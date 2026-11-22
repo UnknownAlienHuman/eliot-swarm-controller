@@ -782,6 +782,14 @@ allowlist. Project Run remains confined to its separate registered-checkout
 
 ## Project registration and rule authority
 
+A registered project may define a static command refusal table with
+[[projects.ID.command_guards]]. Each entry has a pattern glob over the full command
+string exposed by a native permission request and a literal, single-line refusal
+message. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
+text at most 512 bytes. The daemon freezes the registered project's table into each
+admitted launch after project discovery. It is evaluated only when a supported native
+permission request exposes the command.
+
 Owner-global `[projects.ID]` entries register projects. On an Owner open or launch in
 an unregistered Git checkout, S2 creates an entry through the settings writer,
 recorded as a machine change. Its profile allowlist is the existing profiles;
@@ -1425,6 +1433,16 @@ Mask known secret values in native output and reject them in caller durable text
 Private routing tokens are handled separately from semantic profile data. Native
 children receive their own identity only where isolated environment injection is possible;
 otherwise their CLI calls remain attributed to the parent, as the plugin reports.
+
+The profile switch pass_agent_identity_to_shell defaults to true. When false, the
+frozen profile withholds ELIOT_AGENT_TOKEN from shell commands. The nonsecret
+ELIOT_AGENT_ID, ELIOT_AGENT_GENERATION and ELIOT_AGENT_DATA_DIR markers remain so a
+shell CLI fails as an incomplete Agent instead of falling back to Owner authority.
+Codex keeps the token in its per-Agent app-server environment for the named MCP server
+and applies the documented shell environment filter to spawned commands. Claude,
+OpenCode and Antigravity receive the scoped identity in their managed MCP configuration
+while the token is removed from their native process environment. Muse has no managed
+Swarm MCP tool; with this switch off its Agent cannot authenticate swarm CLI calls.
 
 ## Accounts and configured capacity
 

@@ -163,6 +163,7 @@ impl Router {
             let preparation = if let Some(adopt) = request.adopt_worktree.as_deref() {
                 launch.args = json!({"workspace": adopt, "profile": request.profile});
                 normalize_launch(&mut launch, principal)?;
+                launch.args["registered_project"] = json!(request.project);
                 let canonical = required_text(&launch.args, "workspace")?;
                 let (adopt_checkout, adopt_common) = git.repository_identity(canonical).await?;
                 if adopt_checkout != canonical || adopt_common != registration.repo_common_dir {
@@ -172,10 +173,12 @@ impl Router {
                     ));
                 }
                 self.freeze_launch_profile(principal, &mut launch, false).await?;
+                self.freeze_project_command_guards(&mut launch).await?;
                 None
             } else {
                 launch.args = json!({"workspace": registration.checkout, "profile": request.profile, "worktree": ""});
                 normalize_launch(&mut launch, principal)?;
+                launch.args["registered_project"] = json!(request.project);
                 // The hint carries the resolved logical name (display name,
                 // else origin, else main checkout folder), never the
                 // registration ID.

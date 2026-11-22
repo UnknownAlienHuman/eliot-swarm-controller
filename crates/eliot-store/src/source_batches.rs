@@ -643,6 +643,7 @@ impl Store {
                         Error::new("internal", "source batch ack is missing its last sequence")
                     })?,
                     cursor: source.cursor,
+                    permission_refusal: None,
                 };
                 commit_source_batch(tx, &self.write_faulted)?;
                 return Ok(BatchCommit {
@@ -899,6 +900,7 @@ impl Store {
                 first_seq,
                 last_seq,
                 cursor: batch.cursor,
+                permission_refusal: None,
             },
             events: committed_events,
         })

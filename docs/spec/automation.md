@@ -1372,6 +1372,35 @@ it for a later callback or turn. Its first native consumer is Claude Code 2.1.27
 `PreToolUse.additionalContext`; the source schema is confirmed and runtime application is
 still pending qualification.
 
+### Project command guards
+
+The registered project's static command_guards table is frozen into the admitted launch
+after registration resolution. Only the daemon evaluates it. A plugin may attach a
+transient command string to the exact native request.opened; the daemon strips that
+context before persistence, adds the matching refusal text to approval details, and
+returns a refusal bound to the source Agent generation, request id and turn id in the
+event acknowledgement. That acknowledgement follows the committed request event.
+The plugin then issues one native denial. Store admission rejects approve for a request
+that carries guard_refusal, including after an uncertain native write. Uncertain writes
+are never replayed.
+
+The current text-bearing surfaces are Claude can_use_tool for Bash and OpenCode 2.2.7
+permission.asked for bash. OpenCode's native reject closes every pending permission
+for the session, so the adapter reads back the pending list and auto-rejects only when
+the guarded ask is the sole pending permission. If readback fails or a sibling permission
+exists, the guarded request remains pending with its refusal and cannot be approved.
+The native API has no atomic single-request reject; this does not claim exact behavior
+for a sibling permission created after readback but before the session-wide reject.
+
+The guard does not inspect commands outside the exact permission request supplied by a
+supported translator. Codex 0.167.1 exposes execpolicy check --rules as a standalone
+evaluator, but no verified app-server per-session rule attachment; approval_policy
+never emits no permission callback. Codex approval responses carry only a decision,
+Antigravity ACP replies select an offered option without refusal text, and Muse separates
+its request acknowledgement from approval/decide. Those paths do not claim this
+text-bearing guard. This remains a static permission table, not an on.hook rule trigger
+or hook.decide action.
+
 ## Goal loop
 
 A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are

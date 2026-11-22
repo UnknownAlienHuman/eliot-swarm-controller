@@ -6,6 +6,7 @@ pub mod bootstrap;
 mod build_identity;
 mod bus;
 pub mod cloud_mcp;
+mod command_guard;
 mod common;
 mod config;
 pub mod crash;

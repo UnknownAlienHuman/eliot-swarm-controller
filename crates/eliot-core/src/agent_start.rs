@@ -19,6 +19,14 @@ pub struct AgentStartParams {
     pub workspace: Option<String>,
     #[serde(default)]
     pub target_environment: Option<Value>,
+    /// Identity passed only to harness-managed MCP servers, separate from
+    /// the environment inherited by shell tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_environment: Option<Value>,
+    /// Frozen profile choice controlling whether Agent identity reaches shell
+    /// tools. An omitted value retains the pre-switch default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_agent_identity_to_shell: Option<bool>,
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -61,6 +69,8 @@ impl AgentStartParams {
             profile: None,
             workspace: None,
             target_environment: None,
+            mcp_environment: None,
+            pass_agent_identity_to_shell: None,
             note: None,
             source_plan: None,
             source_state: None,

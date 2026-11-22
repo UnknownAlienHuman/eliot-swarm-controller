@@ -158,6 +158,7 @@ impl PluginHost {
                     generation: agent.generation,
                     expected_credential: credential.clone(),
                     observation: Some(agent.clone()),
+                    command_guard_policy: crate::command_guard::CommandGuardPolicy::empty(),
                 },
             ))
         } else {

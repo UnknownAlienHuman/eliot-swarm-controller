@@ -357,9 +357,18 @@ async fn run_agent_startup(
         agent_id: actor.agent.id.clone(),
         generation: actor.agent.generation,
         command_id: actor.start_command.id.clone(),
-        profile: Some(actor.agent.profile_snapshot.clone()),
+        profile: Some({
+            let mut profile = actor.agent.profile_snapshot.clone();
+            if let Some(values) = profile.as_object_mut() {
+                values.remove(crate::command_guard::SNAPSHOT_FIELD);
+                values.remove("pass_agent_identity_to_shell");
+            }
+            profile
+        }),
         workspace: actor.agent.workspace.clone(),
         target_environment: Some(actor.target_environment.clone()),
+        mcp_environment: actor.mcp_environment.clone(),
+        pass_agent_identity_to_shell: Some(actor.pass_agent_identity_to_shell),
         note: None,
         source_plan: Some(source_plan),
         source_state: actor.source_state.clone(),

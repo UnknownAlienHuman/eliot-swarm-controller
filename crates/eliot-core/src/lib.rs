@@ -1369,11 +1369,27 @@ impl SourceBatch {
     }
 }
 
+/// Ephemeral request field carrying a native command to daemon-side guards.
+pub const COMMAND_GUARD_CONTEXT_FIELD: &str = "command_guard";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BatchAck {
     pub first_seq: i64,
     pub last_seq: i64,
     pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_refusal: Option<PermissionRefusal>,
+}
+
+/// Daemon refusal returned with the durable acknowledgement for one exact
+/// native permission request. The source batch binds the Agent generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRefusal {
+    pub agent_id: String,
+    pub generation: i64,
+    pub request_id: String,
+    pub turn_id: String,
+    pub message: String,
 }
 
 /// Stream-loss boundary reported by the Codex producer via `source.gap`.

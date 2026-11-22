@@ -338,6 +338,17 @@ fn validate_start_plan(
         mut secrets,
         mut metadata_secrets,
     } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+    if !provider_probe {
+        let mcp_environment = eliot_plugin::session::agent_mcp_environment(
+            params.mcp_environment.as_ref(),
+            params.target_environment.as_ref(),
+            params.pass_agent_identity_to_shell,
+            &params.agent_id,
+            params.generation,
+            "Codex",
+        )?;
+        secrets.extend(mcp_environment.secrets);
+    }
     if provider_probe {
         environment.retain(|(name, _)| {
             !name
@@ -1255,6 +1266,7 @@ impl CodexPlugin {
         let thread_config = NativeThreadConfigOverrides::from_profile(
             selected_effort.clone(),
             plan.native_subagents.as_deref(),
+            params.pass_agent_identity_to_shell.unwrap_or(true),
         );
         let (thread_method, params_value) = if let Some(subject) = &plan.resume_subject {
             let params = NativeThreadResumeParams {

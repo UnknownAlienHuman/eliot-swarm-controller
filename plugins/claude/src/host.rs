@@ -247,6 +247,7 @@ struct StartPlan {
     instance_dir: PathBuf,
     data_root: PathBuf,
     swarm_binary: PathBuf,
+    mcp_environment: Vec<(OsString, OsString)>,
     program: OsString,
     environment: Vec<(OsString, OsString)>,
     secrets: Vec<String>,
@@ -882,9 +883,18 @@ impl ClaudePlugin {
             mut secrets,
             config_dir,
         } = target_environment(params.target_environment.as_ref(), profile.get("pass_env"))?;
+        let mcp_environment = session::agent_mcp_environment(
+            params.mcp_environment.as_ref(),
+            params.target_environment.as_ref(),
+            params.pass_agent_identity_to_shell,
+            &params.agent_id,
+            params.generation,
+            "Claude",
+        )?;
+        secrets.extend(mcp_environment.secrets.iter().cloned());
         check_effort_override(requested_effort.as_deref(), &environment)?;
         let data_root = ClaudeMcpConfigFile::require_agent_data_root(
-            &environment,
+            &mcp_environment.variables,
             &params.agent_id,
             params.generation,
         )?;
@@ -948,6 +958,7 @@ impl ClaudePlugin {
             instance_dir,
             data_root,
             swarm_binary,
+            mcp_environment: mcp_environment.variables,
             program,
             environment,
             secrets,
@@ -2272,12 +2283,16 @@ async fn launch_session(
             phase: StartPhase::Auth,
             error: Box::new(error),
         })?;
-    let mcp_config =
-        ClaudeMcpConfigFile::create(&plan.instance_dir, &plan.swarm_binary, &plan.data_root)
-            .map_err(|error| PhaseFailure {
-                phase: StartPhase::McpConfig,
-                error: Box::new(error),
-            })?;
+    let mcp_config = ClaudeMcpConfigFile::create(
+        &plan.instance_dir,
+        &plan.swarm_binary,
+        &plan.data_root,
+        &plan.mcp_environment,
+    )
+    .map_err(|error| PhaseFailure {
+        phase: StartPhase::McpConfig,
+        error: Box::new(error),
+    })?;
     // Approvals always travel over stdio so every `can_use_tool` ask
     // reaches Eliot. Resume continues the exact retained session id; the
     // old prompt is never resent.

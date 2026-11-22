@@ -154,20 +154,32 @@ pub struct NativeThreadConfigOverrides {
         skip_serializing_if = "Option::is_none"
     )]
     pub multi_agent_v2: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_environment_policy: Option<serde_json::Value>,
 }
 
 impl NativeThreadConfigOverrides {
     pub(crate) fn from_profile(
         model_reasoning_effort: Option<String>,
         native_subagents: Option<&str>,
+        pass_agent_identity_to_shell: bool,
     ) -> Option<Self> {
         let deny = (native_subagents == Some("deny")).then_some(false);
-        (model_reasoning_effort.is_some() || deny.is_some()).then_some(Self {
-            model_reasoning_effort,
-            agents_enabled: deny,
-            multi_agent: deny,
-            multi_agent_v2: deny,
-        })
+        let shell_environment_policy = (!pass_agent_identity_to_shell).then(|| {
+            serde_json::json!({
+                "filters": {
+                    "ELIOT_AGENT_TOKEN": "exclude"
+                }
+            })
+        });
+        (model_reasoning_effort.is_some() || deny.is_some() || shell_environment_policy.is_some())
+            .then_some(Self {
+                model_reasoning_effort,
+                agents_enabled: deny,
+                multi_agent: deny,
+                multi_agent_v2: deny,
+                shell_environment_policy,
+            })
     }
 }
 

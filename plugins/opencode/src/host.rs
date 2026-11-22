@@ -400,6 +400,7 @@ struct ParsedStart {
     resume: Option<ResumeSubject>,
     swarm_executable: PathBuf,
     swarm_data_dir: PathBuf,
+    swarm_mcp_environment: Vec<(OsString, OsString)>,
 }
 
 /// Outcome of start phase 4: either a created session ready for the
@@ -1113,25 +1114,32 @@ impl OpenCodePlugin {
             profile.get("pass_env"),
             "OpenCode",
         )?;
+        let mcp_environment = eliot_plugin::session::agent_mcp_environment(
+            params.mcp_environment.as_ref(),
+            params.target_environment.as_ref(),
+            params.pass_agent_identity_to_shell,
+            &params.agent_id,
+            params.generation,
+            "OpenCode",
+        )?;
+        secrets.extend(mcp_environment.secrets.iter().cloned());
         secrets.push(initialized.credential.clone());
-        // Agent-scoped swarm MCP identity: the Agent's owned Eliot data root
-        // for the MCP `--data-dir` argument (mirrors the Codex
-        // `args_with_agent_mcp` guard), plus the active Swarm executable for
-        // the server command (mirrors the Claude `swarm_binary` readback).
-        // The token itself is never rendered: the MCP child inherits this
-        // environment from the serve process, and `mcp --require-agent`
-        // fails closed without it.
-        let swarm_data_dir = environment
-            .iter()
-            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
-            .map(|(_, value)| PathBuf::from(value))
-            .filter(|path| path.is_absolute() && path.is_dir())
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    "OpenCode Agent MCP requires an absolute owned Eliot data directory",
-                )
-            })?;
+        // The per-Agent MCP config receives the validated scoped identity
+        // explicitly; the serve process environment may omit its token when
+        // shell identity is disabled. The MCP child still uses --require-agent
+        // and never falls back to Owner authority.
+        let swarm_data_dir = eliot_plugin::native_cli::unique_environment_value(
+            &mcp_environment.variables,
+            "ELIOT_HOME",
+        )
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .ok_or_else(|| {
+            Error::new(
+                "profile_error",
+                "OpenCode Agent MCP requires an absolute owned Eliot data directory",
+            )
+        })?;
         let swarm_executable = std::env::current_exe().map_err(|_| {
             Error::new(
                 "platform_io",
@@ -1162,6 +1170,7 @@ impl OpenCodePlugin {
             resume,
             swarm_executable,
             swarm_data_dir,
+            swarm_mcp_environment: mcp_environment.variables,
         }))
     }
 
@@ -1233,6 +1242,7 @@ impl OpenCodePlugin {
                     .cloned(),
                 swarm_executable: parsed.swarm_executable.clone(),
                 swarm_data_dir: parsed.swarm_data_dir.clone(),
+                swarm_environment: parsed.swarm_mcp_environment.clone(),
                 native_subagents: parsed.native_subagents.clone(),
             },
             &parsed.secrets,
@@ -1656,6 +1666,7 @@ impl OpenCodePlugin {
         // the created session killed, exactly like the gate above.
         {
             let expected_command = managed_mcp_command(parsed);
+            let expected_environment = managed_mcp_environment(parsed);
             let proof = match session
                 .http
                 .get_config(phase_deadline(cutoff, RPC_TIMEOUT))
@@ -1672,7 +1683,11 @@ impl OpenCodePlugin {
                             .iter()
                             .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
                     }) {
-                        verify_managed_mcp_transport(&documents, &expected_command)
+                        verify_managed_mcp_transport(
+                            &documents,
+                            &expected_command,
+                            &expected_environment,
+                        )
                     } else {
                         Ok(())
                     }
@@ -2277,7 +2292,11 @@ impl OpenCodePlugin {
                 .iter()
                 .any(|server| server.is_serving(SWARM_MCP_SERVER_NAME))
         }) {
-            verify_managed_mcp_transport(&documents, &managed_mcp_command(parsed))?;
+            verify_managed_mcp_transport(
+                &documents,
+                &managed_mcp_command(parsed),
+                &managed_mcp_environment(parsed),
+            )?;
         }
         Ok((mcp_servers, mcp_servers_verified))
     }
@@ -4258,6 +4277,19 @@ fn managed_mcp_command(parsed: &ParsedStart) -> Vec<String> {
     ]
 }
 
+fn managed_mcp_environment(parsed: &ParsedStart) -> std::collections::HashMap<String, String> {
+    parsed
+        .swarm_mcp_environment
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .collect()
+}
+
 /// The winning effective `mcp.servers` transport for the managed
 /// Agent-scoped entry: the highest-precedence effective document defining
 /// it wins, mirroring the native fold where later documents replace earlier
@@ -4282,12 +4314,12 @@ fn winning_managed_mcp_server(documents: &[ConfigEntry]) -> Option<&ConfigMcpSer
 /// file, `.opencode/` project directory, or machine scope outside the file
 /// scan) replaces the managed document entry natively, while the inventory
 /// gate only sees the name and status. The winning definition must be the
-/// local stdio shape with exactly the generated argv, no URL, and no
-/// environment override; anything else refuses the start. Only the
-/// transport/auth-identity fields decide; cosmetic keys never do.
+/// local stdio shape with exactly the generated argv, no URL, and the
+/// expected scoped Agent environment; anything else refuses the start.
 fn verify_managed_mcp_transport(
     documents: &[ConfigEntry],
     expected_command: &[String],
+    expected_environment: &std::collections::HashMap<String, String>,
 ) -> Result<()> {
     let server = winning_managed_mcp_server(documents).ok_or_else(|| {
         Error::new(
@@ -4301,10 +4333,7 @@ fn verify_managed_mcp_transport(
         .is_none_or(|kind| kind == "local")
         && server.command.as_deref() == Some(expected_command)
         && server.url.as_deref().is_none_or(str::is_empty)
-        && server
-            .environment
-            .as_ref()
-            .is_none_or(std::collections::HashMap::is_empty);
+        && server.environment.as_ref() == Some(expected_environment);
     if !transport_ok {
         return Err(Error::new(
             "profile_error",

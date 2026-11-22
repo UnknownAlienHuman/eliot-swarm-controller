@@ -5,6 +5,7 @@ use super::{
     FileConfig, MAX_PROFILE_NAME_LEN, MAX_PROFILES, config_error_at,
     configured_route_credential_env_names, read_config, validate_profile_name,
 };
+use crate::command_guard::ProjectCommandGuard;
 use eliot_core as core;
 use serde::Deserialize;
 use std::{
@@ -39,6 +40,7 @@ pub(crate) struct ProjectRegistrationConfig {
     pub check: Vec<String>,
     pub check_at_turn_end: bool,
     pub max_rounds: Option<i64>,
+    pub command_guards: Vec<ProjectCommandGuard>,
     pub workspace: ProjectWorkspaceMode,
 }
 
@@ -322,6 +324,8 @@ pub(super) struct ProjectEntry {
     /// Required when `check` is configured; bounds automatic Goal rounds.
     #[serde(default)]
     max_rounds: Option<i64>,
+    #[serde(default)]
+    command_guards: Vec<ProjectCommandGuard>,
     /// `workspace = "worktree" | "shared"`, default `worktree`.
     #[serde(default)]
     workspace: ProjectWorkspaceMode,
@@ -465,6 +469,7 @@ pub(super) fn project_registrations_in(
             offset,
             &format!("projects.{id}"),
         )?;
+        validate_project_command_guards(id, &entry.command_guards, source, offset)?;
 
         projects.push(ProjectRegistrationConfig {
             id: id.clone(),
@@ -478,6 +483,7 @@ pub(super) fn project_registrations_in(
             check,
             check_at_turn_end: entry.check_at_turn_end,
             max_rounds: entry.max_rounds,
+            command_guards: entry.command_guards.clone(),
             workspace: entry.workspace,
         });
     }
@@ -511,6 +517,52 @@ fn normalize_project_command_argv(
         ));
     }
     Ok(argv.to_vec())
+}
+
+fn validate_project_command_guards(
+    project_id: &str,
+    entries: &[ProjectCommandGuard],
+    source: &str,
+    offset: usize,
+) -> core::Result<()> {
+    let field = format!("projects.{project_id}.command_guards");
+    if entries.len() > crate::command_guard::MAX_PROJECT_GUARDS {
+        return Err(config_error_at(
+            source,
+            offset,
+            &field,
+            "exceeds 64 entries",
+            "profile_error",
+        ));
+    }
+    for entry in entries {
+        if entry.pattern.is_empty()
+            || entry.pattern.len() > crate::command_guard::MAX_PATTERN_BYTES
+            || entry.pattern.chars().any(char::is_control)
+            || globset::Glob::new(&entry.pattern).is_err()
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "patterns must be valid nonempty globs of at most 1024 bytes",
+                "profile_error",
+            ));
+        }
+        if entry.refusal.trim().is_empty()
+            || entry.refusal.len() > crate::command_guard::MAX_REFUSAL_BYTES
+            || entry.refusal.chars().any(char::is_control)
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "refusal text must be a nonempty single line of at most 512 bytes",
+                "profile_error",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_project_allowlist(
