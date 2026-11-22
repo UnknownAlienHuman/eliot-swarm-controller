@@ -1031,6 +1031,67 @@ report lists stored unknowns with no live process, turn or reader as
 retained-unresolved — with resolvability and owner action — instead of
 blocking on them; the stored outcome stays `unknown`.
 
+## Swarm autonomy
+
+[`autonomy.get`](api.md#agent-and-daemon-read-views) reports the Store evidence for
+issue #883. Each row gives its source, counts and coverage (`complete`, `partial`
+with a reason, or `unavailable` with a reason and no counts). Counts with partial
+coverage describe observed evidence. List truncation is explicit. The report
+contains no command text, message bodies, or thresholds for judging performance.
+
+The window includes both endpoints. The Owner backlog is measured as of the
+report end, using an age strictly greater than 24 hours regardless of the start
+of the activity window. The daemon runs one report at a time on a separate
+read-only SQLite snapshot. Indexed, capped source reads run outside the Store
+writer lock. A source that exceeds its work cap reports partial coverage.
+
+| Row | Evidence |
+| --- | --- |
+| Project policy | Retained Swarm Agent creation, project policy applied flag and explicit opt-out reason from admission (#868). |
+| Steers | Retained steer commands classified by caller and automation cause. |
+| Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. |
+| Waits | Captured shell invocations matching wait commands. |
+| Swarm fact notes | Applied Swarm context injections and retained service mail deliveries attributed to `swarm`. |
+| Owner backlog | Current unknown commands, current unarchived failed or lost Agents, and open provider holds, aged from their recorded transition or hold time. |
+| Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
+| Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |
+
+Shell matching counts one check per matching command segment and at most one wait
+per captured shell-tool start. It uses the executable basename, ignoring case and
+an optional `.exe` suffix. Assignments and leading `do`, `then`, `(`, or `{` are
+skipped. Check patterns cover `cargo fmt`, `cargo build`, `cargo check`,
+`cargo clippy`, and `cargo test` after Cargo global flags and an optional
+`+toolchain`. The frozen project check matches the executable and its configured
+argument prefix. Wait patterns cover `sleep`, `Start-Sleep`, and `timeout /t`.
+The matcher splits at unquoted and unescaped line breaks, `;`, `&`, and `|`.
+It unwraps command strings passed via `bash -lc`, `sh -c`, `powershell -Command`,
+and `pwsh -c`. Counts are based on the captured invocation text. Conditional
+segments can be counted even when the shell skips them.
+
+Swarm checks count Goal exits and `project.check.finished` fast-check facts with
+a proven direct exit. Before this release the fast-check worker did not retain
+these facts. Swarm context injections use the timestamp of `command.applied`. Service mail
+counts once per durable delivery. Normalized input sums uncached input and cache
+reads. Average context uses one measured first-call input sample per retained
+completed turn when available. Later calls lack a comparable retained sample.
+An Agent is a manager for a turn if a retained child under its current parent
+links was created at or before the turn's completion. The executor row counts
+distinct Swarm-created Agents with qualifying turn starts or authenticated Swarm
+MCP starts in the window. It uses the completion timestamp for a bound turn
+and the start event timestamp for unfinished turns or unbound calls. A profile
+can have zero calls. The Store keeps current parent links and profiles, so this
+read cannot reconstruct historical reparenting.
+If a current waiting item's transition event is gone, its last update provides
+a lower bound on elapsed waiting time and the backlog row reports partial coverage.
+
+Periodic retention can prune terminal commands. This can remove steers, frozen
+launch checks, or principal attribution for applied injects. Those rows reflect
+the retention risk because the Store has no command-prune timestamp watermark.
+Unknown commands are protected by [retention](core.md#retention). Periodic
+retention does not delete Agent or turn rows. Explicit Agent deletion removes
+the Agent and its dependent history, so the policy, usage, and executor rows
+describe the retained fleet. Event-dependent rows also report known event gaps.
+
 ## Heavy work, session growth and harness drift
 
 Three event families capture heavy work, session growth, and vendor drift.

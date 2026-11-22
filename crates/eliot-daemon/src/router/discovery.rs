@@ -117,6 +117,15 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
+    method!(
+        "autonomy.get",
+        AutonomyRequest,
+        AutonomyResponse,
+        true,
+        false,
+        "Read windowed Swarm autonomy counts and source coverage.",
+        {}
+    ),
     #[cfg(debug_assertions)]
     method!(
         "daemon.panic_test",

@@ -144,6 +144,7 @@ pub(crate) struct Router {
 struct RouterInner {
     data_root: PathBuf,
     store: StoreHandle,
+    autonomy_reader: Arc<tokio::sync::Semaphore>,
     bus: Bus,
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
@@ -408,6 +409,7 @@ impl Router {
             inner: Arc::new(RouterInner {
                 data_root,
                 store,
+                autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 bus,
                 mail,
                 attention,
@@ -620,6 +622,11 @@ impl Router {
                     eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
                 self.status().await
+            }
+            "autonomy.get" => {
+                require_owner(&principal)?;
+                self.autonomy(eliot_core::api::discovery::decode_params(params)?)
+                    .await
             }
             "daemon.shutdown" => {
                 require_owner(&principal)?;

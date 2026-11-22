@@ -5,6 +5,8 @@ mod agent_lifecycle;
 pub use agent_lifecycle::*;
 mod agent_requests;
 mod agent_views;
+mod autonomy;
+pub use autonomy::*;
 mod child_run;
 mod cleanup;
 pub use child_run::*;

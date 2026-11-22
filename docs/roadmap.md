@@ -93,6 +93,9 @@ engine, second scheduler or critic loop.
       ordinary launches, assigned managers, their children and timer launches.
       A failed Goal check continues the Agent's work. Explicit opt-outs retain
       their reason and appear in the project's 24-hour adoption count.
+- [x] **Swarm autonomy (#883).** Owner CLI and MCP report windowed Store counts
+      with source coverage. A private Claude Haiku and OpenCode run contributed
+      native and Swarm facts. The report read an upgraded Store with 600,000 events.
 - [x] **File wake (#833).** OpenCode arms a file condition, ends its turn and
       receives one follow-up when the file appears in its worktree.
 - [x] **Project command guard and shell identity (#833).** OpenCode refuses

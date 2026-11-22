@@ -77,6 +77,8 @@ pub(crate) enum CliCommand {
     Stand(StandArgs),
     /// Read daemon state without starting a daemon.
     Status,
+    /// Read Swarm autonomy counts for the last 24 hours (owner only).
+    Autonomy(AutonomyArgs),
     /// Run the bounded retention maintenance pass now (owner only).
     Maintenance(MaintenanceArgs),
     /// Compact the private Store offline (owner only; daemon must be stopped).
@@ -208,6 +210,13 @@ pub(crate) enum CliCommand {
     /// Internal plugin entry point used by the daemon.
     #[command(hide = true)]
     Plugin(PluginArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct AutonomyArgs {
+    /// Start of the window (RFC 3339, Unix milliseconds, or a duration ago such as 48h).
+    #[arg(long, value_name = "TIME")]
+    pub(crate) since: Option<String>,
 }
 
 #[derive(Args)]

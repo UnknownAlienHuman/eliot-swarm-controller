@@ -59,10 +59,12 @@ impl Store {
         target: &str,
         generation: i64,
         failure: Option<String>,
+        fast_check_exit: Option<i32>,
         now: i64,
     ) -> Result<Change<Option<String>>> {
         self.ensure_writer_healthy()?;
-        let result = self.project_check_context_inner(target, generation, failure, now);
+        let result =
+            self.project_check_context_inner(target, generation, failure, fast_check_exit, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -72,6 +74,7 @@ impl Store {
         target: &str,
         generation: i64,
         failure: Option<String>,
+        fast_check_exit: Option<i32>,
         now: i64,
     ) -> Result<Change<Option<String>>> {
         let agent_num = parse_agent_id(target)?;
@@ -85,6 +88,17 @@ impl Store {
             && agent.generation == generation
             && !agent.is_terminal()
         {
+            if let Some(exit_code) = fast_check_exit {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    "project.check.finished",
+                    "project",
+                    Some(agent_num),
+                    Some(generation),
+                    json!({"exit_code": exit_code}),
+                )?);
+            }
             let previous: Option<String> = tx
                 .query_row(
                     "SELECT id FROM commands INDEXED BY commands_target

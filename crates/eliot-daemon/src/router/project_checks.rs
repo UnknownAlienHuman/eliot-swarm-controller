@@ -632,6 +632,7 @@ async fn check_after_edit(
     let policy = router.secret_policy_snapshot();
     let mut failure = None;
     let mut checked_fingerprint = None;
+    let mut fast_check_exit = None;
     if !work.config.format.is_empty() {
         match run_argv(
             &work.config.format,
@@ -694,7 +695,10 @@ async fn check_after_edit(
                 // be suppressed just as formatter hints are.
                 checked_fingerprint = work_fingerprint(&work.workspace).await.ok();
                 if let CheckOutcome::Failed { exit_code, output } = outcome {
+                    fast_check_exit = Some(exit_code);
                     failure = Some(format_failure("fast check", exit_code, &output, &policy));
+                } else {
+                    fast_check_exit = Some(0);
                 }
             }
             Ok(CheckOutcome::Unknown(reason)) => {
@@ -719,7 +723,7 @@ async fn check_after_edit(
             }
         }
     }
-    if let Err(error) = update_failure_context(router, key, failure).await {
+    if let Err(error) = update_failure_context(router, key, failure, fast_check_exit).await {
         log_error(
             router,
             "daemon.project_check_delivery_failed",
@@ -924,10 +928,17 @@ async fn update_failure_context(
     router: &Router,
     key: &WorkKey,
     failure: Option<String>,
+    fast_check_exit: Option<i32>,
 ) -> Result<()> {
     router.check_command_admission_mode("inject")?;
     let mut store = router.inner.store.lock().await;
-    let change = store.project_check_context(&key.agent, key.generation, failure, now_ms())?;
+    let change = store.project_check_context(
+        &key.agent,
+        key.generation,
+        failure,
+        fast_check_exit,
+        now_ms(),
+    )?;
     router.publish_locked(&change.events);
     drop(store);
     if let Some(command_id) = change.value {
