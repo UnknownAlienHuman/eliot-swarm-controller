@@ -140,6 +140,7 @@ struct Target {
     key: ProcessKey,
     agent: String,
     generation: i64,
+    context_ceiling_tokens: Option<i64>,
     owner: String,
     observer: CustodyObserver,
     sampling: AsyncMutex<()>,
@@ -323,6 +324,11 @@ impl Monitoring {
             key: key.clone(),
             agent: agent.id.clone(),
             generation: agent.generation,
+            context_ceiling_tokens: agent
+                .profile_snapshot
+                .get("context_ceiling_tokens")
+                .and_then(Value::as_i64)
+                .filter(|ceiling| *ceiling > 0),
             owner: owner(&agent.id, agent.generation),
             observer,
             sampling: AsyncMutex::new(()),
@@ -395,6 +401,7 @@ impl Monitoring {
             key: key.clone(),
             agent: context.agent.clone(),
             generation: context.target_generation,
+            context_ceiling_tokens: None,
             owner: workspace_owner(&context.agent, context.target_generation),
             observer,
             sampling: AsyncMutex::new(()),
@@ -1877,7 +1884,9 @@ impl Monitoring {
             }
         }
         // Session growth from the retained snapshot; warn once per basis per
-        // generation until the signal clears, then record the recovery.
+        // generation until the signal clears, then record the recovery. A
+        // profile ceiling uses the latest actual context count independently
+        // of whether the native adapter reports its window capacity.
         let mut growth_events = Vec::new();
         {
             let (harness, usage) = {
@@ -1900,15 +1909,39 @@ impl Monitoring {
             // size where the harness exposes a documented size source
             // (transcript/rollout scan); absent sizes never warn.
             let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
-            match eliot_core::evaluate_session_growth(
-                &harness,
-                usage.as_ref(),
-                session_bytes,
-                &thresholds.growth,
-            ) {
-                Some(warn) => {
-                    if tracker.warned_growth.insert(warn.basis_name()) {
-                        growth_events.push((eliot_core::SESSION_GROWTH_KIND, warn.payload()));
+            let ceiling_growth = target.context_ceiling_tokens.and_then(|ceiling| {
+                let used = usage
+                    .as_ref()
+                    .and_then(|usage| usage.context_used_tokens)
+                    .filter(|used| *used >= 0)?;
+                (used > ceiling).then(|| {
+                    (
+                        "context_ceiling",
+                        serde_json::json!({
+                            "basis": "context_ceiling",
+                            "warn": true,
+                            "context_used_tokens": used,
+                            "context_ceiling_tokens": ceiling,
+                            "usage_observed_at": usage.as_ref().and_then(|usage| usage.observed_at),
+                            "message": format!("latest model context {used} tokens exceeds profile ceiling {ceiling} tokens"),
+                            "level": eliot_core::OBSERVE_LEVEL_STANDARD,
+                        }),
+                    )
+                })
+            });
+            let growth = ceiling_growth.or_else(|| {
+                eliot_core::evaluate_session_growth(
+                    &harness,
+                    usage.as_ref(),
+                    session_bytes,
+                    &thresholds.growth,
+                )
+                .map(|warn| (warn.basis_name(), warn.payload()))
+            });
+            match growth {
+                Some((basis, payload)) => {
+                    if tracker.warned_growth.insert(basis) {
+                        growth_events.push((eliot_core::SESSION_GROWTH_KIND, payload));
                     }
                 }
                 None => {

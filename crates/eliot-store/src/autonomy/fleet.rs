@@ -1,3 +1,4 @@
+use crate::usage::{RoleUsage, manager_at_sql};
 use eliot_core::api::{
     AutonomyOptOut, AutonomyOwnerWaiting, AutonomyProject, AutonomyProjectPolicy, AutonomyRow,
     AutonomyUsage, AutonomyWaitingItem,
@@ -401,8 +402,9 @@ fn read_usage(
     since: i64,
     until: i64,
 ) -> eliot_core::Result<AutonomyRow<AutonomyUsage>> {
+    let manager = manager_at_sql("agents.id", "candidates.observed_at");
     let mut statement = tx
-        .prepare_cached(
+        .prepare_cached(&format!(
             "WITH candidates AS (
                  SELECT agent, generation, turn_id, state, usage,
                         COALESCE(completed_at, started_at, 0) AS observed_at
@@ -414,17 +416,13 @@ fn read_usage(
              )
              SELECT candidates.state, candidates.usage, agents.harness,
                     CASE WHEN agents.id IS NULL THEN NULL
-                         WHEN EXISTS (
-                             SELECT 1 FROM agents AS child INDEXED BY autonomy_child_creation
-                             WHERE child.parent = agents.id
-                               AND child.created_at <= candidates.observed_at
-                         ) THEN 1 ELSE 0 END,
+                         ELSE {manager} END,
                     agents.origin
              FROM candidates
              LEFT JOIN agents ON agents.id = candidates.agent
              ORDER BY candidates.observed_at DESC, candidates.agent DESC,
                       candidates.generation DESC, candidates.turn_id DESC",
-        )
+        ))
         .map_err(crate::sql_error)?;
     let mut rows = statement
         .query(params![since, until, FETCH_LIMIT])
@@ -441,8 +439,7 @@ fn read_usage(
     let mut examined = 0_usize;
     let mut input_overflow = false;
     let mut missing_usage = false;
-    let mut missing_input = false;
-    let mut observed_input = false;
+    let mut role_usage = RoleUsage::default();
     let mut missing_context = false;
     let mut unsettled_turn = false;
     let mut missing_agent = false;
@@ -475,21 +472,7 @@ fn read_usage(
         let harness = row.get::<_, String>(2).map_err(crate::sql_error)?;
         let usage = crate::decode_turn_usage(&usage_json, &harness)?;
 
-        let total = if manager {
-            &mut counts.manager_input_tokens
-        } else {
-            &mut counts.executor_input_tokens
-        };
-        // Normalization already folds disjoint cache writes into input where
-        // the vendor reports them separately.
-        for value in [usage.input_tokens, usage.cache_read_tokens] {
-            if let Some(value) = value {
-                observed_input = true;
-                add_tokens(total, value)?;
-            } else {
-                missing_input = true;
-            }
-        }
+        role_usage.observe_turn(manager, &usage)?;
 
         if let Some(context) = usage.first_call_input_tokens {
             let context = u64::try_from(context).map_err(|_| {
@@ -514,11 +497,10 @@ fn read_usage(
     if counts.observed_calls > 0 {
         counts.average_context_tokens = Some(context_sum as f64 / counts.observed_calls as f64);
     }
-    let total_input =
-        u128::from(counts.manager_input_tokens) + u128::from(counts.executor_input_tokens);
-    if total_input > 0 {
-        counts.manager_input_share = Some(counts.manager_input_tokens as f64 / total_input as f64);
-    }
+    let input = role_usage.input_summary();
+    counts.manager_input_tokens = input.managers;
+    counts.executor_input_tokens = input.executors;
+    counts.manager_input_share = input.manager_share;
 
     let mut reasons = Vec::new();
     if input_overflow {
@@ -529,7 +511,7 @@ fn read_usage(
     if missing_usage {
         reasons.push("some completed turns have no retained turn-usage record".to_owned());
     }
-    if missing_input {
+    if input.incomplete {
         reasons.push(
             "some retained turn-usage records omit uncached or cached input counters".to_owned(),
         );
@@ -550,22 +532,13 @@ fn read_usage(
         reasons.push("some retained turns lack current Agent hierarchy evidence".to_owned());
     }
     let source = "sqlite:turns.usage.normalized+agents.parent";
-    if !observed_input
+    if !input.observed
         && counts.observed_calls == 0
-        && (missing_usage || missing_input || unsettled_turn || missing_agent)
+        && (missing_usage || input.incomplete || unsettled_turn || missing_agent)
     {
         return Ok(AutonomyRow::unavailable(source, &reasons.join(". ")));
     }
     Ok(row_with_coverage(source, reasons, counts))
-}
-
-fn add_tokens(total: &mut u64, value: i64) -> eliot_core::Result<()> {
-    let value = u64::try_from(value)
-        .map_err(|_| crate::Error::new("source_integrity", "negative input token count"))?;
-    *total = total.checked_add(value).ok_or_else(|| {
-        crate::Error::new("source_integrity", "autonomy input token count overflow")
-    })?;
-    Ok(())
 }
 
 fn row_with_coverage<T>(source: &str, reasons: Vec<String>, counts: T) -> AutonomyRow<T> {

@@ -966,6 +966,7 @@ hidden wait/acceptance state to the router.
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |
 | `git.fetch` | targetless ordinary `SubmitCommand` through Router/Store with frozen intent and readback |
+| `git.integrate` | targetless local merge and project check on pinned branch tips, available to configured event and timer rules |
 | `git.publish` | targetless project-rule command bound to one retained `project.check.passed` event; commit, optional approved push, and optional approved PR use one durable dispatch |
 | `git.push`, `git.worktree` | unsupported as general actions; `git.publish` owns only its check-bound branch push |
 
@@ -1026,9 +1027,44 @@ are not turned into Owner RPC clients.
 
 ## Git actions
 
-This increment connects `git.fetch` and the check-bound `git.publish` recipe below through
-the existing Router/Store command path. `git.fetch` remains available to Owner and
-registered-project event/timer rules. `git.publish` is project-rule-only and requires the
+The Router and Store admit `git.fetch`, `git.integrate`, and check-bound
+`git.publish` through the ordinary command path. `git.fetch` is available to Owner and
+registered-project event or timer rules.
+
+### Local branch integration
+
+`git.integrate` takes a literal registered repository, base branch and ordered local
+branches through the [integration DTO](../../crates/eliot-core/src/api/git_integrate.rs).
+An event or timer rule in a registered project needs `git.integrate` in the Owner's
+action allowlist and must name that same project. An authorized manager can request
+the same operation through [the coordination command](coordination.md#integrating-agent-branches).
+Integration runs when a caller requests it or a configured rule fires.
+
+The daemon pins branch tips before admission and uses the Store repository write gate
+shared with publication and workspace operations. It merges in a daemon-owned
+temporary checkout with a private index, then runs the registered project's
+`policy.check` against that combined commit. A conflict returns bounded paths. A
+nonzero check returns a bounded diagnostic tail and identifies any branches that fail
+when checked individually against the same base. If every branch passes separately,
+the result identifies a failure in the combined tree. A local execution failure leaves
+that branch's check unconfirmed. Unconfirmed effects retain their `unknown` state for readback.
+
+Store commits the integration's scratch and process custody before mutation. Startup and
+the next integration request reconcile interrupted scratch after process exit is proven.
+Reconciliation removes only the recorded checkout, private index, and Git registration.
+It retains the interrupted command's outcome. A cleaned scratch-only interruption
+releases the repository write gate. A possibly modified target ref keeps that gate.
+
+An explicit `fast_forward_to` names a local branch to advance after a passing check.
+The daemon checks ancestry and the previous ref value and refuses checked-out targets.
+If readback detects a checkout racing with the update, the daemon attempts a CAS rollback
+from the integrated OID to the previous OID and reports the compensation with an
+`unknown` command outcome.
+Integration performs no remote operations.
+
+### Check-bound publication
+
+`git.publish` is project-rule-only and requires the
 exact `project.check.passed` event. The dedicated event is committed
 atomically with the final project-check success and carries Core `ProjectCheckPassed`
 (`project`, `turn_id`, `fingerprint`, `subject`). Its envelope binds the Agent generation

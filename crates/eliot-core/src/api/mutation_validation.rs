@@ -7,7 +7,10 @@ use crate::{CommandState, Error, Result, is_start_verb};
 
 impl CommandSubmitRequest {
     pub fn validate_response(&self, response: &CommandSubmitResponse) -> Result<()> {
-        if matches!(self.verb.as_str(), "git.fetch" | "notify" | "emit") {
+        if matches!(
+            self.verb.as_str(),
+            "git.fetch" | "git.integrate" | "notify" | "emit"
+        ) {
             if self.validate().is_err()
                 || response.command_id != self.id
                 || response.agent.is_some()

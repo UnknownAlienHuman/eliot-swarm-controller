@@ -76,6 +76,7 @@ impl Router {
         params: &Value,
         principal: &Principal,
         owner_process: Option<&OwnerProcess>,
+        profile_authority: Option<[u8; 32]>,
     ) -> Result<Value> {
         require_owner(principal)?;
         let request: SwitchRequest = eliot_core::api::discovery::decode_params(params.clone())?;
@@ -96,6 +97,7 @@ impl Router {
                     &request,
                     &policy,
                     owner_process,
+                    profile_authority,
                     now_ms(),
                 )
                 .inspect_err(|error| {
@@ -129,6 +131,7 @@ impl Router {
             request,
             plan,
             provider_failure,
+            profile_authority,
         }) = work
         else {
             return;
@@ -231,6 +234,16 @@ impl Router {
                     true,
                 )
                 .await?;
+            if let Some(authority) = profile_authority
+                && eliot_core::provider_switch_authority(
+                    &prepared.request.args["profile_snapshot"],
+                )? != authority
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "session growth switch authority differs from the source generation",
+                ));
+            }
             if let Some((choice, identity)) = provider_route {
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity

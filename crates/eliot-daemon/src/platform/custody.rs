@@ -217,6 +217,16 @@ impl AgentSpawnError {
 }
 
 impl OwnedChild {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn integration_root_identity(&self) -> Option<eliot_core::ProcessIdentity> {
+        let group = self.identity?;
+        Some(eliot_core::ProcessIdentity {
+            pid: group.pid,
+            host_boot_id: super::unix::host_boot_id().ok()?,
+            start_time: group.start_ticks,
+        })
+    }
+
     /// Capture observation authority while the exact leader identity is owned.
     pub fn observer(&self) -> Result<super::CustodyObserver> {
         let mut retained = self.observation.lock_recover();
@@ -422,8 +432,41 @@ impl OwnedChild {
 
     #[cfg(windows)]
     fn spawn_in_job(
+        command: Command,
+        job: super::windows::Job,
+    ) -> std::result::Result<Self, AgentSpawnError> {
+        Self::spawn_in_job_checked(command, job, |_| Ok(()))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn spawn_integration(
+        command: Command,
+        scratch_id: &str,
+        record: impl FnOnce(&eliot_core::ProcessIdentity) -> Result<()>,
+    ) -> std::result::Result<Self, AgentSpawnError> {
+        let name = agent_custody_name("integration", scratch_id, 1);
+        let job = super::windows::Job::new_named_kill_on_close(&name)
+            .map_err(AgentSpawnError::NotSpawned)?;
+        Self::spawn_in_job_checked(command, job, |child| {
+            let pid = child.id().ok_or_else(|| {
+                Error::new(
+                    "process_identity",
+                    "suspended integration child has no process id",
+                )
+            })?;
+            record(&eliot_core::ProcessIdentity {
+                pid,
+                host_boot_id: super::windows::host_boot_id()?,
+                start_time: super::windows::process_start_time(pid)?,
+            })
+        })
+    }
+
+    #[cfg(windows)]
+    fn spawn_in_job_checked(
         mut command: Command,
         job: super::windows::Job,
+        before_resume: impl FnOnce(&Child) -> Result<()>,
     ) -> std::result::Result<Self, AgentSpawnError> {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
@@ -444,7 +487,7 @@ impl OwnedChild {
                 )));
             }
         };
-        job.assign_then_resume(process)
+        job.assign_then_resume(process, || before_resume(&child))
             .map_err(AgentSpawnError::Uncertain)?;
         Ok(Self {
             job,

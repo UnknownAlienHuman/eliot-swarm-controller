@@ -2,9 +2,9 @@ use eliot_core::{
     Error, Event, SubmitCommand,
     api::{
         CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
-        GitPublishDefinitionArgs, GitPublishTrigger, MAX_RULE_FILE_BYTES, MailDefinitionArgs,
-        NotifyDefinitionArgs, ProjectCheckPassed, RuleLimit, RuleLimitScope, RunDefinitionArgs,
-        TimerSchedule, VarDefinitionArgs,
+        GitIntegrateDefinitionArgs, GitPublishDefinitionArgs, GitPublishTrigger,
+        MAX_RULE_FILE_BYTES, MailDefinitionArgs, NotifyDefinitionArgs, ProjectCheckPassed,
+        RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule, VarDefinitionArgs,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -224,6 +224,9 @@ enum ActionDefinition {
     GitFetch {
         definition: GitFetchDefinitionArgs,
     },
+    GitIntegrate {
+        definition: GitIntegrateDefinitionArgs,
+    },
     GitPublish {
         definition: GitPublishDefinitionArgs,
     },
@@ -276,6 +279,13 @@ impl ActionDefinition {
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
             return Ok(Self::GitFetch { definition });
+        }
+        if action == "git.integrate" {
+            let mut fields = object.clone();
+            fields.remove("action");
+            let definition =
+                eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
+            return Ok(Self::GitIntegrate { definition });
         }
         if action == "git.publish" {
             let mut fields = object.clone();
@@ -385,6 +395,22 @@ impl Serialize for ActionDefinition {
                         }
                     };
                 fields.insert("action".to_owned(), Value::String("git.fetch".to_owned()));
+                Value::Object(fields).serialize(serializer)
+            }
+            Self::GitIntegrate { definition } => {
+                let mut fields =
+                    match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
+                        Value::Object(fields) => fields,
+                        _ => {
+                            return Err(serde::ser::Error::custom(
+                                "git.integrate definition must serialize as an object",
+                            ));
+                        }
+                    };
+                fields.insert(
+                    "action".to_owned(),
+                    Value::String("git.integrate".to_owned()),
+                );
                 Value::Object(fields).serialize(serializer)
             }
             Self::GitPublish { definition } => {
@@ -906,6 +932,9 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         ActionDefinition::GitFetch { definition } => {
             return submit_git_fetch_command(definition).map(RuleEvaluation::Command);
         }
+        ActionDefinition::GitIntegrate { definition } => {
+            return submit_git_integrate_command(definition).map(RuleEvaluation::Command);
+        }
         ActionDefinition::GitPublish { definition } => {
             return submit_git_publish_command(definition, event).map(RuleEvaluation::Command);
         }
@@ -1119,6 +1148,19 @@ fn validate_git_fetch_definition(definition: &GitFetchDefinitionArgs) -> Result<
     Ok(())
 }
 
+fn validate_git_integrate_definition(definition: &GitIntegrateDefinitionArgs) -> Result<(), Error> {
+    definition.validate()?;
+    if let Some(timeout) = &definition.timeout {
+        super::schedule::parse_positive_duration_ms(timeout).map_err(|_| {
+            Error::new(
+                "invalid",
+                "git.integrate timeout must be a positive whole-millisecond duration",
+            )
+        })?;
+        super::git_integrate_timeout_ms(Some(timeout))?;
+    }
+    Ok(())
+}
 fn validate_git_publish_definition(definition: &GitPublishDefinitionArgs) -> Result<(), Error> {
     definition.validate()?;
     if let Some(timeout) = &definition.timeout {
@@ -1302,6 +1344,17 @@ fn submit_git_fetch_command(definition: &GitFetchDefinitionArgs) -> Result<Submi
     Ok(command)
 }
 
+fn submit_git_integrate_command(
+    definition: &GitIntegrateDefinitionArgs,
+) -> Result<SubmitCommand, Error> {
+    validate_git_integrate_definition(definition)?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "git.integrate arguments cannot be encoded"))?;
+    let mut command = CommandSubmitRequest::new(String::new(), "git.integrate");
+    command.args = args;
+    command.validate()?;
+    Ok(command)
+}
 fn submit_git_publish_command(
     definition: &GitPublishDefinitionArgs,
     event: &Event,
@@ -1467,6 +1520,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
                                     | "resume"
                                     | "run"
                                     | "git.fetch"
+                                    | "git.integrate"
                                     | "git.publish"
                                     | "notify"
                                     | "emit"
@@ -1692,6 +1746,9 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         ActionDefinition::Run { definition } => return definition.validate(),
         ActionDefinition::GitFetch { definition } => {
             return validate_git_fetch_definition(definition);
+        }
+        ActionDefinition::GitIntegrate { definition } => {
+            return validate_git_integrate_definition(definition);
         }
         ActionDefinition::GitPublish { definition } => {
             return validate_git_publish_definition(definition);
@@ -1927,6 +1984,9 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
     let action = match action {
         ActionDefinition::Run { definition } => return submit_run_command(definition),
         ActionDefinition::GitFetch { definition } => return submit_git_fetch_command(definition),
+        ActionDefinition::GitIntegrate { definition } => {
+            return submit_git_integrate_command(definition);
+        }
         ActionDefinition::GitPublish { .. } => {
             return Err(Error::new(
                 "unsupported",

@@ -5,11 +5,12 @@ pub mod limits;
 pub mod requests;
 
 pub use api::{
-    DEFAULT_GIT_FETCH_TIMEOUT_MS, FrozenGitFetch, FrozenScriptContext, FrozenScriptInterpreter,
-    FrozenScriptRun, GitFetchDefinitionArgs, GitFetchOutcome, RunDefinitionArgs,
-    ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit, ScriptInputContext,
-    ScriptInterpreter, ScriptProcessResult, ScriptRuleContext, ScriptRunApplied,
-    ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
+    DEFAULT_GIT_FETCH_TIMEOUT_MS, DEFAULT_GIT_INTEGRATE_TIMEOUT_MS, FrozenGitFetch,
+    FrozenGitIntegrate, FrozenScriptContext, FrozenScriptInterpreter, FrozenScriptRun,
+    GitFetchDefinitionArgs, GitFetchOutcome, GitIntegrateDefinitionArgs, GitIntegrateOutcome,
+    RunDefinitionArgs, ScriptActionRecord, ScriptCommandContext, ScriptCustody, ScriptDirectExit,
+    ScriptInputContext, ScriptInterpreter, ScriptProcessResult, ScriptRuleContext,
+    ScriptRunApplied, ScriptTimerContext, ScriptTimerInvocation, bound_script_outcome_stderr,
 };
 
 mod agent_start;
@@ -1068,11 +1069,13 @@ pub fn usage_counter(value: Option<&Value>) -> Option<i64> {
 }
 
 /// Session-scoped usage snapshot for one Agent generation. Every member is
-/// nullable: absent native data stays null, never zero. Context
-/// occupancy/capacity (`context_used_tokens`/`context_window_tokens`) and
-/// cumulative session cost are never turn expenditure: they are not
-/// represented in [`TurnUsage`], never fill its counters, and compaction can
-/// reduce occupancy. `cumulative_tokens` carries only input/output/cache
+/// nullable: absent native data stays null, never zero. The per-call context
+/// count (`context_used_tokens`), optional capacity (`context_window_tokens`)
+/// and cumulative session cost are never turn
+/// expenditure: they are not represented in [`TurnUsage`], never fill its
+/// counters, and compaction can reduce context use. A native per-call context
+/// count can be valid without a known capacity; ratio checks require both.
+/// `cumulative_tokens` carries only input/output/cache
 /// counters where the native signal supplies them (never derived totals);
 /// `cumulative_cost.amount` is the verbatim native amount with `unit` the
 /// verbatim native unit (for example `usd_estimate` for an estimated USD
@@ -1204,10 +1207,17 @@ impl SessionUsage {
     }
 
     pub fn retain_valid_context(&mut self) {
-        if self.context_tokens().is_none() {
+        if self.context_used_tokens.is_some_and(|used| used < 0) {
             self.context_used_tokens = None;
         }
-        self.context_window_tokens = self.context_window_tokens.filter(|window| *window > 0);
+        if let Some(window) = self.context_window_tokens {
+            if window <= 0 {
+                self.context_window_tokens = None;
+                self.context_used_tokens = None;
+            } else if self.context_used_tokens.is_some_and(|used| used > window) {
+                self.context_used_tokens = None;
+            }
+        }
     }
 
     pub fn normalized(mut self, harness: &str) -> Self {

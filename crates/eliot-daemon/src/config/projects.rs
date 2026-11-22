@@ -465,6 +465,7 @@ pub(super) fn project_registrations_in(
                             | "stop"
                             | "send"
                             | "git.fetch"
+                            | "git.integrate"
                             | "git.publish"
                             | "steer"
                             | "interrupt"

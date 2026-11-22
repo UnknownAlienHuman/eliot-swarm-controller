@@ -269,6 +269,66 @@ pub struct SessionFacts {
     pub context_capacity_supplied: usize,
 }
 
+/// Bounded token aggregates for one Agent role. Per-counter sample counts
+/// make missing retained usage visible; context is averaged only over facts
+/// with valid observed occupancy.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageRoleTotals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    pub input_samples: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    pub output_samples: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_context_tokens: Option<i64>,
+    pub context_observations: usize,
+    pub context_samples: usize,
+    pub context_missing: usize,
+}
+
+/// Role usage for the authorized scope. Each observation is attributed at its
+/// own timestamp.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageRoleSummary {
+    pub managers: UsageRoleTotals,
+    pub executors: UsageRoleTotals,
+}
+
+impl UsageRoleTotals {
+    fn valid_for(&self, max_turn_samples: usize) -> bool {
+        self.input_samples <= max_turn_samples
+            && self.output_samples <= max_turn_samples
+            && self.context_samples.checked_add(self.context_missing)
+                == Some(self.context_observations)
+            && self.input_tokens.is_some() == (self.input_samples > 0)
+            && self.output_tokens.is_some() == (self.output_samples > 0)
+            && self.average_context_tokens.is_some() == (self.context_samples > 0)
+            && self.input_tokens.is_none_or(|tokens| tokens >= 0)
+            && self.output_tokens.is_none_or(|tokens| tokens >= 0)
+            && self.average_context_tokens.is_none_or(|tokens| tokens >= 0)
+    }
+}
+
+impl UsageRoleSummary {
+    fn valid_for(&self, max_turn_samples: usize) -> bool {
+        self.managers.valid_for(max_turn_samples)
+            && self.executors.valid_for(max_turn_samples)
+            && self
+                .managers
+                .input_samples
+                .saturating_add(self.executors.input_samples)
+                <= max_turn_samples
+            && self
+                .managers
+                .output_samples
+                .saturating_add(self.executors.output_samples)
+                <= max_turn_samples
+    }
+}
+
 /// Bounded usage totals with explicit coverage. No partial sum presents as
 /// complete: turn scopes stay separate, session subtotals carry their
 /// missing counts, and `truncated`/`history_complete` say what was left out.
@@ -286,6 +346,8 @@ pub struct UsageSummaryResponse {
     pub pruned_through: i64,
     pub turns: TurnExpenditure,
     pub sessions: SessionFacts,
+    #[serde(default)]
+    pub by_role: UsageRoleSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub first_calls: Vec<FirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -305,6 +367,9 @@ impl UsageSummaryResponse {
             return Err(invalid_response());
         }
         if self.pruned_through < 0 {
+            return Err(invalid_response());
+        }
+        if !self.by_role.valid_for(self.turns.turns_counted) {
             return Err(invalid_response());
         }
         if self.generations_included < self.sessions.snapshots {

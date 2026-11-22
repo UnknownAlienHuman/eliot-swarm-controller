@@ -9,10 +9,15 @@
 //! cumulative for the same source (a new session counts from zero, an advance
 //! adds its delta, and a same-session correction retracts the over-count by
 //! moving the baseline down), and cost sums only within one verbatim unit,
-//! never converted. Scope
-//! expansion reuses the hierarchy fanout bound and reports truncation; the
+//! never converted. Role context averages use retained session.usage events
+//! in the authorized generation scope. Scope expansion reuses the hierarchy
+//! fanout bound and reports truncation; the
 //! retained-event watermark names the retention floor instead of implying
 //! full totals.
+
+mod role;
+
+pub(crate) use role::{RoleUsage, manager_at_sql};
 
 use super::*;
 use super::{hierarchy, retention};
@@ -259,7 +264,7 @@ impl Store {
     }
 
     /// Summarize retained usage for already-authorized (agent, generation)
-    /// pairs. Runs under the caller's Store lock, so the turn and session
+    /// pairs. Runs under the caller's Store lock, so turn, event and session
     /// reads see one consistent view; every query rides an existing index.
     pub fn summarize_usage(
         &self,
@@ -271,13 +276,16 @@ impl Store {
         let pruned_through = retention::coverage_pruned_through(&self.connection)?;
         let history_complete = pruned_through == 0;
         let history_reason = if history_complete {
-            "no event history pruned; totals cover all retained terminal turns".to_owned()
+            "no event history pruned; totals cover retained terminal turns and session.usage observations"
+                .to_owned()
         } else {
             format!(
-                "event history pruned through seq {pruned_through}; totals cover retained terminal turns only"
+                "event history pruned through seq {pruned_through}; turn totals cover retained terminal turns and context averages cover retained session.usage observations only"
             )
         };
         let wanted: std::collections::HashSet<(i64, i64)> = pairs.iter().copied().collect();
+        let agent_ids: BTreeSet<i64> = wanted.iter().map(|(agent, _)| *agent).collect();
+        let mut role_usage = RoleUsage::default();
         let mut turns_counted = 0_usize;
         let mut turns_without_usage = 0_usize;
         let mut turns_unknown_excluded = 0_usize;
@@ -288,10 +296,8 @@ impl Store {
         let mut first_calls = BTreeMap::new();
         let mut first_calls_truncated = false;
         let mut observed_native_agents = 0i64;
-        if !wanted.is_empty() {
-            let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
-            let nums: Vec<i64> = nums.into_iter().collect();
-            let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        if !agent_ids.is_empty() {
+            let placeholders = agent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             observed_native_agents = self
                 .connection
                 .query_row(
@@ -299,19 +305,21 @@ impl Store {
                         "SELECT COUNT(*) FROM agents
                           WHERE id IN ({placeholders}) AND origin = 'native' AND observe_only = 1"
                     ),
-                    params_from_iter(nums.iter()),
+                    params_from_iter(agent_ids.iter()),
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
+            let completed = "COALESCE(t.completed_at, t.started_at, 0)";
+            let manager = manager_at_sql("t.agent", completed);
             let sql = format!(
                 "SELECT t.agent, t.generation, t.state, t.usage, a.harness, t.turn_id,
-                        COALESCE(t.completed_at, t.started_at, 0)
+                        {completed}, {manager}
                  FROM turns t JOIN agents a ON a.id = t.agent
                  WHERE t.agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
-                .query_map(params_from_iter(nums.iter()), |row| {
+                .query_map(params_from_iter(agent_ids.iter()), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
@@ -320,11 +328,12 @@ impl Store {
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, state, usage, harness, turn_id, settled_at) =
+                let (agent, generation, state, usage, harness, turn_id, settled_at, manager) =
                     row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
@@ -347,6 +356,7 @@ impl Store {
                     continue;
                 };
                 let usage = decode_turn_usage(&usage, &harness)?;
+                role_usage.observe_turn(manager, &usage)?;
                 if let Some(input_tokens) = usage.first_call_input_tokens {
                     first_calls.insert((settled_at, agent, generation, turn_id), input_tokens);
                     if first_calls.len() > MAX_FIRST_CALL_TURNS {
@@ -377,8 +387,10 @@ impl Store {
                 turns_missing: counter_missing(accum.counted, &accum.supplied),
             })
             .collect();
+        self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;
         let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
+        let by_role = role_usage.finish();
         Ok(UsageSummaryResponse {
             scope,
             agents_included,
@@ -397,6 +409,7 @@ impl Store {
                 by_scope,
             },
             sessions,
+            by_role,
             first_calls: first_calls
                 .into_iter()
                 .rev()
@@ -490,6 +503,53 @@ fn normalize_baseline_source(source: Option<&str>) -> String {
 }
 
 impl Store {
+    fn accumulate_usage_context(
+        &self,
+        wanted: &std::collections::HashSet<(i64, i64)>,
+        agents: &BTreeSet<i64>,
+        role_usage: &mut RoleUsage,
+    ) -> Result<()> {
+        if agents.is_empty() {
+            return Ok(());
+        }
+        let placeholders = agents.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let manager = manager_at_sql("e.agent", "e.ts");
+        let sql = format!(
+            "SELECT e.agent, e.generation, e.data, {manager}
+             FROM events e
+             WHERE e.kind = 'session.usage' AND e.agent IN ({placeholders})
+             ORDER BY e.seq"
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map(params_from_iter(agents.iter()), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        for row in rows {
+            let (agent, generation, data, manager) = row.map_err(sql_error)?;
+            if !wanted.contains(&(agent, generation)) {
+                continue;
+            }
+            let event: serde_json::Value = serde_json::from_str(&data)
+                .map_err(|_| Error::new("internal", "retained session usage event is malformed"))?;
+            let mut usage: SessionUsage =
+                serde_json::from_value(event.get("usage").cloned().ok_or_else(|| {
+                    Error::new("internal", "retained session usage event has no usage")
+                })?)
+                .map_err(|_| Error::new("internal", "retained session usage data is malformed"))?;
+            usage.validate()?;
+            usage.retain_valid_context();
+            role_usage.observe_context(manager, usage.context_used_tokens);
+        }
+        Ok(())
+    }
+
     fn summarize_sessions(
         &self,
         wanted: &std::collections::HashSet<(i64, i64)>,

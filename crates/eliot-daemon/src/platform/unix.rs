@@ -293,11 +293,11 @@ pub(crate) fn current_process_birth() -> Result<String> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ProcessGroupIdentity {
     #[cfg(target_os = "linux")]
-    pid: u32,
+    pub(super) pid: u32,
     #[cfg(target_os = "linux")]
     pgid: i32,
     #[cfg(target_os = "linux")]
-    start_ticks: u64,
+    pub(super) start_ticks: u64,
 }
 
 #[cfg(target_os = "linux")]

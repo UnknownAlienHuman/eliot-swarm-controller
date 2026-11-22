@@ -185,6 +185,28 @@ permissions = "workspace-write"
 pass_env = ["CODEX_HOME"]
 ```
 
+A profile may set an absolute context ceiling in tokens. The field is omitted by
+default, so it adds no automatic session action until configured:
+
+```toml
+[profiles.manager-codex]
+harness = "codex"
+context_ceiling_tokens = 150000
+```
+
+`context_ceiling_tokens` must be a positive integer. The daemon compares it with the
+latest valid `session.usage.context_used_tokens` sample for that Agent generation;
+it does not use cumulative input tokens or a fraction of the model window. Profile
+resolution freezes the ceiling in the generation's `profile_snapshot`, so a config
+edit affects a later generation. At the next idle boundary, the daemon compacts when
+the harness advertises native compaction. Otherwise it uses the same-profile safe
+session switch and A6 handoff brief when the source has a retained successful task.
+The replacement must retain the source generation's authority after normal launch
+profile preparation. The brief alone does not trigger another transfer.
+The `session_growth.switch` opt-in applies to legacy ratio/file-size warnings; it does
+not gate a configured context ceiling. The existing
+`daemon.attention.session_growth.enabled` setting still gates automatic reactions.
+
 ## Launch instruction delivery
 
 Every new launch records a bounded inventory of instruction files from the actual
@@ -349,9 +371,10 @@ widen an already-running manager. Naming a different harness is an explicit Owne
 authority grant: the child carries that profile's freshly frozen harness, model,
 permissions, MCP policy and credential references/selector bindings. Parent policy
 names are never reinterpreted on the child's harness, and parent credential or
-native-store bindings are never copied across harnesses. Same-harness children keep
-the existing model/effort-only confinement and inherit captured credential bindings
-verbatim. Control remains equal or narrower on every harness; workspace and project
+native-store bindings are never copied across harnesses. An approved same-harness
+profile can set its model, effort, and daemon context ceiling. Same-harness children
+inherit captured credential bindings verbatim. Control remains equal or narrower on
+every harness; workspace and project
 remain inherited. A cross-harness child retains its own capacity scopes and every
 non-profile scope of the parent with the same bounds; conflicting bounds reject.
 The parent's own profile scope is replaced by the child's. See the launch authority
@@ -707,10 +730,12 @@ switch = false
 ```
 
 `no_progress.interrupt` and `session_growth.switch` default to `false`. Set
-either to `true` to opt into that additional operation. Reading settings emits
-these defaults while retaining any configured per-kind threshold; when a
-per-kind threshold is omitted, the legacy `attention_suspicion_secs` value
-continues to supply it.
+either to `true` to opt into that additional operation. `session_growth.switch`
+controls the fallback for legacy ratio/file-size warnings; a configured profile
+context ceiling uses its safe A6 transfer when native compaction is unavailable.
+Reading settings emits these defaults while retaining any configured per-kind
+threshold; when a per-kind threshold is omitted, the legacy
+`attention_suspicion_secs` value continues to supply it.
 
 Time windows must be positive integers whose millisecond value fits in `i64`.
 An older `daemon.attention_suspicion_secs` supplies the default for omitted
@@ -740,7 +765,8 @@ session_file_bytes = 67108864
 A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
 heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s CPU,
 1 GiB RSS). Session growth warns at 0.8 context occupancy or a 64 MiB native session
-file where the harness exposes a documented size source. The
+file where the harness exposes a documented size source. A profile's optional
+`context_ceiling_tokens` is an independent absolute per-call context limit. The
 [session growth reaction](monitoring.md#automatic-reactions) uses a quiescent
 session boundary.
 `swarm doctor` compares live installed harness versions and contract markers against

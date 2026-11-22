@@ -672,7 +672,7 @@ fn effect_context(
         .filter(|a| !a.chat)
         .map(|a| a.project.as_str());
     let rule_project = principal.strip_prefix("project:");
-    let repository = (verb == "git.fetch")
+    let repository = matches!(verb, "git.fetch" | "git.integrate")
         .then(|| args.get("repository")?.as_str())
         .flatten();
     for project in [target_project, caller_project, rule_project, repository]

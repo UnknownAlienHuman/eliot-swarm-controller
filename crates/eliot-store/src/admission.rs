@@ -57,6 +57,10 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
         serde_json::from_value::<core::api::FrozenGitFetch>(request.args.clone())
             .map_err(|_| Error::new("invalid", "git.fetch args must be a frozen intent"))?
             .binding_args()?
+    } else if request.verb == "git.integrate" {
+        serde_json::from_value::<core::api::FrozenGitIntegrate>(request.args.clone())
+            .map_err(|_| Error::new("invalid", "git.integrate args must be a frozen intent"))?
+            .binding_args()?
     } else {
         request.args.clone()
     };
@@ -676,6 +680,28 @@ fn admit_git_fetch_tx(
     admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
+/// Admit one targetless local branch integration with frozen ref and caller bindings.
+fn admit_git_integrate_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    preparation: &Option<WorkspacePreparationInput>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Option<String>> {
+    if request.selector.is_some() {
+        return Err(Error::new("invalid", "git.integrate cannot use a selector"));
+    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "git.integrate is a targetless command without Agent command bindings",
+    )?;
+    let frozen = projects::decode_frozen_git_integrate(&request.args)?;
+    projects::validate_git_integrate_intent_tx(tx, principal, &frozen)?;
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
+}
 /// Admit one event-triggered targetless project publication with its frozen
 /// passing-check snapshot and Owner registration binding.
 fn admit_git_publish_tx(
@@ -2037,6 +2063,15 @@ fn submit_tx_mode(
             &mut events,
         )?,
         "git.fetch" => admit_git_fetch_tx(
+            tx,
+            principal,
+            &request,
+            &payload_digest,
+            &preparation,
+            now,
+            &mut events,
+        )?,
+        "git.integrate" => admit_git_integrate_tx(
             tx,
             principal,
             &request,

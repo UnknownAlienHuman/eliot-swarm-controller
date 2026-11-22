@@ -1,3 +1,4 @@
+use crate::usage::manager_at_sql;
 use eliot_core::api::{
     AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyNotes, AutonomyRow,
     AutonomySteer, AutonomyWaits, SWARM_MAIL_SENDER,
@@ -266,8 +267,12 @@ fn read_executor_swarm(
     since: i64,
     until: i64,
 ) -> eliot_core::Result<AutonomyRow<AutonomyExecutorSwarm>> {
+    let manager = manager_at_sql(
+        "observation.agent",
+        "COALESCE(t.completed_at, observation.ts)",
+    );
     let mut statement = tx
-        .prepare(concat!(
+        .prepare(&format!(concat!(
             "WITH
              turn_probe AS (
                  SELECT agent, generation, json_extract(data, '$.turn_id') AS turn_id, ts
@@ -304,11 +309,7 @@ fn read_executor_swarm(
                  FROM cohort observation
                  LEFT JOIN turns t ON t.agent = observation.agent AND t.generation = observation.generation
                                   AND t.turn_id = observation.turn_id
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM agents AS child INDEXED BY autonomy_child_creation
-                     WHERE child.parent = observation.agent
-                       AND child.created_at <= COALESCE(t.completed_at, observation.ts)
-                 )
+                 WHERE NOT {manager}
                  GROUP BY observation.agent
              ),
              profile_groups AS (
@@ -333,7 +334,7 @@ fn read_executor_swarm(
              FROM profile_meta
              LEFT JOIN profile_probe AS p ON 1 = 1
              ORDER BY p.profile",
-        ))
+        ), manager = manager))
         .map_err(crate::sql_error)?;
     let rows = statement
         .query_map(

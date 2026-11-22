@@ -423,7 +423,7 @@ impl GitProbe {
                     "--null",
                     "--name-only",
                     "--get-regexp",
-                    "^(filter\\..*|alias\\..*)$",
+                    "^(filter\\..*|alias\\..*|merge\\..*\\.driver)$",
                 ],
                 &[],
                 &[],
@@ -439,13 +439,16 @@ impl GitProbe {
         for key in nul_records(&output.stdout)? {
             if key.starts_with("alias.") {
                 overrides.insert(key.to_owned(), String::new());
+            } else if key.starts_with("merge.") && key.ends_with(".driver") {
+                // Repository attributes can name arbitrary configured merge
+                // drivers; blank their executable command before local merges.
+                overrides.insert(key.to_owned(), String::new());
             } else if let Some((prefix, _)) = key.rsplit_once('.')
                 && prefix.starts_with("filter.")
             {
                 filters.insert(prefix.to_owned());
             }
-        }
-        // Git 2.55 convert.c apply_filter explicitly requires a nonempty command
+        } // Git 2.55 convert.c apply_filter explicitly requires a nonempty command
         // before starting either a single-file or long-running filter. All three
         // command fields must be blank; process takes precedence over clean/smudge.
         for filter in filters {
@@ -1126,12 +1129,9 @@ impl GitProbe {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::new("invalid", "Git effect timeout is out of range"))?;
-        let overrides = self.safe_overrides(root, deadline).await?;
-        if Instant::now() >= deadline {
-            return Err(unavailable("Git effect preparation deadline elapsed"));
-        }
-        let command =
-            self.build_command_with_index(root, args, &overrides, None, Some(index_file))?;
+        let command = self
+            .prepare_workspace_effect_with_index(root, args, index_file, deadline)
+            .await?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(unavailable("Git effect preparation deadline elapsed"));
@@ -1144,6 +1144,20 @@ impl GitProbe {
             cancellation,
         )
         .await)
+    }
+
+    pub(crate) async fn prepare_workspace_effect_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        deadline: Instant,
+    ) -> Result<Command> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("Git effect preparation deadline elapsed"));
+        }
+        self.build_command_with_index(root, args, &overrides, None, Some(index_file))
     }
 
     /// Read from the captured Git repository binding, even if the checkout's

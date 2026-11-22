@@ -857,7 +857,11 @@ impl Job {
         })
     }
 
-    pub(crate) fn assign_then_resume(&self, process: HANDLE) -> Result<()> {
+    pub(crate) fn assign_then_resume(
+        &self,
+        process: HANDLE,
+        before_resume: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
         self.family_empty_confirmed.store(false, Ordering::Release);
         // The process was created with CREATE_SUSPENDED, so assignment occurs
         // before any child instruction can execute.
@@ -870,6 +874,10 @@ impl Job {
             return Err(io_error("assign suspended process to Job Object", error));
         }
 
+        if let Err(error) = before_resume() {
+            let _ = self.terminate();
+            return Err(error);
+        }
         // Tokio exposes the process handle and async stdio, but not the primary
         // thread handle required by ResumeThread. This narrow NT call resumes
         // only after the exact Job membership has been established.

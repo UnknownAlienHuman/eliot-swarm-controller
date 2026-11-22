@@ -26,6 +26,19 @@ pub(crate) fn git_fetch_timeout_ms(timeout: Option<&str>) -> Result<i64> {
     }
 }
 
+pub(crate) fn git_integrate_timeout_ms(timeout: Option<&str>) -> Result<i64> {
+    let value = match timeout {
+        Some(timeout) => schedule::parse_positive_duration_ms(timeout)?,
+        None => eliot_core::api::DEFAULT_GIT_INTEGRATE_TIMEOUT_MS,
+    };
+    if !(1_000..=eliot_core::api::DEFAULT_GIT_INTEGRATE_TIMEOUT_MS).contains(&value) {
+        return Err(Error::new(
+            "invalid",
+            "git.integrate timeout must be between 1000 and 600000 ms",
+        ));
+    }
+    Ok(value)
+}
 pub(crate) fn git_publish_timeout_ms(timeout: Option<&str>) -> Result<i64> {
     match timeout {
         Some(timeout) => schedule::parse_positive_duration_ms(timeout),
@@ -288,8 +301,14 @@ pub(crate) async fn initialize_project_rules(
             ));
         };
         let project_id = registration.id.clone();
-        let initialized =
-            initialize_project_namespace(router, data_root, policy, registration, view).await;
+        let initialized = Box::pin(initialize_project_namespace(
+            router,
+            data_root,
+            policy,
+            registration,
+            view,
+        ))
+        .await;
         match initialized {
             Ok(namespace) => namespaces.push(namespace),
             Err(error) => {

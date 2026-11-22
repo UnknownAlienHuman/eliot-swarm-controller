@@ -1390,6 +1390,17 @@ implemented bounded server wait over a frozen child command/turn set. Single-tar
 server-side wait semantics further below are retained for a future API layer, not part
 of the current request shape.
 
+Submit the targetless `git.integrate` verb through `command.submit`. Its
+[`GitIntegrateDefinitionArgs`](../../crates/eliot-core/src/api/git_integrate.rs)
+names a registered repository, a base branch, and the ordered local branches to combine.
+The daemon merges the pinned commits in its own workspace and runs the project's
+configured check there. Read the checked merge, conflict paths, or a bounded check failure
+through `command.get`. If the combined check fails, the daemon checks each input against
+the same base and reports branches that fail individually. An explicit request can
+fast-forward a permitted local branch that no worktree has checked out. Integration leaves
+the manager's working tree and index intact and has no remote effect. The same operation
+is available to [authorized automation rules](automation.md#git-actions).
+
 Generation-changing dispatch follows [core](core.md#generation-fence): advance and
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
 revokes the token even if degraded Unix custody reports possible escaped descendants.
@@ -1494,8 +1505,9 @@ instead selects ordered candidates intersected with the parent's frozen allow-li
 `workspace` defaults to the parent's workspace, including for CLI child launches.
 The child keeps the parent's recorded project ID. An explicit different workspace
 rejects, so a child never escapes the parent's workspace. Same-harness children
-retain model/effort-only confinement and inherit captured credential bindings
-verbatim. An allow-listed different harness is an explicit Owner grant of that
+inherit native authority and captured credential bindings verbatim. An approved
+same-harness profile can set its model, effort, and daemon context ceiling.
+An allow-listed different harness is an explicit Owner grant of that
 profile's own native policy and bindings; parent credential/native-store bindings
 are never copied across harnesses. Capacity scopes keep every non-profile scope
 of the parent with the same bounds alongside the child's own scopes; conflicting
@@ -1636,6 +1648,34 @@ calls have no local turn and are omitted. The list covers the most recent
 swarm usage <agent> and swarm usage --agent <agent> for the same Agent scope;
 project and root scopes retain their flags. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
+
+`by_role` groups completed turns in the authorized usage scope using the
+same role attribution as `swarm autonomy`. A turn counts as manager
+usage when a retained child of that Agent existed by its completion.
+Archived children and children outside the requested scope can establish
+the role. Only authorized turn usage contributes to the totals.
+
+The role rows report normalized input (uncached input plus cached input once),
+output, and separate sample counts. `input_samples` and `output_samples` count
+completed-turn usage records that supplied those counters. Normalized uncached
+input includes cache writes once; cache writes are not added again as a
+separate counter.
+`average_context_tokens` averages observed `context_used_tokens` values from
+retained `session.usage` events for the authorized Agent generations. Each
+event is one context observation and uses the same role predicate at its
+journal timestamp. `context_observations`,
+`context_samples`, and `context_missing` report total observations,
+valid occupancy samples, and observations without valid occupancy; missing
+values are excluded from the mean, which is rounded down to a whole token.
+Later retained observations are included.
+Adapters that emit no `session.usage` event or omit context occupancy provide no
+sample, so the mean describes observed snapshots rather than every possible
+model call. Event pruning is reflected by `history_complete` and its reason;
+that flag does not measure adapter sampling coverage.
+
+The role aggregates use all retained terminal-turn usage records and
+`session.usage` events in scope, independent of the bounded `first_calls`
+display list.
 
 `first_calls` reports known first-call input for exact retained Agent generations
 and turns within that same usage scope, newest completion first.
@@ -2824,6 +2864,7 @@ swarm heavy [A] [--generation N] [--window-secs N]
 swarm models [A] [--harness H] [--profile P] [--workspace DIR] [--query Q] [--after CURSOR] [--limit N]
 swarm processes A [--scope agent|workspace] [--generation N] [--after CURSOR] [--limit N]
 swarm stats A [--generation N]
+swarm git integrate --project P --base BRANCH [--fast-forward-to BRANCH] [--timeout DURATION] [--wait --timeout-seconds N] BRANCH...
 swarm git-status A [--generation N]
 swarm patch-digest A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]

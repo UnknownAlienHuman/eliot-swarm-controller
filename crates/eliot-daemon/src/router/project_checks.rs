@@ -842,7 +842,7 @@ async fn load_project_work(
     }))
 }
 
-enum CheckOutcome {
+pub(crate) enum CheckOutcome {
     Passed,
     Failed { exit_code: i32, output: String },
     Unknown(String),
@@ -855,22 +855,41 @@ async fn run_argv(
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
 ) -> Result<CheckOutcome> {
+    run_argv_with_index(argv, workspace, deadline_ms, policy, cancellation, None).await
+}
+
+pub(crate) async fn run_argv_with_index(
+    argv: &[String],
+    workspace: &str,
+    deadline_ms: i64,
+    policy: Arc<SecretPolicy>,
+    cancellation: watch::Receiver<bool>,
+    private: Option<(&Path, crate::git_integration::IntegrationLease)>,
+) -> Result<CheckOutcome> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| Error::new("source_integrity", "project command argv is empty"))?;
     let mut command = local_process_command(program)?;
     command.args(args).current_dir(workspace);
-    let outcome = run_owned_process(
-        command,
-        Vec::new(),
-        Duration::from_millis(deadline_ms as u64),
-        policy.clone(),
-        cancellation,
-    )
-    .await;
+    let timeout = Duration::from_millis(deadline_ms as u64);
+    let outcome = if let Some((index_file, lease)) = private {
+        command.env(
+            "GIT_INDEX_FILE",
+            crate::git_monitor::git_path_argument(index_file)?,
+        );
+        crate::scripts::process::run_integration_process(
+            command,
+            timeout,
+            policy.clone(),
+            cancellation,
+            lease,
+        )
+        .await
+    } else {
+        run_owned_process(command, Vec::new(), timeout, policy.clone(), cancellation).await
+    };
     classify_outcome(outcome, &policy)
 }
-
 fn classify_outcome(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<CheckOutcome> {
     Ok(match outcome {
         ProcessOutcome::NotSpawned(error) | ProcessOutcome::ProgramUnrunnable(error) => {

@@ -527,6 +527,7 @@ impl Router {
                 | "compact"
                 | "run"
                 | "git.fetch"
+                | "git.integrate"
                 | "notify"
                 | "emit"
                 | "mail.send"
@@ -535,7 +536,7 @@ impl Router {
         {
             return Err(Error::new(
                 "invalid",
-                "timer firing must contain one prepared stop, send, launch, resume, Run, mail.send, var.set, or local event command",
+                "timer firing requires one supported prepared action",
             ));
         }
         if action.verb == "run" {
@@ -640,7 +641,7 @@ impl Router {
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         if matches!(
             prepared.request.verb.as_str(),
-            "resume" | "git.fetch" | "git.publish"
+            "resume" | "git.fetch" | "git.integrate" | "git.publish"
         ) && let Some(admission) = self
             .replay_rule_event_action(principal, state, revision, event_seq)
             .await?
@@ -704,6 +705,7 @@ impl Router {
         } else if request.verb != "launch"
             && request.verb != "resume"
             && request.verb != "git.fetch"
+            && request.verb != "git.integrate"
             && request.verb != "git.publish"
             && !matches!(
                 request.verb.as_str(),
@@ -725,7 +727,7 @@ impl Router {
         {
             return Err(Error::new(
                 "invalid",
-                "rule firing must contain a prepared stop, send, launch, resume, steer, interrupt, reply, Run, inject, mail.send, var.set, or local event action",
+                "rule firing requires a supported prepared action",
             ));
         }
         if request.verb == "git.publish" {
@@ -761,7 +763,7 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let retained_resume = if matches!(
                 request.verb.as_str(),
-                "resume" | "git.fetch" | "git.publish"
+                "resume" | "git.fetch" | "git.integrate" | "git.publish"
             ) {
                 store.replay_rule_event_action(principal, state, revision, event_seq)?
             } else {
@@ -775,7 +777,13 @@ impl Router {
                 }
                 let replay_first_action = matches!(
                     request.verb.as_str(),
-                    "launch" | "approve" | "deny" | "answer" | "git.fetch" | "git.publish"
+                    "launch"
+                        | "approve"
+                        | "deny"
+                        | "answer"
+                        | "git.fetch"
+                        | "git.integrate"
+                        | "git.publish"
                 );
                 // Store resolves retained launch/reply parents before current gates.
                 if !replay_first_action && let Some(expected) = project {
