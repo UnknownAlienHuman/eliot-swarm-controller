@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
@@ -43,6 +46,15 @@ struct Keys {
     valid_until: Instant,
     retry_after: Instant,
 }
+
+struct RefreshInProgress<'a>(&'a AtomicBool);
+
+impl Drop for RefreshInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct Session {
     identity: RemoteIdentity,
     connection_id: String,
@@ -108,6 +120,7 @@ pub(super) struct OriginAuth {
     client: reqwest::Client,
     keys: Mutex<Keys>,
     key_refresh: Mutex<()>,
+    key_refresh_in_progress: AtomicBool,
     sessions: Mutex<HashMap<String, Session>>,
     slots: Arc<Semaphore>,
     sdk_sessions: Arc<LocalSessionManager>,
@@ -213,6 +226,7 @@ impl OriginAuth {
             audience,
             client,
             key_refresh: Mutex::new(()),
+            key_refresh_in_progress: AtomicBool::new(false),
             keys: Mutex::new(Keys {
                 set: JwkSet { keys: Vec::new() },
                 valid_until: Instant::now(),
@@ -279,11 +293,19 @@ impl OriginAuth {
     }
 
     async fn fetch_and_cache_keys(&self) -> Result<(), StatusCode> {
+        let _refresh_in_progress = RefreshInProgress(&self.key_refresh_in_progress);
         {
             let mut keys = self.keys.lock().await;
             keys.retry_after = Instant::now() + REFRESH_BACKOFF;
+            self.key_refresh_in_progress.store(true, Ordering::Release);
         }
-        let set = self.fetch_keys().await?;
+        let set = match self.fetch_keys().await {
+            Ok(set) => set,
+            Err(error) => {
+                self.key_refresh_in_progress.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
         let mut keys = self.keys.lock().await;
         keys.set = set;
         keys.valid_until = Instant::now() + KEY_LIFETIME;
@@ -313,7 +335,9 @@ impl OriginAuth {
             .ok_or(StatusCode::UNAUTHORIZED)?;
         let key = {
             let keys = self.keys.lock().await;
-            if Instant::now() < keys.valid_until {
+            if Instant::now() < keys.valid_until
+                || self.key_refresh_in_progress.load(Ordering::Acquire)
+            {
                 keys.set.find(&kid).map(Self::decoding_key).transpose()?
             } else {
                 None
