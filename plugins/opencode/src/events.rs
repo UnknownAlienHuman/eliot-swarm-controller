@@ -7,14 +7,15 @@
 //! explicit gap on any loss or unmodelled native behavior. Tool lifecycle
 //! facts map from the installed `session.tool.*` events; the remaining
 //! streaming detail (`text`/`reasoning` deltas, tool input deltas and
-//! progress, steps, usage, ephemeral status) is intentionally folded into
-//! the terminal message readback, never published as its own facts.
+//! progress, steps, usage, ephemeral status) is folded into the terminal
+//! message readback. Its latest complete per-call context count is also
+//! committed as the generation's latest `session.usage` fact.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestrictionKind, Result, SecretPolicy,
-    TurnUsage,
+    SessionUsage, TurnUsage,
     api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
     limits::MAX_TOOL_COMMAND_BYTES,
 };
@@ -2373,6 +2374,26 @@ impl EventProcessor {
         }
         data["outcome"] = json!(outcome);
         data["native_status"] = json!(event_type);
+        if let Some(readback) = readback
+            && let Some(context_used_tokens) = readback.context_used_tokens
+        {
+            let usage = SessionUsage {
+                context_used_tokens: Some(context_used_tokens),
+                source: Some("opencode:assistant_message_tokens".to_owned()),
+                observed_at: None,
+                ..SessionUsage::default()
+            };
+            let native_id = event_id(
+                &terminal.session_id,
+                turn_id,
+                &readback.idle_id,
+                "session.usage",
+                "opencode",
+                "OpenCode",
+            )?;
+            self.commit_event("session.usage", native_id, json!({"usage": usage}))
+                .await?;
+        }
         let native_id = event_id(
             &terminal.session_id,
             turn_id,
@@ -3142,6 +3163,8 @@ fn terminal_turn_data(
 /// with each message's native `content` array order preserved (page
 /// position decides; timestamps never reorder it). Usage sums distinct
 /// assistant messages in that same exact user-to-selected-idle slice.
+/// The newest such message also supplies a per-call context count when input
+/// and both cache counters are complete.
 /// A healthy read with the exact user message and no newer idle proves
 /// running. A missing user message, invalid history or HTTP failure does
 /// not establish either state.
@@ -3247,6 +3270,7 @@ pub(crate) async fn read_turn_messages(
         idle_error,
         final_text,
         usage: main_loop_usage(&usages, idle_position, user_position),
+        context_used_tokens: latest_call_context_tokens(&usages, idle_position, user_position),
     })))
 }
 
@@ -3261,6 +3285,7 @@ pub(crate) struct TerminalReadback {
     pub idle_error: Option<StructuredError>,
     pub final_text: Option<String>,
     usage: Option<TurnUsage>,
+    context_used_tokens: Option<i64>,
 }
 
 /// Project only the newest assistant message in the exact user-to-idle
@@ -3310,6 +3335,25 @@ fn main_loop_usage(
         user_position,
         messages,
     )
+}
+
+/// The newest assistant message in the exact input-to-idle slice supplies one
+/// per-call context count only when input and both cache counters are present.
+fn latest_call_context_tokens(
+    usages: &HashMap<String, (usize, Option<AssistantTokens>)>,
+    idle_position: usize,
+    user_position: usize,
+) -> Option<i64> {
+    let (_, tokens) = usages
+        .values()
+        .filter(|entry| entry.0 > idle_position && entry.0 < user_position)
+        .min_by_key(|entry| entry.0)?;
+    let tokens = tokens.as_ref()?;
+    let cache = tokens.cache.as_ref()?;
+    let input = tokens.input.filter(|value| *value >= 0)?;
+    let cache_read = cache.read.filter(|value| *value >= 0)?;
+    let cache_write = cache.write.filter(|value| *value >= 0)?;
+    input.checked_add(cache_read)?.checked_add(cache_write)
 }
 
 /// One Store claim plus one vendor resolve for a bound hook. The Store

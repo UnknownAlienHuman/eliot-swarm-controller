@@ -911,10 +911,12 @@ names the adapter and native signal, `observed_at` is native epoch
 milliseconds defaulted at the owning boundary). A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
-can never inflate or regress the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
-and capacity for the same model. Shared usage logic reuses an observed window
-when the adapter binds the reading to the same model or native turn. Occupancy is
-available for a positive window with a value between zero and that window.
+can never inflate or regress the readback. `context_used_tokens` carries an actual
+per-call context count and may be retained without a known capacity;
+`context_window_tokens` is optional. Shared usage logic reuses an observed window
+when the adapter binds the reading to the same model or native turn. Ratio-based
+occupancy is available only for a positive window with a value between zero and
+that window; an absolute profile ceiling can compare a valid used count without it.
 `cumulative_tokens` projects input/output/cache counters on the same
 accounting basis as turns, and `cumulative_cost` carries the
 verbatim native amount with its verbatim native unit (for example

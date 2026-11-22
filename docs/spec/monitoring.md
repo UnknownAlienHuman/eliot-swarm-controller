@@ -873,7 +873,7 @@ are per kind under [daemon attention](configuration.md#automatic-attention-setti
 | `no_code_progress` | Ask once with the duration since the last worktree change and the available tool and message counts, then route one attention notice. |
 | Process loss | After exact custody exit and reader drain, reopen the retained idle session without input once. Startup uses the existing promptless restart reconciliation and honors `on_restart`. Unresolved work stays fenced. |
 | Provider refusal | Keep the existing provider hold, opt-in next-preset routing and bounded due probes. If the hold's automatic probe budget is exhausted or a probe stays unresolved, send one Owner notice. |
-| `session.growth` | At an idle boundary, compact through the native operation where supported and route one attention notice. With `switch = true`, an adapter without compact can switch through the existing handoff brief when the source is safe and the completed task is retained. |
+| `session.growth` | At an idle boundary, a configured profile context ceiling compares the latest actual per-call `context_used_tokens` sample with its absolute token limit. Compact when the harness declares it; otherwise use the existing same-profile switch and A6 brief when the source is safe and its task succeeded, even when legacy `switch = false`. Route one attention notice. The claim binds to the generation and usage sample so stale context cannot repeat the action. Without an exceeded profile ceiling, the legacy ratio/file-size reaction remains unchanged and switch fallback stays opt-in. |
 | Repeated command failure | Three matching failures of the same command and output in one turn put one concise fact and question into that turn. |
 | `children_unattended` | Queue one report for the manager. |
 
@@ -1109,15 +1109,19 @@ Three event families capture heavy work, session growth, and vendor drift.
   integration owns any promotion.
 - `session.growth`: one warning per basis (context occupancy at
   `daemon.session_growth_ratio_permille`, native session file size at
-  `daemon.session_file_bytes`). The warning clears when
-  the retained signal drops back under threshold. An absent or out-of-range
-  context observation cannot trigger a context reaction. Suppliers are harness-native
-  only: Codex `thread/tokenUsage/updated` (latest context occupancy against
-  `modelContextWindow` for the same turn or model), Claude stream-json plus the reported
-  model window plus the transcript file size, Muse `session/contextUsage`,
-  Antigravity ACP `usage_update`. OpenCode exposes no session-level signal
-  through its API and the Muse event log exposes no size, so those stay
-  unsupported rather than guessed.
+  `daemon.session_file_bytes`, or a configured profile's absolute
+  `context_ceiling_tokens`). A context ceiling uses the latest actual
+  `context_used_tokens` count and does not require a known window; ratio warnings
+  still require a valid used/window pair. The warning clears when the retained
+  signal drops back under threshold. An absent or invalid context count cannot
+  trigger a context reaction. Suppliers are harness-native only: Codex
+  `thread/tokenUsage/updated` (latest context occupancy against `modelContextWindow`
+  for the same turn or model), Claude stream-json plus the reported model window
+  and transcript file size, Muse `session/contextUsage`, Antigravity ACP
+  `usage_update`, and OpenCode's latest assistant-message input plus complete
+  cache read/write counters from terminal readback. OpenCode has no capacity or
+  session-file-size source, and the Muse event log exposes no size; those signals
+  remain unavailable rather than guessed.
 - `harness.drift`: one event per harness and installed surface while the installed
   version or contract marker differs from `VERIFIED_HARNESSES`
   (`crates/eliot-core/src/observe.rs`). Versions compare normalized per harness

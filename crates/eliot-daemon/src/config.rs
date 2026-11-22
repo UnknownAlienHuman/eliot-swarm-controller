@@ -1305,6 +1305,8 @@ struct ProfileEntry {
     #[serde(default)]
     max_live: Option<u64>,
     #[serde(default)]
+    context_ceiling_tokens: Option<i64>,
+    #[serde(default)]
     cmd: Option<String>,
     #[serde(default)]
     model: Option<String>,
@@ -1506,6 +1508,9 @@ fn resolve_profile_in(config: &FileConfig, source: &str, name: &str) -> core::Re
         )
     })?;
     let mut snapshot = snapshot_from_entry(name, entry.get_ref(), entry.span().start, source)?;
+    if let Some(ceiling) = entry.get_ref().context_ceiling_tokens {
+        snapshot["context_ceiling_tokens"] = json!(ceiling);
+    }
     // Freeze the configured cloud MCP hostname (if any) beside the MCP
     // policy so harness plugins can apply the owner-identity HTTP arm
     // without reading owner config. Snapshots that predate the field read
@@ -1964,6 +1969,16 @@ fn snapshot_from_entry(
     let harness = entry.harness.trim();
     if !core::api::is_supported_harness(harness) {
         return Err(site.error("harness", "unsupported harness", "unsupported"));
+    }
+    if entry
+        .context_ceiling_tokens
+        .is_some_and(|ceiling| ceiling <= 0)
+    {
+        return Err(site.error(
+            "context_ceiling_tokens",
+            "must be a positive token count",
+            "profile_error",
+        ));
     }
     reject_unmapped(
         site,
