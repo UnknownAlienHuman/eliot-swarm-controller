@@ -5705,7 +5705,8 @@ pub fn family_for_kind(kind: &str) -> Result<&'static str> {
         | "turn.model_observed"
         | "turn.notice" => Ok("turn"),
         "message.completed" => Ok("message"),
-        "tool.started" | "tool.completed" | "hook.before_tool" | "hook.after_tool" => Ok("tool"),
+        "tool.started" | "tool.completed" | "tool.file.edited" | "hook.before_tool"
+        | "hook.after_tool" => Ok("tool"),
         "hook.before_model" => Ok("turn"),
         "request.opened" | "request.resolved" | "request.closed" => Ok("request"),
         other => Err(Error::new(

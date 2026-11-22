@@ -1,4 +1,5 @@
 mod hooks;
+pub(crate) use hooks::TOOL_HOOK_TIMEOUT_SECONDS;
 
 use self::hooks::{
     HookToolFacts, approval_summary, hook_callback_response_fits, hook_deadline, hook_tool_facts,
@@ -116,7 +117,7 @@ pub(crate) enum TurnOutcome {
 /// the steer text; `Stale` means the captured turn ended first and the text
 /// was dropped, never leaked into another turn.
 pub(crate) enum SteerOutcome {
-    Applied,
+    Applied(&'static str),
     Rejected(String),
     Unknown(String),
     Stale,
@@ -145,6 +146,7 @@ enum Control {
         command_id: String,
         turn_id: String,
         text: String,
+        hook: HookPoint,
         registered: oneshot::Sender<Result<()>>,
         outcome: oneshot::Sender<SteerOutcome>,
     },
@@ -204,6 +206,7 @@ struct PendingSteer {
     command_id: String,
     turn_id: String,
     text: String,
+    hook: HookPoint,
     outcome: Option<oneshot::Sender<SteerOutcome>>,
 }
 
@@ -411,6 +414,7 @@ struct EventProcessor {
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     pending_steer: Option<PendingSteer>,
+    empty_after_tool_hooks: u64,
     interrupted_turn: Option<String>,
     pending_requests: HashMap<String, PendingNativeRequest>,
     cancelled_hook_requests: HashSet<String>,
@@ -592,13 +596,25 @@ impl EventHandle {
         command_id: String,
         turn_id: String,
         text: String,
+        hook: &str,
     ) -> Result<oneshot::Receiver<SteerOutcome>> {
+        let hook = match hook {
+            "before_tool" => HookPoint::BeforeTool,
+            "after_tool" => HookPoint::AfterTool,
+            _ => {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "Claude requires a supported runtime steer hook",
+                ));
+            }
+        };
         let (outcome_tx, outcome_rx) = oneshot::channel();
         self.actor
             .call(|registered| Control::Steer {
                 command_id,
                 turn_id,
                 text,
+                hook,
                 registered,
                 outcome: outcome_tx,
             })
@@ -827,10 +843,11 @@ async fn dispatch_control(
             command_id,
             turn_id,
             text,
+            hook,
             registered,
             outcome,
         } => {
-            let result = processor.register_steer(command_id, turn_id, text, outcome);
+            let result = processor.register_steer(command_id, turn_id, text, hook, outcome);
             publish(processor, status);
             let _ = registered.send(result);
         }
@@ -956,6 +973,7 @@ impl EventProcessor {
             gap_number: 0,
             pending_turn: None,
             pending_steer: None,
+            empty_after_tool_hooks: 0,
             interrupted_turn: None,
             pending_requests: HashMap::new(),
             cancelled_hook_requests: HashSet::new(),
@@ -1132,6 +1150,7 @@ impl EventProcessor {
         command_id: String,
         turn_id: String,
         text: String,
+        hook: HookPoint,
         outcome: oneshot::Sender<SteerOutcome>,
     ) -> Result<()> {
         if !self.status.ready
@@ -1148,7 +1167,7 @@ impl EventProcessor {
         if self.pending_steer.is_some() {
             return Err(Error::new(
                 "busy",
-                "Claude already has a steer waiting for PreToolUse",
+                "Claude already has a steer waiting for a tool hook",
             ));
         }
         if self.status.active_turn_id.as_deref() != Some(turn_id.as_str()) {
@@ -1182,6 +1201,7 @@ impl EventProcessor {
             command_id,
             turn_id,
             text,
+            hook,
             outcome: Some(outcome),
         });
         Ok(())
@@ -1202,18 +1222,18 @@ impl EventProcessor {
             Self::settle_steer(
                 steer,
                 SteerOutcome::Rejected(
-                    "Claude steer was withdrawn before PreToolUse applied it".to_owned(),
+                    "Claude steer was withdrawn before the selected hook applied it".to_owned(),
                 ),
             );
         }
     }
 
     /// Take the queued steer for the exact turn about to be written.
-    fn take_pending_steer(&mut self, turn_id: &str) -> Option<PendingSteer> {
+    fn take_pending_steer(&mut self, turn_id: &str, hook: HookPoint) -> Option<PendingSteer> {
         if self
             .pending_steer
             .as_ref()
-            .is_some_and(|steer| steer.turn_id == turn_id)
+            .is_some_and(|steer| steer.turn_id == turn_id && steer.hook == hook)
         {
             self.pending_steer.take()
         } else {
@@ -1425,12 +1445,10 @@ impl EventProcessor {
             return Ok(());
         }
         let mut data = json!({});
-        let turn_id = self.status.active_turn_id.clone().or_else(|| {
-            self.pending_turn
-                .as_ref()
-                .map(|pending| pending.turn_id.clone())
-        });
-        if let Some(turn_id) = turn_id {
+        if !self.status.source_unknown
+            && !self.writes_blocked
+            && let Some(turn_id) = self.status.active_turn_id.as_deref()
+        {
             data["turn_id"] = Value::String(turn_id.to_owned());
         }
         self.commit_event("session.context.compacted", native_id, data)
@@ -1446,6 +1464,7 @@ impl EventProcessor {
                 // Until the terminal supplies provenance, even a lifecycle
                 // for a queued input cannot disambiguate this output prefix.
                 self.final_text = None;
+                self.empty_after_tool_hooks = 0;
             }
             _ => {}
         }
@@ -2286,11 +2305,10 @@ impl EventProcessor {
         // Neither FIFO context nor a queued steer for this exact turn: the
         // existing pass path below. A queued steer takes the combined path
         // even when the hook selected no context.
-        let steer_waiting = hook == HookPoint::BeforeTool
-            && self
-                .pending_steer
-                .as_ref()
-                .is_some_and(|steer| steer.turn_id == hook_turn_id);
+        let steer_waiting = self
+            .pending_steer
+            .as_ref()
+            .is_some_and(|steer| steer.turn_id == hook_turn_id && steer.hook == hook);
         if context.is_empty() && !steer_waiting {
             return self
                 .finish_hook_pass(
@@ -2315,11 +2333,7 @@ impl EventProcessor {
         // write that can carry additionalContext. FIFO context comes first,
         // then the steer text; a raw-text or complete-frame overflow rejects
         // the steer and keeps the full FIFO context when its frame fits.
-        let mut steer = if hook == HookPoint::BeforeTool {
-            self.take_pending_steer(&hook_turn_id)
-        } else {
-            None
-        };
+        let mut steer = self.take_pending_steer(&hook_turn_id, hook);
         let mut combined = context_text.clone();
         if let Some(waiting) = steer.as_ref() {
             combined = if combined.trim().is_empty() {
@@ -2461,7 +2475,7 @@ impl EventProcessor {
             }
             self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             if let Some(waiting) = steer.take() {
-                Self::settle_steer(waiting, SteerOutcome::Applied);
+                Self::settle_steer(waiting, SteerOutcome::Applied(hook.native_event_name()));
             }
             return self
                 .commit_empty_hook_event(
@@ -2489,7 +2503,7 @@ impl EventProcessor {
         }
         self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
         if let Some(waiting) = steer.take() {
-            Self::settle_steer(waiting, SteerOutcome::Applied);
+            Self::settle_steer(waiting, SteerOutcome::Applied(hook.native_event_name()));
         }
         let Some(session_id) = self.status.session_id.as_deref() else {
             return Err(Error::new(
@@ -2639,6 +2653,15 @@ impl EventProcessor {
         consumer_id: String,
         tool: &HookToolFacts,
     ) -> Result<()> {
+        let kind = if hook == HookPoint::AfterTool {
+            self.empty_after_tool_hooks = self.empty_after_tool_hooks.saturating_add(1);
+            if !tool.has_edit() {
+                return Ok(());
+            }
+            "tool.file.edited"
+        } else {
+            hook.event_kind()
+        };
         let Some(session_id) = self.status.session_id.as_deref() else {
             return Err(Error::new(
                 "unknown",
@@ -2650,11 +2673,8 @@ impl EventProcessor {
             "consumer_id": consumer_id,
         });
         tool.attach(&mut data);
-        let native_id = format!(
-            "claude:{session_id}:{turn_id}:{}:{consumer_id}",
-            hook.event_kind()
-        );
-        self.commit_event(hook.event_kind(), native_id, data).await
+        let native_id = format!("claude:{session_id}:{turn_id}:{}:{consumer_id}", kind);
+        self.commit_event(kind, native_id, data).await
     }
 
     fn finish_tool_use_hook(&mut self, tool_use_id: &str, hook: HookPoint, consumer_id: &str) {
@@ -3385,6 +3405,10 @@ impl EventProcessor {
             }
         }
         let final_text = self.final_text.take();
+        if self.empty_after_tool_hooks > 0 {
+            data["empty_after_tool_hooks"] =
+                json!(std::mem::take(&mut self.empty_after_tool_hooks));
+        }
         if let Some(text) = final_text {
             // Attach the one final native message; the shared boundary
             // accounts for its event payload size.

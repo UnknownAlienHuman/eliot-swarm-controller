@@ -963,9 +963,10 @@ impl Router {
             return None;
         }
         let mut command = command.clone();
-        if command.verb == "inject" {
+        let claude_steer = command.verb == "steer" && agent.harness == "claude";
+        if command.verb == "inject" || claude_steer {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
-                return Some(Err(Error::new("invalid", "inject requires text")));
+                return Some(Err(Error::new("invalid", "context delivery requires text")));
             };
             if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
                 return Some(Err(Error::new(
@@ -978,6 +979,9 @@ impl Router {
                 Err(error) => return Some(Err(error)),
             };
             command.args["text"] = Value::String(text);
+        }
+        if claude_steer {
+            command.args["steer_hook"] = json!("before_tool");
         }
         let pending = self
             .inner

@@ -77,7 +77,11 @@ impl Store {
                 .hierarchy_limits
                 .max_selector_targets
                 .min(MAX_PROJECT_BROADCAST_AGENTS as i64);
-            let agents = project_broadcast_agents(&tx, &request.project, max_agents)?;
+            let sender = match super::hierarchy::parse_caller(&tx, principal)? {
+                super::hierarchy::Caller::Owner => None,
+                super::hierarchy::Caller::Agent { num, .. } => Some(num),
+            };
+            let agents = project_broadcast_agents(&tx, &request.project, sender, max_agents)?;
             if request
                 .text
                 .len()
@@ -187,6 +191,7 @@ fn authorize_project_broadcast(tx: &Transaction<'_>, principal: &str, project: &
 fn project_broadcast_agents(
     tx: &Transaction<'_>,
     project: &str,
+    sender: Option<i64>,
     max_agents: i64,
 ) -> Result<Vec<Agent>> {
     let ids = {
@@ -196,13 +201,15 @@ fn project_broadcast_agents(
                  WHERE project = ?1 AND archived = 0 AND chat = 0 AND observe_only = 0
                    AND capacity_generation = generation
                    AND state IN ('busy', 'waiting') AND active_turn IS NOT NULL
+                   AND id IS NOT ?3
                  ORDER BY id LIMIT ?2",
             )
             .map_err(super::sql_error)?;
         let rows = statement
-            .query_map(params![project, max_agents.saturating_add(1)], |row| {
-                row.get::<_, i64>(0)
-            })
+            .query_map(
+                params![project, max_agents.saturating_add(1), sender],
+                |row| row.get::<_, i64>(0),
+            )
             .map_err(super::sql_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(super::sql_error)?

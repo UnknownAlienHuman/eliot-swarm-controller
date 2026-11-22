@@ -1,11 +1,14 @@
 //! Durable context-injection queue and exact consumer claims.
 
+mod facts;
 pub(super) mod notes;
+
+use facts::{edit_note_text, edit_path_key, new_note_paths};
 
 use super::*;
 use eliot_core::{
-    ContextItem, ContextOutcome, InjectArgs, InjectPoint, api::harness::MAX_HARNESS_MODEL_ID_BYTES,
-    swarm_note, turn_started_data,
+    ContextEditPath, ContextItem, ContextOutcome, InjectArgs, InjectPoint,
+    api::harness::MAX_HARNESS_MODEL_ID_BYTES, swarm_note, turn_started_data,
 };
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +17,16 @@ const CONTEXT_ITEMS_ARG: &str = "context_items";
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
+enum FactNote<'a> {
+    Text { text: &'a str, id: Option<&'a str> },
+    Edits(&'a [ContextEditPath]),
+}
+
+pub(super) struct FactOrigin<'a> {
+    seq: i64,
+    paths: &'a [ContextEditPath],
+}
+
 type ContextCursor = (i64, i64);
 type ContextPage = (Vec<CommandRecord>, Option<ContextCursor>);
 
@@ -54,7 +67,7 @@ impl Store {
             .connection
             .query_row(
                 "SELECT id FROM commands INDEXED BY commands_target
-             WHERE target = ?1 AND generation <= ?2 AND verb = 'send' AND state = 'applied'
+             WHERE target = ?1 AND generation <= ?2 AND verb = 'send'
                AND link_kind = 'handoff' AND ordinal = 0
              ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 params![parse_agent_id(agent)?, generation],
@@ -64,7 +77,11 @@ impl Store {
             .map_err(sql_error)?;
         id.map(|id| self.get_command(&id))
             .transpose()
-            .map(Option::flatten)
+            .map(|command| {
+                command
+                    .flatten()
+                    .filter(|command| command.state == CommandState::Applied)
+            })
     }
 
     pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
@@ -99,14 +116,17 @@ impl Store {
             .prepare(
                 "SELECT path.value FROM events AS edit INDEXED BY events_agent
              JOIN json_each(CASE
-                WHEN edit.kind = 'hook.after_tool' THEN json_array(json_extract(edit.data, '$.edit_path'))
+                WHEN edit.kind IN ('hook.after_tool', 'tool.file.edited') THEN json_array(CASE
+                  WHEN json_extract(edit.data, '$.edit_path.kind') = 'relative' THEN json_extract(edit.data, '$.edit_path.path')
+                  WHEN json_type(edit.data, '$.edit_path') = 'text' THEN json_extract(edit.data, '$.edit_path')
+                  ELSE NULL END)
                 WHEN json_type(edit.data, '$.changed_paths') = 'array' THEN json_extract(edit.data, '$.changed_paths')
                 ELSE '[]' END) AS path
              WHERE edit.agent = ?1 AND edit.generation = ?2 AND edit.seq < ?3
                AND edit.source = 'stream' AND edit.native_id IS NOT NULL
                AND json_extract(edit.data, '$.redacted') IS NOT 1
                AND json_extract(edit.data, '$.turn_id') = ?4
-               AND (edit.kind = 'hook.after_tool' OR (edit.kind = 'tool.completed'
+               AND (edit.kind IN ('hook.after_tool', 'tool.file.edited') OR (edit.kind = 'tool.completed'
                     AND json_extract(edit.data, '$.tool') = 'fileChange'
                     AND json_extract(edit.data, '$.status') = 'completed'))
                AND path.type = 'text'
@@ -264,7 +284,20 @@ impl Store {
         now: i64,
     ) -> Result<Change<Option<String>>> {
         self.ensure_writer_healthy()?;
-        let result = self.queue_fact_note_inner(event, kind, text, id, now);
+        let result = self.queue_fact_note_inner(event, kind, FactNote::Text { text, id }, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn queue_edit_note(
+        &mut self,
+        event: &Event,
+        kind: &str,
+        paths: &[ContextEditPath],
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        self.ensure_writer_healthy()?;
+        let result = self.queue_fact_note_inner(event, kind, FactNote::Edits(paths), now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -273,8 +306,7 @@ impl Store {
         &mut self,
         event: &Event,
         kind: &str,
-        text: &str,
-        id: Option<&str>,
+        note: FactNote<'_>,
         now: i64,
     ) -> Result<Change<Option<String>>> {
         let empty = Change {
@@ -325,7 +357,22 @@ impl Store {
                 )?;
             }
         }
-        let duplicate: bool = if let Some(id) = id {
+        let (text, id, paths) = match note {
+            FactNote::Text { text, id } => (text.to_owned(), id, Vec::new()),
+            FactNote::Edits(paths) => {
+                let Some(turn) = turn_id else {
+                    return Ok(empty);
+                };
+                let paths = new_note_paths(&tx, agent_num, generation, turn, kind, paths)?;
+                if paths.is_empty() {
+                    return Ok(empty);
+                }
+                (edit_note_text(kind, &paths), None, paths)
+            }
+        };
+        let duplicate: bool = if !paths.is_empty() {
+            false
+        } else if let Some(id) = id {
             tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1)",
                 [id],
@@ -337,8 +384,12 @@ impl Store {
                 "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_target
                  WHERE target = ?1 AND generation = ?2 AND principal = ?3 AND verb = 'inject'
                    AND ((?4 IS NOT NULL AND (turn_id = ?4 OR expected_turn_id = ?4))
-                        OR (turn_id IS NULL AND state IN ('accepted', 'queued', 'dispatched'))))",
-                params![agent_num, generation, principal, turn_id],
+                        OR (turn_id IS NULL AND state IN ('accepted', 'queued', 'dispatched'))))
+                 OR EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                     WHERE agent=?1 AND generation=?2 AND kind='command.accepted'
+                       AND json_extract(data,'$.note_kind')=?5
+                       AND json_extract(data,'$.trigger_seq')=?6)",
+                params![agent_num, generation, principal, turn_id, kind, event.seq],
                 |row| row.get(0),
             )
             .map_err(sql_error)?
@@ -352,7 +403,7 @@ impl Store {
         request.expected_generation = Some(generation);
         request.expected_turn_id = turn_id.map(str::to_owned);
         request.args = json!(InjectArgs {
-            text: text.to_owned(),
+            text,
             point: if turn_id.is_some() {
                 InjectPoint::Soonest
             } else {
@@ -361,7 +412,25 @@ impl Store {
             expires_at_ms: None,
         });
         let digest = admission::command_payload_digest(&request)?;
-        let accepted = admit_tx(&tx, &principal, &request, &digest, now, Some(event.seq))?;
+        let accepted = admit_tx(
+            &tx,
+            &principal,
+            &request,
+            &digest,
+            now,
+            Some(FactOrigin {
+                seq: event.seq,
+                paths: &paths,
+            }),
+        )?;
+        if let Some(turn) = turn_id {
+            for path in &paths {
+                db!(tx.execute(
+                    "INSERT INTO context_noted_paths(agent,generation,kind,path_key,turn_id,note_id) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![agent_num, generation, kind, edit_path_key(path), turn, request.id],
+                ));
+            }
+        }
         let value = (accepted.data["application_point"] == "active_turn").then_some(request.id);
         events.push(accepted);
         commit_transaction(tx, &self.write_faulted)?;
@@ -386,7 +455,7 @@ pub(super) fn admit_tx(
     request: &SubmitCommand,
     payload_digest: &[u8],
     now: i64,
-    fact_seq: Option<i64>,
+    fact: Option<FactOrigin<'_>>,
 ) -> Result<Event> {
     if request.target.is_none()
         || request.selector.is_some()
@@ -500,9 +569,12 @@ pub(super) fn admit_tx(
     });
     let mut data =
         json!({"command_id": request.id, "verb": "inject", "application_point": args.point});
-    if let Some(seq) = fact_seq {
+    if let Some(fact) = fact {
         data["note_kind"] = json!(principal.trim_start_matches("swarm_note:"));
-        data["trigger_seq"] = json!(seq);
+        data["trigger_seq"] = json!(fact.seq);
+        if !fact.paths.is_empty() {
+            data["paths"] = json!(fact.paths);
+        }
     }
     if let Some(outcome) = &initial_outcome {
         data["outcome"] = outcome.clone();

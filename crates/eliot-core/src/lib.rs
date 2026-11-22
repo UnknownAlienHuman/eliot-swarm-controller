@@ -40,8 +40,8 @@ pub use command::{
     workspace_preparation_transition_allowed,
 };
 pub use context::{
-    ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest, InjectArgs, InjectPoint,
-    turn_started_data,
+    ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
+    InjectArgs, InjectPoint, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
@@ -2427,6 +2427,9 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if event.data.get("turn_id").is_some() {
                 require_live_turn(agent, event)?;
             }
+        }
+        "tool.file.edited" => {
+            require_live_turn(agent, event)?;
         }
         "hook.before_model" | "hook.after_tool" => {
             // Receipt authority stays in Store settlement: selection

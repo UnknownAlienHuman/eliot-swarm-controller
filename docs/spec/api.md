@@ -1277,7 +1277,7 @@ delivery, moves and cancellation in the requested window and reports later evide
 that a delivered note's triggering fact cleared. The default window is 24 hours.
 
 `project.broadcast` accepts a registered project id and note text from the Owner or its
-assigned manager. The command captures the working Agents and queues one `soonest`
+assigned manager. The command captures the other working Agents and queues one `soonest`
 insertion per recipient. The response includes the captured generation, turn and
 command id so the sender can read each insertion outcome. Reusing the same mutation id
 with the original input reads back the original recipient set.

@@ -1,5 +1,6 @@
 mod bounded_file;
 pub mod debug;
+pub mod edit_path;
 pub mod event_actor;
 mod file_identity;
 pub mod native_child;

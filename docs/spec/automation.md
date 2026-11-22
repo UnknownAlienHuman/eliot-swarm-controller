@@ -826,7 +826,11 @@ Swarm uses the same insertion path for notes about a confirmed edit outside the
 worktree or the frozen Goal scope, repeated command failures, and a turn with edits
 and no observed configured check before completion. Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
-the observation to a running turn. A task card summarizes the retained task brief and Goal in
+the observation to a running turn. An edit note lists only paths not already
+noted for its kind in that generation. Up to four edit notes can be admitted
+for a turn. Outside or unverifiable paths are recorded as a hash and basename.
+The note worker logs individual fact errors and advances its persisted cursor
+after processing each event. A task card summarizes the retained task brief and Goal in
 at most 600 bytes. Swarm sends it after native compaction, resume, switch or handoff,
 at most once per turn. Lifecycle notes can queue before the first linked input.
 
@@ -834,6 +838,10 @@ A completed fast project check records `project.check.finished` with its
 triggering edit sequence and exit code. Fact counters use later confirmed check,
 command or Git evidence where available. Without a confirming fact, correction
 remains unverified.
+
+For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
+the next-input move at turn end substitutes for a Claude Stop hook. Pending
+inserts can still be delivered by the before-tool and after-tool callbacks.
 
 ## Outcome chaining
 

@@ -3,6 +3,29 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+/// Persisted file edit evidence never includes an absolute path.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextEditPath {
+    Relative { path: String },
+    OutsideOrUnverifiable { sha256: String, basename: String },
+}
+
+impl ContextEditPath {
+    pub fn outside(path: &str, policy: &crate::SecretPolicy) -> Self {
+        let basename = path
+            .rsplit(['/', '\\'])
+            .find(|part| !part.is_empty())
+            .filter(|name| !name.chars().any(char::is_control))
+            .unwrap_or("unavailable");
+        let basename = policy.redact_text(basename);
+        Self::OutsideOrUnverifiable {
+            sha256: crate::api::inference::sha256_hex(path.as_bytes()),
+            basename: crate::api::truncate_bytes(&basename, 240).0.to_owned(),
+        }
+    }
+}
+
 /// An injection request or its resolved application point. Only concrete
 /// points can be used in a native claim or receipt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

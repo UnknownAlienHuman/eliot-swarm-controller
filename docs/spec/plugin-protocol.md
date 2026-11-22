@@ -780,18 +780,20 @@ bind exact generation/request/deadline. Timeout uses the safe native default; la
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
 Claude Code delivers `turn_safe_point` context through `PreToolUse.additionalContext`
-and `PostToolUse.additionalContext`. The
-adapter reports the exact turn and opaque consumer through the existing authenticated
-plugin channel. Timeout/cancellation supplies no context, does not override a native
-result, and discards late context instead of queuing it for a later turn. This context
-path does not make permission decisions; existing approval callbacks retain that
-responsibility. Hooks do not duplicate lifecycle already supplied by the stream.
+and `PostToolUse.additionalContext`. The daemon chooses `before_tool` for a Claude
+steer and frames its text using the shared Swarm note format. The adapter writes
+the supplied text on the selected callback for the exact turn and reports its
+native mechanism. Existing approval callbacks retain permission decisions.
 
-For a recognized successful file write, Claude `PostToolUse` can carry `edit_path`.
-This is the bounded, redacted path from the native tool input, including an absolute
-path outside the worktree. Swarm classifies containment and scope from the fact.
-A native `compact_boundary` record yields `session.context.compacted` with the active
-Swarm turn when one is bound. The stream receipt supplies the compaction fact.
+Both Claude tool hooks have a three-second native timeout and matching adapter deadlines.
+Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
+Only a context delivery emits a `hook.after_tool` receipt. A successful file write
+with an empty selection emits a `tool.file.edited` fact. The `edit_path` on both
+events carries a verified worktree-relative path or an outside-or-unverifiable
+SHA-256 and redacted basename. A native `compact_boundary` record yields
+`session.context.compacted` and includes `turn_id` only for a committed active turn.
+For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
+moving pending inserts to the next input at turn end substitutes for the Stop hook.
 
 The OpenCode `context` hook (`before_model`) is the second consumer. The Rust host binds
 the native session over RPC `eliot-context` version 1 (`bind`/`next`/`resolve` on the

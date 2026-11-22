@@ -36,12 +36,6 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 // input write and association, leaving time to return the actual native cause.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
 
-/// The actual steer mechanism, reported on every applied steer ack: the
-/// installed CLI has no named steer method, so the exact captured turn is
-/// steered through its existing PreToolUse `additionalContext` hook response.
-/// This is steer, never `active_turn` inject: that point stays unsupported.
-const STEER_MECHANISM: &str = "claude.PreToolUse.additionalContext";
-
 #[derive(Default)]
 struct ClaudePlugin {
     initialized: Option<Initialized>,
@@ -1063,11 +1057,11 @@ impl ClaudePlugin {
                     "hooks": {
                         "PreToolUse": [{
                             "hookCallbackIds": [callback_id.clone()],
-                            "timeout": 30,
+                            "timeout": events::TOOL_HOOK_TIMEOUT_SECONDS,
                         }],
                         "PostToolUse": [{
                             "hookCallbackIds": [callback_id],
-                            "timeout": 30,
+                            "timeout": events::TOOL_HOOK_TIMEOUT_SECONDS,
                         }]
                     }
                 }),
@@ -1620,6 +1614,7 @@ impl ClaudePlugin {
                 params.command_id.clone(),
                 turn_id.to_owned(),
                 text.to_owned(),
+                params.args["steer_hook"].as_str().unwrap_or_default(),
             )
             .await
         {
@@ -1674,11 +1669,11 @@ impl ClaudePlugin {
             }
         };
         let result = match outcome {
-            SteerOutcome::Applied => Ok(json!({
+            SteerOutcome::Applied(hook) => Ok(json!({
                 "state": "applied",
                 "command_id": command_id,
                 "turn_id": turn_id,
-                "mechanism": STEER_MECHANISM,
+                "mechanism": format!("claude.{hook}.additionalContext"),
             })),
             SteerOutcome::Rejected(reason) => Ok(rejected_control(&reason)),
             SteerOutcome::Unknown(reason) => Ok(unknown_control(&reason)),

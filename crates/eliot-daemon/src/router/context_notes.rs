@@ -1,4 +1,4 @@
-use super::{MODE_OPEN, Principal, Router};
+use super::{MODE_OPEN, Principal, Router, insertion_facts::InsertionFact};
 use crate::common::now_ms;
 use eliot_core::{CommandState, ContextWaitRequest, Error, Event, Result, api::HandoffResponse};
 use eliot_store::Store;
@@ -11,49 +11,63 @@ pub(crate) async fn run_context_notes(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut events = router.inner.bus.subscribe();
-    let mut cursor = router.inner.store.lock().await.high_water()?;
+    let mut cursor = router.inner.store.lock().await.context_notes_cursor()?;
     router.note_worker_task_running("context_notes");
     loop {
-        let event = tokio::select! {
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    return Ok(());
-                }
-                continue;
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let page = {
+            let mut store = router.inner.store.lock().await;
+            let bounds = store.event_bounds()?;
+            if cursor < bounds.pruned_through {
+                crate::logging::record(
+                    &router.secret_policy_snapshot(),
+                    "daemon.context_notes_retention_gap",
+                    &[],
+                    Some(&Error::new(
+                        "history_gap",
+                        "context notes cursor fell behind event retention",
+                    )),
+                );
+                cursor = bounds.pruned_through;
+                store.advance_context_notes_cursor(cursor)?;
             }
-            event = events.recv() => event,
+            let page = store.read_events(cursor, 128, Some(bounds.hi))?;
+            if page.is_empty() && cursor < bounds.hi {
+                cursor = bounds.hi;
+                store.advance_context_notes_cursor(cursor)?;
+            }
+            page
         };
-        match event {
-            Ok(event) if event.seq == cursor.saturating_add(1) => {
-                router.note_committed_fact(&event).await?;
+        if !page.is_empty() {
+            for event in page {
+                if let Err(error) = router.note_committed_fact(&event).await {
+                    crate::logging::record(
+                        &router.secret_policy_snapshot(),
+                        "daemon.context_note_fact_failed",
+                        &[("seq", &event.seq.to_string()), ("kind", &event.kind)],
+                        Some(&error),
+                    );
+                }
+                router
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .advance_context_notes_cursor(event.seq)?;
                 cursor = event.seq;
             }
-            Ok(event) if event.seq <= cursor => {}
-            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                let through = router.inner.store.lock().await.high_water()?;
-                while cursor < through {
-                    let page =
-                        router
-                            .inner
-                            .store
-                            .lock()
-                            .await
-                            .read_events(cursor, 128, Some(through))?;
-                    if page.is_empty() {
-                        cursor = through;
-                        break;
-                    }
-                    for fact in page {
-                        router.note_committed_fact(&fact).await?;
-                        cursor = fact.seq;
-                    }
-                }
+            continue;
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
             }
-            Err(broadcast::error::RecvError::Closed) => {
-                return Err(Error::new(
-                    "unavailable",
-                    "context note event bus is closed",
-                ));
+            event = events.recv() => {
+                if matches!(event, Err(broadcast::error::RecvError::Closed)) {
+                    return Err(Error::new("unavailable", "context note event bus is closed"));
+                }
             }
         }
     }
@@ -104,19 +118,20 @@ impl Router {
         if event.source == "git" && captured.data["turn_id"].is_null() {
             return Ok(());
         }
-        for (kind, text) in facts {
-            self.queue_fact_note(&captured, &kind, &text).await?;
+        let mut store = self.inner.store.lock().await;
+        for fact in facts {
+            match fact {
+                InsertionFact::Edits { kind, paths } => {
+                    let change = store.queue_edit_note(&captured, kind, &paths, now_ms());
+                    self.publish_fact_note(change)?;
+                }
+                InsertionFact::NoCheckBeforeEnd => self.queue_fact_note_locked(
+                    &mut store, &captured, "no_check_before_end",
+                    "The turn changed files but no configured Goal check is recorded before the turn ended.", None,
+                )?,
+            }
         }
         Ok(())
-    }
-
-    pub(super) async fn queue_fact_note(
-        &self,
-        event: &Event,
-        kind: &str,
-        text: &str,
-    ) -> Result<()> {
-        self.queue_fact_note_with_id(event, kind, text, None).await
     }
 
     pub(super) async fn queue_fact_note_with_id(
@@ -139,7 +154,11 @@ impl Router {
         id: Option<&str>,
     ) -> Result<()> {
         let text = self.secret_policy_snapshot().redact_text(text);
-        match store.queue_fact_note(event, kind, &text, id, now_ms()) {
+        self.publish_fact_note(store.queue_fact_note(event, kind, &text, id, now_ms()))
+    }
+
+    fn publish_fact_note(&self, change: Result<eliot_store::Change<Option<String>>>) -> Result<()> {
+        match change {
             Ok(change) => {
                 self.publish_locked(&change.events);
                 if let Some(id) = change.value {

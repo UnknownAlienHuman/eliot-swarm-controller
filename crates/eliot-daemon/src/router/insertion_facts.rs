@@ -1,20 +1,25 @@
 use super::{Router, goal_scope::outside_scope};
 use crate::git_monitor::normalize_hint;
-use eliot_core::{Event, Result, api::truncate_bytes};
+use eliot_core::{ContextEditPath, Event, Result};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
-const MAX_FACTS: usize = 3;
-const MAX_PATHS_PER_FACT: usize = 8;
-const MAX_NOTE_BYTES: usize = 1_536;
-const MAX_PATH_BYTES: usize = 384;
 const MAX_AGENT_EDITS_READ: usize = 1_000;
 
+pub(super) enum InsertionFact {
+    Edits {
+        kind: &'static str,
+        paths: Vec<ContextEditPath>,
+    },
+    NoCheckBeforeEnd,
+}
+
 impl Router {
-    pub(super) async fn insertion_facts(&self, event: &Event) -> Result<Vec<(String, String)>> {
+    pub(super) async fn insertion_facts(&self, event: &Event) -> Result<Vec<InsertionFact>> {
         if !matches!(
             event.kind.as_str(),
             "hook.after_tool"
+                | "tool.file.edited"
                 | "tool.completed"
                 | "file.changed"
                 | "git.changed"
@@ -70,19 +75,37 @@ impl Router {
         let mut outside_worktree = BTreeSet::new();
         let mut changed_paths = BTreeSet::new();
 
+        let policy = self.secret_policy_snapshot();
         if let Some(workspace) = workspace {
+            if event.source == "stream"
+                && event.native_id.is_some()
+                && matches!(event.kind.as_str(), "hook.after_tool" | "tool.file.edited")
+                && let Ok(ContextEditPath::OutsideOrUnverifiable { sha256, basename }) =
+                    serde_json::from_value(event.data["edit_path"].clone())
+                && sha256.len() == 64
+                && sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && !basename.contains(['/', '\\'])
+                && !basename.chars().any(char::is_control)
+            {
+                outside_worktree.insert(ContextEditPath::OutsideOrUnverifiable {
+                    sha256,
+                    basename: eliot_core::api::truncate_bytes(&policy.redact_text(&basename), 240)
+                        .0
+                        .to_owned(),
+                });
+            }
             for raw_path in event_edit_paths(event) {
-                if raw_path.is_empty() || raw_path.len() > 4_096 {
+                if raw_path.trim().is_empty() {
                     continue;
                 }
-                match normalize_hint(workspace, raw_path) {
-                    Ok(path) => {
-                        changed_paths.insert(path);
-                    }
-                    Err(error) if error.message.contains("escapes its worktree") => {
-                        outside_worktree.insert(bounded_path(self, raw_path));
-                    }
-                    Err(_) => {}
+                if raw_path.len() <= 4096
+                    && let Ok(path) = normalize_hint(workspace, raw_path)
+                {
+                    changed_paths.insert(path);
+                } else {
+                    let path = Path::new(workspace).join(raw_path);
+                    outside_worktree
+                        .insert(ContextEditPath::outside(&path.to_string_lossy(), &policy));
                 }
             }
 
@@ -93,31 +116,29 @@ impl Router {
             }
         }
 
-        let mut facts = Vec::with_capacity(MAX_FACTS);
+        let mut facts = Vec::new();
         if !outside_worktree.is_empty() {
-            facts.push((
-                "outside_worktree".to_owned(),
-                paths_note(
-                    self,
-                    "Native edit path is outside the Agent worktree",
-                    &outside_worktree,
-                ),
-            ));
+            facts.push(InsertionFact::Edits {
+                kind: "outside_worktree",
+                paths: outside_worktree.into_iter().collect(),
+            });
         }
 
         if let Some(definition) = launch_goal
             .as_ref()
             .filter(|goal| !goal.scope.is_empty() || !goal.policy_scope.is_empty())
         {
-            let outside = outside_scope(definition, &changed_paths)
+            let paths = outside_scope(definition, &changed_paths)
                 .into_iter()
-                .map(|path| bounded_path(self, path))
-                .collect::<BTreeSet<_>>();
-            if !outside.is_empty() {
-                facts.push((
-                    "outside_scope".to_owned(),
-                    paths_note(self, "Edit is outside the frozen Goal scope", &outside),
-                ));
+                .map(|path| ContextEditPath::Relative {
+                    path: policy.redact_text(path),
+                })
+                .collect::<Vec<_>>();
+            if !paths.is_empty() {
+                facts.push(InsertionFact::Edits {
+                    kind: "outside_scope",
+                    paths,
+                });
             }
         }
 
@@ -146,18 +167,10 @@ impl Router {
                     checked_at >= started_at && checked_at <= completed_at
                 });
             if edited && !check_ran {
-                facts.push((
-                    "no_check_before_end".to_owned(),
-                    "The turn changed files but no configured Goal check is recorded before the turn ended."
-                        .to_owned(),
-                ));
+                facts.push(InsertionFact::NoCheckBeforeEnd);
             }
         }
 
-        facts.truncate(MAX_FACTS);
-        for (_, text) in &mut facts {
-            *text = truncate_bytes(text, MAX_NOTE_BYTES).0.to_owned();
-        }
         Ok(facts)
     }
 }
@@ -167,12 +180,17 @@ fn event_edit_paths(event: &Event) -> Vec<&str> {
         return Vec::new();
     }
     match event.kind.as_str() {
-        "hook.after_tool" => event
-            .data
-            .get("edit_path")
-            .and_then(Value::as_str)
-            .into_iter()
-            .collect(),
+        "hook.after_tool" | "tool.file.edited" => {
+            let path = &event.data["edit_path"];
+            path.as_str()
+                .or_else(|| {
+                    (path["kind"] == "relative")
+                        .then(|| path["path"].as_str())
+                        .flatten()
+                })
+                .into_iter()
+                .collect()
+        }
         "tool.completed"
             if event.data.get("tool").and_then(Value::as_str) == Some("fileChange")
                 && event.data.get("status").and_then(Value::as_str) == Some("completed")
@@ -226,24 +244,4 @@ fn git_event_paths<'a>(event: &'a Event, workspace: &str) -> Vec<&'a str> {
                 .or_else(|| entry.as_str())
         })
         .collect()
-}
-
-fn bounded_path(router: &Router, path: &str) -> String {
-    let redacted = router.secret_policy_snapshot().redact_text(path);
-    truncate_bytes(&redacted, MAX_PATH_BYTES).0.to_owned()
-}
-
-fn paths_note(router: &Router, title: &str, paths: &BTreeSet<String>) -> String {
-    let mut note = format!("{title} ({}):", paths.len());
-    for path in paths.iter().take(MAX_PATHS_PER_FACT) {
-        note.push_str("\n- ");
-        note.push_str(&bounded_path(router, path));
-    }
-    if paths.len() > MAX_PATHS_PER_FACT {
-        note.push_str(&format!(
-            "\n- … and {} more",
-            paths.len() - MAX_PATHS_PER_FACT
-        ));
-    }
-    truncate_bytes(&note, MAX_NOTE_BYTES).0.to_owned()
 }

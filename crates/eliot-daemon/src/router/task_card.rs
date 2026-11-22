@@ -30,11 +30,17 @@ pub(super) fn read_task_card(
         None => store.task_card_handoff_brief(agent, generation)?,
     }
     .filter(|brief| brief.target.as_deref() == Some(agent) && brief.verb == "send");
+    if brief.is_none() && (handoff.is_some() || store.task_card_has_handoff(agent, generation)?) {
+        return Ok(None);
+    }
     let text = if let Some(brief) = brief {
-        brief.args["text"]
+        let Some(text) = brief.args["text"]
             .as_str()
-            .map(original_task)
-            .map(str::to_owned)
+            .filter(|text| !text.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Some(original_task(text).to_owned())
     } else if let Some(launch) = store.generation_start_command(agent, 1)? {
         let linked = store.get_linked_send(&launch.id)?;
         launch.args["text"]
