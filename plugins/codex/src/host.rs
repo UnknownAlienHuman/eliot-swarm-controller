@@ -360,10 +360,15 @@ fn validate_start_plan(
     route.capture_client_secret(&environment, &mut secrets, &mut metadata_secrets, true)?;
     secrets.push(initialized.credential.clone());
     metadata_secrets.push(initialized.credential.clone());
-    let data_dir = environment
-        .iter()
-        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("ELIOT_HOME"))
-        .map(|(_, value)| PathBuf::from(value))
+    // Provider probes carry only this root in mcp_environment; managed
+    // Agent credentials are absent from that scoped input.
+    let data_dir = params
+        .mcp_environment
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|environment| environment.get("ELIOT_HOME"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
         .filter(|path| path.is_absolute() && path.is_dir())
         .ok_or_else(|| {
             Error::new(

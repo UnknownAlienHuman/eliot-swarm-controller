@@ -145,14 +145,35 @@ pub fn is_passed_env(name: &str, pass_env: Option<&Value>) -> bool {
     })
 }
 
-/// Map the frozen `target_environment` object to child variables, collecting
-/// secret values (secret names plus explicit `pass_env` hits) for redaction.
+/// Map the frozen `target_environment` object to native child variables and
+/// collect secret values for redaction. Data-root variables stay scoped to the
+/// MCP integration; Owner variables are excluded from managed child environments.
 /// `harness` names the caller in diagnostics.
 pub fn target_environment(
     environment: Option<&Value>,
     pass_env: Option<&Value>,
     harness: &str,
 ) -> Result<TargetEnvironment> {
+    target_environment_inner(environment, pass_env, harness, false)
+}
+
+fn target_environment_inner(
+    environment: Option<&Value>,
+    pass_env: Option<&Value>,
+    harness: &str,
+    allow_mcp_scope: bool,
+) -> Result<TargetEnvironment> {
+    if pass_env.and_then(Value::as_array).is_some_and(|names| {
+        names
+            .iter()
+            .filter_map(Value::as_str)
+            .any(is_reserved_eliot_environment_name)
+    }) {
+        return Err(Error::new(
+            "profile_error",
+            format!("{harness} pass_env cannot include reserved ELIOT_* names"),
+        ));
+    }
     let Some(environment) = environment else {
         return Ok(TargetEnvironment {
             variables: Vec::new(),
@@ -168,6 +189,9 @@ pub fn target_environment(
     let mut vars = Vec::with_capacity(object.len());
     let mut secrets = Vec::new();
     for (name, value) in object {
+        if !allow_mcp_scope && is_mcp_only_scope_name(name) {
+            continue;
+        }
         if name.is_empty() || name.contains('=') || name.contains('\0') {
             return Err(Error::new(
                 "profile_error",
@@ -191,10 +215,23 @@ pub fn target_environment(
     })
 }
 
+fn is_reserved_eliot_environment_name(name: &str) -> bool {
+    name.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_"))
+}
+
+fn is_mcp_only_scope_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("ELIOT_HOME")
+        || name.eq_ignore_ascii_case("ELIOT_AGENT_DATA_DIR")
+        || name
+            .get(..12)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_OWNER_"))
+}
+
 /// Resolve the exact Agent identity for one private MCP server. The normal
-/// path uses the daemon's separate MCP environment; a missing field retains
-/// compatibility only for old profiles that still pass identity to the
-/// harness process.
+/// path uses the daemon's separate MCP environment. The legacy fallback reads
+/// scoped fields from old target environments; ordinary target mapping still
+/// removes data-root and Owner variables before native child launch.
 pub fn agent_mcp_environment(
     mcp_environment: Option<&Value>,
     target_environment_value: Option<&Value>,
@@ -254,7 +291,7 @@ pub fn agent_mcp_environment(
             format!("{harness} MCP identity environment has an invalid field set"),
         ));
     }
-    let mapped = target_environment(Some(&value), None, harness)?;
+    let mapped = target_environment_inner(Some(&value), None, harness, true)?;
     crate::native_cli::require_agent_mcp_root(
         &mapped.variables,
         agent_id,

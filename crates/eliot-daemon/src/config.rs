@@ -2926,6 +2926,13 @@ fn validate_model(profile: &str, model: &str, source: &str, offset: usize) -> co
     }
     Ok(())
 }
+
+/// Whether a profile names an environment variable owned by Eliot.
+pub(crate) fn reserved_eliot_environment_name(name: &str) -> bool {
+    name.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_"))
+}
+
 fn validate_pass_env(
     profile: &str,
     names: &[String],
@@ -2956,13 +2963,13 @@ fn validate_pass_env(
                 "profile_error",
             ));
         }
-        if name.to_ascii_uppercase().starts_with("ELIOT_AGENT_") {
+        if reserved_eliot_environment_name(name) {
             return Err(profile_field_error(
                 source,
                 offset,
                 profile,
                 "pass_env",
-                "cannot override Eliot identity variables",
+                "ELIOT_* names are reserved for Eliot-managed identity and scope",
                 "profile_error",
             ));
         }

@@ -198,8 +198,9 @@ pub(super) async fn spawn_owned_session(
     peer: &PeerClient,
 ) -> Result<AgentSession> {
     // Muse serves the skill on demand through a pointer in the first turn.
+    // Its data root arrives through the scoped integration environment.
     let data_dir = params
-        .target_environment
+        .mcp_environment
         .as_ref()
         .and_then(Value::as_object)
         .and_then(|environment| environment.get("ELIOT_HOME"))

@@ -1124,8 +1124,8 @@ impl OpenCodePlugin {
         )?;
         secrets.extend(mcp_environment.secrets.iter().cloned());
         secrets.push(initialized.credential.clone());
-        // The MCP child binds the exact data root. When shell identity is
-        // disabled, only its private MCP config receives the scoped identity.
+        // The native target environment carries no data root. The private
+        // managed MCP config always receives its scoped root and identity.
         let swarm_data_dir = eliot_plugin::native_cli::unique_environment_value(
             &mcp_environment.variables,
             "ELIOT_HOME",
@@ -1144,11 +1144,7 @@ impl OpenCodePlugin {
                 "active Swarm executable could not be resolved for the OpenCode Agent MCP",
             )
         })?;
-        let swarm_mcp_environment = if params.pass_agent_identity_to_shell.unwrap_or(true) {
-            Vec::new()
-        } else {
-            mcp_environment.variables
-        };
+        let swarm_mcp_environment = mcp_environment.variables;
         Ok(Box::new(ParsedStart {
             params,
             native_subagents,
