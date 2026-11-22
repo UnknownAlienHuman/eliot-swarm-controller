@@ -154,8 +154,10 @@ elapsed deadline as its reason. An unresolved transport or generation teardown a
 as `unknown`. The host never replays the steer.
 
 A plugin with no native steer declares `steer_delivery: "turn_safe_point"` in its
-`session.ready` effective settings (Claude does); absent means a direct native steer.
-Such a session's `steer` does not use `agent.command`: the dispatch transaction leaves it
+`session.ready` effective settings (Claude does); absent means a direct native steer, and
+any other value rejects the event as `invalid`. A daemon restart ends every live
+generation, so each live session carries the declaration of the plugin build that started
+it. Such a session's `steer` does not use `agent.command`: the dispatch transaction leaves it
 pending, and Store claims it alongside `turn_safe_point` injects through the authenticated
 `hook.event` callback and settles it from the committed hook receipt.
 

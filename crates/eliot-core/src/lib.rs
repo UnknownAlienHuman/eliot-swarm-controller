@@ -2835,7 +2835,10 @@ fn optional_native_ref(event: &NativeEvent) -> Result<Option<String>> {
 fn optional_effective(event: &NativeEvent) -> Result<Option<Value>> {
     match event.data.get("effective") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(_)) => Ok(Some(event.data["effective"].clone())),
+        Some(effective @ Value::Object(_)) => {
+            context::validate_steer_delivery(effective)?;
+            Ok(Some(effective.clone()))
+        }
         Some(_) => Err(Error::new(
             "invalid",
             format!("{} field effective must be an object", event.kind),

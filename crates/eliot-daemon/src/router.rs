@@ -3287,7 +3287,8 @@ impl Router {
     /// A safe-point steer waits in Store for a hook, so a live runtime that
     /// cannot take it is refused before acceptance (#906). Stale generation
     /// and turn bindings keep their Store errors; direct-RPC steers settle
-    /// from their plugin.
+    /// from their plugin. A read failure here refuses nothing: Store admission
+    /// still owns the decision.
     async fn check_safe_point_steer_target(&self, request: &SubmitCommand) -> Result<()> {
         if request.verb != "steer" {
             return Ok(());
@@ -3297,10 +3298,10 @@ impl Router {
         };
         let agent = {
             let store = self.inner.store.lock().await;
-            if store.get_command(&request.id)?.is_some() {
+            if !matches!(store.get_command(&request.id), Ok(None)) {
                 return Ok(());
             }
-            let Some(agent) = store.get_agent(target)? else {
+            let Ok(Some(agent)) = store.get_agent(target) else {
                 return Ok(());
             };
             agent

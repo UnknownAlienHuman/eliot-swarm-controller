@@ -19,6 +19,21 @@ impl crate::Agent {
     }
 }
 
+/// Refuse a declared `steer_delivery` this build does not implement, so a
+/// typo or renamed value cannot silently select direct steer.
+pub(crate) fn validate_steer_delivery(effective: &Value) -> crate::Result<()> {
+    match effective.get(STEER_DELIVERY_FIELD) {
+        None => Ok(()),
+        Some(value) if InjectPoint::deserialize(value).ok() == Some(InjectPoint::TurnSafePoint) => {
+            Ok(())
+        }
+        Some(_) => Err(crate::Error::new(
+            "invalid",
+            "session.ready steer_delivery must be turn_safe_point",
+        )),
+    }
+}
+
 /// Persisted file edit evidence never includes an absolute path.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
