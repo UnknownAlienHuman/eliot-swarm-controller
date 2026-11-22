@@ -875,6 +875,21 @@ async fn spawn_workers(
         goal_factory,
     ));
 
+    let project_check_router = router.clone();
+    let project_check_factory = move |shutdown: watch::Receiver<bool>| {
+        let router = project_check_router.clone();
+        async move {
+            let result = crate::router::run_project_checks(router, shutdown.clone()).await;
+            crate::daemon::workers::from_result(result, &shutdown)
+        }
+    };
+    workers.spawn(crate::daemon::workers::supervise(
+        "project_checks",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        project_check_factory,
+    ));
+
     let switch_router = router.clone();
     let switch_reporter = worker_reporter.clone();
     workers.spawn(crate::daemon::workers::supervise(

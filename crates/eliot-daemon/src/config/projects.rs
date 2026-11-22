@@ -13,6 +13,7 @@ use std::{
 };
 
 const MAX_PROJECT_PATH_LEN: usize = 4096;
+const MAX_PROJECT_CHECK_ROUNDS: i64 = 16;
 
 /// Managed-worktree policy for top-level launches in a registered project.
 /// `worktree` (the default) prepares one standard worktree per top-level
@@ -34,6 +35,9 @@ pub(crate) struct ProjectRegistrationConfig {
     pub git: Option<core::api::ProjectGitView>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
+    pub format: Vec<String>,
+    pub check: Vec<String>,
+    pub max_rounds: Option<i64>,
     pub workspace: ProjectWorkspaceMode,
 }
 
@@ -305,6 +309,15 @@ pub(super) struct ProjectEntry {
     interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     #[serde(default)]
     run_env: Vec<String>,
+    /// Explicit argv run after a debounced file edit to format the Agent worktree.
+    #[serde(default)]
+    format: Vec<String>,
+    /// Explicit argv used for fast checks and the project default Goal.
+    #[serde(default)]
+    check: Vec<String>,
+    /// Required when `check` is configured; bounds automatic Goal rounds.
+    #[serde(default)]
+    max_rounds: Option<i64>,
     /// `workspace = "worktree" | "shared"`, default `worktree`.
     #[serde(default)]
     workspace: ProjectWorkspaceMode,
@@ -411,6 +424,30 @@ pub(super) fn project_registrations_in(
                             | "var.set"
                     )
             })?;
+        let format = normalize_project_command_argv(&entry.format, source, offset, id, "format")?;
+        let check = normalize_project_command_argv(&entry.check, source, offset, id, "check")?;
+        match (check.is_empty(), entry.max_rounds) {
+            (false, Some(rounds)) if (1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds) => {}
+            (false, _) => {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{id}.max_rounds"),
+                    "is required with check and must be between 1 and 16",
+                    "profile_error",
+                ));
+            }
+            (true, Some(_)) => {
+                return Err(config_error_at(
+                    source,
+                    offset,
+                    &format!("projects.{id}.max_rounds"),
+                    "requires a project check command",
+                    "profile_error",
+                ));
+            }
+            (true, None) => {}
+        }
         let git = entry.git.clone();
         if let Some(git) = &git {
             validate_project_git_config(git, source, offset, id)?;
@@ -432,11 +469,42 @@ pub(super) fn project_registrations_in(
             git,
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
+            format,
+            check,
+            max_rounds: entry.max_rounds,
             workspace: entry.workspace,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
+}
+
+fn normalize_project_command_argv(
+    argv: &[String],
+    source: &str,
+    offset: usize,
+    project_id: &str,
+    field: &str,
+) -> core::Result<Vec<String>> {
+    if argv.is_empty() {
+        return Ok(Vec::new());
+    }
+    if argv.len() > core::api::MAX_GOAL_CHECK_ARGS
+        || argv.iter().any(|arg| {
+            arg.is_empty()
+                || arg.len() > core::api::MAX_GOAL_CHECK_ARG_BYTES
+                || arg.chars().any(char::is_control)
+        })
+    {
+        return Err(config_error_at(
+            source,
+            offset,
+            &format!("projects.{project_id}.{field}"),
+            "must be explicit argv with 1 to 32 nonempty arguments of at most 4 KiB and no control characters",
+            "profile_error",
+        ));
+    }
+    Ok(argv.to_vec())
 }
 
 fn normalize_project_allowlist(

@@ -151,6 +151,36 @@ and supported actions. Missing or empty allowlists deny all. `project list` and
 `project show ID` are owner-only readbacks of the canonical registration; there is no
 project-registration mutation command in this increment.
 
+A project may also declare optional `format` and `check` argv arrays plus a
+bounded `max_rounds`. The daemon debounces committed `file.changed` hints and
+dirty `git.changed` snapshots per exact Agent generation; the latter also covers
+adapters without native file hints. Each event is fenced to the Agent's owned,
+registered worktree. A stable post-format fingerprint suppresses the formatter's own
+follow-up snapshot. Once edits settle, the daemon runs the formatter
+in that Agent's verified worktree, then runs the fast check in the same minimal
+script/process environment. Events in the same debounce window coalesce. Only a
+definite nonzero exit is delivered:
+Claude, OpenCode and Antigravity receive it at their existing exact-turn hook context
+point; Codex and Muse receive it through exact-turn active-turn inject/steer.
+When an exact-generation Eliot Goal is active, the fast path uses that Goal's frozen
+check argv, so a manual Goal retains priority; otherwise it uses the current project
+check. Successful fast checks stay silent and are not final-check receipts. Unknown process
+outcomes are not reported as passes or failures and fence further fast checks for that
+Agent generation, so the daemon never retries an uncertain invocation.
+
+A launch into a registered project by assignment or routing role receives a default
+Eliot Goal when the project has `check`. An explicit assignment Goal takes
+priority, and a later manual `goal.set` uses the ordinary Goal revision and
+replaces the default. The Goal runs the same project check after each turn ends,
+through the existing idle Goal driver; `max_rounds` bounds repair continuations.
+A successful final Goal round persists in the existing Store `goals` row: the
+frozen `definition.check` and state counters including `last_exit_code`,
+`last_check_at` and `last_output_digest`, together with completed status. The
+`goal_markers` reservation is deleted on commit. This readback is not a project
+publication receipt because it does not bind the checked tree and answer turn.
+Projects without such a Goal need a separate final-check result before a future
+publication action can use that result as a gate.
+
 Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
 never from an Agent worktree. Their principal is `project:ID`. Router authorization and
 Store admission/dispatch fences revalidate the registration's canonical checkout and

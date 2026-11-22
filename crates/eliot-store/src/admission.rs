@@ -5,7 +5,14 @@ use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 /// commands cannot use it; only the internal `attention.emit` verb admits it.
 pub(super) const ATTENTION_RESERVED_TOPIC: &str = "agent.attention";
 
-pub(super) fn command_semantic_payload(request: &SubmitCommand, args: Value) -> Result<Value> {
+pub(super) fn command_semantic_payload(request: &SubmitCommand, mut args: Value) -> Result<Value> {
+    // Project-check Goals are frozen from owner configuration during launch
+    // preparation; callers omit them on an exact same-ID replay.
+    if request.verb == "launch"
+        && let Some(args) = args.as_object_mut()
+    {
+        args.remove(core::PROJECT_CHECK_GOAL_ARG);
+    }
     let mut payload = json!({
         "target": request.target,
         "verb": request.verb,
@@ -1021,6 +1028,22 @@ fn admit_launch_tx(
     if let Some((goal, cause)) = assignment::record_admission_tx(tx, principal, request, now)? {
         // A first launch starts generation 1; its Goal binds to it now.
         goals::install_assignment_goal_tx(tx, agent_num, 1, &goal, cause, now)?;
+    } else if let Some(goal) = assignment::project_check_goal(request)? {
+        // Role launches have no folder-assignment cause, but their project
+        // check Goal still binds atomically before native dispatch.
+        goals::install_assignment_goal_tx(
+            tx,
+            agent_num,
+            1,
+            &goal,
+            core::EventCause {
+                command_id: request.id.clone(),
+                rule: None,
+                depth: 0,
+                remote_call: None,
+            },
+            now,
+        )?;
     }
     let root_num = parent_link
         .as_ref()
