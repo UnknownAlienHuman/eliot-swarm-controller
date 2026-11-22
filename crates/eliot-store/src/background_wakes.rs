@@ -1,9 +1,9 @@
 //! Durable persistence for automatic background-process wakes (#879, #881, #883).
 
 use super::{
-    Change, Error, Result, Store, admission, commit_transaction, context, decode_json,
-    format_agent_id, load_agent_by_num, load_turn, parse_agent_id, process_record_from_row,
-    sql_error, validate_limit, wakes::unique_wake_command_id,
+    Change, Error, Result, Store, admission, commit_transaction, context, format_agent_id,
+    load_agent_by_num, load_turn, parse_agent_id, process_record_from_row, sql_error,
+    validate_limit, wakes::unique_wake_command_id,
 };
 use eliot_core::{
     BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_PRINCIPAL, InjectPoint, ProcessIdentity,
@@ -11,15 +11,19 @@ use eliot_core::{
     api::AgentBackgroundWakeView,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::HashSet;
 
 const MAX_ACTIVE_BACKGROUND_WAKES: i64 = 1_024;
 pub const MAX_BACKGROUND_WAKE_PAGE: usize = 128;
 const BACKGROUND_WAKE_RETENTION_MS: i64 = 31 * 24 * 60 * 60 * 1_000;
 const MAX_PRE_ADMISSION_ATTEMPTS: u32 = 5;
-const MAX_DECLARATION_SCAN_ROWS: usize = 128;
-const MAX_TOOL_SCAN_ROWS: usize = 128;
+const MAX_DECLARATION_SCAN_ROWS: i64 = 128;
+const MAX_DECLARED_COMMAND_BYTES: i64 = 4_096;
+const MAX_TURN_EVENT_SCAN_ROWS: i64 = 4_096;
+const MAX_TOOL_COMMAND_BYTES: i64 = 8_192;
+const MAX_TOOL_COMMANDS: i64 = 64;
+const MAX_TAIL_SCAN_CHARS: i64 = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWakeArmInput {
@@ -29,6 +33,8 @@ pub struct BackgroundWakeArmInput {
     pub process: ProcessIdentity,
     pub command_line: String,
     pub command_truncated: bool,
+    /// Redacted, bounded tail captured at arm time, if any.
+    pub output_tail: Option<String>,
     pub expires_at: i64,
 }
 
@@ -54,93 +60,223 @@ pub struct BackgroundWakeRecord {
     pub expires_at: i64,
 }
 
+/// One native shell command the plugin reported (`tool.started`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackgroundWakeToolCommand {
+    pub turn_id: String,
+    pub item_id: String,
+    pub command: String,
+}
+
+/// Everything the Router needs to pick a candidate, read in one short
+/// Store call. Only bounded fields are selected; no event payload is decoded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BackgroundWakeServerDeclarations {
+pub struct BackgroundWakeArmContext {
+    /// Earliest process start (Unix ms): the generation's first turn start.
+    pub window_start: i64,
+    /// Latest process start (Unix ms): this turn's completion.
+    pub window_end: i64,
     pub declared_pids: HashSet<u32>,
     pub declared_commands: Vec<String>,
+    /// Recent native `tool.started` facts of this generation, newest first.
+    pub tool_commands: Vec<BackgroundWakeToolCommand>,
+    /// Identities that already had an automatic wake in this generation.
+    pub woken: HashSet<ProcessIdentity>,
 }
 
 impl Store {
-    /// Whether this Agent generation and completed turn are eligible to arm an
-    /// automatic background-process wake (no terminal state, stop, interrupt,
-    /// open/same-turn manual wake, open automatic wake, or earlier automatic
-    /// wake for this turn).
-    pub fn background_wake_arm_eligible(
+    /// Arm context for a committed `turn.completed`, or `None` when the turn is
+    /// ineligible (see `background_wake_arm_eligible_tx`).
+    pub fn background_wake_arm_context(
         &self,
         agent: &str,
         generation: i64,
         turn_id: &str,
-    ) -> Result<bool> {
+    ) -> Result<Option<BackgroundWakeArmContext>> {
         let agent_num = parse_agent_id(agent)?;
-        background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)
-    }
+        if !background_wake_arm_eligible_tx(&self.connection, agent_num, generation, turn_id)? {
+            return Ok(None);
+        }
+        let window: Option<(Option<i64>, Option<i64>)> = self
+            .connection
+            .query_row(
+                "SELECT (SELECT MIN(started_at) FROM turns WHERE agent = ?1 AND generation = ?2),
+                        completed_at
+                 FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+                params![agent_num, generation, turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((Some(window_start), Some(window_end))) = window else {
+            return Ok(None);
+        };
+        let mut context = BackgroundWakeArmContext {
+            window_start,
+            window_end,
+            ..Default::default()
+        };
 
-    /// Read the Agent generation's committed long-lived server declarations
-    /// (`emit` topic `background.server` with `pid`, `pids` or `command`).
-    pub fn background_wake_server_declarations(
-        &self,
-        agent: &str,
-        generation: i64,
-    ) -> Result<BackgroundWakeServerDeclarations> {
-        parse_agent_id(agent)?;
-        let mut declarations = BackgroundWakeServerDeclarations::default();
-
-        let server_event_kind = format!("x.user.{BACKGROUND_SERVER_TOPIC}");
-        let agent_principal = format!("agent:{agent}:{generation}");
-        let mut emit_stmt = self
+        let mut declared = self
             .connection
             .prepare(
-                "SELECT e.data
+                "SELECT json_extract(e.data, '$.data.pid'),
+                        substr(json_extract(e.data, '$.data.command'), 1, ?3)
                  FROM events AS e INDEXED BY events_kind
                  JOIN commands AS c ON c.id = json_extract(e.cause, '$.command_id')
                  WHERE e.kind = ?1 AND c.principal = ?2
-                 ORDER BY e.seq DESC LIMIT ?3",
+                 ORDER BY e.seq DESC LIMIT ?4",
             )
             .map_err(sql_error)?;
-        let emit_rows = emit_stmt
+        let rows = declared
             .query_map(
                 params![
-                    server_event_kind,
-                    agent_principal,
-                    MAX_DECLARATION_SCAN_ROWS as i64
+                    format!("x.user.{BACKGROUND_SERVER_TOPIC}"),
+                    format!("agent:{agent}:{generation}"),
+                    MAX_DECLARED_COMMAND_BYTES,
+                    MAX_DECLARATION_SCAN_ROWS,
                 ],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
             )
             .map_err(sql_error)?;
-        for row in emit_rows {
-            let raw = row.map_err(sql_error)?;
-            if let Ok(value) = decode_json(&raw) {
-                let payload = value.get("data").unwrap_or(&value);
-                if let Some(pid) = payload
-                    .get("pid")
-                    .and_then(Value::as_u64)
-                    .and_then(|pid| u32::try_from(pid).ok())
-                    .filter(|pid| *pid > 0)
-                {
-                    declarations.declared_pids.insert(pid);
-                }
-                if let Some(pids) = payload.get("pids").and_then(Value::as_array) {
-                    for pid in pids
-                        .iter()
-                        .filter_map(Value::as_u64)
-                        .filter_map(|pid| u32::try_from(pid).ok())
-                        .filter(|pid| *pid > 0)
-                    {
-                        declarations.declared_pids.insert(pid);
-                    }
-                }
-                if let Some(cmd) = payload
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|cmd| !cmd.is_empty())
-                {
-                    declarations.declared_commands.push(cmd.to_owned());
-                }
+        for row in rows {
+            let (pid, command) = row.map_err(sql_error)?;
+            if let Some(pid) = pid
+                .and_then(|pid| u32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+            {
+                context.declared_pids.insert(pid);
+            }
+            if let Some(command) = command.map(|command| command.trim().to_owned())
+                && !command.is_empty()
+            {
+                context.declared_commands.push(command);
             }
         }
 
-        Ok(declarations)
+        // The process may have started in an earlier turn of this generation
+        // (a queued input began the next turn first). Those tool facts are among
+        // the Agent's newest events: scan a bounded window backwards.
+        let mut tools = self
+            .connection
+            .prepare(
+                "SELECT json_extract(data, '$.turn_id'), json_extract(data, '$.item_id'),
+                        json_extract(data, '$.command')
+                 FROM (SELECT seq, kind, generation, data FROM events INDEXED BY events_agent
+                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?3)
+                 WHERE kind = 'tool.started' AND generation = ?2
+                   AND json_type(data, '$.turn_id') = 'text'
+                   AND json_type(data, '$.item_id') = 'text'
+                   AND json_type(data, '$.command') = 'text'
+                   AND length(trim(json_extract(data, '$.command'))) BETWEEN 1 AND ?4
+                 ORDER BY seq DESC LIMIT ?5",
+            )
+            .map_err(sql_error)?;
+        let rows = tools
+            .query_map(
+                params![
+                    agent_num,
+                    generation,
+                    MAX_TURN_EVENT_SCAN_ROWS,
+                    MAX_TOOL_COMMAND_BYTES,
+                    MAX_TOOL_COMMANDS,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?;
+        for row in rows {
+            let (turn_id, item_id, command) = row.map_err(sql_error)?;
+            context.tool_commands.push(BackgroundWakeToolCommand {
+                turn_id,
+                item_id,
+                command: command.trim().to_owned(),
+            });
+        }
+
+        let mut woken = self
+            .connection
+            .prepare(
+                "SELECT host_boot_id, pid, start_time FROM background_process_wakes
+                 WHERE agent = ?1 AND generation = ?2 LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        let rows = woken
+            .query_map(
+                params![agent_num, generation, MAX_DECLARATION_SCAN_ROWS],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?;
+        for row in rows {
+            let (host_boot_id, pid, start_time) = row.map_err(sql_error)?;
+            if let (Ok(pid), Ok(start_time)) = (u32::try_from(pid), u64::try_from(start_time)) {
+                context.woken.insert(ProcessIdentity {
+                    host_boot_id,
+                    pid,
+                    start_time,
+                });
+            }
+        }
+        Ok(Some(context))
+    }
+
+    /// Bounded output tail that the native `tool.completed` for `item_id` in
+    /// `turn_id` captured, if the adapter recorded one.
+    pub fn background_wake_tool_output_tail(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<String>> {
+        let agent_num = parse_agent_id(agent)?;
+        let tail: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT substr(COALESCE(
+                            json_extract(data, '$.output_tail'),
+                            json_extract(data, '$.error_tail'),
+                            json_extract(data, '$.stderr_tail'),
+                            json_extract(data, '$.stdout_tail'),
+                            json_extract(data, '$.native_error.message')), -?5)
+                 FROM (SELECT kind, generation, data FROM events INDEXED BY events_agent
+                       WHERE agent = ?1 ORDER BY seq DESC LIMIT ?6)
+                 WHERE kind = 'tool.completed' AND generation = ?2
+                   AND json_extract(data, '$.turn_id') = ?3
+                   AND json_extract(data, '$.item_id') = ?4
+                 LIMIT 1",
+                params![
+                    agent_num,
+                    generation,
+                    turn_id,
+                    item_id,
+                    MAX_TAIL_SCAN_CHARS,
+                    MAX_TURN_EVENT_SCAN_ROWS,
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        Ok(tail
+            .flatten()
+            .map(|tail| tail.trim().to_owned())
+            .filter(|tail| !tail.is_empty()))
     }
 
     /// Arm at most one automatic wake for `(agent, generation)` if all eligibility
@@ -204,6 +340,26 @@ impl Store {
         {
             return Ok(None);
         }
+        let already_woken: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM background_process_wakes
+                     WHERE agent = ?1 AND generation = ?2
+                       AND host_boot_id = ?3 AND pid = ?4 AND start_time = ?5
+                 )",
+                params![
+                    agent_num,
+                    input.generation,
+                    input.process.host_boot_id,
+                    input.process.pid,
+                    start_time
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if already_woken {
+            return Ok(None);
+        }
         let active: i64 = tx
             .query_row(
                 "SELECT COUNT(*) FROM background_process_wakes
@@ -223,9 +379,9 @@ impl Store {
         tx.execute(
             "INSERT INTO background_process_wakes (
                  id, agent, generation, turn_id, host_boot_id, pid, start_time,
-                 command_line, command_truncated, state, delivery_command_id,
+                 command_line, command_truncated, output_tail, state, delivery_command_id,
                  created_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'waiting', ?10, ?11, ?12)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'waiting', ?11, ?12, ?13)",
             params![
                 id,
                 agent_num,
@@ -236,6 +392,7 @@ impl Store {
                 start_time,
                 input.command_line,
                 input.command_truncated,
+                input.output_tail,
                 delivery_command_id,
                 now,
                 input.expires_at,
@@ -254,7 +411,7 @@ impl Store {
             state: "waiting".to_owned(),
             outcome_kind: None,
             exit_code: None,
-            output_tail: None,
+            output_tail: input.output_tail.clone(),
             note_text: None,
             delivery_command_id,
             delivery_verb: None,
@@ -589,97 +746,6 @@ impl Store {
         outcome
     }
 
-    /// Native shell commands (`tool.started.command`) the plugin reported in `turn_id`.
-    pub fn background_wake_tool_commands(
-        &self,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-    ) -> Result<Vec<String>> {
-        let agent_num = parse_agent_id(agent)?;
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT json_extract(data, '$.command') FROM events INDEXED BY events_agent
-                 WHERE agent = ?1 AND generation = ?2 AND kind = 'tool.started'
-                   AND json_extract(data, '$.turn_id') = ?3
-                   AND json_type(data, '$.command') = 'text'
-                 ORDER BY seq DESC LIMIT ?4",
-            )
-            .map_err(sql_error)?;
-        let rows = stmt
-            .query_map(
-                params![agent_num, generation, turn_id, MAX_TOOL_SCAN_ROWS as i64],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(sql_error)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(sql_error)
-    }
-
-    /// Return a bounded, raw output tail captured by a native `tool.completed`
-    /// event in `turn_id` matching `command_line`, if the adapter recorded one.
-    pub fn background_wake_captured_output_tail(
-        &self,
-        agent: &str,
-        generation: i64,
-        turn_id: &str,
-        command_line: &str,
-    ) -> Result<Option<String>> {
-        let agent_num = parse_agent_id(agent)?;
-        let turn = load_turn(&self.connection, agent_num, generation, turn_id)?;
-        let started_at = turn.and_then(|turn| turn.started_at);
-        let mut stmt = self
-            .connection
-            .prepare(
-                "SELECT kind, data FROM events INDEXED BY events_agent
-                 WHERE agent = ?1 AND generation = ?2
-                   AND kind IN ('tool.started', 'tool.completed')
-                   AND (?3 IS NULL OR ts >= ?3)
-                 ORDER BY seq DESC LIMIT 128",
-            )
-            .map_err(sql_error)?;
-        let rows = stmt
-            .query_map(params![agent_num, generation, started_at], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(sql_error)?;
-
-        let mut matching_items = HashSet::new();
-        let mut completed_in_turn: Vec<Value> = Vec::new();
-        let needle = command_line.split_whitespace().next().unwrap_or("");
-        for row in rows {
-            let (kind, raw) = row.map_err(sql_error)?;
-            let Ok(data) = decode_json(&raw) else {
-                continue;
-            };
-            if data.get("turn_id").and_then(Value::as_str) != Some(turn_id) {
-                continue;
-            }
-            if kind == "tool.started" {
-                if let (Some(item_id), Some(cmd)) = (
-                    data.get("item_id").and_then(Value::as_str),
-                    data.get("command").and_then(Value::as_str),
-                ) && !needle.is_empty()
-                    && (cmd.contains(needle) || command_line.contains(cmd.trim()))
-                {
-                    matching_items.insert(item_id.to_owned());
-                }
-            } else if kind == "tool.completed" {
-                completed_in_turn.push(data);
-            }
-        }
-
-        let matched = completed_in_turn.iter().find_map(|data| {
-            let item_id = data.get("item_id").and_then(Value::as_str)?;
-            matching_items
-                .contains(item_id)
-                .then(|| extract_captured_tail(data))
-                .flatten()
-        });
-        Ok(matched)
-    }
-
     pub fn background_wake_prune(&mut self, now: i64, limit: usize) -> Result<usize> {
         validate_limit(limit)?;
         let cutoff = now.saturating_sub(BACKGROUND_WAKE_RETENTION_MS);
@@ -718,12 +784,33 @@ fn background_wake_arm_eligible_tx(
     let Some(agent) = load_agent_by_num(connection, agent_num)? else {
         return Ok(false);
     };
-    if agent.generation != generation || agent.is_terminal() || agent.observe_only {
+    if agent.generation != generation
+        || agent.is_terminal()
+        || agent.observe_only
+        || agent
+            .active_turn
+            .as_deref()
+            .is_some_and(|active| active != turn_id)
+    {
         return Ok(false);
     }
     let Some(turn) = load_turn(connection, agent_num, generation, turn_id)? else {
         return Ok(false);
     };
+    let newer_turn: bool = connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id <> ?3
+                   AND started_at > ?4
+             )",
+            params![agent_num, generation, turn_id, turn.started_at.unwrap_or(0)],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if newer_turn {
+        return Ok(false);
+    }
     if turn.state != TurnState::Completed
         || !matches!(
             turn.outcome,
@@ -796,24 +883,6 @@ fn agent_has_active_stop_tx(
             |row| row.get(0),
         )
         .map_err(sql_error)
-}
-
-fn extract_captured_tail(data: &Value) -> Option<String> {
-    for key in ["output_tail", "error_tail", "stderr_tail", "stdout_tail"] {
-        if let Some(text) = data
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            return Some(text.to_owned());
-        }
-    }
-    data.pointer("/native_error/message")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .map(str::to_owned)
 }
 
 fn decode_record_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<BackgroundWakeRecord>> {

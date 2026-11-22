@@ -78,14 +78,6 @@ impl Router {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
-        if event.kind == "turn.started"
-            && event.source == "stream"
-            && let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation)
-        {
-            self.inner
-                .monitoring
-                .lock_background_baseline(agent, generation);
-        }
         if event.kind == "turn.completed" && event.source == "stream" {
             // Before the fact-note early return, and without the Store lock held.
             if let Err(error) = self.maybe_arm_background_wake(event).await {

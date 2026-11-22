@@ -146,14 +146,21 @@ attachment cannot issue either native stop or other control operations.
 
 The [automatic background-process wake](automation.md#automatic-background-process-wake)
 reads custody only. A candidate is a running `child` of the Agent generation with
-a complete fresh snapshot. It was not running before the first `turn.started`, and
-its exact parent chain (PID and start time, at most 16 links) reaches the live
+a complete fresh snapshot. Its OS start time (Unix ms) lies between the
+generation's first turn start and the completing turn's end, with one second of
+skew for Linux `btime`; sampling order and daemon restarts do not change this. Its
+exact parent chain (PID and start time, at most 16 links) reaches the live
 `harness` process without passing through the plugin. It must also not be
 harness-owned: console hosts, harness runtimes, language servers, and Swarm or
 configured MCP servers. When a candidate's ancestor also qualifies, the ancestor
-wins. On Windows Swarm holds a query handle to the armed identity, so the exact
-exit code survives the harness closing its own handle. Without that handle, the
-exit code comes from custody and may be unknown.
+wins. On Windows Swarm opens a query handle to the armed identity and keeps it
+only once the wake commits, so the exact exit code survives the harness closing
+its own handle. A refused or failed arm, a self-wake and every retirement close
+it. Without a handle (after a restart or a failed open), each check probes the
+exact boot, PID and start time directly and reopens the handle while the process
+runs, so exit detection does not depend on the monitor target. An exit observed
+without a handle has an unknown code unless custody recorded one; on Unix the
+exit code is always unknown.
 
 ## Process observation and terminal ordering
 

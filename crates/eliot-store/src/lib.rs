@@ -242,7 +242,8 @@ mod wakes;
 pub use wakes::{AgentWakeRecord, AgentWakeRunReceipt, AgentWakeTurnReadiness};
 mod background_wakes;
 pub use background_wakes::{
-    BackgroundWakeArmInput, BackgroundWakeRecord, BackgroundWakeServerDeclarations,
+    BackgroundWakeArmContext, BackgroundWakeArmInput, BackgroundWakeRecord,
+    BackgroundWakeToolCommand,
 };
 mod workspace;
 

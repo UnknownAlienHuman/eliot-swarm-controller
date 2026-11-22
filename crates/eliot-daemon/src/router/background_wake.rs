@@ -34,18 +34,18 @@ impl Router {
             return Ok(());
         };
 
-        let (agent, declarations, tool_commands) = {
+        // One short Store read: eligibility (idle or still this turn, no newer
+        // turn) plus bounded fields only.
+        let (agent, context) = {
             let store = self.inner.store.lock().await;
-            if !store.background_wake_arm_eligible(agent_id, generation, turn_id)? {
+            let Some(context) = store.background_wake_arm_context(agent_id, generation, turn_id)?
+            else {
                 return Ok(());
-            }
+            };
             let Some(agent) = store.get_agent(agent_id)? else {
                 return Ok(());
             };
-            let declarations = store.background_wake_server_declarations(agent_id, generation)?;
-            let tool_commands =
-                store.background_wake_tool_commands(agent_id, generation, turn_id)?;
-            (agent, declarations, tool_commands)
+            (agent, context)
         };
 
         let configured_mcp = eliot_core::extract_configured_mcp_programs(&agent.profile_snapshot);
@@ -53,43 +53,56 @@ impl Router {
         let Some(candidate) = self
             .inner
             .monitoring
-            .inspect_running_background_processes(
-                &agent,
-                &configured_mcp,
-                &declarations.declared_pids,
-                &declarations.declared_commands,
-                &tool_commands,
-                &secrets,
-            )
+            .inspect_running_background_processes(&agent, &configured_mcp, &context, &secrets)
             .await?
         else {
             return Ok(());
         };
 
+        let output_tail = match &candidate.tool_item {
+            Some((tool_turn, item_id)) => self
+                .inner
+                .store
+                .lock()
+                .await
+                .background_wake_tool_output_tail(&agent.id, agent.generation, tool_turn, item_id)?
+                .map(|text| bounded_redacted_tail(&text, &secrets)),
+            None => None,
+        };
+        // Held locally and installed only after the wake commits, so every
+        // refusal or error drops (closes) the handle.
+        let pinned = self
+            .inner
+            .monitoring
+            .pin_background_process(&candidate.identity)
+            .await;
         let now = now_ms();
         let expires_at = now.saturating_add(self.inner.background_wake_max_wait_ms);
-        let armed = {
-            let mut store = self.inner.store.lock().await;
-            store.background_wake_arm(
-                &BackgroundWakeArmInput {
-                    agent: agent.id.clone(),
-                    generation: agent.generation,
-                    turn_id: turn_id.to_owned(),
-                    process: candidate.identity,
-                    command_line: candidate.command_line,
-                    command_truncated: candidate.command_truncated,
-                    expires_at,
-                },
-                now,
-            )?
-        };
-        if armed.is_none() {
-            self.inner
-                .monitoring
-                .release_background_wake_pin(&agent.id, agent.generation);
-            return Ok(());
+        let identity = candidate.identity.clone();
+        let armed = self.inner.store.lock().await.background_wake_arm(
+            &BackgroundWakeArmInput {
+                agent: agent.id.clone(),
+                generation: agent.generation,
+                turn_id: turn_id.to_owned(),
+                process: candidate.identity,
+                command_line: candidate.command_line,
+                command_truncated: candidate.command_truncated,
+                output_tail,
+                expires_at,
+            },
+            now,
+        )?;
+        if armed.is_some() {
+            if let Some(pinned) = pinned {
+                self.inner.monitoring.install_background_wake_pin(
+                    &agent.id,
+                    agent.generation,
+                    &identity,
+                    pinned,
+                );
+            }
+            self.signal_progress();
         }
-        self.signal_progress();
         Ok(())
     }
 
@@ -170,18 +183,7 @@ impl Router {
                 .await?;
             match process {
                 Some(record) if record.state == ProcessState::Exited => {
-                    let raw_tail = {
-                        let store = self.inner.store.lock().await;
-                        store.background_wake_captured_output_tail(
-                            &wake.agent,
-                            wake.generation,
-                            &wake.turn_id,
-                            &wake.command_line,
-                        )?
-                    };
-                    let tail = raw_tail
-                        .as_deref()
-                        .map(|text| bounded_redacted_tail(text, &self.secret_policy_snapshot()));
+                    let tail = wake.output_tail.clone();
                     let max_wait_secs = (self.inner.background_wake_max_wait_ms / 1_000).max(1);
                     let body = eliot_core::format_background_wake_note_body(
                         "exited",
@@ -542,7 +544,7 @@ fn bounded_redacted_tail(raw: &str, secrets: &SecretPolicy) -> String {
             }
         })
         .collect();
-    let redacted = secrets.redact_text(cleaned.trim());
+    let redacted = eliot_core::redact_secret_shapes(&secrets.redact_text(cleaned.trim()));
     let limit = eliot_core::MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES;
     if redacted.len() <= limit {
         return redacted;

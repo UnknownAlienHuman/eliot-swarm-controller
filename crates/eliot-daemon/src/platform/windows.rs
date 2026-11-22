@@ -1140,6 +1140,12 @@ pub(crate) struct PinnedProcess {
     handle: QueryHandle,
 }
 
+/// Creation FILETIME (100 ns since 1601) to Unix milliseconds.
+pub(crate) fn process_start_unix_ms(start_time: u64) -> Option<i64> {
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+    i64::try_from(start_time.checked_sub(UNIX_EPOCH_FILETIME)? / 10_000).ok()
+}
+
 pub(crate) fn pin_process(identity: &ProcessIdentity) -> Option<PinnedProcess> {
     if identity.pid == 0 || identity.start_time == 0 {
         return None;

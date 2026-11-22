@@ -120,8 +120,6 @@ struct ObserveTracker {
     warned_growth: HashSet<&'static str>,
     emitted_heavy: HashSet<String>,
     harness: Option<String>,
-    baseline_children: HashSet<ProcessIdentity>,
-    baseline_locked: bool,
     ancestry: HashMap<u32, (u64, Option<u32>)>,
 }
 
@@ -158,6 +156,9 @@ pub(crate) struct BackgroundProcessCandidate {
     pub(crate) identity: ProcessIdentity,
     pub(crate) command_line: String,
     pub(crate) command_truncated: bool,
+    /// `(turn_id, item_id)` of the native tool whose exact command the OS
+    /// command line contains.
+    pub(crate) tool_item: Option<(String, String)>,
 }
 
 #[derive(Clone, Default)]
@@ -539,12 +540,6 @@ impl Monitoring {
         }
     }
 
-    pub(crate) fn lock_background_baseline(&self, agent: &str, generation: i64) {
-        if let Some(target) = self.target(agent, generation) {
-            target.observe.lock_recover().baseline_locked = true;
-        }
-    }
-
     pub(crate) fn release_background_wake_pin(&self, agent: &str, generation: i64) {
         if let Some(target) = self.target(agent, generation) {
             *target.pinned_wake.lock_recover() = None;
@@ -552,14 +547,13 @@ impl Monitoring {
     }
 
     /// Fresh-sample `agent`'s custody tree and pick the newest running
-    /// non-server descendant under its verified native harness session.
+    /// non-server descendant under its verified native harness session whose
+    /// start time lies inside the arm context's window.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
         configured_mcp_programs: &[String],
-        declared_pids: &HashSet<u32>,
-        declared_commands: &[String],
-        tool_commands: &[String],
+        context: &eliot_store::BackgroundWakeArmContext,
         secrets: &eliot_core::SecretPolicy,
     ) -> Result<Option<BackgroundProcessCandidate>> {
         let Some(target) = self.target(&agent.id, agent.generation) else {
@@ -639,7 +633,7 @@ impl Monitoring {
         .await
         .map_err(|_| Error::new("process_observation", "background process inspect failed"))?;
 
-        let (baseline_children, ancestry) = {
+        let ancestry = {
             let mut tracker = target.observe.lock_recover();
             for sample in &snapshot.samples {
                 if let Some(node) = nodes.get(&sample.record.identity.pid) {
@@ -657,7 +651,7 @@ impl Monitoring {
                     .collect();
                 tracker.ancestry.retain(|pid, _| current_pids.contains(pid));
             }
-            (tracker.baseline_children.clone(), tracker.ancestry.clone())
+            tracker.ancestry.clone()
         };
 
         let mut qualifying: Vec<(&ProcessSample, &crate::platform::ProcessNodeInfo, Vec<u32>)> =
@@ -668,7 +662,13 @@ impl Monitoring {
             if sample.record.role != "child" || sample.record.state != ProcessState::Running {
                 continue;
             }
-            if baseline_children.contains(&sample.record.identity) {
+            if context.woken.contains(&sample.record.identity)
+                || !crate::platform::process_start_unix_ms(sample.record.identity.start_time)
+                    .is_some_and(|started| {
+                        started >= context.window_start.saturating_sub(START_SKEW_MS)
+                            && started <= context.window_end.saturating_add(START_SKEW_MS)
+                    })
+            {
                 continue;
             }
             let Some(chain) = harness_descendant_chain(
@@ -693,8 +693,8 @@ impl Monitoring {
             ) {
                 continue;
             }
-            let declared_server = declared_pids.contains(&sample.record.identity.pid)
-                || matches_declared_command(node, declared_commands);
+            let declared_server = context.declared_pids.contains(&sample.record.identity.pid)
+                || matches_declared_command(node, &context.declared_commands);
             if declared_server {
                 server_ancestor_pids.extend(chain);
                 continue;
@@ -721,24 +721,39 @@ impl Monitoring {
             return Ok(None);
         };
 
-        let pin_identity = winner_sample.record.identity.clone();
-        let pinned =
-            tokio::task::spawn_blocking(move || crate::platform::pin_process(&pin_identity))
-                .await
-                .ok()
-                .flatten();
-        if let Some(pinned) = pinned {
-            *target.pinned_wake.lock_recover() =
-                Some((winner_sample.record.identity.clone(), pinned));
-        }
-
-        let (command_line, command_truncated) =
-            bounded_command_line(winner_node, tool_commands, secrets);
+        let (command_line, command_truncated, tool_item) =
+            bounded_command_line(winner_node, &context.tool_commands, secrets);
         Ok(Some(BackgroundProcessCandidate {
             identity: winner_sample.record.identity.clone(),
             command_line,
             command_truncated,
+            tool_item,
         }))
+    }
+
+    /// Open a query handle to the exact identity. The caller installs it only
+    /// after the wake commits; dropping it closes the handle.
+    pub(crate) async fn pin_background_process(
+        &self,
+        identity: &ProcessIdentity,
+    ) -> Option<crate::platform::PinnedProcess> {
+        let identity = identity.clone();
+        tokio::task::spawn_blocking(move || crate::platform::pin_process(&identity))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub(crate) fn install_background_wake_pin(
+        &self,
+        agent: &str,
+        generation: i64,
+        identity: &ProcessIdentity,
+        pinned: crate::platform::PinnedProcess,
+    ) {
+        if let Some(target) = self.target(agent, generation) {
+            *target.pinned_wake.lock_recover() = Some((identity.clone(), pinned));
+        }
     }
 
     /// Observe live/exit status for one armed background-process wake, reading
@@ -788,11 +803,78 @@ impl Monitoring {
             }
             return Ok(Some(record));
         }
-        if force_sample && let Some(target) = target {
-            let _ = self.sample_target(&target).await;
+        if let Some((ProcessState::Running, _)) = pin_poll {
+            return Ok(Some(self.wake_process_record(
+                agent,
+                identity,
+                ProcessState::Running,
+                None,
+            )));
         }
-        let store = self.inner.store.lock().await;
-        store.agent_wake_process(&agent.id, agent.generation, identity)
+        // No usable handle (daemon restart, missing target or failed pin):
+        // probe the exact identity directly instead of trusting sampling.
+        let probe_identity = identity.clone();
+        let alive = tokio::task::spawn_blocking(move || {
+            crate::platform::exact_process_alive(&probe_identity)
+        })
+        .await
+        .map_err(|_| Error::new("process_observation", "background process probe failed"))?;
+        match alive {
+            Ok(true) => {
+                if let Some(target) = target
+                    && target.pinned_wake.lock_recover().is_none()
+                    && let Some(pinned) = self.pin_background_process(identity).await
+                {
+                    *target.pinned_wake.lock_recover() = Some((identity.clone(), pinned));
+                }
+                Ok(Some(self.wake_process_record(
+                    agent,
+                    identity,
+                    ProcessState::Running,
+                    None,
+                )))
+            }
+            Ok(false) => {
+                let recorded = self.inner.store.lock().await.agent_wake_process(
+                    &agent.id,
+                    agent.generation,
+                    identity,
+                )?;
+                let exit_code = recorded
+                    .filter(|record| record.state == ProcessState::Exited)
+                    .and_then(|record| record.exit_code);
+                Ok(Some(self.wake_process_record(
+                    agent,
+                    identity,
+                    ProcessState::Exited,
+                    exit_code,
+                )))
+            }
+            Err(_) => {
+                if force_sample && let Some(target) = target {
+                    let _ = self.sample_target(&target).await;
+                }
+                let store = self.inner.store.lock().await;
+                store.agent_wake_process(&agent.id, agent.generation, identity)
+            }
+        }
+    }
+
+    fn wake_process_record(
+        &self,
+        agent: &Agent,
+        identity: &ProcessIdentity,
+        state: ProcessState,
+        exit_code: Option<i32>,
+    ) -> ProcessRecord {
+        ProcessRecord {
+            identity: identity.clone(),
+            owner: owner(&agent.id, agent.generation),
+            role: "child".to_owned(),
+            state,
+            exit_code,
+            updated_at: now_ms(),
+        }
     }
 
     pub(crate) async fn view(&self, agent: &Agent) -> Result<ObservationView> {
@@ -2057,14 +2139,6 @@ impl Monitoring {
                 if sample.record.role != "child" {
                     continue;
                 }
-                if !tracker.baseline_locked
-                    && sample.record.state == ProcessState::Running
-                    && tracker.baseline_children.len() < 1_024
-                {
-                    tracker
-                        .baseline_children
-                        .insert(sample.record.identity.clone());
-                }
                 let key = episode_key(&sample.record.identity);
                 seen.insert(key.clone());
                 if let Some(open) = tracker.episodes.get_mut(&key) {
@@ -2559,6 +2633,9 @@ fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
     }
 }
 
+/// Linux converts start ticks with whole-second `btime`.
+const START_SKEW_MS: i64 = 1_000;
+
 fn harness_descendant_chain(
     pid: u32,
     start_time: u64,
@@ -2634,13 +2711,14 @@ fn matches_declared_command(
     })
 }
 
-/// Display text for the woken process: the plugin-reported native tool command
-/// when the OS command line contains it verbatim, else the OS command line.
+/// Display text for the woken process: the exact plugin-reported native tool
+/// command (and its item id) when the OS command line contains it verbatim,
+/// else the OS command line. Known secrets and common secret shapes are masked.
 fn bounded_command_line(
     node: &crate::platform::ProcessNodeInfo,
-    tool_commands: &[String],
+    tool_commands: &[eliot_store::BackgroundWakeToolCommand],
     secrets: &eliot_core::SecretPolicy,
-) -> (String, bool) {
+) -> (String, bool, Option<(String, String)>) {
     let raw = node
         .command_line
         .as_deref()
@@ -2654,21 +2732,21 @@ fn bounded_command_line(
                 .map(|path| path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned())
         })
         .unwrap_or_else(|| format!("pid {}", node.pid));
-    let raw = tool_commands
+    let native = tool_commands
         .iter()
-        .map(|command| command.trim())
-        .filter(|command| !command.is_empty() && raw.contains(command))
-        .max_by_key(|command| command.len())
-        .map_or(raw.clone(), str::to_owned);
+        .filter(|tool| !tool.command.is_empty() && raw.contains(tool.command.as_str()))
+        .max_by_key(|tool| tool.command.len());
+    let item_id = native.map(|tool| (tool.turn_id.clone(), tool.item_id.clone()));
+    let raw = native.map_or(raw.clone(), |tool| tool.command.clone());
     let sanitized: String = raw
         .chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect();
-    let redacted = secrets.redact_text(sanitized.trim());
+    let redacted = eliot_core::redact_secret_shapes(&secrets.redact_text(sanitized.trim()));
     let limit = eliot_core::MAX_BACKGROUND_WAKE_COMMAND_BYTES;
     if redacted.len() <= limit {
-        return (redacted, false);
+        return (redacted, false, item_id);
     }
     let end = redacted.floor_char_boundary(limit);
-    (redacted[..end].to_owned(), true)
+    (redacted[..end].to_owned(), true, item_id)
 }

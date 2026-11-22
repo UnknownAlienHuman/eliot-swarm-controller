@@ -203,6 +203,118 @@ pub fn is_harness_owned_process(
     saw_mcp && saw_stdio
 }
 
+const SECRET_MASK: &str = "***";
+const SECRET_QUOTES: &[char] = &['"', '\'', '`'];
+const SECRET_FLAG_WORDS: &[&str] = &[
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "api-key",
+    "api_key",
+    "apikey",
+    "private-key",
+];
+const SECRET_NAME_WORDS: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "API_KEY", "APIKEY"];
+
+/// Mask common secret shapes in a command line or output tail: the value of a
+/// `--password`, `--token`, `--secret` or `--api-key` style flag (`--flag v` or
+/// `--flag=v`), an `Authorization:` header value, a `Bearer` credential, and
+/// `NAME=value` where NAME contains TOKEN, SECRET, PASSWORD or API_KEY. This is
+/// shape-based and best effort; it runs after literal known-secret redaction.
+pub fn redact_secret_shapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut mask_next = false;
+    let mut rest = text;
+    while !rest.is_empty() {
+        let space = rest.len() - rest.trim_start().len();
+        out.push_str(&rest[..space]);
+        rest = &rest[space..];
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        if end == 0 {
+            break;
+        }
+        let token = &rest[..end];
+        rest = &rest[end..];
+        let core = token.trim_matches(SECRET_QUOTES).to_ascii_lowercase();
+        if mask_next {
+            if matches!(core.as_str(), "bearer" | "basic" | "token" | "digest") {
+                out.push_str(token);
+                continue;
+            }
+            out.push_str(&mask_value(token, 0));
+            mask_next = false;
+            continue;
+        }
+        if let Some(flag) = core.strip_prefix('-') {
+            let flag = flag.trim_start_matches('-');
+            match flag.split_once('=') {
+                Some((name, value)) if is_secret_flag(name) && !value.is_empty() => {
+                    let at = token.find('=').map_or(token.len(), |index| index + 1);
+                    out.push_str(&mask_value(token, at));
+                }
+                None if is_secret_flag(flag) => {
+                    out.push_str(token);
+                    mask_next = true;
+                }
+                _ => out.push_str(token),
+            }
+            continue;
+        }
+        if let Some(value) = core.strip_prefix("authorization:") {
+            if value.is_empty() || matches!(value, "bearer" | "basic" | "token" | "digest") {
+                out.push_str(token);
+                mask_next = true;
+            } else {
+                let at = token.find(':').map_or(token.len(), |index| index + 1);
+                out.push_str(&mask_value(token, at));
+            }
+            continue;
+        }
+        if core == "bearer" {
+            out.push_str(token);
+            mask_next = true;
+            continue;
+        }
+        let trimmed = token.trim_start_matches(SECRET_QUOTES);
+        if let Some((name, value)) = trimmed.split_once('=')
+            && !name.is_empty()
+            && !value.trim_matches(SECRET_QUOTES).is_empty()
+            && name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            && SECRET_NAME_WORDS
+                .iter()
+                .any(|word| name.to_ascii_uppercase().contains(word))
+        {
+            let at = token.find('=').map_or(token.len(), |index| index + 1);
+            out.push_str(&mask_value(token, at));
+            continue;
+        }
+        out.push_str(token);
+    }
+    out
+}
+
+fn is_secret_flag(name: &str) -> bool {
+    SECRET_FLAG_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// Keep `token[..at]` and surrounding quotes; replace the value with the mask.
+fn mask_value(token: &str, at: usize) -> String {
+    let (prefix, value) = token.split_at(at.min(token.len()));
+    let lead = value.len() - value.trim_start_matches(SECRET_QUOTES).len();
+    let trail = value.len() - value.trim_end_matches(SECRET_QUOTES).len();
+    if lead + trail >= value.len() {
+        return token.to_owned();
+    }
+    format!(
+        "{prefix}{}{SECRET_MASK}{}",
+        &value[..lead],
+        &value[value.len() - trail..]
+    )
+}
+
 /// Format the body of the `#888` Swarm note delivered for an automatic background wake.
 pub fn format_background_wake_note_body(
     outcome_kind: &str,

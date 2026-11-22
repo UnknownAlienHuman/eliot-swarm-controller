@@ -103,6 +103,48 @@ pub(crate) fn inspect_process_node(pid: u32) -> Option<ProcessNodeInfo> {
     }
 }
 
+/// Wall-clock Unix milliseconds of a custody `start_time` (Windows creation
+/// FILETIME, Linux ticks since boot). `None` when the platform cannot convert.
+pub(crate) fn process_start_unix_ms(start_time: u64) -> Option<i64> {
+    #[cfg(windows)]
+    {
+        windows::process_start_unix_ms(start_time)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unix::process_start_unix_ms(start_time)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = start_time;
+        None
+    }
+}
+
+/// Whether this exact identity (boot, PID, start time) is still running. A
+/// different boot, missing or reused PID is not that process.
+pub(crate) fn exact_process_alive(identity: &eliot_core::ProcessIdentity) -> Result<bool> {
+    #[cfg(windows)]
+    {
+        if windows::host_boot_id()? != identity.host_boot_id {
+            return Ok(false);
+        }
+        windows::recorded_process_alive(identity.pid, identity.start_time)
+    }
+    #[cfg(unix)]
+    {
+        if unix::host_boot_id()? != identity.host_boot_id {
+            return Ok(false);
+        }
+        unix::recorded_process_alive(identity.pid, identity.start_time)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = identity;
+        Err(Error::new("unsupported", "process liveness is unavailable"))
+    }
+}
+
 #[cfg(windows)]
 pub(crate) use windows::{PinnedProcess, pin_process};
 

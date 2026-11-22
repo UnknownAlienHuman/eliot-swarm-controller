@@ -1248,6 +1248,27 @@ pub(crate) fn resolve_heavy_category(pid: u32) -> Option<CommandClass> {
 
 pub(crate) struct PinnedProcess;
 
+/// Ticks since boot (`/proc/<pid>/stat` field 22) to Unix milliseconds using
+/// `btime` from `/proc/stat` (whole seconds, so up to one second early).
+#[cfg(target_os = "linux")]
+pub(crate) fn process_start_unix_ms(start_ticks: u64) -> Option<i64> {
+    let stat = fs::read_to_string("/proc/stat").ok()?;
+    let btime: i64 = stat
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a process-independent numeric limit.
+    let ticks_per_second = i64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
+        .ok()
+        .filter(|n| *n > 0)?;
+    let ticks = i64::try_from(start_ticks).ok()?;
+    btime
+        .checked_mul(1_000)?
+        .checked_add(ticks.checked_mul(1_000)? / ticks_per_second)
+}
+
 pub(crate) fn pin_process(_identity: &eliot_core::ProcessIdentity) -> Option<PinnedProcess> {
     None
 }
