@@ -105,6 +105,7 @@ async fn run_inner(cli: Cli) -> ExitCode {
                 CliCommand::Daemon(_)
                     | CliCommand::Stand(_)
                     | CliCommand::Status
+                    | CliCommand::Autonomy(_)
                     | CliCommand::Mcp(_)
                     | CliCommand::Store(_)
             ) {

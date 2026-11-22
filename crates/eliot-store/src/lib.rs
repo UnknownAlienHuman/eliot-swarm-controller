@@ -4,6 +4,7 @@
 
 mod assignment;
 mod attention_steps;
+mod autonomy;
 mod canonical;
 mod capacity;
 mod launch_queue;

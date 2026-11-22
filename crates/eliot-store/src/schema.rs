@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 85;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 86;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2083,6 +2083,18 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (85);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 86 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            for indexes in autonomy::INDEXES {
+                tx.execute_batch(indexes).map_err(sql_error)?;
+            }
+            tx.execute("INSERT INTO schema_migrations(version) VALUES (86)", [])
+                .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

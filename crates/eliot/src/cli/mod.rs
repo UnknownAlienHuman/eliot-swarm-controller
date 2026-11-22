@@ -3,6 +3,7 @@
 //! module only routes a parsed command to the owning family runner.
 mod agents;
 pub(crate) mod args;
+mod autonomy;
 mod autostart;
 mod cleanup;
 mod coord;
@@ -43,6 +44,7 @@ pub(crate) async fn dispatch(
         CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,
+        CliCommand::Autonomy(args) => autonomy::run(args, &data_dir, json_output).await,
         CliCommand::Maintenance(args) => daemon::run_maintenance(args, data_dir, json_output).await,
         CliCommand::Store(args) => store::run_store(args, data_dir, json_output),
         CliCommand::Provider(args) => rules::run_provider(args, data_dir, json_output, id).await,

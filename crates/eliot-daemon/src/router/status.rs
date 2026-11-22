@@ -4,7 +4,7 @@ use super::{Router, STATUS_BLOCKER_MAX};
 use eliot_core::{
     AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
-        DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
+        AutonomyRequest, DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
         RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
         UnsettledCommandSummary, WorkspaceCustodyView,
     },
@@ -14,6 +14,26 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 impl Router {
+    pub(super) async fn autonomy(&self, request: AutonomyRequest) -> Result<Value> {
+        let until = super::now_ms();
+        let since = request.since(until)?;
+        let permit = self
+            .inner
+            .autonomy_reader
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::new("unavailable", "an autonomy report is already running"))?;
+        let path = self.inner.data_root.join("eliot.db");
+        let report = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            eliot_store::Store::read_autonomy(&path, since, until)
+        })
+        .await
+        .map_err(|_| Error::new("internal", "autonomy reader failed"))??;
+        serde_json::to_value(report)
+            .map_err(|_| Error::new("internal", "autonomy report could not be encoded"))
+    }
+
     pub(super) async fn status(&self) -> Result<Value> {
         let claude_profile_command_issues = self.claude_profile_command_issues(None).await;
         let blockers = self.status_blockers().await?;

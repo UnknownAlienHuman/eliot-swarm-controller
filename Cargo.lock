@@ -519,6 +519,7 @@ dependencies = [
  "eliot-plugin-muse",
  "eliot-plugin-opencode",
  "futures-util",
+ "humantime",
  "jsonwebtoken",
  "libc",
  "reqwest",

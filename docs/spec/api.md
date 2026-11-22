@@ -474,6 +474,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | --- | --- |
 | `api.methods/help/identity` | bounded authenticated method discovery, compact DTO fields/examples, and credential-free caller scope |
 | `daemon.status/shutdown` | owner-only current state/admission and exact drain/force |
+| `autonomy.get` | Owner-only windowed autonomy counts and source coverage |
 | `maintenance.run` | owner-only immediate bounded retention pass reporting pruned counts |
 | `maintenance.purge_legacy_attention_advisories` | owner-only dry-run count and exact-count purge of owner-sent legacy advisory-attention mail |
 | `agent.list/get/result` | scoped, paginated Agent state and exact results |
@@ -756,6 +757,16 @@ Absent source cursors and sequence/acknowledgement values remain null.
 When explicit Claude profile cmd paths no longer exist, status and doctor return
 `claude_profile_command_issues` with the configured path, discovered replacement
 path/version, and one-command repair when a replacement is installed.
+
+`autonomy.get` is an Owner-only read for CLI, desktop and authenticated cloud
+MCP callers. Its [Core request and response](../../crates/eliot-core/src/api/autonomy.rs)
+use Unix milliseconds. Omit `since_ms` for the last 24 hours. An explicit
+start must be between the Unix epoch and the daemon's current time, inclusive.
+The return value gives the inclusive window used and one coverage label per row.
+The [monitoring contract](monitoring.md#swarm-autonomy) defines the sources and
+counting rules. `swarm autonomy` renders the same DTO in text or with `--json`.
+`--since` accepts an RFC 3339 timestamp, Unix milliseconds, or a relative duration
+such as `48h`. This read requires a running daemon.
 
 `daemon.status` includes `build_identity`: the package version with a short Git
 revision suffix (or `git-unknown` when built without an available repository),
@@ -2781,6 +2792,7 @@ swarm daemon update <RELEASE> [--wait-seconds N]
 swarm stand up [--root PATH] [--profile FILE] [--binary PATH]
 swarm stand down <PATH>
 swarm status
+swarm autonomy [--since TIME] [--json]
 swarm store compact
 swarm cleanup plan [--after TOKEN]
 swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
