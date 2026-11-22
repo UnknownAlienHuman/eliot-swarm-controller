@@ -105,6 +105,11 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
+    // This start ends the Owner's previous stop: a later exit without a
+    // new `daemon.shutdown` is a failure the desktop may restart.
+    if let Err(error) = data_dir.clear_owner_stop(&daemon_lock) {
+        logging::record(&policy, "daemon.owner_stop_clear_failed", &[], Some(&error));
+    }
     // `[daemon] log_level` sets process verbosity at startup; an invalid
     // value fails startup like invalid retention or mail config.
     let daemon_config = crate::config::load_daemon_config(data_dir.path()).map_err(|error| {

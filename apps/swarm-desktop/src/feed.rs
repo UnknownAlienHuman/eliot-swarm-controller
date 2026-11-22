@@ -211,7 +211,10 @@ pub fn reread(
 
 /// Run `future`, giving up promptly when the UI cancelled this task. A
 /// dropped read only closes its IPC connection; it has no side effect.
-async fn cancellable<F: Future>(future: F, cancelled: &dyn Fn() -> bool) -> Option<F::Output> {
+pub(crate) async fn cancellable<F: Future>(
+    future: F,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<F::Output> {
     let mut future = std::pin::pin!(future);
     loop {
         tokio::select! {

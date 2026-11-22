@@ -5470,6 +5470,16 @@ impl Router {
                 Ordering::SeqCst,
             );
             self.inner.shutdown_ready.store(false, Ordering::SeqCst);
+            // The Owner asked: a desktop must not start this daemon again
+            // on its own (a crash leaves no marker and is restarted).
+            if let Err(error) = crate::platform::data_dir::mark_owner_stop(&self.inner.data_root) {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.owner_stop_mark_failed",
+                    &[],
+                    Some(&error),
+                );
+            }
             if mode == ShutdownMode::Force {
                 self.inner.workspaces.close_startup_admission();
                 self.inner.plugin_host.close_startup_admission();

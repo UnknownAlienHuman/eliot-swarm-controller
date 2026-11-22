@@ -2448,6 +2448,9 @@ same reply, including the original drain blocker snapshot; use owner-only
 `id_conflict`. A retained reply written before the drain report existed carries no
 `drain` field and still validates; a present report always validates.
 Force admission is monotonic; a later, in-flight, or replayed drain cannot downgrade it.
+An admitted shutdown of either mode writes the data directory's `owner-stop` marker
+(see [configuration](configuration.md)) before it replies, so a desktop does not
+start the stopped daemon again on its own; the next daemon start clears it.
 
 Drain is a pure read-side report: no effects run before the shutdown-ID claim, and
 the pre-change effect behavior is unchanged. Drain returns `state:"applied"` with an

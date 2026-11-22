@@ -48,14 +48,31 @@ pub(super) enum Panel {
 pub(super) enum ShellMsg {
     AutoSettings,
     RepairSettings,
+    /// Start the daemon again on the same data directory.
     RetryStartup,
     /// Open this data directory's editable daemon configuration.
     OpenStartupConfig,
+    /// Open the daemon's log (`logs\daemon.log`).
+    OpenStartupLog,
+    /// Show the data directory in File Explorer.
+    OpenDataFolder,
     /// The daemon runs (started when needed), the opened checkout was
     /// discovered, and the settings were read.
     DaemonReady(MutationResult<(Option<String>, eliot_core::api::SettingsReadResponse)>),
-    /// The owner chose a fresh private data directory (unsafe default).
+    /// What `daemon.status` found after a failed read (or while stopped).
+    LinkProbed(super::link_ui::Probe),
+    /// The owner chose another existing Swarm data directory.
+    ChooseDataDirectory,
+    /// The owner asked for a new, empty private data directory (the last
+    /// choice): confirm first.
     UseFreshDirectory,
+    /// The new empty data directory was confirmed (or cancelled).
+    FreshConfirmed(bool),
+    /// A chosen data directory, checked on a worker, to start on (or why
+    /// not).
+    CandidateChecked(Result<PathBuf, String>),
+    /// The new data directory runs: whether it was remembered.
+    RootRemembered(PathBuf, Result<(), String>),
     ProjectsLoaded(Fallible<Vec<UiProject>>),
     /// The sidebar's grouping readback (`chat.organization` groups with
     /// their headers and totals, and the `organization.changed` rows since
@@ -326,12 +343,15 @@ impl DesktopApp {
             ShellMsg::RepairSettings => {
                 self.open_settings(Some(Page::Advanced), context);
             }
-            ShellMsg::RetryStartup => {
-                if let Ok(data_dir) = self.data_dir.clone() {
-                    self.startup_error = None;
-                    self.start_connection(data_dir, context);
-                }
-            }
+            ShellMsg::RetryStartup => self.retry_startup(context),
+            ShellMsg::OpenStartupLog => self.open_in_data_dir(&["logs", "daemon.log"]),
+            ShellMsg::OpenDataFolder => self.open_in_data_dir(&[]),
+            ShellMsg::LinkProbed(probed) => self.link_probed(probed, context),
+            ShellMsg::ChooseDataDirectory => self.choose_data_dir(context),
+            ShellMsg::UseFreshDirectory => self.link.confirm_fresh = true,
+            ShellMsg::FreshConfirmed(confirmed) => self.fresh_confirmed(confirmed, context),
+            ShellMsg::CandidateChecked(checked) => self.candidate_checked(checked, context),
+            ShellMsg::RootRemembered(root, remembered) => self.root_remembered(root, remembered),
             ShellMsg::OpenStartupConfig => {
                 if let Ok(data_dir) = &self.data_dir
                     && let Err(error) =
@@ -343,18 +363,19 @@ impl DesktopApp {
             ShellMsg::DaemonReady(result) => match result {
                 Ok((discovered, read)) => {
                     self.startup_error = None;
+                    let restarted = self.link_ready(context);
                     let before = self.palette();
                     self.prefs = crate::settings::Preferences::from_reply(&read);
                     self.palette_changed(before, context);
                     self.nav.collapsed = self.prefs.collapsed.iter().cloned().collect();
                     self.launch_preferences_loaded();
                     self.seed_settings(read, context);
+                    let first_connection = !self.preferences_loaded;
                     // The opened checkout, registered by discovery, is where
-                    // a new task starts.
-                    if let Some(checkout) = discovered {
+                    // a new task starts (a restart keeps the folder chosen).
+                    if let Some(checkout) = discovered.filter(|_| !restarted) {
                         self.launch.workspace = checkout;
                     }
-                    let first_connection = !self.preferences_loaded;
                     self.preferences_loaded = true;
                     self.load_agents(context, None);
                     self.load_organization(context);
@@ -371,38 +392,22 @@ impl DesktopApp {
                     }
                     if first_connection {
                         self.watch_list(context);
+                    } else {
+                        // Reconnected: the open conversation and the panel
+                        // (the Monitor or the details, one refresh chain)
+                        // read again from the daemon.
+                        self.set_status("Swarm is running again.");
+                        self.load_queue(context);
+                        if self.chat.convo.is_some() {
+                            self.start_snapshot(context);
+                        }
+                        if self.panel != Panel::Closed {
+                            self.read_monitor(0, context);
+                        }
                     }
                 }
-                Err(error) => {
-                    self.startup_error = Some(error);
-                }
+                Err(error) => self.link_failed(error, context),
             },
-            ShellMsg::UseFreshDirectory => {
-                if let Ok(original) = client::data_dir() {
-                    let fresh = original
-                        .with_file_name(format!("Eliot-private-{}", client::new_mutation_id()));
-                    match eliot_daemon::bootstrap::ensure_private_data_dir(&fresh).and_then(
-                        |selected| {
-                            eliot_daemon::persist_selected_root(&selected).map(|()| selected)
-                        },
-                    ) {
-                        Ok(selected) => {
-                            self.data_dir = Ok(selected.clone());
-                            self.startup_error = None;
-                            self.note_window_size();
-                            self.alert = None;
-                            self.set_status(format!(
-                                "Starting in fresh private directory {}",
-                                selected.display()
-                            ));
-                            self.start_connection(selected, context);
-                        }
-                        Err(error) => {
-                            self.alert(format!("Cannot select fresh private directory: {error}"))
-                        }
-                    }
-                }
-            }
             ShellMsg::OrganizationLoaded(read) => {
                 self.nav.organization_loading = false;
                 let read = *read;
@@ -423,6 +428,9 @@ impl DesktopApp {
                 if changed > 0 {
                     self.refresh_search();
                 }
+                if read.stale {
+                    self.link_suspect(context);
+                }
             }
             ShellMsg::QueueLoaded(read) => {
                 self.nav.queue_loading = false;
@@ -434,8 +442,12 @@ impl DesktopApp {
                 }
                 organization.intents = read.intents;
                 organization.missing_intents = read.missing;
+                let failed = !read.errors.is_empty();
                 organization.queue_errors = read.errors;
                 self.settle_queued_launches(context);
+                if failed {
+                    self.link_suspect(context);
+                }
             }
             ShellMsg::ProjectsLoaded(projects) => match projects {
                 Ok(projects) => {
@@ -531,7 +543,7 @@ impl DesktopApp {
                         if self.nav.show_archived && error.contains("(k92)") {
                             self.nav.show_archived = false;
                         }
-                        self.alert(format!("Agents not read: {error}"));
+                        self.read_failed(format!("Agents not read: {error}"), context);
                     }
                 }
             }
@@ -551,7 +563,7 @@ impl DesktopApp {
                         self.refresh_search();
                     }
                     Err(error) => {
-                        self.alert(format!("Agents not read: {error}"));
+                        self.read_failed(format!("Agents not read: {error}"), context);
                     }
                 }
             }
@@ -566,7 +578,7 @@ impl DesktopApp {
                         self.refresh_search();
                     }
                     Err(error) => {
-                        self.alert(format!("Agents not read: {error}"));
+                        self.read_failed(format!("Agents not read: {error}"), context);
                     }
                 }
             }
@@ -963,7 +975,13 @@ impl DesktopApp {
                 // its own worker, so the grouping reads never delay an
                 // arbiter's admission or refusal.
                 // Every message renders the whole window (k209), so the
-                // refresh's reads reply together, as one message.
+                // refresh's reads reply together, as one message. While no
+                // daemon answers, the restart owns the connection attempts.
+                if self.daemon_down() {
+                    self.link_watch(context);
+                    self.watch_list(context);
+                    return;
+                }
                 self.nav.batch = Some(Vec::new());
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
@@ -1052,9 +1070,6 @@ impl DesktopApp {
 
     /// Open Settings, at `page` when given.
     fn open_settings(&mut self, page: Option<settings_ui::Page>, context: &ComponentContext<Self>) {
-        if self.startup_error.is_some() && !self.repairing_settings() {
-            return;
-        }
         self.close_popover();
         let reopened = self.main != Main::Settings;
         let page_changed = page.is_some_and(|page| page != self.settings_page);
@@ -1068,16 +1083,16 @@ impl DesktopApp {
         }
     }
 
+    /// No daemon runs: Settings reads and writes the file under the
+    /// daemon lock with its own reader and writer (offline repair).
     pub(super) fn repairing_settings(&self) -> bool {
-        self.startup_error.as_ref().is_some_and(|error| {
-            error.failure_where.as_deref() == Some(eliot_daemon::startup::CONFIG_STARTUP_LOCATION)
-        })
+        self.startup_error.is_some()
     }
 
     /// Where the owner is now, for Back and Forward (nothing while the
     /// daemon is not reached).
     pub(super) fn location(&self) -> Option<Location> {
-        if self.startup_error.is_some() && self.main != Main::Settings {
+        if self.link_view_shown() && self.main != Main::Settings {
             return None;
         }
         Some(match self.main {
@@ -1567,7 +1582,7 @@ impl DesktopApp {
     /// too narrow to keep the task area at its minimum beside the sidebar
     /// (and the open panel); Settings always shows its navigation.
     fn rail_shown(&self) -> bool {
-        if self.main == Main::Settings || self.startup_error.is_some() {
+        if self.main == Main::Settings || self.link_view_shown() {
             return false;
         }
         let panel = if self.panel_shown() {
@@ -1584,9 +1599,7 @@ impl DesktopApp {
     /// The right panel belongs to the conversation: Settings shows two
     /// columns (its navigation and the page), as in the Codex app.
     fn panel_shown(&self) -> bool {
-        self.panel != Panel::Closed
-            && self.main == Main::Conversation
-            && self.startup_error.is_none()
+        self.panel != Panel::Closed && self.main == Main::Conversation && !self.link_view_shown()
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -1621,36 +1634,64 @@ impl DesktopApp {
         }
     }
 
-    /// Start the daemon when needed (Owner only, the sibling `swarm.exe`),
-    /// register the checkout `--workspace` named (only that: registering a
-    /// project is the owner's explicit act), then read the settings.
-    pub(super) fn start_connection(&self, data_dir: PathBuf, context: &ComponentContext<Self>) {
+    /// After `delay_ms`, start the daemon when needed (Owner only, the
+    /// sibling `swarm.exe`), register the checkout `--workspace` named (only
+    /// that: registering a project is the owner's explicit act), then read
+    /// the settings.
+    /// A cancelled task (superseded, or the window closing) starts
+    /// nothing: its pause and its readiness wait end at the cancellation.
+    pub(super) fn start_connection(
+        &self,
+        data_dir: PathBuf,
+        delay_ms: u64,
+        context: &ComponentContext<Self>,
+    ) -> ComponentTask {
         let workspace = self.opened_workspace.clone();
-        let _task = context.spawn_background(move |_| {
-            let result = client::block_on(async {
-                let executable = std::env::current_exe()
-                    .map_err(|_| {
-                        eliot_core::Error::new("platform_io", "cannot locate desktop executable")
-                    })?
-                    .with_file_name("swarm.exe");
-                eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
-                let mut discovered = None;
-                if let Some(workspace) = workspace {
-                    let request = eliot_core::api::ProjectDiscoverRequest {
-                        workspace: workspace.to_string_lossy().into_owned(),
-                    };
-                    request.validate()?;
-                    let reply: eliot_core::api::ProjectDiscoverResponse =
-                        eliot_daemon::client_call_typed(&data_dir, "project.discover", &request)
+        context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            let stopped = || {
+                Err(eliot_core::Error::new(
+                    "cancelled",
+                    "the start was cancelled before Swarm answered",
+                ))
+            };
+            if !feed::backoff(delay_ms, &cancelled) || cancelled() {
+                return Message::Shell(ShellMsg::DaemonReady(stopped()));
+            }
+            let started = client::block_on(feed::cancellable(
+                async {
+                    let executable = std::env::current_exe()
+                        .map_err(|_| {
+                            eliot_core::Error::new(
+                                "platform_io",
+                                "cannot locate desktop executable",
+                            )
+                        })?
+                        .with_file_name("swarm.exe");
+                    eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
+                    let mut discovered = None;
+                    if let Some(workspace) = workspace {
+                        let request = eliot_core::api::ProjectDiscoverRequest {
+                            workspace: workspace.to_string_lossy().into_owned(),
+                        };
+                        request.validate()?;
+                        let reply: eliot_core::api::ProjectDiscoverResponse =
+                            eliot_daemon::client_call_typed(
+                                &data_dir,
+                                "project.discover",
+                                &request,
+                            )
                             .await?;
-                    request.validate_response(&reply)?;
-                    discovered = reply.project.map(|project| project.checkout);
-                }
-                let read = config_client::read_settings(&data_dir).await?;
-                Ok((discovered, read))
-            });
-            Message::Shell(ShellMsg::DaemonReady(result))
-        });
+                        request.validate_response(&reply)?;
+                        discovered = reply.project.map(|project| project.checkout);
+                    }
+                    let read = config_client::read_settings(&data_dir).await?;
+                    Ok((discovered, read))
+                },
+                &cancelled,
+            ));
+            Message::Shell(ShellMsg::DaemonReady(started.unwrap_or_else(stopped)))
+        })
     }
 
     /// `text` once the editors are primed, empty during the priming render.
@@ -1882,7 +1923,7 @@ impl DesktopApp {
         m3::set_palette(palette);
 
         let main: View = match self.main {
-            Main::Conversation if self.startup_error.is_some() => {
+            Main::Conversation if self.link_view_shown() => {
                 self.startup_error_view(context, palette)
             }
             // Settings is drawn in the conversation's place, which keeps
@@ -1936,6 +1977,8 @@ impl DesktopApp {
             self.cleanup_confirmation(context, palette)
         } else if let Some(dialog) = &self.bulk {
             self.bulk_dialog(dialog, context, palette)
+        } else if self.link.confirm_fresh {
+            self.fresh_confirmation(context, palette)
         } else {
             self.task_dialog(context, palette)
         };
@@ -2109,14 +2152,19 @@ impl DesktopApp {
             filtered,
             hovered: self.menu.hovered.clone(),
             focused: self.menu.focused.clone(),
-            errors: self
-                .nav
-                .organization
-                .errors
-                .iter()
-                .chain(&self.nav.organization.queue_errors)
-                .cloned()
-                .collect(),
+            // While the daemon is checked or restarted, its notice speaks for
+            // the reads it failed.
+            errors: if self.link_unsure() {
+                Vec::new()
+            } else {
+                self.nav
+                    .organization
+                    .errors
+                    .iter()
+                    .chain(&self.nav.organization.queue_errors)
+                    .cloned()
+                    .collect()
+            },
             empty,
             places,
             more: (more && loaded < total)
@@ -2310,56 +2358,6 @@ impl DesktopApp {
             return;
         }
         self.alert = Some(text);
-    }
-
-    /// The data directory could not be opened (for example, the default
-    /// root is owned by another principal). Nothing is moved; the owner may
-    /// select a fresh private directory, which is remembered.
-    fn startup_error_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let error = self
-            .startup_error
-            .as_ref()
-            .map_or_else(String::new, ToString::to_string);
-        StackPanel::new()
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .spacing(tokens::spacing::MD)
-            .margin(Thickness::uniform(tokens::spacing::LG))
-            .children((
-                m3::page_title("Swarm daemon could not start"),
-                m3::secondary(error)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-                if self.repairing_settings() {
-                    StackPanel::new().spacing(tokens::spacing::SM).children((
-                        m3::filled(palette)
-                            .automation_name("Repair settings")
-                            .on_click(context.message(Message::Shell(ShellMsg::RepairSettings)))
-                            .content(m3::label("Repair settings")),
-                        m3::text_button(palette)
-                            .automation_name("Open config.toml")
-                            .on_click(context.message(Message::Shell(ShellMsg::OpenStartupConfig)))
-                            .content(m3::link_content("Open config.toml")),
-                    ))
-                } else {
-                    View::empty()
-                },
-                m3::text_button(palette)
-                    .automation_name("Retry startup")
-                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
-                    .content(m3::label("Retry startup")),
-                // One filled action per page: Repair settings when the
-                // config is what failed, else the fresh directory.
-                if self.repairing_settings() {
-                    m3::outlined(palette)
-                } else {
-                    m3::filled(palette)
-                }
-                .automation_name("Use fresh private directory")
-                .on_click(context.message(Message::Shell(ShellMsg::UseFreshDirectory)))
-                .content(m3::label("Use a fresh private directory")),
-            ))
     }
 
     /// The right panel: the monitor or the open Agent's details.

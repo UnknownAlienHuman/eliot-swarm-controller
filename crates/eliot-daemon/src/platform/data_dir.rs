@@ -9,6 +9,9 @@ const DAEMON_LOCK_FILE: &str = "daemon.lock";
 #[cfg(not(windows))]
 const OPERATOR_LOCK_FILE: &str = "operator.lock";
 const DAEMON_INFO_FILE: &str = "daemon.json";
+/// Present from an Owner's `daemon.shutdown` until the next daemon start:
+/// the daemon stopped because the Owner asked, not because it failed.
+const OWNER_STOP_FILE: &str = "owner-stop";
 const MAX_SELECTED_ROOT_BYTES: usize = 32 * 1024;
 
 /// The small local endpoint record consumed by the CLI during daemon discovery.
@@ -250,6 +253,17 @@ impl DataDir {
         }
     }
 
+    /// A starting daemon clears the previous Owner stop.
+    pub(crate) fn clear_owner_stop(&self, lock: &DaemonLock) -> Result<()> {
+        self.check_lock(lock)?;
+        match fs::remove_file(self.path.join(OWNER_STOP_FILE)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(io_error("clear owner stop marker", error))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Only the daemon holding this root's lock may create its private log directory.
     pub(crate) fn daemon_log_directory(&self, lock: &DaemonLock) -> Result<PathBuf> {
         self.check_lock(lock)?;
@@ -277,6 +291,19 @@ fn unsafe_data_dir_error(path: &Path) -> Error {
             "the selected data directory is unsafe and was not changed; create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
         ),
     )
+}
+
+/// Record, in the serving daemon's validated root, that the Owner asked it to
+/// stop (`daemon.shutdown`, drain or force). Written while the daemon still
+/// serves, so a client that finds it gone also finds the marker.
+pub(crate) fn mark_owner_stop(root: &Path) -> Result<()> {
+    replace_file_atomically(root, OWNER_STOP_FILE, b"owner-stop\n", true)
+}
+
+/// Whether this root's daemon was last stopped by its Owner and has not
+/// started since. A desktop does not restart such a daemon on its own.
+pub fn owner_stopped(root: &Path) -> bool {
+    DataDir::open_existing(root).is_ok_and(|root| root.path().join(OWNER_STOP_FILE).is_file())
 }
 
 /// Persist a user-selected private data root so CLI and desktop launches share it.

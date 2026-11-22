@@ -60,6 +60,7 @@ mod configure_ui;
 mod dialog_ui;
 mod handoff_ui;
 mod launch_ui;
+mod link_ui;
 mod menu_ui;
 mod monitor_ui;
 mod move_ui;
@@ -350,6 +351,9 @@ struct DesktopApp {
     settings: settings_ui::SettingsState,
     /// The daemon could not start in the selected private data directory.
     startup_error: Option<eliot_core::Error>,
+    /// The daemon link after the first connection: a probe, or a restart
+    /// of a daemon that stopped answering.
+    link: link_ui::LinkState,
     scripts: scripts_ui::ScriptsEditor,
     handoff: handoff_ui::DialogState,
     nav: shell_ui::ShellState,
@@ -795,6 +799,7 @@ impl Component for DesktopApp {
             editor: profiles_ui::ProfilesEditor::default(),
             settings: settings_ui::SettingsState::default(),
             startup_error: None,
+            link: link_ui::LinkState::default(),
             scripts: scripts_ui::ScriptsEditor::default(),
             handoff: handoff_ui::DialogState::default(),
             nav: shell_ui::ShellState {
@@ -877,7 +882,7 @@ impl Component for DesktopApp {
         app.note_window_size();
         if let Ok(data_dir) = app.data_dir.clone() {
             app.watch_high_contrast(context);
-            app.start_connection(data_dir, context);
+            let _start = app.start_connection(data_dir, 0, context);
         }
         // On the UI thread, before its message loop runs.
         match crate::shortcuts::install() {

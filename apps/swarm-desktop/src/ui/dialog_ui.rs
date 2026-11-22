@@ -72,6 +72,8 @@ impl DesktopApp {
             5
         } else if self.bulk.is_some() {
             6
+        } else if self.link.confirm_fresh {
+            7
         } else {
             0
         }
@@ -157,6 +159,7 @@ impl DesktopApp {
                 };
                 self.bulk_update(message, context);
             }
+            7 => self.fresh_confirmed(false, context),
             _ => {}
         }
     }

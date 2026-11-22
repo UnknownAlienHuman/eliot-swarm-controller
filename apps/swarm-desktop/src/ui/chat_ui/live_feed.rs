@@ -84,7 +84,8 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         self.chat.invalidated.merge(invalidation);
-        if self.chat.reread_inflight || !self.chat.invalidated.any() {
+        // While no daemon answers, the reconnect's snapshot reads it all.
+        if self.chat.reread_inflight || !self.chat.invalidated.any() || self.daemon_down() {
             return;
         }
         let (Some(agent), Ok(data_dir)) = (
@@ -137,8 +138,15 @@ impl DesktopApp {
                 reason,
             } => {
                 self.chat.failures = attempt;
+                // The daemon is being started again: its reply resumes the
+                // feed, and the notice counts its attempts.
+                if self.daemon_down() {
+                    self.chat.live_task = None;
+                    return;
+                }
                 self.chat.live = LiveStatus::Reconnecting { attempt, reason };
                 self.spawn_backoff(context, delay_ms);
+                self.link_suspect(context);
             }
             Next::Stop { reason } => {
                 self.chat.live = LiveStatus::Stopped(reason);
