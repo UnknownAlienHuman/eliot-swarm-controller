@@ -490,6 +490,7 @@ pub(crate) fn public_request_view(request: &CorePending) -> Result<(String, Valu
                     },
                 ],
                 feedback_allowed: false,
+                guard_refusal: None,
             })
             .map_err(|_| Error::new("internal", "approval public details could not be encoded"))?;
             Ok(("approval".to_owned(), details))

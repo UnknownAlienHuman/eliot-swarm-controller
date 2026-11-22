@@ -696,6 +696,25 @@ Implementation: `plugins/codex/src/native/types.rs`
 (`NativeThreadConfigOverrides::from_profile`), `host.rs` (both thread
 requests), and `route.rs` (`native_subagents_argv`). No vendor code is copied.
 
+## Shell identity and command-guard limits
+
+Verified 2026-11-21 with installed codex-cli 0.167.1 using a private CODEX_HOME and
+an environment with credentials cleared. codex execpolicy check --rules <path> <argv>
+evaluates a supplied rule file, but codex app-server --help has no rule-file launch
+option and the installed app-server schema has no rule-path field. Official
+Rules documentation describes startup-loaded files under active config layers,
+including trusted project layers; it does not establish a private per-Agent app-server
+attachment. Eliot therefore does not claim a guard for Codex profiles with
+approval_policy set to never, which do not emit permission requests.
+
+The installed app-server accepts thread config overlays. Official configuration
+documentation defines shell_environment_policy.filters for variables passed to
+spawned commands. When pass_agent_identity_to_shell is false, Eliot excludes
+ELIOT_AGENT_TOKEN from thread shell commands while keeping the nonsecret managed identity
+markers, which make a shell CLI reject as incomplete instead of falling back to Owner
+authority. Its managed MCP server retains the explicitly named Agent env_vars. Live shell filtering remains subject to private-daemon
+qualification.
+
 ## Access levels (`--access ask|auto|full`)
 
 Ad-hoc mapping, frozen in the snapshot and reported in effective settings:

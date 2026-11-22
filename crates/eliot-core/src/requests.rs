@@ -154,4 +154,7 @@ pub struct ApprovalRequest {
     pub choices: Vec<ApprovalChoice>,
     #[serde(default)]
     pub feedback_allowed: bool,
+    /// Static project command guard reason for this permission request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_refusal: Option<String>,
 }

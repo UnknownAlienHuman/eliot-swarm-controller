@@ -5,6 +5,7 @@ use super::{
     FileConfig, MAX_PROFILE_NAME_LEN, MAX_PROFILES, config_error_at,
     configured_route_credential_env_names, read_config, validate_profile_name,
 };
+use crate::command_guard::ProjectCommandGuard;
 use eliot_core as core;
 use serde::Deserialize;
 use std::{
@@ -34,6 +35,7 @@ pub(crate) struct ProjectRegistrationConfig {
     pub git: Option<core::api::ProjectGitView>,
     pub interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     pub run_env: Vec<String>,
+    pub command_guards: Vec<ProjectCommandGuard>,
     pub workspace: ProjectWorkspaceMode,
 }
 
@@ -305,6 +307,8 @@ pub(super) struct ProjectEntry {
     interpreters: BTreeMap<String, core::api::ScriptInterpreter>,
     #[serde(default)]
     run_env: Vec<String>,
+    #[serde(default)]
+    command_guards: Vec<ProjectCommandGuard>,
     /// `workspace = "worktree" | "shared"`, default `worktree`.
     #[serde(default)]
     workspace: ProjectWorkspaceMode,
@@ -423,6 +427,7 @@ pub(super) fn project_registrations_in(
             offset,
             &format!("projects.{id}"),
         )?;
+        validate_project_command_guards(id, &entry.command_guards, source, offset)?;
 
         projects.push(ProjectRegistrationConfig {
             id: id.clone(),
@@ -432,11 +437,58 @@ pub(super) fn project_registrations_in(
             git,
             interpreters: run_grant.interpreters,
             run_env: run_grant.run_env,
+            command_guards: entry.command_guards.clone(),
             workspace: entry.workspace,
         });
     }
     projects.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(projects)
+}
+
+fn validate_project_command_guards(
+    project_id: &str,
+    entries: &[ProjectCommandGuard],
+    source: &str,
+    offset: usize,
+) -> core::Result<()> {
+    let field = format!("projects.{project_id}.command_guards");
+    if entries.len() > crate::command_guard::MAX_PROJECT_GUARDS {
+        return Err(config_error_at(
+            source,
+            offset,
+            &field,
+            "exceeds 64 entries",
+            "profile_error",
+        ));
+    }
+    for entry in entries {
+        if entry.pattern.is_empty()
+            || entry.pattern.len() > crate::command_guard::MAX_PATTERN_BYTES
+            || entry.pattern.chars().any(char::is_control)
+            || globset::Glob::new(&entry.pattern).is_err()
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "patterns must be valid nonempty globs of at most 1024 bytes",
+                "profile_error",
+            ));
+        }
+        if entry.refusal.trim().is_empty()
+            || entry.refusal.len() > crate::command_guard::MAX_REFUSAL_BYTES
+            || entry.refusal.chars().any(char::is_control)
+        {
+            return Err(config_error_at(
+                source,
+                offset,
+                &field,
+                "refusal text must be a nonempty single line of at most 512 bytes",
+                "profile_error",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_project_allowlist(

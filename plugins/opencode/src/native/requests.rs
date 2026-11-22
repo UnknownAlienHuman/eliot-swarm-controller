@@ -88,6 +88,7 @@ fn public_approval_details(details: &Map<String, Value>) -> Result<Value> {
             },
         ],
         feedback_allowed: true,
+        guard_refusal: None,
     })
     .map_err(|_| Error::new("internal", "approval public details could not be encoded"))
 }

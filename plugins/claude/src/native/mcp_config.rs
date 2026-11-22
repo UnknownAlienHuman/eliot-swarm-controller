@@ -34,12 +34,14 @@ impl ClaudeMcpConfigFile {
         )
     }
 
-    /// Write only public executable/data-root arguments. Agent authentication
-    /// remains in the inherited environment and is never copied into this file.
+    /// Write the public executable/data-root arguments and the exact scoped
+    /// Agent identity for this private MCP child. The file is generation-local
+    /// and removed with the native session.
     pub(crate) fn create(
         instance_dir: &Path,
         swarm_binary: &Path,
         data_root: &Path,
+        environment: &[(OsString, OsString)],
     ) -> Result<Self> {
         if !instance_dir.is_absolute() || !instance_dir.is_dir() {
             return Err(Error::new(
@@ -63,11 +65,21 @@ impl ClaudeMcpConfigFile {
         let data_dir = data_root
             .to_str()
             .ok_or_else(|| Error::new("invalid", "Claude MCP data-root path is not UTF-8"))?;
+        let environment = environment
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    serde_json::Value::String(value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         let config = json!({
             "mcpServers": {
                 WORKER_SWARM_MCP_SERVER_NAME: {
                     "command": command,
-                    "args": worker_swarm_mcp_args(data_dir)
+                    "args": worker_swarm_mcp_args(data_dir),
+                    "env": environment,
                 }
             }
         });

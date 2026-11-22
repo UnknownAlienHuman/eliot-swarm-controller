@@ -2572,19 +2572,45 @@ impl EventProcessor {
         };
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let committed = redact_request_details_for_commit(&public_details, &secrets);
-        self.commit_event(
-            "request.opened",
-            native_id,
-            json!({
-                "request_id": pending.id,
-                "turn_id": pending.turn_id,
-                "kind": public_kind,
-                "details": committed,
-            }),
-        )
-        .await?;
+        let guard_commands = (pending.kind == "approval"
+            && pending.details["action"]
+                .as_str()
+                .is_some_and(|action| action.eq_ignore_ascii_case("bash")))
+        .then(|| {
+            pending.details["resources"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|commands| !commands.is_empty());
+        let mut data = json!({
+            "request_id": pending.id,
+            "turn_id": pending.turn_id,
+            "kind": public_kind,
+            "details": committed,
+        });
+        if let Some(commands) = guard_commands {
+            data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": commands});
+        }
+        let refusal = self
+            .stream_source()
+            .commit_request_event(native_id, data)
+            .await?;
+        if refusal.as_ref().is_some_and(|refusal| {
+            refusal.request_id != pending.id || refusal.turn_id != pending.turn_id
+        }) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode guard refusal did not bind to its exact permission request",
+            ));
+        }
+        let request_id = pending.id.clone();
+        let turn_id = pending.turn_id.clone();
         self.pending_requests.insert(
-            pending.id.clone(),
+            request_id.clone(),
             PendingNativeRequest {
                 request: pending,
                 reply_command_id: None,
@@ -2592,6 +2618,97 @@ impl EventProcessor {
                 reply_is_cancel: false,
             },
         );
+        if let Some(refusal) = refusal {
+            self.refuse_guarded_permission(&request_id, &turn_id, &refusal.message)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Reject one guarded Bash permission only when OpenCode readback proves
+    /// this is the session's sole pending permission: native `reject` closes
+    /// every pending permission in the session.
+    async fn refuse_guarded_permission(
+        &mut self,
+        request_id: &str,
+        turn_id: &str,
+        message: &str,
+    ) -> Result<()> {
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode guard refusal has no owned session",
+            ));
+        };
+        if self.status.active_turn_id.as_deref() != Some(turn_id) {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode guard refusal lost its exact turn",
+            ));
+        }
+        let listed = match self
+            .http
+            .list_permissions(&session_id, Instant::now() + REPLY_DEADLINE)
+            .await
+        {
+            Ok(listed) => listed,
+            Err(_) => {
+                self.record_gap(
+                    "OpenCode guard refusal was withheld because pending permissions could not be read back",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if listed.len() != 1 || listed[0].id != request_id {
+            self.record_gap(
+                "OpenCode guard refusal was withheld because native reject would close sibling permissions",
+            )
+            .await?;
+            return Ok(());
+        }
+        let Some(pending) = self.pending_requests.get_mut(request_id) else {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode guarded permission was not retained",
+            ));
+        };
+        if pending.request.turn_id != turn_id || pending.reply_state != NativeReplyState::Available
+        {
+            return Err(Error::new(
+                "unknown",
+                "OpenCode guarded permission binding changed",
+            ));
+        }
+        pending.reply_state = NativeReplyState::Writing;
+        match self
+            .http
+            .reply_permission(
+                &session_id,
+                request_id,
+                "reject",
+                Some(message.to_owned()),
+                Instant::now() + REPLY_DEADLINE,
+            )
+            .await
+        {
+            Ok(()) => {
+                if let Some(pending) = self.pending_requests.get_mut(request_id) {
+                    pending.reply_state = NativeReplyState::Written;
+                    pending.reply_command_id = None;
+                }
+            }
+            Err(_) => {
+                if let Some(pending) = self.pending_requests.get_mut(request_id) {
+                    pending.reply_state = NativeReplyState::Unknown;
+                    pending.reply_command_id = None;
+                }
+                self.record_gap(
+                    "OpenCode guard refusal reply outcome is unresolved and will not be repeated",
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 

@@ -1670,6 +1670,18 @@ pub(super) fn admit_control_tx(
                     "pending request row does not match the Agent projection",
                 ));
             }
+            if request.verb == "approve"
+                && pending
+                    .details
+                    .get("guard_refusal")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| !message.trim().is_empty())
+            {
+                return Err(Error::new(
+                    "not_allowed",
+                    "native permission request was refused by the project command guard",
+                ));
+            }
             if request.verb == "answer" && contains_secret_marker(&pending.details) {
                 return Err(Error::new(
                     "secret_in_payload",

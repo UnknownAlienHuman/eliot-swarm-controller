@@ -13,9 +13,10 @@ use super::{
 };
 use super::{native_children, observation, source_handoff};
 
+use crate::command_guard::{CommandGuardPolicy, CommandGuardRequest, REQUEST_FIELD};
 use crate::common::{now_ms, secure_eq};
 
-use eliot_core::{Error, Result, SecretPolicy, SourceBatch, SourceGap};
+use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
 use eliot_plugin::protocol::{HookEvent, HookResponse};
 use eliot_plugin::sync::LockExt;
 use eliot_store::family_for_kind;
@@ -23,6 +24,11 @@ use serde_json::{Value, json};
 
 use tokio::time::{Instant, timeout_at};
 use ulid::Ulid;
+
+struct GuardEvaluation<'a> {
+    policy: &'a CommandGuardPolicy,
+    credentials: &'a [String],
+}
 
 pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, source: EventSource) {
     let EventSource {
@@ -36,6 +42,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         generation,
         expected_credential,
         observation,
+        command_guard_policy,
     } = source;
     let binding = source_handoff::SourceBinding {
         agent_id: &agent_id,
@@ -147,7 +154,10 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                             &bus,
                             params,
                             binding,
-                            &source_credentials,
+                            GuardEvaluation {
+                                credentials: &source_credentials,
+                                policy: &command_guard_policy,
+                            },
                             request_deadline,
                             &mut rejected_batch,
                         )
@@ -381,11 +391,13 @@ async fn put_events(
     bus: &Bus,
     params: Value,
     binding: source_handoff::SourceBinding<'_>,
-    credentials: &[String],
+    guard: GuardEvaluation<'_>,
     until: Instant,
     rejected: &mut Option<SourceGap>,
 ) -> Result<Value> {
     let invalid_batch = || Error::new("invalid", "events.put params are malformed");
+    let credentials = guard.credentials;
+    let guard_policy = guard.policy;
     let gap = batch_gap(&params).ok_or_else(invalid_batch)?;
     let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
     let subject = binding.expected_subject()?;
@@ -395,9 +407,11 @@ async fn put_events(
             "events.put generation does not match this Agent generation",
         ));
     }
+    let mut permission_refusal = None;
     let batch = serde_json::from_value(params)
         .map_err(|_| invalid_batch())
         .and_then(|mut batch| {
+            permission_refusal = apply_command_guard(&mut batch, guard_policy, credentials)?;
             redact_source_batch(&mut batch, credentials)?;
             Ok(batch)
         });
@@ -437,7 +451,11 @@ async fn put_events(
         )),
     };
     match result {
-        Ok(commit) => Ok(json!(commit.ack)),
+        Ok(commit) => {
+            let mut ack = commit.ack;
+            ack.permission_refusal = permission_refusal;
+            Ok(json!(ack))
+        }
         Err(error) => {
             let cause = safe_cause_code(&error.code);
             record_store_batch_rejection(
@@ -467,6 +485,107 @@ async fn put_events(
             }
         }
     }
+}
+
+fn apply_command_guard(
+    batch: &mut SourceBatch,
+    policy: &CommandGuardPolicy,
+    credentials: &[String],
+) -> Result<Option<PermissionRefusal>> {
+    if !batch
+        .events
+        .iter()
+        .any(|event| event.data.get(REQUEST_FIELD).is_some())
+    {
+        return Ok(None);
+    }
+    if batch.source != "stream" {
+        return Err(Error::new(
+            "not_allowed",
+            "command guard context is valid only on the live stream source",
+        ));
+    }
+    let mut refusal = None;
+    for event in &mut batch.events {
+        if event.kind == "request.opened"
+            && let Some(details) = event.data.get_mut("details").and_then(Value::as_object_mut)
+        {
+            details.remove("guard_refusal");
+        }
+        let Some(data) = event.data.as_object_mut() else {
+            continue;
+        };
+        let Some(raw_guard) = data.remove(REQUEST_FIELD) else {
+            continue;
+        };
+        if event.kind != "request.opened" {
+            return Err(Error::new(
+                "not_allowed",
+                "command guard context requires request.opened",
+            ));
+        }
+        let guard: CommandGuardRequest = serde_json::from_value(raw_guard)
+            .map_err(|_| Error::new("invalid", "command guard context is malformed"))?;
+        if guard.commands.is_empty()
+            || guard.commands.len() > crate::command_guard::MAX_REQUEST_COMMANDS
+            || guard.commands.iter().any(|command| {
+                command.trim().is_empty()
+                    || command.len() > crate::command_guard::MAX_COMMAND_BYTES
+                    || command.chars().any(char::is_control)
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "command guard command list is invalid",
+            ));
+        }
+        let Some(request_id) = data
+            .get("request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(Error::new(
+                "invalid",
+                "guarded request has no exact request id",
+            ));
+        };
+        let Some(turn_id) = data
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return Err(Error::new(
+                "invalid",
+                "guarded request has no exact turn id",
+            ));
+        };
+        if request_id.trim().is_empty() || turn_id.trim().is_empty() {
+            return Err(Error::new("invalid", "guarded request identity is empty"));
+        }
+        let Some(reason) = policy.refusal(&guard.commands) else {
+            continue;
+        };
+        if refusal.is_some() {
+            return Err(Error::new(
+                "unsupported",
+                "one native source batch cannot decide multiple guarded requests",
+            ));
+        }
+        let reason = SecretPolicy::new(credentials.iter()).redact_text(reason);
+        let details = data
+            .get_mut("details")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::new("invalid", "guarded approval details must be an object"))?;
+        details.insert("guard_refusal".to_owned(), Value::String(reason.clone()));
+        refusal = Some(PermissionRefusal {
+            agent_id: batch.agent_id.clone(),
+            generation: batch.generation,
+            request_id,
+            turn_id,
+            message: reason,
+        });
+    }
+    Ok(refusal)
 }
 
 // Recover only the source binding and recognized kinds from a malformed batch.

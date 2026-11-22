@@ -880,6 +880,7 @@ impl State {
             summary,
             choices,
             feedback_allowed: false,
+            guard_refusal: None,
         })
         .map_err(|_| {
             Error::new(

@@ -125,12 +125,9 @@ pub const SWARM_MCP_SERVER_NAME: &str = eliot_plugin::native_cli::WORKER_SWARM_M
 /// fragment is a profile error raised by the caller, never rendered here.
 ///
 /// `swarm_executable` and `swarm_data_dir` are the absolute active Swarm
-/// executable and the Agent's owned Eliot data root, validated by the
-/// caller (host start admission mirrors the Codex `args_with_agent_mcp`
-/// guards). They render as public `command` arguments only: Agent
-/// authentication stays in the inherited server environment and is never
-/// copied into this file (the Claude `mcp_config.rs` model), and
-/// `mcp --require-agent` fails closed without it. Shape verified against
+/// executable and the Agent's owned Eliot data root. The private config carries
+/// the exact Agent identity in OpenCode's MCP `environment` map, never in the
+/// shell-visible server environment. Shape verified against
 /// the installed 2.2.7 server: `mcp add` writes
 /// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
 /// and `GET /api/config` echoes the document while `GET /api/mcp`
@@ -160,9 +157,19 @@ fn agent_config_json(
     fragment: Option<&LocalProvider>,
     swarm_executable: &str,
     swarm_data_dir: &str,
+    swarm_environment: &[(OsString, OsString)],
     native_subagents: Option<&str>,
 ) -> String {
     let mut servers = serde_json::Map::new();
+    let environment = swarm_environment
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                serde_json::Value::String(value.to_string_lossy().into_owned()),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     let mut command = vec![swarm_executable.to_owned()];
     command.extend(eliot_plugin::native_cli::worker_swarm_mcp_args(
         swarm_data_dir,
@@ -172,6 +179,7 @@ fn agent_config_json(
         serde_json::json!({
             "type": "local",
             "command": command,
+            "environment": environment,
         }),
     );
     let mcp = serde_json::Value::Object({
@@ -263,6 +271,8 @@ pub struct ServerLaunch {
     /// The Agent's owned Eliot data root for the MCP `--data-dir` argument.
     /// Absolute; start admission resolves it from the launch environment.
     pub swarm_data_dir: PathBuf,
+    /// Scoped Agent identity passed only to the managed MCP child.
+    pub swarm_environment: Vec<(OsString, OsString)>,
     /// Frozen native-subagent switch (`allow` or `deny`): `deny` keeps the
     /// `task` deny in the isolated per-Agent config as a second layer next
     /// to the authoritative per-session `subagent` deny ruleset.
@@ -394,6 +404,7 @@ impl OwnedServer {
                 launch.local_provider.as_ref(),
                 swarm_executable,
                 swarm_data_dir,
+                &launch.swarm_environment,
                 launch.native_subagents.as_deref(),
             ),
         )

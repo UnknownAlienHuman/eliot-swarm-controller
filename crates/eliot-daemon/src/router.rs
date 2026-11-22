@@ -2637,6 +2637,7 @@ impl Router {
             .freeze_launch_profile(principal, request, arbitrated)
             .await?
         {
+            self.freeze_project_command_guards(request).await?;
             return retained_preparation(&request.args);
         }
         // A switch that requests neither a workspace nor a branch keeps its
@@ -2648,6 +2649,7 @@ impl Router {
             .and_then(|args| args.remove("switch_reuse_source_checkout"))
             .is_some()
         {
+            self.freeze_project_command_guards(request).await?;
             return Ok(None);
         }
         let mut registered_checkout = None;
@@ -2688,6 +2690,7 @@ impl Router {
                 .get_project_registration("owner", project)?
                 .map(|registration| registration.checkout);
         }
+        self.freeze_project_command_guards(request).await?;
         // A requested branch name always wins, but even an explicit branch
         // lands in the standard directory. A bare `--worktree` (an empty
         // value) or a top-level launch in a `worktree`-mode project generates
@@ -2849,6 +2852,62 @@ impl Router {
         if let Some(model) = catalog::launch_model_default(harness, &response)? {
             snapshot["daemon_model"] = Value::String(model);
         }
+        Ok(())
+    }
+
+    async fn freeze_project_command_guards(&self, request: &mut SubmitCommand) -> Result<()> {
+        if request
+            .args
+            .get("profile_snapshot")
+            .and_then(|snapshot| snapshot.get(crate::command_guard::SNAPSHOT_FIELD))
+            .is_some()
+        {
+            return Ok(());
+        }
+        let project_id = request
+            .args
+            .get("registered_project")
+            .and_then(Value::as_str)
+            .filter(|project| !project.trim().is_empty())
+            .map(str::to_owned);
+        let guards = if let Some(project_id) = project_id {
+            let registrations =
+                crate::config::load_project_registration_config(&self.inner.data_root)?;
+            let registration = registrations
+                .iter()
+                .find(|registration| registration.id == project_id)
+                .ok_or_else(|| {
+                    Error::new(
+                        "not_found",
+                        "registered project command guard policy is unavailable",
+                    )
+                })?;
+            serde_json::to_value(&registration.command_guards)
+                .map_err(|_| Error::new("internal", "project command guards could not be frozen"))?
+        } else if let Some(parent_id) = request.args.get("parent").and_then(Value::as_str) {
+            let store = self.inner.store.lock().await;
+            let parent = store
+                .get_agent(parent_id)?
+                .ok_or_else(|| Error::new("not_found", "launch parent was not found"))?;
+            parent
+                .profile_snapshot
+                .get(crate::command_guard::SNAPSHOT_FIELD)
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()))
+        } else {
+            request
+                .args
+                .get("profile_snapshot")
+                .and_then(|snapshot| snapshot.get(crate::command_guard::SNAPSHOT_FIELD))
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()))
+        };
+        let snapshot = request
+            .args
+            .get_mut("profile_snapshot")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| Error::new("internal", "launch profile snapshot is not an object"))?;
+        snapshot.insert(crate::command_guard::SNAPSHOT_FIELD.to_owned(), guards);
         Ok(())
     }
 
