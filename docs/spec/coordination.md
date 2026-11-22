@@ -756,8 +756,9 @@ bypasses routing; a `role` selects candidates intersected with that frozen list
 An allow-listed cross-harness profile is an explicit Owner grant of that profile's
 freshly frozen harness, model, permissions and MCP policy. The child gets its own
 credential/selector bindings; parent bindings and native policy names never cross
-harnesses. Same-harness children retain the model/effort-only comparison and inherit
-parent credential bindings verbatim. Every frozen account or proxy capacity scope of the parent
+harnesses. Approved same-harness profiles can set their model, effort, and daemon
+context ceiling under the parent's native authority and captured credential bindings.
+Every frozen account or proxy capacity scope of the parent
 is kept with the same bounds, alongside the child's own scopes; conflicting bounds
 reject. Control is narrowed or equal (never widened). It omits `profile_snapshot` (the daemon
 freezes it) and shares the parent's workspace (an omitted workspace defaults to

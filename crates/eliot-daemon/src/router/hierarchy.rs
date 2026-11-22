@@ -92,6 +92,7 @@ fn ignored_child_snapshot_key(key: &str) -> bool {
         key,
         "model"
             | "effort"
+            | "context_ceiling_tokens"
             | "daemon_model"
             | "child_profiles"
             | "native_subagents"
@@ -100,8 +101,9 @@ fn ignored_child_snapshot_key(key: &str) -> bool {
     )
 }
 
-/// "Same profile except model and effort" over frozen snapshots (#398
-/// follow-up) for same-harness children. After removing the ignorable keys, each
+/// Compare native authority across frozen same-harness profiles. Model,
+/// effort and the daemon's context ceiling can vary by approved profile.
+/// After removing the ignorable keys, each
 /// side's own `profile:<name>` scope and the daemon-stamped scopes, every
 /// other key must be equal, including absent-vs-present: that covers
 /// permissions, approval policy, approval, MCP policy, pass_env, cmd,
@@ -121,7 +123,7 @@ fn child_snapshot_within_parent(
     } else {
         Err(Error::new(
             "not_allowed",
-            "child profile snapshot differs from its parent's frozen profile beyond model and effort",
+            "child profile snapshot differs outside the permitted profile fields",
         ))
     }
 }
@@ -246,8 +248,8 @@ fn cross_harness_capacity_scopes(child: &Value, parent: &Agent) -> Result<Value>
 /// cannot widen parental authority). Owner launches are unrestricted. An
 /// Agent's child on the parent profile reuses the parent's frozen snapshot;
 /// a child on an allow-listed same-harness profile carries that profile's
-/// freshly frozen snapshot with only model and effort differing, and the
-/// parent's credential bindings inherited; the daemon-owned capacity scopes
+/// freshly frozen model, effort and context ceiling, and inherits the
+/// parent's credential bindings. The daemon-owned capacity scopes
 /// are stamped after the check from the inherited project. An allow-listed
 /// cross-harness profile is an explicit Owner grant of its own native policy
 /// and bindings, retaining the parent's shared capacity scopes. Control is

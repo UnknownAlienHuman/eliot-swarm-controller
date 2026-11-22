@@ -1505,8 +1505,9 @@ instead selects ordered candidates intersected with the parent's frozen allow-li
 `workspace` defaults to the parent's workspace, including for CLI child launches.
 The child keeps the parent's recorded project ID. An explicit different workspace
 rejects, so a child never escapes the parent's workspace. Same-harness children
-retain model/effort-only confinement and inherit captured credential bindings
-verbatim. An allow-listed different harness is an explicit Owner grant of that
+inherit native authority and captured credential bindings verbatim. An approved
+same-harness profile can set its model, effort, and daemon context ceiling.
+An allow-listed different harness is an explicit Owner grant of that
 profile's own native policy and bindings; parent credential/native-store bindings
 are never copied across harnesses. Capacity scopes keep every non-profile scope
 of the parent with the same bounds alongside the child's own scopes; conflicting

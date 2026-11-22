@@ -371,9 +371,10 @@ widen an already-running manager. Naming a different harness is an explicit Owne
 authority grant: the child carries that profile's freshly frozen harness, model,
 permissions, MCP policy and credential references/selector bindings. Parent policy
 names are never reinterpreted on the child's harness, and parent credential or
-native-store bindings are never copied across harnesses. Same-harness children keep
-the existing model/effort-only confinement and inherit captured credential bindings
-verbatim. Control remains equal or narrower on every harness; workspace and project
+native-store bindings are never copied across harnesses. An approved same-harness
+profile can set its model, effort, and daemon context ceiling. Same-harness children
+inherit captured credential bindings verbatim. Control remains equal or narrower on
+every harness; workspace and project
 remain inherited. A cross-harness child retains its own capacity scopes and every
 non-profile scope of the parent with the same bounds; conflicting bounds reject.
 The parent's own profile scope is replaced by the child's. See the launch authority
