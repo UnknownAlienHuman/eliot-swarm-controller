@@ -796,6 +796,19 @@ at the owning daemon dispatch boundary. Child control stays a later increment,
 as do tree forms for mail recipients (non-Agent ids stay `invalid`) and watch filters
 (a tree value matches no events today).
 
+### Integrating Agent branches
+
+A manager with tree or project control can submit `git.integrate` for an Owner-registered
+project that allows it and matches the manager's verified repository. The request names a
+local base branch and the branches to combine. The daemon runs the project check in a
+temporary checkout and retains the result under the command ID. The manager can read it
+with `command.get` or wait through the [CLI](api.md#cli).
+
+The manager can explicitly fast-forward its own bound branch after a passing check when
+the branch is clear of all worktrees. The integration keeps the manager's working tree
+and index intact. See [the automation contract](automation.md#local-branch-integration)
+for the Git operation and failure readback.
+
 ### One-call child run
 
 `child.run` uses one `ChildRunRequest` / `ChildRunResponse` DTO pair
