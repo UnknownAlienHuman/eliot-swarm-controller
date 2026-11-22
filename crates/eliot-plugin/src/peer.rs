@@ -6,7 +6,7 @@ use crate::protocol::{
 use crate::sync::LockExt;
 use eliot_core::{
     BatchAck, Error, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SourceBatch, bound_stderr_diagnostics,
-    limits::{MAX_TERMINAL_WIRE_BYTES, bound_terminal_text},
+    limits::bound_terminal_text,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -346,10 +346,7 @@ impl CommitSink {
         }
         for event in &mut batch.events {
             if event.kind == "turn.completed" && event.data["final_text"].is_string() {
-                // Leave room for the batch envelope. The daemon and Store
-                // apply the smaller published-event bound after redaction.
-                bound_terminal_text(&mut event.data, MAX_TERMINAL_WIRE_BYTES);
-                continue;
+                bound_terminal_text(&mut event.data, MAX_EVENT_BYTES);
             }
             let encoded_data = serde_json::to_vec(&event.data)
                 .map_err(|_| Error::new("internal", "event data could not be encoded"))?;

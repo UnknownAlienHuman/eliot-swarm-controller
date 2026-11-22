@@ -1546,6 +1546,10 @@ impl EventProcessor {
                 .await;
         };
         let main_thread = is_main_thread_assistant(record);
+        let model = assistant_model(record);
+        let model_output = main_thread
+            && record.get("error").is_none_or(Value::is_null)
+            && model.as_deref() != Some("<synthetic>");
         let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
         if main_thread {
             self.native_failure = record
@@ -1558,11 +1562,7 @@ impl EventProcessor {
             self.bind_tool_uses(record, &turn_id);
             self.observe_tool_uses(record).await?;
         }
-        let observed_model = if record.get("error").is_none_or(Value::is_null) {
-            assistant_model(record).filter(|model| model != "<synthetic>")
-        } else {
-            None
-        };
+        let observed_model = model.filter(|_| model_output);
         let text = assistant_text(record);
         if is_blank_native_text(&text) {
             if let Some(model) = observed_model {
@@ -1592,12 +1592,15 @@ impl EventProcessor {
         if let Some(model) = observed_model {
             data["model"] = Value::String(model);
         }
+        if !model_output {
+            data["model_output"] = Value::Bool(false);
+        }
         self.message_seq = self.message_seq.saturating_add(1);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:message:{}", self.message_seq);
         // Keep every assistant message in the event stream, but expose only
         // the last visible message after the turn's final tool call.
-        if main_thread && !has_tool_uses {
+        if model_output && !has_tool_uses {
             self.final_text = Some(text.clone());
         }
         // A message-event gap does not erase text already observed for the

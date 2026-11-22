@@ -18,7 +18,7 @@ use eliot_core::{
     },
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{MailSendOutcome, MailSendResult, NoticeKind, NoticePending};
+use eliot_store::{MailSendOutcome, MailSendResult};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::{
@@ -88,18 +88,6 @@ fn wake_enabled(snapshot: &Value) -> bool {
         .get("wake_on_mail")
         .and_then(Value::as_bool)
         .unwrap_or(true)
-}
-
-/// One neutral wake text for every harness: the unread count plus the
-/// coordination method path. Every harness resolves `mail.inbox`/`mail.ack`
-/// through its own surface (the MCP swarm tool or the shell CLI), so the
-/// notice no longer selects wording per harness.
-fn notice_text(kind: NoticeKind, count: i64) -> String {
-    match kind {
-        NoticeKind::Mail => format!("{count} unread: mail.inbox, then mail.ack"),
-        NoticeKind::Claim if count == 1 => "1 overlapping work claim: who".to_owned(),
-        NoticeKind::Claim => format!("{count} overlapping work claims: who"),
-    }
 }
 
 impl Router {
@@ -400,13 +388,12 @@ impl Router {
 
     async fn wake_recipients(&self, response: &MailSendResponse) {
         for delivery in &response.deliveries {
-            self.offer_notice(&delivery.recipient, NoticePending::Mail)
-                .await;
+            self.offer_notice(&delivery.recipient).await;
         }
     }
 
     /// Offer one bounded notice to a routed recipient through the shared
-    /// Store gate. Every gate — the per-kind routing pre-check, no live
+    /// Store gate. Every gate — the routing pre-check, no live
     /// plugin owner, the Store's atomic claim (mail-only busy/waiting plus
     /// pending send input), or the ordinary send admission (provider hold,
     /// drain, unknown gates, plus final mail-only busy/pending
@@ -414,7 +401,7 @@ impl Router {
     /// notice never fails the admitted write. When the claimed `send` is
     /// not admitted, the claim is released so the failure does not consume
     /// the notice cooldown, which otherwise runs from native presentation.
-    pub(super) async fn offer_notice(&self, recipient: &str, pending: NoticePending) {
+    pub(super) async fn offer_notice(&self, recipient: &str) {
         let agent = {
             let store = self.inner.store.lock().await;
             match store.get_agent(recipient) {
@@ -422,23 +409,12 @@ impl Router {
                 _ => return,
             }
         };
-        // Generation 0 never dispatched: no live generation is routed yet.
-        // Mail honors the recipient's wake flag and defers while busy or
-        // waiting, since an ordinary queued send cannot notify mid-turn
-        // anyway; claims stop at terminal state instead, since a terminal
-        // holder's claims already released.
-        match pending.kind() {
-            NoticeKind::Mail
-                if !wake_enabled(&agent.profile_snapshot)
-                    || agent.generation < 1
-                    || matches!(agent.state, AgentState::Busy | AgentState::Waiting) =>
-            {
-                return;
-            }
-            NoticeKind::Claim if agent.state.is_terminal() || agent.generation < 1 => {
-                return;
-            }
-            _ => {}
+        // No standalone input while the recipient is busy or waiting.
+        if !wake_enabled(&agent.profile_snapshot)
+            || agent.generation < 1
+            || matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+        {
+            return;
         }
         if !self
             .inner
@@ -450,7 +426,7 @@ impl Router {
         let notice_id = ulid::Ulid::new().to_string();
         let claim = {
             let mut store = self.inner.store.lock().await;
-            match store.notice_claim(recipient, &notice_id, pending, now_ms()) {
+            match store.notice_claim(recipient, &notice_id, now_ms()) {
                 Ok(claim) => claim,
                 Err(_) => return,
             }
@@ -458,15 +434,11 @@ impl Router {
         let Some(claim) = claim else {
             return;
         };
-        let notice_kind = match claim.kind {
-            NoticeKind::Mail => "mail",
-            NoticeKind::Claim => "claim",
-        };
         let has_inline = claim.inline_text.is_some();
         let text = claim
             .inline_text
-            .unwrap_or_else(|| notice_text(claim.kind, claim.count));
-        let mut args = json!({"text": text, "notice_kind": notice_kind});
+            .unwrap_or_else(|| format!("{} unread: mail.inbox, then mail.ack", claim.count));
+        let mut args = json!({"text": text, "notice_kind": "mail"});
         if has_inline {
             args["inline_digest"] = json!(true);
         }
@@ -488,7 +460,7 @@ impl Router {
     /// claim time, so idle events without mail are harmless no-ops and no
     /// cooldown is spent unless a wake is actually claimed.
     pub(super) async fn reoffer_mail_notice(&self, recipient: &str) {
-        self.offer_notice(recipient, NoticePending::Mail).await;
+        self.offer_notice(recipient).await;
     }
 }
 

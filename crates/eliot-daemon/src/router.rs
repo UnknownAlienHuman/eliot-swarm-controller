@@ -63,6 +63,7 @@ use eliot_core::{
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
         MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
+        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
         MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
         ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
         ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
@@ -519,6 +520,10 @@ impl Router {
                 }))
             }
             "maintenance.run" => self.maintenance_run(&params, &principal).await,
+            "maintenance.purge_legacy_attention_advisories" => {
+                self.maintenance_purge_legacy_attention_advisories(&params, &principal)
+                    .await
+            }
             "artifact.register" => self.artifact_register(&params, &principal).await,
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
@@ -5389,6 +5394,36 @@ impl Router {
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "maintenance.run result could not be encoded"))
+    }
+
+    /// Preview or explicitly purge owner-sent legacy advisory-attention mail.
+    async fn maintenance_purge_legacy_attention_advisories(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: MaintenancePurgeLegacyAttentionRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        request.validate()?;
+        let (matching_count, deleted_count) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .purge_legacy_attention_advisories(request.expected_message_count)?;
+        let response = MaintenancePurgeLegacyAttentionResponse {
+            matching_count,
+            deleted_count,
+            applied: request.expected_message_count.is_some(),
+        };
+        request.validate_response(&response)?;
+        serde_json::to_value(response).map_err(|_| {
+            Error::new(
+                "internal",
+                "legacy attention advisory purge result could not be encoded",
+            )
+        })
     }
 
     pub(super) fn set_previous_crash(&self, crash: Option<CrashMarker>) {

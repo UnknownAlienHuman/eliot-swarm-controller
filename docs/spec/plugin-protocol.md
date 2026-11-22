@@ -556,6 +556,9 @@ provider restriction. The adapter translates the turn's final assistant reply in
 `final_text`. A stream with tool boundaries uses the last assistant message after
 the last tool invocation. Earlier messages retain their own `message.completed`
 events within the message budget.
+Adapters mark known synthetic or out-of-turn diagnostic messages with
+`model_output: false` when retaining them as message events. These events provide
+no proof that the model consumed the wake input.
 After redaction, the shared retention path bounds the encoded terminal event. An
 oversized `final_text` retains its ending after a plain `[... truncated ...]` line.
 The same rule applies to every terminal outcome and recovered turn. A Core

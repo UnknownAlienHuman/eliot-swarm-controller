@@ -1596,11 +1596,7 @@ impl State {
     }
 
     async fn record_unattributed_tool(&mut self) -> Result<()> {
-        let first_tool_gap = self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| !pending.tool_gap_reported);
-        if first_tool_gap {
+        if self.pending.is_some() {
             self.finish_message_before_tool().await?;
         }
         if self
@@ -1854,7 +1850,8 @@ impl State {
             }
             restriction
         });
-        if restriction.is_some() {
+        let quota_warning = restriction.is_some();
+        if quota_warning {
             status = "failed";
         }
         // The reply answers the fenced `session/prompt` of the exact prepared
@@ -1932,7 +1929,7 @@ impl State {
             );
         }
         self.policy.redact_values(&mut data);
-        if missing_text.is_none() {
+        if missing_text.is_none() && !quota_warning {
             self.commit_assistant_message(&text).await?;
         }
         let unavailable = reply_unavailable(missing_text, status, &text);
@@ -1948,7 +1945,10 @@ impl State {
         if let Some(usage) = prompt_turn_usage(result) {
             data["usage"] = json!(usage);
         }
-        if (self.text_truncated || !is_blank_native_text(&text)) && missing_text.is_none() {
+        if (self.text_truncated || !is_blank_native_text(&text))
+            && missing_text.is_none()
+            && !quota_warning
+        {
             attach_final_text(&mut data, &text);
         }
         self.commit("turn.completed", &turn, "completed", data.clone())

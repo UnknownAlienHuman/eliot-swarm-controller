@@ -42,8 +42,13 @@ impl Router {
         };
         self.signal_progress();
         if change.is_new {
-            self.notify_claim_conflicts(&change.value.claim_conflicts)
-                .await;
+            self.notify_claim_conflicts(
+                &change.value.to,
+                &change.value.claims,
+                &change.value.claim_conflicts,
+                None,
+            )
+            .await;
         }
         serde_json::to_value(change.value)
             .map_err(|_| Error::new("internal", "cannot encode handoff"))

@@ -1149,6 +1149,23 @@ pub(crate) struct MaintenanceArgs {
 pub(crate) enum MaintenanceCommand {
     /// Run one bounded retention pass now and report pruned counts.
     Run,
+    /// Preview owner-sent legacy attention advisory mail; apply only with the exact preview count.
+    PurgeLegacyAttentionAdvisories(PurgeLegacyAttentionAdvisoriesArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct PurgeLegacyAttentionAdvisoriesArgs {
+    /// Apply the purge after confirming the exact count from a prior dry-run.
+    #[arg(long, requires = "expected_count")]
+    pub(crate) apply: bool,
+    /// Exact total returned by the prior dry-run.
+    #[arg(
+        long,
+        value_name = "COUNT",
+        value_parser = clap::value_parser!(i64).range(0..),
+        requires = "apply"
+    )]
+    pub(crate) expected_count: Option<i64>,
 }
 
 #[derive(Args)]
