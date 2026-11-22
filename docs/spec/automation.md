@@ -190,7 +190,9 @@ readback show the reason.
 
 The fast path uses the Agent's resolved launch Goal check, including any Owner argv,
 working-directory and deadline overrides. Setting `policy.check.at_turn_end = true`
-reserves the check for Goal rounds. A later manual `goal.set` replaces the Goal through
+directs checks to Goal rounds while the launch Goal is active. An enabled worktree review
+rule may request a check of a later author turn after that Goal completes. A later manual
+`goal.set` replaces the Goal through
 the ordinary revision. Every launch-installed Goal waits for the first turn to settle,
 so a check cannot finish the Goal before the Agent receives its work. A supplied
 cadence anchors at launch admission and still waits for that first turn.

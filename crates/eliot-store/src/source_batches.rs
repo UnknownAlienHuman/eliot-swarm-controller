@@ -819,10 +819,10 @@ impl Store {
                     core::limits::bound_terminal_text(&mut event.data, MAX_EVENT_BYTES);
                     data_bytes = encode_json(&event.data)?.len();
                 }
-                if data_bytes > MAX_EVENT_BYTES {
-                    if let Some(data) = event.data.as_object_mut() {
-                        data.remove("project_check");
-                    }
+                if data_bytes > MAX_EVENT_BYTES
+                    && let Some(data) = event.data.as_object_mut()
+                {
+                    data.remove("project_check");
                 }
                 enriched = Some(event);
             }
