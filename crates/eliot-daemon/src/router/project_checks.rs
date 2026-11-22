@@ -3,9 +3,9 @@
 //! The project configuration is read from the owner's settings. Commands run
 //! with the same minimal environment and owned-process custody as Goal checks.
 //! Only a definite nonzero exit is delivered, bound to the exact generation
-//! and turn that was active when the edit settled.
+//! and the context consumer available when the check finishes.
 
-use super::{Principal, Router};
+use super::Router;
 use crate::{
     common::now_ms,
     git_monitor::GitProbe,
@@ -15,17 +15,18 @@ use crate::{
     workspace_git::WorkspaceGit,
 };
 use eliot_core::{
-    Agent, Error, Event, InjectArgs, InjectPoint, Result, SecretPolicy, SubmitCommand,
+    Error, Event, Result, SecretPolicy, SubmitCommand,
     api::{DEFAULT_GOAL_CHECK_TIMEOUT_MS, GoalDefinition},
 };
+use eliot_plugin::sync::LockExt;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     path::Path,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    sync::watch,
+    sync::{Mutex, watch},
     task::JoinSet,
     time::{Instant, sleep_until},
 };
@@ -33,9 +34,8 @@ use tokio::{
 const EDIT_DEBOUNCE: Duration = Duration::from_millis(750);
 const MAX_PENDING_CHECKS: usize = 256;
 const MAX_CONCURRENT_CHECKS: usize = 4;
-const MAX_REMEMBERED_CHECKS: usize = 512;
 const MAX_FAILURE_CONTEXT_BYTES: usize = 6 * 1024;
-const INJECT_EXPIRY_MS: i64 = 10 * 60 * 1000;
+const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct WorkKey {
@@ -47,7 +47,6 @@ struct PendingEdit {
     seq: i64,
     deadline: Instant,
     workspace: String,
-    git_only: bool,
 }
 
 #[derive(Default)]
@@ -59,7 +58,6 @@ struct CheckState {
 
 struct WorkCompletion {
     key: WorkKey,
-    workspace: String,
     event_seq: i64,
     uncertain: bool,
     fingerprint: Option<String>,
@@ -68,10 +66,7 @@ struct WorkCompletion {
 struct CheckDriver {
     pending: HashMap<WorkKey, PendingEdit>,
     in_flight: HashSet<WorkKey>,
-    in_flight_workspaces: HashSet<String>,
     check_states: HashMap<WorkKey, CheckState>,
-    state_order: VecDeque<WorkKey>,
-    fenced_all: bool,
     tasks: JoinSet<WorkCompletion>,
 }
 
@@ -81,10 +76,33 @@ struct CheckDisposition {
 }
 
 struct ProjectWork {
-    agent: Agent,
     config: crate::config::ProjectRegistrationConfig,
     check: Vec<String>,
     workspace: String,
+}
+
+impl Router {
+    pub(super) fn workspace_check_lock(&self, workspace: &str) -> Arc<Mutex<()>> {
+        let path = eliot_core::display_path(workspace);
+        let key = if cfg!(windows) {
+            path.replace('/', "\\").to_ascii_lowercase()
+        } else {
+            path.to_string()
+        };
+        let key = crate::daemon::normalize_identity_data_dir(Path::new(&key));
+        let mut locks = self.inner.workspace_check_locks.lock_recover();
+        if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+            return lock;
+        }
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+pub(super) async fn wait_for_check_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    let _ = shutdown.wait_for(|stopped| *stopped).await;
 }
 
 /// Add the configured project check as a launch-time Goal for assigned and
@@ -179,12 +197,11 @@ pub(crate) async fn run_project_checks(
     let mut driver = CheckDriver {
         pending: HashMap::new(),
         in_flight: HashSet::new(),
-        in_flight_workspaces: HashSet::new(),
         check_states: HashMap::new(),
-        state_order: VecDeque::new(),
-        fenced_all: false,
         tasks: JoinSet::new(),
     };
+    let mut reap = tokio::time::interval(REAP_INTERVAL);
+    reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     if *shutdown.borrow() {
         return Ok(());
@@ -222,7 +239,10 @@ pub(crate) async fn run_project_checks(
             Some(joined) = driver.tasks.join_next(), if !driver.tasks.is_empty() => match joined {
                 Ok(completion) => {
                     driver.in_flight.remove(&completion.key);
-                    driver.in_flight_workspaces.remove(&completion.workspace);
+                    if !is_live_generation(&*router.inner.store.lock().await, &completion.key) {
+                        driver.pending.remove(&completion.key);
+                        continue;
+                    }
                     let state = driver.check_states.entry(completion.key.clone()).or_default();
                     state.checked_seq = state.checked_seq.max(completion.event_seq);
                     state.uncertain = completion.uncertain;
@@ -230,28 +250,14 @@ pub(crate) async fn run_project_checks(
                     if completion.uncertain {
                         driver.pending.remove(&completion.key);
                     }
-                    touch_state(&completion.key, &mut driver.state_order);
-                    if driver.check_states.len() > MAX_REMEMBERED_CHECKS {
-                        let overflow = trim_check_states(
-                            &mut driver.check_states,
-                            &mut driver.state_order,
-                            &driver.pending,
-                            &driver.in_flight,
-                        );
-                        if overflow && !driver.fenced_all {
-                            log_worker(
-                                &router,
-                                "daemon.project_check_state_full",
-                                Some(&completion.key),
-                                "project-check state is full; new checks are fenced",
-                            );
-                        }
-                        driver.fenced_all |= overflow;
-                    }
                 }
                 Err(_) => {
                     return Err(Error::new("unknown", "project-check task ended unexpectedly"));
                 }
+            },
+            _ = reap.tick() => {
+                let store = router.inner.store.lock().await;
+                driver.check_states.retain(|key, _| is_live_generation(&store, key));
             },
             _ = &mut timer, if driver.tasks.len() < MAX_CONCURRENT_CHECKS => {
                 start_due_checks(&router, &shutdown, &mut driver);
@@ -261,6 +267,18 @@ pub(crate) async fn run_project_checks(
 }
 
 fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
+    if let (Some(agent), Some(generation), Some(subject)) =
+        (&event.agent, event.generation, &event.subject)
+        && (subject.state.is_terminal() || event.kind == "session.ready")
+    {
+        let retained = |key: &WorkKey| {
+            &key.agent != agent
+                || key.generation > generation
+                || (key.generation == generation && !subject.state.is_terminal())
+        };
+        driver.check_states.retain(|key, _| retained(key));
+        driver.pending.retain(|key, _| retained(key));
+    }
     if event.source != "git" || !matches!(event.kind.as_str(), "file.changed" | "git.changed") {
         return;
     }
@@ -291,7 +309,6 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
         .as_ref()
         .and_then(|subject| subject.workspace.as_deref())
         .is_some_and(|subject_workspace| subject_workspace != workspace)
-        || driver.fenced_all
     {
         return;
     }
@@ -323,42 +340,21 @@ fn schedule_edit(router: &Router, event: Event, driver: &mut CheckDriver) {
             existing.seq = existing.seq.max(event.seq);
             existing.deadline = deadline;
             existing.workspace = workspace.to_owned();
-            existing.git_only &= git_only;
         })
         .or_insert(PendingEdit {
             seq: event.seq,
             deadline,
             workspace: workspace.to_owned(),
-            git_only,
         });
 }
 
-fn touch_state(key: &WorkKey, order: &mut VecDeque<WorkKey>) {
-    if let Some(index) = order.iter().position(|candidate| candidate == key) {
-        order.remove(index);
-    }
-    order.push_back(key.clone());
-}
-
-fn trim_check_states(
-    states: &mut HashMap<WorkKey, CheckState>,
-    order: &mut VecDeque<WorkKey>,
-    pending: &HashMap<WorkKey, PendingEdit>,
-    in_flight: &HashSet<WorkKey>,
-) -> bool {
-    while states.len() > MAX_REMEMBERED_CHECKS {
-        let Some(index) = order.iter().position(|key| {
-            !pending.contains_key(key)
-                && !in_flight.contains(key)
-                && !states.get(key).is_some_and(|state| state.uncertain)
-        }) else {
-            return true;
-        };
-        if let Some(key) = order.remove(index) {
-            states.remove(&key);
+fn is_live_generation(store: &eliot_store::Store, key: &WorkKey) -> bool {
+    match store.get_agent(&key.agent) {
+        Ok(agent) => {
+            agent.is_some_and(|agent| agent.generation == key.generation && !agent.is_terminal())
         }
+        Err(_) => true,
     }
-    false
 }
 
 fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &mut CheckDriver) {
@@ -377,23 +373,17 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
         if driver.tasks.len() >= MAX_CONCURRENT_CHECKS {
             break;
         }
-        if driver.fenced_all
-            || driver.check_states.get(&key).is_some_and(|state| {
-                state.uncertain
-                    || driver
-                        .pending
-                        .get(&key)
-                        .is_some_and(|edit| edit.seq <= state.checked_seq)
-            })
-        {
+        if driver.check_states.get(&key).is_some_and(|state| {
+            state.uncertain
+                || driver
+                    .pending
+                    .get(&key)
+                    .is_some_and(|edit| edit.seq <= state.checked_seq)
+        }) {
             driver.pending.remove(&key);
             continue;
         }
-        let workspace_busy = driver
-            .pending
-            .get(&key)
-            .is_some_and(|edit| driver.in_flight_workspaces.contains(&edit.workspace));
-        if driver.in_flight.contains(&key) || workspace_busy {
+        if driver.in_flight.contains(&key) {
             if let Some(edit) = driver.pending.get_mut(&key) {
                 edit.deadline = now + EDIT_DEBOUNCE;
             }
@@ -402,34 +392,26 @@ fn start_due_checks(router: &Router, shutdown: &watch::Receiver<bool>, driver: &
         let Some(edit) = driver.pending.remove(&key) else {
             continue;
         };
-        let prior_fingerprint = if edit.git_only {
-            driver
-                .check_states
-                .get(&key)
-                .and_then(|state| state.fingerprint.clone())
-        } else {
-            None
-        };
+        let prior_fingerprint = driver
+            .check_states
+            .get(&key)
+            .and_then(|state| state.fingerprint.clone());
         let task_router = router.clone();
         let task_shutdown = shutdown.clone();
         let task_key = key.clone();
-        let task_workspace = edit.workspace.clone();
         driver.in_flight.insert(key);
-        driver.in_flight_workspaces.insert(task_workspace.clone());
         driver.tasks.spawn(async move {
             let disposition = check_after_edit(
                 &task_router,
                 &task_key,
                 edit.seq,
                 &edit.workspace,
-                edit.git_only,
                 prior_fingerprint.as_deref(),
                 task_shutdown,
             )
             .await;
             WorkCompletion {
                 key: task_key,
-                workspace: task_workspace,
                 event_seq: edit.seq,
                 uncertain: disposition.uncertain,
                 fingerprint: disposition.fingerprint,
@@ -443,10 +425,17 @@ async fn check_after_edit(
     key: &WorkKey,
     event_seq: i64,
     expected_workspace: &str,
-    git_only: bool,
     prior_fingerprint: Option<&str>,
-    shutdown: watch::Receiver<bool>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> CheckDisposition {
+    let lock = router.workspace_check_lock(expected_workspace);
+    let _permit = tokio::select! {
+        biased;
+        _ = wait_for_check_shutdown(&mut shutdown) => {
+            return CheckDisposition { uncertain: false, fingerprint: None };
+        }
+        permit = lock.lock_owned() => permit,
+    };
     let work = match load_project_work(router, key, expected_workspace).await {
         Ok(Some(work)) => work,
         Ok(None) => {
@@ -485,7 +474,7 @@ async fn check_after_edit(
             };
         }
     };
-    if git_only && prior_fingerprint == Some(before.as_str()) {
+    if prior_fingerprint == Some(before.as_str()) {
         return CheckDisposition {
             uncertain: false,
             fingerprint: Some(before),
@@ -493,7 +482,6 @@ async fn check_after_edit(
     }
 
     let policy = router.secret_policy_snapshot();
-    let active_turn = work.agent.active_turn.clone();
     let mut failure = None;
     let mut checked_fingerprint = None;
     if !work.config.format.is_empty() {
@@ -540,15 +528,13 @@ async fn check_after_edit(
         }
     }
     if failure.is_none() && !work.check.is_empty() {
-        let check_input = work_fingerprint(&work.workspace).await.ok();
         match run_argv(&work.check, &work.workspace, Arc::clone(&policy), shutdown).await {
             Ok(outcome @ (CheckOutcome::Passed | CheckOutcome::Failed { .. })) => {
-                let after = work_fingerprint(&work.workspace).await.ok();
-                checked_fingerprint =
-                    after.filter(|fingerprint| check_input.as_ref() == Some(fingerprint));
-                if checked_fingerprint.is_some()
-                    && let CheckOutcome::Failed { exit_code, output } = outcome
-                {
+                // Remember the worktree left by this invocation, including
+                // any reports the checker wrote. Its own Git hints can then
+                // be suppressed just as formatter hints are.
+                checked_fingerprint = work_fingerprint(&work.workspace).await.ok();
+                if let CheckOutcome::Failed { exit_code, output } = outcome {
                     failure = Some(format_failure("fast check", exit_code, &output, &policy));
                 }
             }
@@ -574,31 +560,27 @@ async fn check_after_edit(
             }
         }
     }
-    if let Some(failure) = failure {
-        if let Some(turn_id) = active_turn.as_deref() {
-            if let Err(error) =
-                deliver_failure(router, key, turn_id, &work.agent.harness, failure).await
-            {
-                log_error(
-                    router,
-                    "daemon.project_check_delivery_failed",
-                    key,
-                    event_seq,
-                    &error,
-                );
-            }
-        } else {
-            log_worker(
-                router,
-                "daemon.project_check_failure_no_active_turn",
-                Some(key),
-                "failure awaits the next Goal continuation or an exact active turn",
-            );
-        }
+    if let Err(error) = update_failure_context(router, key, failure).await {
+        log_error(
+            router,
+            "daemon.project_check_delivery_failed",
+            key,
+            event_seq,
+            &error,
+        );
     }
 
+    let uncertain = checked_fingerprint.is_none();
+    if uncertain {
+        log_worker(
+            router,
+            "daemon.project_check_fingerprint_unknown",
+            Some(key),
+            "the worktree after the project commands could not be verified",
+        );
+    }
     CheckDisposition {
-        uncertain: false,
+        uncertain,
         fingerprint: checked_fingerprint,
     }
 }
@@ -672,7 +654,6 @@ async fn load_project_work(
         ));
     }
     Ok(Some(ProjectWork {
-        agent,
         config,
         check,
         workspace: canonical,
@@ -704,11 +685,14 @@ async fn run_argv(
         cancellation,
     )
     .await;
-    Ok(classify_outcome(outcome, &policy))
+    classify_outcome(outcome, &policy)
 }
 
-fn classify_outcome(outcome: ProcessOutcome, policy: &SecretPolicy) -> CheckOutcome {
-    match outcome {
+fn classify_outcome(outcome: ProcessOutcome, policy: &SecretPolicy) -> Result<CheckOutcome> {
+    Ok(match outcome {
+        ProcessOutcome::NotSpawned(error) | ProcessOutcome::ProgramUnrunnable(error) => {
+            return Err(error);
+        }
         ProcessOutcome::Completed(capture) => classify_capture(capture, policy),
         ProcessOutcome::Failed {
             reason: ProcessFailure::Exit,
@@ -720,7 +704,7 @@ fn classify_outcome(outcome: ProcessOutcome, policy: &SecretPolicy) -> CheckOutc
         ProcessOutcome::Unknown { reason, .. } => {
             CheckOutcome::Unknown(format!("process outcome is unknown: {reason:?}"))
         }
-    }
+    })
 }
 
 fn classify_capture(capture: ProcessCapture, policy: &SecretPolicy) -> CheckOutcome {
@@ -758,53 +742,19 @@ fn format_failure(kind: &str, exit_code: i32, output: &str, policy: &SecretPolic
     message
 }
 
-async fn deliver_failure(
+async fn update_failure_context(
     router: &Router,
     key: &WorkKey,
-    turn_id: &str,
-    harness: &str,
-    text: String,
+    failure: Option<String>,
 ) -> Result<()> {
-    let still_current = {
-        let store = router.inner.store.lock().await;
-        store.get_agent(&key.agent)?.is_some_and(|agent| {
-            agent.generation == key.generation && agent.active_turn.as_deref() == Some(turn_id)
-        })
-    };
-    if !still_current {
-        return Err(Error::new(
-            "stale_generation",
-            "project check failure no longer matches the active turn",
-        ));
+    router.check_command_admission_mode("inject")?;
+    let mut store = router.inner.store.lock().await;
+    let change = store.project_check_context(&key.agent, key.generation, failure, now_ms())?;
+    router.publish_locked(&change.events);
+    drop(store);
+    if let Some(command_id) = change.value {
+        router.schedule_command(command_id, None);
     }
-    let point = match harness {
-        "claude" | "opencode" | "antigravity" => InjectPoint::TurnSafePoint,
-        _ => InjectPoint::ActiveTurn,
-    };
-    let request = SubmitCommand {
-        id: ulid::Ulid::new().to_string(),
-        target: Some(key.agent.clone()),
-        selector: None,
-        verb: "inject".to_owned(),
-        args: serde_json::to_value(InjectArgs {
-            text,
-            point,
-            expires_at_ms: Some(now_ms().saturating_add(INJECT_EXPIRY_MS)),
-        })
-        .map_err(|_| Error::new("internal", "project check context could not be encoded"))?,
-        expected_generation: Some(key.generation),
-        expected_turn_id: Some(turn_id.to_owned()),
-        request_id: None,
-        probe: false,
-    };
-    router
-        .submit(
-            &serde_json::to_value(request).map_err(|_| {
-                Error::new("internal", "project check command could not be encoded")
-            })?,
-            &Principal::Owner,
-        )
-        .await?;
     Ok(())
 }
 

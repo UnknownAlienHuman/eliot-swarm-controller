@@ -111,8 +111,8 @@ pub use goals::{
     GoalGetRequest, GoalMarkerState, GoalMode, GoalPauseRequest, GoalResumeRequest, GoalRoundEvent,
     GoalRoundEventOutcome, GoalRoundMarker, GoalRoundOutcome, GoalRoundRequest, GoalRoundResponse,
     GoalScopeBase, GoalScopeStart, GoalSetRequest, GoalStatus, GoalView, MAX_GOAL_CADENCE_MS,
-    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_LIMIT,
-    MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
+    MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS, MAX_GOAL_LIMIT, MAX_GOAL_OBSERVATION_BYTES,
+    MAX_GOAL_SCOPE_BASE_PATHS, MIN_GOAL_CADENCE_MS,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,

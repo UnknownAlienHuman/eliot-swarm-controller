@@ -15,6 +15,7 @@ use std::{
 
 const MAX_PROJECT_PATH_LEN: usize = 4096;
 const MAX_PROJECT_CHECK_ROUNDS: i64 = 16;
+const DEFAULT_PROJECT_CHECK_ROUNDS: i64 = 3;
 
 /// Managed-worktree policy for top-level launches in a registered project.
 /// `worktree` (the default) prepares one standard worktree per top-level
@@ -321,7 +322,7 @@ pub(super) struct ProjectEntry {
     /// Run a heavy check only through the idle Goal driver.
     #[serde(default)]
     check_at_turn_end: bool,
-    /// Required when `check` is configured; bounds automatic Goal rounds.
+    /// Bounds automatic Goal rounds.
     #[serde(default)]
     max_rounds: Option<i64>,
     #[serde(default)]
@@ -435,14 +436,17 @@ pub(super) fn project_registrations_in(
             })?;
         let format = normalize_project_command_argv(&entry.format, source, offset, id, "format")?;
         let check = normalize_project_command_argv(&entry.check, source, offset, id, "check")?;
-        match (check.is_empty(), entry.max_rounds) {
-            (false, Some(rounds)) if (1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds) => {}
-            (false, _) => {
+        let max_rounds = match (check.is_empty(), entry.max_rounds) {
+            (false, Some(rounds)) if (1..=MAX_PROJECT_CHECK_ROUNDS).contains(&rounds) => {
+                Some(rounds)
+            }
+            (false, None) => Some(DEFAULT_PROJECT_CHECK_ROUNDS),
+            (false, Some(_)) => {
                 return Err(config_error_at(
                     source,
                     offset,
                     &format!("projects.{id}.max_rounds"),
-                    "is required with check and must be between 1 and 16",
+                    "must be between 1 and 16",
                     "profile_error",
                 ));
             }
@@ -455,8 +459,8 @@ pub(super) fn project_registrations_in(
                     "profile_error",
                 ));
             }
-            (true, None) => {}
-        }
+            (true, None) => None,
+        };
         let git = entry.git.clone();
         if let Some(git) = &git {
             validate_project_git_config(git, source, offset, id)?;
@@ -482,7 +486,7 @@ pub(super) fn project_registrations_in(
             format,
             check,
             check_at_turn_end: entry.check_at_turn_end,
-            max_rounds: entry.max_rounds,
+            max_rounds,
             command_guards: entry.command_guards.clone(),
             workspace: entry.workspace,
         });

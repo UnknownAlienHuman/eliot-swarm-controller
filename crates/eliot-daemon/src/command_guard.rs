@@ -84,11 +84,52 @@ impl CommandGuardPolicy {
     pub(crate) fn refusal(&self, commands: &[String]) -> Option<&str> {
         for command in commands {
             for rule in &self.rules {
-                if rule.matcher.is_match(command) {
+                if rule.matcher.is_match(command.trim())
+                    || command_segments(command).any(|segment| rule.matcher.is_match(segment))
+                {
                     return Some(rule.refusal.as_str());
                 }
             }
         }
         None
     }
+}
+
+/// Match unquoted shell list separators without interpreting or executing
+/// shell syntax. The verbatim request is also matched by the caller.
+fn command_segments(command: &str) -> impl Iterator<Item = &str> {
+    let mut start = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    command
+        .char_indices()
+        .chain(std::iter::once((command.len(), '\n')))
+        .filter_map(move |(offset, ch)| {
+            if offset != command.len() {
+                if escaped {
+                    escaped = false;
+                    return None;
+                }
+                if matches!(ch, '\\' | '`') && quote != Some('\'') {
+                    escaped = true;
+                    return None;
+                }
+                if let Some(delimiter) = quote {
+                    if ch == delimiter {
+                        quote = None;
+                    }
+                    return None;
+                }
+                if matches!(ch, '\'' | '"') {
+                    quote = Some(ch);
+                    return None;
+                }
+                if !matches!(ch, ';' | '|' | '&' | '\n' | '\r') {
+                    return None;
+                }
+            }
+            let segment = command[start..offset].trim();
+            start = offset + ch.len_utf8();
+            (!segment.is_empty()).then_some(segment)
+        })
 }

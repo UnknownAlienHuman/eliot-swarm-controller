@@ -70,19 +70,20 @@ use eliot_core::{
         CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
         EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
-        FrozenGitPublish, GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
-        HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
-        MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
-        MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,
-        MaintenanceRunRequest, MaintenanceRunResponse, NotifyDefinitionArgs, ObservationPage,
-        ObservationQuery, ObservationView, ObserveHeavyRequest, ObserveHeavyResponse,
-        ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
-        ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
-        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
-        SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
-        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessDoctorRequest,
+        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
+        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
+        MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
+        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
+        ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
+        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult,
+        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -174,6 +175,7 @@ struct RouterInner {
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
     run_cancellation: watch::Sender<bool>,
+    workspace_check_locks: Mutex<HashMap<PathBuf, std::sync::Weak<AsyncMutex<()>>>>,
     run_workers: Mutex<HashMap<String, RunWorkerHandle>>,
     inference_ops: AsyncMutex<()>,
     inference_runner: AsyncMutex<()>,
@@ -448,6 +450,7 @@ impl Router {
                 progress,
                 run_cancellation,
                 run_workers: Mutex::new(HashMap::new()),
+                workspace_check_locks: Mutex::new(HashMap::new()),
                 inference_ops: AsyncMutex::new(()),
                 inference_runner: AsyncMutex::new(()),
                 inference_workers: Mutex::new(HashMap::new()),
@@ -1359,7 +1362,8 @@ impl Router {
             feedback: None,
         })
         .map_err(|_| Error::new("internal", "guard reply could not be encoded"))?;
-        self.submit(&json!(deny), &Principal::Owner, "command.submit").await?;
+        self.submit(&json!(deny), &Principal::Owner, "command.submit")
+            .await?;
 
         let mut inject = SubmitCommand::new(ulid::Ulid::new().to_string(), "inject");
         inject.target = Some(agent.clone());
@@ -1370,7 +1374,8 @@ impl Router {
             point,
             expires_at_ms: Some(now_ms().saturating_add(60_000)),
         });
-        self.submit(&json!(inject), &Principal::Owner, "command.submit").await?;
+        self.submit(&json!(inject), &Principal::Owner, "command.submit")
+            .await?;
         Ok(())
     }
 

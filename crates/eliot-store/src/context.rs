@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 const CONTEXT_ITEMS_ARG: &str = "context_items";
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
+const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
 type ContextCursor = (i64, i64);
 type ContextPage = (Vec<CommandRecord>, Option<ContextCursor>);
 
@@ -40,6 +41,114 @@ struct ClaimedContextRecord {
 pub(super) struct ContextConsumer<'a> {
     pub(super) id: &'a str,
     pub(super) point: InjectPoint,
+}
+
+impl Store {
+    /// Replace one unclaimed project diagnostic. The live Agent row chooses
+    /// the consumer in the transaction that admits the context.
+    pub fn project_check_context(
+        &mut self,
+        target: &str,
+        generation: i64,
+        failure: Option<String>,
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        self.ensure_writer_healthy()?;
+        let result = self.project_check_context_inner(target, generation, failure, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn project_check_context_inner(
+        &mut self,
+        target: &str,
+        generation: i64,
+        failure: Option<String>,
+        now: i64,
+    ) -> Result<Change<Option<String>>> {
+        let agent_num = parse_agent_id(target)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let mut events = Vec::new();
+        let mut value = None;
+        if let Some(agent) = load_agent_by_num(&tx, agent_num)?
+            && agent.generation == generation
+            && !agent.is_terminal()
+        {
+            let previous: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM commands INDEXED BY commands_target
+                     WHERE target = ?1 AND generation = ?2 AND principal = ?3
+                       AND verb = 'inject' AND state IN ('accepted', 'queued') LIMIT 1",
+                    params![agent_num, generation, PROJECT_CHECK_PRINCIPAL],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(id) = previous {
+                let command = load_command_record(&tx, &id)?.ok_or_else(|| {
+                    Error::new("source_integrity", "project check context disappeared")
+                })?;
+                reject_pending_context(
+                    &tx,
+                    &command,
+                    agent_num,
+                    generation,
+                    "project_check_superseded",
+                    now,
+                    &mut events,
+                )?;
+            }
+            if let Some(text) = failure {
+                let preferred = match agent.harness.as_str() {
+                    "claude" | "opencode" | "antigravity" => InjectPoint::TurnSafePoint,
+                    _ => InjectPoint::ActiveTurn,
+                };
+                let turn = agent
+                    .active_turn
+                    .as_ref()
+                    .filter(|_| {
+                        matches!(agent.state, AgentState::Busy | AgentState::Waiting)
+                            && require_context_point_available(&agent, preferred).is_ok()
+                    })
+                    .cloned();
+                let point = if turn.is_some() {
+                    preferred
+                } else {
+                    InjectPoint::NextInput
+                };
+                let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "inject");
+                request.target = Some(target.to_owned());
+                request.expected_generation = Some(generation);
+                request.expected_turn_id = turn;
+                request.args = serde_json::to_value(InjectArgs {
+                    text,
+                    point,
+                    expires_at_ms: (point != InjectPoint::NextInput)
+                        .then(|| now.saturating_add(10 * 60 * 1000)),
+                })
+                .map_err(|_| {
+                    Error::new("internal", "project check context could not be encoded")
+                })?;
+                let digest = canonical::digest(&admission::command_semantic_payload(
+                    &request,
+                    request.args.clone(),
+                )?)?;
+                events.push(admit_tx(
+                    &tx,
+                    PROJECT_CHECK_PRINCIPAL,
+                    &request,
+                    &digest,
+                    now,
+                )?);
+                value = (point == InjectPoint::ActiveTurn).then_some(request.id);
+            }
+        }
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(Change { value, events })
+    }
 }
 
 pub(super) fn admit_tx(

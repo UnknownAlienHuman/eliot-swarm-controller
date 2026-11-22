@@ -536,7 +536,9 @@ fn apply_command_guard(
             || guard.commands.iter().any(|command| {
                 command.trim().is_empty()
                     || command.len() > crate::command_guard::MAX_COMMAND_BYTES
-                    || command.chars().any(char::is_control)
+                    || command
+                        .chars()
+                        .any(|ch| ch.is_control() && !matches!(ch, '\t' | '\n' | '\r'))
             })
         {
             return Err(Error::new(

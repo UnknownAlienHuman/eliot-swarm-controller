@@ -783,9 +783,11 @@ allowlist. Project Run remains confined to its separate registered-checkout
 ## Project registration and rule authority
 
 A registered project may define a static command refusal table with
-[[projects.ID.command_guards]]. Each entry has a pattern glob over the full command
-string exposed by a native permission request and a literal, single-line refusal
-message. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
+[[projects.ID.command_guards]]. Each entry has a pattern glob and a literal,
+single-line refusal. Globs match the trimmed command supplied by a native
+permission request and each trimmed segment separated by unquoted, unescaped
+`;`, `|`, `&`, or a newline. Matching uses the supplied text without shell
+expansion. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
 text at most 512 bytes. The daemon freezes the registered project's table into each
 admitted launch after project discovery. It is evaluated only when a supported native
 permission request exposes the command.
@@ -821,7 +823,7 @@ arguments, at most 4 KiB each); the daemon never parses them through a shell.
 After a Git-confirmed `file.changed` hint or dirty `git.changed` snapshot
 settles, the daemon runs `format` and then `check` in the Agent's managed
 worktree. Set `check_at_turn_end = true` for a heavy check that runs through
-the idle Goal driver. `max_rounds` is required with `check` and must be 1–16.
+the idle Goal driver. With `check`, `max_rounds` defaults to 3 and accepts 1–16.
 Project registration readback uses the canonical Core [`ProjectRegistrationView`](../../crates/eliot-core/src/api/agent_views.rs);
 project identity includes the canonical checkout and Git common directory. The registration ID names nothing a person reads: a project's name is the
 owner's `[desktop] display_names` entry, else the repository name of its `origin` remote

@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug)]
 pub struct GoalRoundProbe {
     pub view: GoalView,
+    pub project_default: bool,
     pub agent_state: AgentState,
     pub active_turn: Option<String>,
     pub pending_count: usize,
@@ -456,6 +457,8 @@ struct GoalStatePersist {
     transferred_turns: i64,
     #[serde(default)]
     await_first_turn: bool,
+    #[serde(default)]
+    project_default: bool,
     status: GoalStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     paused_reason: Option<String>,
@@ -1087,9 +1090,11 @@ impl Store {
             turn_count.saturating_add(row.state.transferred_turns),
         )?;
         let scope_base = row.state.scope_base.clone();
+        let project_default = row.state.project_default;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
             scope_base,
+            project_default,
             agent_state: agent_row.state,
             active_turn: agent_row.active_turn.clone(),
             pending_count: agent_row.pending.len(),
@@ -1322,7 +1327,7 @@ impl Store {
         if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
                 && row.state.status == GoalStatus::Active
-                && !row.state.await_first_turn
+                && !row.state.project_default
                 && encode_json(&row.definition)? == encoded
             {
                 let view = goal_view_on(&tx, &goal_holder, row)?;
@@ -1336,6 +1341,7 @@ impl Store {
             let state = GoalStatePersist {
                 transferred_turns: 0,
                 await_first_turn: false,
+                project_default: false,
                 status: GoalStatus::Active,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1377,6 +1383,7 @@ impl Store {
         let state = GoalStatePersist {
             transferred_turns: 0,
             await_first_turn: false,
+            project_default: false,
             status: GoalStatus::Active,
             paused_reason: None,
             blocked_reason: None,
@@ -1513,6 +1520,7 @@ impl Store {
             let state = GoalStatePersist {
                 transferred_turns: row.state.transferred_turns,
                 await_first_turn: row.state.await_first_turn,
+                project_default: row.state.project_default,
                 status: GoalStatus::Cleared,
                 paused_reason: None,
                 blocked_reason: None,
@@ -1630,6 +1638,7 @@ impl Store {
         let state = GoalStatePersist {
             transferred_turns: row.state.transferred_turns,
             await_first_turn: row.state.await_first_turn,
+            project_default: row.state.project_default,
             status: GoalStatus::Paused,
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
@@ -1690,6 +1699,7 @@ impl Store {
                 let state = GoalStatePersist {
                     transferred_turns: row.state.transferred_turns,
                     await_first_turn: row.state.await_first_turn,
+                    project_default: row.state.project_default,
                     status: GoalStatus::Paused,
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
@@ -2359,7 +2369,8 @@ impl Store {
             ],
         ));
         let mut events = Vec::new();
-        if matches!(outcome, GoalCommitOutcome::Completed)
+        if state.project_default
+            && matches!(outcome, GoalCommitOutcome::Completed)
             && let Some((project, fingerprint)) = &commit.project_check
             && let Some(event) =
                 project_check_passed_event(&tx, agent_num, &agent_row, project, fingerprint, now)?
@@ -3301,14 +3312,15 @@ pub(super) fn install_assignment_goal_tx(
     generation: i64,
     definition: &GoalDefinition,
     cause: core::EventCause,
-    await_first_turn: bool,
+    project_default: bool,
     now: i64,
 ) -> Result<()> {
     definition.validate()?;
     definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
-        await_first_turn,
+        await_first_turn: project_default,
+        project_default,
         status: GoalStatus::Active,
         paused_reason: None,
         blocked_reason: None,

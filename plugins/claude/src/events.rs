@@ -2701,15 +2701,8 @@ impl EventProcessor {
                 .record_gap("Claude normalized request exceeded the persisted-event bound")
                 .await;
         }
-        let guard_command = (body.tool_name.eq_ignore_ascii_case("bash"))
-            .then(|| {
-                body.input
-                    .as_ref()
-                    .and_then(|input| input.get("command"))
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .flatten();
+        let guard_command =
+            eliot_plugin::session::shell_permission_command(&body.tool_name, body.input.as_ref());
         let mut event_data = data;
         if let Some(command) = guard_command {
             event_data[eliot_core::COMMAND_GUARD_CONTEXT_FIELD] = json!({"commands": [command]});

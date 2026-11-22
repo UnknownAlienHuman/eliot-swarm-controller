@@ -2584,9 +2584,9 @@ impl EventProcessor {
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let committed = redact_request_details_for_commit(&public_details, &secrets);
         let guard_commands = (pending.kind == "approval"
-            && pending.details["action"]
-                .as_str()
-                .is_some_and(|action| action.eq_ignore_ascii_case("shell") || action.eq_ignore_ascii_case("bash")))
+            && pending.details["action"].as_str().is_some_and(|action| {
+                action.eq_ignore_ascii_case("shell") || action.eq_ignore_ascii_case("bash")
+            }))
         .then(|| {
             pending.details["resources"]
                 .as_array()

@@ -1409,6 +1409,15 @@ pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy)
     redacted
 }
 
+/// Extract the command supplied by a Bash or PowerShell permission callback.
+pub fn shell_permission_command<'a>(tool: &str, input: Option<&'a Value>) -> Option<&'a str> {
+    if tool.eq_ignore_ascii_case("bash") || tool.eq_ignore_ascii_case("powershell") {
+        input?.get("command")?.as_str()
+    } else {
+        None
+    }
+}
+
 /// Refuse a `model.list` or `quota.read` call on a session-bound plugin
 /// instance. Catalogue and quota reads run on a dedicated reader instance
 /// with no session, no retained start outcome and no observer; anything else

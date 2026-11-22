@@ -75,6 +75,7 @@ struct ClaimedGoalRound {
     check: Option<Pin<Box<dyn Future<Output = ProcessOutcome> + Send>>>,
     quiescent: bool,
     pending_decision: Option<GoalRoundCommit>,
+    workspace_permit: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl ClaimedGoalRound {
@@ -133,7 +134,9 @@ impl Drop for ClaimedGoalRound {
         self.cancellation.send_replace(true);
         let check = self.check.take();
         let pending_decision = self.pending_decision.take();
+        let workspace_permit = self.workspace_permit.take();
         self.runtime.spawn(async move {
+            let _workspace_permit = workspace_permit;
             if let Some(commit) = pending_decision {
                 // This exact decision was made before awaiting the Store.
                 let _ = router
@@ -430,6 +433,20 @@ impl Router {
                 "goal check input exceeds 1 MiB",
             ));
         }
+        drop(store);
+        let workspace_permit = if let Some(workspace) = probe.workspace.as_deref() {
+            let lock = self.workspace_check_lock(workspace);
+            Some(tokio::select! {
+                biased;
+                _ = super::project_checks::wait_for_check_shutdown(&mut cancellation) => {
+                    return Err(Error::new("cancelled", "Goal cancelled before checking its worktree"));
+                }
+                permit = lock.lock_owned() => permit,
+            })
+        } else {
+            None
+        };
+        let mut store = self.inner.store.lock().await;
         // The claim re-validates the probe and commits the durable in-flight
         // marker. Everything after it resolves the marker exactly once: the
         // commit consumes it, every other exit abandons it to `unknown`.
@@ -465,6 +482,7 @@ impl Router {
             check: None,
             quiescent: true,
             pending_decision: None,
+            workspace_permit,
         };
         let turns_used = probe
             .turn_count
@@ -680,7 +698,8 @@ impl Router {
             ));
             GoalRoundDecision::Block(reason.to_owned())
         });
-        let project_check = if decision.is_none()
+        let project_check = if probe.project_default
+            && decision.is_none()
             && let Some(fingerprint) = fingerprint_before.as_ref()
             && let Some(project) = self.publication_check_project(&probe, &definition).await
             && work_fingerprint(probe.workspace.as_deref()).await.as_ref() == Some(fingerprint)

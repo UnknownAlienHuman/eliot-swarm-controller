@@ -155,29 +155,33 @@ A project may also declare optional `format` and `check` argv arrays plus a
 bounded `max_rounds`. The daemon debounces committed `file.changed` hints and
 dirty `git.changed` snapshots per exact Agent generation; the latter also covers
 adapters without native file hints. Each event is fenced to the Agent's owned,
-registered worktree. A stable post-format fingerprint suppresses the formatter's own
-follow-up snapshot. Once edits settle, the daemon runs the formatter
+registered worktree. A post-run fingerprint suppresses follow-up hints and snapshots
+for the same content, including reports the check writes. Once edits settle, the daemon runs the formatter
 in that Agent's verified worktree, then runs the fast check in the same minimal
 script/process environment. Events in the same debounce window coalesce. Only a
-definite nonzero exit is delivered:
-Claude, OpenCode and Antigravity receive it at their existing exact-turn hook context
-point; Codex and Muse receive it through exact-turn active-turn inject/steer.
+definite nonzero exit is delivered. The live turn is selected when the diagnostic
+is admitted. Claude, OpenCode and Antigravity receive it at their existing
+exact-turn hook point. Codex and Muse receive it through active-turn inject/steer.
+When the Agent is idle, the latest failure replaces its unclaimed project-check
+context and waits for the next input. A passing check clears unclaimed failures.
 The fast path uses the current project check. A project can set
 `check_at_turn_end = true` to reserve a heavy check for its Goal. Manual Goal
-checks also run at turn end. Successful fast checks stay silent. Unknown process
-outcomes are not reported as passes or failures and fence further fast checks for that
-Agent generation, so the daemon never retries an uncertain invocation.
+checks also run at turn end. Fast checks and Goal checks share one execution lock
+per worktree. Successful fast checks stay silent. Unknown outcomes fence further
+fast checks for the affected Agent generation. Its fence expires when that
+generation ends.
 
-A launch into a registered project by assignment or routing role receives a default
-Eliot Goal when the project has `check`. Projects that enable `git.publish` also
+A launch into any registered project with `check` receives a default Eliot Goal
+when it is admitted by assignment or routing role. Projects that enable `git.publish` also
 receive it on profile-selected launches. An explicit assignment Goal takes
 priority, and a later manual `goal.set` replaces the default through the ordinary
 Goal revision. The first round waits for the Agent's first turn to settle. The
 idle Goal driver runs the check at turn end and enforces `max_rounds`.
 A successful final round records the frozen check and its result in the Goal.
-With publication enabled, the same transaction records a
+With publication enabled, the default project Goal's successful check records a
 [`project.check.passed` receipt](#final-project-check-publication) after the
-configured project check passes against the same worktree state.
+configured project check passes against the same worktree state. Only the
+default project Goal carries publication authority.
 
 Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
 never from an Agent worktree. Their principal is `project:ID`. Router authorization and
@@ -1383,7 +1387,8 @@ event acknowledgement. That acknowledgement follows the committed request event.
 Store admission rejects `approve` for a guarded request. A refreshed native offer
 retains the refusal for the same request. Each native denial is attempted once.
 
-Claude `can_use_tool` and OpenCode 2.2.7 `permission.asked` carry the refusal text
+Claude `can_use_tool` for Bash or PowerShell and OpenCode 2.2.7
+`permission.asked` carry the refusal text
 in their native reply. OpenCode's native reject closes every pending permission
 for the session, so the adapter reads back the pending list and auto-rejects only when
 the guarded ask is the sole pending permission. If readback fails or a sibling permission
@@ -1403,7 +1408,8 @@ The existing prohibition on `on.hook` and `hook.decide` applies.
 
 A Goal is keyed by `(agent,generation,mode,revision)`; native and Eliot modes are
 independent. `set`, definition changes, pause, clear and resume advance revision.
-An identical `set` on an active Goal's bound generation is a no-op. A fresh
+An identical `set` on an active manual Goal's bound generation is a no-op.
+Replacing a default project Goal establishes a manual Goal. A fresh
 `goal set` on a blocked Goal clears its reason and resets its budget, even with
 the same definition. Generation change pauses
 the old Goal on its next round attempt, and `resume` on a drifted generation is
