@@ -302,13 +302,11 @@ forwards calls through the existing authenticated local client. Ordinary mode us
 uses [`eliot_daemon::client_call_with_agent_identity`](../../crates/eliot-daemon/src/daemon.rs).
 Ordinary stdio authenticates with `api.identity` before MCP initialization so the
 daemon's local Owner refusal is reported when the bridge connects.
-Both reuse the daemon methods and shared Core DTOs. Discovery is available through
-the same tool: start with `api.identity` and `{}`, then `api.methods` with optional
-`query`, `after` and `limit` (default 20, maximum 50), and `api.help` with a canonical
-`method`, for example `mail.send` or `var.set`. The MCP tool description advertises
-these entry points so a fresh caller needs no private prompt or repository files.
-Only `--require-agent` stdio includes standard `initialize.instructions`, directing the
-client to the `swarm` tool, current `method`/`params` DTOs, and inherited Agent authentication.
+Both reuse the daemon methods and shared Core DTOs. Call known methods directly.
+For discovery, `api.identity` gives the caller's identity and scope, `api.methods`
+finds callable names, and `api.help` describes a canonical method. Only
+`--require-agent` stdio includes standard `initialize.instructions` pointing to
+the `swarm` tool and the bundled `eliot-swarm` skill.
 
 Clients configure the stdio server using their native project-scoped configuration, such as
 an Antigravity workspace plugin (`.agents/plugins/eliot-swarm/plugin.json` + `mcp_config.json`).

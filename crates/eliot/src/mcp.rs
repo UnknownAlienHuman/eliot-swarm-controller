@@ -61,8 +61,8 @@ use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
 
 const TOOL_NAME: &str = "swarm";
-const TOOL_DESCRIPTION: &str = "Generic Eliot management call. Start with api.identity and params:{} for your identity/scopes; api.methods and params:{query:\"mail\",limit:20} lists callable methods; api.help and params:{method:\"mail.send\"} returns fields, a runnable example and limits (full:true restores the DTO schemas). Use canonical mail.send and var.set. Mutations accept params without id: the server mints a ULID and returns it as top-level id; retry with that same id. Authentication is inherited; never supply credentials. { method, params } -> authenticated daemon RPC result";
-const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use this server's swarm tool for Eliot controller and coordination operations instead of shell commands. Discover your actual identity/scopes with api.identity params:{}, list/search methods with api.methods params:{query:\"mail\",limit:20}, then read api.help params:{method:\"mail.send\"} (or var.set) for field lists, examples and mutation-id rules (full:true restores the DTO schemas). Mutations accept params without id: the server mints a ULID and returns it as top-level id; retry with that same id, never mint a new one after an uncertain outcome. Authentication is inherited from this Agent session; never put credentials or tokens in tool arguments.";
+const TOOL_DESCRIPTION: &str = "Call a Swarm method with inherited authentication. Use api.methods or api.help when you need a name or example. Omit a mutation id to mint one. Keep it for exact retries.";
+const REQUIRE_AGENT_INSTRUCTIONS: &str = "Use the swarm MCP tool and the eliot-swarm skill when your task needs coordination. Call known methods directly. Use api.identity if you need your identity or scope.";
 
 const INVALID_ARGS_MESSAGE: &str = "tool arguments must be an object with method and params";
 
@@ -393,7 +393,7 @@ fn tool_definition() -> Tool {
         serde_json::from_value(json!({
             "type": "object",
             "properties": {
-                "method": { "type": "string", "description": "Canonical Eliot method. Start with api.identity, api.methods (query/limit/after), then api.help (method) for actual DTO fields and examples." },
+                "method": { "type": "string", "description": "Canonical Eliot method, such as mail.inbox." },
                 "params": { "type": "object", "description": "Method params object; auth is inherited server-side and cannot be overridden here" }
             },
             "required": ["method", "params"],
