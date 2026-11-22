@@ -55,12 +55,12 @@ use eliot_core::{
         AgentConfigView, AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse,
         AgentGetRequest, AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest,
         AgentListRequest, AgentListResponse, AgentListRow, AgentProcessesRequest,
-        AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
-        AgentStatsResponse, AgentSummary, CommandChildrenRequest, CommandChildrenResponse,
-        CommandGetRequest, CommandSubmitRequest, CommandSubmitResponse, CrashMarker,
-        DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage,
-        DoctorHarnessEntry, EmitDefinitionArgs, EventsBoundsRequest, EventsFilter,
-        EventsReadRequest, EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
+        AgentProcessesResponse, AgentResultRequest, AgentStatsRequest, AgentStatsResponse,
+        AgentSummary, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
+        CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
+        DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
+        EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
+        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse,
         GitFetchDefinitionArgs, GitView, HarnessDoctorRequest, HarnessDoctorResponse,
         HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES,
         MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
@@ -4615,35 +4615,38 @@ impl Router {
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
-        let (agent_metadata, generation, mut turns) = {
+        let mut response = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, request.generation)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
-            let generation = request.generation.unwrap_or(agent.generation);
-            let mut turns = if let Some(turn_id) = request.turn_id.as_deref() {
-                vec![store.get_turn(id, generation, turn_id)?.ok_or_else(|| {
-                    Error::new("not_found", format!("turn {turn_id} was not found"))
-                })?]
-            } else {
-                store.list_turns(id, generation, request.limit)?
+            let self_generation = match principal {
+                Principal::Agent {
+                    id: caller_id,
+                    generation,
+                } if caller_id == id => Some(*generation),
+                _ => None,
             };
-            // Historical configuration from each turn's exact retained
-            // revision, never the current overlay.
-            for turn in &mut turns {
-                store.fill_turn_readback(&agent, turn)?;
+            let generation_filter = request.generation.or(self_generation);
+            let generation = generation_filter.unwrap_or(agent.generation);
+            if let Some(before) = &request.before
+                && (before.generation > generation
+                    || generation_filter.is_some_and(|filter| before.generation != filter))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "result cursor generation is outside the requested generation scope",
+                ));
             }
-            (agent, generation, turns)
+            store.agent_result_page(agent, generation_filter, &request)?
         };
-        self.mask_unknown_turns(id, generation, &mut turns).await?;
-        serde_json::to_value(AgentResultResponse {
-            agent: request.id,
-            generation,
-            turns,
-            agent_metadata,
-        })
-        .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
+        self.mask_unknown_turns(id, &mut response.turns).await?;
+        request
+            .validate_response(&response)
+            .map_err(|_| Error::new("internal", "agent.result response is invalid"))?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }
 
     async fn turn_get(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -4666,7 +4669,7 @@ impl Router {
             store.fill_turn_readback(&agent_row, &mut turn)?;
             turn
         };
-        self.mask_unknown_turns(agent, generation, std::slice::from_mut(&mut turn))
+        self.mask_unknown_turns(agent, std::slice::from_mut(&mut turn))
             .await?;
         serde_json::to_value(turn)
             .map_err(|error| Error::new("internal", format!("encode turn: {error}")))
@@ -5977,24 +5980,22 @@ impl Router {
         self.inner.unknown_causes.lock_recover().get(id).cloned()
     }
 
-    async fn mask_unknown_turns(
-        &self,
-        agent: &str,
-        generation: i64,
-        turns: &mut [Turn],
-    ) -> Result<()> {
+    async fn mask_unknown_turns(&self, agent: &str, turns: &mut [Turn]) -> Result<()> {
         self.clear_terminal_unknown_cache().await;
         if turns.is_empty() {
             return Ok(());
         }
         let memory_unknown = self.unknown_ids();
-        let turn_ids: Vec<String> = turns.iter().map(|turn| turn.turn_id.clone()).collect();
+        let turn_keys = turns
+            .iter()
+            .map(|turn| (turn.generation, turn.turn_id.clone()))
+            .collect::<Vec<_>>();
         let unknown_turns = {
             let store = self.inner.store.lock().await;
-            store.turns_with_unknown_commands(agent, generation, &turn_ids, &memory_unknown)?
+            store.turns_with_unknown_commands_for_page(agent, &turn_keys, &memory_unknown)?
         };
         for turn in turns {
-            if unknown_turns.contains(&turn.turn_id) {
+            if unknown_turns.contains(&(turn.generation, turn.turn_id.clone())) {
                 turn.state = TurnState::Unknown;
                 turn.status = None;
             }

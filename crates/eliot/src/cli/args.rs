@@ -750,6 +750,9 @@ pub(crate) struct ResultArgs {
     pub(crate) generation: GenerationArgs,
     #[arg(long, value_name = "TURN")]
     pub(crate) turn_id: Option<String>,
+    /// Read older turns starting before the previous response's `next` cursor.
+    #[arg(long, value_name = "CURSOR_JSON", conflicts_with = "turn_id")]
+    pub(crate) before: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
 }

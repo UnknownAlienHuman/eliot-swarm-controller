@@ -915,6 +915,25 @@ eligible idle session through normal resume admission. The new generation starts
 without input.
 Missing custody proof and unresolved effects leave the old generation fenced.
 
+### Retained transcript generations
+
+Committed `Turn` rows remain scoped to their exact Agent generation when the Agent
+projection advances. The default `agent.result` read pages retained turns across those
+generations in descending generation and immutable turn insertion order.
+It reads Store history without reopening a native session or querying private
+native history. [API contract](api.md#command-turn-and-result-reads)
+
+Generation origin is committed with the transition. A daemon restart records
+`restart_resume` and an Owner resume records `owner_resume`. Switch starts a
+successor Agent with its own identity and records `switch`. A handoff to a prepared
+generation with no retained turns can replace a launch or unknown origin with
+`handoff`. Each transcript read stays within the requested Agent ID. Missing
+historical origin is reported as `unknown`.
+
+The desktop consumes the default cross-generation result and joins each turn to its
+retained events using the exact generation and turn ID. The API supplies the markers
+for the desktop renderer.
+
 ## Views
 
 The daemon supervises long-lived rule, Goal, retention, monitoring, Git,

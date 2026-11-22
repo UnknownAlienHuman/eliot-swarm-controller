@@ -162,7 +162,8 @@ pub use provider::{
 };
 pub use reads::{
     AgentResultRequest, AgentResultResponse, CommandChildrenRequest, CommandChildrenResponse,
-    CommandGetRequest, RuleGetRequest, RuleStateView, TurnGetRequest,
+    CommandGetRequest, GenerationBoundary, GenerationReason, ResultCursor, RuleGetRequest,
+    RuleStateView, TurnGetRequest,
 };
 pub use resolutions::{
     CommandResolution, CommandResolveRequest, CommandResolveResponse, SettleStoppedRequest,

@@ -541,16 +541,23 @@ pub(crate) async fn run_result(
         agent,
         generation: GenerationArgs { generation },
         turn_id,
+        before,
         page: PageArgs { limit },
     }: ResultArgs,
     data_dir: PathBuf,
     json_output: bool,
 ) -> Result<u8, Failure> {
     validate_limit(limit)?;
+    let before = before
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| Failure::new(2, "--before must be a JSON result cursor"))?;
     let params = AgentResultRequest {
         id: agent,
         generation,
         turn_id,
+        before,
         limit,
     };
     read_and_print!(

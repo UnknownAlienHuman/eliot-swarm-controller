@@ -12,6 +12,7 @@ mod cleanup;
 pub use cleanup::{CleanupInventoryPage, cleanup_worktree_command_id};
 mod projects;
 mod provider_holds;
+mod result_page;
 mod rules;
 mod scripts;
 mod settings;
@@ -1565,36 +1566,16 @@ impl Store {
         turn_ids: &[String],
         memory_unknown: &[String],
     ) -> Result<HashSet<String>> {
-        if turn_ids.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let agent_num = parse_agent_id(agent)?;
-        let turn_ids = serde_json::to_string(turn_ids)
-            .map_err(|_| Error::new("internal", "cannot encode unknown turn keys"))?;
-        let memory_unknown = serde_json::to_string(memory_unknown)
-            .map_err(|_| Error::new("internal", "cannot encode unknown command keys"))?;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT DISTINCT turn_id FROM commands INDEXED BY commands_turn_unknown
-             WHERE target=?1 AND generation=?2 AND turn_id IN (SELECT value FROM json_each(?3))
-               AND state IN ('accepted','queued','dispatched','unknown')
-               AND (state='unknown' OR id IN (SELECT value FROM json_each(?4)))",
-            )
-            .map_err(sql_error)?;
-        let rows = statement
-            .query_map(
-                params![agent_num, generation, turn_ids, memory_unknown],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .map_err(sql_error)?;
-        let mut unknown = HashSet::new();
-        for row in rows {
-            if let Some(turn_id) = row.map_err(sql_error)? {
-                unknown.insert(turn_id);
-            }
-        }
-        Ok(unknown)
+        let keys = turn_ids
+            .iter()
+            .cloned()
+            .map(|turn_id| (generation, turn_id))
+            .collect::<Vec<_>>();
+        Ok(self
+            .turns_with_unknown_commands_for_page(agent, &keys, memory_unknown)?
+            .into_iter()
+            .map(|(_, turn_id)| turn_id)
+            .collect())
     }
 
     /// Return the retained starting SEND command for an exact generation/turn.
@@ -5318,11 +5299,18 @@ fn load_harness_by_num(connection: &Connection, agent: i64) -> Result<String> {
 }
 
 fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
+    // Keep cursors stable across native readback, retention and VACUUM.
+    let insertion_seq: i64 = db!(tx.query_row(
+        "UPDATE turn_insertion_sequence SET last_seq = last_seq + 1
+         WHERE singleton = 1 RETURNING last_seq",
+        [],
+        |row| row.get(0),
+    ));
     db!(tx.execute(
         "INSERT INTO turns(agent, generation, turn_id, start_command_id, state, status, outcome, native_status,
                            final_text, started_at, completed_at, usage, config_revision,
-                           preceded_by, effective_model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                           preceded_by, effective_model, insertion_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             turn.agent,
             turn.generation,
@@ -5339,6 +5327,7 @@ fn insert_turn(tx: &Transaction<'_>, turn: TurnInsert<'_>) -> Result<()> {
             turn.config_revision,
             turn.preceded_by,
             turn.effective_model,
+            insertion_seq,
         ],
     ));
     Ok(())

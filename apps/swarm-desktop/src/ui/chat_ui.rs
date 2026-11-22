@@ -491,9 +491,11 @@ impl DesktopApp {
                         self.sync_open_agent();
                         self.ensure_catalog(context);
                         let cursor = snapshot.coverage.cursor;
+                        let mut generation_changed = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
                             let missing =
                                 convo.reset(snapshot.coverage, &snapshot.turns, &snapshot.events);
+                            generation_changed = missing.generation_changed;
                             convo.apply_inputs(snapshot.inputs);
                             convo.set_stale(None);
                             self.chat.invalidated.merge(Invalidation {
@@ -506,6 +508,15 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        if generation_changed {
+                            self.follow_next(
+                                Next::Resnapshot {
+                                    reason: "a new run started".to_owned(),
+                                },
+                                context,
+                            );
+                            return;
+                        }
                         self.check_waiting_inputs(context);
                         if first_load {
                             // The transcript opens at its newest turn by
@@ -597,8 +608,9 @@ impl DesktopApp {
                             self.ensure_catalog(context);
                         }
                         if let Some(convo) = self.chat.convo.as_mut() {
-                            if let Some(turns) = reread.turns.as_deref() {
-                                convo.apply_turns(turns);
+                            if let Some(results) = reread.results.as_ref() {
+                                convo.update_turn_coverage(results.generation, results.has_older);
+                                convo.apply_turns(&results.turns);
                             }
                             convo.apply_inputs(reread.inputs);
                         }
