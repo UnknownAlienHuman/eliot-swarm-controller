@@ -1028,6 +1028,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("agent_edits", "agent"),
         ("workspaces", "agent"),
         ("agent_wakes", "agent"),
+        ("background_process_wakes", "agent"),
         ("turns", "agent"),
         ("pending_requests", "agent"),
         ("source_owners", "agent"),

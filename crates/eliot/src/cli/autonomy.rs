@@ -106,13 +106,13 @@ fn print_report(report: &AutonomyResponse) {
     });
     row("Swarm fact notes", &report.notes, |counts| {
         println!(
-            "  {} delivered, {} moved, {} cancelled",
-            counts.delivered, counts.moved, counts.cancelled
+            "  {} delivered, {} moved, {} cancelled, {} expired",
+            counts.delivered, counts.moved, counts.cancelled, counts.expired
         );
         for kind in &counts.by_kind {
             println!(
-                "  {}  {} delivered, {} moved, {} cancelled, {} cleared",
-                kind.kind, kind.delivered, kind.moved, kind.cancelled, kind.resolved
+                "  {}  {} delivered, {} moved, {} cancelled, {} expired, {} cleared",
+                kind.kind, kind.delivered, kind.moved, kind.cancelled, kind.expired, kind.resolved
             );
         }
     });

@@ -650,6 +650,10 @@ another incarnation. The bounded worker scans keyset pages and reads the exact
 process, run, child-turn, workspace and due-time facts; it does not create a
 second rules engine.
 
+An open or same-turn self-wake suppresses the
+[automatic background-process wake](automation.md#automatic-background-process-wake),
+and arming a self-wake cancels a waiting automatic wake.
+
 Example Agent MCP call, then end the current turn:
 
 ```javascript

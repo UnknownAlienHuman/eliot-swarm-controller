@@ -15,6 +15,7 @@ pub use api::{
 };
 
 mod agent_start;
+mod background_wake;
 mod canonical;
 mod command;
 mod context;
@@ -34,6 +35,13 @@ mod source_handoff;
 mod verbatim;
 
 pub use agent_start::AgentStartParams;
+pub use background_wake::{
+    BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_NOTE_KIND, BACKGROUND_WAKE_PRINCIPAL,
+    DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS, MAX_BACKGROUND_WAKE_COMMAND_BYTES,
+    MAX_BACKGROUND_WAKE_MAX_WAIT_SECS, MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES,
+    extract_configured_mcp_programs, format_background_wake_note_body, is_harness_owned_process,
+    redact_secret_shapes,
+};
 pub use canonical::canonical_json_sha256;
 pub use command::{
     classify_dispatched_error, command_transition_allowed, handoff_brief_resolution_allowed,

@@ -35,7 +35,7 @@ impl Router {
             "agent.wake",
             AgentWakeRequest::validate,
         )?;
-        let Principal::Agent { .. } = principal else {
+        let Principal::Agent { id, generation } = principal else {
             return Err(Error::new("not_allowed", "agent.wake is Agent-only"));
         };
         let name = principal_name(principal);
@@ -43,6 +43,10 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             store.agent_wake_arm(&name, &request, now_ms())?
         };
+        // Arming a self-wake cancelled any waiting automatic wake; close its handle.
+        self.inner
+            .monitoring
+            .release_background_wake_pin(id, *generation);
         self.signal_progress();
         serde_json::to_value(response).map_err(|_| {
             Error::new(
@@ -486,6 +490,7 @@ pub(crate) async fn run_agent_wakes(
     let mut ticks = interval(WAKE_POLL_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut after: Option<(i64, String)> = None;
+    let mut bg_after: Option<(i64, String)> = None;
     let mut last_prune = now_ms();
     reporter.running("agent_wake");
     loop {
@@ -525,12 +530,29 @@ pub(crate) async fn run_agent_wakes(
                 );
             }
         }
+        if let Err(error) = router.process_background_wakes_tick(&mut bg_after).await {
+            crate::logging::record(
+                &eliot_core::SecretPolicy::default(),
+                "daemon.background_wake_tick_failed",
+                &[],
+                Some(&error),
+            );
+            bg_after = None;
+        }
         let now = now_ms();
         if now.saturating_sub(last_prune) >= WAKE_PRUNE_INTERVAL_MS {
             if let Err(error) = router.prune_agent_wakes(now).await {
                 crate::logging::record(
                     &eliot_core::SecretPolicy::default(),
                     "daemon.agent_wake_prune_failed",
+                    &[],
+                    Some(&error),
+                );
+            }
+            if let Err(error) = router.prune_background_wakes(now).await {
+                crate::logging::record(
+                    &eliot_core::SecretPolicy::default(),
+                    "daemon.background_wake_prune_failed",
                     &[],
                     Some(&error),
                 );

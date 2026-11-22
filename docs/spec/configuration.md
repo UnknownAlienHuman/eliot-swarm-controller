@@ -865,6 +865,7 @@ heavy_cpu_secs = 60
 heavy_rss_bytes = 1073741824
 session_growth_ratio_permille = 800
 session_file_bytes = 67108864
+background_wake_max_wait_secs = 1800
 ```
 
 A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
@@ -873,7 +874,8 @@ heavy threshold closes as one `activity.heavy` event (defaults: 30 s wall, 60 s 
 file where the harness exposes a documented size source. A profile's optional
 `context_ceiling_tokens` is an independent absolute per-call context limit. The
 [session growth reaction](monitoring.md#automatic-reactions) uses a quiescent
-session boundary.
+session boundary. `background_wake_max_wait_secs` (1 to 86,400) bounds an
+[automatic background-process wake](automation.md#automatic-background-process-wake).
 `swarm doctor` compares live installed harness versions and contract markers against
 the pinned `VERIFIED_HARNESSES` table without blocking launch. It also reports
 Claude profiles whose explicitly pinned executable is missing, with the current

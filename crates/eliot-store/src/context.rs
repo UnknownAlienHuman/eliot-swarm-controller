@@ -2054,7 +2054,7 @@ fn reject_pending_context(
     Ok(())
 }
 
-fn context_points(agent: &Agent) -> Result<Vec<InjectPoint>> {
+pub(super) fn context_points(agent: &Agent) -> Result<Vec<InjectPoint>> {
     let Some(context_points) = agent
         .effective
         .as_ref()

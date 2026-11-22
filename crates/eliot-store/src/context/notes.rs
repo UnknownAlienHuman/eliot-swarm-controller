@@ -1,5 +1,5 @@
 use crate::{Result, sql_error};
-use eliot_core::ContextNoteCounters;
+use eliot_core::{BACKGROUND_WAKE_NOTE_KIND, ContextNoteCounters};
 use rusqlite::{Connection, params};
 
 const PROBE_LIMIT: i64 = 10_001;
@@ -21,6 +21,7 @@ pub(crate) fn read_counters(
                    state <> 'applied' AS cancelled
             FROM commands INDEXED BY commands_fact_note_settlements
             WHERE verb = 'inject' AND principal GLOB 'swarm_note:*'
+              AND principal <> 'swarm_note:background_process_wake'
               AND updated_at BETWEEN ?1 AND ?2
               AND state IN ('applied', 'cancelled', 'rejected', 'failed')
             ORDER BY updated_at, id LIMIT ?3
@@ -30,6 +31,7 @@ pub(crate) fn read_counters(
             JOIN commands AS note ON note.id = json_extract(data, '$.command_id')
             WHERE ({MOVE_EVENTS}) AND ts BETWEEN ?1 AND ?2
               AND note.verb = 'inject' AND note.principal GLOB 'swarm_note:*'
+              AND note.principal <> 'swarm_note:background_process_wake'
             ORDER BY ts, seq LIMIT ?3
          ), outcomes AS (
             SELECT * FROM settled UNION ALL SELECT * FROM moved
@@ -90,10 +92,11 @@ pub(crate) fn read_counters(
                 moved: u64::from(row.get::<_, u32>(2)?),
                 cancelled: u64::from(row.get::<_, u32>(3)?),
                 resolved: u64::from(row.get::<_, u32>(4)?),
+                expired: 0,
             })
         })
         .map_err(sql_error)?;
-    let counts = rows
+    let mut counts = rows
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(sql_error)?;
     let settled = counts
@@ -101,6 +104,38 @@ pub(crate) fn read_counters(
         .map(|count| count.delivered + count.cancelled)
         .sum::<u64>();
     let moved = counts.iter().map(|count| count.moved).sum::<u64>();
-    let truncated = settled >= PROBE_LIMIT as u64 || moved >= PROBE_LIMIT as u64;
+
+    let (bg_delivered, bg_expired, bg_cancelled, bg_total): (i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                 COALESCE(SUM(state = 'delivered'), 0),
+                 COALESCE(SUM(state = 'expired'), 0),
+                 COALESCE(SUM(state IN ('cancelled', 'failed', 'stale')), 0),
+                 COUNT(*)
+             FROM (
+                 SELECT state
+                 FROM background_process_wakes INDEXED BY background_process_wakes_autonomy_window
+                 WHERE settled_at BETWEEN ?1 AND ?2
+                   AND state IN ('delivered', 'expired', 'cancelled', 'failed', 'stale')
+                 ORDER BY settled_at, id LIMIT ?3
+             )",
+            params![since, until, PROBE_LIMIT],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(sql_error)?;
+    if bg_total > 0 {
+        counts.push(ContextNoteCounters {
+            kind: BACKGROUND_WAKE_NOTE_KIND.to_owned(),
+            delivered: u64::try_from(bg_delivered).unwrap_or(0),
+            moved: 0,
+            cancelled: u64::try_from(bg_cancelled).unwrap_or(0),
+            resolved: 0,
+            expired: u64::try_from(bg_expired).unwrap_or(0),
+        });
+        counts.sort_by(|left, right| left.kind.cmp(&right.kind));
+    }
+
+    let truncated =
+        settled >= PROBE_LIMIT as u64 || moved >= PROBE_LIMIT as u64 || bg_total >= PROBE_LIMIT;
     Ok((counts, truncated))
 }

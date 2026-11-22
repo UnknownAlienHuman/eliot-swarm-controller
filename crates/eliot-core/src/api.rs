@@ -61,10 +61,10 @@ pub use agent_requests::{
     DiagnoseRequest, ProjectDiscoverRequest, decode_recent_cursor, encode_recent_cursor,
 };
 pub use agent_views::{
-    AGENT_LIST_STATES, AGENT_NOTICE_MESSAGE_CHARS, AGENT_PREVIEW_CHARS, AgentConfigView,
-    AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse, AgentListRow,
-    AgentNativeNotice, AgentPatchDigestResponse, AgentProcessesResponse, AgentProviderHold,
-    AgentStateTotal, AgentStatsResponse, AgentSummary, AttentionStepReadback,
+    AGENT_LIST_STATES, AGENT_NOTICE_MESSAGE_CHARS, AGENT_PREVIEW_CHARS, AgentBackgroundWakeView,
+    AgentConfigView, AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse,
+    AgentListRow, AgentNativeNotice, AgentPatchDigestResponse, AgentProcessesResponse,
+    AgentProviderHold, AgentStateTotal, AgentStatsResponse, AgentSummary, AttentionStepReadback,
     AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView, CloudMcpCustody,
     CloudMcpHealth, CloudMcpStatus, CrashMarker, DaemonBuildIdentity, DaemonPanicTestResponse,
     DaemonStatusResponse, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,

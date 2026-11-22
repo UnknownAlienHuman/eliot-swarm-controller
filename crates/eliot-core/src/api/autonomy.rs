@@ -162,6 +162,8 @@ pub struct AutonomyNotes {
     #[serde(default)]
     pub cancelled: u64,
     #[serde(default)]
+    pub expired: u64,
+    #[serde(default)]
     pub by_kind: Vec<crate::ContextNoteCounters>,
 }
 
