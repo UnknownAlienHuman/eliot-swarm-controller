@@ -170,6 +170,7 @@ impl NativeThreadConfigOverrides {
                 "filters": {
                     "ELIOT_HOME": "exclude",
                     "ELIOT_AGENT_DATA_DIR": "exclude",
+                    "ELIOT_AGENT_DATA_SCOPE": "exclude",
                     "ELIOT_AGENT_ID": "exclude",
                     "ELIOT_AGENT_GENERATION": "exclude",
                     "ELIOT_AGENT_TOKEN": "exclude"

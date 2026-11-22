@@ -460,10 +460,10 @@ impl Plugin {
             .as_deref()
             .map_or_else(PathBuf::new, PathBuf::from);
         // The bundled skill stages from the daemon-owned copy resolved
-        // through the frozen launch environment; a missing copy fails the
+        // through the scoped integration environment; a missing copy fails the
         // start rather than starting an Agent without its skill.
         let data_dir = params
-            .target_environment
+            .mcp_environment
             .as_ref()
             .and_then(serde_json::Value::as_object)
             .and_then(|environment| environment.get("ELIOT_HOME"))

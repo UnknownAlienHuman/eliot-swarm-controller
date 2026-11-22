@@ -151,6 +151,7 @@ impl Store {
         request: &ProjectTransferRequest,
         launch: Option<Result<SubmitCommand>>,
         policy: &core::SecretPolicy,
+        owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<Change<ProjectTransferResult>> {
         request.validate()?;
@@ -252,6 +253,7 @@ impl Store {
                     }
                 }
             }
+            annotate_owner_events(tx, &mut events, owner_process)?;
             Ok((value, events))
         })
     }

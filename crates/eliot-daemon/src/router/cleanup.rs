@@ -2312,7 +2312,7 @@ impl Router {
                     request,
                     workspace: None,
                 },
-                None,
+                SubmissionContext::default(),
             )?;
             self.publish_locked(&admission.events);
             admission

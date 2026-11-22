@@ -15,8 +15,8 @@ use crate::common::now_ms;
 use eliot_core::{
     Error, Result,
     api::{
-        MailSendRequest, SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest,
-        WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
+        MailSendRequest, SWARM_MAIL_SENDER, SwarmDigestRequest, SwarmDigestResponse,
+        SwarmWaitRequest, WaitEntryResult, digest_mode_completed, digest_text, digest_thread,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -290,8 +290,7 @@ impl Router {
                 "mail.send",
                 MailSendRequest::validate,
             )?;
-            let change =
-                self.mail_send_locked(&mut store, &principal_name(&Principal::Owner), &mail, true)?;
+            let change = self.mail_send_locked(&mut store, SWARM_MAIL_SENDER, &mail, true)?;
             (row, results, mail, change)
         };
         let delivery_id = self

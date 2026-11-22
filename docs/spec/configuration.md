@@ -110,9 +110,10 @@ The ordinary CLI reads `owner.token` automatically, only outside managed Agent/r
 environments. A missing managed token rejects, never becomes owner. An inherited Agent
 identity applies only to the daemon that issued it (see
 [Environment and secrets](#environment-and-secrets)): calls naming another data directory
-(`--data-dir`, else `ELIOT_HOME`, else default) connect as that directory's local Owner
-instead of sending the foreign token. This is attribution
-within one OS user, not hostile-same-user isolation. Tokens never appear in semantic
+(`--data-dir`, else `ELIOT_HOME`, else default) reject as cross-root Agent calls;
+they never use that directory's Owner identity or token. Incomplete Agent identity for
+the issuing data directory also rejects. This is attribution within one OS user, not
+hostile-same-user isolation. Tokens never appear in semantic
 payloads, recordings or logs.
 
 After acquiring the data-directory lock, daemon startup calls
@@ -206,7 +207,8 @@ The daemon prefers AGENTS.md as the primary file, then AGENTS.override.md,
 CLAUDE.md, .claude/CLAUDE.md, GEMINI.md and the local Claude instruction files.
 When the primary file's native reading isn't established, the daemon attaches it
 through the existing required-sources renderer to the launch's linked first input.
-That renderer labels SHA-256 as file identity and marks redacted text and truncation.
+The renderer puts file content in a [quoted data fence](coordination.md#quoted-data)
+and labels SHA-256, redaction and completeness outside the fence.
 Explicit user sources are read at admission from their requested workspace. The
 catalog reuses an explicit attachment with the same workspace-relative path and file
 digest as the prepared primary file. Otherwise automatic delivery reads the prepared
@@ -1470,18 +1472,27 @@ it afterward. No global content-addressed store, provenance graph or custom GC s
 
 ## Environment and secrets
 
-Build the native environment from OS baseline, admitted nonsecret `pass_env` values,
-literal nonsecret `env`, named secrets resolved in memory, then Eliot identity/Git/PATH.
-`secret_env` is a subset of `pass_env`; those values are never persisted. Missing named
-required values fail clearly. Windows keys compare case-insensitively.
-The managed Agent target environment sets `ELIOT_HOME` to the owned data directory,
-overriding ambient/profile, alongside `ELIOT_AGENT_ID`/`ELIOT_AGENT_GENERATION`/`ELIOT_AGENT_TOKEN`
-and the normalized issuing data directory `ELIOT_AGENT_DATA_DIR`. The CLI uses the
-inherited Agent identity only when the resolved target data directory (`--data-dir`, else
-`ELIOT_HOME`, else default) equals `ELIOT_AGENT_DATA_DIR` (lexically normalized, compared
-case-insensitively on Windows); otherwise it connects as the local Owner of the target
-data directory and never sends the foreign token. An incomplete Agent identity for the
-same data directory still rejects and never falls back to Owner authority.
+Build the native environment from the OS baseline, admitted nonsecret `pass_env` values,
+literal nonsecret `env`, named secrets resolved in memory, and the allowed Eliot shell
+identity/Git/PATH. `secret_env` is a subset of `pass_env`; those values are never persisted.
+Missing named required values fail clearly. Windows keys compare case-insensitively.
+Names beginning with `ELIOT_`, compared case-insensitively, are reserved and cannot
+appear in `pass_env`.
+
+The managed Agent shell never receives `ELIOT_HOME`, `ELIOT_AGENT_DATA_DIR`, or Owner
+token or data-path variables. Eliot supplies the owned data root to each managed
+Agent-bound MCP integration through its scoped process arguments or MCP environment.
+`ELIOT_HOME` stays inside that integration scope, and `ELIOT_AGENT_DATA_DIR` is
+MCP-only. The client compares the resolved target (`--data-dir`, then `ELIOT_HOME`, then
+the default) with the issuing directory after lexical normalization and case-insensitively
+on Windows. The CLI refuses cross-root and unbound Agent credentials before connecting.
+When `pass_agent_identity_to_shell` is enabled, the shell receives the Agent ID,
+generation and token with a fingerprint of the issuing directory in
+`ELIOT_AGENT_DATA_SCOPE`. A bare Agent CLI resolves the issuing directory from
+its generation's private artifact root and checks the fingerprint before connecting.
+An explicit directory must match the same binding.
+Codex receives the Agent identity at its app-server boundary to configure the named
+MCP transport, with its issuing directory supplied in the MCP environment.
 It prepends the active controller executable's parent directory to `PATH`, preserving the
 native baseline entries, so bare `swarm` resolves to the current controller before ambient/legacy bins.
 A controller directory containing the OS `PATH` separator (`;` on Windows, `:` elsewhere)
@@ -1520,10 +1531,10 @@ shell commands omit the Agent identity variables. A marker carrying no Agent
 identity makes the shell CLI reject requests that would use Owner authority.
 Codex supplies its named MCP server from the per-Agent app-server environment
 and filters identity variables from shell tools. Claude, OpenCode and Antigravity
-pass scoped identity directly to the managed MCP server. OpenCode's inherited
-identity path continues to use the process environment when the switch is `true`.
-Muse currently uses shell CLI identity, so disabling it prevents Agent
-authentication from that shell.
+pass scoped identity directly to the managed MCP server. The MCP integration
+receives its data root through its own arguments or environment even when shell
+identity is disabled. Muse currently uses shell CLI identity, so disabling it
+prevents Agent authentication from that shell.
 
 ## Accounts and configured capacity
 

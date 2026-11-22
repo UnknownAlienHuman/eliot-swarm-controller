@@ -74,7 +74,10 @@ pub use observe::{
     resolve_heavy_category, split_unix_cmdline, split_windows_command_line, unwrap_shell_command,
     verified_harness,
 };
-pub use presentation::{count_words, origin_words, reason_message, reason_words};
+pub use presentation::{
+    count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
+    reason_words,
+};
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
     CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_LAUNCH_OVERRIDE_FIELDS,

@@ -331,6 +331,18 @@ pub(crate) struct InspectedLocalPeer {
 
 #[cfg(target_os = "linux")]
 impl LocalPeer {
+    pub(crate) fn process_id(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn image_path(&self) -> Option<String> {
+        use std::os::fd::AsRawFd;
+
+        fs::read_link(format!("/proc/self/fd/{}/exe", self.proc_dir.as_raw_fd()))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
     pub(crate) fn capture(stream: &tokio::net::UnixStream) -> Option<Self> {
         let credentials = stream.peer_cred().ok()?;
         let pid = u32::try_from(credentials.pid()?)
@@ -395,6 +407,10 @@ impl LocalPeer {
 
 #[cfg(target_os = "linux")]
 impl InspectedLocalPeer {
+    pub(crate) fn into_peer(self) -> LocalPeer {
+        self.peer
+    }
+
     pub(crate) fn verify(&self) -> Result<()> {
         for (index, (pid, expected)) in self.lineage.iter().enumerate() {
             let current = if index == 0 {

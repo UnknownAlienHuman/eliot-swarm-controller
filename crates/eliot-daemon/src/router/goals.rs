@@ -1794,7 +1794,8 @@ fn goal_continuation_text(
     let exit = check
         .exit_code
         .map_or_else(|| "no exit code".to_owned(), |code| format!("exit {code}"));
-    let output = check.observation.as_deref().unwrap_or("(no output)");
+    let output =
+        eliot_core::fence_untrusted_text(check.observation.as_deref().unwrap_or("(no output)"));
     let completeness = if check.output_complete {
         ""
     } else {

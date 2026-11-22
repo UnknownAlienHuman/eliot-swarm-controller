@@ -23,7 +23,7 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
-pub use context::ContextDispatch;
+pub use context::{ContextDispatch, fenced_inject_text};
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
@@ -558,28 +558,31 @@ impl Store {
         result
     }
 
-    /// Preserve authenticated HTTP call provenance in the existing command
-    /// cause and admission events, in the original admission transaction.
+    /// Preserve authenticated caller provenance in the original admission transaction.
     /// A retained retry keeps its original provenance and never rewrites history.
-    pub fn submit_with_remote_context(
+    pub fn submit_with_context(
         &mut self,
         principal: &str,
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
-        remote: Option<&core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
         now: i64,
     ) -> Result<Admission> {
-        let Some(remote) = remote else {
+        let SubmissionContext {
+            remote,
+            owner_process,
+        } = context;
+        if remote.is_none() && owner_process.is_none() {
             return self.submit_inner_checked(principal, request, preparation, now);
-        };
-        validate_remote_command_context(principal, Some(remote))?;
+        }
+        context.validate(principal)?;
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let previous_command_rowid = latest_command_rowid(&tx)?;
+            let previous_command_rowid = remote.map(|_| latest_command_rowid(&tx)).transpose()?;
             let mut admission = admission::submit_tx(
                 &tx,
                 principal,
@@ -591,7 +594,10 @@ impl Store {
                 self.capacity_policy.as_deref(),
             )?;
             if admission.is_new {
-                annotate_remote_submission(&tx, &mut admission, remote, previous_command_rowid)?;
+                if let Some((remote, rowid)) = remote.zip(previous_command_rowid) {
+                    annotate_remote_submission(&tx, &mut admission, remote, rowid)?;
+                }
+                annotate_owner_events(&tx, &mut admission.events, owner_process)?;
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(admission)
@@ -818,6 +824,36 @@ fn stop_fences_resume_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> R
 }
 
 impl Store {
+    /// Record an authenticated Owner submission before its handler runs.
+    pub fn record_owner_submission(
+        &mut self,
+        method: &str,
+        mutation_id: Option<&str>,
+        process: &OwnerProcess,
+        now: i64,
+    ) -> Result<Event> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                "owner.submitted",
+                "owner",
+                None,
+                None,
+                json!({"method": method, "mutation_id": mutation_id, "owner_process": process}),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(event)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Persist an idempotent non-command write. L1 uses this for daemon shutdown;
     /// command admission remains in the commands table.
     pub fn record_write(
@@ -4551,6 +4587,61 @@ fn annotate_new_event_cause_tx(
         }
     }
     event.cause = Some(cause);
+    Ok(())
+}
+
+/// OS-reported peer information for an authenticated Owner submission.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct OwnerProcess {
+    pub pid: Option<u32>,
+    pub image_path: Option<String>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SubmissionContext<'a> {
+    pub remote: Option<&'a core::RemoteCallContext>,
+    pub owner_process: Option<&'a OwnerProcess>,
+}
+
+impl SubmissionContext<'_> {
+    fn validate(self, principal: &str) -> Result<()> {
+        validate_remote_command_context(principal, self.remote)?;
+        if self.owner_process.is_some() && principal != "owner" {
+            return Err(Error::new(
+                "not_allowed",
+                "Owner process metadata requires an Owner submission",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn annotate_owner_events(
+    tx: &Transaction<'_>,
+    events: &mut [Event],
+    process: Option<&OwnerProcess>,
+) -> Result<()> {
+    let Some(process) = process else {
+        return Ok(());
+    };
+    let process = json!(process);
+    for event in events {
+        if !event.kind.starts_with("command.") {
+            continue;
+        }
+        let mut data = event.data.clone();
+        data["owner_process"] = process.clone();
+        let encoded = encode_json(&data)?;
+        if encoded.len() > MAX_EVENT_BYTES {
+            continue;
+        }
+        tx.execute(
+            "UPDATE events SET data = ?1 WHERE seq = ?2",
+            params![encoded, event.seq],
+        )
+        .map_err(sql_error)?;
+        event.data = data;
+    }
     Ok(())
 }
 

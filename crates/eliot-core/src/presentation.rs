@@ -125,3 +125,44 @@ impl crate::api::DiagnoseStep {
         )
     }
 }
+/// Quote one external text body with a delimiter longer than every backtick run.
+/// Compose trusted labels and metadata outside the returned block.
+pub fn fence_untrusted_text(text: &str) -> String {
+    let fence = "`".repeat(fence_width(text));
+    format!("{fence}text\n{text}\n{fence}")
+}
+
+fn fence_width(text: &str) -> usize {
+    let longest = text.split(|ch| ch != '`').map(str::len).max().unwrap_or(0);
+    3.max(longest + 1)
+}
+
+pub(crate) fn fenced_untrusted_len(text: &str) -> usize {
+    text.len() + 2 * fence_width(text) + "text\n\n".len()
+}
+
+/// Quote the longest UTF-8 prefix that leaves room for both delimiters.
+/// Returns an empty block when there is no room for the minimum frame.
+pub fn fence_untrusted_prefix(text: &str, budget: usize) -> (&str, String) {
+    if fenced_untrusted_len("") > budget {
+        return ("", String::new());
+    }
+    let excerpt = &text[..text.floor_char_boundary(budget)];
+    if fenced_untrusted_len(excerpt) <= budget {
+        return (excerpt, fence_untrusted_text(excerpt));
+    }
+    let mut low = 0;
+    let mut high = excerpt.len();
+    let mut best = "";
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let excerpt = &text[..text.floor_char_boundary(middle)];
+        if fenced_untrusted_len(excerpt) <= budget {
+            best = excerpt;
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    (best, fence_untrusted_text(best))
+}

@@ -10,7 +10,7 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         let original: LaunchQueueRequest = decode_params(params.clone())?;
         original.validate()?;
@@ -49,7 +49,7 @@ impl Router {
         let view = {
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
-            store.enqueue_launch(&caller, &original, request, &project, remote, now_ms())?
+            store.enqueue_launch(&caller, &original, request, &project, context, now_ms())?
         };
         self.signal_progress();
         self.signal_launch_arbitration();

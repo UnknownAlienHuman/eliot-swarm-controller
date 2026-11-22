@@ -89,8 +89,9 @@ use eliot_core::{
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, AgentListFilter, ProjectRegistrationInput, RestartResumeCandidate,
-    RuleProcessingState, TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
+    Admission, AgentListFilter, OwnerProcess, ProjectRegistrationInput, RestartResumeCandidate,
+    RuleProcessingState, SubmissionContext, TimerDefinitionInput, TimerSlotAdmission,
+    TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -479,8 +480,11 @@ impl Router {
             .get_mut("_auth")
             .and_then(Value::as_object_mut)
             .and_then(|auth| auth.remove("swarm_mcp_call_id"));
-        let (principal, params) = self.authenticate(wire_params, peer).await?;
+        let (principal, params, owner_peer) = self.authenticate(wire_params, peer).await?;
         *log_principal = diagnostic_principal(&principal);
+        let owner_process = (matches!(principal, Principal::Owner)
+            && discovery::is_mutation(method))
+        .then(|| self.owner_process(owner_peer.as_ref()));
         let remote: Option<eliot_core::RemoteCallContext> = remote
             .map(serde_json::from_value)
             .transpose()
@@ -495,8 +499,12 @@ impl Router {
         } else {
             None
         };
+        let context = SubmissionContext {
+            remote: remote.as_ref(),
+            owner_process: owner_process.as_ref(),
+        };
         let result = self
-            .handle_authorized(method, params, principal, remote.as_ref())
+            .handle_authorized(method, params, principal, context)
             .await;
         if let Some(trace) = mcp_trace {
             self.finish_swarm_mcp_tool_call(&trace, result.is_err())
@@ -509,12 +517,35 @@ impl Router {
         })
     }
 
+    fn owner_process(&self, peer: Option<&crate::platform::custody::LocalPeer>) -> OwnerProcess {
+        #[cfg(any(windows, target_os = "linux"))]
+        let (pid, image_path) = (
+            peer.map(|peer| peer.process_id()),
+            peer.and_then(|peer| peer.image_path()).map(|path| {
+                const MAX_IMAGE_PATH_BYTES: usize = 4096;
+                const TRUNCATED: &str = " [truncated]";
+                let mut path = self.secret_policy_snapshot().redact_text(&path);
+                if path.len() > MAX_IMAGE_PATH_BYTES {
+                    path.truncate(path.floor_char_boundary(MAX_IMAGE_PATH_BYTES - TRUNCATED.len()));
+                    path.push_str(TRUNCATED);
+                }
+                path
+            }),
+        );
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let (pid, image_path) = {
+            let _ = peer;
+            (None, None)
+        };
+        OwnerProcess { pid, image_path }
+    }
+
     async fn handle_authorized(
         &self,
         method: &str,
         params: Value,
         principal: Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         authorize_rpc_method(&principal, method)?;
         let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
@@ -529,6 +560,30 @@ impl Router {
         } else {
             None
         };
+        if let Some(process) = context.owner_process {
+            let mutation_id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| ulid::Ulid::from_string(id).is_ok());
+            let mut store = self.inner.store.lock().await;
+            match store.record_owner_submission(method, mutation_id, process, now_ms()) {
+                Ok(event) => self.publish_locked(&[event]),
+                Err(error) => {
+                    let pid = process.pid.map(|pid| pid.to_string()).unwrap_or_default();
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        "owner.submission_record_failed",
+                        &[
+                            ("method", method),
+                            ("command_id", mutation_id.unwrap_or_default()),
+                            ("pid", &pid),
+                            ("path", process.image_path.as_deref().unwrap_or_default()),
+                        ],
+                        Some(&error),
+                    );
+                }
+            }
+        }
         // Debug mode times every RPC at this single choke point. Standard
         // mode pays one Instant read and a branch; no parameters, prompts or
         // results ever enter the record.
@@ -592,8 +647,8 @@ impl Router {
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                let result = self.submit_bound(&params, &principal, remote).await;
-                self.note_command_submission(&principal, remote, "command.submit", &result);
+                let result = self.submit_bound(&params, &principal, context).await;
+                self.note_command_submission(&principal, context.remote, "command.submit", &result);
                 // Capacity preflight can refuse before a command exists.
                 // Retain diagnostic metadata under the caller's exact ID in
                 // the existing bounded log; this grants no replay authority.
@@ -616,7 +671,7 @@ impl Router {
                 }
                 result
             }
-            "launch.enqueue" => self.enqueue_launch(&params, &principal, remote).await,
+            "launch.enqueue" => self.enqueue_launch(&params, &principal, context).await,
             "launch.intent.get" => self.read_launch_intent(&params, &principal).await,
             "launch.queue" => self.read_launch_queue(&params, &principal).await,
             "project.budget.set" => self.set_manager_budget(&params, &principal).await,
@@ -665,18 +720,28 @@ impl Router {
             "swarm.wait" => self.swarm_wait(&params, &principal).await,
             "swarm.digest" => self.swarm_digest(&params, &principal).await,
             "swarm.reparent" => self.swarm_reparent(&params, &principal).await,
-            "swarm.handoff" => self.swarm_handoff(&params, &principal).await,
-            "swarm.switch" => self.swarm_switch(&params, &principal).await,
+            "swarm.handoff" => {
+                self.swarm_handoff(&params, &principal, context.owner_process)
+                    .await
+            }
+            "swarm.switch" => {
+                self.swarm_switch(&params, &principal, context.owner_process)
+                    .await
+            }
             "chat.organization" => self.chat_organization(&params, &principal).await,
             "chat.attach" => self.chat_attach(&params, &principal).await,
             "chat.detach" => self.chat_detach(&params, &principal).await,
             "chat.tag" => self.chat_tag(&params, &principal).await,
             "command.cancel" => self.command_cancel(&params, &principal).await,
-            "project.transfer" => self.project_transfer(&params, &principal).await,
+            "project.transfer" => {
+                self.project_transfer(&params, &principal, context.owner_process)
+                    .await
+            }
             "project.assignment.get" => self.project_assignment_get(&params, &principal).await,
             "project.assignment.claim" => self.project_assignment_claim(&params, &principal).await,
             "project.assignment.launch" => {
-                self.project_assignment_launch(&params, &principal).await
+                self.project_assignment_launch(&params, &principal, context.owner_process)
+                    .await
             }
             "project.assignment.release" => {
                 self.project_assignment_release(&params, &principal).await
@@ -1386,7 +1451,9 @@ impl Router {
         principal: &Principal,
         method: &'static str,
     ) -> Result<Value> {
-        let result = self.submit_bound(params, principal, None).await;
+        let result = self
+            .submit_bound(params, principal, SubmissionContext::default())
+            .await;
         self.note_command_submission(principal, None, method, &result);
         result
     }
@@ -1395,13 +1462,14 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         let mut request: CommandSubmitRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         if request.verb == "git.fetch" {
-            return self.submit_git_fetch(request, principal, remote).await;
+            return self.submit_git_fetch(request, principal, context).await;
         }
+        let remote = context.remote;
         // The internal attention verb is admitted only through
         // `submit_attention_event`; the public path never carries it.
         if request.verb == "attention.emit" {
@@ -1463,7 +1531,7 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
             let submitted =
-                self.admit_prepared_submission(&mut store, &principal, prepared, remote);
+                self.admit_prepared_submission(&mut store, &principal, prepared, context);
             match submitted {
                 Ok(admission) => {
                     if !admission.events.is_empty() {
@@ -1522,17 +1590,19 @@ impl Router {
         store: &mut eliot_store::Store,
         principal: &str,
         prepared: PreparedSubmission,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Admission> {
         let PreparedSubmission { request, workspace } = prepared;
-        if let Some(admission) = store.replay_command_submission(principal, &request, remote)? {
+        if let Some(admission) =
+            store.replay_command_submission(principal, &request, context.remote)?
+        {
             return Ok(admission);
         }
         self.check_command_admission_mode(&request.verb)?;
         if request.verb == "answer" {
             validate_answer_request(store, &request)?;
         }
-        store.submit_with_remote_context(principal, request, workspace, remote, now_ms())
+        store.submit_with_context(principal, request, workspace, context, now_ms())
     }
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
@@ -1632,7 +1702,7 @@ impl Router {
         &self,
         request: CommandSubmitRequest,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         request.validate()?;
         let definition = eliot_core::api::discovery::decode_params_at::<GitFetchDefinitionArgs>(
@@ -1668,7 +1738,7 @@ impl Router {
         let admission = {
             let mut store = self.inner.store.lock().await;
             let result =
-                self.admit_prepared_submission(&mut store, &principal_name, prepared, remote);
+                self.admit_prepared_submission(&mut store, &principal_name, prepared, context);
             match result {
                 Ok(admission) => {
                     self.publish_locked(&admission.events);
@@ -1765,7 +1835,7 @@ impl Router {
                 &mut store,
                 &principal_name(&Principal::Owner),
                 prepared,
-                None,
+                SubmissionContext::default(),
             );
             match submitted {
                 Ok(admission) => {
@@ -8127,13 +8197,10 @@ fn validate_pass_env_references(
                     "profile pass_env entries must be environment variable names",
                 )
             })?;
-        if name
-            .get(..12)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
-        {
+        if crate::config::reserved_eliot_environment_name(name) {
             return Err(Error::new(
                 "invalid",
-                "profile pass_env cannot override Eliot Agent identity variables",
+                "profile pass_env cannot include reserved ELIOT_* names",
             ));
         }
     }

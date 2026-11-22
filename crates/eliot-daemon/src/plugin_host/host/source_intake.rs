@@ -329,7 +329,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                                         generation,
                                         &event.turn_id,
                                         &event.consumer_id,
-                                        &event.hook,
+                                        (&event.hook, &request_id),
                                         now_ms(),
                                     ) {
                                         Ok(change) => {

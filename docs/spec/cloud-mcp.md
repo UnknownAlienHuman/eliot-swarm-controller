@@ -71,6 +71,18 @@ the origin before SDK dispatch, using the same configured team and audience. The
 native cloudflared check protects the tunnel route; it cannot authenticate a direct
 loopback request. Both managed and manual HTTP fail closed without origin auth.
 
+Origin verification fetches the initial signing-key set before accepting requests.
+Cached signing keys are usable only before their validity deadline. Refresh attempts
+serialize independently from cache reads; callers recheck the cache after acquiring
+the refresh lock, and the lock is held for at most 10 seconds including the HTTP
+fetch. The key-state lock is released before waiting for or performing a refresh. A
+successful fetch replaces the key set and its validity deadline together. A failed,
+canceled or timed-out refresh leaves the prior set and validity deadline unchanged,
+but expired keys are never used. The 30-second retry backoff remains in effect.
+Verification that attempts a failed refresh returns service unavailable. When the
+cache is expired, verification during the retry backoff also returns service
+unavailable.
+
 The module owns exactly these two children. It never discovers, adopts, signals,
 or stops a pre-existing `mcp-bridge` or other tunnel. HTTP stdin stays open
 while serving; shutdown closes it to deliver EOF, then waits for graceful exit

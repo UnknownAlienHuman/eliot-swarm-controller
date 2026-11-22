@@ -8,6 +8,14 @@ use eliot_core::{
 use serde::{Deserialize, Serialize};
 
 const CONTEXT_ITEMS_ARG: &str = "context_items";
+
+/// Render one claimed inject at the native input boundary.
+pub fn fenced_inject_text(text: &str) -> String {
+    format!(
+        "Swarm context (quoted data):\n{}",
+        eliot_core::fence_untrusted_text(text)
+    )
+}
 const MAX_CONTEXT_QUERY_ROWS: usize = 32;
 const MAX_CONTEXT_QUERY_BYTES: usize = MAX_FRAME_BYTES;
 const PROJECT_CHECK_PRINCIPAL: &str = "project_check";
@@ -284,6 +292,12 @@ pub(super) fn claim_next_input_tx(
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
     let mut selected_outcomes: Vec<ContextOutcome> = Vec::new();
+    let mut payload_bytes = send
+        .args
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Error::new("source_integrity", "send command has no text"))?
+        .len();
     let mut cursor = None;
     // The mandatory `turn.started` receipt, budgeted in the exact shape the
     // adapters persist (one outcome per claimed item). Fields fixed only at
@@ -378,12 +392,7 @@ pub(super) fn claim_next_input_tx(
                 )?;
                 continue;
             }
-            let item = ContextItem {
-                command_id: record.command.id.clone(),
-                text: args.text,
-                expires_at_ms: args.expires_at_ms,
-            };
-            if item.text.len().saturating_add(2) > MAX_TEXT_BYTES {
+            if args.text.len() > MAX_TEXT_BYTES {
                 reject_pending_context(
                     tx,
                     &record,
@@ -395,6 +404,11 @@ pub(super) fn claim_next_input_tx(
                 )?;
                 continue;
             }
+            let item = ContextItem {
+                command_id: record.command.id.clone(),
+                text: fenced_inject_text(&args.text),
+                expires_at_ms: args.expires_at_ms,
+            };
             let lone = vec![item.clone()];
             let lone_frame = plugin_frame(&minimal_send, &lone)?;
             match check_rpc_frame("agent.command", &lone_frame) {
@@ -418,7 +432,8 @@ pub(super) fn claim_next_input_tx(
             // deferred, never rejected against an already-full batch.
             let mut candidate = selected.clone();
             candidate.push(item.clone());
-            if combined_send_text_len(&send.args, &candidate)? > MAX_TEXT_BYTES {
+            let candidate_bytes = payload_bytes.saturating_add(args.text.len());
+            if candidate_bytes > MAX_TEXT_BYTES {
                 break 'scan;
             }
             let frame = plugin_frame(&send.args, &candidate)?;
@@ -435,6 +450,7 @@ pub(super) fn claim_next_input_tx(
                     }
                     selected_outcomes = candidate_outcomes;
                     selected = candidate;
+                    payload_bytes = candidate_bytes;
                     selected_ids.push(record.command.id.clone());
                 }
                 Err(error) if error.code == "frame_too_large" => break 'scan,
@@ -470,13 +486,13 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
-        hook: &str,
+        callback: (&str, &Value),
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         self.ensure_writer_healthy()?;
         require_nonempty(consumer_id, "consumer_id")?;
         require_nonempty(turn_id, "turn_id")?;
-        if !matches!(hook, "before_tool" | "before_model") {
+        if !matches!(callback.0, "before_tool" | "before_model") {
             return Err(Error::new("invalid", "context hook is not supported"));
         }
         let result = self.claim_turn_safe_point_context_inner(
@@ -484,7 +500,7 @@ impl Store {
             generation,
             turn_id,
             consumer_id,
-            hook,
+            callback,
             now,
         );
         self.fault_on_persistence_error(&result);
@@ -497,7 +513,7 @@ impl Store {
         generation: i64,
         turn_id: &str,
         consumer_id: &str,
-        hook: &str,
+        (hook, reply_id): (&str, &Value),
         now: i64,
     ) -> Result<Change<Vec<ContextItem>>> {
         let agent_num = parse_agent_id(agent_id)?;
@@ -576,6 +592,7 @@ impl Store {
         let mut events = Vec::new();
         let mut selected = Vec::new();
         let mut selected_ids = Vec::new();
+        let mut payload_bytes = 0_usize;
         for record in pending_context_batch(
             &tx,
             agent_num,
@@ -609,18 +626,19 @@ impl Store {
             }
             let item = ContextItem {
                 command_id: record.command.id.clone(),
-                text: args.text,
+                text: fenced_inject_text(&args.text),
                 expires_at_ms: args.expires_at_ms,
             };
             let mut candidate = selected.clone();
             candidate.push(item.clone());
-            let text_len = candidate
-                .iter()
-                .fold(0_usize, |sum, item| sum.saturating_add(item.text.len()));
-            let text_len =
-                text_len.saturating_add(candidate.len().saturating_sub(1).saturating_mul(2));
-            let encoded_len = encode_json(&json!({"context": &candidate}))?.len();
-            if text_len > MAX_TEXT_BYTES || encoded_len > MAX_FRAME_BYTES {
+            let candidate_bytes = payload_bytes.saturating_add(args.text.len());
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": reply_id,
+                "result": {"context": &candidate},
+            });
+            let encoded_len = encode_json(&reply)?.len().saturating_add(1);
+            if candidate_bytes > MAX_TEXT_BYTES || encoded_len > MAX_FRAME_BYTES {
                 reject_pending_context(
                     &tx,
                     &record,
@@ -633,6 +651,7 @@ impl Store {
                 continue;
             }
             selected = candidate;
+            payload_bytes = candidate_bytes;
             selected_ids.push(record.command.id.clone());
         }
         for command_id in &selected_ids {
@@ -1645,17 +1664,4 @@ fn inject_point_name(point: InjectPoint) -> &'static str {
 pub(super) fn decode_inject_args(value: &Value) -> Result<InjectArgs> {
     serde_json::from_value(value.clone())
         .map_err(|_| Error::new("source_integrity", "persisted inject args are malformed"))
-}
-
-fn combined_send_text_len(args: &Value, items: &[ContextItem]) -> Result<usize> {
-    let send_text = args
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| Error::new("source_integrity", "send command has no text"))?;
-    let text_len = items.iter().fold(send_text.len(), |sum, item| {
-        sum.saturating_add(item.text.len())
-    });
-    // The native adapters join claimed context and the original user text
-    // with exactly one blank line between each part.
-    Ok(text_len.saturating_add(items.len().saturating_mul(2)))
 }

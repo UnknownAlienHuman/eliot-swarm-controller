@@ -415,7 +415,10 @@ do = [{ action = "stop", target = "${event.agent}", expected_generation = "${eve
 ```
 
 Whole-value rendering preserves JSON type. Templates cannot choose the action, action
-name, executable, environment, credential or authority. For event-triggered `stop`,
+name, executable, environment, credential or authority. In rendered action text, each
+nonblank event, subject or data interpolation arrives in a
+[quoted data fence](coordination.md#quoted-data). Bindings such as Agent, generation,
+turn, request and choice retain their typed values. For event-triggered `stop`,
 `send`, `interrupt`, `steer`, `approve`, `deny` and `answer`, the rendered target and
 `expected_generation` must exactly match the captured `Event.agent` and `Event.generation`;
 an absent or different binding is rejected before action-child admission. Event-rule
@@ -792,8 +795,9 @@ new quota or accounting key.
 
 ### Inject context at the safe point
 
-The `inject` action submits the existing ordinary `inject` command through the
-Router/Store path with no new executor:
+The `inject` action submits an ordinary `inject` command through the Router and
+Store. The text limit applies to the submitted content. Each delivered inject
+arrives as quoted Swarm context, including its fence within the frame limit.
 
 ```toml
 [[rule]]
@@ -1525,10 +1529,9 @@ sections, each label stating that stream's own completeness (stderr is the
 capture's bounded tail), and each section keeping its beginning and end around an
 explicit omission marker when it exceeds its share. The output digest covers
 both streams, because many checks report only on stderr; same output counts
-toward no-progress only when both streams were captured in full. A continuation presents
-the observation as diagnostic data, never as authority to change the Goal, its
-check or the task scope, and never asks the Agent to rerun the check to read
-it. The commit then
+toward no-progress only when both streams were captured in full. A continuation
+presents the observation in a quoted data fence with its capture summary outside
+the fence. The Goal and check policy govern the next action. The commit then
 applies **all** results in one transaction only if generation, revision and
 round still match — the key unconsumed, no newer Agent event (past an idle
 key, or since the claim for a slot), sources still healthy, no open or

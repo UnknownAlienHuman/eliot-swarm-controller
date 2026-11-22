@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 84;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 85;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2069,6 +2069,18 @@ impl Store {
                  CREATE INDEX agents_project_policy_window ON agents(project, created_at, id)
                      WHERE origin = 'eliot';
                  INSERT INTO schema_migrations(version) VALUES (84);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 85 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE launch_intents ADD COLUMN owner_process TEXT;
+                 INSERT INTO schema_migrations(version) VALUES (85);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

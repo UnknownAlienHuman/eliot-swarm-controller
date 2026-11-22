@@ -19,13 +19,17 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch};
+use tokio::{
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, watch},
+    time::timeout,
+};
 
 const MAX_ASSERTION_BYTES: usize = 16 * 1024;
 const MAX_JWKS_BYTES: usize = 256 * 1024;
 const MAX_SESSIONS: usize = 1024;
 const KEY_LIFETIME: Duration = Duration::from_secs(300);
 const REFRESH_BACKOFF: Duration = Duration::from_secs(30);
+const KEY_REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Deserialize, Serialize)]
 struct Claims {
@@ -43,6 +47,7 @@ struct Keys {
     valid_until: Instant,
     retry_after: Instant,
 }
+
 struct Session {
     identity: RemoteIdentity,
     connection_id: String,
@@ -107,6 +112,7 @@ pub(super) struct OriginAuth {
     audience: String,
     client: reqwest::Client,
     keys: Mutex<Keys>,
+    key_refresh: Mutex<()>,
     sessions: Mutex<HashMap<String, Session>>,
     slots: Arc<Semaphore>,
     sdk_sessions: Arc<LocalSessionManager>,
@@ -211,6 +217,7 @@ impl OriginAuth {
             issuer,
             audience,
             client,
+            key_refresh: Mutex::new(()),
             keys: Mutex::new(Keys {
                 set: JwkSet { keys: Vec::new() },
                 valid_until: Instant::now(),
@@ -257,11 +264,57 @@ impl OriginAuth {
     }
 
     async fn refresh(&self) -> Result<(), StatusCode> {
+        timeout(KEY_REFRESH_TIMEOUT, async {
+            let _refresh = self.key_refresh.lock().await;
+            self.fetch_and_cache_keys().await
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    }
+
+    async fn refresh_for_key(&self, kid: &str) -> Result<(), StatusCode> {
+        timeout(KEY_REFRESH_TIMEOUT, async {
+            let _refresh = self.key_refresh.lock().await;
+            {
+                let keys = self.keys.lock().await;
+                let now = Instant::now();
+                if now < keys.valid_until && keys.set.find(kid).is_some() {
+                    return Ok(());
+                }
+                if now < keys.retry_after {
+                    return if now < keys.valid_until {
+                        Ok(())
+                    } else {
+                        Err(StatusCode::SERVICE_UNAVAILABLE)
+                    };
+                }
+            }
+            // The cache lock is released before the bounded network refresh.
+            self.fetch_and_cache_keys().await
+        })
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+    }
+
+    async fn fetch_and_cache_keys(&self) -> Result<(), StatusCode> {
+        {
+            let mut keys = self.keys.lock().await;
+            keys.retry_after = Instant::now() + REFRESH_BACKOFF;
+        }
+        let set = self.fetch_keys().await?;
         let mut keys = self.keys.lock().await;
-        keys.retry_after = Instant::now() + REFRESH_BACKOFF;
-        keys.set = self.fetch_keys().await?;
+        keys.set = set;
         keys.valid_until = Instant::now() + KEY_LIFETIME;
         Ok(())
+    }
+
+    fn decoding_key(jwk: &jsonwebtoken::jwk::Jwk) -> Result<DecodingKey, StatusCode> {
+        if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256)
+            || jwk.common.public_key_use != Some(PublicKeyUse::Signature)
+        {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        DecodingKey::from_jwk(jwk).map_err(|_| StatusCode::UNAUTHORIZED)
     }
 
     async fn verify(&self, assertion: &str) -> Result<Claims, StatusCode> {
@@ -276,23 +329,26 @@ impl OriginAuth {
             .kid
             .filter(|s| !s.is_empty() && s.len() <= 256)
             .ok_or(StatusCode::UNAUTHORIZED)?;
-        let mut keys = self.keys.lock().await;
-        let expired = Instant::now() >= keys.valid_until;
-        if (expired || keys.set.find(&kid).is_none()) && Instant::now() >= keys.retry_after {
-            keys.retry_after = Instant::now() + REFRESH_BACKOFF;
-            keys.set = self.fetch_keys().await?;
-            keys.valid_until = Instant::now() + KEY_LIFETIME;
-        }
-        if Instant::now() >= keys.valid_until {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        let jwk = keys.set.find(&kid).ok_or(StatusCode::UNAUTHORIZED)?;
-        if jwk.common.key_algorithm != Some(KeyAlgorithm::RS256)
-            || jwk.common.public_key_use != Some(PublicKeyUse::Signature)
-        {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-        let key = DecodingKey::from_jwk(jwk).map_err(|_| StatusCode::UNAUTHORIZED)?;
+        let key = {
+            let keys = self.keys.lock().await;
+            if Instant::now() < keys.valid_until {
+                keys.set.find(&kid).map(Self::decoding_key).transpose()?
+            } else {
+                None
+            }
+        };
+        let key = match key {
+            Some(key) => key,
+            None => {
+                self.refresh_for_key(&kid).await?;
+                let keys = self.keys.lock().await;
+                if Instant::now() >= keys.valid_until {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                let jwk = keys.set.find(&kid).ok_or(StatusCode::UNAUTHORIZED)?;
+                Self::decoding_key(jwk)?
+            }
+        };
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);

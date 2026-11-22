@@ -10,6 +10,7 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+        owner_process: Option<&OwnerProcess>,
     ) -> Result<Value> {
         require_owner(principal)?;
         let request: ProjectTransferRequest = decode_params(params.clone())?;
@@ -66,7 +67,8 @@ impl Router {
                 "drain prevents new project transfer actions",
             ));
         }
-        let change = store.project_transfer(&request, prepared, &policy, now_ms())?;
+        let change =
+            store.project_transfer(&request, prepared, &policy, owner_process, now_ms())?;
         self.publish_locked(&change.events);
         if !change.events.is_empty()
             && change.value.outcome == ProjectTransferOutcome::LaunchAdmitted
@@ -123,6 +125,7 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+        owner_process: Option<&OwnerProcess>,
     ) -> Result<Value> {
         require_owner(principal)?;
         let request: ProjectAssignmentLaunchRequest = decode_params(params.clone())?;
@@ -230,7 +233,7 @@ impl Router {
             }
             Ok((launch, preparation))
         });
-        let change = store.launch_project_manager(&request, prepared, now_ms())?;
+        let change = store.launch_project_manager(&request, prepared, owner_process, now_ms())?;
         if !change.events.is_empty() {
             self.publish_locked(&change.events);
             if let Some(id) = &change.value.command_id {

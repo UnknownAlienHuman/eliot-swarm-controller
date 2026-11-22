@@ -2394,38 +2394,29 @@ fn render_text(
         .as_str()
         .ok_or_else(|| Error::new("invalid", format!("{verb} action text must be a string")))?;
     let parts = parse_template(source)?;
-    if let [TemplatePart::Placeholder(path)] = parts.as_slice() {
-        let text = lookup(path, roots.event, roots.subject, roots.data)
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    format!("{verb} text template is unavailable or not a string"),
-                )
-            })?;
-        if text.len() > max_bytes {
-            return Err(Error::new(
-                "invalid",
-                format!("rendered {verb} text exceeds the {limit_label}"),
-            ));
-        }
-        return Ok(text.to_owned());
-    }
-
     let mut rendered = String::new();
     for part in parts {
-        let fragment = match part {
-            TemplatePart::Literal(text) => text,
-            TemplatePart::Placeholder(path) => lookup(path, roots.event, roots.subject, roots.data)
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        format!("{verb} text template is unavailable or not a string"),
-                    )
-                })?,
-        };
-        push_bounded_text(&mut rendered, fragment, max_bytes, verb, limit_label)?;
+        match part {
+            TemplatePart::Literal(text) => {
+                push_bounded_text(&mut rendered, text, max_bytes, verb, limit_label)?;
+            }
+            TemplatePart::Placeholder(path) => {
+                let text = lookup(path, roots.event, roots.subject, roots.data)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            "invalid",
+                            format!("{verb} text template is unavailable or not a string"),
+                        )
+                    })?;
+                let fragment = if text.trim().is_empty() {
+                    Cow::Borrowed(text)
+                } else {
+                    Cow::Owned(format!("\n{}\n", eliot_core::fence_untrusted_text(text)))
+                };
+                push_bounded_text(&mut rendered, &fragment, max_bytes, verb, limit_label)?;
+            }
+        }
     }
     Ok(rendered)
 }

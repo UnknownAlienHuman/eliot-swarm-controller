@@ -356,7 +356,7 @@ impl Router {
             "target": wake.agent,
             "verb": "send",
             "expected_generation": wake.generation,
-            "args": { "text": format!("Wake condition met: {fact}") },
+            "args": { "text": wake_delivery_text(fact) },
         });
         let submitted = self
             .submit(&params, &Principal::Owner, "command.submit")
@@ -615,8 +615,20 @@ fn matches_wake_delivery(command: &Command, wake: &AgentWakeRecord) -> bool {
         && command.verb == "send"
         && command.target.as_deref() == Some(wake.agent.as_str())
         && command.expected_generation == Some(wake.generation)
-        && command.args.get("text").and_then(Value::as_str)
-            == Some(format!("Wake condition met: {fact}").as_str())
+        && command
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| {
+                text == wake_delivery_text(fact) || text == format!("Wake condition met: {fact}")
+            })
+}
+
+fn wake_delivery_text(fact: &str) -> String {
+    format!(
+        "Swarm wake condition met (quoted data):\n{}",
+        eliot_core::fence_untrusted_text(fact)
+    )
 }
 
 fn agent_wake_run_nonzero_fact(

@@ -298,6 +298,7 @@ impl Store {
         principal: &str,
         request: &SwitchRequest,
         policy: &core::SecretPolicy,
+        owner_process: Option<&OwnerProcess>,
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
         if let Some(value) = self.replay_switch(principal, request)? {
@@ -336,7 +337,8 @@ impl Store {
                 ));
             }
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
-            let change = reserve_switch_tx(&tx, request, args, &digest, now)?;
+            let mut change = reserve_switch_tx(&tx, request, args, &digest, now)?;
+            annotate_owner_events(&tx, &mut change.events, owner_process)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(change)
         })();

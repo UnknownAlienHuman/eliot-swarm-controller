@@ -161,10 +161,10 @@ impl CodexRoute {
                 push_override(&mut mcp_override, key, value.to_owned());
             }
         } else {
+            let scope_dir = quote_path(data_dir)?;
             let server = format!(
-                "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {}], env = {{}}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
+                "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {scope_dir}], env = {{ ELIOT_AGENT_DATA_DIR = {scope_dir} }}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
                 quote_path(swarm_executable)?,
-                quote_path(data_dir)?,
                 quote_path(cwd)?,
             );
             push_override(

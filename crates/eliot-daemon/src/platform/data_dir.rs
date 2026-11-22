@@ -13,6 +13,7 @@ const DAEMON_INFO_FILE: &str = "daemon.json";
 /// the daemon stopped because the Owner asked, not because it failed.
 const OWNER_STOP_FILE: &str = "owner-stop";
 const MAX_SELECTED_ROOT_BYTES: usize = 32 * 1024;
+const AGENT_ROOT_LOCATOR: &str = "swarm-data-root";
 
 /// The small local endpoint record consumed by the CLI during daemon discovery.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,12 +373,49 @@ fn resolve_selected_root_at(pointer_dir: &Path) -> Result<Option<PathBuf>> {
 /// and `ELIOT_HOME` take precedence over the durable user selection and default.
 pub fn resolve_data_dir(explicit: Option<&Path>) -> Result<PathBuf> {
     let env_home = std::env::var_os("ELIOT_HOME").filter(|value| !value.is_empty());
+    if explicit.is_none()
+        && env_home.is_none()
+        && let Some(scope) = std::env::var_os(crate::daemon::AGENT_DATA_SCOPE_ENV)
+    {
+        return resolve_agent_data_dir(&scope);
+    }
     resolve_data_dir_with(
         explicit,
         env_home.as_deref(),
         resolve_selected_root,
         default_data_dir,
     )
+}
+
+pub(crate) fn write_agent_root_locator(artifact_root: &Path, data_root: &Path) -> Result<()> {
+    let root = data_root
+        .to_str()
+        .filter(|root| root.len() <= MAX_SELECTED_ROOT_BYTES)
+        .ok_or_else(|| unavailable("Agent daemon directory cannot be recorded"))?;
+    replace_file_atomically(artifact_root, AGENT_ROOT_LOCATOR, root.as_bytes(), true)
+}
+
+fn resolve_agent_data_dir(scope: &std::ffi::OsStr) -> Result<PathBuf> {
+    let invalid = || {
+        unavailable(
+            "Agent daemon directory binding is unavailable; supply --data-dir or use managed Swarm MCP",
+        )
+    };
+    let root = std::env::var_os("ELIOT_ARTIFACT_ROOT")
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .ok_or_else(invalid)?;
+    let bytes = read_private_bytes(&root.join(AGENT_ROOT_LOCATOR), MAX_SELECTED_ROOT_BYTES)
+        .map_err(|_| invalid())?;
+    let path = std::str::from_utf8(&bytes)
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(invalid)?;
+    if scope != std::ffi::OsStr::new(&crate::daemon::identity_data_scope(&path)) {
+        return Err(invalid());
+    }
+    Ok(path)
 }
 
 fn resolve_data_dir_with(

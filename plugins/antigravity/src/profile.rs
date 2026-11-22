@@ -788,19 +788,19 @@ pub(crate) fn translate_model(model: &str) -> (String, Option<String>) {
 /// over the frozen `pass_env` names plus the Windows `System32` prepend),
 /// resolved from the plugin's own minimal process environment. Agent
 /// identity is never added here: discovery carries no Agent credentials, and
-/// a frozen `pass_env` naming an `ELIOT_AGENT_` variable is refused rather
+/// frozen `pass_env` names in Eliot's reserved namespace are refused rather
 /// than leaked into the child.
 pub(crate) fn reader_environment(snapshot: &Value) -> Result<TargetEnvironment> {
     let mut object = serde_json::Map::new();
     if let Some(names) = snapshot.get("pass_env").and_then(Value::as_array) {
         for name in names.iter().filter_map(Value::as_str) {
             if name
-                .get(..12)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_"))
             {
                 return Err(Error::new(
                     "not_allowed",
-                    "discovery cannot receive Agent identity or tokens",
+                    "discovery cannot receive reserved ELIOT_* environment names",
                 ));
             }
             if let Some(value) = std::env::var_os(name) {

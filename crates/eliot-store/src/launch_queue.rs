@@ -28,6 +28,7 @@ pub struct PendingLaunch {
     parent_generation: Option<i64>,
     assignment_epoch: Option<i64>,
     remote: Option<core::RemoteCallContext>,
+    owner_process: Option<OwnerProcess>,
 }
 
 pub struct ArbitratedTimer {
@@ -148,11 +149,11 @@ impl Store {
         original: &LaunchQueueRequest,
         request: SubmitCommand,
         project: &str,
-        remote: Option<&core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
         now: i64,
     ) -> Result<LaunchIntentView> {
         self.ensure_writer_healthy()?;
-        validate_remote_command_context(principal, remote)?;
+        context.validate(principal)?;
         let result = (|| {
             let digest = admission::command_payload_digest(&original.command())?;
             let tx = self
@@ -200,15 +201,16 @@ impl Store {
             };
             insert_receipt(&tx, &original.id, principal, METHOD, &digest, &view, now)?;
             tx.execute(
-                "INSERT INTO launch_intents(id,project,request,parent_generation,assignment_epoch,remote_context)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO launch_intents(id,project,request,parent_generation,assignment_epoch,remote_context,owner_process)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     original.id,
                     project,
                     encode_json(&request)?,
                     parent_generation,
                     assignment_epoch,
-                    remote.map(encode_json).transpose()?
+                    context.remote.map(encode_json).transpose()?,
+                    context.owner_process.map(encode_json).transpose()?,
                 ],
             )
             .map_err(sql_error)?;
@@ -241,7 +243,7 @@ impl Store {
     pub fn pending_launches(&self) -> Result<Vec<PendingLaunch>> {
         self.ensure_committed_reads()?;
         let mut statement = self.connection.prepare(
-            "SELECT w.result,w.principal,q.request,w.created_at,q.route,q.parent_generation,q.assignment_epoch,q.remote_context
+            "SELECT w.result,w.principal,q.request,w.created_at,q.route,q.parent_generation,q.assignment_epoch,q.remote_context,q.owner_process
              FROM launch_intents q JOIN writes w USING (id)
              ORDER BY w.created_at,q.rowid",
         ).map_err(sql_error)?;
@@ -256,6 +258,7 @@ impl Store {
                     r.get(5)?,
                     r.get(6)?,
                     r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })
             .map_err(sql_error)?;
@@ -269,6 +272,7 @@ impl Store {
                 parent_generation,
                 assignment_epoch,
                 remote,
+                owner_process,
             ) = row.map_err(sql_error)?;
             Ok(PendingLaunch {
                 view: decode(&view)?,
@@ -279,6 +283,7 @@ impl Store {
                 parent_generation,
                 assignment_epoch,
                 remote: remote.as_deref().map(decode).transpose()?,
+                owner_process: owner_process.as_deref().map(decode).transpose()?,
             })
         })
         .collect()
@@ -343,6 +348,7 @@ impl Store {
             if let Some((rowid, remote)) = previous.zip(intent.remote.as_ref()) {
                 annotate_remote_submission(&tx, &mut admission, remote, rowid)?;
             }
+            annotate_owner_events(&tx, &mut admission.events, intent.owner_process.as_ref())?;
             let mut view = intent.view.clone();
             view.state = LaunchIntentState::Admitted;
             view.command_id = Some(admission.command.id.clone());

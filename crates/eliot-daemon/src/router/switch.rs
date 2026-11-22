@@ -75,6 +75,7 @@ impl Router {
         &self,
         params: &Value,
         principal: &Principal,
+        owner_process: Option<&OwnerProcess>,
     ) -> Result<Value> {
         require_owner(principal)?;
         let request: SwitchRequest = eliot_core::api::discovery::decode_params(params.clone())?;
@@ -90,7 +91,13 @@ impl Router {
                 return Err(Error::new("unavailable", "drain prevents new switches"));
             }
             let change = store
-                .reserve_switch(&principal_name(principal), &request, &policy, now_ms())
+                .reserve_switch(
+                    &principal_name(principal),
+                    &request,
+                    &policy,
+                    owner_process,
+                    now_ms(),
+                )
                 .inspect_err(|error| {
                     log_refusal(&policy, &request.id, &error.code, &error.message);
                 })?;

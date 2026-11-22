@@ -641,17 +641,30 @@ impl PluginHost {
         };
         let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
-        if let Some(root) = self
+        let mcp_environment = if agent.is_automatic_provider_probe() || agent.harness == "muse" {
+            Some(data_root_only_mcp_environment(&mcp_environment)?)
+        } else if matches!(
+            agent.harness.as_str(),
+            "codex" | "claude" | "opencode" | "antigravity"
+        ) {
+            Some(mcp_environment)
+        } else {
+            None
+        };
+        let artifact_root = self
             .state
             .store
             .lock()
             .await
-            .agent_artifact_root(&agent.id, agent.generation)?
-        {
+            .agent_artifact_root(&agent.id, agent.generation)?;
+        if let Some(root) = &artifact_root {
             target_environment
                 .as_object_mut()
                 .ok_or_else(|| Error::new("invalid", "target environment is not an object"))?
-                .insert("ELIOT_ARTIFACT_ROOT".to_owned(), Value::String(root.path));
+                .insert(
+                    "ELIOT_ARTIFACT_ROOT".to_owned(),
+                    Value::String(root.path.clone()),
+                );
         }
         // Cleanup closes admission, then waits for this gate before snapshotting
         // running. Cover the first filesystem effect through child ownership
@@ -672,6 +685,17 @@ impl PluginHost {
                 "bad_state",
                 "an owned plugin already exists for this Agent generation",
             ));
+        }
+        if let Some(root) = artifact_root
+            && !agent.is_automatic_provider_probe()
+            && target_environment
+                .get(crate::daemon::AGENT_DATA_SCOPE_ENV)
+                .is_some()
+        {
+            crate::platform::data_dir::write_agent_root_locator(
+                Path::new(&root.path),
+                &self.state.data_root,
+            )?;
         }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
         if let Err(error) = self
@@ -867,12 +891,7 @@ impl PluginHost {
             plugin_credential: credential.clone(),
             _prepared_mcp: prepared_mcp,
             target_environment,
-            mcp_environment: (!agent.is_automatic_provider_probe()
-                && matches!(
-                    agent.harness.as_str(),
-                    "codex" | "claude" | "opencode" | "antigravity"
-                ))
-            .then_some(mcp_environment),
+            mcp_environment,
             pass_agent_identity_to_shell: agent
                 .profile_snapshot
                 .get("pass_agent_identity_to_shell")
@@ -1599,7 +1618,10 @@ impl PluginHost {
         })
     }
 
-    pub(crate) async fn authorize_local_owner(&self, peer: Option<LocalPeer>) -> Result<()> {
+    pub(crate) async fn authorize_local_owner(
+        &self,
+        peer: Option<LocalPeer>,
+    ) -> Result<Option<LocalPeer>> {
         self.state.agent_custodies.authorize_owner(peer).await
     }
 
@@ -3108,13 +3130,10 @@ fn prepare_process_environment(
                         "frozen profile pass_env entries must be environment variable names",
                     )
                 })?;
-            if name
-                .get(..12)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_AGENT_"))
-            {
+            if crate::config::reserved_eliot_environment_name(name) {
                 return Err(Error::new(
                     "invalid",
-                    "frozen profile pass_env cannot override Eliot Agent identity variables",
+                    "frozen profile pass_env cannot include reserved ELIOT_* names",
                 ));
             }
             if let Some(selector) = crate::config::native_store_selector(name) {
@@ -3168,6 +3187,19 @@ fn prepare_process_environment(
     Ok((environment, identity))
 }
 
+/// Scope only the daemon data root to a probe or a plugin-owned skill lookup.
+fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
+    let root = environment
+        .as_object()
+        .and_then(|values| values.get("ELIOT_HOME"))
+        .and_then(Value::as_str)
+        .filter(|path| Path::new(path).is_absolute() && Path::new(path).is_dir())
+        .ok_or_else(|| Error::new("invalid", "managed MCP data root is unavailable"))?;
+    let mut scoped = Map::new();
+    insert_environment(&mut scoped, "ELIOT_HOME", root.to_owned());
+    Ok(Value::Object(scoped))
+}
+
 fn build_target_environment(
     data_root: &Path,
     agent: &Agent,
@@ -3216,9 +3248,27 @@ fn build_target_environment(
         .and_then(Value::as_bool)
         .unwrap_or(true);
     // Codex's app-server supplies its MCP identity from named environment
-    // variables and filters those variables from its shell tools.
+    // variables and filters those variables from its shell tools. Data-root
+    // values stay in the separate MCP environment for every harness.
     if pass_identity || agent.harness == "codex" {
-        environment.extend(mcp_environment.clone());
+        insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
+        insert_environment(
+            &mut environment,
+            "ELIOT_AGENT_GENERATION",
+            agent.generation.to_string(),
+        );
+        insert_environment(
+            &mut environment,
+            "ELIOT_AGENT_TOKEN",
+            agent_token.to_owned(),
+        );
+    }
+    if pass_identity {
+        insert_environment(
+            &mut environment,
+            crate::daemon::AGENT_DATA_SCOPE_ENV,
+            crate::daemon::identity_data_scope(data_root),
+        );
     }
     if !pass_identity {
         insert_environment(
