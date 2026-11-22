@@ -398,8 +398,19 @@ pub fn read_stand_registration(
     name: &str,
     root: &Path,
 ) -> Result<StandRegistration> {
-    let record: StandRegistration = read_bounded_json(&registry.join(name))
-        .ok_or_else(|| Error::new("not_found", "directory is not registered by swarm stand up"))?;
+    let path = registry.join(name);
+    // The exact spelling used for the lookup, including any verbatim prefix.
+    let shown = path.display();
+    let record: StandRegistration = read_record(&path).map_err(|failure| match failure {
+        RecordFailure::Missing => Error::new(
+            "not_found",
+            format!("directory is not registered by swarm stand up: no registration at {shown}"),
+        ),
+        RecordFailure::Unusable(detail) => Error::new(
+            "platform_io",
+            format!("stand registration at {shown} is unusable: {detail}"),
+        ),
+    })?;
     if record.marker.format != 2 || registry_name(&record.marker.root) != registry_name(root) {
         return Err(Error::new(
             "not_allowed",
@@ -450,23 +461,57 @@ pub fn list_stand_registrations(registry: &Path) -> Result<Vec<StandEntry>> {
     Ok(entries)
 }
 
-fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let metadata = fs::symlink_metadata(path).ok()?;
+/// Why a bounded stand record could not be used.
+enum RecordFailure {
+    /// The path has no entry.
+    Missing,
+    /// An entry exists but cannot be used. The detail never quotes file
+    /// content, because a record carries the stand's creation token.
+    Unusable(String),
+}
+
+fn read_record<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> std::result::Result<T, RecordFailure> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RecordFailure::Missing
+        } else {
+            RecordFailure::Unusable(format!("inspect failed: {error}"))
+        }
+    })?;
     if !metadata.is_file() || is_reparse_point(&metadata) || metadata.file_type().is_symlink() {
-        return None;
+        return Err(RecordFailure::Unusable("not a plain file".to_owned()));
     }
     if metadata.len() > MAX_RECORD_BYTES {
-        return None;
+        return Err(RecordFailure::Unusable(format!(
+            "{} bytes exceeds the {MAX_RECORD_BYTES}-byte limit",
+            metadata.len()
+        )));
     }
-    let file = File::open(path).ok()?;
+    let file = File::open(path)
+        .map_err(|error| RecordFailure::Unusable(format!("open failed: {error}")))?;
     let mut bytes = Vec::new();
     file.take(MAX_RECORD_BYTES + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
+        .map_err(|error| RecordFailure::Unusable(format!("read failed: {error}")))?;
     if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return None;
+        return Err(RecordFailure::Unusable(format!(
+            "content exceeds the {MAX_RECORD_BYTES}-byte limit"
+        )));
     }
-    serde_json::from_slice(&bytes).ok()
+    serde_json::from_slice(&bytes).map_err(|error| {
+        RecordFailure::Unusable(format!(
+            "parse failed ({:?}) at line {}, column {}",
+            error.classify(),
+            error.line(),
+            error.column()
+        ))
+    })
+}
+
+fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    read_record(path).ok()
 }
 
 pub fn check_directory_chain(path: &Path) -> Result<()> {

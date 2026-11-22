@@ -2889,7 +2889,10 @@ still being written is retried, never bound. While a stand daemon prepares a
 managed worktree, before any Git effect, it records the repository common
 directory, branch, creation OID and worktree path in a sidecar of its
 registration; a stand whose registration cannot be verified refuses the
-creation. `stand list` inspects registered stands with expiry and liveness
+creation. A missing registration refuses with `not_found`; one that exists but
+cannot be inspected, opened, read or parsed refuses with `platform_io`. Both
+name the exact lookup path, and the second names the failed step without
+quoting file content. `stand list` inspects registered stands with expiry and liveness
 state, and `stand prune` tears down expired registered stands.
 
 `stand down` requires that registry binding, the stand marker and the owner
