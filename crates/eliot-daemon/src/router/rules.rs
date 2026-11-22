@@ -636,11 +636,10 @@ impl Router {
         project: Option<&ProjectRegistrationView>,
         state: &RuleStateView,
         revision: i64,
-        event_seq: i64,
+        event: eliot_store::RuleEventInput,
         prepared: PreparedSubmission,
-        once_per_key: Option<[u8; 32]>,
-        rate_key: Option<[u8; 32]>,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
+        let event_seq = event.seq;
         if matches!(
             prepared.request.verb.as_str(),
             "resume" | "git.fetch" | "git.integrate" | "git.publish"
@@ -804,10 +803,8 @@ impl Router {
                 store.admit_rule_action(
                     principal,
                     state,
-                    event_seq,
+                    event,
                     request,
-                    once_per_key,
-                    rate_key,
                     now_ms(),
                     &secret_policy,
                 )?

@@ -125,6 +125,12 @@ pub struct RuleEventAdmission {
     pub is_new: bool,
 }
 
+pub struct RuleEventInput {
+    pub seq: i64,
+    pub once_per_key: Option<[u8; 32]>,
+    pub rate_key: Option<[u8; 32]>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RuleActionDispatchGate {
     Ready,
@@ -776,24 +782,14 @@ impl Store {
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
-        event_seq: i64,
+        event: RuleEventInput,
         request: SubmitCommand,
-        once_per_key: Option<[u8; 32]>,
-        rate_key: Option<[u8; 32]>,
         now: i64,
         secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.admit_rule_action_inner(
-            principal,
-            state,
-            event_seq,
-            request,
-            once_per_key,
-            rate_key,
-            now,
-            secret_policy,
-        );
+        let result =
+            self.admit_rule_action_inner(principal, state, event, request, now, secret_policy);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -824,13 +820,16 @@ impl Store {
         &mut self,
         principal: &str,
         state: &core::api::RuleStateView,
-        event_seq: i64,
+        event: RuleEventInput,
         mut request: SubmitCommand,
-        once_per_key: Option<[u8; 32]>,
-        rate_key: Option<[u8; 32]>,
         now: i64,
         secret_policy: &core::SecretPolicy,
     ) -> Result<RuleEventAdmission> {
+        let RuleEventInput {
+            seq: event_seq,
+            once_per_key,
+            rate_key,
+        } = event;
         require_nonempty(principal, "principal")?;
         require_nonempty(&state.id, "rule id")?;
         if event_seq <= 0 {

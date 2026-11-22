@@ -43,8 +43,8 @@ pub use resolution::{ConfigureReadback, TurnInactiveProof};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,
-    RuleDefinitionInput, RuleEventAdmission, RuleProcessingState, TimerDefinitionInput,
-    TimerSlotAdmission, TimerSlotCommit,
+    RuleDefinitionInput, RuleEventAdmission, RuleEventInput, RuleProcessingState,
+    TimerDefinitionInput, TimerSlotAdmission, TimerSlotCommit,
 };
 pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};

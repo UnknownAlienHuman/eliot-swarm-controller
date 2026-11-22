@@ -1875,10 +1875,12 @@ async fn process_rule_cursor(
                     rule.project.as_ref(),
                     &rule.state,
                     revision,
-                    event.seq,
+                    eliot_store::RuleEventInput {
+                        seq: event.seq,
+                        once_per_key,
+                        rate_key,
+                    },
                     prepared,
-                    once_per_key,
-                    rate_key,
                 )
                 .await
             {
