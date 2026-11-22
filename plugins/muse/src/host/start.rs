@@ -197,10 +197,7 @@ pub(super) async fn spawn_owned_session(
     secrets: Vec<String>,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
-    // Muse `serve` offers no per-session skill flag, so the first turn
-    // carries the identical skill text instead. Resolve the daemon-owned
-    // copy here: a missing copy fails the start rather than starting an
-    // Agent that believes it has no skill.
+    // Muse serves the skill on demand through a pointer in the first turn.
     let data_dir = params
         .target_environment
         .as_ref()
@@ -215,12 +212,19 @@ pub(super) async fn spawn_owned_session(
                 "Muse skill delivery requires the Agent-bound Eliot data root",
             )
         })?;
-    let skill_text = skill::read_skill_file(&skill::skill_body_path(&data_dir)).map_err(|_| {
+    let skill_path = skill::skill_body_path(&data_dir);
+    skill::read_skill_file(&skill_path).map_err(|_| {
         Error::new(
             "skill_unavailable",
             "Muse skill source is unavailable; the daemon did not materialize it",
         )
     })?;
+    let skill_path = eliot_core::display_path(&skill_path.to_string_lossy());
+    let skill_pointer = format!(
+        "The inherited `swarm` MCP tool is available for coordination.\n\
+         Read the skill for delegation, mail, claims, variables, or artifacts. Skip it for solo work.\n\
+         Skill file: {skill_path}"
+    );
     let mut native =
         NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
     let frames = native.take_frames()?;
@@ -253,8 +257,7 @@ pub(super) async fn spawn_owned_session(
         events,
         current_turn: None,
         stop_command_id: None,
-        skill_text,
-        skill_pending: true,
+        skill_pointer: Some(skill_pointer),
     })
 }
 /// Dispatched session start or resume with its owned session: the dispatch

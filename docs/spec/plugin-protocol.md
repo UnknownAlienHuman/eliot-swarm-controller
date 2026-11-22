@@ -784,11 +784,10 @@ Codex `skills/extraRoots/set`, Claude Code `--plugin-dir`, OpenCode
 per-Agent global skills, Antigravity staged `.agents/skills`, and the Muse
 first-turn fallback below.
 
-Where a harness offers no per-session skill mechanism (Muse `serve` loads
-only the session workspace's skills and rules), the plugin delivers the
-identical text through the launch-time first-turn system context ? the same
-native slot `inject` `next_input` claims occupy. A missing canonical copy
-fails the session start: an Agent must not start believing it has no skill.
+Muse `serve` loads the session workspace's skills and rules. Its plugin
+prepends a short pointer to the materialized skill on the first accepted
+turn of the native session. The Agent reads the file when it needs Swarm
+coordination. A missing or unreadable canonical copy fails session start.
 
 Skill content points at the live surface (`api.methods` / `api.help`,
 `swarm <cmd> --help`) and never copies field catalogs. `swarm identity`

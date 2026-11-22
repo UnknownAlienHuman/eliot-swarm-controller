@@ -212,13 +212,8 @@ struct AgentSession {
     events: EventHandle,
     current_turn: Option<(String, String)>,
     stop_command_id: Option<String>,
-    /// Bundled skill text read at start; prepended once to the first
-    /// accepted turn (see `skill_pending`).
-    skill_text: String,
-    /// True until the first turn carrying the skill text is accepted
-    /// natively. A rejected or unknown first turn leaves this true so the
-    /// retry still carries the skill.
-    skill_pending: bool,
+    /// Kept until the native host accepts a turn with the bundled skill pointer.
+    skill_pointer: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -1336,15 +1331,9 @@ impl MusePlugin {
                 "Muse send budget elapsed before turn/start; turn/start was not dispatched. Retry the send.",
             ));
         }
-        // Muse `serve` loads only the session workspace's skills and
-        // rules; the checkout stays untouched and no trust is
-        // auto-enabled, so the identical skill text rides the first
-        // turn's system context instead ? the same native slot `inject`
-        // `next_input` claims occupy.
-        let send_text = if session.skill_pending {
-            format!("{}\n\n{text}", session.skill_text)
-        } else {
-            text.to_owned()
+        let send_text = match &session.skill_pointer {
+            Some(pointer) => format!("{pointer}\n\n{text}"),
+            None => text.to_owned(),
         };
         let combined = with_claimed_context(&send_text, &params.context, "Muse")?;
         let command_id = params.command_id.clone();
@@ -1471,7 +1460,7 @@ impl MusePlugin {
         }
         // The first turn carrying the skill text is now accepted and
         // acknowledged: later turns send plain input.
-        session.skill_pending = false;
+        session.skill_pointer = None;
         // Echo what the native request carried when a `configure` overlay
         // applied, so the settled outcome reads back the effective values
         // alongside the native turn association. Unchanged without one.

@@ -654,22 +654,19 @@ names the `isDefault`-marked row when the server marks one, and an omitted
 reports
 `catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
 remedy.
-## Agent skill delivery (`eliot-swarm`): first-turn fallback
+## Agent skill delivery (`eliot-swarm`)
 
 `muse serve` offers no per-session skill flag: it loads each session
 workspace's skills and rules (`muse serve --help`: `--trust-workspace`,
 "Load each session workspace's skills and rules"). Writing the skill into
 the checkout is forbidden and workspace trust is a broader grant that is
-never auto-enabled, so this harness has no native skill mechanism. The
-plugin instead delivers the identical daemon-materialized skill text
-through the launch-time first-turn system context: the first accepted
-native turn carries the skill text ahead of the send text, in the same
-native slot `inject` `next_input` claims occupy. The flag clears only
-after the first turn is accepted and acknowledged, so a rejected or
-unknown first turn still retries with the skill. A missing canonical
-copy fails the start. Implementation:
+never auto-enabled. The plugin prepends a three-line pointer with the
+daemon-materialized path and the Swarm operations that need the skill.
+The first accepted native turn consumes the pointer. A rejected or unknown
+start leaves it available for the next admitted input. A missing or unreadable
+canonical copy fails the session start. Implementation:
 [`plugins/muse/src/host.rs`](../../plugins/muse/src/host.rs)
-(`skill_pending`) and
+(`skill_pointer`) and
 [`plugins/muse/src/host/start.rs`](../../plugins/muse/src/host/start.rs)
 (`spawn_owned_session`).
 
