@@ -1297,7 +1297,7 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
             counter_cell(entry.totals.thinking_tokens),
             counter_cell(entry.totals.cache_read_tokens),
             counter_cell(entry.totals.cache_write_tokens),
-            format_args!("{total}{partial}"),
+            format!("{total}{partial}"),
         );
     }
     if response
