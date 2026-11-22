@@ -526,7 +526,7 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       `CLAUDE_CONFIG_DIR` credential mount; readiness commits, never unknown.
       Muse/Antigravity Linux binaries install and run, but their authenticated
       turns are not qualified here. Custody stays honestly degraded (see Docker README).
-- [ ] Retention/WAL/backpressure and representative load. The 10,000-Agent,
+- [x] Retention/WAL/backpressure and representative load. The 10,000-Agent,
       2,000-events/s owner run is a release capacity check, not a prerequisite to L2.
 
 Fix the root cause and keep focused regressions. No runtime readiness claim until the

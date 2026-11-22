@@ -405,6 +405,32 @@ impl Store {
         Self::open_with_observer(path, |_| {})
     }
 
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        #[cfg(windows)]
+        let owned_path = core::verbatim_path(path);
+        #[cfg(windows)]
+        let path: &Path = &owned_path;
+        let connection =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(sql_error)?;
+        connection
+            .busy_timeout(Duration::from_secs(1))
+            .map_err(sql_error)?;
+        connection
+            .execute_batch("BEGIN DEFERRED; SELECT 1 FROM schema_migrations LIMIT 1;")
+            .map_err(sql_error)?;
+        Ok(Self {
+            connection,
+            write_faulted: Cell::new(false),
+            retention_commands_cursor: None,
+            retention_processes_cursor: None,
+            goal_holder: String::new(),
+            hierarchy_limits: core::api::HierarchyLimits::default(),
+            capacity_policy: None,
+            git_observed_at: BTreeMap::new(),
+        })
+    }
+
     pub fn open_with_observer<F>(path: &Path, mut on_phase: F) -> Result<Self>
     where
         F: FnMut(StoreOpenPhase),
@@ -1617,9 +1643,17 @@ impl Store {
                 agent_record_columns!(),
                 "
                  FROM agents
-                 WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
-                   OR EXISTS(SELECT 1 FROM native_child_registrations r
-                     WHERE r.producer = agents.id AND r.producer_generation = agents.generation))
+                 WHERE id IN (
+                     SELECT id FROM (
+                         SELECT id FROM agents INDEXED BY agents_attention_active
+                         WHERE id > ?1 AND observe_only = 0 AND state IN ('busy', 'waiting')
+                         ORDER BY id LIMIT ?2
+                     )
+                     UNION
+                     SELECT a.id FROM native_child_registrations r
+                     JOIN agents a ON a.id = r.producer AND a.generation = r.producer_generation
+                     WHERE a.id > ?1 AND a.observe_only = 0
+                 )
                  ORDER BY id LIMIT ?2"
             ))
             .map_err(sql_error)?;
@@ -1656,7 +1690,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, generation, updated_at FROM agents
+                "SELECT id, generation, updated_at FROM agents INDEXED BY agents_lost_recent
                  WHERE observe_only = 0 AND state = 'lost'
                    AND (updated_at < ?1 OR (updated_at = ?1 AND id < ?2))
                  ORDER BY updated_at DESC, id DESC LIMIT ?3",
@@ -6872,9 +6906,10 @@ fn latest_lost_seq(
 ) -> Result<Option<i64>> {
     connection
         .query_row(
-            "SELECT seq FROM events
-             WHERE kind = 'agent.lost' AND agent = ?1 AND generation = ?2
-             ORDER BY seq DESC LIMIT 1",
+            "SELECT seq FROM events INDEXED BY autonomy_fleet_agent_state_event
+             WHERE kind IN ('agent.failed', 'agent.lost')
+               AND kind = 'agent.lost' AND agent = ?1 AND generation = ?2
+             ORDER BY ts DESC, seq DESC LIMIT 1",
             params![agent_num, generation],
             |row| row.get(0),
         )

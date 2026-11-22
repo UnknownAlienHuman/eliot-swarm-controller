@@ -1031,8 +1031,8 @@ each candidate walks one bounded breadth-first subtree over the
 `commands_prune_roots` index with a per-parent limit, skipping kept or oversize
 sets in place, so no pass revisits every kept root, rewinds the root index, or
 materializes an oversize tree into an automatic index before the outer limit.
-A pass deletes at most 128 commands and 128 writes. A command set larger than
-128 is kept intact. Retain command bindings/results in `commands` and other mutation bindings/results
+A pass deletes at most 2,048 commands and 2,048 writes. A command set larger than
+2,048 is kept intact. Retain command bindings/results in `commands` and other mutation bindings/results
 in `writes` for at least the supported retry window plus the allowed clock-skew
 margin. Cleanup must not make an accepted id look new or replay an external effect.
 An unresolved Running Goal-round reservation remains pinned in `writes` beyond
@@ -1070,7 +1070,10 @@ to the owned-exit proof and restart recovery. Historical child process events ex
 through the ordinary event prefix; the observer suppresses new child start and exit
 events.
 
-The daemon releases the Store writer between retention batches. New Stores use
+The daemon releases the Store writer between retention batches, and each retention
+epoch runs a `PASSIVE` WAL checkpoint outside the Store writer lock (even when no rows
+expired in that epoch), followed by a non-blocking `TRUNCATE` checkpoint when `frames >
+1,024` or the WAL file exceeds 1 MiB and no reader is busy. New Stores use
 incremental auto-vacuum to return free pages in bounded steps. Existing Stores with
 auto-vacuum disabled reuse freed pages during live retention. An explicit [startup
 conversion](configuration.md#daemon-and-automation-settings) rebuilds an older file before

@@ -17,7 +17,7 @@ const AGENT_NOTICE_BATCH_SQL: &str = "WITH request AS (
                t.kind AS latest_kind, t.ts AS latest_ts, t.data AS latest_data
         FROM request AS r
         LEFT JOIN events AS t ON t.seq = (
-            SELECT e.seq FROM events AS e INDEXED BY events_agent
+            SELECT e.seq FROM events AS e INDEXED BY events_turn_lifecycle
             WHERE r.active_turn IS NULL
               AND e.agent = r.agent AND e.generation = r.generation
               AND e.kind IN ('turn.started', 'turn.completed', 'turn.unknown')
@@ -29,7 +29,7 @@ const AGENT_NOTICE_BATCH_SQL: &str = "WITH request AS (
            n.ts, n.data
     FROM targets AS t
     LEFT JOIN events AS n ON n.seq = (
-        SELECT e.seq FROM events AS e INDEXED BY events_agent
+        SELECT e.seq FROM events AS e INDEXED BY events_turn_notice
         WHERE t.turn_id IS NOT NULL AND e.agent = t.agent AND e.generation = t.generation
           AND e.kind = 'turn.notice'
           AND json_extract(e.data, '$.turn_id') = t.turn_id

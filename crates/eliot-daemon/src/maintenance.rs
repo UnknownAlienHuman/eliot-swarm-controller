@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, watch};
 
 /// One retention epoch loops bounded passes until a pass deletes nothing
 /// or a budget runs out.
-pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 10_000;
+pub(crate) const RETENTION_TICK_ROW_BUDGET: i64 = 65_536;
 pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Known provider resets and due probes are serviced within one second.
@@ -316,39 +316,36 @@ async fn run_epochs(
             }
         };
         let rows = report.rows_deleted();
-        if rows > 0 || report.pages_reclaimed > 0 {
-            let path = data_root.join("eliot.db");
-            let result =
-                tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
-            match result {
-                Ok(Ok((frames, checkpointed, busy))) => {
-                    report.wal_frames = frames;
-                    report.checkpointed_frames = checkpointed;
-                    report.checkpoint_busy = busy;
-                }
-                Ok(Err(error)) => {
-                    logging::record(
-                        policy,
-                        "daemon.retention_checkpoint_failed",
-                        &[
-                            ("producer", "daemon.retention"),
-                            ("method", "retention.checkpoint"),
-                        ],
-                        Some(&error),
-                    );
-                }
-                Err(error) => {
-                    let error = maintenance_join_error("retention checkpoint", &error);
-                    logging::record(
-                        policy,
-                        "daemon.retention_checkpoint_failed",
-                        &[
-                            ("producer", "daemon.retention"),
-                            ("method", "retention.checkpoint.join"),
-                        ],
-                        Some(&error),
-                    );
-                }
+        let path = data_root.join("eliot.db");
+        let result = tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
+        match result {
+            Ok(Ok((frames, checkpointed, busy))) => {
+                report.wal_frames = frames;
+                report.checkpointed_frames = checkpointed;
+                report.checkpoint_busy = busy;
+            }
+            Ok(Err(error)) => {
+                logging::record(
+                    policy,
+                    "daemon.retention_checkpoint_failed",
+                    &[
+                        ("producer", "daemon.retention"),
+                        ("method", "retention.checkpoint"),
+                    ],
+                    Some(&error),
+                );
+            }
+            Err(error) => {
+                let error = maintenance_join_error("retention checkpoint", &error);
+                logging::record(
+                    policy,
+                    "daemon.retention_checkpoint_failed",
+                    &[
+                        ("producer", "daemon.retention"),
+                        ("method", "retention.checkpoint.join"),
+                    ],
+                    Some(&error),
+                );
             }
         }
         total.accumulate(report);

@@ -485,7 +485,7 @@ async fn initialize_runtime(
         let mut store = store.lock().await;
         crate::config::settings::reconcile_at_startup(data_dir.path(), &mut store)?;
     }
-    let bus = Bus::new(1_024);
+    let bus = Bus::new(8_192);
     let daemon_config =
         crate::config::load_daemon_config(data_dir.path()).map_err(startup_config_failure)?;
     // Invalid `[mail]` fails startup like invalid retention; the Router keeps

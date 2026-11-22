@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 97;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 98;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2304,6 +2304,47 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE agents ADD COLUMN owner_rules_delivery TEXT;
                  INSERT INTO schema_migrations(version) VALUES (97);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 98 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS events_turn_notice
+                     ON events(agent, generation, json_extract(data, '$.turn_id'), seq DESC)
+                     WHERE kind = 'turn.notice';
+                 CREATE INDEX IF NOT EXISTS events_turn_lifecycle
+                     ON events(agent, generation, seq DESC)
+                     WHERE kind IN ('turn.started', 'turn.completed', 'turn.unknown');
+                 CREATE INDEX IF NOT EXISTS events_goal_changed
+                     ON events(agent, generation, seq DESC)
+                     WHERE kind = 'goal.changed';
+                 CREATE INDEX IF NOT EXISTS turns_completed_success
+                     ON turns(completed_at DESC, agent DESC, turn_id DESC)
+                     WHERE state = 'completed' AND outcome = 'success'
+                       AND started_at > 0 AND completed_at >= started_at;
+                 CREATE INDEX IF NOT EXISTS provider_holds_probe_command
+                     ON provider_holds(probe_command)
+                     WHERE probe_command IS NOT NULL;
+                 CREATE INDEX IF NOT EXISTS agents_nonterminal_controlled
+                     ON agents(id)
+                     WHERE observe_only = 0 AND archived = 0
+                       AND state IN ('created','starting','idle','busy','waiting','failed','lost','unknown');
+                 CREATE INDEX IF NOT EXISTS agents_attention_active
+                     ON agents(id)
+                     WHERE observe_only = 0 AND state IN ('busy', 'waiting');
+                 CREATE INDEX IF NOT EXISTS agents_lost_recent
+                     ON agents(updated_at DESC, id DESC)
+                     WHERE observe_only = 0 AND state = 'lost';
+                 CREATE INDEX IF NOT EXISTS commands_target_active_start
+                     ON commands(target, generation, expected_generation)
+                     WHERE verb IN ('launch', 'resume')
+                       AND state IN ('accepted', 'queued', 'dispatched');
+                 INSERT INTO schema_migrations(version) VALUES (98);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
