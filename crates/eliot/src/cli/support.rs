@@ -16,6 +16,36 @@ pub(crate) const MAX_TEXT_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_ANSWERS_FILE_BYTES: usize = 512 * 1024;
 pub(crate) const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
+pub(crate) fn parse_goal_json(
+    input: Option<String>,
+) -> Result<Option<serde_json::Map<String, Value>>, Failure> {
+    let Some(input) = input else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(&input)
+        .map_err(|_| Failure::new(2, "--goal-json must contain valid JSON"))?;
+    match value {
+        Value::Object(goal) => Ok(Some(goal)),
+        _ => Err(Failure::new(2, "--goal-json must contain a JSON object")),
+    }
+}
+
+pub(crate) fn validate_no_policy(reason: Option<String>) -> Result<Option<String>, Failure> {
+    if reason
+        .as_ref()
+        .is_some_and(|reason| !eliot_core::api::valid_project_policy_opt_out_reason(reason))
+    {
+        return Err(Failure::new(
+            2,
+            format!(
+                "--no-policy needs a nonblank, one-line reason of at most {} bytes without control, format, bidi, or invisible zero-width characters",
+                eliot_core::api::PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(reason)
+}
+
 #[derive(Debug)]
 pub(crate) struct Failure {
     pub(crate) exit_code: u8,

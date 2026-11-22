@@ -215,7 +215,14 @@ impl Router {
                 }
             }
             let mut prepared = self
-                .prepare_submission_after_authorization(launch, &Principal::Owner, false, false)
+                .prepare_submission_with_routing(
+                    launch,
+                    &Principal::Owner,
+                    false,
+                    false,
+                    false,
+                    true,
+                )
                 .await?;
             if let Some((choice, identity)) = provider_route {
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
@@ -298,9 +305,24 @@ impl Router {
             } else {
                 prepared.request.args["registered_project"] = json!(source.project);
             }
+            if target
+                .as_ref()
+                .is_none_or(|target| target.id == source.project)
+                && let Some(reason) = &source.policy_opt_out_reason
+            {
+                prepared.request.args["no_policy"] = json!(reason);
+            }
             if scope.is_empty() {
                 prepared.request.args[SWITCH_BLANK_SCOPE_ARG] = json!(true);
             }
+            // Continuation retains the source registration unless the Owner
+            // named and verified a target project above.
+            super::project_checks::freeze_launch_goal(
+                self,
+                &mut prepared.request,
+                &Principal::Owner,
+            )
+            .await?;
             let policy = self.secret_policy_snapshot();
             if policy.contains_value(&prepared.request.args) {
                 return Err(Error::new(

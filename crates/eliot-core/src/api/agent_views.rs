@@ -1320,6 +1320,124 @@ impl ProjectGitView {
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ProjectPolicyOptOutView {
+    pub agent: String,
+    /// The required launch opt-out rationale, bounded to 256 UTF-8 bytes.
+    #[schemars(length(max = 256))]
+    pub reason: String,
+    /// Unix timestamp in milliseconds from the Agent's creation event.
+    #[schemars(range(min = 0))]
+    pub created_at: i64,
+}
+
+impl ProjectPolicyOptOutView {
+    pub fn validate(&self) -> Result<()> {
+        text(&self.agent)?;
+        if self.created_at < 0 || !valid_project_policy_opt_out_reason(&self.reason) {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPolicyUsageView {
+    /// Unique project Agents created in the last 24 hours with policy applied.
+    #[schemars(range(min = 0))]
+    pub applied: u64,
+    /// Unique project Agents created in the last 24 hours.
+    #[schemars(range(min = 0))]
+    pub total: u64,
+    /// All explicit opt-outs among the counted Agents.
+    #[serde(default)]
+    pub opted_out: u64,
+    /// Newest explicit opt-outs among those Agents, capped at 16 entries.
+    #[schemars(length(max = 16))]
+    pub opt_outs: Vec<ProjectPolicyOptOutView>,
+}
+
+impl ProjectPolicyUsageView {
+    pub fn validate(&self) -> Result<()> {
+        let mut agents = BTreeSet::new();
+        if self.applied.saturating_add(self.opted_out) > self.total
+            || self.opt_outs.len() as u64 > self.opted_out
+            || self.opt_outs.len() > PROJECT_POLICY_OPTOUTS_MAX
+        {
+            return Err(invalid_response());
+        }
+        for opt_out in &self.opt_outs {
+            opt_out.validate()?;
+            if !agents.insert(&opt_out.agent) {
+                return Err(invalid_response());
+            }
+        }
+        Ok(())
+    }
+}
+
+pub const PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES: usize = 256;
+pub const PROJECT_POLICY_OPTOUTS_MAX: usize = 16;
+
+fn is_project_policy_opt_out_control(character: char) -> bool {
+    // Format characters and default ignorables, including bidi controls.
+    character.is_control()
+        || matches!(
+            character as u32,
+            0x00AD
+                | 0x034F
+                | 0x0600..=0x0605
+                | 0x061C
+                | 0x06DD
+                | 0x070F
+                | 0x0890..=0x0891
+                | 0x08E2
+                | 0x115F..=0x1160
+                | 0x17B4..=0x17B5
+                | 0x180B..=0x180F
+                | 0x200B..=0x200F
+                | 0x202A..=0x202E
+                | 0x2060..=0x206F
+                | 0x3164
+                | 0xFE00..=0xFE0F
+                | 0xFEFF
+                | 0xFFA0
+                | 0xFFF0..=0xFFFB
+                | 0x110BD
+                | 0x110CD
+                | 0x13430..=0x1343F
+                | 0x1BCA0..=0x1BCA3
+                | 0x1D173..=0x1D17A
+                | 0xE0000..=0xE0FFF
+        )
+}
+
+pub fn valid_project_policy_opt_out_reason(reason: &str) -> bool {
+    !reason.trim().is_empty()
+        && reason.len() <= PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES
+        && !reason.chars().any(is_project_policy_opt_out_control)
+}
+
+/// Old Store rows can predate format-character validation. Keep their
+/// reason displayable and within its original byte bound.
+pub fn sanitize_project_policy_opt_out_reason(reason: String) -> String {
+    if reason.chars().any(is_project_policy_opt_out_control) {
+        return reason
+            .chars()
+            .map(|character| {
+                if is_project_policy_opt_out_control(character) {
+                    '?'
+                } else {
+                    character
+                }
+            })
+            .collect();
+    }
+    reason
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectRegistrationView {
     pub id: String,
     pub checkout: String,
@@ -1331,6 +1449,10 @@ pub struct ProjectRegistrationView {
     #[serde(default)]
     pub git: Option<ProjectGitView>,
     pub revision: i64,
+    /// Per-project launch policy usage from the trailing 24 hours. The opt-out
+    /// entries are the newest 16 unique Agents and retain their launch time.
+    #[serde(default)]
+    pub policy_usage: ProjectPolicyUsageView,
     /// The repository's name from its `origin` remote URL (the last path
     /// segment without `.git`), read live from Git by `project.list` and
     /// `project.get`. Read-only: never stored or settable, never the URL
@@ -1466,6 +1588,7 @@ impl ProjectRegistrationView {
                 "project registration revision must be nonnegative",
             ));
         }
+        self.policy_usage.validate()?;
         validate_project_allowset(&self.profiles, "profiles")?;
         validate_project_allowset(&self.actions, "actions")?;
         validate_project_run_env(&self.run_env)?;

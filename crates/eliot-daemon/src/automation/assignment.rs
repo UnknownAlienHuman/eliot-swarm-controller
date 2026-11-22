@@ -175,7 +175,6 @@ pub(crate) async fn prepare(
         .map(|goal| {
             serde_json::from_value::<eliot_core::api::AssignmentGoal>(goal.clone())
                 .map_err(|_| Error::new("invalid", "assignment goal is invalid"))
-                .map(|goal| goal.definition(&brief))
         })
         .transpose()?;
     request.args["text"] = Value::String(text);
@@ -189,8 +188,11 @@ pub(crate) async fn prepare(
     }
     if let Some(goal) = goal {
         goal.validate()?;
-        request.args["assignment"]["goal"] = serde_json::to_value(goal)
+        let text = goal.definition(&brief).text;
+        let mut fields = serde_json::to_value(goal)
             .map_err(|_| Error::new("invalid", "assignment goal cannot be encoded"))?;
+        fields["text"] = Value::String(text);
+        request.args["assignment"]["goal"] = fields;
     }
     request.validate()?;
     Ok(request)

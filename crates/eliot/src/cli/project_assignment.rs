@@ -1,5 +1,5 @@
 use super::args::{ProjectAssignmentCommand, ProjectTransferArgs, ProjectTransferCommand};
-use super::support::{Failure, mutation_id, print_value};
+use super::support::{Failure, mutation_id, parse_goal_json, print_value, validate_no_policy};
 use eliot_core::api::{
     PROJECT_TRANSFER_METHOD, ProjectAssignment, ProjectAssignmentClaimRequest,
     ProjectAssignmentGetRequest, ProjectAssignmentLaunchRequest, ProjectAssignmentOutcome,
@@ -42,12 +42,18 @@ pub(super) async fn run(
             project,
             profile,
             adopt_worktree,
+            no_policy,
+            goal_json,
         } => {
+            let no_policy = validate_no_policy(no_policy)?;
+            let goal = parse_goal_json(goal_json)?;
             let request = ProjectAssignmentLaunchRequest {
                 id: mutation_id(id)?,
                 project,
                 profile,
                 adopt_worktree,
+                no_policy,
+                goal,
             };
             call(data_dir, "project.assignment.launch", &request).await?
         }

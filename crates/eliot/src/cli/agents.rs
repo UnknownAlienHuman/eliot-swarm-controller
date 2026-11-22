@@ -8,10 +8,10 @@ use super::args::{
 use super::support::read_and_print;
 use super::support::{
     DEFAULT_WAIT_SECONDS, Failure, INTERRUPTED_EXIT_CODE, MAX_ANSWERS_FILE_BYTES, MAX_TEXT_BYTES,
-    command_value, mutation_id, print_value, response_exit_code, sleep_before_deadline,
-    submit_and_print, submit_command, submit_request, submit_value, turn_exit_code, turn_value,
-    validate_limit, wait_call, wait_deadline, wait_for_command, wait_for_linked_turn,
-    wait_for_turn,
+    command_value, mutation_id, parse_goal_json, print_value, response_exit_code,
+    sleep_before_deadline, submit_and_print, submit_command, submit_request, submit_value,
+    turn_exit_code, turn_value, validate_limit, validate_no_policy, wait_call, wait_deadline,
+    wait_for_command, wait_for_linked_turn, wait_for_turn,
 };
 use eliot_core::api::{
     AgentDiscoverRequest, AgentGetRequest, AgentGetResponse, CommandGetRequest, DiscoverPage,
@@ -209,6 +209,8 @@ pub(crate) async fn run_launch(
         parent,
         prompt,
         sources,
+        no_policy,
+        goal_json,
         queue,
         owner_override,
         wait,
@@ -288,6 +290,8 @@ pub(crate) async fn run_launch(
         return Err(Failure::new(2, "--cmd must not be empty"));
     }
     validate_text(prompt.as_deref())?;
+    let no_policy = validate_no_policy(no_policy)?;
+    let goal = parse_goal_json(goal_json)?;
     let deadline = wait_deadline(timeout_seconds)?;
     let mut args = json!({});
     if let Some(workspace) = workspace {
@@ -334,6 +338,12 @@ pub(crate) async fn run_launch(
     }
     if !sources.is_empty() {
         args["sources"] = json!(sources);
+    }
+    if let Some(goal) = goal {
+        args["goal"] = Value::Object(goal);
+    }
+    if let Some(reason) = no_policy {
+        args["no_policy"] = Value::String(reason);
     }
     if queue {
         let request = eliot_core::api::LaunchQueueRequest {

@@ -453,7 +453,8 @@ external work. A live duplicate is `busy`; an abandoned holder reads `unknown`.
 See [Goal loop](automation.md#goal-loop) and the canonical
 [Goal request/response DTOs](../../crates/eliot-core/src/api/goals.rs). The round
 response binds the original mutation id separately from the distinct continuation
-command id frozen at claim. Stored Goal responses/round records use Core
+command id frozen at claim. The settled event's persisted `kind` is exactly
+`goal.round`. Stored Goal responses/round records use Core
 [`MAX_FRAME_BYTES`](../../crates/eliot-core/src/limits.rs), not the event budget.
 
 ## Methods
@@ -527,7 +528,12 @@ unknown preparation reads as blocked, with the outcome on the start command.
 Owner release revokes that assignment at its epoch and retains the preparation
 receipt and unknown outcome. Remote assignment is
 unsupported. CLI callers use `swarm project assignment get|claim|launch|release`.
-An explicit Owner claim supplies the Agent ID and generation. A scoped claim
+`ProjectAssignmentLaunchRequest` accepts optional `no_policy: String` and
+`goal: Map<String, Value>` fields with the same reason and field-by-field Goal
+semantics as ordinary launch. The CLI exposes them as `--no-policy REASON` and
+`--goal-json JSON_OBJECT`. Only an Owner may override `check`, `check_cwd` or
+`escalation`; explicit safe fields and opt-out remain available to permitted launch
+principals. An explicit Owner claim supplies the Agent ID and generation. A scoped claim
 omits the manager to select the caller. The project action
 `project.assignment.claim` grants self-claim under the configured profile allowlist.
 For transfer, use `swarm project transfer <project> --revision <revision> begin|launch|commit|cancel`.
@@ -808,7 +814,15 @@ whose optional `git` value uses [`ProjectGitView` and `GitCredentialHelper`](../
 The read-only `origin` is the validated basename of the local `origin` remote's path,
 with `.git` stripped. Malformed and pathless remotes produce no name. The daemon
 reads each common directory in the Git probe's sanitized environment after releasing
-the Store lock. The readback carries only the name.
+the Store lock. The readback carries only the name. The
+`ProjectRegistrationView.policy_usage` field carries
+`applied`, `total`, `opted_out` and `opt_outs` for the last 24 hours. `total` counts distinct
+retained launched Agent IDs, including stopped Agents; attaches and resumed
+generations do not add another launch. `applied` counts those Agents that inherited
+at least one project policy default. `opted_out` counts explicit opt-outs and `opt_outs`
+returns the newest 16 with their `agent`, `reason` and `created_at`. Human `swarm project show` prints the line
+`policy applied to N of M Agents in the last 24 h` and the opt-out reasons. JSON keeps
+the DTO, and the desktop receives the same project data through its existing API client.
 Owner-facing views render Windows paths without the verbatim prefix, through Core
 `display_path` ([verbatim.rs](../../crates/eliot-core/src/verbatim.rs)): the registration
 `checkout`, `repo_common_dir` and every `checkouts` path, and the Agent views'
@@ -879,7 +893,8 @@ known reset or next probe without implying replay of an unknown native effect.
 `agent.list` resolves all distinct holds for the selected page in one indexed scope
 query and resolves native notices in one page-scoped query over the existing event
 index. `agent.get` uses the same projection for its single Agent. Neither read adds a
-polling source.
+polling source. `AgentView.policy_opt_out_reason` retains an explicit project-policy
+opt-out reason; `swarm show` includes it in human output and JSON keeps the view field.
 The Agent `effective` settings are the last
 natively admitted values, never a prediction: the launch `session.ready`
 readback sets them, and a `configure` revision's turn refreshes them when the
@@ -1166,7 +1181,15 @@ process statistics nor model progress.
 ## Command admission
 
 `swarm launch --queue` calls `launch.enqueue` with a mutation ID and ordinary launch
-arguments. A queued intent has no Agent or command until admitted. Exact retry
+arguments. `args.goal`, when present, is a partial Goal object. The Owner may
+override individual defaults, while other principals may only tighten an applied
+policy. `args.no_policy` is a nonblank reason of at most 256 bytes without control
+or invisible format characters. It skips both the policy Goal and the fast check and
+records `project.policy.opted_out` with the reason. Private chats have no registered
+execution project or policy. A same-project switch retains the opt-out reason.
+The same arguments reach direct and queued launch admission. Executable check
+overrides and escalation require Owner authority. A queued intent has no Agent or command until
+admitted. Exact retry
 returns the current intent. When admission succeeds, the receipt gives the
 ordinary launch command ID. Use `swarm launch-queue [INTENT]` for exact readback or
 the pending page. The queue reports the wait code, scope and actor who can
@@ -2746,8 +2769,8 @@ swarm stand down <PATH>
 swarm status
 swarm store compact
 swarm cleanup plan [--after TOKEN]
-swarm launch --profile P --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [PROMPT] [--wait] [--timeout-seconds N]
-swarm launch --workspace PATH [PROMPT] [--wait] [--timeout-seconds N]
+swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
+swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]
 swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
@@ -2805,6 +2828,7 @@ swarm chat tag AGENT... [--tag TAG]...
 swarm provider holds [--after SCOPE] [--limit N]
 swarm provider clear-hold SCOPE --corrective-evidence credentials_updated|configuration_updated|owner_verified [--expected-probe-command ID]
 swarm project assignment claim PROJECT [AGENT] [--generation N]
+swarm project assignment launch PROJECT --profile P [--adopt-worktree PATH] [--no-policy REASON] [--goal-json JSON_OBJECT]
 swarm plugin NAME | plugin-test ... | hook ... | mcp
 ```
 

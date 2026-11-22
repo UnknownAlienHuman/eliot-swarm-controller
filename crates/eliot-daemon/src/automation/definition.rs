@@ -89,6 +89,10 @@ struct LaunchActionDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     assignment: Option<AssignmentActionDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    goal: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<Value>,
 }
 
@@ -939,6 +943,8 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         workspace,
         role,
         assignment,
+        goal,
+        no_policy,
         ..
     }) = action
     {
@@ -953,6 +959,8 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
             workspace,
             role.as_deref(),
             assignment.as_ref(),
+            goal.as_ref(),
+            no_policy.as_deref(),
             text,
         )
         .map(RuleEvaluation::Command);
@@ -1339,6 +1347,8 @@ fn submit_launch_command(
     workspace: &str,
     role: Option<&str>,
     assignment: Option<&AssignmentActionDefinition>,
+    goal: Option<&BTreeMap<String, Value>>,
+    no_policy: Option<&str>,
     text: Option<String>,
 ) -> Result<SubmitCommand, Error> {
     let mut command = CommandSubmitRequest::new(String::new(), "launch");
@@ -1361,6 +1371,13 @@ fn submit_launch_command(
             command.args["assignment"]["goal"] = serde_json::to_value(goal)
                 .map_err(|_| Error::new("invalid", "assignment goal cannot be encoded"))?;
         }
+    }
+    if let Some(goal) = goal {
+        command.args["goal"] = serde_json::to_value(goal)
+            .map_err(|_| Error::new("invalid", "launch goal cannot be encoded"))?;
+    }
+    if let Some(reason) = no_policy {
+        command.args["no_policy"] = Value::String(reason.to_owned());
     }
     if let Some(text) = text {
         command.args["text"] = Value::String(text);
@@ -1460,7 +1477,7 @@ fn reject_unimplemented_options(raw: &toml::Value) -> Result<(), Error> {
     if has_unsupported_launch_option {
         return Err(Error::new(
             "unsupported",
-            "launch accepts profile or role, workspace, optional text, and bounded assignment fields; worktree and per-action overrides are unsupported",
+            "launch accepts profile or role, workspace, optional text, assignment, optional goal and no_policy; worktree, base, setup, model, effort, permissions and executable are unsupported",
         ));
     }
     if has_unsupported_trigger || has_unsupported_selector || has_unsupported_action {
@@ -1701,7 +1718,9 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         workspace,
         role,
         assignment,
+        goal,
         text,
+        ..
     }) = action
     {
         return validate_launch_action(
@@ -1709,6 +1728,7 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
             workspace,
             role.as_deref(),
             assignment.as_ref(),
+            goal.as_ref(),
             text.as_ref(),
             true,
         );
@@ -1800,9 +1820,16 @@ fn validate_launch_action(
     workspace: &str,
     role: Option<&str>,
     assignment: Option<&AssignmentActionDefinition>,
+    goal: Option<&BTreeMap<String, Value>>,
     text: Option<&Value>,
     allow_text_templates: bool,
 ) -> Result<(), Error> {
+    if goal.is_some() && assignment.is_some_and(|assignment| assignment.goal.is_some()) {
+        return Err(Error::new(
+            "invalid",
+            "launch cannot set both a folder assignment goal and a goal override",
+        ));
+    }
     if let Some(profile) = profile {
         validate_launch_literal(profile, "profile")?;
     }
@@ -1987,6 +2014,8 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             workspace,
             role,
             assignment,
+            goal,
+            no_policy,
             text,
         }) => {
             validate_launch_action(
@@ -1994,6 +2023,7 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 workspace,
                 role.as_deref(),
                 assignment.as_ref(),
+                goal.as_ref(),
                 text.as_ref(),
                 false,
             )?;
@@ -2005,6 +2035,8 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
                 workspace,
                 role.as_deref(),
                 assignment.as_ref(),
+                goal.as_ref(),
+                no_policy.as_deref(),
                 text,
             );
         }

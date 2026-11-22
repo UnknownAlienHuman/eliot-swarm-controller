@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 83;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 84;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2053,6 +2053,22 @@ impl Store {
             tx.execute_batch(
                 "ALTER TABLE agents ADD COLUMN instruction_delivery TEXT;
                  INSERT INTO schema_migrations(version) VALUES (83);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 84 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE agents ADD COLUMN policy_applied INTEGER NOT NULL DEFAULT 0
+                     CHECK(policy_applied IN (0,1));
+                 ALTER TABLE agents ADD COLUMN policy_opt_out_reason TEXT;
+                 CREATE INDEX agents_project_policy_window ON agents(project, created_at, id)
+                     WHERE origin = 'eliot';
+                 INSERT INTO schema_migrations(version) VALUES (84);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

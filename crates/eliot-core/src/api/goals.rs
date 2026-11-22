@@ -128,6 +128,7 @@ impl AssignmentGoal {
             max_without_progress: self.max_without_progress,
             cadence_ms: None,
             scope: Vec::new(),
+            policy_scope: Vec::new(),
             check_inputs: Vec::new(),
             max_cost: None,
             escalation: None,
@@ -168,6 +169,9 @@ pub struct GoalDefinition {
     /// starting point at `set` and blocks the Goal on any change outside.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<String>,
+    /// When a launch narrows its project policy, paths must match both scope sets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_scope: Vec<String>,
     /// The check's own inputs, as the same globs. A passing check after one
     /// of them changed is not accepted as completion: the Goal blocks for a
     /// separate review. Workspace files named by the check argv are added.
@@ -257,7 +261,7 @@ pub struct GoalCostLimit {
 }
 
 impl GoalCostLimit {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.unit.is_empty()
             || self.unit.len() > MAX_GOAL_COST_UNIT_BYTES
             || self
@@ -349,7 +353,11 @@ impl GoalDefinition {
         if let Some(escalation) = &self.escalation {
             escalation.validate()?;
         }
-        for (name, globs) in [("scope", &self.scope), ("check_inputs", &self.check_inputs)] {
+        for (name, globs) in [
+            ("scope", &self.scope),
+            ("policy_scope", &self.policy_scope),
+            ("check_inputs", &self.check_inputs),
+        ] {
             if globs.len() > MAX_GOAL_SCOPE_GLOBS {
                 return Err(Error::new(
                     "invalid",
@@ -372,7 +380,7 @@ impl GoalDefinition {
 
     /// Whether Swarm records a starting point and checks the change scope.
     pub fn tracks_changes(&self) -> bool {
-        !self.scope.is_empty() || !self.check_inputs.is_empty()
+        !self.scope.is_empty() || !self.policy_scope.is_empty() || !self.check_inputs.is_empty()
     }
 
     /// Automatic `on_idle` driving needs a bound: a Goal without a cadence

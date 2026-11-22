@@ -56,7 +56,8 @@ engine, second scheduler or critic loop.
       sources are delivered with path and version or their absence is explicit;
       limits survive handoff and continuation.
 - [x] **A3 Change scope and checker trust.** A Goal's `scope` and
-      `check_inputs` get a starting point at `set`; each round the daemon,
+      `check_inputs` get a starting point at `set`, or after workspace setup
+      and before first input when installed by launch; each round the daemon,
       outside the writable checkout, compares the change with it. A change
       outside `scope` blocks without a check or continuation; a pass after a
       check input changed, or with the change set unverified, blocks for a
@@ -72,9 +73,9 @@ engine, second scheduler or critic loop.
       current instruction and limits, and the executor's last decisions and
       next step, keeping machine facts and model claims distinct.
 - [x] **A7 Goal cost budget.** `max_cost` budgets the native session cost
-      since `set` in its verbatim unit from a baseline snapshot; incomplete,
-      stale, mixed-unit, reset or decreasing data is `cost_unverified` and
-      blocks, never zero.
+      since a set-time or pre-first-launch-input baseline in its verbatim unit;
+      incomplete, stale, mixed-unit, reset or decreasing data is
+      `cost_unverified` and blocks, never zero.
 - [x] **A8 Bounded escalation.** The second identical Goal failure in a row
       gets one diagnosis continuation; an identical failure after it applies
       the Goal's one Owner-authorized `escalation` (a model/effort `configure`
@@ -88,6 +89,10 @@ engine, second scheduler or critic loop.
 - [x] **Project formatting and checks (#833, #811).** Swarm applies the project
       formatter in the managed worktree and delivers a failed fast check in the
       same OpenCode turn. The routing role installs the bounded project Goal.
+- [x] **Project launch policy (#868).** The registered project's defaults reach
+      ordinary launches, assigned managers, their children and timer launches.
+      A failed Goal check continues the Agent's work. Explicit opt-outs retain
+      their reason and appear in the project's 24-hour adoption count.
 - [x] **File wake (#833).** OpenCode arms a file condition, ends its turn and
       receives one follow-up when the file appears in its worktree.
 - [x] **Project command guard and shell identity (#833).** OpenCode refuses

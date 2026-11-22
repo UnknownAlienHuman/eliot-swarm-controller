@@ -100,8 +100,10 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
-/// Daemon-derived launch argument carrying the default project-check Goal.
+/// Daemon-derived launch argument carrying the resolved launch Goal.
 pub const PROJECT_CHECK_GOAL_ARG: &str = "_project_check_goal";
+/// Daemon-derived launch argument marking the use of a project policy default.
+pub const PROJECT_POLICY_APPLIED_ARG: &str = "_project_policy_applied";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FrozenSetupFile {
@@ -492,6 +494,10 @@ pub struct Agent {
     pub control: AgentControl,
     pub name: Option<String>,
     pub project: String,
+    /// The durable reason supplied when this Agent explicitly opted out of
+    /// the registered project's launch policy, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_opt_out_reason: Option<String>,
     /// The pre-resolution authorization namespace when it differs from the project.
     #[serde(skip)]
     pub project_scope: Option<String>,
@@ -566,6 +572,7 @@ impl Agent {
             control: AgentControl::Slf,
             name: None,
             project: project.into(),
+            policy_opt_out_reason: None,
             project_scope: None,
             harness: harness.into(),
             profile: profile.into(),

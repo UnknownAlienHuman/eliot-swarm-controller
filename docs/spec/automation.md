@@ -165,22 +165,40 @@ exact-turn hook point. Codex and Muse receive it through active-turn inject/stee
 When the Agent is idle, the latest failure replaces its unclaimed project-check
 context and waits for the next input. A passing check clears unclaimed failures.
 The fast path uses the current project check. A project can set
-`check_at_turn_end = true` to reserve a heavy check for its Goal. Manual Goal
+`policy.check.at_turn_end = true` to reserve a heavy check for its Goal. Manual Goal
 checks also run at turn end. Fast checks and Goal checks share one execution lock
 per worktree. Successful fast checks stay silent. Unknown outcomes fence further
 fast checks for the affected Agent generation. Its fence expires when that
 generation ends.
 
-A launch into any registered project with `check` receives a default Eliot Goal
-when it is admitted by assignment or routing role. Projects that enable `git.publish` also
-receive it on profile-selected launches. An explicit assignment Goal takes
-priority, and a later manual `goal.set` replaces the default through the ordinary
-Goal revision. The first round waits for the Agent's first turn to settle. The
-idle Goal driver runs the check at turn end and enforces `max_rounds`.
-A successful final round records the frozen check and its result in the Goal.
-With publication enabled, the default project Goal's successful check records a
-[`project.check.passed` receipt](#final-project-check-publication) after the
-configured project check passes against the same worktree state. Only the
+A project policy applies to every admitted launch bound to that registered project,
+regardless of caller or route: Owner profile and role-routed launches from CLI or
+desktop; CLI ad-hoc harness launches; Agent child launches inheriting the project;
+project/folder assignments; and launch actions from event rules and timers. Profile
+selection, routing, assignment, rules and timers retain their existing owners.
+Project policy supplies defaults to those paths; it adds no launch or assignment
+engine.
+
+The Owner's explicit Goal fields replace defaults individually. Agent and
+project-rule launches can tighten policy by lowering limits or the check deadline,
+adding check-input globs, or adding a scope that intersects the project scope.
+They can opt out explicitly with a nonblank `no_policy` reason. Executable check
+overrides and escalation require Owner authority. Opting out skips the policy Goal
+and the fast project check. A separately supplied Goal continues under the caller's
+existing authority. Store records `project.policy.opted_out`, and Agent and project
+readback show the reason.
+
+The fast path uses the Agent's resolved launch Goal check, including any Owner argv,
+working-directory and deadline overrides. Setting `policy.check.at_turn_end = true`
+reserves the check for Goal rounds. A later manual `goal.set` replaces the Goal through
+the ordinary revision. Every launch-installed Goal waits for the first turn to settle,
+so a check cannot finish the Goal before the Agent receives its work. A supplied
+cadence anchors at launch admission and still waits for that first turn.
+The idle Goal driver runs the check at turn end and
+enforces `max_rounds`. A successful final round records the frozen check and its
+result in the Goal. With publication enabled, the default project Goal's successful
+check records a [`project.check.passed` receipt](#final-project-check-publication)
+after the configured project check passes against the same worktree state. Only the
 default project Goal carries publication authority.
 
 Load project rules only from the registered canonical checkout's `.eliot/rules/*.toml`,
@@ -658,7 +676,14 @@ role. Neither accepts templates. Both may be omitted to use the routing default.
 `text` is optional; for event rules,
 its value is rendered once from the captured event context and frozen into the launch
 command. Timer launch uses the same action shape, but its optional text must be literal.
-Settings-generated assignment timers add `assignment = { key, folder, max_busy }`; this
+Optional `goal` is a partial Goal object and `no_policy` is a nonblank, one-line reason
+of at most 256 bytes with no control characters. Both are literal and map to the
+ordinary launch's `args.goal` and `args.no_policy`; `goal` fields override policy
+defaults individually, while `no_policy` skips those defaults. Nullable member `null`
+and empty collections remain explicit; whole-object `goal = null` is invalid. Only an
+Owner may override `check`, `check_cwd` or `escalation`; an Agent or project-rule
+caller can tighten project policy or opt out. Settings-generated assignment timers add
+`assignment = { key, folder, max_busy }`; this
 form requires a role and obtains `text` from the next brief at timer admission.
 Launch text follows the ordinary launch/linked-send 64 KiB persisted-text bound. A
 nonblank text value uses the normal linked `send` admission and dispatch path. The launch
@@ -1478,7 +1503,7 @@ and replaces the reservation with the full original response rendered from that
 same transaction connection. Stored round records use `MAX_FRAME_BYTES`, including
 their response; they are not subject to the smaller persisted-event budget.
 
-Settling a round publishes an ordinary `goal.round` event with the Agent and
+Settling a round publishes an event whose `kind` is `goal.round`, with the Agent and
 generation on the envelope and the round id, revision, key, outcome, optional
 reason and known direct exit code in [GoalRoundEvent](../../crates/eliot-core/src/api/goals.rs).
 The event and the retained result commit together. Event readers, watch and rules
@@ -1586,11 +1611,20 @@ through a new `set` after the Owner reviews the finding; that `set` records a ne
 `goal show` reports the starting HEAD, the number of pre-existing changes and the
 argv-named check files.
 
+A launch-installed Goal uses the same baseline after the final workspace is ready and
+launch instruction delivery has completed, before native start dispatch and the linked
+first input. This includes managed worktrees that did not exist at admission and shared
+workspaces. The Router captures it from that exact workspace, and Store commits it only
+for the captured Agent generation and Goal revision. A pre-dispatch recovery reuses an
+already committed baseline rather than replacing it.
+
 **Cost budget.** `max_cost {unit, amount_micros}` budgets the Agent's native
 session cost since `set`, in that verbatim unit (Claude reports `usd_estimate`; units
 are never converted, and subscription quota is a separate resource). At `set` the Store
 records a baseline from the generation's latest `session_usage` snapshot in that unit.
-An Agent that has run no turn starts from zero and binds the first session it sees.
+For a launch-installed Goal, Store initializes a zero cost baseline at admission,
+when the new native session has no usage. The baseline binds to the first observed
+session. The Git scope baseline is captured separately after workspace setup.
 `set` is refused as `unsupported` when the harness reports no session cost, reports
 another unit, or ran turns without one. After each failed check, the round commit reads
 the latest snapshot. The spent cost is that cumulative amount minus the baseline. It

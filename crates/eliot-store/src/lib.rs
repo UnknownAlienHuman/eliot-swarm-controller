@@ -106,11 +106,20 @@ const LIST_UNSETTLED_COMMANDS_COLUMNS: &str =
 /// commands.
 const NONTERMINAL_AGENTS_WHERE: &str =
     "observe_only = 0 AND state IN ('created', 'starting', 'idle', 'busy', 'waiting')";
-const LIST_NONTERMINAL_AGENTS_COLUMNS: &str = "SELECT id, generation, name, project, harness, profile,
-                        profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
-                 FROM agents";
+// Keep all row readers in exactly the order used by agent_record_from_row.
+macro_rules! agent_record_columns {
+    () => {
+        "agents.id, agents.generation, agents.name, agents.project, agents.harness, agents.profile,
+         agents.profile_snapshot, agents.native_scope, agents.native_ref, agents.workspace, agents.effective,
+         agents.pending, agents.state, agents.active_turn, agents.created_at, agents.updated_at,
+         agents.origin, agents.observe_only, (agents.token IS NOT NULL AND agents.observe_only = 0),
+         agents.parent, agents.root, agents.depth, agents.control, agents.profile_inherited,
+         agents.profile_choice, agents.archived, agents.chat, agents.project_scope, agents.policy_opt_out_reason"
+    };
+}
+const AGENT_RECORD_COLUMNS: &str = agent_record_columns!();
+const LIST_NONTERMINAL_AGENTS_COLUMNS: &str =
+    concat!("SELECT ", agent_record_columns!(), " FROM agents");
 const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
     "state IN ('accepted', 'queued', 'dispatched', 'unknown') AND (
        (state = 'accepted' AND principal = 'owner' AND parent_command IS NULL
@@ -1226,13 +1235,12 @@ impl Store {
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, generation, name, project, harness, profile,
-                        profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
-                 FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2",
-            )
+            .prepare(concat!(
+                "SELECT ",
+                agent_record_columns!(),
+                "
+                 FROM agents WHERE id > ?1 ORDER BY id LIMIT ?2"
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(params![after_num, limit as i64], agent_record_from_row)
@@ -1257,17 +1265,16 @@ impl Store {
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, generation, name, project, harness, profile,
-                        profile_snapshot, native_scope, native_ref, workspace, effective,
-                        pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                        parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
+            .prepare(concat!(
+                "SELECT ",
+                agent_record_columns!(),
+                "
                  FROM agents
                  WHERE id > ?1 AND observe_only = 0 AND (state IN ('busy', 'waiting')
                    OR EXISTS(SELECT 1 FROM native_child_registrations r
                      WHERE r.producer = agents.id AND r.producer_generation = agents.generation))
-                 ORDER BY id LIMIT ?2",
-            )
+                 ORDER BY id LIMIT ?2"
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(params![after_num, limit as i64], agent_record_from_row)
@@ -3627,6 +3634,7 @@ struct AgentRecord {
     profile_choice: Option<String>,
     archived: bool,
     chat: bool,
+    policy_opt_out_reason: Option<String>,
 }
 
 struct CommandRecord {
@@ -3931,6 +3939,7 @@ fn agent_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecor
         archived: row.get(25)?,
         chat: row.get(26)?,
         project_scope: row.get(27)?,
+        policy_opt_out_reason: row.get(28)?,
     })
 }
 
@@ -3961,6 +3970,9 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
         control: AgentControl::parse(&record.control)?,
         name: record.name,
         project: record.project,
+        policy_opt_out_reason: record
+            .policy_opt_out_reason
+            .map(core::api::sanitize_project_policy_opt_out_reason),
         project_scope: record.project_scope,
         harness: record.harness,
         profile: record.profile,
@@ -4011,11 +4023,12 @@ fn agent_from_record(connection: &Connection, record: AgentRecord) -> Result<Age
 fn load_agent_by_num(connection: &Connection, id: i64) -> Result<Option<Agent>> {
     let record = connection
         .query_row(
-            "SELECT id, generation, name, project, harness, profile,
-                    profile_snapshot, native_scope, native_ref, workspace, effective,
-                    pending, state, active_turn, created_at, updated_at, origin, observe_only, (token IS NOT NULL AND observe_only = 0),
-                    parent, root, depth, control, profile_inherited, profile_choice, archived, chat, project_scope
-             FROM agents WHERE id = ?1",
+            concat!(
+                "SELECT ",
+                agent_record_columns!(),
+                "
+             FROM agents WHERE id = ?1"
+            ),
             [id],
             agent_record_from_row,
         )

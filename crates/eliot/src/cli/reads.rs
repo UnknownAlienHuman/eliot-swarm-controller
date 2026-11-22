@@ -140,6 +140,9 @@ pub(crate) async fn run_show(
                 agent.generation
             );
             println!("Project: {}", agent.project);
+            if let Some(reason) = &agent.policy_opt_out_reason {
+                println!("Policy opt-out: {reason}");
+            }
             println!("Harness/profile: {}/{}", agent.harness, agent.profile);
             if let Some(workspace) = &agent.workspace {
                 println!("Workspace: {workspace}");

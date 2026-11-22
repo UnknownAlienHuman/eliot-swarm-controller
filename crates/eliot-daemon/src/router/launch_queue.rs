@@ -26,6 +26,10 @@ impl Router {
         authorize_command(principal, &mut request)?;
         self.check_command_admission_mode("launch")?;
         reject_launch_derived_keys(&request.args)?;
+        super::project_checks::validate_launch_inputs(
+            &request.args,
+            matches!(principal, Principal::Owner),
+        )?;
         if contains_known_secret_including_keys(&request.args, &self.inner.secrets) {
             return Err(Error::new(
                 "secret_in_payload",
@@ -196,7 +200,7 @@ impl Router {
                 "queued launch workspace is unavailable",
             ));
         }
-        self.prepare_submission_with_routing(request, principal, false, false, true)
+        self.prepare_submission_with_routing(request, principal, false, false, true, false)
             .await
     }
 

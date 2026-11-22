@@ -1,7 +1,8 @@
 //! Change scope of a Goal. A Goal with `scope` or `check_inputs` gets a
-//! starting point at `set`: HEAD and the content of every path that already
-//! differed from it. Each round compares the workspace with that starting
-//! point, so pre-existing work is never attributed to the Goal. A change
+//! starting point at `set`, or during launch preflight after workspace setup:
+//! HEAD and the content of every path that already differed from it. Each
+//! round compares the workspace with that starting point, so pre-existing
+//! work is never attributed to the Goal. A change
 //! outside `scope` blocks the Goal before its check. A passing check after a
 //! check input changed, or with the change set unverified, blocks it instead
 //! of completing it. Swarm never reverts or deletes anything here.
@@ -49,6 +50,24 @@ impl Router {
             .get_agent(agent)?
             .and_then(|agent| agent.workspace)
             .ok_or_else(|| Error::new("invalid", "a scoped Goal needs an Agent workspace"))?;
+        self.goal_scope_base_for_workspace(&workspace, definition)
+            .await
+            .map(Some)
+    }
+
+    /// Capture the baseline for the exact workspace path read with the
+    /// launch Goal's generation and revision.
+    pub(super) async fn goal_scope_base_for_workspace(
+        &self,
+        workspace: &str,
+        definition: &GoalDefinition,
+    ) -> Result<GoalScopeBase> {
+        if !definition.tracks_changes() {
+            return Err(Error::new(
+                "internal",
+                "an unscoped Goal cannot capture a Git starting point",
+            ));
+        }
         let unavailable = |error: Error| {
             Error::new(
                 "unavailable",
@@ -60,7 +79,7 @@ impl Router {
         };
         let state = GitProbe::new()
             .map_err(unavailable)?
-            .scope_state(&workspace)
+            .scope_state(workspace)
             .await
             .map_err(unavailable)?;
         if state.changed.len() > MAX_GOAL_SCOPE_BASE_PATHS {
@@ -72,7 +91,7 @@ impl Router {
                 ),
             ));
         }
-        let check_files = check_files(&state.root, definition, &workspace);
+        let check_files = check_files(&state.root, definition, workspace);
         let root = state.root.clone();
         let changed = tokio::task::spawn_blocking(move || {
             scope_digests(&root, state.changed.iter().map(String::as_str))
@@ -80,7 +99,7 @@ impl Router {
         .await
         .map_err(|_| Error::new("internal", "scope read task failed"))?
         .map_err(unavailable)?;
-        Ok(Some(GoalScopeBase {
+        Ok(GoalScopeBase {
             root: state
                 .root
                 .to_str()
@@ -89,7 +108,7 @@ impl Router {
             head: state.head,
             changed,
             check_files,
-        }))
+        })
     }
 
     /// Paths the Goal's work changed since `base`: committed since its HEAD,
@@ -154,17 +173,23 @@ pub(super) fn outside_scope<'a>(
     definition: &GoalDefinition,
     changed: &'a BTreeSet<String>,
 ) -> Vec<&'a str> {
-    if definition.scope.is_empty() {
+    if definition.scope.is_empty() && definition.policy_scope.is_empty() {
         return Vec::new();
     }
-    let globs = normalized(&definition.scope);
+    let scopes = [&definition.scope, &definition.policy_scope]
+        .into_iter()
+        .filter(|scope| !scope.is_empty())
+        .map(|scope| normalized(scope))
+        .collect::<Vec<_>>();
     changed
         .iter()
         .map(String::as_str)
         .filter(|path| {
-            !globs
-                .iter()
-                .any(|glob| claim_glob_matches_normalized(glob, path))
+            scopes.iter().any(|scope| {
+                !scope
+                    .iter()
+                    .any(|glob| claim_glob_matches_normalized(glob, path))
+            })
         })
         .collect()
 }
@@ -214,6 +239,18 @@ pub(super) fn with_finding(finding: &str, observation: Option<&str>, bound: usiz
 
 /// The scope line a continuation repeats so the limit survives every round.
 pub(super) fn scope_reminder(definition: &GoalDefinition) -> Option<String> {
+    if !definition.policy_scope.is_empty() {
+        let policy = definition.policy_scope.join(", ");
+        if !definition.scope.is_empty() {
+            return Some(format!(
+                "Change only paths matching both the project scope ({policy}) and the launch scope ({}).",
+                definition.scope.join(", ")
+            ));
+        }
+        return Some(format!(
+            "Change only paths within the project scope ({policy})."
+        ));
+    }
     (!definition.scope.is_empty()).then(|| {
         format!(
             "Change only these paths; Swarm blocks the Goal on any other change: {}",
