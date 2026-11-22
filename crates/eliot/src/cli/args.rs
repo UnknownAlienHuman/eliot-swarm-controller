@@ -125,7 +125,7 @@ pub(crate) enum CliCommand {
     Resume(ResumeArgs),
     /// Steer the exact active turn.
     Steer(SteerArgs),
-    /// Queue system context for the next input or the exact active turn's safe point.
+    /// Add context at the soonest available point or at a specified point.
     Inject(InjectCliArgs),
     /// Interrupt the exact active turn. `abort` is an alias.
     #[command(alias = "abort")]
@@ -577,7 +577,7 @@ pub(crate) struct InjectCliArgs {
     pub(crate) agent: String,
     #[arg(value_name = "TEXT", allow_hyphen_values = true)]
     pub(crate) text: String,
-    #[arg(long, value_parser = ["next_input", "turn_safe_point", "active_turn"], default_value = "next_input")]
+    #[arg(long, alias = "at", value_parser = ["soonest", "next_input", "turn_safe_point", "active_turn"], default_value = "next_input")]
     pub(crate) point: String,
     #[command(flatten)]
     pub(crate) generation: GenerationArgs,
@@ -585,6 +585,8 @@ pub(crate) struct InjectCliArgs {
     pub(crate) turn: Option<String>,
     #[arg(long, value_name = "MS")]
     pub(crate) expires_at_ms: Option<i64>,
+    #[arg(long)]
+    pub(crate) wait: bool,
 }
 
 #[derive(Args)]
@@ -1712,6 +1714,8 @@ pub(crate) enum ProjectCommand {
     },
     /// Read or change current project manager assignments.
     Assignment(ProjectAssignmentArgs),
+    /// Queue soonest context for every visible working Agent in a project.
+    Broadcast { project: String, text: String },
     /// Change unused manager capacity or priority within the Owner grant.
     Budget {
         project: String,

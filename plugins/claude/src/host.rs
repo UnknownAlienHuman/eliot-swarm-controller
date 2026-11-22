@@ -1062,6 +1062,10 @@ impl ClaudePlugin {
                 json!({
                     "hooks": {
                         "PreToolUse": [{
+                            "hookCallbackIds": [callback_id.clone()],
+                            "timeout": 30,
+                        }],
+                        "PostToolUse": [{
                             "hookCallbackIds": [callback_id],
                             "timeout": 30,
                         }]
@@ -1141,7 +1145,7 @@ impl ClaudePlugin {
                     session,
                     Error::new(
                         "profile_error",
-                        "Claude initialize did not apply the registered PreToolUse callback",
+                        "Claude initialize did not apply the registered tool callbacks",
                     ),
                 )
                 .await);

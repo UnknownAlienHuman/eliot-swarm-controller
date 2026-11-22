@@ -723,7 +723,8 @@ async fn check_after_edit(
             }
         }
     }
-    if let Err(error) = update_failure_context(router, key, failure, fast_check_exit).await {
+    let fast_check = fast_check_exit.map(|exit_code| (event_seq, exit_code));
+    if let Err(error) = update_failure_context(router, key, failure, fast_check).await {
         log_error(
             router,
             "daemon.project_check_delivery_failed",
@@ -928,17 +929,12 @@ async fn update_failure_context(
     router: &Router,
     key: &WorkKey,
     failure: Option<String>,
-    fast_check_exit: Option<i32>,
+    fast_check: Option<(i64, i32)>,
 ) -> Result<()> {
     router.check_command_admission_mode("inject")?;
     let mut store = router.inner.store.lock().await;
-    let change = store.project_check_context(
-        &key.agent,
-        key.generation,
-        failure,
-        fast_check_exit,
-        now_ms(),
-    )?;
+    let change =
+        store.project_check_context(&key.agent, key.generation, failure, fast_check, now_ms())?;
     router.publish_locked(&change.events);
     drop(store);
     if let Some(command_id) = change.value {

@@ -79,8 +79,6 @@ pub(super) async fn advance_time_ladder(
     let notice_after_question =
         key.kind == IncidentKind::CodeProgress || !config.no_progress.interrupt;
     let Some((question_seq, question_at)) = question else {
-        // Choose the channel before reserving the step. Safe-point context
-        // stays queued on this turn even if no native hook can consume it.
         let point = super::super::attention_inject_point(&captured.agent);
         if let Some(id) = claim_step(
             router,
@@ -90,16 +88,20 @@ pub(super) async fn advance_time_ladder(
             None,
         )
         .await?
-            && let Some(point) = point
+            && point.is_some()
         {
-            let mut request = bound_request(key, turn_id, id, "inject");
-            request.args = json!({"text": question_text(key.kind, &report), "point": point});
-            submit_step(
-                router,
-                request,
-                point != eliot_core::InjectPoint::TurnSafePoint,
-            )
-            .await?;
+            let mut fact = report_event.clone();
+            fact.agent = Some(key.agent.clone());
+            fact.generation = Some(key.generation);
+            fact.data["turn_id"] = json!(turn_id);
+            router
+                .queue_fact_note_with_id(
+                    &fact,
+                    key.kind.as_str(),
+                    &question_text(key.kind, &report),
+                    Some(&id),
+                )
+                .await?;
         }
         if notice_after_question {
             send_turn_notice(router, key, &report).await?;

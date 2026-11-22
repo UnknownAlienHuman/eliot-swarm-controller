@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 86;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 87;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2095,6 +2095,26 @@ impl Store {
             }
             tx.execute("INSERT INTO schema_migrations(version) VALUES (86)", [])
                 .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 87 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE rule_state ADD COLUMN rate_limited_firings INTEGER NOT NULL DEFAULT 0
+                     CHECK(rate_limited_firings >= 0);
+                 CREATE INDEX commands_fact_note_settlements ON commands(updated_at)
+                     WHERE verb = 'inject' AND principal GLOB 'swarm_note:*';
+                 INSERT INTO schema_migrations(version) VALUES (87);",
+            )
+            .map_err(sql_error)?;
+            tx.execute_batch(&format!(
+                "CREATE INDEX events_context_moves ON events(ts, seq) WHERE ({});",
+                context::notes::MOVE_EVENTS,
+            ))
+            .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

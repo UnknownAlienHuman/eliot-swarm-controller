@@ -105,7 +105,16 @@ fn print_report(report: &AutonomyResponse) {
         println!("  {} calls", counts.calls)
     });
     row("Swarm fact notes", &report.notes, |counts| {
-        println!("  {} delivered", counts.delivered)
+        println!(
+            "  {} delivered, {} moved, {} cancelled",
+            counts.delivered, counts.moved, counts.cancelled
+        );
+        for kind in &counts.by_kind {
+            println!(
+                "  {}  {} delivered, {} moved, {} cancelled, {} cleared",
+                kind.kind, kind.delivered, kind.moved, kind.cancelled, kind.resolved
+            );
+        }
     });
     row(
         "Waiting for the owner over 24h",

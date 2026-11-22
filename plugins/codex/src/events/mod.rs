@@ -961,7 +961,11 @@ impl EventProcessor {
             .is_some_and(|known| Some(known) == turn_id)
     }
 
-    fn process_compaction_notification(&mut self, method: &str, params: &Value) -> Result<bool> {
+    async fn process_compaction_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<bool> {
         if !self.compaction_notification_matches(method, params) {
             return Ok(false);
         }
@@ -1021,26 +1025,28 @@ impl EventProcessor {
                             "Codex compact item/completed did not match the installed schema",
                         )
                     })?;
-                let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
-                if raw_item.get("type").and_then(Value::as_str) == Some("contextCompaction") {
-                    let item_id = raw_item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|id| !id.trim().is_empty())
-                        .ok_or_else(|| {
-                            Error::new(
-                                "native_protocol",
-                                "Codex contextCompaction completion omitted its item id",
-                            )
-                        })?;
-                    let progress = self.status.compaction.as_mut().unwrap();
-                    if !progress.item_started || progress.item_id.as_deref() != Some(item_id) {
-                        progress.terminal_status = Some("unknown".to_owned());
-                    } else {
-                        progress.item_completed = true;
+                if let NativeThreadItem::ContextCompaction(item) = &notification.item {
+                    let confirmed = {
+                        let progress = self.status.compaction.as_mut().unwrap();
+                        if !progress.item_started
+                            || progress.item_id.as_deref() != Some(item.id.as_str())
+                        {
+                            progress.terminal_status = Some("unknown".to_owned());
+                            false
+                        } else {
+                            progress.item_completed = true;
+                            true
+                        }
+                    };
+                    if confirmed {
+                        self.commit_context_compacted(
+                            &notification.thread_id,
+                            &notification.turn_id,
+                            &item.id,
+                        )
+                        .await?;
                     }
                 }
-                let _ = notification;
             }
             "turn/completed" => {
                 let notification: NativeTurnCompletedNotification =
@@ -1475,7 +1481,10 @@ impl EventProcessor {
     }
 
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
-        if self.process_compaction_notification(method, &params)? {
+        if self
+            .process_compaction_notification(method, &params)
+            .await?
+        {
             return Ok(());
         }
         if turn_activity_notification(method)
@@ -1597,7 +1606,14 @@ impl EventProcessor {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 self.turn_has_work_or_uncertain_effects |= item_type != "userMessage";
-                if item_type == "agentMessage" {
+                if let NativeThreadItem::ContextCompaction(item) = &notification.item {
+                    self.commit_context_compacted(
+                        &notification.thread_id,
+                        &notification.turn_id,
+                        &item.id,
+                    )
+                    .await?;
+                } else if item_type == "agentMessage" {
                     self.complete_message(&notification.turn_id, &raw_item)
                         .await?;
                 } else if is_tool_type(item_type) {
@@ -2060,6 +2076,22 @@ impl EventProcessor {
         self.turn_usage = None;
         self.first_call_usage = FirstCallUsage::default();
         Ok(())
+    }
+
+    async fn commit_context_compacted(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<()> {
+        validate_thread_and_turn(&self.status, thread_id, turn_id)?;
+        let native_id = event_id(thread_id, turn_id, item_id, "session.context.compacted")?;
+        let mut data = json!({"native_turn_id": turn_id});
+        if self.status.active_turn_id.as_deref() == Some(turn_id) {
+            data["turn_id"] = json!(turn_id);
+        }
+        self.commit_event("session.context.compacted", native_id, data)
+            .await
     }
 
     async fn finish_pending_end_stop(&mut self) {

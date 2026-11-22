@@ -41,6 +41,7 @@ impl Router {
             self.publish_locked(&change.events);
             // No await between commit and scheduling: cancellation cannot strand inputs.
             if change.is_new {
+                self.queue_handoff_task_card(&mut store, &change.value, &change.events);
                 for child in &change.value.children {
                     self.schedule_command(child.clone(), None);
                 }

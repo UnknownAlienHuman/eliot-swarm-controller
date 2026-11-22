@@ -1192,12 +1192,12 @@ fn validate_inject_action(definition: &InjectActionDefinition) -> Result<(), Err
         || has_templates(&parse_template(&definition.at)?)
         || !matches!(
             definition.at.as_str(),
-            "turn_safe_point" | "active_turn" | "next_input"
+            "soonest" | "turn_safe_point" | "active_turn" | "next_input"
         )
     {
         return Err(Error::new(
             "invalid",
-            "inject at must be turn_safe_point, active_turn or next_input without templates",
+            "inject at must be soonest, turn_safe_point, active_turn or next_input without templates",
         ));
     }
     validate_text_template(
@@ -1219,11 +1219,11 @@ fn submit_inject_event_command(
 ) -> Result<SubmitCommand, Error> {
     if !matches!(
         definition.at.as_str(),
-        "turn_safe_point" | "active_turn" | "next_input"
+        "soonest" | "turn_safe_point" | "active_turn" | "next_input"
     ) {
         return Err(Error::new(
             "invalid",
-            "inject at must be turn_safe_point, active_turn or next_input",
+            "inject at must be soonest, turn_safe_point, active_turn or next_input",
         ));
     }
     if has_templates(&parse_template(&definition.at)?) {
@@ -1264,7 +1264,13 @@ fn submit_inject_event_command(
     if text.trim().is_empty() {
         return Err(Error::new("invalid", "inject text cannot be empty"));
     }
-    let expected_turn_id = if definition.at != "next_input" {
+    let expected_turn_id = if definition.at == "soonest" {
+        event
+            .data
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else if definition.at != "next_input" {
         let turn_id = event
             .data
             .get("turn_id")

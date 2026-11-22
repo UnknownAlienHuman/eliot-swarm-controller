@@ -7,6 +7,7 @@ mod cleanup;
 mod command;
 mod command_verbs;
 mod config_ops;
+mod context_notes;
 mod coordination;
 mod diagnose;
 mod digests;
@@ -16,6 +17,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod insertion_facts;
 mod instructions;
 pub(crate) mod launch_queue;
 mod loss_recovery;
@@ -23,6 +25,7 @@ mod organization;
 mod overview;
 mod patch_digest;
 mod project_assignment;
+mod project_broadcast;
 mod project_checks;
 mod provider_resilience;
 mod repeat_failures;
@@ -34,11 +37,13 @@ mod sources;
 mod status;
 mod swarm_usage;
 mod switch;
+mod task_card;
 mod tool_incident;
 mod wake;
 
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
+pub(crate) use context_notes::run_context_notes;
 pub(crate) use coordination::run_mail_reoffer;
 pub(crate) use digests::run_completion_digest;
 use eliot_core::{is_attachment_verb, is_start_verb, is_user_event_verb};
@@ -683,6 +688,7 @@ impl Router {
             "launch.queue" => self.read_launch_queue(&params, &principal).await,
             "project.budget.set" => self.set_manager_budget(&params, &principal).await,
             "command.get" => self.command_get(&params, &principal).await,
+            "inject.wait" => self.inject_wait(&params, &principal).await,
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
             "command.settle_stopped" => self.command_settle_stopped(&params, &principal).await,
@@ -752,6 +758,10 @@ impl Router {
             }
             "project.assignment.release" => {
                 self.project_assignment_release(&params, &principal).await
+            }
+            "project.broadcast" => {
+                self.project_broadcast(&params, &principal, context.owner_process)
+                    .await
             }
             "project.get" => self.project_get(&params, &principal).await,
             "project.overview" => self.project_overview(&params, &principal).await,

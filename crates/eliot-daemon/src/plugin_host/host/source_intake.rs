@@ -313,7 +313,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                                 Ok(event)
                                     if !matches!(
                                         event.hook.as_str(),
-                                        "before_tool" | "before_model"
+                                        "before_tool" | "after_tool" | "before_model"
                                     ) || event.turn_id.trim().is_empty()
                                         || event.consumer_id.trim().is_empty() =>
                                 {

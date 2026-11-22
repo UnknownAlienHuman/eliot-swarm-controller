@@ -11,7 +11,7 @@ use crate::native::types::{
 };
 
 const HOOK_CALLBACK_TIMEOUT_MS: u64 = 30_000;
-/// Char bounds for the optional `hook.before_tool` progress diagnostics. The
+/// Char bounds for the optional tool-hook progress diagnostics. The
 /// committed event envelope stays under the shared `MAX_EVENT_BYTES` bound;
 /// these per-field caps keep each diagnostic small on its own. Redaction runs
 /// before truncation so a cap can never split a configured secret.
@@ -138,26 +138,34 @@ fn collect_summary_args_labeled(
     }
 }
 
-/// Extract the optional bounded progress diagnostics for one PreToolUse hook
+/// Extract the optional bounded progress diagnostics for one Claude tool hook
 /// input. Only the native tool name, the already-matched invocation id, a
-/// closed-vocabulary operation kind and a single workspace-relative file path
-/// survive: full command lines, file contents and every other argument are
-/// dropped here, never persisted. Every kept field is redacted before its
-/// char cap, so a cap cannot split a configured secret.
+/// closed-vocabulary operation kind, the workspace-relative path, and only for
+/// successful PostToolUse writes the bounded native `file_path` survive. Full
+/// command lines, file contents and every other argument are dropped here,
+/// never persisted. Every kept field is redacted before its char cap, so a cap
+/// cannot split a configured secret.
 pub(super) fn hook_tool_facts(
     input: &Value,
     native_tool_id: &str,
     workspace: &Path,
     policy: &SecretPolicy,
+    include_edit_path: bool,
 ) -> HookToolFacts {
     let tool_name = input
         .get("tool_name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty());
+    let operation = tool_name.and_then(hook_operation_for_tool);
     HookToolFacts {
-        operation: tool_name.and_then(hook_operation_for_tool),
+        operation: operation.clone(),
         path: hook_tool_path(input.get("tool_input"), workspace, policy),
+        edit_path: if include_edit_path && operation.as_deref() == Some("write") {
+            hook_edit_path(input.get("tool_input"), policy)
+        } else {
+            None
+        },
         tool: tool_name
             .map(|name| truncate_chars(&policy.redact_text(name), MAX_HOOK_TOOL_NAME_CHARS)),
         native_tool_id: {
@@ -204,6 +212,16 @@ fn hook_tool_path(
         .filter(|path| !path.is_empty())?;
     let relative = normalize_hook_path(workspace, candidate)?;
     let safe = policy.redact_text(&relative);
+    (!safe.trim().is_empty()).then(|| truncate_chars(&safe, MAX_HOOK_PATH_CHARS))
+}
+
+fn hook_edit_path(input: Option<&Value>, policy: &SecretPolicy) -> Option<String> {
+    let path = input
+        .and_then(Value::as_object)
+        .and_then(|fields| fields.get("file_path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())?;
+    let safe = policy.redact_text(path);
     (!safe.trim().is_empty()).then(|| truncate_chars(&safe, MAX_HOOK_PATH_CHARS))
 }
 
@@ -285,7 +303,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-/// Optional bounded progress diagnostics for one `hook.before_tool` fact.
+/// Optional bounded progress diagnostics for one tool-hook fact.
 /// Every field is redacted and capped; absent native data stays absent, never
 /// an empty string. Only these fields are ever persisted from the native
 /// hook input: full command lines, contents and remaining arguments are
@@ -300,6 +318,7 @@ pub(super) struct HookToolFacts {
     operation: Option<String>,
     /// Workspace-relative file path, normalized like native file hints.
     path: Option<String>,
+    edit_path: Option<String>,
 }
 
 impl HookToolFacts {
@@ -321,6 +340,9 @@ impl HookToolFacts {
         }
         if let Some(path) = &self.path {
             fields.insert("path".to_owned(), Value::String(path.clone()));
+        }
+        if let Some(edit_path) = &self.edit_path {
+            fields.insert("edit_path".to_owned(), Value::String(edit_path.clone()));
         }
     }
 }

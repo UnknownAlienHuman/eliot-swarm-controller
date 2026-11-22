@@ -973,7 +973,11 @@ impl Router {
                     "inject text exceeds 512 KiB",
                 )));
             }
-            command.args["text"] = Value::String(eliot_store::fenced_inject_text(text));
+            let text = match store.render_injection(&command, text) {
+                Ok(text) => text,
+                Err(error) => return Some(Err(error)),
+            };
+            command.args["text"] = Value::String(text);
         }
         let pending = self
             .inner

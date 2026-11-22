@@ -1251,20 +1251,36 @@ shape before persisting the command, so foreign answer shapes reject as `invalid
 raw callers cannot bypass answer syntax.
 
 For `verb:"inject"`, `args` is the canonical Core `InjectArgs` DTO
-([definition](../../crates/eliot-core/src/context.rs)); `point` is required and is either
-`next_input`, `turn_safe_point`, or `active_turn`, with optional absolute
+([definition](../../crates/eliot-core/src/context.rs)); `point` (also accepted as `at`)
+is `soonest`, `next_input`, `turn_safe_point`, or `active_turn`, with optional absolute
 Unix-millisecond `expires_at_ms`. Store freezes the target generation and, for
 `turn_safe_point` and `active_turn`, the exact active turn at admission. A supplied
 `expected_turn_id` must match that turn; `next_input` has no turn binding and applies
 to the next SEND in that generation. An `active_turn` command dispatches directly
 as the plugin's `agent.command` inject to the native turn/steer effect on the
 captured turn, expiry being revalidated at dispatch. An
-adapter that cannot apply the requested point returns `unsupported`; it does not map
-inject to SEND. The command's acceptance/queue state means only that the context was
-admitted. `CommandSubmitResponse` retains its existing six fields; for this command its
-`outcome` is the narrow Core `ContextOutcome` identifying the mechanism, actual
-application point and opaque consumer ([definition](../../crates/eliot-core/src/context.rs)).
-It adds no separate receipt or response field.
+adapter that lacks an explicitly requested point returns `unsupported`. With `soonest`,
+Swarm uses the advertised in-turn point when the bound turn is active. It queues the
+note for the next input when no in-turn point is available. The next input is an
+ordinary SEND from any existing sender. Swarm adds context to it without starting a turn.
+
+An unclaimed note whose captured turn ends moves to the next input when the current
+generation supports it and the note is still valid. The original id remains usable.
+`context.moved` and `command.get` report the move. Native confirmation records delivery,
+and settlement reports cancellation or `unknown` when applicable. `inject.wait` waits
+up to 30 seconds for delivery, a move, cancellation or uncertainty and returns the
+retained command. A timeout returns the current command. `command.get` also reports
+final settlement after a move.
+
+The notes row of `autonomy.get` reports Swarm-generated fact notes by kind. It counts
+delivery, moves and cancellation in the requested window and reports later evidence
+that a delivered note's triggering fact cleared. The default window is 24 hours.
+
+`project.broadcast` accepts a registered project id and note text from the Owner or its
+assigned manager. The command captures the working Agents and queues one `soonest`
+insertion per recipient. The response includes the captured generation, turn and
+command id so the sender can read each insertion outcome. Reusing the same mutation id
+with the original input reads back the original recipient set.
 
 `verb:\"configure\"` switches a live Agent's model and/or effort for its next
 turn without touching the frozen profile snapshot. `target` is required and
@@ -2743,7 +2759,8 @@ started for that directory.
 and a scratch Git repository inside it. It accepts an optional private TOML
 file containing the `[profiles]` table and an optional alternate Swarm binary. It prints the new
 data and workspace paths after the daemon is ready. Operate on the printed
-directory through explicit `--data-dir`. The stand starts with a fresh Store.
+directory through explicit `--data-dir`. The stand starts with a fresh Store. A copy of
+production data can retain production process custody names. Launch Agents only from a fresh Store.
 
 `SWARM_STANDS_ROOT` selects the designated parent. The default is
 `EliotStands` under local application data on Windows or `eliot-stands`
@@ -2812,7 +2829,8 @@ swarm patch-digest A [--generation N]
 swarm edits A [--generation N] [--after PATH] [--limit N]
 swarm send A TEXT [--probe] [--wait] [--timeout-seconds N] [--generation N]
 swarm steer A TEXT [--generation N] [--turn ID]
-swarm inject A TEXT --point next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS]
+swarm inject A TEXT --point soonest|next_input|turn_safe_point|active_turn [--generation N] [--turn ID] [--expires-at-ms MS] [--wait]
+swarm project broadcast PROJECT TEXT
 swarm interrupt|abort A [--generation N] [--turn ID]
 swarm stop A [--force] [--tree | --generation N]
 swarm resume A [PROMPT] [--wait] [--timeout-seconds N]

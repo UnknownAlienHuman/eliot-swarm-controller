@@ -206,6 +206,9 @@ pub(crate) async fn run_project(
         ProjectCommand::Assignment(args) => {
             super::project_assignment::run(args.command, &data_dir, json_output, id).await
         }
+        ProjectCommand::Broadcast { project, text } => {
+            super::project_broadcast::run(project, text, &data_dir, json_output, id).await
+        }
         ProjectCommand::Budget {
             project,
             revision,

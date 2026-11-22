@@ -239,6 +239,8 @@ the cursor. Store failure rolls back the admission and cursor update. Disable/pa
 records the skipped range and advances without firing.
 
 `rule.rejected` includes the failure code and a bounded, redacted message.
+When an automatic event firing hits its action limit, Swarm advances the rule
+cursor and increments `rate_limited_firings`. `rule show` exposes the counter.
 `rule show` reports the latest settled action outcome and the latest refusal in the
 selected namespace within retained history. A script outcome includes the observed exit
 code and the first bounded lines of redacted stderr when present. A refusal includes
@@ -306,7 +308,7 @@ for global and registered-project interval, cron and once firings, including man
 `timer.run`. See
 [Timer Run invocation context](#timer-run-invocation-context).
 Timer `interrupt`, `steer`, `inject` and request-reply actions remain unsupported for
-scheduled or manual timer runs; `inject` requires an event trigger with exact turn binding.
+scheduled or manual timer runs. `inject` requires an event trigger with an Agent and generation.
 Other action verbs remain future work.
 
 ```toml
@@ -796,14 +798,14 @@ new quota or accounting key.
 ### Inject context at the safe point
 
 The `inject` action submits an ordinary `inject` command through the Router and
-Store. The text limit applies to the submitted content. Each delivered inject
-arrives as quoted Swarm context, including its fence within the frame limit.
+Store. Each insertion begins with `[Swarm note from {sender}] This adds to your task and does not replace it.`
+The body uses the common quoted-data fence. The frame and fence count toward the wire budget.
 
 ```toml
 [[rule]]
 id = "hook-context"
 on = { event = "hook.before_tool" }
-do = [{ action = "inject", target = "${event.agent}", at = "turn_safe_point", text = "Context: ${event.data.tool}" }]
+do = [{ action = "inject", target = "${event.agent}", at = "soonest", text = "Current tool: ${event.data.tool}" }]
 ```
 
 `target` renders from the captured event and must equal `event.agent`;
@@ -811,13 +813,27 @@ do = [{ action = "inject", target = "${event.agent}", at = "turn_safe_point", te
 `at = "turn_safe_point"` and `at = "active_turn"` the rule also binds `expected_turn_id` to the captured
 event's nonempty `data.turn_id`. Store enforces these bindings and the live Agent
 generation at admission. For `at = "next_input"` the command carries no turn
-binding and is claimed by the next send in that generation.
-`at` is a literal `turn_safe_point`, `active_turn`, or `next_input`.
+binding and is claimed by the next send in that generation. For `at = "soonest"` the
+rule retains the event's turn when available. Swarm chooses the native point and moves
+an unclaimed insertion to the next input when the active turn ends before delivery.
 `text` renders once from the captured event and is frozen under the
 512 KiB text bound. Store revalidates the exact Agent and the bound turn
 at admission and at the dispatch effect boundary; adapters whose effective
 `context_points` lack the requested point return their typed `unsupported`, never a
 weaker send. `inject` requires an event trigger and is unsupported for timers.
+
+Swarm uses the same insertion path for notes about a confirmed edit outside the
+worktree or the frozen Goal scope, repeated command failures, and a turn with edits
+and no observed configured check before completion. Notes bind to the captured
+Agent and generation. Git snapshots supply scope evidence when Swarm can bind
+the observation to a running turn. A task card summarizes the retained task brief and Goal in
+at most 600 bytes. Swarm sends it after native compaction, resume, switch or handoff,
+at most once per turn. Lifecycle notes can queue before the first linked input.
+
+A completed fast project check records `project.check.finished` with its
+triggering edit sequence and exit code. Fact counters use later confirmed check,
+command or Git evidence where available. Without a confirming fact, correction
+remains unverified.
 
 ## Outcome chaining
 
@@ -937,7 +953,7 @@ hidden wait/acceptance state to the router.
 | `launch` | targetless ordinary launch command at generation 0; optional nonblank text creates the normal linked `send` |
 | `mail.send` | targetless ordinary command; Store atomically commits one scoped queued-mail fanout with its Applied outcome |
 | `var.set` | targetless ordinary command; Store atomically commits one versioned variable write with its Applied outcome |
-| `inject` | Exact-turn context at `turn_safe_point` or `active_turn`, or generation-bound context at `next_input`. The native capability determines whether the requested point is available. |
+| `inject` | `soonest` selects an available native point. Explicit `turn_safe_point` and `active_turn` bind the captured turn. `next_input` binds the generation. |
 | `run` | targetless `SubmitCommand` via Router; bounded child under saved authority; emitted commands become ordered children |
 | `notify` | targetless ordinary command; Store atomically commits one persisted `x.user.notify` event with its Applied outcome (local log only) |
 | `emit` | targetless ordinary command; Store atomically commits one persisted `x.user.<topic>` event with its Applied outcome (local log only) |

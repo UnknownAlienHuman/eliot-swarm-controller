@@ -6,7 +6,7 @@ use self::hooks::{
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy,
-    limits::MAX_TOOL_COMMAND_BYTES,
+    limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
@@ -280,16 +280,106 @@ enum HookConsumerState {
     Finished,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookPoint {
+    BeforeTool,
+    AfterTool,
+}
+
+impl HookPoint {
+    fn native_event_name(self) -> &'static str {
+        match self {
+            Self::BeforeTool => "PreToolUse",
+            Self::AfterTool => "PostToolUse",
+        }
+    }
+
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::BeforeTool => "hook.before_tool",
+            Self::AfterTool => "hook.after_tool",
+        }
+    }
+
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::BeforeTool => "before_tool",
+            Self::AfterTool => "after_tool",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ToolUseBinding {
     turn_id: String,
     prompt_id: Option<String>,
-    hook_state: HookConsumerState,
-    active_consumer_id: Option<String>,
+    before_hook_state: HookConsumerState,
+    before_consumer_id: Option<String>,
+    after_hook_state: HookConsumerState,
+    after_consumer_id: Option<String>,
+}
+
+impl ToolUseBinding {
+    fn hook_state(&self, hook: HookPoint) -> HookConsumerState {
+        match hook {
+            HookPoint::BeforeTool => self.before_hook_state,
+            HookPoint::AfterTool => self.after_hook_state,
+        }
+    }
+
+    fn is_active_consumer(&self, hook: HookPoint, consumer_id: &str) -> bool {
+        let active = match hook {
+            HookPoint::BeforeTool => self.before_consumer_id.as_deref(),
+            HookPoint::AfterTool => self.after_consumer_id.as_deref(),
+        };
+        active == Some(consumer_id)
+    }
+
+    fn start_hook(&mut self, hook: HookPoint, consumer_id: String) {
+        match hook {
+            HookPoint::BeforeTool => {
+                self.before_hook_state = HookConsumerState::InFlight;
+                self.before_consumer_id = Some(consumer_id);
+            }
+            HookPoint::AfterTool => {
+                self.after_hook_state = HookConsumerState::InFlight;
+                self.after_consumer_id = Some(consumer_id);
+            }
+        }
+    }
+
+    fn finish_hook(&mut self, hook: HookPoint, consumer_id: &str) {
+        if !self.is_active_consumer(hook, consumer_id) {
+            return;
+        }
+        match hook {
+            HookPoint::BeforeTool => {
+                self.before_hook_state = HookConsumerState::Finished;
+                self.before_consumer_id = None;
+            }
+            HookPoint::AfterTool => {
+                self.after_hook_state = HookConsumerState::Finished;
+                self.after_consumer_id = None;
+            }
+        }
+    }
+
+    fn finish_available_hook(&mut self, hook: HookPoint) {
+        match hook {
+            HookPoint::BeforeTool if self.before_hook_state == HookConsumerState::Available => {
+                self.before_hook_state = HookConsumerState::Finished;
+            }
+            HookPoint::AfterTool if self.after_hook_state == HookConsumerState::Available => {
+                self.after_hook_state = HookConsumerState::Finished;
+            }
+            _ => {}
+        }
+    }
 }
 
 struct PendingHookCallback {
     generation: i64,
+    hook: HookPoint,
     turn_id: String,
     tool_use_id: String,
     consumer_id: String,
@@ -1297,7 +1387,7 @@ impl EventProcessor {
             }
             self.observe_task_boundary(record);
             self.retain_init_mcp_servers(record);
-            return Ok(());
+            return self.observe_compaction_boundary(record, session_id).await;
         }
         if self.status.ready {
             // Ready without a session id cannot happen; treat it as unknown.
@@ -1308,7 +1398,43 @@ impl EventProcessor {
         }
         self.status.session_id = Some(session_id.to_owned());
         self.retain_init_mcp_servers(record);
-        Ok(())
+        self.observe_compaction_boundary(record, session_id).await
+    }
+
+    async fn observe_compaction_boundary(
+        &mut self,
+        record: &Value,
+        session_id: &str,
+    ) -> Result<()> {
+        if record.get("subtype").and_then(Value::as_str) != Some("compact_boundary") {
+            return Ok(());
+        }
+        let Some(native_event_id) = record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            self.record_gap("Claude compact boundary omitted its native event id")
+                .await?;
+            return Ok(());
+        };
+        let native_id = format!("claude:{session_id}:{native_event_id}:session.context.compacted");
+        if native_id.len() > MAX_COMMAND_ID_BYTES {
+            self.record_gap("Claude compact boundary native event id exceeded its bound")
+                .await?;
+            return Ok(());
+        }
+        let mut data = json!({});
+        let turn_id = self.status.active_turn_id.clone().or_else(|| {
+            self.pending_turn
+                .as_ref()
+                .map(|pending| pending.turn_id.clone())
+        });
+        if let Some(turn_id) = turn_id {
+            data["turn_id"] = Value::String(turn_id.to_owned());
+        }
+        self.commit_event("session.context.compacted", native_id, data)
+            .await
     }
 
     fn observe_task_boundary(&mut self, record: &Value) {
@@ -1805,8 +1931,10 @@ impl EventProcessor {
                 ToolUseBinding {
                     turn_id: turn_id.to_owned(),
                     prompt_id: prompt_id.clone(),
-                    hook_state: HookConsumerState::Available,
-                    active_consumer_id: None,
+                    before_hook_state: HookConsumerState::Available,
+                    before_consumer_id: None,
+                    after_hook_state: HookConsumerState::Available,
+                    after_consumer_id: None,
                 },
             );
         }
@@ -1975,9 +2103,13 @@ impl EventProcessor {
         let Some(body) = body else {
             return self.write_hook_pass(&native, request_id, deadline).await;
         };
+        let hook = match body.input.get("hook_event_name").and_then(Value::as_str) {
+            Some("PreToolUse") => HookPoint::BeforeTool,
+            Some("PostToolUse") => HookPoint::AfterTool,
+            _ => return self.write_hook_pass(&native, request_id, deadline).await,
+        };
         if body.subtype != "hook_callback"
             || body.callback_id != self.hook_callback_id
-            || body.input.get("hook_event_name").and_then(Value::as_str) != Some("PreToolUse")
             || body
                 .input
                 .get("agent_id")
@@ -2012,14 +2144,14 @@ impl EventProcessor {
         let Some(binding) = self.tool_use_turns.get(&tool_use_id).cloned() else {
             return self.write_hook_pass(&native, request_id, deadline).await;
         };
-        if binding.hook_state != HookConsumerState::Available {
+        if binding.hook_state(hook) != HookConsumerState::Available {
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         if let (Some(input_prompt_id), Some(assistant_prompt_id)) =
             (input_prompt_id, binding.prompt_id.as_deref())
             && input_prompt_id != assistant_prompt_id
         {
-            self.finish_available_tool_use_hook(&tool_use_id);
+            self.finish_available_tool_use_hook(&tool_use_id, hook);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         let turn_id = binding.turn_id.clone();
@@ -2028,11 +2160,11 @@ impl EventProcessor {
             || self.status.failure.is_some()
             || self.status.stopped
         {
-            self.finish_available_tool_use_hook(&tool_use_id);
+            self.finish_available_tool_use_hook(&tool_use_id, hook);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         if self.pending_hooks.len() >= MAX_PENDING_HOOKS {
-            self.finish_available_tool_use_hook(&tool_use_id);
+            self.finish_available_tool_use_hook(&tool_use_id, hook);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         let control_actor = self.control_actor.clone();
@@ -2041,21 +2173,27 @@ impl EventProcessor {
         // matched invocation id is already proven above; the name, operation
         // and path are optional and stay absent when the hook omits them.
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        let tool = hook_tool_facts(&body.input, &tool_use_id, &self.workspace, &policy);
+        let tool = hook_tool_facts(
+            &body.input,
+            &tool_use_id,
+            &self.workspace,
+            &policy,
+            hook == HookPoint::AfterTool,
+        );
         let event = HookEvent {
-            hook: "before_tool".to_owned(),
+            hook: hook.event_name().to_owned(),
             turn_id: turn_id.clone(),
             consumer_id: consumer_id.clone(),
         };
         let mut params = match serde_json::to_value(event) {
             Ok(params) => params,
             Err(_) => {
-                self.finish_available_tool_use_hook(&tool_use_id);
+                self.finish_available_tool_use_hook(&tool_use_id, hook);
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
         };
         let Some(params_object) = params.as_object_mut() else {
-            self.finish_available_tool_use_hook(&tool_use_id);
+            self.finish_available_tool_use_hook(&tool_use_id, hook);
             return self.write_hook_pass(&native, request_id, deadline).await;
         };
         // This private IPC envelope field is stripped by the host before the
@@ -2066,8 +2204,7 @@ impl EventProcessor {
             Value::String(self.credential.clone()),
         );
         if let Some(binding) = self.tool_use_turns.get_mut(&tool_use_id) {
-            binding.hook_state = HookConsumerState::InFlight;
-            binding.active_consumer_id = Some(consumer_id.clone());
+            binding.start_hook(hook, consumer_id.clone());
         } else {
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
@@ -2094,6 +2231,7 @@ impl EventProcessor {
             request_id.to_owned(),
             PendingHookCallback {
                 generation: self.generation,
+                hook,
                 turn_id,
                 tool_use_id,
                 consumer_id,
@@ -2124,11 +2262,12 @@ impl EventProcessor {
         let tool_use_id = pending.tool_use_id.clone();
         let consumer_id = pending.consumer_id.clone();
         let hook_turn_id = pending.turn_id.clone();
+        let hook = pending.hook;
         let context = match result {
             Ok(context) => context,
             Err(_) => {
                 self.pending_hooks.remove(request_id);
-                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
         };
@@ -2139,7 +2278,7 @@ impl EventProcessor {
                 Ok(text) => text.strip_suffix("\n\n").unwrap_or(&text).to_owned(),
                 Err(_) => {
                     self.pending_hooks.remove(request_id);
-                    self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                    self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                     return self.write_hook_pass(&native, request_id, deadline).await;
                 }
             }
@@ -2147,28 +2286,40 @@ impl EventProcessor {
         // Neither FIFO context nor a queued steer for this exact turn: the
         // existing pass path below. A queued steer takes the combined path
         // even when the hook selected no context.
-        let steer_waiting = self
-            .pending_steer
-            .as_ref()
-            .is_some_and(|steer| steer.turn_id == hook_turn_id);
+        let steer_waiting = hook == HookPoint::BeforeTool
+            && self
+                .pending_steer
+                .as_ref()
+                .is_some_and(|steer| steer.turn_id == hook_turn_id);
         if context.is_empty() && !steer_waiting {
             return self
-                .finish_hook_pass(request_id, &native, deadline, &tool_use_id, &consumer_id)
+                .finish_hook_pass(
+                    request_id,
+                    &native,
+                    deadline,
+                    hook,
+                    &tool_use_id,
+                    &consumer_id,
+                )
                 .await;
         }
         if !self.hook_callback_is_live(request_id) {
             // Not live: the steer (if any) stays queued for the next
-            // PreToolUse of this same turn; turn end settles it, never
+            // tool hook of this same turn; turn end settles it, never
             // leaks it into another turn.
             self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         // Take the queued steer only now, immediately before the only native
         // write that can carry additionalContext. FIFO context comes first,
         // then the steer text; a raw-text or complete-frame overflow rejects
         // the steer and keeps the full FIFO context when its frame fits.
-        let mut steer = self.take_pending_steer(&hook_turn_id);
+        let mut steer = if hook == HookPoint::BeforeTool {
+            self.take_pending_steer(&hook_turn_id)
+        } else {
+            None
+        };
         let mut combined = context_text.clone();
         if let Some(waiting) = steer.as_ref() {
             combined = if combined.trim().is_empty() {
@@ -2188,7 +2339,8 @@ impl EventProcessor {
                 combined = context_text.clone();
             }
         }
-        let mut response = HookCallbackResponse::with_context(combined.clone());
+        let mut response =
+            HookCallbackResponse::with_context(hook.native_event_name(), combined.clone());
         if !hook_callback_response_fits(request_id, &response)
             && let Some(waiting) = steer.take()
         {
@@ -2200,16 +2352,24 @@ impl EventProcessor {
                 ),
             );
             combined = context_text.clone();
-            response = HookCallbackResponse::with_context(combined.clone());
+            response =
+                HookCallbackResponse::with_context(hook.native_event_name(), combined.clone());
         }
         if context.is_empty() && steer.is_none() {
             return self
-                .finish_hook_pass(request_id, &native, deadline, &tool_use_id, &consumer_id)
+                .finish_hook_pass(
+                    request_id,
+                    &native,
+                    deadline,
+                    hook,
+                    &tool_use_id,
+                    &consumer_id,
+                )
                 .await;
         }
         if !hook_callback_response_fits(request_id, &response) {
             self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
             return Err(Error::new(
                 "frame_too_large",
                 "Claude FIFO hook context exceeds the 1 MiB encoded response bound",
@@ -2231,7 +2391,7 @@ impl EventProcessor {
                 );
             }
             self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+            self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
         match native
@@ -2249,7 +2409,7 @@ impl EventProcessor {
                     );
                 }
                 self.pending_hooks.remove(request_id);
-                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                 return self.write_hook_pass(&native, request_id, deadline).await;
             }
             Err(_) => {
@@ -2262,7 +2422,7 @@ impl EventProcessor {
                     );
                 }
                 self.pending_hooks.remove(request_id);
-                self.finish_tool_use_hook(&tool_use_id, &consumer_id);
+                self.finish_tool_use_hook(&tool_use_id, hook, &consumer_id);
                 return Err(Error::new(
                     "unknown",
                     "Claude hook response write outcome is unknown",
@@ -2293,18 +2453,23 @@ impl EventProcessor {
                         ),
                     );
                 }
-                self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+                self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
                 return Err(Error::new(
                     "unknown",
                     "Claude empty hook selection lost its exact callback binding",
                 ));
             }
-            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             if let Some(waiting) = steer.take() {
                 Self::settle_steer(waiting, SteerOutcome::Applied);
             }
             return self
-                .commit_empty_hook_event(pending.turn_id, pending.consumer_id, &pending.tool)
+                .commit_empty_hook_event(
+                    pending.hook,
+                    pending.turn_id,
+                    pending.consumer_id,
+                    &pending.tool,
+                )
                 .await;
         }
         if !self.hook_context_was_claimed(&context, &pending) {
@@ -2316,13 +2481,13 @@ impl EventProcessor {
                     ),
                 );
             }
-            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             return Err(Error::new(
                 "unknown",
                 "Claude hook context was written without an exact live binding",
             ));
         }
-        self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+        self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
         if let Some(waiting) = steer.take() {
             Self::settle_steer(waiting, SteerOutcome::Applied);
         }
@@ -2346,10 +2511,13 @@ impl EventProcessor {
         });
         pending.tool.attach(&mut data);
         let native_id = format!(
-            "claude:{session_id}:{}:hook.before_tool:{}",
-            pending.turn_id, pending.consumer_id
+            "claude:{session_id}:{}:{}:{}",
+            pending.turn_id,
+            pending.hook.event_kind(),
+            pending.consumer_id
         );
-        self.commit_event("hook.before_tool", native_id, data).await
+        self.commit_event(pending.hook.event_kind(), native_id, data)
+            .await
     }
 
     /// The pass path for a hook that selected no context and carries no
@@ -2360,12 +2528,13 @@ impl EventProcessor {
         request_id: &str,
         native: &ClaudeClient,
         deadline: Instant,
+        hook: HookPoint,
         tool_use_id: &str,
         consumer_id: &str,
     ) -> Result<()> {
         if !self.hook_callback_is_live(request_id) {
             self.pending_hooks.remove(request_id);
-            self.finish_tool_use_hook(tool_use_id, consumer_id);
+            self.finish_tool_use_hook(tool_use_id, hook, consumer_id);
             return self.write_hook_pass(native, request_id, deadline).await;
         }
         match native
@@ -2375,12 +2544,12 @@ impl EventProcessor {
             Ok(()) => {}
             Err(error) if native_no_write(&error.code) => {
                 self.pending_hooks.remove(request_id);
-                self.finish_tool_use_hook(tool_use_id, consumer_id);
+                self.finish_tool_use_hook(tool_use_id, hook, consumer_id);
                 return Ok(());
             }
             Err(_) => {
                 self.pending_hooks.remove(request_id);
-                self.finish_tool_use_hook(tool_use_id, consumer_id);
+                self.finish_tool_use_hook(tool_use_id, hook, consumer_id);
                 return Err(Error::new(
                     "unknown",
                     "Claude hook pass response write outcome is unknown",
@@ -2394,15 +2563,20 @@ impl EventProcessor {
             ));
         };
         if !self.hook_empty_selection_was_claimed(&pending) {
-            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             return Err(Error::new(
                 "unknown",
                 "Claude empty hook selection lost its exact callback binding",
             ));
         }
-        self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
-        self.commit_empty_hook_event(pending.turn_id, pending.consumer_id, &pending.tool)
-            .await
+        self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
+        self.commit_empty_hook_event(
+            pending.hook,
+            pending.turn_id,
+            pending.consumer_id,
+            &pending.tool,
+        )
+        .await
     }
 
     fn hook_callback_is_live(&self, request_id: &str) -> bool {
@@ -2419,9 +2593,8 @@ impl EventProcessor {
                 .get(&pending.tool_use_id)
                 .is_some_and(|binding| {
                     binding.turn_id == pending.turn_id
-                        && binding.hook_state == HookConsumerState::InFlight
-                        && binding.active_consumer_id.as_deref()
-                            == Some(pending.consumer_id.as_str())
+                        && binding.hook_state(pending.hook) == HookConsumerState::InFlight
+                        && binding.is_active_consumer(pending.hook, &pending.consumer_id)
                 })
     }
 
@@ -2437,9 +2610,8 @@ impl EventProcessor {
                 .get(&pending.tool_use_id)
                 .is_some_and(|binding| {
                     binding.turn_id == pending.turn_id
-                        && binding.hook_state == HookConsumerState::InFlight
-                        && binding.active_consumer_id.as_deref()
-                            == Some(pending.consumer_id.as_str())
+                        && binding.hook_state(pending.hook) == HookConsumerState::InFlight
+                        && binding.is_active_consumer(pending.hook, &pending.consumer_id)
                 })
             && pending.consumer_id.trim() != ""
     }
@@ -2454,15 +2626,15 @@ impl EventProcessor {
                 .get(&pending.tool_use_id)
                 .is_some_and(|binding| {
                     binding.turn_id == pending.turn_id
-                        && binding.hook_state == HookConsumerState::InFlight
-                        && binding.active_consumer_id.as_deref()
-                            == Some(pending.consumer_id.as_str())
+                        && binding.hook_state(pending.hook) == HookConsumerState::InFlight
+                        && binding.is_active_consumer(pending.hook, &pending.consumer_id)
                 })
             && !pending.consumer_id.trim().is_empty()
     }
 
     async fn commit_empty_hook_event(
         &mut self,
+        hook: HookPoint,
         turn_id: String,
         consumer_id: String,
         tool: &HookToolFacts,
@@ -2478,24 +2650,22 @@ impl EventProcessor {
             "consumer_id": consumer_id,
         });
         tool.attach(&mut data);
-        let native_id = format!("claude:{session_id}:{turn_id}:hook.before_tool:{consumer_id}");
-        self.commit_event("hook.before_tool", native_id, data).await
+        let native_id = format!(
+            "claude:{session_id}:{turn_id}:{}:{consumer_id}",
+            hook.event_kind()
+        );
+        self.commit_event(hook.event_kind(), native_id, data).await
     }
 
-    fn finish_tool_use_hook(&mut self, tool_use_id: &str, consumer_id: &str) {
-        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id)
-            && binding.active_consumer_id.as_deref() == Some(consumer_id)
-        {
-            binding.hook_state = HookConsumerState::Finished;
-            binding.active_consumer_id = None;
+    fn finish_tool_use_hook(&mut self, tool_use_id: &str, hook: HookPoint, consumer_id: &str) {
+        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id) {
+            binding.finish_hook(hook, consumer_id);
         }
     }
 
-    fn finish_available_tool_use_hook(&mut self, tool_use_id: &str) {
-        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id)
-            && binding.hook_state == HookConsumerState::Available
-        {
-            binding.hook_state = HookConsumerState::Finished;
+    fn finish_available_tool_use_hook(&mut self, tool_use_id: &str, hook: HookPoint) {
+        if let Some(binding) = self.tool_use_turns.get_mut(tool_use_id) {
+            binding.finish_available_hook(hook);
         }
     }
 
@@ -2538,7 +2708,7 @@ impl EventProcessor {
         self.remove_buffered_hook_callback(&cancel.request_id);
         if let Some(pending) = self.pending_hooks.remove(&cancel.request_id) {
             pending.task.abort();
-            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
         }
     }
 
@@ -2571,7 +2741,7 @@ impl EventProcessor {
         for request_id in request_ids {
             if let Some(pending) = self.pending_hooks.remove(&request_id) {
                 pending.task.abort();
-                self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+                self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
             }
         }
     }
@@ -2580,7 +2750,7 @@ impl EventProcessor {
         let pending_hooks = std::mem::take(&mut self.pending_hooks);
         for pending in pending_hooks.into_values() {
             pending.task.abort();
-            self.finish_tool_use_hook(&pending.tool_use_id, &pending.consumer_id);
+            self.finish_tool_use_hook(&pending.tool_use_id, pending.hook, &pending.consumer_id);
         }
         self.cancelled_hook_requests.clear();
     }

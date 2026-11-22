@@ -734,6 +734,15 @@ fn dispatch_inject_tx(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let args = context::decode_inject_args(&command.command.args)?;
+    if args.point == InjectPoint::NextInput
+        && command
+            .command
+            .outcome
+            .as_ref()
+            .is_some_and(|value| value["delivery"] == "moved")
+    {
+        return Ok(());
+    }
     if args.point != InjectPoint::ActiveTurn {
         return Err(Error::new(
             "bad_state",

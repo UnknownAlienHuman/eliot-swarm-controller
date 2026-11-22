@@ -699,6 +699,19 @@ async fn spawn_workers(
         worker_stop.subscribe(),
         tool_failure_factory,
     ));
+    let context_router = router.clone();
+    workers.spawn(crate::daemon::workers::supervise(
+        "context_notes",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        move |shutdown: watch::Receiver<bool>| {
+            let router = context_router.clone();
+            async move {
+                let result = crate::router::run_context_notes(router, shutdown.clone()).await;
+                crate::daemon::workers::from_result(result, &shutdown)
+            }
+        },
+    ));
     let mail_router = router.clone();
     let mail_reporter = worker_reporter.clone();
     let mail_factory = move |shutdown: watch::Receiver<bool>| {

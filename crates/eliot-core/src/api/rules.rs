@@ -12,6 +12,11 @@ pub const MAX_RULE_SHOW_STDERR_BYTES: usize = 1_024;
 pub struct RuleShowView {
     #[serde(flatten)]
     pub state: super::reads::RuleStateView,
+    #[serde(default)]
+    #[schemars(
+        description = "Cumulative count of automatic event firings rejected by the rate limit."
+    )]
+    pub rate_limited_firings: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_outcome: Option<RuleLastOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

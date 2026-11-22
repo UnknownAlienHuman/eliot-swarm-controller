@@ -1051,7 +1051,7 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 | Steers | Retained steer commands classified by caller and automation cause. |
 | Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. |
 | Waits | Captured shell invocations matching wait commands. |
-| Swarm fact notes | Applied Swarm context injections and retained service mail deliveries attributed to `swarm`. |
+| Swarm fact notes | Deliveries, moves and cancellations of retained fact notes, with counts and confirmed corrections by kind. |
 | Owner backlog | Current unknown commands, current unarchived failed or lost Agents, and open provider holds, aged from their recorded transition or hold time. |
 | Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
 | Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |

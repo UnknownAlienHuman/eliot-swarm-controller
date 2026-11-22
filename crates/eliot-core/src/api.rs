@@ -498,6 +498,8 @@ fn event_wait_ms<'de, D: serde::Deserializer<'de>>(
 
 pub mod inference;
 
+mod project_broadcast;
+pub use project_broadcast::*;
 mod project_assignment;
 pub use project_assignment::*;
 mod project_transfer;

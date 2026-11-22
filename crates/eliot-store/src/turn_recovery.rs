@@ -132,7 +132,7 @@ impl Store {
             events.push(insert_daemon_command_event(
                 &tx,
                 now,
-                &format!("command.{}", command_state_name(command.state)),
+                &command.kind(),
                 Some(agent_num),
                 Some(agent.generation),
                 &command.command_id,

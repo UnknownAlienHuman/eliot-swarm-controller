@@ -562,6 +562,7 @@ pub(crate) async fn run_inject(
         generation: GenerationArgs { generation },
         turn,
         expires_at_ms,
+        wait,
     }: InjectCliArgs,
     data_dir: PathBuf,
     json_output: bool,
@@ -569,13 +570,14 @@ pub(crate) async fn run_inject(
 ) -> Result<u8, Failure> {
     validate_text(Some(&text))?;
     let point = match point.as_str() {
+        "soonest" => InjectPoint::Soonest,
         "next_input" => InjectPoint::NextInput,
         "turn_safe_point" => InjectPoint::TurnSafePoint,
         "active_turn" => InjectPoint::ActiveTurn,
         _ => {
             return Err(Failure::new(
                 2,
-                "inject point must be next_input, turn_safe_point, or active_turn",
+                "inject point must be soonest, next_input, turn_safe_point, or active_turn",
             ));
         }
     };
@@ -588,7 +590,21 @@ pub(crate) async fn run_inject(
     let mut params = submit_request(id, Some(agent), "inject", args)?;
     params.expected_generation = generation;
     params.expected_turn_id = turn;
-    submit_and_print(&data_dir, &params, json_output).await
+    if !wait {
+        return submit_and_print(&data_dir, &params, json_output).await;
+    }
+    let submitted = submit_command(&data_dir, &params).await?;
+    let request = eliot_core::ContextWaitRequest {
+        id: submitted.command_id,
+        wait_ms: 30_000,
+    };
+    let command: eliot_core::Command =
+        eliot_daemon::client_call_typed(&data_dir, "inject.wait", &request)
+            .await
+            .map_err(Failure::readback)?;
+    let state = command.state;
+    print_value(&command_value(command)?, json_output);
+    Ok(response_exit_code(state))
 }
 
 pub(crate) async fn run_interrupt(

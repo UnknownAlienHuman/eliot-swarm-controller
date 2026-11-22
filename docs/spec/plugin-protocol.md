@@ -316,7 +316,7 @@ channel. The connection credential binds the Agent generation; the plugin cannot
 or override that identity in the callback. The shared wire DTOs are named `HookEvent`
 and `HookResponse`; their field catalog belongs in the [protocol DTO module](../../crates/eliot-plugin/src/protocol.rs),
 while this spec owns their semantics. A callback reports
-`before_tool` (Claude Code `PreToolUse`) or `before_model` (OpenCode `context` hook and
+`before_tool` (Claude Code `PreToolUse`), `after_tool` (Claude Code `PostToolUse`), or `before_model` (OpenCode `context` hook and
 Antigravity `PreInvocation`), its exact `turn_id`, and an opaque `consumer_id`; the response
 carries `context[]` as shared Core `ContextItem` values.
 
@@ -330,14 +330,15 @@ claims are committed, it returns no context; any late context is discarded and n
 applied on a subsequent turn. Permission decisions stay on the existing exact approval
 callbacks.
 
-After the native write is confirmed, the plugin publishes a `hook.before_tool` /
-`hook.before_model` fact on the existing event path with the exact turn and consumer plus
+After the native write is confirmed, the plugin publishes a `hook.before_tool`,
+`hook.after_tool` or `hook.before_model` fact on the existing event path with the exact turn and consumer plus
 one shared `ContextOutcome` for that callback. Store settles its fixed FIFO claims in the
 same source-batch transaction. A failed or uncertain native write emits no applied fact;
 the claim stays frozen and is never requeued. A confirmed receipt may reconcile a claimed
 `unknown` in the same generation against its captured turn record even when its native
 terminal won the race; selection always requires the exact active turn. This adds no second
-source/lifecycle stream, client API method, hook-decision RPC, or policy engine.
+source or lifecycle stream. The daemon selects the delivery point and handles an unclaimed
+note that misses its turn. Hooks deliver the committed context selection and supply native facts.
 
 A `hook.before_tool` fact may also carry optional bounded progress diagnostics taken
 only from the native hook input: `tool` (bounded native tool name), `native_tool_id`
@@ -581,6 +582,12 @@ Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a
 repeated message id replaces, and the value is never presented as a turn or session total.
+`session.context.compacted` is a session fact. Codex emits it for a confirmed v2
+`item/completed` whose typed item is `contextCompaction`. The fact carries
+`native_turn_id` and includes `turn_id` when the compaction belongs to the exact active
+Swarm turn. Its native identity binds thread, turn and item. The manual compact command
+still settles through the existing native lifecycle. The installed app-server favors
+the item lifecycle over the deprecated `thread/compacted` notification.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a
@@ -772,20 +779,28 @@ Add hooks only for a missing native fact/decision. Config is session-scoped; dec
 bind exact generation/request/deadline. Timeout uses the safe native default; late
 approval is discarded, not queued. Hooks do not duplicate the authoritative stream.
 
-The first system-context hook consumer is Claude Code 2.1.278:
-`PreToolUse.additionalContext` is the native `turn_safe_point` application point. The
+Claude Code delivers `turn_safe_point` context through `PreToolUse.additionalContext`
+and `PostToolUse.additionalContext`. The
 adapter reports the exact turn and opaque consumer through the existing authenticated
 plugin channel. Timeout/cancellation supplies no context, does not override a native
 result, and discards late context instead of queuing it for a later turn. This context
 path does not make permission decisions; existing approval callbacks retain that
 responsibility. Hooks do not duplicate lifecycle already supplied by the stream.
 
+For a recognized successful file write, Claude `PostToolUse` can carry `edit_path`.
+This is the bounded, redacted path from the native tool input, including an absolute
+path outside the worktree. Swarm classifies containment and scope from the fact.
+A native `compact_boundary` record yields `session.context.compacted` with the active
+Swarm turn when one is bound. The stream receipt supplies the compaction fact.
+
 The OpenCode `context` hook (`before_model`) is the second consumer. The Rust host binds
 the native session over RPC `eliot-context` version 1 (`bind`/`next`/`resolve` on the
 existing authenticated HTTP transport) before readiness and advertises `turn_safe_point`
 only after a verified v1 binding. An owned longpoll claims through the same authenticated
-`hook.event` channel before the vendor `resolve` mutates the native system draft; only a
-confirmed `applied`/`empty` may emit a receipt.
+`hook.event` channel before the vendor `resolve` mutates the native system draft. A
+confirmed `applied` or `empty` emits a receipt. OpenCode rebuilds that draft between
+tool calls. The plugin keeps the applied parts with the same exact native input so
+later drafts include them. The next input gets its own context.
 
 The Antigravity `PreInvocation` hook (`before_model`) is the third consumer. The adapter
 stages a private generation-scoped hook group in a dedicated hook-only directory's

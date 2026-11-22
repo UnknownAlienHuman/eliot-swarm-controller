@@ -6,7 +6,7 @@ impl Store {
         &mut self,
         id: &str,
         state: CommandState,
-        outcome: Option<Value>,
+        mut outcome: Option<Value>,
         now: i64,
         start_not_spawned: bool,
     ) -> Result<Change<Command>> {
@@ -18,6 +18,46 @@ impl Store {
         let mut record = load_command_record(&tx, id)?
             .ok_or_else(|| Error::new("not_found", format!("command {id} was not found")))?;
         check_settle_verb_guards(&tx, &record, state, &outcome, id)?;
+        if record.command.verb == "inject" {
+            let args = context::decode_inject_args(&record.command.args)?;
+            if state == CommandState::Rejected
+                && record.state == CommandState::Dispatched
+                && args.point == InjectPoint::ActiveTurn
+                && args.expires_at_ms.is_none_or(|expires| expires > now)
+                && let Some(target) = record.target
+                && let Some(agent) = load_agent_by_num(&tx, target)?
+                && Some(agent.generation) == record.command.generation
+                && context::next_input_available(&agent)
+            {
+                let outcome = context::move_context_to_next_input(&tx, id, now)?;
+                let event = insert_daemon_command_event(
+                    &tx,
+                    now,
+                    "context.moved",
+                    Some(target),
+                    Some(agent.generation),
+                    id,
+                    json!({"command_id": id, "outcome": outcome}),
+                )?;
+                let value = load_command(&tx, id)?
+                    .ok_or_else(|| Error::new("source_integrity", "moved context disappeared"))?;
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value,
+                    events: vec![event],
+                });
+            }
+            let delivery = match state {
+                CommandState::Applied => Some("delivered_in_turn"),
+                CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
+                    Some("cancelled")
+                }
+                _ => None,
+            };
+            if let Some(delivery) = delivery {
+                outcome.get_or_insert_with(|| json!({}))["delivery"] = json!(delivery);
+            }
+        }
         if let Some(command) = check_settle_idempotent(&record, state, outcome.as_ref())? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Change {
