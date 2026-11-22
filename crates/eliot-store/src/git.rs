@@ -1,6 +1,34 @@
 use super::*;
 
 impl Store {
+    /// Commit OIDs already observed and committed for this live Git binding.
+    pub fn observed_git_commits(
+        &self,
+        agent: &str,
+        generation: i64,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT oid FROM git_committed_oids
+                 WHERE agent = ?1 AND generation = ?2 ORDER BY oid LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(
+                params![
+                    parse_agent_id(agent)?,
+                    generation,
+                    limit.min(MAX_PAGE_ENTRIES) as i64
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
+    }
+
     pub(super) fn record_git_observation_inner(
         &mut self,
         agent: &str,

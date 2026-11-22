@@ -153,7 +153,7 @@ pub struct ChildRunChangedFile {
     pub observed_at: i64,
 }
 
-/// Generation-attributed agent.edits paths. `truncated` marks the compact
+/// Observed Git paths or generation-attributed edits. `truncated` marks the compact
 /// response cap or a path too long for this DTO; absence of edit evidence is
 /// reported as unobserved.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -388,34 +388,18 @@ impl Router {
                         .and_then(|counts| counts.get(workspace).copied())
                         == Some(1)
                 });
-            (target, edits, goal, claims, exclusively_bound)
+            let commits = exclusively_bound
+                .then(|| store.observed_git_commits(agent, generation, MAX_CHILD_RUN_COMMITS + 1))
+                .and_then(Result::ok);
+            (target, edits, goal, claims, exclusively_bound, commits)
         };
-        let (target, edits, goal, claims, exclusively_bound) = captured;
-        let attributed_paths: Vec<String> = edits
-            .as_ref()
-            .into_iter()
-            .flatten()
-            .take(MAX_CHILD_RUN_CHANGED_FILES)
-            .map(|edit| edit.path.clone())
-            .collect();
-        if let Some(edits) = edits
-            && !edits.is_empty()
-        {
-            let mut truncated = edits.len() > MAX_CHILD_RUN_CHANGED_FILES;
-            let mut files = Vec::with_capacity(MAX_CHILD_RUN_CHANGED_FILES);
-            for edit in edits.into_iter().take(MAX_CHILD_RUN_CHANGED_FILES) {
-                if edit.path.len() > MAX_CHILD_RUN_FILE_PATH_BYTES
-                    || edit.path.chars().any(char::is_control)
-                {
-                    truncated = true;
-                    continue;
-                }
-                files.push(ChildRunChangedFile {
-                    path: edit.path,
-                    observed_at: edit.updated_at,
-                });
-            }
-            facts.changed_files = ChildRunFact::Observed(ChildRunChangedFiles { files, truncated });
+        let (target, edits, goal, claims, exclusively_bound, commits) = captured;
+        if let Some(edits) = edits.as_ref().filter(|edits| !edits.is_empty()) {
+            facts.changed_files = observed_changes(
+                edits
+                    .iter()
+                    .map(|edit| (edit.path.as_str(), edit.updated_at)),
+            );
         }
         if let Some(goal) = goal
             && goal.agent == agent
@@ -433,11 +417,13 @@ impl Router {
             .as_ref()
             .filter(|claims| !claims.truncated && !claims.claims.is_empty());
         if let Some(claims) = active_claims
-            && attributed_paths.iter().any(|path| {
-                claims
-                    .claims
-                    .iter()
-                    .all(|claim| !claim_glob_matches_normalized(&claim.glob, path))
+            && edits.as_ref().is_some_and(|edits| {
+                edits.iter().any(|edit| {
+                    claims
+                        .claims
+                        .iter()
+                        .all(|claim| !claim_glob_matches_normalized(&claim.glob, &edit.path))
+                })
             })
         {
             // An attributed mismatch proves an outside edit even when the
@@ -453,35 +439,61 @@ impl Router {
                 facts.line_counts = ChildRunFact::Observed(counts);
             }
             if view.history_complete == Some(true)
-                && let Some(commits) = view.commits.as_ref()
+                && let Some(commits) = commits
                 && commits.len() <= MAX_CHILD_RUN_COMMITS
             {
-                facts.commits = ChildRunFact::Observed(
-                    commits.iter().map(|commit| commit.oid.clone()).collect(),
-                );
+                facts.commits = ChildRunFact::Observed(commits);
             }
-            if let Some(claims) = active_claims
-                && view.complete == Some(true)
+            if view.complete == Some(true)
                 && view.base_complete == Some(true)
                 && view.base_oid.is_some()
-                && let (Some(dirty), Some(committed_paths)) =
-                    (view.dirty.as_ref(), view.committed_paths.as_ref())
+                && let (Some(dirty), Some(committed_paths), Some(observed_at)) = (
+                    view.dirty.as_ref(),
+                    view.committed_paths.as_ref(),
+                    view.observed_at,
+                )
             {
                 let mut paths: BTreeSet<&str> =
                     dirty.iter().map(|file| file.path.as_str()).collect();
                 paths.extend(committed_paths.iter().map(String::as_str));
-                let outside = facts.outside_claims == ChildRunFact::Observed(true)
-                    || paths.iter().any(|path| {
-                        claims
-                            .claims
-                            .iter()
-                            .all(|claim| !claim_glob_matches_normalized(&claim.glob, path))
-                    });
-                facts.outside_claims = ChildRunFact::Observed(outside);
+                facts.changed_files =
+                    observed_changes(paths.iter().map(|path| (*path, observed_at)));
+                if let Some(claims) = active_claims {
+                    let outside = facts.outside_claims == ChildRunFact::Observed(true)
+                        || paths.iter().any(|path| {
+                            claims
+                                .claims
+                                .iter()
+                                .all(|claim| !claim_glob_matches_normalized(&claim.glob, path))
+                        });
+                    facts.outside_claims = ChildRunFact::Observed(outside);
+                }
             }
         }
         facts
     }
+}
+
+fn observed_changes<'a>(
+    mut paths: impl Iterator<Item = (&'a str, i64)>,
+) -> ChildRunFact<ChildRunChangedFiles> {
+    let mut files = Vec::new();
+    let mut truncated = false;
+    for (path, observed_at) in paths.by_ref().take(MAX_CHILD_RUN_CHANGED_FILES) {
+        if path.trim().is_empty()
+            || path.len() > MAX_CHILD_RUN_FILE_PATH_BYTES
+            || path.chars().any(char::is_control)
+        {
+            truncated = true;
+            continue;
+        }
+        files.push(ChildRunChangedFile {
+            path: path.to_owned(),
+            observed_at,
+        });
+    }
+    truncated |= paths.next().is_some();
+    ChildRunFact::Observed(ChildRunChangedFiles { files, truncated })
 }
 
 fn require_agent(principal: &Principal) -> Result<(&str, i64)> {

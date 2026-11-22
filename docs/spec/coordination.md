@@ -797,14 +797,15 @@ when visible, bounded retained `final_text`, `truncated` and the shared bounded
 `ChildRunFacts`. The same facts appear on visible settled child results in
 `swarm.wait`; the CLI serializes those `WaitEntryResult` fields. Collection runs
 only after the final child-wait snapshot, once per Agent generation, so polling
-does not repeat Git reads. `changed_files` comes only from generation-bound
-`agent.edits` rows (up to 8 paths of at most 128 bytes, with `truncated` for
+does not repeat Git reads. `changed_files` comes from a complete owned workspace
+view or generation-bound `agent.edits` rows (up to 8 paths of at most 128 bytes, with `truncated` for
 omitted or overlong paths). The exact-generation Goal `eliot` check includes its
 exit code and check time.
 
-Workspace-wide Git line counts, commit ids and paths are reported only when the
+Workspace-wide Git line counts, observed commit ids and paths are reported only when the
 target child generation is the sole non-terminal Agent bound to that workspace;
-then they come from the latest complete cached Git view. A shared workspace leaves
+the paths and counts use the complete cached Git view and commit IDs use the
+generation's retained Git observations. A shared workspace leaves
 those facts unobserved. With active claims, a shared-workspace `outside_claims`
 fact may be observed `true` when a generation-attributed edit path matches none
 of the child's claim globs; lack of such a mismatch does not prove `false`. With
