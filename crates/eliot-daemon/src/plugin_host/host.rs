@@ -1551,6 +1551,7 @@ impl PluginHost {
             purpose: "Swarm plugin instance directory".to_owned(),
             identity: identity.clone(),
             created_at: now_ms(),
+            expires_at: None,
             state: "registered".to_owned(),
             git: None,
         };
@@ -1796,6 +1797,10 @@ impl PluginHost {
             .current_dir(workspace)
             .env_clear()
             .envs(minimal_plugin_environment())
+            .env(
+                "ELIOT_CRASH_DIR",
+                crate::crash::crash_dir(&self.state.data_root),
+            )
             .kill_on_drop(true)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2140,7 +2145,7 @@ async fn cleanup_startup(
     proven_no_dispatch: bool,
     origin: Option<eliot_core::FailureOrigin>,
 ) {
-    let exited = terminate_child(child, &actor.monitoring, &actor.agent).await;
+    let (exited, exit) = terminate_child_with_exit(child, &actor.monitoring, &actor.agent).await;
     // `settle_owned_source_exit` returns Ok only after positive custody exit,
     // completed reader drain, and the committed exit gap (see
     // `settle_drained_source_exit`). This failed-start path never enters the
@@ -2165,16 +2170,23 @@ async fn cleanup_startup(
             .expect("startup owns the stderr capture until cleanup")
             .finish(Instant::now() + STOP_GRACE)
             .await;
-        let origin_evidence = plugin_crash_marker(&stderr.text).map(|marker| marker.summary());
+        let marker = plugin_crash_marker(&stderr.text);
+        let (origin, origin_evidence) = match marker {
+            Some(marker) => (
+                Some(eliot_core::FailureOrigin::Swarm),
+                Some(marker.summary()),
+            ),
+            None => (origin, None),
+        };
         mark_lost_state_with_exit(
             &actor.state,
             &actor.key,
             "plugin_startup_exit",
             AgentLossEvidence {
+                exit,
                 stderr_tail: Some(stderr.text),
                 origin,
                 origin_evidence,
-                ..Default::default()
             },
         )
         .await;
@@ -2531,6 +2543,10 @@ fn diagnose_error(error: Error, stderr: &StderrView, credentials: &[String]) -> 
     let mut error = error;
     if let Some(marker) = plugin_crash_marker(&snapshot.text) {
         let summary = marker.summary();
+        error.origin = Some(eliot_core::FailureOrigin::Swarm);
+        if error.failure_where.is_none() {
+            error.failure_where = Some(eliot_core::PLUGIN_EXIT_WHERE.into());
+        }
         error.origin_evidence = Some(
             match error.origin_evidence.as_deref() {
                 Some(evidence) => format!("{evidence}; {summary}"),
@@ -3537,7 +3553,9 @@ async fn wait_child(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
-    wait_child_family(child, duration, duration, monitoring, agent).await
+    wait_child_family_with_exit(child, duration, duration, monitoring, agent)
+        .await
+        .0
 }
 
 /// Wait `leader` for the plugin process, then `family` for its Job to
@@ -3549,6 +3567,18 @@ async fn wait_child_family(
     monitoring: &Monitoring,
     agent: &Agent,
 ) -> bool {
+    wait_child_family_with_exit(child, leader, family, monitoring, agent)
+        .await
+        .0
+}
+
+async fn wait_child_family_with_exit(
+    child: &mut OwnedChild,
+    leader: Duration,
+    family: Duration,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> (bool, Option<eliot_core::ProcessExit>) {
     #[cfg(target_os = "linux")]
     {
         linux_wait_child_family(child, leader, family, monitoring, agent).await
@@ -3573,25 +3603,28 @@ async fn linux_wait_child_family(
     family: Duration,
     monitoring: &Monitoring,
     agent: &Agent,
-) -> bool {
+) -> (bool, Option<eliot_core::ProcessExit>) {
     if !matches!(
         timeout_at(Instant::now() + leader, child.wait_exit_unreaped()).await,
         Ok(Ok(()))
     ) {
-        return false;
+        return (false, None);
     }
     let _ = monitoring.sample_generation(agent).await;
     if !linux_drain_owned_group(child, family).await {
-        return false;
+        return (false, None);
     }
     let _ = monitoring.sample_generation(agent).await;
     // Reap only after the group is proven empty except the leader: the
     // numeric PGID cannot be reused between the final observation and this
     // reap because the exited leader is still unreaped.
-    matches!(
-        timeout_at(Instant::now() + family, child.wait()).await,
-        Ok(Ok(_))
-    )
+    match timeout_at(Instant::now() + family, child.wait()).await {
+        Ok(Ok(status)) => (
+            true,
+            Some(eliot_core::ProcessExit::from_code(status.code())),
+        ),
+        _ => (false, None),
+    }
 }
 
 /// Linux owned-group drain after the leader exit was observed without
@@ -3628,13 +3661,11 @@ async fn legacy_wait_child_family(
     family: Duration,
     monitoring: &Monitoring,
     agent: &Agent,
-) -> bool {
-    if !matches!(
-        timeout_at(Instant::now() + leader, child.wait()).await,
-        Ok(Ok(_))
-    ) {
-        return false;
-    }
+) -> (bool, Option<eliot_core::ProcessExit>) {
+    let Ok(Ok(status)) = timeout_at(Instant::now() + leader, child.wait()).await else {
+        return (false, None);
+    };
+    let exit = eliot_core::ProcessExit::from_code(status.code());
     let _ = monitoring.sample_generation(agent).await;
     #[cfg(windows)]
     {
@@ -3642,15 +3673,15 @@ async fn legacy_wait_child_family(
             // Consume the OS observer's verified-empty certificate before the
             // owning Job is dropped; exited database rows alone are not proof.
             let _ = monitoring.sample_generation(agent).await;
-            true
+            (true, Some(exit))
         } else {
-            false
+            (false, Some(exit))
         }
     }
     #[cfg(not(windows))]
     {
         let _ = family;
-        true
+        (true, Some(exit))
     }
 }
 
@@ -3670,6 +3701,25 @@ async fn terminate_child(mut child: OwnedChild, monitoring: &Monitoring, agent: 
         child.terminate().is_ok() && wait_child(&mut child, STOP_GRACE, monitoring, agent).await;
     drop(child);
     exited
+}
+
+async fn terminate_child_with_exit(
+    mut child: OwnedChild,
+    monitoring: &Monitoring,
+    agent: &Agent,
+) -> (bool, Option<eliot_core::ProcessExit>) {
+    #[cfg(not(target_os = "linux"))]
+    let early_exit = child.try_root_exit_if_finished();
+    #[cfg(target_os = "linux")]
+    let early_exit = None;
+    let terminated = child.terminate().is_ok();
+    let (exited, waited_exit) = if terminated {
+        wait_child_family_with_exit(&mut child, STOP_GRACE, STOP_GRACE, monitoring, agent).await
+    } else {
+        (false, None)
+    };
+    drop(child);
+    (exited, early_exit.or(waited_exit))
 }
 
 /// Private shutdown, input close, then graceful wait with one

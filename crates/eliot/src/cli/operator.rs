@@ -1,12 +1,17 @@
 //! The shared stop, drain and verified startup sequence for local operators.
 
-use super::daemon::{STARTUP_WAIT, daemon_now_ms, shutdown_daemon, startup_failure};
-use super::support::{Failure, mutation_id, submit_command, submit_request, wait_for_command};
+use super::daemon::{STARTUP_WAIT, daemon_now_ms, startup_failure};
+use super::support::{Failure, command_state_result, mutation_id, submit_request};
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentListRequest, AgentListResponse, AgentSummary,
-    ArchivedFilter, DaemonShutdownRequest, DaemonStatusRequest, DaemonStatusResponse, ShutdownMode,
+    ArchivedFilter, CommandGetRequest, CommandSubmitResponse, DaemonShutdownRequest,
+    DaemonShutdownResponse, DaemonStatusRequest, DaemonStatusResponse, MAX_SWARM_WAIT_MS,
+    ShutdownMode, SwarmWaitRequest, SwarmWaitResponse,
 };
+use eliot_core::{Command as CoreCommand, CommandState, Error as CoreError, SubmitCommand};
 use eliot_daemon::operator::{DaemonInfo, daemon_alive, daemon_info};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,8 +22,61 @@ const STOP_WAIT: Duration = Duration::from_secs(90);
 const CUSTODY_SETTLE_WAIT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
-pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<(), Failure> {
-    let (daemon, initial_status) = require_running(data_dir).await?;
+async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
+    data_dir: &Path,
+    method: &str,
+    params: &P,
+) -> eliot_core::Result<R> {
+    let payload = serde_json::to_value(params)
+        .map_err(|_| CoreError::new("invalid", "daemon RPC parameters could not be serialized"))?;
+    let allowed = match method {
+        "daemon.status" | "agent.list" | "agent.get" | "swarm.wait" | "command.get"
+        | "daemon.shutdown" => true,
+        "command.submit" => payload.get("verb").and_then(serde_json::Value::as_str) == Some("stop"),
+        _ => false,
+    };
+    if !allowed {
+        return Err(CoreError::new(
+            "not_allowed",
+            "stand owner helper only permits stand lifecycle and readback RPC methods",
+        ));
+    }
+    let absolute = std::path::absolute(data_dir)
+        .map_err(|error| CoreError::new("unavailable", format!("resolve stand root: {error}")))?;
+    eliot_daemon::operator::check_directory_chain(&absolute)?;
+    let canonical = std::fs::canonicalize(&absolute)
+        .map_err(|error| CoreError::new("unavailable", format!("resolve stand root: {error}")))?;
+    eliot_daemon::operator::check_directory_chain(&canonical)?;
+    if eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&absolute)
+        || eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&canonical)
+    {
+        return Err(CoreError::new(
+            "not_allowed",
+            "stand owner auth cannot target the default daemon or an inherited issuing daemon",
+        ));
+    }
+    let (_, registry) = eliot_daemon::operator::stand_registry(false)?;
+    eliot_daemon::operator::ensure_registry_is_external(&canonical, &registry)?;
+    let reg_name = eliot_daemon::operator::registry_name(&canonical);
+    let registration =
+        eliot_daemon::operator::read_stand_registration(&registry, &reg_name, &canonical)?;
+    eliot_daemon::operator::verify_stand_marker(&canonical, &registration)?;
+    let token = eliot_daemon::DataDir::open_existing(&canonical)?.read_owner_token()?;
+    let value =
+        eliot_daemon::client_call_with_owner_credential(&canonical, method, payload, &token)
+            .await?;
+    if !value.is_object() {
+        return Err(CoreError::new(
+            "unknown",
+            "daemon returned a malformed typed result",
+        ));
+    }
+    serde_json::from_value(value)
+        .map_err(|_| CoreError::new("unknown", "daemon returned a malformed typed result"))
+}
+
+pub(super) async fn stop_and_drain_stand(data_dir: &Path) -> Result<(), Failure> {
+    let (daemon, initial_status) = require_running_inner(data_dir, true).await?;
     if initial_status.store_write_faulted || initial_status.drain.is_none() {
         return Err(Failure::new(1, "the daemon cannot prove a clean stop"));
     }
@@ -27,7 +85,7 @@ pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<(), Failure> {
         stop_stand_agents(data_dir, &mut stops).await?;
         wait_for_custody_to_settle(data_dir, &daemon).await?;
         let request = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Drain);
-        shutdown_daemon(data_dir, &request).await?;
+        stand_shutdown(data_dir, &request).await?;
         wait_for_exit(&daemon, STARTUP_WAIT).await?;
         check_same_daemon(data_dir, &daemon)?;
         if eliot_daemon::last_daemon_phase(data_dir).as_deref() != Some("daemon.stopped") {
@@ -49,12 +107,12 @@ pub(super) async fn stop_and_drain(data_dir: &Path) -> Result<(), Failure> {
 }
 
 async fn stop_stand_agents(data_dir: &Path, stops: &mut Vec<String>) -> Result<(), Failure> {
-    for summary in agents(data_dir)
+    for summary in agents_inner(data_dir, true)
         .await?
         .into_values()
         .filter(|agent| !agent.state.is_terminal())
     {
-        let agent = read_agent(data_dir, &summary.id).await?.agent;
+        let agent = read_stand_agent(data_dir, &summary.id).await?.agent;
         if agent.generation != summary.generation {
             return Err(Failure::new(
                 1,
@@ -73,10 +131,10 @@ async fn stop_stand_agents(data_dir: &Path, stops: &mut Vec<String>) -> Result<(
         )?;
         stop.expected_generation = Some(agent.generation);
         stops.push(format!("{}#{} ({})", agent.id, agent.generation, stop.id));
-        timeout_at(deadline, submit_command(data_dir, &stop))
+        timeout_at(deadline, stand_submit_command(data_dir, &stop))
             .await
             .map_err(|_| Failure::timeout())??;
-        wait_for_command(data_dir, &stop.id, deadline).await?;
+        stand_wait_for_command(data_dir, &stop.id, deadline).await?;
     }
     Ok(())
 }
@@ -103,7 +161,7 @@ async fn wait_for_custody_to_settle(data_dir: &Path, daemon: &DaemonInfo) -> Res
     // Stop commits before the last process-observation projection can settle.
     let deadline = Instant::now() + CUSTODY_SETTLE_WAIT;
     loop {
-        let status = status(data_dir).await?;
+        let status = status_inner(data_dir, true).await?;
         check_same_daemon(data_dir, daemon)?;
         let report = status
             .drain
@@ -131,10 +189,17 @@ async fn wait_for_custody_to_settle(data_dir: &Path, daemon: &DaemonInfo) -> Res
 pub(super) async fn require_running(
     data_dir: &Path,
 ) -> Result<(DaemonInfo, DaemonStatusResponse), Failure> {
+    require_running_inner(data_dir, false).await
+}
+
+async fn require_running_inner(
+    data_dir: &Path,
+    use_stand_owner: bool,
+) -> Result<(DaemonInfo, DaemonStatusResponse), Failure> {
     let daemon = daemon_info(data_dir)
         .map_err(Failure::for_read)?
         .ok_or_else(|| Failure::new(1, "the data directory has no daemon process record"))?;
-    let status = status(data_dir).await?;
+    let status = status_inner(data_dir, use_stand_owner).await?;
     check_same_daemon(data_dir, &daemon)?;
     if !daemon_alive(&daemon).map_err(Failure::for_read)? {
         return Err(Failure::new(1, "the recorded daemon process has exited"));
@@ -154,14 +219,25 @@ pub(super) fn check_same_daemon(data_dir: &Path, expected: &DaemonInfo) -> Resul
 }
 
 pub(super) async fn status(data_dir: &Path) -> Result<DaemonStatusResponse, Failure> {
+    status_inner(data_dir, false).await
+}
+
+async fn status_inner(
+    data_dir: &Path,
+    use_stand_owner: bool,
+) -> Result<DaemonStatusResponse, Failure> {
     let request = DaemonStatusRequest::default();
-    let response = timeout_at(
-        Instant::now() + Duration::from_secs(3),
-        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request),
-    )
-    .await
-    .map_err(|_| Failure::new(5, "daemon status timed out"))?
-    .map_err(Failure::for_read)?;
+    let call = async {
+        if use_stand_owner {
+            stand_owner_call_typed(data_dir, "daemon.status", &request).await
+        } else {
+            eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await
+        }
+    };
+    let response: DaemonStatusResponse = timeout_at(Instant::now() + Duration::from_secs(3), call)
+        .await
+        .map_err(|_| Failure::new(5, "daemon status timed out"))?
+        .map_err(Failure::for_read)?;
     request
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
@@ -169,16 +245,25 @@ pub(super) async fn status(data_dir: &Path) -> Result<DaemonStatusResponse, Fail
 }
 
 pub(super) async fn agents(data_dir: &Path) -> Result<BTreeMap<String, AgentSummary>, Failure> {
+    agents_inner(data_dir, false).await
+}
+
+async fn agents_inner(
+    data_dir: &Path,
+    use_stand_owner: bool,
+) -> Result<BTreeMap<String, AgentSummary>, Failure> {
     let mut request = AgentListRequest {
         archived: ArchivedFilter::Include,
         ..AgentListRequest::default()
     };
     let mut agents = BTreeMap::new();
     loop {
-        let page: AgentListResponse =
-            eliot_daemon::client_call_typed(data_dir, "agent.list", &request)
-                .await
-                .map_err(Failure::for_read)?;
+        let page: AgentListResponse = if use_stand_owner {
+            stand_owner_call_typed(data_dir, "agent.list", &request).await
+        } else {
+            eliot_daemon::client_call_typed(data_dir, "agent.list", &request).await
+        }
+        .map_err(Failure::for_read)?;
         request
             .validate_response(&page)
             .map_err(Failure::invalid_response)?;
@@ -194,9 +279,9 @@ pub(super) async fn agents(data_dir: &Path) -> Result<BTreeMap<String, AgentSumm
     }
 }
 
-pub(super) async fn read_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse, Failure> {
+async fn read_stand_agent(data_dir: &Path, id: &str) -> Result<AgentGetResponse, Failure> {
     let request = AgentGetRequest::new(id);
-    let response = eliot_daemon::client_call_typed(data_dir, "agent.get", &request)
+    let response: AgentGetResponse = stand_owner_call_typed(data_dir, "agent.get", &request)
         .await
         .map_err(Failure::for_read)?;
     request
@@ -205,8 +290,98 @@ pub(super) async fn read_agent(data_dir: &Path, id: &str) -> Result<AgentGetResp
     Ok(response)
 }
 
+async fn stand_submit_command(
+    data_dir: &Path,
+    params: &SubmitCommand,
+) -> Result<CommandSubmitResponse, Failure> {
+    params.validate().map_err(Failure::for_mutation)?;
+    let response: CommandSubmitResponse =
+        stand_owner_call_typed(data_dir, "command.submit", params)
+            .await
+            .map_err(Failure::for_mutation)?;
+    params
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    Ok(response)
+}
+
+async fn stand_wait_for_command(
+    data_dir: &Path,
+    command_id: &str,
+    deadline: Instant,
+) -> Result<CoreCommand, Failure> {
+    let request = CommandGetRequest::new(command_id);
+    request.validate().map_err(Failure::readback)?;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Failure::timeout());
+        }
+        let wait_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(MAX_SWARM_WAIT_MS);
+        let wait_req =
+            SwarmWaitRequest::new(vec![command_id.to_owned()], Vec::new(), "all", wait_ms);
+        wait_req.validate().map_err(Failure::readback)?;
+        let reply: SwarmWaitResponse = timeout_at(
+            deadline,
+            stand_owner_call_typed(data_dir, "swarm.wait", &wait_req),
+        )
+        .await
+        .map_err(|_| Failure::timeout())?
+        .map_err(Failure::readback)?;
+        wait_req
+            .validate_response(&reply)
+            .map_err(Failure::readback)?;
+        if !reply.completed {
+            continue;
+        }
+        let command: CoreCommand = timeout_at(
+            deadline,
+            stand_owner_call_typed(data_dir, "command.get", &request),
+        )
+        .await
+        .map_err(|_| Failure::timeout())?
+        .map_err(Failure::readback)?;
+        request
+            .validate_response(&command)
+            .map_err(Failure::readback)?;
+        if !matches!(
+            command.state,
+            CommandState::Accepted | CommandState::Queued | CommandState::Dispatched
+        ) {
+            command_state_result(&command)?;
+            return Ok(command);
+        }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "The local stand operator waits briefly for a settled command readback."
+        )]
+        sleep(PROBE_INTERVAL.min(deadline.saturating_duration_since(Instant::now()))).await;
+    }
+}
+
+async fn stand_shutdown(
+    data_dir: &Path,
+    params: &DaemonShutdownRequest,
+) -> Result<DaemonShutdownResponse, Failure> {
+    params.validate().map_err(Failure::for_mutation)?;
+    let response: DaemonShutdownResponse =
+        stand_owner_call_typed(data_dir, "daemon.shutdown", params)
+            .await
+            .map_err(Failure::for_mutation)?;
+    params
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    Ok(response)
+}
+
 pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, None).await
+    start_owned_inner(data_dir, binary, None, false).await
+}
+
+pub(super) async fn start_owned_stand(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
+    start_owned_inner(data_dir, binary, None, true).await
 }
 
 pub(super) async fn start_update(
@@ -214,13 +389,14 @@ pub(super) async fn start_update(
     binary: &Path,
     attempt: &str,
 ) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, Some(attempt)).await
+    start_owned_inner(data_dir, binary, Some(attempt), false).await
 }
 
 async fn start_owned_inner(
     data_dir: &Path,
     binary: &Path,
     attempt: Option<&str>,
+    use_stand_owner: bool,
 ) -> Result<u32, Failure> {
     let start_ms = daemon_now_ms();
     let previous = daemon_info(data_dir).map_err(Failure::for_read)?;
@@ -305,7 +481,7 @@ async fn start_owned_inner(
         ))?
     };
 
-    let result = wait_for_ready(data_dir, pid, previous.as_ref(), start_ms).await;
+    let result = wait_for_ready(data_dir, pid, previous.as_ref(), start_ms, use_stand_owner).await;
     if let Err(mut failure) = result {
         let _publication = if let Some(attempt) = attempt {
             match eliot_daemon::operator::lock_update_publication(data_dir, attempt) {
@@ -344,6 +520,7 @@ async fn wait_for_ready(
     pid: u32,
     previous: Option<&DaemonInfo>,
     start_ms: u128,
+    use_stand_owner: bool,
 ) -> Result<(), Failure> {
     let deadline = Instant::now() + STARTUP_WAIT;
     let log_path = data_dir.join("logs").join("daemon.log");
@@ -361,7 +538,7 @@ async fn wait_for_ready(
                 ));
             }
             if daemon_alive(&current).map_err(Failure::for_read)?
-                && status(data_dir)
+                && status_inner(data_dir, use_stand_owner)
                     .await
                     .is_ok_and(|status| status.admission == "open" && !status.store_write_faulted)
             {

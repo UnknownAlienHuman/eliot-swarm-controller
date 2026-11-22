@@ -6,10 +6,86 @@ use std::path::{Path, PathBuf};
 
 pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
+pub use crate::stand_cleanup::{
+    STAND_MARKER, StandBranchOutcome, StandEntry, StandExternalCleanupReport, StandMarker,
+    StandRegistration, StandWorktreeOutcome, check_directory_chain, check_nested_roots,
+    cleanup_stand_external_git, ensure_registry_is_external, list_stand_registrations,
+    parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
+    stand_now_ms, stand_registry, verify_stand_marker, write_stand_registration,
+};
 pub use crate::update_backup::{
     discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
 };
 pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
+
+/// Returns the issuing parent daemon data directory when running inside a
+/// managed Agent session with complete inherited credentials.
+pub fn inherited_agent_parent_data_dir() -> Option<PathBuf> {
+    let has_agent_creds = [
+        "ELIOT_AGENT_ID",
+        "ELIOT_AGENT_GENERATION",
+        "ELIOT_AGENT_TOKEN",
+    ]
+    .into_iter()
+    .all(|name| std::env::var_os(name).is_some_and(|val| !val.is_empty()));
+    if !has_agent_creds {
+        return None;
+    }
+    let resolved = if let Some(dir) = std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
+        .filter(|val| !val.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        dir
+    } else {
+        crate::platform::data_dir::resolve_data_dir(None).ok()?
+    };
+    if let Some(scope) = std::env::var_os(crate::daemon::AGENT_DATA_SCOPE_ENV)
+        && scope != std::ffi::OsStr::new(&crate::daemon::identity_data_scope(&resolved))
+    {
+        return None;
+    }
+    if let Some(issuing) = std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
+        && !crate::daemon::identity_data_dirs_equal(&resolved, Path::new(&issuing))
+    {
+        return None;
+    }
+    Some(resolved)
+}
+
+/// Checks whether `candidate` matches `expected` data directory identity.
+pub fn data_dirs_match(left: &Path, right: &Path) -> bool {
+    crate::daemon::identity_data_dirs_equal(left, right)
+}
+
+/// Returns whether `target` must never receive stand-owner credential fallback
+/// (matches the default daemon root or the inherited Agent issuing daemon).
+pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
+    let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let matches_dir = |candidate: &Path| {
+        data_dirs_match(target, candidate)
+            || data_dirs_match(&canonical, candidate)
+            || std::fs::canonicalize(candidate)
+                .is_ok_and(|canon_candidate| data_dirs_match(&canonical, &canon_candidate))
+    };
+    if inherited_agent_parent_data_dir().is_some_and(|parent| matches_dir(&parent)) {
+        return true;
+    }
+    if std::env::var_os(crate::daemon::AGENT_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|dir| matches_dir(Path::new(&dir)))
+    {
+        return true;
+    }
+    if let Some(scope) =
+        std::env::var_os(crate::daemon::AGENT_DATA_SCOPE_ENV).filter(|value| !value.is_empty())
+        && (scope == std::ffi::OsStr::new(&crate::daemon::identity_data_scope(target))
+            || scope == std::ffi::OsStr::new(&crate::daemon::identity_data_scope(&canonical)))
+    {
+        return true;
+    }
+    crate::platform::data_dir::default_data_dir().is_ok_and(|dir| matches_dir(&dir))
+}
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {
     DataDir::open_existing(path)?.read_daemon_info()
@@ -80,6 +156,10 @@ pub fn validate_stand_directory(path: &Path) -> Result<()> {
 pub fn write_stand_record(path: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     DataDir::open_existing(path)?;
     crate::platform::data_dir::replace_file_atomically(path, name, bytes, true)
+}
+
+pub fn write_stand_config(root: &Path, bytes: &[u8]) -> Result<()> {
+    crate::platform::data_dir::replace_private_file(root, "config.toml", bytes)
 }
 
 pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {

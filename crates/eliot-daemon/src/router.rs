@@ -688,18 +688,20 @@ impl Router {
             "command.submit" => {
                 let result = self.submit_bound(&params, &principal, context).await;
                 self.note_command_submission(&principal, context.remote, "command.submit", &result);
-                // Capacity preflight can refuse before a command exists.
-                // Retain diagnostic metadata under the caller's exact ID in
-                // the existing bounded log; this grants no replay authority.
+                // Admission preflight (capacity, a missing profile executable)
+                // can refuse with a typed location and origin before a command
+                // exists. Retain diagnostic metadata under the caller's exact
+                // ID in the existing bounded log; this grants no replay authority.
                 if let Err(error) = &result
-                    && error.code == "capacity_unavailable"
+                    && error.failure_where.is_some()
+                    && error.origin.is_some()
                     && let Some(id) = params.get("id").and_then(Value::as_str)
                     && ulid::Ulid::from_string(id).is_ok()
                 {
                     let log_principal = diagnostic_principal(&principal);
                     crate::logging::record(
                         &self.secret_policy_snapshot(),
-                        crate::logging::CAPACITY_REFUSAL_CODE,
+                        crate::logging::ADMISSION_REFUSAL_CODE,
                         &[
                             ("principal", log_principal.as_str()),
                             ("method", "command.submit"),

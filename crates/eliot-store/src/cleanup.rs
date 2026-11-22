@@ -638,6 +638,14 @@ impl Store {
                 .map_err(|_| Error::new("source_integrity", "invalid retained artifact"));
         }
         validate_id_age(&request.id, now)?;
+        if let Some(expires_at) = request.expires_at
+            && (expires_at <= 0 || expires_at > now.saturating_add(MAX_ARTIFACT_TTL_MS))
+        {
+            return Err(Error::new(
+                "invalid",
+                "artifact expiry is out of range (must be positive and within 30 days)",
+            ));
+        }
         let Sender::Agent {
             num, generation, ..
         } = parse_sender(principal, "artifact")?
@@ -699,6 +707,7 @@ impl Store {
             purpose: request.purpose.clone(),
             identity: identity.to_owned(),
             created_at: now,
+            expires_at: request.expires_at,
             state: "registered".to_owned(),
             git: None,
         };

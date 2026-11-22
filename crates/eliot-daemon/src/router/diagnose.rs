@@ -66,7 +66,7 @@ impl Router {
         if is_agent {
             return self.diagnose_agent(target, target, previous_crash).await;
         }
-        if let Some(step) = crate::logging::capacity_refusal(
+        if let Some(step) = crate::logging::admission_refusal(
             &self.inner.data_root,
             target,
             &self.secret_policy_snapshot(),
@@ -518,6 +518,13 @@ fn provider_switch_step(
 }
 
 fn append_retained(summary: &str, unresolved: &[String]) -> String {
+    // The failure message already names an unresolved item when it is the
+    // chain's reason; repeat only the others.
+    let unresolved: Vec<&str> = unresolved
+        .iter()
+        .map(String::as_str)
+        .filter(|item| !summary.contains(item))
+        .collect();
     if unresolved.is_empty() {
         return summary.to_owned();
     }

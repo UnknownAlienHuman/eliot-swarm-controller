@@ -782,6 +782,7 @@ unknown commands remain unknown. Agent list observations appear only when reques
 Moving, Asked, Stuck, and Long classifications and groups Stuck and Long
 objects by reason.
 Absent source cursors and sequence/acknowledgement values remain null.
+When a previous daemon panic marker was consumed once at startup or plugin panic markers exist, `daemon.status` exposes `previous_crash` and `plugin_crashes`, and human `swarm status` renders one summary line for each.
 When explicit Claude profile cmd paths no longer exist, status and doctor return
 `claude_profile_command_issues` with the configured path, discovered replacement
 path/version, and one-command repair when a replacement is installed.
@@ -2859,26 +2860,41 @@ started for that directory.
 
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. It accepts an optional private TOML
-file containing the `[profiles]` table and an optional alternate Swarm binary. It prints the new
-data and workspace paths after the daemon is ready. Operate on the printed
+file containing the `[profiles]` table (written with private file permissions), an optional alternate Swarm binary, and
+`--ttl DURATION` (default `DEFAULT_STAND_TTL_MS` = 24 hours, max `MAX_ARTIFACT_TTL_MS` = 30 days in [`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs)). It prints the new
+data, workspace and expiry after the daemon is ready. Operate on the printed
 directory through explicit `--data-dir`. The stand starts with a fresh Store. A copy of
 production data can retain production process custody names. Launch Agents only from a fresh Store.
 
-`SWARM_STANDS_ROOT` selects the designated parent. The default is
-`EliotStands` under local application data on Windows or `eliot-stands`
-under the XDG state directory on Unix. A private registry binds the random creation
-token to the canonical stand path outside the stand itself.
+When run inside a managed Agent session with inherited credentials, omitting
+`--root` and `SWARM_STANDS_ROOT` places the stand under `ELIOT_ARTIFACT_ROOT`,
+and `stand up` automatically registers the stand with the issuing parent daemon
+via `artifact.register` (`kind: data_dir`, `purpose: SWARM_STAND_ARTIFACT_PURPOSE`,
+`expires_at`). Otherwise `SWARM_STANDS_ROOT` selects the designated parent,
+defaulting to `EliotStands` under local application data on Windows or
+`eliot-stands` under the XDG state directory on Unix. A private registry binds
+the random creation token to the canonical stand path outside the stand itself.
+`stand list` inspects registered stands with expiry and liveness state, and
+`stand prune` tears down expired registered stands.
 
 `stand down` requires both that registry binding and the stand marker. It
 stops owned processes, records exit proof before removal, and deletes the
-marker last. A retry uses the recorded removal phase. After a crash without
+marker last. Its local stand owner-credential helper permits only stand
+lifecycle and readback RPCs (`daemon.status`, `agent.list`, `agent.get`,
+`swarm.wait`, `command.get`, `daemon.shutdown`, and `command.submit` with
+`verb == "stop"`), rejects the caller's inherited issuing parent daemon, and
+requires external stand registration and marker verification, leaving server-side
+`#846`/`#886` owner boundaries unchanged. A retry uses the recorded removal phase. After a crash without
 exit proof, start the registered stand again so boot can reconcile custody,
 then retry teardown.
 
-This is explicit teardown of files owned by the stand, including its whole
-scratch repository and any branches and worktrees inside the stand. Repositories
-outside the stand keep their own worktrees and branches. Artifact registration
-for managed proofs is explicit and there is no automatic expiry.
+After proving the stand daemon stopped, `stand down`, `stand prune`, and parent
+`cleanup` remove stand files owned by the stand, including its scratch
+repository, and remove stand-created clean/contained worktrees and detached
+contained branches in external repositories using `#885` write-fenced containment
+and branch-deletion proofs. Dirty, unmerged, or uncertain external worktrees or
+branches keep the stand directory and registration (`retained`, CLI exit 4) so
+retried `stand down` after cleanup completes removal (CLI exit 0).
 
 ## CLI
 
@@ -2908,12 +2924,16 @@ swarm daemon [--foreground]
 swarm daemon install | uninstall
 swarm daemon stop [--drain|--force]
 swarm daemon update <RELEASE> [--wait-seconds N]
-swarm stand up [--root PATH] [--profile FILE] [--binary PATH]
+swarm stand up [--root PATH] [--profile FILE] [--binary PATH] [--ttl DURATION]
 swarm stand down <PATH>
+swarm stand list
+swarm stand prune
 swarm status
 swarm autonomy [--since TIME] [--json]
 swarm store compact
 swarm cleanup plan [--after TOKEN]
+swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
+swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
 swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read

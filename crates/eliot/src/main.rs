@@ -32,6 +32,12 @@ fn main() -> ExitCode {
     if !matches!(&cli.command, Some(CliCommand::Stand(_))) {
         eliot_daemon::crash::install_panic_hook(is_plugin);
     }
+    if is_plugin
+        && std::env::var_os("ELIOT_CRASH_DIR").is_none_or(|dir| dir.is_empty())
+        && let Ok(path) = resolve_data_dir(cli.data_dir.as_deref())
+    {
+        eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
+    }
     // Debug-only panic trigger for crash-capture tests. Compiled out of
     // release builds: release binaries cannot panic on demand.
     #[cfg(debug_assertions)]
@@ -68,6 +74,7 @@ async fn run(cli: Cli) -> ExitCode {
 }
 
 async fn run_inner(cli: Cli) -> ExitCode {
+    let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     let data_dir = if matches!(&cli.command, Some(CliCommand::Stand(_))) {
         if cli.data_dir.is_some() || cli.id.is_some() {
             return report_failure(Failure::new(2, "stand uses its own path and mutation IDs"));
@@ -79,7 +86,9 @@ async fn run_inner(cli: Cli) -> ExitCode {
             Err(failure) => return report_failure(failure),
         };
         // Read lazily by the panic hook for the daemon this process serves.
-        eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
+        if !is_plugin || std::env::var_os("ELIOT_CRASH_DIR").is_none_or(|dir| dir.is_empty()) {
+            eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
+        }
         path
     };
 

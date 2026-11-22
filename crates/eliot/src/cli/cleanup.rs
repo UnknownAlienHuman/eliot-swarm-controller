@@ -89,7 +89,18 @@ pub(crate) async fn run_artifact(
         path,
         kind,
         purpose,
+        ttl,
     } = args.command;
+    let expires_at = ttl
+        .as_deref()
+        .map(|duration| {
+            let ttl_ms = eliot_daemon::operator::parse_stand_ttl_ms(duration)
+                .map_err(Failure::for_mutation)?;
+            eliot_daemon::operator::stand_now_ms()
+                .checked_add(ttl_ms)
+                .ok_or_else(|| Failure::new(2, "TTL overflows epoch timestamp"))
+        })
+        .transpose()?;
     let request = ArtifactRegisterRequest {
         id: mutation_id(id)?,
         path,
@@ -100,6 +111,7 @@ pub(crate) async fn run_artifact(
             "temp" => ArtifactKind::Temp,
             _ => ArtifactKind::Other,
         },
+        expires_at,
     };
     request.validate().map_err(Failure::for_mutation)?;
     let result: ArtifactView =

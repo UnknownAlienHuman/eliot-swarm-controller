@@ -314,7 +314,6 @@ async fn run_agent_startup(
         Err(error) => {
             let proven_no_dispatch = error.code == "native_not_dispatched";
             let origin = startup_loss_origin(&error);
-            let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
                 child
@@ -327,6 +326,7 @@ async fn run_agent_startup(
                 origin,
             )
             .await;
+            let _ = started.send(Err(error));
             return false;
         }
     };
@@ -339,7 +339,6 @@ async fn run_agent_startup(
         Ok(resume_config) => resume_config,
         Err(error) => {
             let origin = startup_loss_origin(&error);
-            let _ = started.send(Err(error));
             cleanup_startup(
                 actor,
                 child
@@ -352,6 +351,7 @@ async fn run_agent_startup(
                 origin,
             )
             .await;
+            let _ = started.send(Err(error));
             return false;
         }
     };

@@ -1276,6 +1276,11 @@ fn missing_claude_profile_command(
         "profile_error",
         format!("{profile}: Claude executable was not found at {cmd}; {detail}"),
     )
+    .with_where("router.admission.profile_cmd")
+    .with_origin(
+        core::FailureOrigin::Environment,
+        "configured profile executable is missing",
+    )
 }
 
 pub(crate) fn claude_settings_command(profile: &str, cmd: &str) -> String {

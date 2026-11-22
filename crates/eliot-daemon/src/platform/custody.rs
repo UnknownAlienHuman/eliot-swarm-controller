@@ -297,6 +297,15 @@ impl OwnedChild {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn try_root_exit_if_finished(&mut self) -> Option<eliot_core::ProcessExit> {
+        let status = self.child.try_wait().ok()??;
+        if let Some(observer) = self.observation.lock_recover().as_ref() {
+            observer.record_root_exit(status.code());
+        }
+        Some(eliot_core::ProcessExit::from_code(status.code()))
+    }
+
     /// Separate from leader wait(): only Windows can prove exact family exit.
     /// `false` means the bounded wait expired, never that the family was killed.
     #[cfg(windows)]

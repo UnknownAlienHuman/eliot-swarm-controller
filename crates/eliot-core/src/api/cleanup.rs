@@ -28,6 +28,9 @@ impl ArtifactKind {
 }
 
 pub const MAX_CLEANUP_ITEMS: usize = 64;
+pub const SWARM_STAND_ARTIFACT_PURPOSE: &str = "Swarm private stand";
+pub const MAX_ARTIFACT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+pub const DEFAULT_STAND_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +39,8 @@ pub struct ArtifactRegisterRequest {
     pub path: String,
     pub kind: ArtifactKind,
     pub purpose: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 impl ArtifactRegisterRequest {
     pub fn validate(&self) -> Result<()> {
@@ -45,6 +50,7 @@ impl ArtifactRegisterRequest {
             || self.path.contains('\0')
             || self.purpose.trim().is_empty()
             || self.purpose.len() > 512
+            || self.expires_at.is_some_and(|ts| ts <= 0)
             || matches!(
                 self.kind,
                 ArtifactKind::Branch
@@ -55,7 +61,7 @@ impl ArtifactRegisterRequest {
         {
             return Err(Error::new(
                 "invalid",
-                "invalid artifact path, kind or purpose",
+                "invalid artifact path, kind, purpose or expiry",
             ));
         }
         Ok(())
@@ -75,6 +81,8 @@ pub struct ArtifactView {
     pub purpose: String,
     pub identity: String,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<CleanupGitBinding>,

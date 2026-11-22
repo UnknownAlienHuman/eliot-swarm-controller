@@ -29,6 +29,7 @@ mod router;
 pub(crate) mod scripts;
 mod setup;
 mod skill;
+mod stand_cleanup;
 pub mod startup;
 mod update_backup;
 mod workspace_git;

@@ -49,6 +49,7 @@ pub use rules::{
 pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
+pub use workspace::StandWorkspaceRecord;
 
 use eliot_core::api::{
     HeavySummaryView, InstructionDeliveryView, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,

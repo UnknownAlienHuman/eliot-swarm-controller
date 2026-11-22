@@ -1062,7 +1062,8 @@ across the harness adapters. Remote StreamableHTTP calls carry authenticated
 remote Owner context but no local Agent generation or turn; their events remain
 unbound and are excluded from per-turn usage.
 
-`daemon.status` also exposes retention and drain honesty in one place. Compact
+`daemon.status` also exposes crash markers (`previous_crash` consumed once on
+restart, plus `plugin_crashes`) and retention and drain honesty in one place. Compact
 `agent.list` reads and history-derived attention thresholds use SQLite read
 snapshots outside the Store writer lock. Compact list requests wait for a reader
 slot before scheduling blocking work, with up to four snapshots active at once.
