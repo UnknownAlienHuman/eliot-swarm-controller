@@ -1484,7 +1484,7 @@ impl Router {
         let mut request: CommandSubmitRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         if request.verb == "git.integrate" {
-            return self.submit_git_integrate(request, principal, remote).await;
+            return self.submit_git_integrate(request, principal, context).await;
         }
         if request.verb == "git.fetch" {
             return self.submit_git_fetch(request, principal, context).await;
@@ -1722,7 +1722,7 @@ impl Router {
         &self,
         mut request: CommandSubmitRequest,
         principal: &Principal,
-        remote: Option<&eliot_core::RemoteCallContext>,
+        context: SubmissionContext<'_>,
     ) -> Result<Value> {
         request.validate()?;
         if request.verb != "git.integrate" {
@@ -1764,7 +1764,8 @@ impl Router {
         let saved_principal = principal_name(principal);
         let admission = {
             let mut store = self.inner.store.lock().await;
-            self.admit_prepared_submission(&mut store, &saved_principal, prepared, remote)
+            self.admit_prepared_submission(&mut store, &saved_principal, prepared, context)
+                .inspect(|admission| self.publish_locked(&admission.events))
         };
         let admission = match admission {
             Ok(admission) => admission,
@@ -1992,14 +1993,8 @@ impl Router {
         registration.validate()?;
         crate::automation::verify_project_registration(&self.inner.data_root, &registration)
             .await?;
-        let frozen = crate::git_integration::freeze(
-            &self.inner.data_root,
-            &registration,
-            &definition,
-            caller,
-            timeout_ms,
-        )
-        .await?;
+        let frozen =
+            crate::git_integration::freeze(&registration, &definition, caller, timeout_ms).await?;
         request.args = serde_json::to_value(frozen)
             .map_err(|_| Error::new("internal", "frozen git.integrate intent cannot be encoded"))?;
         self.prepare_submission_after_authorization(request, principal, true, false)

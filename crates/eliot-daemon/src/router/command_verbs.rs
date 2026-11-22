@@ -68,7 +68,6 @@ impl Router {
         };
         let mut execution = crate::git_integration::execute(
             &self.inner.data_root,
-            id,
             &frozen,
             &registration,
             self.run_cancellation_receiver(),

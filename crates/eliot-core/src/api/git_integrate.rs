@@ -253,18 +253,17 @@ impl GitIntegrateOutcome {
         {
             return Err(invalid("git.integrate conflict paths exceed their bound"));
         }
-        if let Some(check) = &self.check_failure {
-            if check.tail.len() > MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES
+        if let Some(check) = &self.check_failure
+            && (check.tail.len() > MAX_GIT_INTEGRATE_CHECK_TAIL_BYTES
                 || check.failed_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
                 || check.unknown_branches.len() > MAX_GIT_INTEGRATE_BRANCHES
                 || check
                     .failed_branches
                     .iter()
                     .chain(&check.unknown_branches)
-                    .any(|name| !frozen.branches.iter().any(|pin| &pin.branch == name))
-            {
-                return Err(invalid("git.integrate check attribution exceeds its bound"));
-            }
+                    .any(|name| !frozen.branches.iter().any(|pin| &pin.branch == name)))
+        {
+            return Err(invalid("git.integrate check attribution exceeds its bound"));
         }
         if let Some(update) = &self.fast_forward {
             branch(&update.branch, "fast_forward.branch")?;

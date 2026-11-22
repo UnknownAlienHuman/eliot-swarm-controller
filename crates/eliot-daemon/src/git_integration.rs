@@ -20,11 +20,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
 const REF_READ_BUDGET: Duration = Duration::from_secs(10);
+const MAX_CONFLICT_PATH_BYTES: usize = 4 * 1024;
 
 pub(crate) struct GitIntegrateExecution {
     pub state: CommandState,
@@ -32,13 +33,11 @@ pub(crate) struct GitIntegrateExecution {
 }
 
 pub(crate) async fn freeze(
-    data_root: &Path,
     registration: &ProjectRegistrationView,
     definition: &GitIntegrateDefinitionArgs,
     caller: Option<GitIntegrateCaller>,
     timeout_ms: i64,
 ) -> Result<FrozenGitIntegrate> {
-    let _ = data_root;
     registration.validate()?;
     definition.validate()?;
     if timeout_ms < 1_000 {
@@ -66,18 +65,19 @@ pub(crate) async fn freeze(
     }
     let git = GitProbe::new()?;
     let root = Path::new(&registration.checkout);
-    let base_oid = resolve_branch_oid(&git, root, &definition.base_branch).await?;
+    let deadline = Instant::now() + REF_READ_BUDGET;
+    let base_oid = current_branch_oid(&git, root, &definition.base_branch, deadline).await?;
     let mut branches = Vec::with_capacity(definition.branches.len());
     for name in &definition.branches {
         branches.push(GitIntegrateBranchPin {
             branch: name.clone(),
-            oid: resolve_branch_oid(&git, root, name).await?,
+            oid: current_branch_oid(&git, root, name, deadline).await?,
         });
     }
     let fast_forward = definition.fast_forward_to.as_deref().map(|name| async {
         Ok::<_, Error>(eliot_core::api::GitIntegrateTargetPin {
             branch: name.to_owned(),
-            expected_oid: resolve_branch_oid(&git, root, name).await?,
+            expected_oid: current_branch_oid(&git, root, name, deadline).await?,
         })
     });
     let fast_forward = match fast_forward {
@@ -98,24 +98,6 @@ pub(crate) async fn freeze(
     };
     frozen.validate()?;
     Ok(frozen)
-}
-
-async fn resolve_branch_oid(git: &GitProbe, root: &Path, name: &str) -> Result<String> {
-    let reference = format!("refs/heads/{name}^{{commit}}");
-    read_git_line(
-        git,
-        root,
-        &["rev-parse", "--verify", "--end-of-options", &reference],
-        Instant::now() + REF_READ_BUDGET,
-    )
-    .await
-    .and_then(|value| {
-        if is_git_oid(&value) {
-            Ok(value)
-        } else {
-            Err(unavailable("branch tip is not an exact commit OID"))
-        }
-    })
 }
 
 async fn read_git_line(
@@ -161,16 +143,17 @@ fn outcome(frozen: &FrozenGitIntegrate, status: GitIntegrateStatus) -> GitIntegr
 
 fn execution(
     frozen: &FrozenGitIntegrate,
-    state: CommandState,
+    mut state: CommandState,
     mut result: GitIntegrateOutcome,
     failure_code: Option<&str>,
 ) -> GitIntegrateExecution {
-    result.failure_code = failure_code.map(str::to_owned);
+    if let Some(code) = failure_code {
+        result.failure_code = Some(code.to_owned());
+    }
     if result.validate_for(frozen).is_err() {
-        return GitIntegrateExecution {
-            state: CommandState::Unknown,
-            outcome: json!({"code":"git_integrate_result_invalid"}),
-        };
+        result = outcome(frozen, GitIntegrateStatus::Unknown);
+        result.failure_code = Some("git_integrate_result_invalid".to_owned());
+        state = CommandState::Unknown;
     }
     let value = serde_json::to_value(result)
         .unwrap_or_else(|_| json!({"code":"git_integrate_result_encode_failed"}));
@@ -186,13 +169,10 @@ struct TemporaryWorktree {
 }
 
 impl TemporaryWorktree {
-    fn create(data_root: &Path, command_id: &str) -> Result<Self> {
+    fn create(data_root: &Path) -> Result<Self> {
         let data_root = fs::canonicalize(data_root)
             .map_err(|_| unavailable("private Git integration data root cannot be resolved"))?;
-        let id = ulid::Ulid::from_string(command_id)
-            .map_err(|_| Error::new("invalid", "git.integrate command id is malformed"))?
-            .to_string();
-        let root = data_root.join(format!("git-integrate-{id}"));
+        let root = data_root.join(format!("git-integrate-{}", ulid::Ulid::new()));
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
@@ -303,10 +283,13 @@ async fn ref_is_checked_out(git: &GitProbe, root: &Path, branch: &str) -> Result
         return Err(unavailable("Git could not enumerate checked-out branches"));
     }
     let wanted = format!("branch refs/heads/{branch}");
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .any(|record| record == wanted.as_bytes()))
+    Ok(output.stdout.split(|byte| *byte == 0).any(|record| {
+        if cfg!(windows) {
+            record.eq_ignore_ascii_case(wanted.as_bytes())
+        } else {
+            record == wanted.as_bytes()
+        }
+    }))
 }
 
 async fn worktree_registered(git: &GitProbe, root: &Path, path: &Path) -> Result<bool> {
@@ -322,11 +305,23 @@ async fn worktree_registered(git: &GitProbe, root: &Path, path: &Path) -> Result
             "Git could not verify temporary worktree ownership",
         ));
     }
-    let wanted = path_text(path)?.as_bytes();
+    let wanted = path_text(path)?;
     Ok(output.stdout.split(|byte| *byte == 0).any(|record| {
         record
             .strip_prefix(b"worktree ")
-            .is_some_and(|found| found == wanted)
+            .and_then(|found| std::str::from_utf8(found).ok())
+            .is_some_and(|found| {
+                #[cfg(windows)]
+                {
+                    eliot_core::display_path(found)
+                        .replace('\\', "/")
+                        .eq_ignore_ascii_case(&eliot_core::display_path(wanted).replace('\\', "/"))
+                }
+                #[cfg(not(windows))]
+                {
+                    found == wanted
+                }
+            })
     }))
 }
 
@@ -469,6 +464,7 @@ async fn conflict_paths(
     .await?;
     let mut paths = Vec::new();
     let mut truncated = false;
+    let mut bytes_used = 0;
     for record in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
@@ -477,12 +473,15 @@ async fn conflict_paths(
             truncated = true;
             break;
         }
-        let path =
-            std::str::from_utf8(record).map_err(|_| unavailable("a conflict path is not UTF-8"))?;
-        if path.is_empty() || path.len() > 4_096 {
+        let Ok(path) = std::str::from_utf8(record) else {
+            truncated = true;
+            continue;
+        };
+        if bytes_used + path.len() > MAX_CONFLICT_PATH_BYTES {
             truncated = true;
             continue;
         }
+        bytes_used += path.len();
         paths.push(path.to_owned());
     }
     Ok((paths, truncated))
@@ -540,7 +539,9 @@ async fn merge_branch(
             Err(_) => MergeResult::Unknown("git_integrate_merge_readback_unknown"),
         },
         Some(_) => match conflict_paths(git, root, index, deadline).await {
-            Ok((paths, truncated)) if !paths.is_empty() => MergeResult::Conflict(paths, truncated),
+            Ok((paths, truncated)) if !paths.is_empty() || truncated => {
+                MergeResult::Conflict(paths, truncated)
+            }
             Ok(_) => MergeResult::Failed("git_integrate_merge_failed"),
             Err(_) => MergeResult::Unknown("git_integrate_conflict_readback_unknown"),
         },
@@ -629,6 +630,30 @@ struct IsolationResult {
     unknown: Vec<String>,
 }
 
+#[derive(Clone, Copy)]
+struct GitRun<'a> {
+    deadline: Instant,
+    policy: &'a Arc<SecretPolicy>,
+    cancellation: &'a watch::Receiver<bool>,
+}
+
+async fn verify_private_worktree(
+    git: &GitProbe,
+    root: &Path,
+    expected_common_dir: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let root_text = path_text(root)?;
+    let (workspace, common_dir) = WorkspaceGit::new()?.repository_identity(root_text).await?;
+    let head = git
+        .workspace_command(root, &["symbolic-ref", "-q", "HEAD"], deadline)
+        .await?;
+    if workspace != root_text || common_dir != expected_common_dir || head.code != 1 {
+        return Err(unavailable("private integration worktree identity changed"));
+    }
+    Ok(())
+}
+
 async fn isolate_failed_branches(
     git: &GitProbe,
     root: &Path,
@@ -636,10 +661,13 @@ async fn isolate_failed_branches(
     frozen: &FrozenGitIntegrate,
     check_argv: &[String],
     check_timeout_ms: i64,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> std::result::Result<IsolationResult, &'static str> {
+    let GitRun {
+        deadline,
+        policy,
+        cancellation,
+    } = run;
     let mut result = IsolationResult {
         failed: Vec::new(),
         unknown: Vec::new(),
@@ -653,13 +681,16 @@ async fn isolate_failed_branches(
             );
             return Ok(result);
         }
+        verify_private_worktree(git, root, &frozen.common_dir, deadline)
+            .await
+            .map_err(|_| "git_integrate_isolation_worktree_changed")?;
         reset_to_base(
             git,
             root,
             index,
             &frozen.base_oid,
             deadline,
-            Arc::clone(&policy),
+            Arc::clone(policy),
             cancellation.clone(),
         )
         .await
@@ -670,7 +701,7 @@ async fn isolate_failed_branches(
             index,
             pin,
             deadline,
-            Arc::clone(&policy),
+            Arc::clone(policy),
             cancellation.clone(),
         )
         .await
@@ -685,7 +716,7 @@ async fn isolate_failed_branches(
                     root,
                     index,
                     deadline,
-                    Arc::clone(&policy),
+                    Arc::clone(policy),
                     cancellation.clone(),
                 )
                 .await
@@ -799,10 +830,13 @@ async fn update_fast_forward(
     index: &Path,
     frozen: &FrozenGitIntegrate,
     integration_oid: &str,
-    deadline: Instant,
-    policy: Arc<SecretPolicy>,
-    cancellation: watch::Receiver<bool>,
+    run: GitRun<'_>,
 ) -> std::result::Result<GitIntegrateRefUpdate, TargetUpdateFailure> {
+    let GitRun {
+        deadline,
+        policy,
+        cancellation,
+    } = run;
     let Some(target) = &frozen.fast_forward else {
         return Err(TargetUpdateFailure {
             code: "git_integrate_target_missing",
@@ -883,8 +917,8 @@ async fn update_fast_forward(
         &args,
         index,
         deadline,
-        Arc::clone(&policy),
-        cancellation,
+        Arc::clone(policy),
+        cancellation.clone(),
     )
     .await
     {
@@ -937,7 +971,6 @@ async fn update_fast_forward(
 }
 pub(crate) async fn execute(
     data_root: &Path,
-    command_id: &str,
     frozen: &FrozenGitIntegrate,
     registration: &ProjectRegistrationView,
     cancellation: watch::Receiver<bool>,
@@ -999,7 +1032,7 @@ pub(crate) async fn execute(
     };
     let repo = Path::new(&frozen.canonical_checkout);
     let preflight_deadline = Instant::now() + REF_READ_BUDGET;
-    match resolve_branch_oid(&git, repo, &frozen.base_branch).await {
+    match current_branch_oid(&git, repo, &frozen.base_branch, preflight_deadline).await {
         Ok(oid) if oid == frozen.base_oid => {}
         Ok(_) => {
             result.failure_code = Some("git_integrate_base_ref_moved".to_owned());
@@ -1011,7 +1044,7 @@ pub(crate) async fn execute(
         }
     }
     for pin in &frozen.branches {
-        match resolve_branch_oid(&git, repo, &pin.branch).await {
+        match current_branch_oid(&git, repo, &pin.branch, preflight_deadline).await {
             Ok(oid) if oid == pin.oid => {}
             Ok(_) => {
                 result.failure_code = Some("git_integrate_source_ref_moved".to_owned());
@@ -1024,7 +1057,7 @@ pub(crate) async fn execute(
         }
     }
     if let Some(target) = &frozen.fast_forward {
-        match resolve_branch_oid(&git, repo, &target.branch).await {
+        match current_branch_oid(&git, repo, &target.branch, preflight_deadline).await {
             Ok(oid) if oid == target.expected_oid => {}
             Ok(_) => {
                 result.failure_code = Some("git_integrate_target_ref_moved".to_owned());
@@ -1043,25 +1076,6 @@ pub(crate) async fn execute(
             }
             Err(_) => {
                 result.failure_code = Some("git_integrate_target_checkout_unknown".to_owned());
-                return execution(frozen, CommandState::Unknown, result, None);
-            }
-        }
-        match branch_is_ancestor(
-            &git,
-            repo,
-            &target.expected_oid,
-            &frozen.base_oid,
-            preflight_deadline,
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                result.failure_code = Some("git_integrate_target_not_fast_forwardable".to_owned());
-                return execution(frozen, CommandState::Rejected, result, None);
-            }
-            Err(_) => {
-                result.failure_code = Some("git_integrate_target_ancestry_unknown".to_owned());
                 return execution(frozen, CommandState::Unknown, result, None);
             }
         }
@@ -1090,17 +1104,19 @@ pub(crate) async fn execute(
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(frozen.timeout_ms as u64))
         .unwrap_or_else(Instant::now);
-    let temporary = match TemporaryWorktree::create(data_root, command_id) {
+    let run = GitRun {
+        deadline,
+        policy: &secret_policy,
+        cancellation: &cancellation,
+    };
+    let temporary = match TemporaryWorktree::create(data_root) {
         Ok(temporary) => temporary,
         Err(_) => {
             result.failure_code = Some("git_integrate_private_worktree_unavailable".to_owned());
             return execution(frozen, CommandState::Rejected, result, None);
         }
     };
-    let index = match TemporaryGitIndex::create_with_prefix(
-        data_root,
-        &format!("git-integrate-index-{command_id}"),
-    ) {
+    let index = match TemporaryGitIndex::create_with_prefix(data_root, "git-integrate-index") {
         Ok(index) => index,
         Err(_) => {
             let _ = temporary.cleanup_root();
@@ -1171,6 +1187,14 @@ pub(crate) async fn execute(
         return execution(frozen, CommandState::Unknown, result, None);
     }
 
+    if verify_private_worktree(&git, temporary_root, &frozen.common_dir, deadline)
+        .await
+        .is_err()
+    {
+        std::mem::forget(index);
+        result.failure_code = Some("git_integrate_private_worktree_unverified".to_owned());
+        return execution(frozen, CommandState::Unknown, result, None);
+    }
     let reset_args = ["reset", "--hard", frozen.base_oid.as_str()];
     let reset = match run_git_effect(
         &git,
@@ -1348,9 +1372,7 @@ pub(crate) async fn execute(
                 frozen,
                 &check.argv,
                 check.deadline_ms,
-                deadline,
-                Arc::clone(&secret_policy),
-                cancellation.clone(),
+                run,
             )
             .await;
             let isolation = match isolation {
@@ -1421,8 +1443,19 @@ pub(crate) async fn execute(
         }
     }
 
-    result.status = GitIntegrateStatus::Merged;
-    result.integration_oid = Some(integration_oid.clone());
+    let checked_tree_intact =
+        verify_private_worktree(&git, temporary_root, &frozen.common_dir, deadline)
+            .await
+            .is_ok()
+            && verify_private_tree(
+                &git,
+                temporary_root,
+                index.path(),
+                &integration_oid,
+                deadline,
+            )
+            .await
+            .is_ok();
     if cleanup_temporary_worktree(
         &git,
         repo_root,
@@ -1440,24 +1473,22 @@ pub(crate) async fn execute(
         result.failure_code = Some("git_integrate_cleanup_unknown".to_owned());
         return execution(frozen, CommandState::Unknown, result, None);
     }
+    if !checked_tree_intact {
+        result.failure_code = Some("git_integrate_checked_tree_changed".to_owned());
+        return execution(frozen, CommandState::Failed, result, None);
+    }
+    result.status = GitIntegrateStatus::Merged;
+    result.integration_oid = Some(integration_oid.clone());
 
     if frozen.fast_forward.is_some() {
-        match update_fast_forward(
-            &git,
-            repo_root,
-            index.path(),
-            frozen,
-            &integration_oid,
-            deadline,
-            Arc::clone(&secret_policy),
-            cancellation,
-        )
-        .await
+        match update_fast_forward(&git, repo_root, index.path(), frozen, &integration_oid, run)
+            .await
         {
             Ok(update) => result.fast_forward = Some(update),
             Err(failure) => {
                 result.failure_code = Some(failure.code.to_owned());
                 let state = if failure.unknown {
+                    result.status = GitIntegrateStatus::Unknown;
                     CommandState::Unknown
                 } else {
                     CommandState::Failed
