@@ -606,12 +606,10 @@ pub struct NativeErrorNotification {
 /// One per-update token breakdown from installed 0.167.1
 /// `thread/tokenUsage/updated` (`tokenUsage.last` / `tokenUsage.total`).
 /// `total` is the cumulative per-thread snapshot (accumulated session
-/// spend). `last.total_tokens` is the latest active context size per
-/// upstream TUI `tokens_in_context_window` (for `last_token_usage`),
-/// not a per-response delta and not the whole turn. `modelContextWindow`
-/// is capacity:
-/// neither is per-turn expenditure and neither is mapped to turn usage
-/// directly; the turn total is `total` minus the turn-start baseline.
+/// spend). For a model response, `last` carries that response's usage.
+/// Codex's TUI uses the latest response total for context occupancy.
+/// The protocol also emits synthetic window-fill updates with a total
+/// but zero input/output components.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTokenUsageDelta {
@@ -629,13 +627,18 @@ pub struct NativeTokenUsageDelta {
     pub cache_write_input_tokens: Option<i64>,
 }
 
+impl NativeTokenUsageDelta {
+    pub(crate) fn has_response_counters(&self) -> bool {
+        [self.input_tokens, self.output_tokens]
+            .into_iter()
+            .flatten()
+            .any(|tokens| tokens > 0)
+    }
+}
+
 /// Fresh `thread/tokenUsage/updated` notification (required: threadId +
-/// turnId + tokenUsage). `tokenUsage.last.total_tokens` is the latest
-/// active context size (occupancy); `tokenUsage.total` is the cumulative
-/// per-thread spend snapshot. Turn expenditure derives from `total`
-/// against the turn-start baseline, never from raw `last`.
-/// `modelContextWindow` (capacity) stays unmapped so context
-/// occupancy can never read as turn tokens.
+/// turnId + tokenUsage). Turn expenditure derives from cumulative
+/// `tokenUsage.total` against the turn-start baseline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeThreadTokenUsageUpdatedNotification {
@@ -644,9 +647,7 @@ pub struct NativeThreadTokenUsageUpdatedNotification {
     pub token_usage: NativeThreadTokenUsage,
 }
 
-/// Installed 0.167.1 `ThreadTokenUsage` body: `last.total_tokens` is the
-/// latest active context size for `turnId` (occupancy), `total` the
-/// cumulative per-thread spend snapshot.
+/// Installed 0.167.1 `ThreadTokenUsage` body with latest usage and window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeThreadTokenUsage {

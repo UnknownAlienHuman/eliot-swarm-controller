@@ -881,15 +881,15 @@ CREATE TABLE git_workspaces (
 `turn.completed` `data.usage`: `scope` names the native attribution (`message` for one
 assistant message with its `message_id`, `main_loop_turn` for one turn's main-loop-only
 usage with `message_id` null, `turn` for one turn's aggregate or per-turn-delta
-usage with `message_id` null), token members stay null when unavailable, and
-a present value replaces rather than sums. Context occupancy/capacity and
-cumulative session cost are separate session-scoped facts: they are never
-written here and never fill `input_tokens`/`total_tokens` (compaction can
-reduce occupancy, and cumulative cost needs its own unit). Missing per-turn
-counters stay null. `total_tokens` is set only when the native signal
-supplies a turn-scoped total, never derived from other members. Session facts
-never derive per-turn usage: a terminal with no native turn counters keeps
-null usage even when session facts exist for that generation.
+usage with `message_id` null). Store retains the adapter counters and projects
+them on reads using one accounting basis, including for retained history.
+`input_tokens` is uncached input, including cache creation. `cache_read_tokens`
+is cached input. `output_tokens` includes reasoning, and `reasoning_tokens`
+names that part of output when supplied. `cache_write_tokens` describes the
+portion written to cache. `total_tokens` is uncached input + cached input +
+output when all three are proven. Reported subtotals carry explicit coverage.
+Context occupancy and cumulative cost belong to session facts. A terminal
+without native turn counters keeps null usage.
 
 `session_usage` retains only the latest serialized `SessionUsage` snapshot
 per Agent generation, committed from `session.usage` `data.usage` (`source`
@@ -898,8 +898,10 @@ milliseconds defaulted at the owning boundary). A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
-and capacity, `cumulative_tokens` carries only input/output/cache counters
-where supplied (never a derived total), and `cumulative_cost` carries the
+and capacity from the same native observation. Occupancy is available for
+a positive window with a value between zero and that window. `cumulative_tokens`
+projects input/output/cache counters on the same accounting basis as turns,
+and `cumulative_cost` carries the
 verbatim native amount with its verbatim native unit (for example
 `usd_estimate` for an estimated USD total), never converted and never
 assumed to be money. There is no history table and no rollup: only the
@@ -907,8 +909,11 @@ latest snapshot reads back, through `agent.get`/`agent.stats`
 `session_usage` in its own session-scope section.
 
 `usage.summary` is the one bounded totals read over one scope: one Agent
-(all retained generations, or one named generation), one project label, or
-one tree (a root Agent and its descendants). It reports known subtotals with
+(all retained generations, or one named generation, with observed native
+descendants registered under those generations), one project label, or one
+tree (a root Agent and its descendants). Scope expansion respects the caller's
+read authority, and each included (Agent, generation) pair counts once.
+It reports known subtotals with
 explicit coverage and never presents a partial sum as complete. Turn
 expenditure sums each `TurnUsage` counter over retained terminal turns that
 supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,

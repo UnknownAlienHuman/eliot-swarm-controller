@@ -4481,30 +4481,22 @@ impl Router {
                             target,
                             request.generation,
                         )?;
-                        (resolved.pairs, resolved.agents_included)
-                    } else {
-                        if request.root.is_some() {
-                            hierarchy::authorize_agent_read(
-                                &store,
-                                principal,
-                                request.root.as_deref().expect("root scope present"),
-                                None,
-                            )?;
-                        }
-                        let caller = store.get_agent(id)?.ok_or_else(|| {
-                            Error::new("not_found", format!("Agent {id} was not found"))
-                        })?;
-                        let mut pairs = Vec::new();
-                        let mut agents = HashSet::new();
-                        for (num, generation) in &resolved.pairs {
-                            let target = format!("a{num}");
-                            if target == *id || store.agent_in_scope(&caller, &target)? {
-                                agents.insert(*num);
-                                pairs.push((*num, *generation));
-                            }
-                        }
-                        (pairs, agents.len())
+                    } else if let Some(root) = request.root.as_deref() {
+                        hierarchy::authorize_agent_read(&store, principal, root, None)?;
                     }
+                    let caller = store.get_agent(id)?.ok_or_else(|| {
+                        Error::new("not_found", format!("Agent {id} was not found"))
+                    })?;
+                    let mut pairs = Vec::new();
+                    let mut agents = HashSet::new();
+                    for (num, generation) in resolved.pairs {
+                        let target = format!("a{num}");
+                        if target == *id || store.agent_in_scope(&caller, &target)? {
+                            agents.insert(num);
+                            pairs.push((num, generation));
+                        }
+                    }
+                    (pairs, agents.len())
                 }
                 Principal::Run { .. }
                 | Principal::ProjectRule { .. }

@@ -310,7 +310,8 @@ impl Store {
             }
             None => (None, None, None, None),
         };
-        let (usage, usage_scope) = match turn_usage {
+        let (usage, usage_scope) = match turn_usage.filter(|usage| usage.reported_total().is_some())
+        {
             Some(usage) => (Some(usage), Some("turn".to_owned())),
             None => {
                 let fallback = self
@@ -470,7 +471,9 @@ impl Store {
                 None => TurnOutcome::classify_legacy_status_for_harness(harness, status.as_deref()),
             };
             let outcome = source.map_or(canonical, |source| source.reported_outcome(canonical));
-            let usage = usage.map(|value| decode_turn_usage(&value)).transpose()?;
+            let usage = usage
+                .map(|value| decode_turn_usage(&value, harness))
+                .transpose()?;
             Ok((turn_id, outcome, source, usage))
         })
         .transpose()

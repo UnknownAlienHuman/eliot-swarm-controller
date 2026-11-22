@@ -1784,6 +1784,7 @@ impl EventProcessor {
             })?;
         validate_thread_and_turn(&self.status, &notification.thread_id, &notification.turn_id)?;
         if self.status.active_turn_id.as_deref() == Some(notification.turn_id.as_str())
+            && notification.token_usage.last.has_response_counters()
             && let Some(total) = notification.token_usage.total.clone()
         {
             match self.turn_usage.as_mut() {
@@ -2294,12 +2295,7 @@ fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
 /// Merge one `thread/tokenUsage/updated` body into the retained session
 /// snapshot: the cumulative per-thread `total` replaces the retained
 /// cumulative counters (input/output/cache only, never a derived total),
-/// `last.total_tokens` (the latest active context size per upstream TUI
-/// `tokens_in_context_window`) replaces the retained occupancy, and
-/// `modelContextWindow` replaces the retained capacity. Yields `None` when
-/// the update contributes nothing new, so repeats commit nothing. Negative
-/// counters stay null (never zero); an update with no usable cumulative
-/// or occupancy content keeps the retained snapshot.
+/// Codex's latest response total and window are read from the same frame.
 fn session_usage_from_token_usage(
     token_usage: &NativeThreadTokenUsage,
     previous: Option<&SessionUsage>,
@@ -2315,7 +2311,10 @@ fn session_usage_from_token_usage(
         observed_at: None,
     });
     let mut changed = false;
-    if let Some(total) = &token_usage.total {
+    let last = &token_usage.last;
+    if last.has_response_counters()
+        && let Some(total) = &token_usage.total
+    {
         let totals = SessionTokenTotals {
             input_tokens: counter(total.input_tokens),
             output_tokens: counter(total.output_tokens),
@@ -2332,20 +2331,14 @@ fn session_usage_from_token_usage(
             changed = true;
         }
     }
-    // Occupancy is the latest active context size from `last.total_tokens`
-    // (upstream TUI `last_token_usage`), never the accumulated `total`.
-    if let Some(used) = counter(token_usage.last.total_tokens)
-        && merged.context_used_tokens != Some(used)
-    {
-        merged.context_used_tokens = Some(used);
-        changed = true;
-    }
-    if let Some(window) = counter(token_usage.model_context_window)
-        && merged.context_window_tokens != Some(window)
-    {
-        merged.context_window_tokens = Some(window);
-        changed = true;
-    }
+    let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
+    merged.context_used_tokens = last
+        .has_response_counters()
+        .then_some(last.total_tokens)
+        .flatten();
+    merged.context_window_tokens = token_usage.model_context_window;
+    merged.retain_valid_context();
+    changed |= previous_context != (merged.context_used_tokens, merged.context_window_tokens);
     if !changed {
         return None;
     }

@@ -3067,9 +3067,8 @@ fn terminal_turn_data(
 /// text is the concatenated assistant text parts strictly between the
 /// two in newest-first page order, reversed to chronological order
 /// with each message's native `content` array order preserved (page
-/// position decides; timestamps never reorder it). Usage is the
-/// final assistant message's native token usage in that same exact
-/// user-to-selected-idle slice, attributed at message scope.
+/// position decides; timestamps never reorder it). Usage sums distinct
+/// assistant messages in that same exact user-to-selected-idle slice.
 /// A healthy read with the exact user message and no newer idle proves
 /// running. A missing user message, invalid history or HTTP failure does
 /// not establish either state.
@@ -3084,7 +3083,7 @@ pub(crate) async fn read_turn_messages(
     let mut user_position: Option<usize> = None;
     let mut idle: Option<(String, String, Option<StructuredError>, usize)> = None;
     let mut assistant_messages: Vec<(usize, Vec<String>)> = Vec::new();
-    let mut usages: HashMap<String, (usize, i64, Option<AssistantTokens>)> = HashMap::new();
+    let mut usages: HashMap<String, (usize, Option<AssistantTokens>)> = HashMap::new();
     let mut position: usize = 0;
     for _ in 0..MAX_MESSAGE_PAGES {
         let page = http
@@ -3113,12 +3112,9 @@ pub(crate) async fn read_turn_messages(
                         }
                     }
                     assistant_messages.push((position, message_text));
-                    // A repeated message id replaces its usage; repeated
-                    // observations are never summed.
-                    usages.insert(
-                        assistant.id.clone(),
-                        (position, assistant.time.created, assistant.tokens.clone()),
-                    );
+                    usages
+                        .entry(assistant.id.clone())
+                        .or_insert_with(|| (position, assistant.tokens.clone()));
                 }
                 Message::Idle(idle_message) if idle.is_none() => {
                     // Newest-first: the first idle seen before our
@@ -3177,7 +3173,7 @@ pub(crate) async fn read_turn_messages(
         },
         idle_error,
         final_text,
-        usage: final_message_usage(&usages, idle_position, user_position),
+        usage: main_loop_usage(&usages, idle_position, user_position),
     })))
 }
 
@@ -3214,32 +3210,49 @@ fn project_terminal_text(
     }
 }
 
-/// The newest assistant message in the exact user-to-selected-idle slice
-/// contributes its native token usage at message scope. The slice is the
-/// newest-first page order strictly between our input and the selected
-/// idle. No assistant message in it, or no native tokens on the newest
-/// one, means unavailable usage — never an earlier message's usage, never
-/// a sum, never zero.
-fn final_message_usage(
-    usages: &HashMap<String, (usize, i64, Option<AssistantTokens>)>,
+/// A counter is proven only when every assistant message in the slice
+/// supplies it. The Store normalizes these vendor counters on read.
+fn main_loop_usage(
+    usages: &HashMap<String, (usize, Option<AssistantTokens>)>,
     idle_position: usize,
     user_position: usize,
 ) -> Option<TurnUsage> {
-    let (id, (_, _, tokens)) = usages
-        .iter()
-        .filter(|(_, (position, _, _))| *position > idle_position && *position < user_position)
-        .max_by(|(left_id, (_, left, _)), (right_id, (_, right, _))| {
-            (left, left_id).cmp(&(right, right_id))
-        })?;
-    tokens.as_ref().map(|tokens| TurnUsage {
-        scope: Some("message".to_owned()),
-        message_id: Some(id.clone()),
-        input_tokens: tokens.input,
-        output_tokens: tokens.output,
-        reasoning_tokens: tokens.reasoning,
+    let messages = usages
+        .values()
+        .filter(|(position, _)| *position > idle_position && *position < user_position);
+    let sum = |counter: fn(&AssistantTokens) -> Option<i64>| {
+        let mut values = messages
+            .clone()
+            .map(|(_, tokens)| tokens.as_ref().and_then(counter));
+        let first = values.next()??;
+        values.try_fold(first, |sum, value| sum.checked_add(value?))
+    };
+    let input_tokens = sum(|tokens| tokens.input);
+    let output_tokens = sum(|tokens| tokens.output);
+    let reasoning_tokens = sum(|tokens| tokens.reasoning);
+    let cache_read_tokens = sum(|tokens| tokens.cache.as_ref()?.read);
+    let cache_write_tokens = sum(|tokens| tokens.cache.as_ref()?.write);
+    if [
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+    ]
+    .into_iter()
+    .all(|counter| counter.is_none())
+    {
+        return None;
+    }
+    Some(TurnUsage {
+        scope: Some("main_loop_turn".to_owned()),
+        message_id: None,
+        input_tokens,
+        output_tokens,
+        reasoning_tokens,
         thinking_tokens: None,
-        cache_read_tokens: tokens.cache.as_ref().and_then(|cache| cache.read),
-        cache_write_tokens: tokens.cache.as_ref().and_then(|cache| cache.write),
+        cache_read_tokens,
+        cache_write_tokens,
         total_tokens: None,
     })
 }

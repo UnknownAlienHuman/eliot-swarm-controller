@@ -279,7 +279,7 @@ fn elapsed_time(milliseconds: i64) -> String {
 /// `usage` where available. Success requires native evidence.
 /// When the newest terminal turn carries no native turn usage, `usage` falls
 /// back to the generation's latest retained `session.usage` snapshot
-/// (cumulative input/output/cache counters only, never a derived total) with
+/// (cumulative normalized counters) with
 /// `usage_scope` set to `"session"`; turn-backed usage carries `"turn"`.
 /// A session fallback is a fleet-visibility signal, never turn expenditure:
 /// the inner `usage.scope` is `"session"` and per-turn accounting stays on
@@ -619,35 +619,24 @@ impl AgentSummary {
 
     /// Fleet token count for this summary plus its provenance scope:
     /// `"turn"` for the newest terminal turn's native turn usage,
-    /// `"session"` for the session-snapshot fallback. The count is the
-    /// native total when the harness supplies one, otherwise the
-    /// input+output sum as a fleet signal (never a native total; cache
-    /// counters cover the remainder when neither is present). `None` when
-    /// the summary carries no usage. Every fleet surface (`swarm ls`,
-    /// `swarm top`, desktop monitor) derives its cell from this one
-    /// method so a session fallback can never pass as turn usage.
+    /// `"session"` for the session-snapshot fallback. Every fleet surface
+    /// sums the available uncached input, cached input and output.
     pub fn fleet_usage(&self) -> Option<(i64, &'static str)> {
         let usage = self.usage.as_ref()?;
-        let tokens =
-            usage
-                .total_tokens
-                .or_else(|| match (usage.input_tokens, usage.output_tokens) {
-                    (Some(input), Some(output)) => input.checked_add(output),
-                    (Some(input), None) => Some(input),
-                    (None, Some(output)) => Some(output),
-                    (None, None) => usage
-                        .cache_read_tokens
-                        .unwrap_or(0)
-                        .checked_add(usage.cache_write_tokens.unwrap_or(0))
-                        .filter(|_| {
-                            usage.cache_read_tokens.is_some() || usage.cache_write_tokens.is_some()
-                        }),
-                })?;
+        let tokens = usage.reported_total()?;
         let scope = match self.usage_scope.as_deref() {
             Some("session") => "session",
             _ => "turn",
         };
         Some((tokens, scope))
+    }
+
+    pub fn fleet_usage_is_partial(&self) -> bool {
+        self.usage.as_ref().is_some_and(|usage| {
+            usage.input_tokens.is_none()
+                || usage.cache_read_tokens.is_none()
+                || usage.output_tokens.is_none()
+        })
     }
 
     /// Human-readable fleet STATE cell. A native child that ended with its

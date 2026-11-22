@@ -1534,10 +1534,10 @@ per-call total when scope is unknown.
 
 `usage.summary` reads bounded usage totals with explicit coverage over
 exactly one of `agent` (with an optional `generation`; omitted covers all
-retained generations), `project`, or `root` (the root Agent and its
+retained generations and their registered native descendants), `project`, or `root` (the root Agent and its
 descendants). The same read authorization as the other Agent reads applies:
 an Agent principal sees only what its frozen scope allows. The response
-echoes the scope, reports the included Agent/generation counts with explicit
+echoes the scope, reports the included Agent, observed-native Agent and generation counts with explicit
 `truncated`, states `history_complete` with its reason and the
 `pruned_through` watermark, groups turn expenditure by native scope with
 `turns_counted`/`turns_without_usage`/per-counter `turns_missing` (no

@@ -99,8 +99,9 @@ fn normalize_turn_scope(scope: &Option<String>) -> String {
 impl Store {
     /// Resolve one usage scope to its retained (agent, generation) pairs.
     /// Agent scope covers every retained generation unless the request names
-    /// one; project and tree scopes cover every retained generation of each
-    /// included Agent. Expansion stops at the hierarchy fanout bound and
+    /// one, and the native descendants observed under those generations.
+    /// Project and tree scopes cover every generation of each included Agent.
+    /// Expansion stops at the hierarchy fanout bound and
     /// reports truncation. No authorization happens here; the Router filters
     /// these pairs against the caller's frozen scope before summarizing.
     pub fn resolve_usage_scope(&self, request: &UsageSummaryRequest) -> Result<ResolvedUsageScope> {
@@ -110,25 +111,20 @@ impl Store {
             let num = parse_agent_id(agent)?;
             let row = load_agent_by_num(&self.connection, num)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {agent} was not found")))?;
-            if let Some(generation) = request.generation {
-                return Ok(ResolvedUsageScope {
-                    pairs: vec![(num, generation)],
-                    agents_included: 1,
-                    truncated: false,
-                });
-            }
-            let mut generations = BTreeSet::new();
-            generations.insert(row.generation);
-            for generation in self.retained_generations(&[num])? {
-                generations.insert(generation.1);
-            }
+            let mut pairs = if let Some(generation) = request.generation {
+                vec![(num, generation)]
+            } else {
+                self.resolve_agent_scope(vec![(num, row.generation)])?.pairs
+            };
+            let mut children = self.usage_native_descendants(num, request.generation, bound)?;
+            let truncated = children.len() as i64 >= bound;
+            children.truncate(bound.saturating_sub(1).max(0) as usize);
+            let agents_included = 1 + children.len();
+            pairs.extend(children);
             return Ok(ResolvedUsageScope {
-                pairs: generations
-                    .into_iter()
-                    .map(|generation| (num, generation))
-                    .collect(),
-                agents_included: 1,
-                truncated: false,
+                pairs,
+                agents_included,
+                truncated,
             });
         }
         if let Some(project) = request.project.as_deref() {
@@ -178,6 +174,36 @@ impl Store {
             agents_included: nums.len(),
             truncated: false,
         })
+    }
+
+    fn usage_native_descendants(
+        &self,
+        parent: i64,
+        generation: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH RECURSIVE native(id, generation) AS (
+                SELECT r.child, a.generation FROM native_child_registrations r
+                JOIN agents a ON a.id = r.child
+                WHERE r.parent = ?1 AND (?2 IS NULL OR r.parent_generation = ?2)
+                UNION
+                SELECT r.child, a.generation FROM native_child_registrations r
+                JOIN native n ON n.id = r.parent AND n.generation = r.parent_generation
+                JOIN agents a ON a.id = r.child
+             )
+             SELECT id, generation FROM native ORDER BY id LIMIT ?3",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(params![parent, generation, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
     }
 
     fn usage_agents_by_project(
@@ -258,12 +284,26 @@ impl Store {
         let mut overall_supplied = [0_usize; TURN_COUNTERS];
         let mut overall_sums = [0_i128; TURN_COUNTERS];
         let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
+        let mut observed_native_agents = 0i64;
         if !wanted.is_empty() {
             let nums: BTreeSet<i64> = wanted.iter().map(|(num, _)| *num).collect();
             let nums: Vec<i64> = nums.into_iter().collect();
             let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            observed_native_agents = self
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM agents
+                          WHERE id IN ({placeholders}) AND origin = 'native' AND observe_only = 1"
+                    ),
+                    params_from_iter(nums.iter()),
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
             let sql = format!(
-                "SELECT agent, generation, state, usage FROM turns WHERE agent IN ({placeholders})"
+                "SELECT t.agent, t.generation, t.state, t.usage, a.harness
+                 FROM turns t JOIN agents a ON a.id = t.agent
+                 WHERE t.agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
@@ -273,11 +313,12 @@ impl Store {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, state, usage) = row.map_err(sql_error)?;
+                let (agent, generation, state, usage, harness) = row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
                 }
@@ -298,7 +339,7 @@ impl Store {
                     turns_without_usage += 1;
                     continue;
                 };
-                let usage = decode_turn_usage(&usage)?;
+                let usage = decode_turn_usage(&usage, &harness)?;
                 let accum = scopes
                     .entry(normalize_turn_scope(&usage.scope))
                     .or_default();
@@ -327,6 +368,7 @@ impl Store {
         Ok(UsageSummaryResponse {
             scope,
             agents_included,
+            observed_native_agents: observed_native_agents as usize,
             generations_included: wanted.len(),
             truncated,
             history_complete,
@@ -379,7 +421,9 @@ impl Store {
             let nums: Vec<i64> = nums.into_iter().collect();
             let placeholders = nums.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
-                "SELECT agent, generation, snapshot FROM session_usage WHERE agent IN ({placeholders})"
+                "SELECT s.agent, s.generation, s.snapshot, a.harness
+                     FROM session_usage s JOIN agents a ON a.id = s.agent
+                     WHERE s.agent IN ({placeholders})"
             );
             let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
             let rows = statement
@@ -388,15 +432,16 @@ impl Store {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(sql_error)?;
             for row in rows {
-                let (agent, generation, snapshot) = row.map_err(sql_error)?;
+                let (agent, generation, snapshot, harness) = row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
                 }
-                let usage = decode_session_usage(&snapshot)?;
+                let usage = decode_session_usage(&snapshot, &harness)?;
                 chain.push((agent, generation, usage));
             }
         }

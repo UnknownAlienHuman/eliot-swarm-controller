@@ -620,11 +620,7 @@ pub fn evaluate_session_growth(
             basis: SessionGrowthBasis::SessionFileBytes { bytes },
         });
     }
-    if let Some(usage) = usage
-        && let (Some(used), Some(window)) = (usage.context_used_tokens, usage.context_window_tokens)
-        && window > 0
-        && used >= 0
-    {
+    if let Some((used, window)) = usage.and_then(SessionUsage::context_tokens) {
         let ratio = used as f64 / window as f64;
         if ratio >= thresholds.context_ratio {
             let hint = compact_hint_for_harness(harness);
