@@ -122,6 +122,7 @@ pub(super) fn persist_turn_fact(
         effective_model: None,
         native_error_message: None,
     });
+    let mut terminal_usage = None;
     match event.kind.as_str() {
         "turn.started" => {
             if turn.state == TurnState::Completed {
@@ -181,9 +182,7 @@ pub(super) fn persist_turn_fact(
             if let Some(text) = optional_text(&event.data, "final_text")? {
                 turn.final_text = Some(text.to_owned());
             }
-            if let Some(usage) = optional_turn_usage(&event.data)? {
-                turn.usage = Some(usage);
-            }
+            terminal_usage = optional_turn_usage(&event.data)?;
         }
         "message.completed" => {
             if turn.state != TurnState::Completed
@@ -195,7 +194,7 @@ pub(super) fn persist_turn_fact(
         }
         _ => return Ok(()),
     }
-    let usage = turn.usage.as_ref().map(encode_json).transpose()?;
+    let usage = terminal_usage.as_ref().map(encode_json).transpose()?;
     if existing.is_none() {
         insert_turn(
             tx,

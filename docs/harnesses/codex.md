@@ -509,7 +509,8 @@ window. The Store removes cache hits from Codex's cache-inclusive
 cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
 counters stay null. Idle updates merge and commit without waiting for a
 terminal. Registered native child threads use independent baselines bound to
-their exact thread and active turn. Their terminal event carries the resulting+turn delta once into the child's retained turn row; turn usage remains separate+from session snapshots and child lifecycle state.
+their exact thread and active turn. Their terminal event carries the resulting
+delta once into the child's retained turn row.
 
 ## Recovery and later capabilities
 

@@ -1,9 +1,7 @@
 //! Codex child-event registration, buffering and settlement.
 //!
 //! Parent turns own their facts; this module owns child-thread tracking,
-//! child usage attribution, child-frame buffering and child-gap settlement
-//! behind narrow `pub(super)` interfaces. Pure move from `super`: signatures,
-//! transactions, locking and event order unchanged.
+//! usage attribution, frame buffering and gap settlement for child threads.
 use super::*;
 /// Bound on tracked child threads, unconfirmed threads and in-flight spawns per
 /// generation; overflow is a source gap.
@@ -1078,7 +1076,9 @@ impl EventProcessor {
             .child_states
             .get_mut(child_thread)
             .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-        if state.active_turn_id.as_deref() != Some(notification.turn_id.as_str()) {
+        if state.active_turn_id.as_deref() != Some(notification.turn_id.as_str())
+            || !notification.token_usage.last.has_response_counters()
+        {
             // A late or stale update must never bind to another child turn.
             return Ok(());
         }
