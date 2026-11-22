@@ -119,7 +119,9 @@ impl Router {
                 self.submit(&action, &Principal::Owner, "daemon.session_growth")
                     .await?;
             } else {
-                self.swarm_switch(&action, &Principal::Owner, None).await?;
+                let authority = eliot_core::provider_switch_authority(&agent.profile_snapshot)?;
+                self.swarm_switch(&action, &Principal::Owner, None, Some(authority))
+                    .await?;
             }
         }
         self.report_session_growth(agent, &reaction).await
@@ -129,14 +131,7 @@ impl Router {
         if agent.chat || agent.parent.is_some() {
             return Ok(None);
         }
-        let Ok(profile) = self.resolve_profile_cached(&agent.profile) else {
-            return Ok(None);
-        };
-        // A mutable profile name cannot silently change the authority of a
-        // daemon-initiated replacement.
-        if eliot_core::provider_switch_authority(&profile)?
-            != eliot_core::provider_switch_authority(&agent.profile_snapshot)?
-        {
+        if self.resolve_profile_cached(&agent.profile).is_err() {
             return Ok(None);
         }
         let store = self.inner.store.lock().await;

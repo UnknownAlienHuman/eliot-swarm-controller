@@ -8,6 +8,7 @@ use eliot_core::api::{
 const METHOD: &str = "swarm.switch";
 const PROVIDER_FAILURE: &str = "provider_failure";
 const PROVIDER_AUTHORITY: &str = "provider_authority";
+const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 
 #[derive(Clone, Copy)]
 pub struct ProviderSwitchFailure {
@@ -35,29 +36,39 @@ pub struct SwitchWork {
     pub request: SwitchRequest,
     pub plan: SwitchResponse,
     pub provider_failure: Option<ProviderSwitchFailure>,
+    pub profile_authority: Option<[u8; 32]>,
 }
 
-fn decode_switch(mut args: Value) -> Result<(SwitchRequest, Option<ProviderSwitchFailure>)> {
+struct RetainedSwitch {
+    request: SwitchRequest,
+    provider_failure: Option<ProviderSwitchFailure>,
+    profile_authority: Option<[u8; 32]>,
+}
+
+fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
     let malformed = || Error::new("source_integrity", "switch request malformed");
-    let failure = args
-        .as_object_mut()
-        .ok_or_else(malformed)?
+    let args_map = args.as_object_mut().ok_or_else(malformed)?;
+    let failure = args_map
         .remove(PROVIDER_FAILURE)
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
-    let authority = args
-        .as_object_mut()
-        .ok_or_else(malformed)?
+    let authority = args_map
         .remove(PROVIDER_AUTHORITY)
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
+    let profile_authority = args_map
+        .remove(SESSION_GROWTH_AUTHORITY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
-    Ok((
+    Ok(RetainedSwitch {
         request,
-        failure.map(|kind| ProviderSwitchFailure { kind, authority }),
-    ))
+        provider_failure: failure.map(|kind| ProviderSwitchFailure { kind, authority }),
+        profile_authority,
+    })
 }
 
 pub(super) fn reserve_rule_switch_tx(
@@ -299,6 +310,7 @@ impl Store {
         request: &SwitchRequest,
         policy: &core::SecretPolicy,
         owner_process: Option<&OwnerProcess>,
+        profile_authority: Option<[u8; 32]>,
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
         if let Some(value) = self.replay_switch(principal, request)? {
@@ -309,9 +321,12 @@ impl Store {
         }
         self.ensure_writer_healthy()?;
         let result = (|| {
-            let args = serde_json::to_value(request)
+            let mut args = serde_json::to_value(request)
                 .map_err(|_| Error::new("internal", "cannot encode switch"))?;
             let digest = canonical::digest(&args)?;
+            if let Some(authority) = profile_authority {
+                args[SESSION_GROWTH_AUTHORITY] = json!(authority);
+            }
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -373,7 +388,11 @@ impl Store {
                 });
             }
             let value = stored_result(&command.outcome)?;
-            let (request, provider_failure) = decode_switch(command.args)?;
+            let RetainedSwitch {
+                request,
+                provider_failure,
+                profile_authority,
+            } = decode_switch(command.args)?;
             update_command_state(
                 &tx,
                 id,
@@ -397,6 +416,7 @@ impl Store {
                     request,
                     plan: value,
                     provider_failure,
+                    profile_authority,
                 }),
                 events,
             })
@@ -455,7 +475,11 @@ impl Store {
                     "switch launch binding or phase differs",
                 ));
             }
-            let (source, provider_failure) = decode_switch(parent.args)?;
+            let RetainedSwitch {
+                request: source,
+                provider_failure,
+                ..
+            } = decode_switch(parent.args)?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
             if let Some(failure) = provider_failure {
                 require_provider_retry(&tx, &agent, &source.task_command)?;
@@ -632,7 +656,11 @@ impl Store {
                     events: Vec::new(),
                 });
             }
-            let (request, provider_failure) = decode_switch(parent.args)?;
+            let RetainedSwitch {
+                request,
+                provider_failure,
+                ..
+            } = decode_switch(parent.args)?;
             let plan = stored_result(&parent.outcome)?;
             let launch = component(&tx, id, &plan.launch_command, 0)?
                 .ok_or_else(|| Error::new("bad_state", "switch launch not admitted"))?;

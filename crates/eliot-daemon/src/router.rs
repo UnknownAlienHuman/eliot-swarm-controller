@@ -738,7 +738,7 @@ impl Router {
                     .await
             }
             "swarm.switch" => {
-                self.swarm_switch(&params, &principal, context.owner_process)
+                self.swarm_switch(&params, &principal, context.owner_process, None)
                     .await
             }
             "chat.organization" => self.chat_organization(&params, &principal).await,
