@@ -657,21 +657,14 @@ impl PluginHost {
             .lock()
             .await
             .agent_artifact_root(&agent.id, agent.generation)?;
-        if let Some(root) = artifact_root {
-            if !agent.is_automatic_provider_probe()
-                && target_environment
-                    .get(crate::daemon::AGENT_DATA_SCOPE_ENV)
-                    .is_some()
-            {
-                crate::platform::data_dir::write_agent_root_locator(
-                    Path::new(&root.path),
-                    &self.state.data_root,
-                )?;
-            }
+        if let Some(root) = &artifact_root {
             target_environment
                 .as_object_mut()
                 .ok_or_else(|| Error::new("invalid", "target environment is not an object"))?
-                .insert("ELIOT_ARTIFACT_ROOT".to_owned(), Value::String(root.path));
+                .insert(
+                    "ELIOT_ARTIFACT_ROOT".to_owned(),
+                    Value::String(root.path.clone()),
+                );
         }
         // Cleanup closes admission, then waits for this gate before snapshotting
         // running. Cover the first filesystem effect through child ownership
@@ -692,6 +685,17 @@ impl PluginHost {
                 "bad_state",
                 "an owned plugin already exists for this Agent generation",
             ));
+        }
+        if let Some(root) = artifact_root
+            && !agent.is_automatic_provider_probe()
+            && target_environment
+                .get(crate::daemon::AGENT_DATA_SCOPE_ENV)
+                .is_some()
+        {
+            crate::platform::data_dir::write_agent_root_locator(
+                Path::new(&root.path),
+                &self.state.data_root,
+            )?;
         }
         let (instance_dir, credential) = self.create_instance_dir(&key)?;
         if let Err(error) = self
