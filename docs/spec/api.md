@@ -2885,10 +2885,21 @@ When run inside a managed Agent session with inherited credentials, omitting
 and `stand up` automatically registers the stand with the issuing parent daemon
 via `artifact.register` (`kind: data_dir`, `purpose: SWARM_STAND_ARTIFACT_PURPOSE`,
 `expires_at`). Otherwise `SWARM_STANDS_ROOT` selects the designated parent,
-defaulting to the fixed stand home: `EliotStands` under the account's Local
-AppData Known Folder on Windows, or `.local/state/eliot-stands` under the
-account's password-database home on Unix. The private registry always lives in
+defaulting to the fixed stand home: `.eliot-stands` under the account's profile
+Known Folder on Windows, or `.local/state/eliot-stands` under the account's
+password-database home on Unix. The private registry always lives in
 `.registry` under that fixed stand home; no environment variable selects it.
+On Windows the home is outside AppData because Windows redirects AppData writes
+from a process inside an MSIX package, such as a shell started by Claude
+Desktop, to that package's private cache, where the out-of-package stand daemon
+cannot see them. A packaged process refuses a stand root or designated parent
+under AppData ([packaged-process rule](configuration.md#private-data-directory)).
+A registration an earlier build left in `%LOCALAPPDATA%\EliotStands\.registry`
+is still a stand. `stand list` shows it with that path, and `stand down` and
+`stand prune` tear it down under the same marker, identity and owner-token
+checks. Once its daemon exit is proven and the offline lock is held, the record
+and its worktree records move once to the current registry, and the output
+names the former path. Parent `cleanup` reads only the current registry.
 It binds the random creation token to the canonical stand path outside the
 stand itself and records the handle identity (volume serial and file index) of
 the directory `stand up` created and the issuing daemon root when created
@@ -2903,8 +2914,16 @@ still being written is retried, never bound. While a stand daemon prepares a
 managed worktree, before any Git effect, it records the repository common
 directory, branch, creation OID and worktree path in a sidecar of its
 registration; a stand whose registration cannot be verified refuses the
-creation. `stand list` inspects registered stands with expiry and liveness
-state, and `stand prune` tears down expired registered stands.
+creation. A missing registration refuses with `not_found`. One that exists but
+is not a plain file, exceeds the record size limit, or cannot be inspected,
+opened, read or parsed refuses with `not_allowed`. Both refusals precede any
+effect and name the exact lookup path; the second names the reason without
+quoting file content. An existing worktree record or stand marker that cannot
+be used is refused the same way. `stand list` inspects registered stands with
+expiry and liveness state, and `stand prune` tears down expired registered
+stands. Both report every registry file they cannot use with its path and
+reason. `stand prune` never tears down such an entry, because it cannot prove
+its expiry or root, and exits 4.
 
 `stand down` requires that registry binding, the stand marker and the owner
 binding before any action. It refuses every daemon root the caller could resolve
@@ -2931,9 +2950,13 @@ contained branches in external repositories using `#885` write-fenced containmen
 and branch-deletion proofs. A worktree or branch from the stand Store is touched
 only when the external creation record matches its repository common directory,
 branch, creation OID and worktree path; otherwise it is kept
-(`unregistered_worktree`). Dirty, unmerged, or uncertain external worktrees or
-branches keep the stand directory and registration (`retained`, CLI exit 4) so
-retried `stand down` after cleanup completes removal (CLI exit 0).
+(`unregistered_worktree`, or `not_allowed` with the record path and failed step
+when the record exists but cannot be used). Any unusable file among the
+creation records, even one no Store worktree refers to, is reported the same
+way and keeps the stand until it is repaired or removed. Dirty, unmerged, or
+uncertain external worktrees or branches keep the stand directory and
+registration (`retained`, CLI exit 4) so retried `stand down` after cleanup
+completes removal (CLI exit 0).
 
 ## CLI
 

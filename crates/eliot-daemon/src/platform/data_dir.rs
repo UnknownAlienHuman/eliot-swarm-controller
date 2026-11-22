@@ -198,6 +198,19 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
+        refuse_package_redirected(&path)?;
+        // A new root or a missing owner token is new state other processes
+        // will read. A root whose token exists only needs the check above.
+        let is_missing = |target: &Path| {
+            fs::symlink_metadata(target)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        let token = path.join(OWNER_TOKEN_FILE);
+        if is_missing(&path) {
+            refuse_unverified_write(&path)?;
+        } else if is_missing(&token) {
+            refuse_unverified_write(&token)?;
+        }
         ensure_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
                 unsafe_data_dir_error(&path, error)
@@ -216,6 +229,7 @@ impl DataDir {
     /// or opening daemon.lock, the database, or any missing root/token files.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
+        refuse_package_redirected(&path)?;
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(unavailable("data directory does not exist"));
@@ -428,17 +442,26 @@ fn unsafe_data_dir_error(path: &Path, mut error: Error) -> Error {
     if repairable_data_dir_acl(&error) {
         return error;
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("Eliot");
-    let fresh_path = parent.join(format!("{name}-{}", ulid::Ulid::new()));
-    // PowerShell single-quoted literals double embedded apostrophes.
-    let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+    let remedy = match fresh_data_dir(path, &format!("{name}-{}", ulid::Ulid::new())) {
+        Ok(fresh_path) => {
+            // PowerShell single-quoted literals double embedded apostrophes.
+            let command_path = fresh_path.to_string_lossy().replace('\'', "''");
+            format!(
+                "Create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
+            )
+        }
+        Err(lookup) => format!(
+            "Use --data-dir or ELIOT_HOME with a fresh private directory outside AppData ({})",
+            lookup.message
+        ),
+    };
     *error.message = format!(
-        "the selected data directory is unsafe and was not changed: {}. Create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)",
+        "the selected data directory is unsafe and was not changed: {}. {remedy}",
         error.message
     );
     error
@@ -466,6 +489,7 @@ pub fn persist_selected_root(path: &Path) -> Result<()> {
 
 fn persist_selected_root_at(path: &Path, pointer_dir: &Path) -> Result<()> {
     let selected = DataDir::open_existing(path)?;
+    refuse_unverified_write(pointer_dir)?;
     ensure_private_root(pointer_dir)?;
     validate_private_root(pointer_dir)?;
     let root = selected.path().to_str().ok_or_else(|| {
@@ -927,6 +951,52 @@ fn open_or_create_lock_file(path: &Path) -> Result<File> {
             "daemon locks are unsupported on this platform",
         ))
     }
+}
+
+/// Refuse a directory Windows definitely redirects for this process; see the
+/// packaged-process rule in `docs/spec/configuration.md`.
+pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::windows::refuse_package_redirected(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Refuse new state at a location that is redirected for this process or whose
+/// redirection cannot be determined; see the same rule.
+pub(crate) fn refuse_unverified_write(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::windows::refuse_unverified_write(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Where a new private data directory named `name` goes: beside `current`, or
+/// in the account profile when Windows would redirect that location for this
+/// process, so a remedy never names a directory the process must refuse. A
+/// failed profile lookup is an error, never a fallback to `current`'s folder.
+pub(crate) fn fresh_data_dir(current: &Path, name: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    if refuse_unverified_write(current).is_err() {
+        return super::windows::account_profile().map(|profile| profile.join(name));
+    }
+    Ok(current.with_file_name(name))
+}
+
+/// Check the former AppData stand registry before trusting a record in it. A
+/// packaged process may read it, so this does not apply the redirection refusal.
+pub(crate) fn validate_former_registry(path: &Path) -> Result<()> {
+    validate_private_root(path)
 }
 
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
