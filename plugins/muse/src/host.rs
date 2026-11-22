@@ -1498,7 +1498,7 @@ impl MusePlugin {
             .get("text")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("invalid", "Muse steer requires args.text"))?;
-        if text.len() > MAX_TEXT_BYTES {
+        if params.verb != "inject" && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Muse steer input exceeds 512 KiB"));
         }
         if session.secrets.iter().any(|secret| text.contains(secret)) {

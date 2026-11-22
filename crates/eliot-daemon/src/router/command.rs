@@ -967,14 +967,13 @@ impl Router {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
                 return Some(Err(Error::new("invalid", "inject requires text")));
             };
-            let text = eliot_store::fenced_inject_text(text);
             if text.len() > eliot_core::limits::MAX_TEXT_BYTES {
                 return Some(Err(Error::new(
                     "frame_too_large",
-                    "fenced inject text exceeds 512 KiB",
+                    "inject text exceeds 512 KiB",
                 )));
             }
-            command.args["text"] = Value::String(text);
+            command.args["text"] = Value::String(eliot_store::fenced_inject_text(text));
         }
         let pending = self
             .inner

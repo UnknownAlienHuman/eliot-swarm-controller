@@ -796,8 +796,8 @@ new quota or accounting key.
 ### Inject context at the safe point
 
 The `inject` action submits an ordinary `inject` command through the Router and
-Store. Each delivered inject arrives as quoted Swarm context. Its frame counts
-toward native input bounds.
+Store. The text limit applies to the submitted content. Each delivered inject
+arrives as quoted Swarm context, including its fence within the frame limit.
 
 ```toml
 [[rule]]

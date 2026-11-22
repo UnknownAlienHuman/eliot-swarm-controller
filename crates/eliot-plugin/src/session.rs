@@ -368,17 +368,16 @@ pub fn native_no_write(code: &str) -> bool {
 /// line, then the exact original text. The Store has already framed each item
 /// as quoted data. Retain the original input for idempotency and digests, and
 /// send the returned string natively
-/// in the same operation (no second send). The combined text is checked against
-/// `MAX_TEXT_BYTES` here; the caller checks the encoded native frame against
-/// `MAX_FRAME_BYTES` before I/O. Pure: no replay on late or unknown outcomes.
+/// in the same operation. The Store checks the unframed input budget. The
+/// adapter checks the encoded native frame against `MAX_FRAME_BYTES` before I/O.
 pub fn with_claimed_context(text: &str, context: &[ContextItem], harness: &str) -> Result<String> {
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            format!("{harness} input exceeds 512 KiB"),
+        ));
+    }
     if context.is_empty() {
-        if text.len() > MAX_TEXT_BYTES {
-            return Err(Error::new(
-                "frame_too_large",
-                format!("{harness} input exceeds 512 KiB"),
-            ));
-        }
         return Ok(text.to_owned());
     }
     let mut combined = String::new();
@@ -390,10 +389,10 @@ pub fn with_claimed_context(text: &str, context: &[ContextItem], harness: &str) 
     }
     combined.push_str("\n\n");
     combined.push_str(text);
-    if combined.len() > MAX_TEXT_BYTES {
+    if combined.len() > crate::MAX_FRAME_BYTES {
         return Err(Error::new(
             "frame_too_large",
-            format!("{harness} input with claimed context exceeds 512 KiB"),
+            format!("{harness} input with context exceeds the frame limit"),
         ));
     }
     Ok(combined)
