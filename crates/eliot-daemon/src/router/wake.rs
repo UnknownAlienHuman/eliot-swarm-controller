@@ -5,7 +5,7 @@ use super::{
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Command, CommandState, Error, ProcessState, Result,
+    Command, CommandState, Error, ProcessState, Result, SecretPolicy, StderrSnapshot,
     api::{AgentWakeCondition, AgentWakeRequest, SwarmWaitRequest, WaitTurnRef},
 };
 use eliot_store::{
@@ -24,6 +24,8 @@ use tokio::{
 const WAKE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WAKE_PRUNE_INTERVAL_MS: i64 = 60_000;
 const WAKE_PAGE_SIZE: usize = 128;
+const WAKE_RUN_STDERR_TAIL_BYTES: usize = 512;
+const WAKE_FACT_MAX_BYTES: usize = 1_024;
 
 impl Router {
     pub(super) async fn agent_wake(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -207,7 +209,10 @@ impl Router {
                     StoreRunReceipt::ExitZero => Ok(WakeFact::Satisfied(format!(
                         "authorized Run {run_id} has a retained exit-zero, quiescent receipt"
                     ))),
-                    StoreRunReceipt::NotZero => Ok(WakeFact::NoMatch),
+                    StoreRunReceipt::ExitNonZero { exit_code, stderr } => Ok(WakeFact::Satisfied(
+                        agent_wake_run_nonzero_fact(run_id, exit_code, stderr, &self.inner.secrets),
+                    )),
+                    StoreRunReceipt::NoMatch => Ok(WakeFact::NoMatch),
                     StoreRunReceipt::Unknown => Ok(WakeFact::Unknown),
                 }
             }
@@ -357,21 +362,43 @@ impl Router {
                 .await?;
             return Ok(());
         }
-        if submitted.is_ok() {
+        let Err(error) = submitted else {
             // The write response preceded the Store read. A missing row here
             // is a consistency gap, so keep the stable id and check it again.
             return Err(Error::new(
                 "source_integrity",
                 "wake delivery acknowledgement has no retained command",
             ));
-        }
-        // No command row proves the command effect was never admitted. The
-        // same stable id remains safe to retry after a bounded backoff.
-        let _ = self.inner.store.lock().await.agent_wake_delivery_retry(
-            &wake.id,
-            wake.generation,
-            now,
-        )?;
+        };
+        // Store commits admission before native dispatch. With an error and no
+        // command row, this is a definite pre-admission refusal; retry only
+        // this case and retain the same stable command id.
+        let error_text = self
+            .inner
+            .secrets
+            .redact_bounded(&format!("{}: {}", error.code, error.message), 384);
+        let failure_reason = error_text
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let _ = self
+            .inner
+            .store
+            .lock()
+            .await
+            .agent_wake_delivery_pre_admission_failure(
+                &wake.id,
+                wake.generation,
+                now,
+                &failure_reason,
+            )?;
+        self.signal_progress();
         Ok(())
     }
 
@@ -582,6 +609,50 @@ fn matches_wake_delivery(command: &Command, wake: &AgentWakeRecord) -> bool {
         && command.expected_generation == Some(wake.generation)
         && command.args.get("text").and_then(Value::as_str)
             == Some(format!("Wake condition met: {fact}").as_str())
+}
+
+fn agent_wake_run_nonzero_fact(
+    run_id: &str,
+    exit_code: i32,
+    stderr: Option<StderrSnapshot>,
+    secrets: &SecretPolicy,
+) -> String {
+    let mut fact = format!("authorized Run {run_id} exited with nonzero code {exit_code}");
+    match stderr {
+        Some(stderr) => {
+            let redacted = secrets.redact_text(&stderr.text);
+            let tail = utf8_tail(&redacted, WAKE_RUN_STDERR_TAIL_BYTES);
+            if !tail.is_empty() {
+                fact.push_str("\nredacted stderr tail:\n");
+                fact.push_str(tail);
+            } else if stderr.read_error {
+                fact.push_str("\nstderr tail unavailable (read error)");
+            } else if stderr.truncated {
+                fact.push_str("\nstderr tail unavailable (stored capture truncated)");
+            } else {
+                fact.push_str("\nstderr tail was empty");
+            }
+            if stderr.truncated {
+                fact.push_str("\n[stderr capture truncated]");
+            }
+            if stderr.read_error {
+                fact.push_str("\n[stderr read error]");
+            }
+            if !stderr.eof {
+                fact.push_str("\n[stderr stream did not reach EOF]");
+            }
+        }
+        None => fact.push_str("\nstderr tail unavailable in retained outcome"),
+    }
+    secrets.redact_bounded(&fact, WAKE_FACT_MAX_BYTES)
+}
+
+fn utf8_tail(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn seconds_condition_is_deadline(wake: &AgentWakeRecord) -> bool {

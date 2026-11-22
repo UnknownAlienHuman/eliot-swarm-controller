@@ -599,7 +599,11 @@ Conditions are one of:
   event's Agent, generation and workspace to match the caller's exact current
   binding. Timer runs and runs without that event binding are ineligible. Only
   an applied `ScriptRunApplied` receipt with known zero exit, quiescent custody
-  and known custody satisfies it. This condition never starts an Agent-supplied
+  and known custody reports success. A definite `script_exit_failed` receipt
+  with a known nonzero direct exit also wakes the Agent with its exit code and
+  bounded redacted stderr tail from the retained Run outcome. Failed receipts
+  without that exact exit proof do not claim a nonzero code; malformed or
+  unknown receipts remain unknown. This condition never starts an Agent-supplied
   argv.
 - `child_completion {turn}`: one exact retained turn of a direct child in its
   current generation. Reconciliation uses the same exact-turn projection as
@@ -609,13 +613,16 @@ Conditions are one of:
 A condition may become true while the caller's turn is still running. The
 daemon records one bounded fact, then waits until that exact turn is completed
 and the caller's generation is still current before submitting one ordinary
-`send` with the reserved delivery command id. The command id is checked before
-retry after a crash. A retained unknown command is never replayed; an outcome
-that cannot prove delivery remains `unknown`, and a definite rejected/failed
-delivery is retained as `failed`. Generation replacement or
-timeout retires the wake without delivering into another incarnation. The
-bounded worker scans keyset pages and reads the exact process, run, child-turn,
-workspace and due-time facts; it does not create a second rules engine.
+`send` with the reserved delivery command id. Definite pre-admission refusals
+retry with bounded backoff for at most five total delivery submissions; the
+terminal `failed` record retains a bounded, redacted reason in its existing
+fact. The command id is checked before retry after a crash. A retained unknown
+command is never replayed; an outcome that cannot prove delivery remains
+`unknown`, and a definite rejected/failed delivery is retained as `failed`.
+Generation replacement or timeout retires the wake without delivering into
+another incarnation. The bounded worker scans keyset pages and reads the exact
+process, run, child-turn, workspace and due-time facts; it does not create a
+second rules engine.
 
 Example Agent MCP call, then end the current turn:
 

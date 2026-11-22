@@ -7,7 +7,8 @@ use super::{
     validate_ulid, workspace, write_binding, write_exists,
 };
 use eliot_core::{
-    Agent, CommandState, ProcessIdentity, ProcessRecord, TurnState, WorkspacePhase,
+    Agent, CommandState, ProcessIdentity, ProcessRecord, ScriptDirectExit, ScriptProcessResult,
+    StderrSnapshot, TurnState, WorkspacePhase,
     api::{AgentWakeCondition, AgentWakeRequest, AgentWakeResponse, ScriptRunApplied},
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
@@ -18,6 +19,9 @@ const AGENT_WAKE_METHOD: &str = "agent.wake";
 const MAX_ACTIVE_AGENT_WAKES: i64 = 1_024;
 pub const MAX_AGENT_WAKE_PAGE: usize = 128;
 const AGENT_WAKE_RETENTION_MS: i64 = 25 * 60 * 60 * 1_000;
+const MAX_AGENT_WAKE_PRE_ADMISSION_ATTEMPTS: u32 = 5;
+const MAX_AGENT_WAKE_FAILURE_REASON_BYTES: usize = 384;
+const MAX_AGENT_WAKE_FACT_BYTES: usize = 1_024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentWakeRecord {
@@ -42,11 +46,15 @@ pub enum AgentWakeTurnReadiness {
     Stale,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentWakeRunReceipt {
     Pending,
     ExitZero,
-    NotZero,
+    ExitNonZero {
+        exit_code: i32,
+        stderr: Option<StderrSnapshot>,
+    },
+    NoMatch,
     Unknown,
 }
 
@@ -376,9 +384,8 @@ impl Store {
                     None => AgentWakeRunReceipt::Unknown,
                 }
             }
-            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {
-                AgentWakeRunReceipt::NotZero
-            }
+            CommandState::Failed => failed_run_wake_receipt(run.command.outcome),
+            CommandState::Rejected | CommandState::Cancelled => AgentWakeRunReceipt::NoMatch,
             CommandState::Unknown => AgentWakeRunReceipt::Unknown,
         })
     }
@@ -442,23 +449,60 @@ impl Store {
         self.agent_wake_mark_state(id, generation, command_id, "delivery_pending")
     }
 
-    pub fn agent_wake_delivery_retry(
+    pub fn agent_wake_delivery_pre_admission_failure(
         &mut self,
         id: &str,
         generation: i64,
         now: i64,
+        failure_reason: &str,
     ) -> Result<bool> {
         self.ensure_writer_healthy()?;
-        let result = self.connection.execute(
-            "UPDATE agent_wakes
-             SET delivery_attempts = delivery_attempts + 1,
-                 delivery_next_at = ?1 + MIN(30000, 500 * (1 << MIN(delivery_attempts, 6)))
-             WHERE id = ?2 AND generation = ?3 AND state = 'satisfied'",
-            params![now, id, generation],
-        );
-        let outcome = result.map_err(sql_error);
+        let outcome = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let current: Option<(i64, Option<String>)> = tx
+                .query_row(
+                    "SELECT delivery_attempts, fact FROM agent_wakes
+                     WHERE id = ?1 AND generation = ?2 AND state = 'satisfied'",
+                    params![id, generation],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some((attempts, fact)) = current else {
+                return Ok(false);
+            };
+            let attempts = u32::try_from(attempts).map_err(|_| {
+                Error::new("source_integrity", "wake delivery attempt count is invalid")
+            })?;
+            let next_attempt = attempts.saturating_add(1);
+            let changed = if next_attempt >= MAX_AGENT_WAKE_PRE_ADMISSION_ATTEMPTS {
+                let failed_fact =
+                    wake_delivery_failure_fact(fact.as_deref(), failure_reason, next_attempt);
+                tx.execute(
+                    "UPDATE agent_wakes
+                     SET delivery_attempts = ?1, fact = ?2, state = 'failed', settled_at = ?3
+                     WHERE id = ?4 AND generation = ?5 AND state = 'satisfied'",
+                    params![next_attempt, failed_fact, now, id, generation],
+                )
+                .map_err(sql_error)?
+            } else {
+                let delay_ms = 500_i64.saturating_mul(1_i64 << attempts.min(6)).min(30_000);
+                tx.execute(
+                    "UPDATE agent_wakes
+                     SET delivery_attempts = ?1, delivery_next_at = ?2
+                     WHERE id = ?3 AND generation = ?4 AND state = 'satisfied'",
+                    params![next_attempt, now.saturating_add(delay_ms), id, generation],
+                )
+                .map_err(sql_error)?
+            };
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(changed == 1)
+        })();
         self.fault_on_persistence_error(&outcome);
-        outcome.map(|changed| changed == 1)
+        outcome
     }
 
     pub fn agent_wake_finish(
@@ -744,6 +788,80 @@ fn require_agent_wake_workspace(
         ));
     }
     Ok(preparation)
+}
+
+fn failed_run_wake_receipt(outcome: Option<serde_json::Value>) -> AgentWakeRunReceipt {
+    let Some(outcome) = outcome else {
+        return AgentWakeRunReceipt::Unknown;
+    };
+    if outcome.get("code").and_then(serde_json::Value::as_str) != Some("failed") {
+        return AgentWakeRunReceipt::Unknown;
+    }
+    let cause = outcome.get("cause").and_then(serde_json::Value::as_str);
+    let Some(process) = outcome.get("process") else {
+        return AgentWakeRunReceipt::Unknown;
+    };
+    let Ok(process) = serde_json::from_value::<ScriptProcessResult>(process.clone()) else {
+        return AgentWakeRunReceipt::Unknown;
+    };
+    if process.validate().is_err() {
+        return AgentWakeRunReceipt::Unknown;
+    }
+    match process.direct_exit {
+        ScriptDirectExit::Exited {
+            success: false,
+            exit_code: Some(exit_code),
+        } if exit_code != 0 && cause == Some("script_exit_failed") => {
+            AgentWakeRunReceipt::ExitNonZero {
+                exit_code,
+                stderr: process.stderr,
+            }
+        }
+        ScriptDirectExit::Exited {
+            success: true,
+            exit_code: Some(0),
+        } if cause != Some("script_exit_failed") => AgentWakeRunReceipt::NoMatch,
+        ScriptDirectExit::Exited {
+            success: false,
+            exit_code: None,
+        } if cause == Some("script_exit_failed") => AgentWakeRunReceipt::NoMatch,
+        ScriptDirectExit::Unknown
+        | ScriptDirectExit::Exited { success: true, .. }
+        | ScriptDirectExit::Exited {
+            success: false,
+            exit_code: Some(_),
+        }
+        | ScriptDirectExit::Exited {
+            success: false,
+            exit_code: None,
+        } => AgentWakeRunReceipt::Unknown,
+    }
+}
+
+fn wake_delivery_failure_fact(fact: Option<&str>, reason: &str, attempts: u32) -> String {
+    let reason = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let reason = truncate_utf8(&reason, MAX_AGENT_WAKE_FAILURE_REASON_BYTES);
+    let suffix = format!("; delivery stopped after {attempts} pre-admission failures: {reason}");
+    let fact = fact.unwrap_or("wake condition satisfied");
+    let fact = truncate_utf8(fact, MAX_AGENT_WAKE_FACT_BYTES.saturating_sub(suffix.len()));
+    format!("{fact}{suffix}")
+}
+
+fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
+    let mut end = text.len().min(max_bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 fn wake_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawWake> {

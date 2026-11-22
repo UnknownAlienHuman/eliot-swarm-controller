@@ -21,7 +21,8 @@ pub enum AgentWakeCondition {
     FileAppears { path: String },
     /// One exact process owned by the caller's Agent or managed-workspace generation exits.
     ProcessExit { identity: ProcessIdentity },
-    /// Wait for an existing authorized `run` command's retained exit-zero receipt.
+    /// Observe an existing authorized `run` receipt; definite nonzero exits are
+    /// delivered with their exit code and bounded redacted stderr tail.
     ArgvExit0 { run_id: String },
     /// One exact turn of a direct child Agent settles.
     ChildCompletion { turn: WaitTurnRef },
