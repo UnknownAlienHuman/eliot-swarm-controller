@@ -895,7 +895,7 @@ pub struct Turn {
 /// cumulative session cost are session-scoped facts, never turn expenditure:
 /// they are not represented here. The Store projects adapter counters into
 /// the shared accounting basis when serving usage reads.
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TurnUsage {
     #[serde(default)]
     pub scope: Option<String>,
@@ -935,11 +935,17 @@ impl TurnUsage {
                 .and_then(|(visible, reasoning)| visible.checked_add(reasoning));
         }
         self.reasoning_tokens = self.reasoning_tokens.or(self.thinking_tokens);
-        self.total_tokens = self
-            .input_tokens
-            .zip(self.cache_read_tokens)
-            .zip(self.output_tokens)
-            .and_then(|((input, cached), output)| input.checked_add(cached)?.checked_add(output));
+        self.total_tokens =
+            if matches!(harness, "claude" | "opencode") && self.cache_write_tokens.is_none() {
+                None
+            } else {
+                self.input_tokens
+                    .zip(self.cache_read_tokens)
+                    .zip(self.output_tokens)
+                    .and_then(|((input, cached), output)| {
+                        input.checked_add(cached)?.checked_add(output)
+                    })
+            };
         self
     }
 
@@ -949,6 +955,54 @@ impl TurnUsage {
             self.cache_read_tokens,
             self.output_tokens,
         )
+    }
+
+    /// Construct usage from translated native counters, preserving absence
+    /// and reporting a usage record only when at least one counter is known.
+    pub fn from_native(scope: &str, mut counters: Self) -> Option<Self> {
+        let fields = [
+            &mut counters.input_tokens,
+            &mut counters.output_tokens,
+            &mut counters.reasoning_tokens,
+            &mut counters.thinking_tokens,
+            &mut counters.cache_read_tokens,
+            &mut counters.cache_write_tokens,
+            &mut counters.total_tokens,
+        ];
+        let mut observed = false;
+        for counter in fields {
+            *counter = counter.filter(|value| *value >= 0);
+            observed |= counter.is_some();
+        }
+        if observed {
+            counters.scope = Some(scope.to_owned());
+            Some(counters)
+        } else {
+            None
+        }
+    }
+
+    /// Sum each native counter only when every observation supplied it.
+    /// The caller selects and deduplicates the observations for the turn.
+    pub fn sum_native(scope: &str, counters: impl IntoIterator<Item = Self>) -> Option<Self> {
+        fn add(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+            let (left, right) = left.zip(right)?;
+            if left < 0 || right < 0 {
+                return None;
+            }
+            left.checked_add(right)
+        }
+        let totals = counters.into_iter().reduce(|left, right| Self {
+            input_tokens: add(left.input_tokens, right.input_tokens),
+            output_tokens: add(left.output_tokens, right.output_tokens),
+            reasoning_tokens: add(left.reasoning_tokens, right.reasoning_tokens),
+            thinking_tokens: add(left.thinking_tokens, right.thinking_tokens),
+            cache_read_tokens: add(left.cache_read_tokens, right.cache_read_tokens),
+            cache_write_tokens: add(left.cache_write_tokens, right.cache_write_tokens),
+            total_tokens: add(left.total_tokens, right.total_tokens),
+            ..Self::default()
+        })?;
+        Self::from_native(scope, totals)
     }
 }
 
@@ -974,12 +1028,22 @@ fn uncached_input(
     let input = input?;
     match harness {
         // Codex includes cache hits in its input count.
-        "codex" => input.checked_sub(cached?).filter(|input| *input >= 0),
+        "codex" => subtract_cached_input(input, cached),
         // These harnesses report cache creation outside input. Creation
         // spends fresh input tokens that can serve future cache hits.
-        "claude" | "opencode" => input.checked_add(written?),
+        "claude" | "opencode" => written.map_or(Some(input), |written| input.checked_add(written)),
         _ => Some(input),
     }
+}
+
+fn subtract_cached_input(input: i64, cached: Option<i64>) -> Option<i64> {
+    cached.map_or(Some(input), |cached| {
+        input.checked_sub(cached).filter(|input| *input >= 0)
+    })
+}
+
+pub fn usage_counter(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64).filter(|count| *count >= 0)
 }
 
 /// Session-scoped usage snapshot for one Agent generation. Every member is
@@ -999,7 +1063,7 @@ fn uncached_input(
 /// adapter performs itself); it stays null where nothing is observable, never
 /// zero and never a guess. Unknown fields are ignored so
 /// harnesses decode forward.
-#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionUsage {
     #[serde(default)]
     pub context_used_tokens: Option<i64>,
@@ -1044,6 +1108,73 @@ pub struct SessionCost {
     pub unit: Option<String>,
 }
 
+/// Retain a native context window for the same turn or a later turn on the
+/// same known model. The adapter supplies exact native bindings and counters.
+#[derive(Default)]
+pub struct ContextWindowTracker {
+    turn_model: Option<(String, String)>,
+    window: Option<ObservedContextWindow>,
+}
+
+struct ObservedContextWindow {
+    turn_id: String,
+    model: Option<String>,
+    tokens: i64,
+}
+
+impl ContextWindowTracker {
+    pub fn associate_turn(&mut self, turn_id: &str, model: Option<&str>) {
+        if let Some(window) = &mut self.window
+            && window.turn_id == turn_id
+        {
+            window.model = model.map(str::to_owned);
+        }
+        self.turn_model = model.map(|model| (turn_id.to_owned(), model.to_owned()));
+    }
+
+    pub fn observe(
+        &mut self,
+        usage: &mut SessionUsage,
+        turn_id: &str,
+        has_response: bool,
+        used: Option<i64>,
+        capacity: Option<i64>,
+    ) -> bool {
+        let model = self
+            .turn_model
+            .as_ref()
+            .filter(|(turn, _)| turn == turn_id)
+            .map(|(_, model)| model.as_str());
+        let cached = self
+            .window
+            .as_ref()
+            .filter(|window| {
+                window.turn_id == turn_id || (model.is_some() && model == window.model.as_deref())
+            })
+            .map(|window| window.tokens);
+        let prior = (usage.context_used_tokens, usage.context_window_tokens);
+        if has_response {
+            usage.context_used_tokens = used;
+            usage.context_window_tokens = capacity.or(cached);
+        } else if let Some(window) = capacity
+            && (cached.is_none() || usage.context_window_tokens != Some(window))
+        {
+            // A capacity-only observation cannot carry old occupancy onto a new window.
+            usage.context_used_tokens = None;
+            usage.context_window_tokens = Some(window);
+        }
+        usage.retain_valid_context();
+        if let Some(tokens) = capacity {
+            self.window = (tokens > 0).then(|| ObservedContextWindow {
+                turn_id: turn_id.to_owned(),
+                model: model.map(str::to_owned),
+                tokens,
+            });
+        }
+        prior != (usage.context_used_tokens, usage.context_window_tokens)
+    }
+}
+
 impl SessionUsage {
     /// Returns an observed occupancy and its compatible context window.
     pub fn context_tokens(&self) -> Option<(i64, i64)> {
@@ -1065,9 +1196,7 @@ impl SessionUsage {
                 // Muse supplies its counted-once prompt total for sessions.
                 tokens
                     .input_tokens
-                    .zip(tokens.cache_read_tokens)
-                    .and_then(|(prompt, cached)| prompt.checked_sub(cached))
-                    .filter(|input| *input >= 0)
+                    .and_then(|prompt| subtract_cached_input(prompt, tokens.cache_read_tokens))
             } else {
                 uncached_input(
                     harness,

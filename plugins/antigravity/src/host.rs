@@ -6,8 +6,8 @@ use eliot_plugin::{
     Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ManifestFeatures, stream_sources},
     session::{
-        decode, ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid,
-        not_initialized, required_native_cmd, validate_binding, validate_identity,
+        decode, initialize_fields_valid, model_catalogue_profile, not_initialized,
+        required_native_cmd, validate_binding, validate_identity,
     },
 };
 use serde_json::{Value, json};
@@ -332,14 +332,13 @@ impl Plugin {
     /// session, no turn, no input and no inference. Ids are returned verbatim;
     /// `agy models` names no default, so `default` stays null.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        ensure_dedicated_reader(
+        let snapshot = model_catalogue_profile(
+            raw,
             self.session.is_some() || self.start.is_some(),
+            "antigravity",
             "Antigravity",
-            "model.list",
+            false,
         )?;
-        let profile: Value = decode(raw, "Antigravity model.list params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
-        ensure_reader_harness(snapshot, "antigravity", "Antigravity", "model.list")?;
         let program = required_native_cmd(
             snapshot,
             "Antigravity model.list requires a frozen native cmd",

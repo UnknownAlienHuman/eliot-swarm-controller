@@ -2,7 +2,9 @@
 //!
 //! Parent turns own their facts; this module owns child-thread tracking,
 //! usage attribution, frame buffering and gap settlement for child threads.
+//! The shared runtime owns child registration and turn state.
 use super::*;
+use eliot_plugin::native_child::ChildLifecycle;
 /// Bound on tracked child threads, unconfirmed threads and in-flight spawns per
 /// generation; overflow is a source gap.
 pub(super) const MAX_CHILD_THREADS: usize = 256;
@@ -15,7 +17,7 @@ pub(super) struct ChildState {
     batch_unknown: bool,
     failure: Option<String>,
     final_text: Option<String>,
-    active_turn_id: Option<String>,
+    lifecycle: ChildLifecycle,
     /// Baseline and latest cumulative token snapshot for this exact child
     /// turn. The terminal event carries only their difference.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
@@ -33,7 +35,7 @@ impl ChildState {
             batch_unknown: false,
             failure: None,
             final_text: None,
-            active_turn_id: None,
+            lifecycle: ChildLifecycle::default(),
             turn_usage: None,
             ready_committed: false,
         }
@@ -309,7 +311,7 @@ impl EventProcessor {
     fn retain_unattributed_excluding(&self, excluding: &str) -> bool {
         self.child_states
             .iter()
-            .any(|(thread, state)| thread != excluding && state.active_turn_id.is_some())
+            .any(|(thread, state)| thread != excluding && state.lifecycle.active_turn.is_some())
     }
 
     fn settle_spawn_window_for(&mut self, producer: &str) {
@@ -806,7 +808,15 @@ impl EventProcessor {
         child_thread: &str,
         registration: ChildRegistration,
     ) -> Result<()> {
-        let ack = match register_child(&self.host, &self.credential, registration.clone()).await {
+        let ack = match register_child(
+            &self.host,
+            &self.credential,
+            registration.clone(),
+            "codex",
+            &eliot_core::CODEX_NATIVE_CHILD_FAMILIES,
+        )
+        .await
+        {
             Ok(ack) => ack,
             Err(error) if is_admission_rejection(&error) => {
                 self.child_pending.remove(child_thread);
@@ -1008,7 +1018,7 @@ impl EventProcessor {
                     .child_states
                     .get_mut(child_thread)
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-                state.active_turn_id = Some(turn_id.to_owned());
+                state.lifecycle.started(turn_id);
                 state.final_text = None;
                 state.turn_usage = None;
                 let native_id = event_id(child_thread, turn_id, turn_id, "turn.started")?;
@@ -1076,7 +1086,7 @@ impl EventProcessor {
             .child_states
             .get_mut(child_thread)
             .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
-        if state.active_turn_id.as_deref() != Some(notification.turn_id.as_str())
+        if state.lifecycle.active_turn.as_deref() != Some(notification.turn_id.as_str())
             || !notification.token_usage.last.has_response_counters()
         {
             // A late or stale update must never bind to another child turn.
@@ -1120,7 +1130,7 @@ impl EventProcessor {
             params,
             self.child_states
                 .get(child_thread)
-                .and_then(|state| state.active_turn_id.as_deref()),
+                .and_then(|state| state.lifecycle.active_turn.as_deref()),
         );
         let mut data = json!({
             "turn_id": turn_id.as_str(),
@@ -1198,7 +1208,7 @@ impl EventProcessor {
         state
             .commit_event(sink, &host, &credential, "turn.completed", native_id, data)
             .await?;
-        state.active_turn_id = None;
+        state.lifecycle.completed(Some(&status_text));
         Ok(())
     }
 

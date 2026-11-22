@@ -32,11 +32,11 @@ use tokio_util::{
 };
 
 use eliot_core::{
-    Error, Result, SecretPolicy, StderrSnapshot, StderrSource,
+    Error, Result, SecretPolicy, StderrSnapshot,
     limits::{MAX_FRAME_BYTES, MAX_NATIVE_INBOUND_FRAME_BYTES},
 };
 
-use crate::{StderrCapture, StderrView, spawn_stderr, sync::LockExt};
+use crate::{StderrCapture, StderrView, harness_diagnostic, spawn_stderr, sync::LockExt};
 
 /// Leading bytes inspected for an oversized record's envelope.
 const OVERSIZED_PREFIX_CAP: usize = 2048;
@@ -1141,9 +1141,8 @@ impl NativeChild {
         self.stderr_view.clone()
     }
 
-    pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message).into();
-        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    pub fn diagnostic_error(&self, error: Error) -> Error {
+        harness_diagnostic(error, &self.policy, Some(self.stderr_snapshot()))
     }
 
     /// Wait for the single stdout reader to finish; a timeout leaves that same

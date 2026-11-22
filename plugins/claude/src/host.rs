@@ -1591,9 +1591,13 @@ impl ClaudePlugin {
         }
         // The event task answers behind any queued terminal frame, so a
         // steer racing completion refuses instead of queueing behind it.
-        if !session.events.check_turn(turn_id).await {
-            // Proven no-effect: never queued behind the finished turn.
-            return ready(Ok(rejected_control("Claude turn is not the active turn")));
+        match session.events.check_turn(turn_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // Proven no-effect: never queued behind the finished turn.
+                return ready(Ok(rejected_control("Claude turn is not the active turn")));
+            }
+            Err(error) => return ready(Err(error)),
         }
         let outcome = match session
             .events
@@ -1690,12 +1694,11 @@ impl ClaudePlugin {
         }
         let request_id = waiter.request_id;
         if self.session.is_some() {
-            let reason = if cancellation_acknowledged {
-                "Claude steer was not confirmed before its deadline; it will not be repeated"
-            } else {
-                "Claude steer withdrawal was not confirmed before its deadline; it will not be repeated"
-            };
-            let result = unknown_control(reason);
+            let result = session::unconfirmed_control(
+                cancellation_acknowledged,
+                "Claude steer was not confirmed before its deadline; it will not be repeated",
+                "Claude steer withdrawal was not confirmed before its deadline; it will not be repeated",
+            );
             let result = self.post_process("agent.command", Ok(result));
             return respond_deferred(client, request_id, result).await;
         }
@@ -1744,7 +1747,7 @@ impl ClaudePlugin {
         }
         // The event task answers behind any queued terminal frame, so an
         // interrupt racing completion refuses instead of writing twice.
-        let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await else {
+        let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await? else {
             return Err(Error::new(
                 "stale_turn",
                 "Claude turn is not the active turn",
@@ -1877,22 +1880,27 @@ impl ClaudePlugin {
     }
 
     async fn shutdown(&mut self) -> Result<Value> {
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                terminate_session(session, true, false).await?;
-            }
-            session.events.close().await;
-        }
-        Ok(json!({"state": "shutdown"}))
+        self.shutdown_paths(false).await
     }
 
     async fn shutdown_owned(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                let _ = terminate_session(session, true, false).await;
-            }
-            session.events.close().await;
-        }
+        let _ = self.shutdown_paths(true).await;
+    }
+
+    async fn shutdown_paths(&mut self, best_effort: bool) -> Result<Value> {
+        session::shutdown_session(
+            self.session.as_mut(),
+            best_effort,
+            async |session| {
+                if session.phase == SessionPhase::Stopped {
+                    Ok(())
+                } else {
+                    terminate_session(session, true, false).await
+                }
+            },
+            async |session| session.events.close().await,
+        )
+        .await
     }
 }
 
@@ -2086,32 +2094,37 @@ fn snapshot_turn_facts<'a>(
 }
 
 async fn terminate_session(session: &mut AgentSession, force: bool, graceful: bool) -> Result<()> {
-    let begin = session.events.begin_stop().await;
-    let process_exit = if graceful {
-        session
-            .native
-            .close_gracefully(Instant::now() + RPC_TIMEOUT)
-            .await
-    } else {
-        session
-            .native
-            .terminate(force, Instant::now() + RPC_TIMEOUT)
-            .await
-    };
-    let drained = session
-        .native
-        .await_output_drained(Instant::now() + RPC_TIMEOUT)
-        .await;
-    let ended = session.events.end_stop().await;
-    if begin.is_err() || process_exit.is_err() || drained.is_err() || ended.is_err() {
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            "Claude process/output drain or session.ended outcome is unknown",
-        ));
+    let AgentSession {
+        phase,
+        mcp_config,
+        native,
+        events,
+        ..
+    } = session;
+    let result = eliot_plugin::session::stop_owned_session(
+        "Claude",
+        None,
+        events.begin_stop(),
+        async {
+            let process_exit = if graceful {
+                native.close_gracefully(Instant::now() + RPC_TIMEOUT).await
+            } else {
+                native.terminate(force, Instant::now() + RPC_TIMEOUT).await
+            };
+            let drained = native
+                .await_output_drained(Instant::now() + RPC_TIMEOUT)
+                .await;
+            (process_exit, drained)
+        },
+        events.end_stop(),
+    )
+    .await;
+    if let Err(error) = result {
+        *phase = SessionPhase::Unknown;
+        return Err(error);
     }
-    session.phase = SessionPhase::Stopped;
-    drop(session.mcp_config.take());
+    *phase = SessionPhase::Stopped;
+    drop(mcp_config.take());
     Ok(())
 }
 

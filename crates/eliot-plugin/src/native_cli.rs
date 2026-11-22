@@ -39,23 +39,47 @@ pub struct BoundedReadLabels {
 /// deadline and requires a successful status. Every failure after spawn
 /// kills and reaps the child; `kill_on_drop` stays the backstop.
 pub async fn run_bounded(
-    mut command: Command,
+    command: Command,
     cap: usize,
     deadline: Instant,
     labels: &BoundedReadLabels,
 ) -> Result<Vec<u8>> {
+    read_bounded_stdout(command, cap, deadline, false)
+        .await
+        .map_err(|error| match error {
+            BoundedReadError::Spawn(_) => Error::new("native_spawn", labels.start),
+            BoundedReadError::Deadline => Error::new("native_spawn", labels.deadline),
+            BoundedReadError::Unreadable => Error::new("native_readback", labels.unreadable),
+            BoundedReadError::Status => Error::new("native_readback", labels.status),
+        })
+}
+
+#[derive(Debug)]
+pub enum BoundedReadError {
+    Spawn(std::io::Error),
+    Deadline,
+    Unreadable,
+    Status,
+}
+
+/// Read one owned CLI's bounded output. Some read-only native queries encode
+/// their authoritative status in stdout even when the process exits nonzero.
+pub async fn read_bounded_stdout(
+    mut command: Command,
+    cap: usize,
+    deadline: Instant,
+    accept_non_success: bool,
+) -> std::result::Result<Vec<u8>, BoundedReadError> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|_| Error::new("native_spawn", labels.start))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("native_spawn", labels.start))?;
+    let mut child = command.spawn().map_err(BoundedReadError::Spawn)?;
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_and_reap(&mut child).await;
+        return Err(BoundedReadError::Unreadable);
+    };
     let mut buffer = Vec::new();
     let read = async {
         let mut limited = (&mut stdout).take((cap + 1) as u64);
@@ -64,30 +88,31 @@ pub async fn run_bounded(
     match tokio::time::timeout_at(deadline, read).await {
         Err(_) => {
             kill_and_reap(&mut child).await;
-            return Err(Error::new("native_spawn", labels.deadline));
+            return Err(BoundedReadError::Deadline);
         }
         Ok(Err(_)) => {
             kill_and_reap(&mut child).await;
-            return Err(Error::new("native_readback", labels.unreadable));
+            return Err(BoundedReadError::Unreadable);
         }
         Ok(Ok(_)) => {}
     }
     if buffer.len() > cap {
         kill_and_reap(&mut child).await;
-        return Err(Error::new("native_readback", labels.unreadable));
+        return Err(BoundedReadError::Unreadable);
     }
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Err(_) => {
             kill_and_reap(&mut child).await;
-            return Err(Error::new("native_spawn", labels.deadline));
+            return Err(BoundedReadError::Deadline);
         }
         Ok(Err(_)) => {
-            return Err(Error::new("native_readback", labels.unreadable));
+            kill_and_reap(&mut child).await;
+            return Err(BoundedReadError::Unreadable);
         }
         Ok(Ok(status)) => status,
     };
-    if !status.success() {
-        return Err(Error::new("native_readback", labels.status));
+    if !status.success() && !accept_non_success {
+        return Err(BoundedReadError::Status);
     }
     Ok(buffer)
 }

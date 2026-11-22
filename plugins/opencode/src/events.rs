@@ -20,6 +20,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
+    event_actor::EventActor,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
@@ -159,8 +160,7 @@ pub(crate) struct EventConfig {
 }
 
 pub(crate) struct EventHandle {
-    control: mpsc::Sender<Control>,
-    status: watch::Receiver<EventStatus>,
+    actor: EventActor<Control, EventStatus>,
 }
 
 enum Control {
@@ -432,22 +432,29 @@ pub(crate) fn spawn(
     config: EventConfig,
 ) -> EventHandle {
     let processor = EventProcessor::new(http, host, config);
-    let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
-    let (status_tx, status) = watch::channel(EventStatus::default());
-    tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
-    EventHandle { control, status }
+    let actor = EventActor::spawn(
+        CONTROL_QUEUE,
+        EventStatus::default(),
+        move |control_rx, status_tx| async move {
+            run(frames, stream, processor, control_rx, status_tx).await;
+        },
+    );
+    EventHandle { actor }
 }
 
 impl EventHandle {
     pub async fn begin_compaction(&self) -> Result<oneshot::Receiver<(String, bool)>> {
         let (terminal, result) = oneshot::channel();
-        self.send(|reply| Control::BeginCompact { terminal, reply })
-            .await?;
+        self.actor
+            .call(|reply| Control::BeginCompact { terminal, reply })
+            .await??;
         Ok(result)
     }
 
     pub async fn refuse_compaction(&self) -> Result<()> {
-        self.send(|reply| Control::RefuseCompact { reply }).await
+        self.actor
+            .call(|reply| Control::RefuseCompact { reply })
+            .await?
     }
 
     pub async fn ready(
@@ -456,13 +463,14 @@ impl EventHandle {
         session_id: String,
         effective: Value,
     ) -> Result<()> {
-        self.send(|reply| Control::Ready {
-            native_scope,
-            session_id,
-            effective,
-            reply,
-        })
-        .await
+        self.actor
+            .call(|reply| Control::Ready {
+                native_scope,
+                session_id,
+                effective,
+                reply,
+            })
+            .await?
     }
 
     pub async fn associate_inbox(
@@ -471,13 +479,14 @@ impl EventHandle {
         inbox_id: String,
         context: Vec<ContextItem>,
     ) -> Result<()> {
-        self.send(|reply| Control::AssociateInbox {
-            command_id,
-            inbox_id,
-            context,
-            reply,
-        })
-        .await
+        self.actor
+            .call(|reply| Control::AssociateInbox {
+                command_id,
+                inbox_id,
+                context,
+                reply,
+            })
+            .await?
     }
 
     pub async fn resume_ready(
@@ -486,13 +495,14 @@ impl EventHandle {
         session_id: String,
         effective: Value,
     ) -> Result<()> {
-        self.send(|reply| Control::ResumeReady {
-            native_scope,
-            session_id,
-            effective,
-            reply,
-        })
-        .await
+        self.actor
+            .call(|reply| Control::ResumeReady {
+                native_scope,
+                session_id,
+                effective,
+                reply,
+            })
+            .await?
     }
 
     pub async fn reply_request(
@@ -503,25 +513,16 @@ impl EventHandle {
         verb: String,
         args: Value,
     ) -> Result<Value> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::ReplyRequest {
+        self.actor
+            .call(|reply| Control::ReplyRequest {
                 command_id,
                 request_id,
                 turn_id,
                 verb,
                 args,
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))?
+            })
+            .await?
     }
 
     /// Authoritative exact-turn gate for interrupt: the check runs on the
@@ -529,33 +530,19 @@ impl EventHandle {
     /// arrives after the terminal batch always sees the finished turn even
     /// though the watch snapshot still lags it.
     pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::CheckTurn {
+        self.actor
+            .call(|reply| Control::CheckTurn {
                 turn_id: turn_id.to_owned(),
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            })
             .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
     }
 
     pub async fn abandon_association(&self, command_id: String) {
-        let (reply, response) = oneshot::channel();
-        if self
-            .control
-            .send(Control::AbandonAssociation { command_id, reply })
-            .await
-            .is_ok()
-        {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self
+            .actor
+            .call(|reply| Control::AbandonAssociation { command_id, reply })
+            .await;
     }
 
     /// Watch one admitted steer input against its exact turn. The returned
@@ -569,56 +556,33 @@ impl EventHandle {
         turn_id: String,
         inbox_id: String,
     ) -> Result<oneshot::Receiver<SteerVerdict>> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::WatchSteer {
+        self.actor
+            .call(|reply| Control::WatchSteer {
                 command_id,
                 turn_id,
                 inbox_id,
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))?
+            })
+            .await?
     }
 
     pub async fn abandon_steer(&self, command_id: String) {
-        let (reply, response) = oneshot::channel();
-        if self
-            .control
-            .send(Control::AbandonSteer { command_id, reply })
-            .await
-            .is_ok()
-        {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self
+            .actor
+            .call(|reply| Control::AbandonSteer { command_id, reply })
+            .await;
     }
 
     /// The event task's retained stream record for one inbox id,
     /// serialized behind terminal and delivery handling like the
     /// exact-turn gate.
     pub async fn check_inbox(&self, inbox_id: &str) -> Result<InboxRecord> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::CheckInbox {
+        self.actor
+            .call(|reply| Control::CheckInbox {
                 inbox_id: inbox_id.to_owned(),
                 reply,
-            }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+            })
             .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
     }
 
     pub async fn begin_stop(&self) -> Result<()> {
@@ -636,15 +600,14 @@ impl EventHandle {
     }
 
     pub async fn close(&self) {
-        let (reply, response) = oneshot::channel();
-        if self.control.send(Control::Close { reply }).await.is_ok() {
-            let _ = timeout_at(Instant::now() + EVENT_DEADLINE, response).await;
-        }
+        let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
     pub async fn drain_native(&self) -> Result<()> {
-        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
-            .await
+        eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
+            s.native_drained
+        })
+        .await
     }
 
     /// Wait until `ready` for the association of `command_id`: its turn
@@ -659,7 +622,7 @@ impl EventHandle {
     pub async fn await_association(&self, command_id: &str, deadline: Instant) -> Result<String> {
         // One watcher for the whole wait: cloning per iteration could miss
         // a status version that lands between the check and the clone.
-        let mut watcher = self.status.clone();
+        let mut watcher = self.actor.watch().clone();
         loop {
             {
                 let status = watcher.borrow_and_update();
@@ -699,33 +662,13 @@ impl EventHandle {
     /// still show the active turn after the caller already observed
     /// turn.completed).
     pub async fn current_status(&self) -> Result<EventStatus> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(Control::SnapshotStatus { reply }),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
+        self.actor
+            .call(|reply| Control::SnapshotStatus { reply })
             .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))
     }
 
     async fn send(&self, build: impl FnOnce(oneshot::Sender<Result<()>>) -> Control) -> Result<()> {
-        let (reply, response) = oneshot::channel();
-        timeout_at(
-            Instant::now() + EVENT_DEADLINE,
-            self.control.send(build(reply)),
-        )
-        .await
-        .map_err(|_| Error::new("unknown", "OpenCode event-control queue deadline elapsed"))?
-        .map_err(|_| Error::new("unknown", "OpenCode event processor stopped"))?;
-        timeout_at(Instant::now() + EVENT_DEADLINE, response)
-            .await
-            .map_err(|_| Error::new("unknown", "OpenCode event-control outcome is unknown"))?
-            .map_err(|_| Error::new("unknown", "OpenCode event-control response was lost"))?
+        self.actor.call(build).await?
     }
 }
 
@@ -1564,6 +1507,7 @@ impl EventProcessor {
             let done =
                 run_context_claim(http, host, credential, hook, turn_id, consumer_id, deadline)
                     .await;
+            // Keep the completion until the consumer accepts it or exits.
             let _ = done_tx
                 .send(ContextHookMsg::Done(ContextHookDone {
                     hook_id: pending_hook_id,
@@ -3219,42 +3163,21 @@ fn main_loop_usage(
 ) -> Option<TurnUsage> {
     let messages = usages
         .values()
-        .filter(|(position, _)| *position > idle_position && *position < user_position);
-    let sum = |counter: fn(&AssistantTokens) -> Option<i64>| {
-        let mut values = messages
-            .clone()
-            .map(|(_, tokens)| tokens.as_ref().and_then(counter));
-        let first = values.next()??;
-        values.try_fold(first, |sum, value| sum.checked_add(value?))
-    };
-    let input_tokens = sum(|tokens| tokens.input);
-    let output_tokens = sum(|tokens| tokens.output);
-    let reasoning_tokens = sum(|tokens| tokens.reasoning);
-    let cache_read_tokens = sum(|tokens| tokens.cache.as_ref()?.read);
-    let cache_write_tokens = sum(|tokens| tokens.cache.as_ref()?.write);
-    if [
-        input_tokens,
-        output_tokens,
-        reasoning_tokens,
-        cache_read_tokens,
-        cache_write_tokens,
-    ]
-    .into_iter()
-    .all(|counter| counter.is_none())
-    {
-        return None;
-    }
-    Some(TurnUsage {
-        scope: Some("main_loop_turn".to_owned()),
-        message_id: None,
-        input_tokens,
-        output_tokens,
-        reasoning_tokens,
-        thinking_tokens: None,
-        cache_read_tokens,
-        cache_write_tokens,
-        total_tokens: None,
-    })
+        .filter(|(position, _)| *position > idle_position && *position < user_position)
+        .map(|(_, tokens)| {
+            let Some(tokens) = tokens else {
+                return TurnUsage::default();
+            };
+            TurnUsage {
+                input_tokens: tokens.input,
+                output_tokens: tokens.output,
+                reasoning_tokens: tokens.reasoning,
+                cache_read_tokens: tokens.cache.as_ref().and_then(|cache| cache.read),
+                cache_write_tokens: tokens.cache.as_ref().and_then(|cache| cache.write),
+                ..TurnUsage::default()
+            }
+        });
+    TurnUsage::sum_native("main_loop_turn", messages)
 }
 
 /// One Store claim plus one vendor resolve for a bound hook. The Store

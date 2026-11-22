@@ -40,11 +40,11 @@
 use std::{ffi::OsStr, ffi::OsString, path::Path};
 
 use eliot_core::{Error, Result};
-use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded};
+use eliot_plugin::native_cli::{BoundedReadError, BoundedReadLabels, run_bounded};
 use eliot_plugin::native_lifecycle::kill_and_reap;
 use serde::Deserialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     process::Command,
     time::{Instant, timeout_at},
 };
@@ -548,28 +548,21 @@ pub(crate) async fn quota_credential_for(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|_| {
-        eliot_plugin::quota::environment("OpenCode credential reader could not start")
-    })?;
     let deadline = Instant::now() + std::time::Duration::from_secs(8);
-    let stdout = child.stdout.take().ok_or_else(|| {
-        eliot_plugin::quota::environment("OpenCode credential reader has no output")
-    })?;
-    let mut bytes = Vec::new();
-    let read = async {
-        stdout
-            .take((MAX_AUTH_BYTES + 1) as u64)
-            .read_to_end(&mut bytes)
-            .await?;
-        child.wait().await
-    };
-    let result = timeout_at(deadline, read).await;
-    if !matches!(result,Ok(Ok(status)) if status.success()) || bytes.len() > MAX_AUTH_BYTES {
-        kill_and_reap(&mut child).await;
-        return Err(eliot_plugin::quota::environment(
-            "OpenCode native credential read failed or exceeded its bound",
-        ));
-    }
+    let bytes =
+        eliot_plugin::native_cli::read_bounded_stdout(command, MAX_AUTH_BYTES, deadline, false)
+            .await
+            .map_err(|error| {
+                let message = match error {
+                    BoundedReadError::Spawn(_) => "OpenCode credential reader could not start",
+                    BoundedReadError::Deadline
+                    | BoundedReadError::Unreadable
+                    | BoundedReadError::Status => {
+                        "OpenCode native credential read failed or exceeded its bound"
+                    }
+                };
+                eliot_plugin::quota::environment(message)
+            })?;
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes).map_err(|_| {
         eliot_plugin::quota::environment("OpenCode credential export schema is unavailable")
     })?;

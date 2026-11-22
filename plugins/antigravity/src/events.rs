@@ -278,7 +278,7 @@ pub(crate) struct State {
     /// `(turn_id, status)` where status is the mapped turn status or
     /// `"unknown"`. Interrupt waits on this instead of trusting its own
     /// notification write.
-    pub settlement: Option<(String, String)>,
+    settlement: watch::Sender<Option<(String, bool)>>,
     /// Latest merged session-scoped snapshot from `usage_update`: context
     /// occupancy/capacity and cumulative session cost. Never turn expenditure;
     /// committed as `session.usage` when accepted and replaced wholesale on
@@ -322,6 +322,7 @@ impl State {
         conversation: String,
     ) -> Self {
         let (load_tx, _) = watch::channel(None);
+        let (settlement, _) = watch::channel(None);
         Self {
             sink: CommitSink::new(host.clone(), credential.clone()),
             host,
@@ -359,18 +360,26 @@ impl State {
             stopping: false,
             stopped: false,
             last_turn: None,
-            settlement: None,
+            settlement,
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
         }
     }
 
-    pub fn settlement_for(&self, turn: &str) -> Option<&str> {
+    pub fn subscribe_settlement(&self) -> watch::Receiver<Option<(String, bool)>> {
+        self.settlement.subscribe()
+    }
+
+    fn record_settlement(&self, turn: String, cancelled: bool) {
+        self.settlement.send_replace(Some((turn, cancelled)));
+    }
+
+    fn has_settlement_for(&self, turn: &str) -> bool {
         self.settlement
+            .borrow()
             .as_ref()
-            .filter(|(settled, _)| settled == turn)
-            .map(|(_, status)| status.as_str())
+            .is_some_and(|(settled, _)| settled == turn)
     }
 
     /// Bind the exact session identity, then validate and apply any updates
@@ -1100,7 +1109,7 @@ impl State {
             .pending
             .as_ref()
             .is_none_or(|pending| pending.turn != turn_id)
-            || self.settlement_for(turn_id).is_some()
+            || self.has_settlement_for(turn_id)
         {
             return Ok(rejected_control(
                 "Antigravity request is no longer attached to the active turn",
@@ -1966,7 +1975,7 @@ impl State {
         if let Some(last) = self.last_turn.as_mut() {
             last.final_text = final_text;
         }
-        self.settlement = Some((turn, status.to_owned()));
+        self.record_settlement(turn, status == "cancelled");
         self.clear_fenced();
         self.pending = None;
         Ok(())
@@ -2069,8 +2078,8 @@ impl State {
                 )),
             )));
         }
-        if let Some(pending) = self.pending.as_ref() {
-            self.settlement = Some((pending.turn.clone(), "unknown".to_owned()));
+        if let Some(turn) = self.pending.as_ref().map(|pending| pending.turn.clone()) {
+            self.record_settlement(turn, false);
         }
         if report_gap && !self.gap_reported && !self.writes_blocked {
             let mut source = self.source();

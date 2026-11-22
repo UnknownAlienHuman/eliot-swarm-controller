@@ -288,6 +288,7 @@ pub struct OwnedServer {
     child: Child,
     stdout: Option<StderrCapture>,
     stderr: Option<StderrCapture>,
+    diagnostic_policy: std::sync::Arc<SecretPolicy>,
     http: OpenCodeHttp,
     config_dir: PathBuf,
     data_dir: PathBuf,
@@ -610,12 +611,13 @@ impl OwnedServer {
         // stdout carries the `server listening` line and MCP spawn notes.
         let capture = std::sync::Arc::new(capture);
         let stdout = spawn_stderr(stdout, capture.clone());
-        let stderr = spawn_stderr(stderr, capture);
+        let stderr = spawn_stderr(stderr, capture.clone());
 
         let mut server = Self {
             child,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            diagnostic_policy: capture,
             http,
             config_dir,
             data_dir,
@@ -798,11 +800,12 @@ impl OwnedServer {
         })?;
         let capture = std::sync::Arc::new(capture);
         let stdout = spawn_stderr(stdout, capture.clone());
-        let stderr = spawn_stderr(stderr, capture);
+        let stderr = spawn_stderr(stderr, capture.clone());
         let mut server = Self {
             child,
             stdout: Some(stdout),
             stderr: Some(stderr),
+            diagnostic_policy: capture,
             http,
             config_dir,
             data_dir,
@@ -837,14 +840,12 @@ impl OwnedServer {
             })
     }
 
-    /// Attach the harness stderr tail to an error as its second diagnostic
-    /// source. Stdout stays out of the error: it carries only the
-    /// `server listening` line and spawn notes.
+    /// Sanitize under the server's live scope and attach the harness stderr
+    /// tail as the second diagnostic source when available. Stdout stays out
+    /// of the error: it carries only the `server listening` line and spawn notes.
     pub fn diagnostic_error(&self, error: Error) -> Error {
-        if self.stderr.is_none() {
-            return error;
-        }
-        error.with_stderr(eliot_core::StderrSource::Harness, self.stderr_snapshot())
+        let stderr = self.stderr.as_ref().map(|_| self.stderr_snapshot());
+        eliot_plugin::harness_diagnostic(error, &self.diagnostic_policy, stderr)
     }
 
     /// End the owned server during cleanup. The generation Job owns any

@@ -10,9 +10,10 @@ use eliot_core::{Error, InjectPoint, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_FRAME_BYTES,
     MAX_TEXT_BYTES, PeerClient,
+    event_actor::wait_for_status,
     session::{
-        native_no_write, register_native_process, unknown_snapshot, with_claimed_context,
-        with_context_points,
+        interrupt_settlement_outcome, native_no_write, register_native_process, unknown_snapshot,
+        with_claimed_context, with_context_points,
     },
     skill,
 };
@@ -910,7 +911,7 @@ impl Session {
             .ok_or_else(|| {
                 Error::new("stale_turn", "turn/interrupt requires a captured turn id")
             })?;
-        {
+        let mut settlement = {
             let state = self.state.lock().await;
             if state.active_turn() != Some(turn_id) {
                 return Err(Error::new(
@@ -918,7 +919,8 @@ impl Session {
                     "turn/interrupt does not match the exact active native turn",
                 ));
             }
-        }
+            state.subscribe_settlement()
+        };
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
         {
@@ -940,39 +942,18 @@ impl Session {
                 // terminal while an ask is still open. Best-effort per
                 // ask; the terminal below still decides the interrupt.
                 // The notification write proves dispatch only, never
-                // cancellation. Wait (bounded, lock-free between polls)
+                // cancellation. Wait (bounded and lock-free)
                 // for the prompt task's actual settlement of this exact
                 // turn: only `cancelled` proves the interrupt; natural
                 // completion, failure, or no settlement stay unknown.
                 let deadline = Instant::now() + TIMEOUT;
-                let settled = loop {
-                    let status = {
-                        let state = self.state.lock().await;
-                        state.settlement_for(turn_id).map(str::to_owned)
-                    };
-                    if status.is_some() {
-                        break status;
-                    }
-                    if Instant::now() >= deadline {
-                        break None;
-                    }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                };
-                match settled.as_deref() {
-                    Some("cancelled") => Ok(json!({
-                        "state": "applied",
-                        "command_id": params.command_id.clone(),
-                        "turn_id": turn_id,
-                    })),
-                    Some(_) => Err(Error::new(
-                        "unknown",
-                        "Antigravity interrupt raced natural turn completion",
-                    )),
-                    None => Err(Error::new(
-                        "unknown",
-                        "Antigravity interrupt settlement is unknown",
-                    )),
-                }
+                let cancelled = wait_for_status(&mut settlement, deadline, |current| {
+                    current.as_ref().and_then(|(settled_turn, cancelled)| {
+                        (settled_turn == turn_id).then_some(*cancelled)
+                    })
+                })
+                .await;
+                interrupt_settlement_outcome("Antigravity", &params.command_id, turn_id, cancelled)
             }
             // The locked re-check refused before native I/O. Preserve that
             // refusal and leave private history available for the next command.

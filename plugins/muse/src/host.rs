@@ -31,10 +31,11 @@ use eliot_plugin::{
     protocol::stream_sources,
     session::{
         attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
-        ensure_reader_harness, initialize_fields_valid, native_no_write, not_initialized,
-        paths_equal, register_native_process, rejected_control, request_reply_ids,
-        required_native_cmd, unknown_control, unknown_snapshot, validate_binding,
-        validate_identity, with_claimed_context, with_context_points,
+        ensure_reader_harness, initialize_fields_valid, model_catalogue_profile, native_no_write,
+        not_initialized, paths_equal, register_native_process, rejected_control, request_reply_ids,
+        required_native_cmd, shutdown_session, stop_owned_session, unknown_control,
+        unknown_snapshot, validate_binding, validate_identity, with_claimed_context,
+        with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -43,10 +44,7 @@ use std::{
     ffi::OsString,
     path::Path,
 };
-use tokio::{
-    sync::mpsc,
-    time::{Instant, timeout_at},
-};
+use tokio::{sync::mpsc, time::Instant};
 
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1968,23 +1966,28 @@ impl MusePlugin {
         Ok(json!({"state": "applied"}))
     }
 
+    async fn shutdown_paths(&mut self, best_effort: bool) -> Result<Value> {
+        shutdown_session(
+            self.session.as_mut(),
+            best_effort,
+            async |session| {
+                if session.phase != SessionPhase::Stopped {
+                    terminate_session(session, true, Instant::now() + RPC_TIMEOUT).await
+                } else {
+                    Ok(())
+                }
+            },
+            async |session| session.events.close().await,
+        )
+        .await
+    }
+
     async fn shutdown(&mut self) -> Result<Value> {
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                terminate_session(session, true, Instant::now() + RPC_TIMEOUT).await?;
-            }
-            session.events.close().await;
-        }
-        Ok(json!({"state": "shutdown"}))
+        self.shutdown_paths(false).await
     }
 
     async fn shutdown_owned(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped {
-                let _ = terminate_session(session, true, Instant::now() + RPC_TIMEOUT).await;
-            }
-            session.events.close().await;
-        }
+        let _ = self.shutdown_paths(true).await;
     }
 }
 
@@ -2025,55 +2028,41 @@ async fn terminate_session(
 ) -> Result<()> {
     let settlement_deadline = deadline - STOP_RESPONSE_RESERVE;
     let native_deadline = settlement_deadline - STOP_SETTLEMENT_RESERVE;
-    let begin = Instant::now() < native_deadline
-        && matches!(
-            timeout_at(native_deadline, session.events.begin_stop()).await,
-            Ok(Ok(()))
-        );
-    if Instant::now() >= native_deadline {
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            "Muse stop deadline elapsed before native termination",
-        ));
-    }
-    let process_exit = if force {
-        // Startup/plugin-shutdown cleanup retains its separate forceful path.
-        session
-            .native
-            .transport
-            .terminate_dropping_input(true, native_deadline)
-            .await
-    } else {
-        // Agent stop must never escalate to a child kill; daemon Job custody
-        // owns force termination after this graceful close is unresolved.
-        session
-            .native
-            .transport
-            .close_gracefully(native_deadline, true)
-            .await
+    let result = {
+        let events = &session.events;
+        let native = &mut session.native;
+        let begin = events.begin_stop();
+        let native = async move {
+            let process_exit = if force {
+                native
+                    .transport
+                    .terminate_dropping_input(true, native_deadline)
+                    .await
+            } else {
+                native
+                    .transport
+                    .close_gracefully(native_deadline, true)
+                    .await
+            };
+            let drained = native.await_output_drained(native_deadline).await;
+            (process_exit, drained)
+        };
+        let end = events.end_stop();
+        stop_owned_session(
+            "Muse",
+            Some((native_deadline, settlement_deadline)),
+            begin,
+            native,
+            end,
+        )
+        .await
     };
-    let drained = session.native.await_output_drained(native_deadline).await;
-    // The event actor retains commit ownership if this acknowledgement times out.
-    let ended = Instant::now() < settlement_deadline
-        && matches!(
-            timeout_at(settlement_deadline, session.events.end_stop()).await,
-            Ok(Ok(()))
-        );
-    if !begin
-        || process_exit.is_err()
-        || drained.is_err()
-        || !ended
-        || Instant::now() >= settlement_deadline
-    {
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            "Muse process/output drain or session.ended outcome is unknown",
-        ));
-    }
-    session.phase = SessionPhase::Stopped;
-    Ok(())
+    session.phase = if result.is_ok() {
+        SessionPhase::Stopped
+    } else {
+        SessionPhase::Unknown
+    };
+    result
 }
 
 async fn discard_unstarted(session: &mut AgentSession) {
@@ -2131,34 +2120,44 @@ fn select_launch_model(
     catalog: NativeModelListResult,
     requested_model: Option<&str>,
 ) -> Result<Option<NativeModelCatalogEntry>> {
+    use eliot_plugin::session::{LaunchModelMissing, LaunchModelRequest, choose_launch_model};
+
     let source = catalog
         .source
         .clone()
         .unwrap_or_else(|| "unknown".to_owned());
     let count = catalog.models.len();
-    match requested_model {
-        Some(requested) => catalog
-            .models
-            .into_iter()
-            .find(|model| model.model_id == requested)
-            .map(Some)
-            .ok_or_else(|| {
-                Error::new(
-                    "profile_error",
-                    format!(
-                        "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
-                    ),
-                ).with_where("plugin.muse.start.model_list")
-                 .with_origin(eliot_core::FailureOrigin::Harness, "native model catalogue omits the exact requested model; upstream error absent")
-            }),
-        None if catalog.models.is_empty() => Err(Error::new(
+    let request = requested_model.map_or(
+        LaunchModelRequest::VendorDefault,
+        LaunchModelRequest::Explicit,
+    );
+    let selected = choose_launch_model(
+        &catalog.models,
+        request,
+        |model| model.model_id.as_str(),
+        |_, _| true,
+        |model| model.is_default == Some(true),
+    )
+    .map_err(|reason| match reason {
+        LaunchModelMissing::Explicit | LaunchModelMissing::Frozen => Error::new(
+            "profile_error",
+            format!(
+                "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
+            ),
+        )
+        .with_where("plugin.muse.start.model_list")
+        .with_origin(
+            eliot_core::FailureOrigin::Harness,
+            "native model catalogue omits the exact requested model; upstream error absent",
+        ),
+        LaunchModelMissing::Default => Error::new(
             "profile_error",
             format!(
                 "Muse model catalogue (source {source}, {count} models) names no default model; use an explicit model"
             ),
-        )),
-        None => Ok(None),
-    }
+        ),
+    })?;
+    Ok(selected.cloned())
 }
 
 impl MusePlugin {
@@ -2169,14 +2168,13 @@ impl MusePlugin {
     /// host supplies it) projects as the catalogue default; absent or
     /// all-false stays unknown and is never invented by list order.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        ensure_dedicated_reader(
+        let snapshot = model_catalogue_profile(
+            raw,
             self.session.is_some() || self.failed_start.is_some(),
+            "muse",
             "Muse",
-            "model.list",
+            false,
         )?;
-        let profile: Value = decode(raw, "Muse model.list params are invalid")?;
-        let snapshot = profile.get("profile").unwrap_or(&profile);
-        ensure_reader_harness(snapshot, "muse", "Muse", "model.list")?;
         let program =
             required_native_cmd(snapshot, "Muse model.list requires a discovered native cmd")?;
         let cwd = std::env::current_dir()

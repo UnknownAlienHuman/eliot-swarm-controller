@@ -1,15 +1,14 @@
 //! Read the selected CLI's authentication state before starting a session.
 
 use eliot_core::{Error, Result};
-use eliot_plugin::native_lifecycle::kill_and_reap;
+use eliot_plugin::native_cli::{BoundedReadError, read_bounded_stdout};
 use serde_json::Value;
 use std::{
     ffi::{OsStr, OsString},
     path::Path,
-    process::Stdio,
     time::Duration,
 };
-use tokio::{io::AsyncReadExt, process::Command, time::timeout_at};
+use tokio::{process::Command, time::Instant};
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(20);
 
@@ -57,15 +56,16 @@ pub(crate) async fn auth_status(
     environment: &[(OsString, OsString)],
 ) -> Result<Value> {
     let mut command = cli(program, cwd, environment);
-    command
-        .args(["auth", "status", "--json"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let deadline = tokio::time::Instant::now() + STATUS_DEADLINE;
-    let mut child = command.spawn().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
+    command.args(["auth", "status", "--json"]);
+    let bytes = read_bounded_stdout(
+        command,
+        MAX_AUTH_STATUS_BYTES,
+        Instant::now() + STATUS_DEADLINE,
+        true,
+    )
+    .await
+    .map_err(|error| match error {
+        BoundedReadError::Spawn(error) if error.kind() == std::io::ErrorKind::NotFound => {
             // The profile's `cmd` names no executable: say so, rather than
             // blaming authentication for a file that does not exist.
             Error::new(
@@ -75,41 +75,20 @@ pub(crate) async fn auth_status(
                     program.to_string_lossy()
                 ),
             )
-        } else {
-            Error::new(
-                "native_not_dispatched",
-                "Claude CLI auth status could not run",
-            )
         }
-    })?;
-    let mut stdout = child.stdout.take().ok_or_else(|| {
-        Error::new(
+        BoundedReadError::Spawn(_) => Error::new(
             "native_not_dispatched",
             "Claude CLI auth status could not run",
-        )
-    })?;
-    let mut bytes = Vec::new();
-    let read = async {
-        let mut limited = (&mut stdout).take((MAX_AUTH_STATUS_BYTES + 1) as u64);
-        limited.read_to_end(&mut bytes).await
-    };
-    let read_result = timeout_at(deadline, read).await;
-    let over_cap = bytes.len() > MAX_AUTH_STATUS_BYTES;
-    // The child is done or refused either way: always kill and reap so no
-    // auth-status child outlives this read, including on timeout.
-    kill_and_reap(&mut child).await;
-    if read_result.is_err() {
-        return Err(Error::new(
+        ),
+        BoundedReadError::Deadline => Error::new(
             "native_not_dispatched",
             "Claude CLI auth status timed out",
-        ));
-    }
-    if over_cap || read_result.is_ok_and(|read| read.is_err()) {
-        return Err(Error::new(
+        ),
+        BoundedReadError::Unreadable | BoundedReadError::Status => Error::new(
             "native_not_dispatched",
             "Claude CLI auth status did not print its JSON status",
-        ));
-    }
+        ),
+    })?;
     serde_json::from_slice(&bytes).map_err(|_| {
         Error::new(
             "native_not_dispatched",

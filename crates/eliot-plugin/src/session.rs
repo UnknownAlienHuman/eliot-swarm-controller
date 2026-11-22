@@ -1301,3 +1301,214 @@ pub fn ensure_reader_harness(
     }
     Ok(())
 }
+
+pub fn model_catalogue_profile<'a>(
+    raw: &'a Value,
+    occupied: bool,
+    harness_id: &str,
+    harness: &str,
+    requires_wrapped_profile: bool,
+) -> Result<&'a Value> {
+    ensure_dedicated_reader(occupied, harness, "model.list")?;
+    let profile = match raw.get("profile") {
+        Some(profile) => profile,
+        None if !requires_wrapped_profile => raw,
+        None => {
+            return Err(Error::new(
+                "invalid",
+                format!("{harness} model.list params are invalid"),
+            ));
+        }
+    };
+    ensure_reader_harness(profile, harness_id, harness, "model.list")?;
+    Ok(profile)
+}
+
+pub enum LaunchModelRequest<'a> {
+    Explicit(&'a str),
+    Frozen(&'a str),
+    CatalogueDefault,
+    VendorDefault,
+}
+
+pub enum LaunchModelMissing {
+    Explicit,
+    Frozen,
+    Default,
+}
+
+/// Select the exact explicit or frozen model. An omitted selection can
+/// delegate to a vendor that reports its default at session creation.
+pub fn choose_launch_model<'a, T>(
+    entries: &'a [T],
+    request: LaunchModelRequest<'_>,
+    id: impl Fn(&T) -> &str,
+    exact: impl Fn(&T, &str) -> bool,
+    is_default: impl Fn(&T) -> bool,
+) -> std::result::Result<Option<&'a T>, LaunchModelMissing> {
+    let selected = match request {
+        LaunchModelRequest::Explicit(requested) => entries
+            .iter()
+            .find(|entry| id(entry) == requested && exact(entry, requested))
+            .ok_or(LaunchModelMissing::Explicit)?,
+        LaunchModelRequest::Frozen(frozen) => entries
+            .iter()
+            .find(|entry| id(entry) == frozen)
+            .ok_or(LaunchModelMissing::Frozen)?,
+        LaunchModelRequest::CatalogueDefault => entries
+            .iter()
+            .find(|entry| is_default(entry))
+            .ok_or(LaunchModelMissing::Default)?,
+        LaunchModelRequest::VendorDefault => {
+            return if entries.is_empty() {
+                Err(LaunchModelMissing::Default)
+            } else {
+                Ok(None)
+            };
+        }
+    };
+    Ok(Some(selected))
+}
+
+/// Close the owned event task after stop. Teardown after a transport loss
+/// still closes the task if its stop reply could not be proved.
+pub async fn shutdown_session<S>(
+    session: Option<&mut S>,
+    best_effort: bool,
+    stop: impl AsyncFnOnce(&mut S) -> Result<()>,
+    close: impl AsyncFnOnce(&mut S),
+) -> Result<Value> {
+    if let Some(session) = session {
+        let stopped = stop(session).await;
+        if !best_effort {
+            stopped?;
+        }
+        close(session).await;
+    }
+    Ok(json!({"state": "shutdown"}))
+}
+
+/// Stop a process-owned native session and verify output and source drain.
+/// A failed begin, process close or drain must still allow the remaining
+/// bounded cleanup stages. A caller with an end-to-end budget supplies the
+/// native and settlement cutoffs from that budget.
+pub async fn stop_owned_session<P>(
+    harness: &str,
+    deadlines: Option<(Instant, Instant)>,
+    begin: impl std::future::Future<Output = Result<()>>,
+    native: impl std::future::Future<Output = (Result<P>, Result<()>)>,
+    end: impl std::future::Future<Output = Result<()>>,
+) -> Result<()> {
+    let began = if let Some((native_deadline, _)) = deadlines {
+        let began = Instant::now() < native_deadline
+            && matches!(
+                tokio::time::timeout_at(native_deadline, begin).await,
+                Ok(Ok(()))
+            );
+        if Instant::now() >= native_deadline {
+            return Err(Error::new(
+                "unknown",
+                format!("{harness} stop deadline elapsed before native termination"),
+            ));
+        }
+        began
+    } else {
+        begin.await.is_ok()
+    };
+    let (process_exit, drained) = native.await;
+    let ended = if let Some((_, settlement_deadline)) = deadlines {
+        Instant::now() < settlement_deadline
+            && matches!(
+                tokio::time::timeout_at(settlement_deadline, end).await,
+                Ok(Ok(()))
+            )
+            && Instant::now() < settlement_deadline
+    } else {
+        end.await.is_ok()
+    };
+    if began && process_exit.is_ok() && drained.is_ok() && ended {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "unknown",
+            format!("{harness} process/output drain or session.ended outcome is unknown"),
+        ))
+    }
+}
+
+pub fn unconfirmed_control(acknowledged: bool, pending: &str, withdrawal: &str) -> Value {
+    unknown_control(if acknowledged { pending } else { withdrawal })
+}
+
+/// A cancellation notification only proves dispatch. Applied requires an
+/// observed cancellation terminal for the same bound turn.
+pub fn interrupt_settlement_outcome(
+    harness: &str,
+    command_id: &str,
+    turn_id: &str,
+    cancelled: Option<bool>,
+) -> Result<Value> {
+    match cancelled {
+        Some(true) => Ok(json!({
+            "state": "applied",
+            "command_id": command_id,
+            "turn_id": turn_id,
+        })),
+        Some(false) => Err(Error::new(
+            "unknown",
+            format!("{harness} interrupt raced natural turn completion"),
+        )),
+        None => Err(Error::new(
+            "unknown",
+            format!("{harness} interrupt settlement is unknown"),
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum RetainedStopStep {
+    Begin,
+    VerifyRetention,
+    Drain,
+    Process,
+    End,
+    Diagnostics,
+}
+
+/// For a retained native session, graceful stop drains the source while
+/// leaving process exit to the daemon. Forced cleanup can publish End only
+/// after proving closure of its owned process.
+pub async fn stop_retained_session(
+    harness: &str,
+    force: bool,
+    mut step: impl AsyncFnMut(RetainedStopStep) -> Result<()>,
+) -> Result<()> {
+    use RetainedStopStep::{Begin, Diagnostics, Drain, End, Process, VerifyRetention};
+
+    let began = step(Begin).await.is_ok();
+    let retained = began && step(VerifyRetention).await.is_ok();
+    let unknown = |stage| {
+        Error::new(
+            "unknown",
+            format!("{harness} stop outcome is unknown at stage {stage}"),
+        )
+    };
+    if !force {
+        let drained = step(Drain).await.is_ok();
+        return if retained && drained {
+            Ok(())
+        } else {
+            Err(unknown(if began { "retention" } else { "begin" }))
+        };
+    }
+    if step(Process).await.is_err() {
+        return Err(unknown("end_ack"));
+    }
+    let ended = step(End).await.is_ok();
+    let _ = step(Diagnostics).await;
+    if retained && ended {
+        Ok(())
+    } else {
+        Err(unknown("end_ack"))
+    }
+}

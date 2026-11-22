@@ -1,6 +1,8 @@
 mod bounded_file;
 pub mod debug;
+pub mod event_actor;
 mod file_identity;
+pub mod native_child;
 pub mod native_cli;
 pub mod native_lifecycle;
 pub mod native_stdio;
@@ -9,6 +11,7 @@ pub mod owner_scan;
 pub mod peer;
 pub mod protocol;
 pub mod quota;
+pub mod retry;
 pub mod session;
 pub mod skill;
 pub mod start_classification;
@@ -28,6 +31,6 @@ pub use protocol::{
     RpcResponse,
 };
 pub use stderr::{
-    StderrCapture, StderrSnapshot, StderrView, spawn_plugin_stderr, spawn_stderr,
-    spawn_stderr_prefix,
+    StderrCapture, StderrSnapshot, StderrView, harness_diagnostic, spawn_plugin_stderr,
+    spawn_stderr, spawn_stderr_prefix,
 };

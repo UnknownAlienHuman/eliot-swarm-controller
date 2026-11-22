@@ -281,36 +281,6 @@ enum SessionPhase {
     Stopped,
 }
 
-/// Static stop-stage class for one unknown error message. Safe by
-/// construction: a fixed literal, never a payload, native error, or secret.
-#[derive(Clone, Copy)]
-enum StopStage {
-    Begin,
-    Retention,
-    Process,
-    EndAck,
-}
-
-impl StopStage {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Begin => "begin",
-            Self::Retention => "retention",
-            Self::Process => "process",
-            Self::EndAck => "end_ack",
-        }
-    }
-}
-
-fn note_stage(stage: &mut StopStage, next: StopStage) -> StopStage {
-    // This is a function call, so the compiler treats the stage value
-    // as read here; sequential semantic stages advance the same
-    // variable without a dead-assignment lint. The observable value at
-    // the final stage is the furthest semantic step reached.
-    *stage = next;
-    *stage
-}
-
 fn native_io_blocked(session: &AgentSession) -> bool {
     session.resources_proved_closed || session.stop_end_ack_proved
 }
@@ -748,13 +718,13 @@ impl OpenCodePlugin {
             .await;
         match (result, stopped) {
             (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(Error::new(
+            (Ok(_), Err(error)) => Err(server.diagnostic_error(Error::new(
                 "unknown",
                 format!(
                     "OpenCode native.archive server cleanup is unconfirmed ({})",
                     error.message
                 ),
-            )),
+            ))),
             (Err(error), _) => Err(server.diagnostic_error(error)),
         }
     }
@@ -871,14 +841,14 @@ impl OpenCodePlugin {
     /// `api model.list --standalone` metadata. The daemon gives each phase
     /// its own reader Job and proves family closure before overlaying results.
     async fn model_list(&self, raw: &Value) -> Result<Value> {
-        ensure_dedicated_reader(
+        let snapshot = eliot_plugin::session::model_catalogue_profile(
+            raw,
             self.session.is_some() || self.failed_start.is_some(),
+            "opencode",
             "OpenCode",
-            "model.list",
+            true,
         )?;
         let params: ModelListParams = decode(raw, "OpenCode model.list params are invalid")?;
-        let snapshot = &params.profile;
-        ensure_reader_harness(snapshot, "opencode", "OpenCode", "model.list")?;
         let program = required_native_cmd(
             snapshot,
             "OpenCode model.list requires a discovered native cmd",
@@ -3926,25 +3896,32 @@ impl OpenCodePlugin {
     }
 
     async fn shutdown(&mut self) -> Result<Value> {
-        if let Some(session) = self.session.as_mut() {
-            // Shutdown with proved resource closure ends the owned path
-            // without replaying native control. An already-acked End is
-            // likewise never repeated.
-            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
-                terminate_session(session, true).await?;
-            }
-            session.events.close().await;
-        }
-        Ok(json!({"state": "shutdown"}))
+        self.shutdown_paths(false).await
     }
 
     async fn shutdown_owned(&mut self) {
-        if let Some(session) = self.session.as_mut() {
-            if session.phase != SessionPhase::Stopped && !session.resources_proved_closed {
-                let _ = terminate_session(session, true).await;
-            }
-            session.events.close().await;
-        }
+        let _ = self.shutdown_paths(true).await;
+    }
+
+    async fn shutdown_paths(&mut self, best_effort: bool) -> Result<Value> {
+        eliot_plugin::session::shutdown_session(
+            self.session.as_mut(),
+            best_effort,
+            async |session| {
+                // Shutdown with proved resource closure ends the owned path
+                // without replaying native control. An already-acked End is
+                // likewise never repeated.
+                if session.phase == SessionPhase::Stopped || session.resources_proved_closed {
+                    Ok(())
+                } else {
+                    terminate_session(session, true).await
+                }
+            },
+            async |session| {
+                session.events.close().await;
+            },
+        )
+        .await
     }
 }
 
@@ -4760,91 +4737,56 @@ fn start_paths(
 /// Preserve the exact native session for resume and drain its event source.
 /// The daemon owns the server's process exit after an ordinary stop.
 async fn terminate_session(session: &mut AgentSession, force: bool) -> Result<()> {
-    let deadline = Instant::now() + RPC_TIMEOUT;
-    // A retention/readback failure never skips the bounded owned-resource
-    // cleanup below. The semantic error is preserved separately, then
-    // process closure and source End run without replaying the unknown read.
-    let mut stage = StopStage::Begin;
-    let _ = note_stage(&mut stage, StopStage::Begin);
-    let mut semantic_error = false;
-    if session.events.begin_stop().await.is_err() {
-        semantic_error = true;
-    } else {
-        let _ = note_stage(&mut stage, StopStage::Retention);
-        let retained = match session.session_id.clone() {
-            Some(session_id) if !session_id.is_empty() => {
-                match session.http.get_session(&session_id, deadline).await {
-                    Ok(info) => info.id == session_id,
-                    Err(_) => false,
-                }
-            }
-            _ => false,
-        };
-        if !retained {
-            semantic_error = true;
-        }
-    }
-    if !force {
-        let drained = session.events.drain_stop().await;
-        if drained.is_ok() {
-            session.stop_end_ack_proved = true;
-        }
-        if semantic_error || drained.is_err() {
-            session.phase = SessionPhase::Unknown;
-            return Err(Error::new(
-                "unknown",
-                format!(
-                    "OpenCode stop outcome is unknown at stage {}",
-                    stage.as_str()
-                ),
-            ));
-        }
-        session.phase = SessionPhase::Stopped;
-        return Ok(());
-    }
-    finish_stop_cleanup(session, stage, semantic_error, force, deadline).await
-}
+    use eliot_plugin::session::{RetainedStopStep, stop_retained_session};
 
-async fn finish_stop_cleanup(
-    session: &mut AgentSession,
-    mut stage: StopStage,
-    semantic_error: bool,
-    force: bool,
-    deadline: Instant,
-) -> Result<()> {
-    let _ = note_stage(&mut stage, StopStage::Process);
-    let process_exit = session.server.terminate_leader(force, deadline).await;
-    if process_exit.is_ok() {
-        session.resources_proved_closed = true;
-    }
-    // End is attempted only when the process-exit proof binds closure.
-    let _ = note_stage(&mut stage, StopStage::EndAck);
-    let ended = if process_exit.is_ok() {
-        Some(session.events.end_stop().await)
+    let deadline = Instant::now() + RPC_TIMEOUT;
+    let result = stop_retained_session("OpenCode", force, async |step| match step {
+        RetainedStopStep::Begin => session.events.begin_stop().await,
+        RetainedStopStep::VerifyRetention => {
+            if let Some(id) = session.session_id.as_deref().filter(|id| !id.is_empty())
+                && session
+                    .http
+                    .get_session(id, deadline)
+                    .await
+                    .is_ok_and(|info| info.id == id)
+            {
+                Ok(())
+            } else {
+                Err(Error::new(
+                    "unknown",
+                    "OpenCode session retention was not confirmed",
+                ))
+            }
+        }
+        RetainedStopStep::Drain | RetainedStopStep::End => {
+            let result = match step {
+                RetainedStopStep::Drain => session.events.drain_stop().await,
+                _ => session.events.end_stop().await,
+            };
+            if result.is_ok() {
+                session.stop_end_ack_proved = true;
+            }
+            result
+        }
+        RetainedStopStep::Process => {
+            let exit = session.server.terminate_leader(force, deadline).await;
+            if exit.is_ok() {
+                session.resources_proved_closed = true;
+            }
+            exit
+        }
+        RetainedStopStep::Diagnostics => {
+            session.server.finish_diagnostics(deadline).await;
+            Ok(())
+        }
+    })
+    .await;
+    session.phase = if result.is_ok() {
+        SessionPhase::Stopped
     } else {
-        None
+        SessionPhase::Unknown
     };
-    if ended.as_ref().is_some_and(|result| result.is_ok()) {
-        session.stop_end_ack_proved = true;
-    }
-    if process_exit.is_ok() {
-        session.server.finish_diagnostics(deadline).await;
-    }
-    if semantic_error
-        || process_exit.is_err()
-        || ended.as_ref().is_none_or(|result| result.is_err())
-    {
-        session.phase = SessionPhase::Unknown;
-        return Err(Error::new(
-            "unknown",
-            format!(
-                "OpenCode stop outcome is unknown at stage {}",
-                stage.as_str()
-            ),
-        ));
-    }
-    session.phase = SessionPhase::Stopped;
-    Ok(())
+    result
 }
 
 /// Close the start event stream inside the shared envelope: the raw close
@@ -4946,7 +4888,9 @@ async fn bind_context_hooks(
     session_id: &str,
     deadline: Instant,
 ) -> bool {
-    for _ in 0..3 {
+    let mut retry =
+        eliot_plugin::retry::Retry::new(eliot_plugin::retry::RetryOperation::SessionBinding);
+    loop {
         if Instant::now() >= deadline {
             return false;
         }
@@ -4956,11 +4900,15 @@ async fn bind_context_hooks(
             }
             Err(HttpOutcome::Rejected { .. }) => return false,
             Err(HttpOutcome::Unknown { .. } | HttpOutcome::NotDispatched { .. }) => {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !retry
+                    .wait(eliot_plugin::retry::RetryFact::Idempotent, Some(deadline))
+                    .await
+                {
+                    return false;
+                }
             }
         }
     }
-    false
 }
 
 /// The first slash separates `providerID`; the full remaining id stays intact.

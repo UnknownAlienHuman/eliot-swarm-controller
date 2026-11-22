@@ -18,7 +18,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
-use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot, StderrSource};
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot};
 
 use crate::StderrView;
 use crate::native_transport::{
@@ -228,9 +228,8 @@ impl<C: NativeStdioConfig> StdioClient<C> {
         self.stderr.snapshot()
     }
 
-    pub fn diagnostic_error(&self, mut error: Error) -> Error {
-        error.message = self.policy.redact_text(&error.message).into();
-        error.with_stderr(StderrSource::Harness, self.stderr_snapshot())
+    pub fn diagnostic_error(&self, error: Error) -> Error {
+        crate::harness_diagnostic(error, &self.policy, Some(self.stderr_snapshot()))
     }
 
     async fn call_inner(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {

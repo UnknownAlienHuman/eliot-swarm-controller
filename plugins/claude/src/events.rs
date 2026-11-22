@@ -11,6 +11,7 @@ use eliot_core::{
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, MAX_TEXT_BYTES, PeerClient,
+    event_actor::EventActor,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
@@ -98,8 +99,7 @@ pub(crate) struct EventConfig {
 }
 
 pub(crate) struct EventHandle {
-    control: mpsc::Sender<Control>,
-    status: watch::Receiver<EventStatus>,
+    actor: EventActor<Control, EventStatus>,
     hook_callback_id: String,
 }
 
@@ -370,7 +370,7 @@ struct EventProcessor {
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
-    control_tx: Option<mpsc::Sender<Control>>,
+    control_actor: EventActor<Control, EventStatus>,
     pending_hooks: HashMap<String, PendingHookCallback>,
 }
 
@@ -380,15 +380,24 @@ pub(crate) fn spawn(
     host: PeerClient,
     config: EventConfig,
 ) -> EventHandle {
-    let (control, control_rx) = mpsc::channel(CONTROL_QUEUE);
-    let (status_tx, status) = watch::channel(EventStatus::default());
-    let mut processor = EventProcessor::new(host, config, status_tx.clone());
-    let hook_callback_id = processor.hook_callback_id.clone();
-    processor.control_tx = Some(control.clone());
-    tokio::spawn(run(frames, stream, processor, control_rx, status_tx));
+    let hook_callback_id = ulid::Ulid::new().to_string();
+    let processor_callback_id = hook_callback_id.clone();
+    let actor = EventActor::spawn_with_actor(
+        CONTROL_QUEUE,
+        EventStatus::default(),
+        move |control_actor, control_rx, status_tx| async move {
+            let processor = EventProcessor::new(
+                host,
+                config,
+                processor_callback_id,
+                status_tx.clone(),
+                control_actor,
+            );
+            run(frames, stream, processor, control_rx, status_tx).await;
+        },
+    );
     EventHandle {
-        control,
-        status,
+        actor,
         hook_callback_id,
     }
 }
@@ -412,14 +421,15 @@ impl EventHandle {
         native: ClaudeClient,
     ) -> Result<()> {
         let deadline = Instant::now() + EVENT_DEADLINE;
+        let mut status = self.actor.watch().clone();
         loop {
             {
-                let status = self.status.borrow();
-                if status.session_id.is_some() || status.failure.is_some() {
+                let current = status.borrow();
+                if current.session_id.is_some() || current.failure.is_some() {
                     break;
                 }
             }
-            match timeout_at(deadline, self.status.changed()).await {
+            match timeout_at(deadline, status.changed()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     return Err(Error::new(
@@ -435,14 +445,15 @@ impl EventHandle {
                 }
             }
         }
-        self.send(|reply| Control::Ready {
-            native_scope,
-            session_id,
-            effective,
-            native,
-            reply,
-        })
-        .await
+        self.actor
+            .call(|reply| Control::Ready {
+                native_scope,
+                session_id,
+                effective,
+                native,
+                reply,
+            })
+            .await?
     }
 
     /// Register one pending input BEFORE its stdin write, then wait for the
@@ -454,21 +465,16 @@ impl EventHandle {
         turn_id: String,
         context: Vec<ContextItem>,
     ) -> Result<oneshot::Receiver<TurnOutcome>> {
-        let (registered_tx, registered_rx) = oneshot::channel();
         let (outcome_tx, outcome_rx) = oneshot::channel();
-        self.control
-            .send(Control::ExpectTurn {
+        self.actor
+            .call(|registered| Control::ExpectTurn {
                 command_id,
                 turn_id,
                 context,
-                registered: registered_tx,
+                registered,
                 outcome: outcome_tx,
             })
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?;
-        registered_rx
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))??;
+            .await??;
         Ok(outcome_rx)
     }
 
@@ -477,19 +483,10 @@ impl EventHandle {
     /// exact pending command is cleared; an associated turn is untouched.
     /// The ack is awaited so a following send cannot race the clear.
     pub async fn cancel_turn(&self, command_id: String) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .control
-            .send(Control::CancelTurn {
-                command_id,
-                reply: reply_tx,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let _ = reply_rx.await;
+        let _ = self
+            .actor
+            .call(|reply| Control::CancelTurn { command_id, reply })
+            .await;
     }
 
     /// Queue one steer for its exact captured turn. Registration is
@@ -504,21 +501,16 @@ impl EventHandle {
         turn_id: String,
         text: String,
     ) -> Result<oneshot::Receiver<SteerOutcome>> {
-        let (registered_tx, registered_rx) = oneshot::channel();
         let (outcome_tx, outcome_rx) = oneshot::channel();
-        self.control
-            .send(Control::Steer {
+        self.actor
+            .call(|registered| Control::Steer {
                 command_id,
                 turn_id,
                 text,
-                registered: registered_tx,
+                registered,
                 outcome: outcome_tx,
             })
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?;
-        registered_rx
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))??;
+            .await??;
         Ok(outcome_rx)
     }
 
@@ -526,18 +518,13 @@ impl EventHandle {
     /// the host control dispatcher wait behind a native callback write/receipt.
     /// The returned receiver resolves when that task processes the request.
     pub fn request_cancel_steer(&self, command_id: String) -> oneshot::Receiver<bool> {
-        let control = self.control.clone();
+        let actor = self.actor.clone();
         let (completed_tx, completed_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let completed = control
-                .send(Control::CancelSteer {
-                    command_id,
-                    reply: reply_tx,
-                })
+            let completed = actor
+                .call(|reply| Control::CancelSteer { command_id, reply })
                 .await
-                .is_ok()
-                && reply_rx.await.is_ok();
+                .is_ok();
             let _ = completed_tx.send(completed);
         });
         completed_rx
@@ -545,31 +532,26 @@ impl EventHandle {
 
     /// Whether `turn_id` is the exact live turn, answered behind any queued
     /// terminal frame so a control never targets a finished turn.
-    pub async fn check_turn(&self, turn_id: &str) -> bool {
-        self.turn_interrupt_status(turn_id).await.is_some()
+    pub async fn check_turn(&self, turn_id: &str) -> Result<bool> {
+        self.turn_interrupt_status(turn_id)
+            .await
+            .map(|status| status.is_some())
     }
 
     /// The exact live turn's interrupt status, or None if the turn ended.
-    pub async fn turn_interrupt_status(&self, turn_id: &str) -> Option<bool> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .control
-            .send(Control::CheckTurn {
+    /// An actor timeout or loss remains an error, never proof of a finished turn.
+    pub async fn turn_interrupt_status(&self, turn_id: &str) -> Result<Option<bool>> {
+        self.actor
+            .call(|reply| Control::CheckTurn {
                 turn_id: turn_id.to_owned(),
-                reply: reply_tx,
+                reply,
             })
             .await
-            .is_err()
-        {
-            return None;
-        }
-        reply_rx.await.ok().flatten()
     }
 
     pub async fn mark_interrupted(&self, turn_id: &str) {
-        let _ = self
-            .control
-            .send(Control::MarkInterrupted {
+        self.actor
+            .deliver(Control::MarkInterrupted {
                 turn_id: turn_id.to_owned(),
             })
             .await;
@@ -578,7 +560,8 @@ impl EventHandle {
     /// Decide one open `can_use_tool` permission. Runs on the event task,
     /// serialized behind queued frames, so a reply racing the terminal sees
     /// the finished turn. Returns the outcome value (`applied`, `rejected`
-    /// or `unknown` state); only a lost task surfaces as `Err`.
+    /// or `unknown` state); a lost task or expired event-control deadline
+    /// surfaces as `Err`.
     pub async fn reply_request(
         &self,
         command_id: String,
@@ -588,22 +571,17 @@ impl EventHandle {
         args: Value,
         native: ClaudeClient,
     ) -> Result<Value> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.control
-            .send(Control::ReplyRequest {
+        self.actor
+            .call(|reply| Control::ReplyRequest {
                 command_id,
                 request_id,
                 turn_id,
                 verb,
                 args,
                 native,
-                reply: reply_tx,
+                reply,
             })
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?
+            .await?
     }
 
     pub async fn begin_stop(&self) -> Result<()> {
@@ -615,19 +593,19 @@ impl EventHandle {
     }
 
     pub async fn close(&self) {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        let _ = self.control.send(Control::Close { reply: reply_tx }).await;
-        let _ = timeout_at(Instant::now() + EVENT_DEADLINE, reply_rx).await;
+        let _ = self.actor.call(|reply| Control::Close { reply }).await;
     }
 
     pub async fn drain_native(&self) -> Result<()> {
-        eliot_plugin::native_lifecycle::wait_for_native_tail(&self.status, |s| s.native_drained)
-            .await
+        eliot_plugin::native_lifecycle::wait_for_native_tail(self.actor.watch(), |s| {
+            s.native_drained
+        })
+        .await
     }
 
     pub fn status(&self) -> EventStatus {
-        let mut status = self.status.borrow().clone();
-        if self.control.is_closed() && status.failure.is_none() {
+        let mut status = self.actor.watch().borrow().clone();
+        if self.actor.is_closed() && status.failure.is_none() {
             status.failure = Some("Claude event task is unavailable".to_owned());
         }
         status
@@ -637,14 +615,7 @@ impl EventHandle {
         &self,
         control: impl FnOnce(oneshot::Sender<Result<()>>) -> Control,
     ) -> Result<()> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.control
-            .send(control(reply_tx))
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?;
-        reply_rx
-            .await
-            .map_err(|_| Error::new("unknown", "Claude event task is unavailable"))?
+        self.actor.call(control).await?
     }
 }
 
@@ -870,7 +841,13 @@ async fn dispatch_control(
 }
 
 impl EventProcessor {
-    fn new(host: PeerClient, config: EventConfig, status_tx: watch::Sender<EventStatus>) -> Self {
+    fn new(
+        host: PeerClient,
+        config: EventConfig,
+        hook_callback_id: String,
+        status_tx: watch::Sender<EventStatus>,
+        control_actor: EventActor<Control, EventStatus>,
+    ) -> Self {
         let sink = CommitSink::new(host.clone(), config.credential.clone());
         Self {
             host,
@@ -878,7 +855,7 @@ impl EventProcessor {
             credential: config.credential,
             agent_id: config.agent_id,
             generation: config.generation,
-            hook_callback_id: ulid::Ulid::new().to_string(),
+            hook_callback_id,
             secrets: config.secrets,
             workspace: config.workspace,
             status: EventStatus::default(),
@@ -916,7 +893,7 @@ impl EventProcessor {
             closed: false,
             native: None,
             status_tx,
-            control_tx: None,
+            control_actor,
             pending_hooks: HashMap::new(),
         }
     }
@@ -2052,10 +2029,7 @@ impl EventProcessor {
             self.finish_available_tool_use_hook(&tool_use_id);
             return self.write_hook_pass(&native, request_id, deadline).await;
         }
-        let Some(control_tx) = self.control_tx.clone() else {
-            self.finish_available_tool_use_hook(&tool_use_id);
-            return self.write_hook_pass(&native, request_id, deadline).await;
-        };
+        let control_actor = self.control_actor.clone();
         let consumer_id = ulid::Ulid::new().to_string();
         // Bounded progress diagnostics from the native hook input only. The
         // matched invocation id is already proven above; the name, operation
@@ -2102,8 +2076,8 @@ impl EventProcessor {
                     .map_err(|_| Error::new("invalid", "Claude hook response was malformed")),
                 Err(error) => Err(error),
             };
-            let _ = control_tx
-                .send(Control::HookResponseReady {
+            control_actor
+                .deliver(Control::HookResponseReady {
                     request_id: callback_request_id,
                     consumer_id: callback_consumer_id,
                     result,

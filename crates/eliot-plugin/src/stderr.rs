@@ -5,7 +5,7 @@
 
 use crate::sync::LockExt;
 pub use eliot_core::StderrSnapshot;
-use eliot_core::{MAX_STDERR_BYTES, SecretPolicy};
+use eliot_core::{Error, MAX_STDERR_BYTES, SecretPolicy, StderrSource};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -19,6 +19,18 @@ use tokio::{
 const TAIL_BYTES: usize = MAX_STDERR_BYTES;
 const PREFIX_BYTES: usize = 4 * 1024;
 const READ_BYTES: usize = 8192;
+
+pub fn harness_diagnostic(
+    error: Error,
+    policy: &SecretPolicy,
+    stderr: Option<StderrSnapshot>,
+) -> Error {
+    let error = match stderr {
+        Some(stderr) => error.with_stderr(StderrSource::Harness, stderr),
+        None => error,
+    };
+    error.sanitized(policy)
+}
 
 #[derive(Default)]
 struct CaptureState {
