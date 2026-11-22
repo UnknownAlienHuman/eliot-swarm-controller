@@ -13,6 +13,8 @@ use std::collections::HashSet;
 
 /// Mail body bound from the coordination contract: 32 KiB.
 pub const MAX_MAIL_TEXT_BYTES: usize = 32 * 1024;
+/// Service identity used for daemon-produced mailbox messages.
+pub const SWARM_MAIL_SENDER: &str = "swarm";
 /// One admission fans out to at most this many concrete recipients.
 pub const MAX_MAIL_RECIPIENTS: usize = 100;
 /// Thread labels stay small enough for list output.
@@ -278,16 +280,17 @@ pub struct MailDelivery {
 impl MailDelivery {
     pub fn validate(&self) -> Result<()> {
         validate_delivery_id(&self.delivery_id)?;
-        if self.sender != "owner" {
+        let service_sender = self.sender == "owner" || self.sender == SWARM_MAIL_SENDER;
+        if !service_sender {
             parse_agent_id(&self.sender)?;
         }
-        if self.sender == "owner" && self.sender_generation.is_some() {
+        if service_sender && self.sender_generation.is_some() {
             return Err(Error::new(
                 "invalid",
-                "owner mail carries no sender generation",
+                "service mail carries no sender generation",
             ));
         }
-        if self.sender != "owner"
+        if !service_sender
             && self
                 .sender_generation
                 .is_none_or(|generation| generation < 0)

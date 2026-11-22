@@ -95,8 +95,8 @@ pub use coordination::{
     MAX_VAR_SCOPE_BYTES, MAX_VAR_VALUE_BYTES, MAX_WHO_PATHS, MAX_WHO_WORKERS, MailAckRequest,
     MailAckResponse, MailDefinitionArgs, MailDelivery, MailDeliverySummary, MailInboxRequest,
     MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-    VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
-    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches,
+    SWARM_MAIL_SENDER, VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest,
+    VarSetResponse, WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches,
     claim_glob_matches, claim_glob_matches_normalized, claim_globs_overlap,
     claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
