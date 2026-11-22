@@ -27,6 +27,12 @@ impl Store {
                 format!("Store schema version {current} is newer than this binary"),
             ));
         }
+        self.migrate_through_42(current)?;
+        self.migrate_after_42(current)
+    }
+
+    // Keep the debug-build migration frames small enough for Windows.
+    fn migrate_through_42(&mut self, current: i64) -> Result<()> {
         if current == 0 {
             let tx = self
                 .connection
@@ -1003,6 +1009,10 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        Ok(())
+    }
+
+    fn migrate_after_42(&mut self, current: i64) -> Result<()> {
         if current < 43 {
             let tx = self
                 .connection
