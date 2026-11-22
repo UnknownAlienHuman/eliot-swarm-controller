@@ -434,6 +434,11 @@ qualification is incomplete; do not describe it as feature complete.
 Implement the bounded retention path first, then build/run the complete campaign against
 the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
+- [x] Daemon update fences admission, waits for current work, starts the replacement
+      or rolls back, and leaves continuation to boot recovery (#836).
+- [x] Explicit private stand creation and registered teardown of owned files (#837).
+- [ ] Automatic stand artifact registration and expiry, and cleanup of stand-created
+      worktrees and branches in external repositories (#837).
 - [x] **Physical retention.** Wire retention settings to bounded Store cleanup invoked
       by daemon maintenance. Implement event-prefix pruning and atomic command/child
       cleanup under the [Core retention contract](spec/core.md#retention), including the

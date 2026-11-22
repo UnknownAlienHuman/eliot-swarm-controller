@@ -6,6 +6,8 @@ use std::path::{Component, Path, PathBuf};
 
 const OWNER_TOKEN_FILE: &str = "owner.token";
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
+#[cfg(not(windows))]
+const OPERATOR_LOCK_FILE: &str = "operator.lock";
 const DAEMON_INFO_FILE: &str = "daemon.json";
 const MAX_SELECTED_ROOT_BYTES: usize = 32 * 1024;
 
@@ -34,6 +36,11 @@ pub struct DaemonLock {
     root: PathBuf,
     _file: File,
 }
+
+#[cfg(windows)]
+pub type OperatorLock = std::os::windows::io::OwnedHandle;
+#[cfg(not(windows))]
+pub type OperatorLock = File;
 
 impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
@@ -96,7 +103,7 @@ impl DataDir {
     /// Acquire the single-daemon lock. The returned guard releases it on drop.
     pub fn acquire_daemon_lock(&self) -> Result<DaemonLock> {
         let path = self.path.join(DAEMON_LOCK_FILE);
-        let file = open_or_create_daemon_lock(&path)?;
+        let file = open_or_create_lock_file(&path)?;
         ensure_private_file(&path)?;
 
         match file.try_lock() {
@@ -110,6 +117,33 @@ impl DataDir {
             )),
             Err(std::fs::TryLockError::Error(error)) => {
                 Err(io_error("lock daemon data directory", error))
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn acquire_operator_lock(&self, _exclusive: bool) -> Result<OperatorLock> {
+        super::windows::acquire_operator_event(&self.path)
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn acquire_operator_lock(&self, exclusive: bool) -> Result<OperatorLock> {
+        let path = self.path.join(OPERATOR_LOCK_FILE);
+        let file = open_or_create_lock_file(&path)?;
+        ensure_private_file(&path)?;
+        let acquired = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match acquired {
+            Ok(()) => Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::new(
+                "operator_busy",
+                "another local operator or daemon startup holds this data directory",
+            )),
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(io_error("lock local operator operation", error))
             }
         }
     }
@@ -575,7 +609,7 @@ fn private_file_options() -> OpenOptions {
     options
 }
 
-fn create_new_private_file(path: &Path) -> std::io::Result<File> {
+pub(crate) fn create_new_private_file(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         super::windows::create_private_file_new(path)
@@ -596,7 +630,7 @@ fn create_new_private_file(path: &Path) -> std::io::Result<File> {
     }
 }
 
-fn open_or_create_daemon_lock(path: &Path) -> Result<File> {
+fn open_or_create_lock_file(path: &Path) -> Result<File> {
     #[cfg(windows)]
     {
         match create_new_private_file(path) {
@@ -858,7 +892,7 @@ pub(crate) fn replace_file_atomically(
     }
 }
 
-fn validate_private_file(path: &Path) -> Result<()> {
+pub(crate) fn validate_private_file(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::validate_private_file(path)
@@ -920,7 +954,7 @@ pub(crate) fn read_private_bytes(path: &Path, max: usize) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn replace_file(source: &Path, target: &Path) -> Result<()> {
+pub(crate) fn replace_file(source: &Path, target: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         super::windows::replace_file(source, target)
@@ -931,7 +965,7 @@ fn replace_file(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         File::open(path)

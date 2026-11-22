@@ -839,10 +839,18 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         let _ = reply.send(result);
                         break;
                     }
-                    RuntimeMessage::DaemonForce { reply } => {
+                    RuntimeMessage::DaemonForce { restart, reply } => {
                         let guarantee = child.guarantee();
                         let terminated = child.terminate().is_ok();
                         let exited = wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
+                        if restart && terminated && exited {
+                            // Preserve the idle projection and its custody reservation.
+                            // Boot recovery proves the prior generation's exit before
+                            // it decides whether this session can continue.
+                            planned_exit = true;
+                            let _ = reply.send(Ok(()));
+                            break;
+                        }
                         if !terminated || !exited {
                             drop(child_slot.take());
                             let _ = settle_owned_source_exit(

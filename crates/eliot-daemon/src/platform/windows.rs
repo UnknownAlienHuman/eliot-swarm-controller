@@ -11,7 +11,7 @@ use eliot_plugin::sync::LockExt;
 use std::ffi::{OsStr, c_void};
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::slice;
@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND,
     ERROR_INVALID_PARAMETER, ERROR_MORE_DATA, ERROR_SHARING_VIOLATION, FILETIME, GetLastError,
-    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree, STILL_ACTIVE, SetLastError, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -38,8 +39,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
-    GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+    GetDiskFreeSpaceExW, GetFileInformationByHandle, GetFileType, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
@@ -55,10 +56,11 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS,
-    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateEventW, CreateProcessW,
+    DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
+    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
+    WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -106,8 +108,54 @@ pub(crate) fn start_background_daemon(data_dir: &Path) -> Result<()> {
     start_background_daemon_executable(&executable, data_dir)
 }
 
+pub(crate) fn acquire_operator_event(data_dir: &Path) -> Result<OwnedHandle> {
+    let root = fs::canonicalize(data_dir)
+        .map_err(|error| io_error("resolve operator data root", error))?;
+    let identity = root.to_string_lossy().to_lowercase();
+    let hash = eliot_core::api::inference::sha256_hex(identity.as_bytes());
+    let name: Vec<u16> = format!(r"Global\EliotSwarmOperator.{hash}")
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let descriptor = private_security_descriptor(false)?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    // The single successful creator holds the name until it drops the handle.
+    // Unlike a lock file in the root, this guard survives directory deletion.
+    // SAFETY: both arguments stay live through CreateEventW. Last error is thread local.
+    let (handle, error) = unsafe {
+        SetLastError(0);
+        let handle = CreateEventW(&attributes, 0, 0, name.as_ptr());
+        (handle, GetLastError())
+    };
+    if handle.is_null() {
+        return Err(io_error(
+            "acquire operator event",
+            std::io::Error::from_raw_os_error(error as i32),
+        ));
+    }
+    // SAFETY: CreateEventW returned a uniquely owned non-null handle.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    if error == ERROR_ALREADY_EXISTS {
+        return Err(Error::new(
+            "operator_busy",
+            "another local operator or daemon startup holds this data directory",
+        ));
+    }
+    Ok(handle)
+}
+
 pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &Path) -> Result<()> {
-    let mut command_line = background_daemon_command_line(executable, data_dir)?;
+    let mut command_line = windows_command_line(&[
+        executable.as_os_str(),
+        OsStr::new("--data-dir"),
+        data_dir.as_os_str(),
+        OsStr::new("daemon"),
+        OsStr::new("--foreground"),
+    ])?;
     let application = wide_path(executable);
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
@@ -153,15 +201,9 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
     Ok(())
 }
 
-fn background_daemon_command_line(executable: &Path, data_dir: &Path) -> Result<Vec<u16>> {
+pub(crate) fn windows_command_line(arguments: &[&OsStr]) -> Result<Vec<u16>> {
     let mut command_line = Vec::new();
-    for argument in [
-        executable.as_os_str(),
-        OsStr::new("--data-dir"),
-        data_dir.as_os_str(),
-        OsStr::new("daemon"),
-        OsStr::new("--foreground"),
-    ] {
+    for argument in arguments {
         if !command_line.is_empty() {
             command_line.push(u16::from(b' '));
         }
@@ -967,6 +1009,87 @@ pub(crate) fn recorded_process_alive(pid: u32, start_time: u64) -> Result<bool> 
         Err(error) if error.code == "process_gone" => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn process_start_time(pid: u32) -> Result<u64> {
+    let (sample, _) = read_job_process(None, pid, "", "", "", 0)?;
+    if sample.record.state == ProcessState::Exited {
+        return Err(Error::new(
+            "process_gone",
+            "the launched process already exited",
+        ));
+    }
+    Ok(sample.record.identity.start_time)
+}
+
+pub(crate) fn recorded_process_argv(pid: u32, start_time: u64) -> Result<Vec<String>> {
+    let process = verified_process(pid, start_time, 0)?;
+    let command_line = process_command_line(process.0)
+        .ok_or_else(|| Error::new("process_identity", "the daemon command line is unavailable"))?;
+    Ok(eliot_core::split_windows_command_line(&command_line))
+}
+
+pub(crate) fn recorded_process_image(pid: u32, start_time: u64) -> Result<PathBuf> {
+    let process = verified_process(pid, start_time, 0)?;
+    process_image_basename(process.0)
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new("process_identity", "the daemon executable is unavailable"))
+}
+
+pub(crate) fn terminate_recorded_process(pid: u32, start_time: u64) -> Result<()> {
+    if !recorded_process_alive(pid, start_time)? {
+        return Ok(());
+    }
+    let process = match verified_process(pid, start_time, PROCESS_TERMINATE) {
+        Ok(process) => process,
+        Err(_) if !recorded_process_alive(pid, start_time)? => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    // SAFETY: this handle belongs to the exact candidate process verified above.
+    unsafe {
+        TerminateProcess(process.0, 1);
+        if WaitForSingleObject(process.0, 5000) == WAIT_OBJECT_0 {
+            return Ok(());
+        }
+    }
+    Err(Error::new(
+        "process_identity",
+        "the replacement process did not exit",
+    ))
+}
+
+fn verified_process(pid: u32, start_time: u64, extra_access: u32) -> Result<QueryHandle> {
+    // SAFETY: the query/synchronize handle pins the observed process identity.
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | extra_access,
+            0,
+            pid,
+        )
+    };
+    if process.is_null() {
+        return Err(io_error(
+            "open daemon process",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    let process = QueryHandle(process);
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: the handle stays live and all timestamp outputs are writable.
+    let valid = unsafe {
+        GetProcessTimes(process.0, &mut creation, &mut exit, &mut kernel, &mut user) != 0
+            && WaitForSingleObject(process.0, 0) == WAIT_TIMEOUT
+    };
+    if !valid || filetime_ticks(creation) != start_time {
+        return Err(Error::new(
+            "process_identity",
+            "the daemon process identity changed",
+        ));
+    }
+    Ok(process)
 }
 /// ProcessCommandLineInformation class for NtQueryInformationProcess.
 const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
@@ -1896,6 +2019,19 @@ fn current_user_pipe_descriptor() -> Result<*mut c_void> {
     } else {
         Ok(descriptor)
     }
+}
+
+pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
+    let path = wide_path(path);
+    let mut available = 0;
+    // SAFETY: the path is NUL-terminated and the one requested output is writable.
+    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, null_mut(), null_mut()) } == 0 {
+        return Err(io_error(
+            "query Store backup disk space",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(available)
 }
 
 fn wide_path(path: &Path) -> Vec<u16> {

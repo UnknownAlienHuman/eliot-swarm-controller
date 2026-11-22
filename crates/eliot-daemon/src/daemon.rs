@@ -84,12 +84,24 @@ const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Open the private local daemon, recover durable state without replaying any
 /// external effects, and serve concurrent local RPC connections.
 pub async fn run(path: PathBuf) -> Result<()> {
+    run_with_update(path, None).await
+}
+
+pub async fn run_for_update(path: PathBuf, attempt: &str) -> Result<()> {
+    run_with_update(path, Some(attempt)).await
+}
+
+async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     // Daemon-private files carry explicit current-user-only creation modes
     // (0600 files, 0700 directories) at each creation site; the process umask
     // is left alone so Agents' files in shared workspaces keep the ambient
     // mask. Windows keeps its ACL checks.
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
+    if let Some(attempt) = attempt {
+        let backup = crate::update_backup::update_backup_path(data_dir.path(), attempt)?;
+        crate::platform::data_dir::validate_private_file(&backup)?;
+    }
     crate::skill::materialize(data_dir.path())?;
     let _log = logging::init(&data_dir, &daemon_lock)?;
     let policy = Arc::new(SecretPolicy::new([data_dir.owner_token()]));
@@ -107,7 +119,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
     {
         logging::record(&policy, "daemon.mcp_temp_cleanup_failed", &[], Some(&error));
     }
-    let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy)).await;
+    let outcome = run_owned(&data_dir, &daemon_lock, Arc::clone(&policy), attempt).await;
     logging::record(
         &policy,
         if outcome.is_ok() {
@@ -125,9 +137,10 @@ async fn run_owned(
     data_dir: &DataDir,
     daemon_lock: &DaemonLock,
     policy: Arc<SecretPolicy>,
+    attempt: Option<&str>,
 ) -> Result<()> {
     let runtime = initialize_runtime(data_dir, policy).await?;
-    let supervision = spawn_workers(data_dir, daemon_lock, runtime).await?;
+    let supervision = spawn_workers(data_dir, daemon_lock, runtime, attempt).await?;
     let (outcome, supervision) = supervise(supervision).await;
     shutdown_supervision(supervision, outcome).await
 }
@@ -323,6 +336,7 @@ async fn spawn_workers(
     data_dir: &DataDir,
     daemon_lock: &DaemonLock,
     runtime: DaemonRuntime,
+    attempt: Option<&str>,
 ) -> Result<DaemonSupervision> {
     let DaemonRuntime {
         store,
@@ -340,8 +354,14 @@ async fn spawn_workers(
     } = runtime;
     let listener = IpcListener::bind(data_dir, daemon_lock).await?;
     logging::record(&policy, "daemon.ipc_bound", &[], None);
-    let info =
-        data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?;
+    let info = {
+        let _publication = attempt
+            .map(|id| crate::update_backup::lock_update_publication(data_dir.path(), id))
+            .transpose()?;
+        // This durable endpoint change is the admission boundary. Boot
+        // recovery workers, automation and RPC handling all follow it.
+        data_dir.publish_daemon(daemon_lock, listener.endpoint(), env!("CARGO_PKG_VERSION"))?
+    };
     logging::record(&policy, "daemon.ready", &[("boot_id", &info.boot_id)], None);
 
     let cloud_mcp_shutdown = CancellationToken::new();
@@ -868,6 +888,8 @@ async fn shutdown_supervision(
     }
     if router.is_force_requested() {
         router.force_owned_processes().await;
+    } else if router.is_restart_requested() {
+        router.stop_for_restart().await;
     }
     recovery.abort_all();
     while recovery.join_next().await.is_some() {}
@@ -1365,7 +1387,11 @@ async fn serve_connection_with_write_timeout(
             match decode_request(&line) {
                 Ok(request) => {
                     measured = request.params.get("_timing") == Some(&Value::Bool(true));
-                    let is_shutdown = request.method == "daemon.shutdown";
+                    let is_shutdown = request.method == "daemon.shutdown"
+                        && !matches!(
+                            request.params.get("mode").and_then(Value::as_str),
+                            Some("prepare_restart" | "cancel_restart")
+                        );
                     match router.handle_rpc(&request, peer).await {
                         Ok(result) => {
                             arm_shutdown = is_shutdown;
@@ -1801,7 +1827,9 @@ fn valid_id(id: &Value) -> bool {
 }
 
 fn call_timeout(method: &str, params: &Value) -> Duration {
-    if matches!(method, "models.catalog" | "harness.list") {
+    if method == "daemon.shutdown" && params.get("backup") == Some(&Value::Bool(true)) {
+        Duration::from_secs(150)
+    } else if matches!(method, "models.catalog" | "harness.list") {
         // Leave time for IPC and encoding after the shared inventory deadline.
         crate::adhoc::DISCOVERY_BUDGET + Duration::from_secs(5)
     } else if method == "agent.discover" {

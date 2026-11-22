@@ -134,22 +134,15 @@ and recompute the change. To wait for a change, pass `after_version` with
 
 ### Run a private live proof
 
-Follow the [private daemon procedure](reference.md#private-live-proof-on-windows)
-for ACLs, registration and cleanup. Use an authorized private data directory.
-Agent launches require a fresh one. Pass its exact path to every private command.
-
-| Step | PowerShell | MCP method |
-| --- | --- | --- |
-| Start | `& $swarm daemon --data-dir $proofDir` | CLI startup only |
-| Read status | `& $swarm status --data-dir $proofDir` | `daemon.status` (private Owner) |
-| Stop | `& $swarm daemon stop --data-dir $proofDir --drain` | `daemon.shutdown` with `mode: "drain"` (private Owner) |
+Use [stand up and stand down](reference.md#private-live-proof-on-windows)
+with an authorized fresh directory. Pass the printed path to every private command.
 
 ## Do not
 
 - Do not end your turn waiting on a shell job or native Monitor. Run long commands in the foreground or poll them to completion.
 - Do not retry a refused Owner operation as Owner on prod, change inherited identity, or read the Owner token.
 - Do not guess child profiles or bypass a same-harness permission mismatch. Read your frozen `child_profiles`.
-- Do not start a private daemon on an unprotected data directory, leave it undrained, or omit its artifact registration.
+- Register owned managed-proof artifacts when they are under the bound artifact root. Use a protected private data directory and drain the stand before leaving the proof.
 - Do not launch Agents from a copy of production data. Copied stores can share production process custody names.
 - Do not leave a test desktop open after its screenshots. Use plain test repo names under one `qa-…` folder.
 - Do not accept a black screenshot as UI evidence. Check whether the console display is off.

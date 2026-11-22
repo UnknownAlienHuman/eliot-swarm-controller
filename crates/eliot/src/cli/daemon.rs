@@ -33,18 +33,27 @@ pub(crate) async fn run_daemon(
             "daemon autostart requires an Owner CLI outside an Agent session",
         )));
     }
+    if foreground && args.action.is_some() {
+        return Err(Failure::new(
+            2,
+            "--foreground is only valid when starting the daemon",
+        ));
+    }
     match args.action {
+        Some(DaemonAction::Update {
+            release,
+            wait_seconds,
+        }) => {
+            if id.is_some() {
+                return Err(Failure::new(2, "--id is not valid with daemon update"));
+            }
+            super::update::run(release, data_dir, wait_seconds, json_output).await
+        }
         Some(DaemonAction::Stop(args)) => {
             if args.drain == args.force {
                 return Err(Failure::new(
                     2,
                     "daemon stop requires exactly one of --drain or --force",
-                ));
-            }
-            if foreground {
-                return Err(Failure::new(
-                    2,
-                    "--foreground is only valid when starting the daemon",
                 ));
             }
             let mode = if args.drain {
@@ -78,9 +87,11 @@ pub(crate) async fn run_daemon(
             super::autostart::uninstall(&data_dir, json_output).await
         }
         None if foreground => {
-            eliot_daemon::run(data_dir)
-                .await
-                .map_err(Failure::for_read)?;
+            let result = match args.upgrade_attempt.as_deref() {
+                Some(attempt) => eliot_daemon::operator::run_for_update(data_dir, attempt).await,
+                None => eliot_daemon::run(data_dir).await,
+            };
+            result.map_err(Failure::for_read)?;
             Ok(0)
         }
         None => {

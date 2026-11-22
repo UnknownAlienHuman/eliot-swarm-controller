@@ -33,7 +33,8 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
             ) => {}
         Err(error) => return Err(error),
     }
-    crate::platform::DataDir::open(data_dir)?;
+    let root = crate::platform::DataDir::open(data_dir)?;
+    let _startup = root.acquire_operator_lock(false)?;
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |time| time.as_millis());

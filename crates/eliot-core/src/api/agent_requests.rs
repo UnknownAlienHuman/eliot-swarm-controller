@@ -839,6 +839,8 @@ impl DaemonStatusRequest {
             "open" => "running",
             "draining" => "draining",
             "forcing" => "forcing",
+            "quiescing" => "quiescing",
+            "restarting" => "restarting",
             _ => return Err(invalid_response()),
         };
         if reply.state != state

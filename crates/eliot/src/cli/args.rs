@@ -28,6 +28,9 @@ pub(crate) struct PageArgs {
     about = "Local controller for coding-agent sessions"
 )]
 pub(crate) struct Cli {
+    #[arg(long, hide = true, exclusive = true)]
+    pub(crate) operator_release_info: bool,
+
     /// Private Eliot data directory (defaults to ELIOT_HOME or the platform data location).
     #[arg(long, global = true, value_name = "PATH")]
     pub(crate) data_dir: Option<PathBuf>,
@@ -54,8 +57,10 @@ pub(crate) enum CliCommand {
     Artifact(ArtifactArgs),
     /// Read or save unified daemon settings with revision checking.
     Settings(SettingsArgs),
-    /// Start or stop the local daemon, or manage current-user logon startup.
+    /// Start, stop or update the local daemon, or manage logon startup.
     Daemon(DaemonArgs),
+    /// Create or tear down an isolated live-proof stand.
+    Stand(StandArgs),
     /// Read daemon state without starting a daemon.
     Status,
     /// Run the bounded retention maintenance pass now (owner only).
@@ -1081,17 +1086,55 @@ pub(crate) struct DaemonArgs {
     /// Run the daemon in this process instead of detaching it.
     #[arg(long)]
     pub(crate) foreground: bool,
+    #[arg(long, hide = true, requires = "foreground")]
+    pub(crate) upgrade_attempt: Option<String>,
     #[command(subcommand)]
     pub(crate) action: Option<DaemonAction>,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
+    /// Shut down the running daemon.
     Stop(ShutdownArgs),
     /// Install a current-user logon task that starts the daemon.
     Install,
     /// Remove this data directory's verified current-user logon task.
     Uninstall,
+    /// Stop Agents, drain the daemon and start a new release.
+    Update {
+        /// Release directory or path to the replacement Swarm executable.
+        release: PathBuf,
+        /// Maximum seconds to let already-admitted work finish.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=90))]
+        wait_seconds: u64,
+    },
+}
+
+#[derive(Args)]
+pub(crate) struct StandArgs {
+    #[command(subcommand)]
+    pub(crate) action: StandAction,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum StandAction {
+    /// Initialize a fresh private daemon and scratch Git repository.
+    Up {
+        /// Fresh directory to create for the stand.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Private TOML configuration file for the stand's profiles.
+        #[arg(long, value_name = "FILE")]
+        profile: Option<PathBuf>,
+        /// Swarm executable to run. Defaults to the current binary.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+    },
+    /// Drain the private daemon and delete this stand's files.
+    Down {
+        /// Stand directory printed by stand up.
+        path: PathBuf,
+    },
 }
 
 #[derive(Args)]

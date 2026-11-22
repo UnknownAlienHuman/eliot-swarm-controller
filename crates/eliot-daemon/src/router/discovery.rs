@@ -341,6 +341,12 @@ pub fn is_mutation_id_method(name: &str) -> bool {
     mutation_id_methods().contains(&name)
 }
 
+pub(super) fn is_mutation(name: &str) -> bool {
+    METHODS
+        .iter()
+        .any(|method| method.name == name && method.mutation)
+}
+
 fn request_takes_id(method: &Method) -> bool {
     (method.input)()
         .get("properties")
