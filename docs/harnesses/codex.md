@@ -486,7 +486,8 @@ flows once per upstream model response inside a turn (the installed
 Responses API completion", keyed by turn), so one turn with tool calls sees
 several updates. The protocol can also send a synthetic window-fill update
 with zero input and output counters. That update contributes no response
-expenditure and leaves context occupancy unavailable. Turn expenditure is the cumulative `total` of the latest
+expenditure. A prior measured context pair stays available while its window
+is unchanged. Turn expenditure is the cumulative `total` of the latest
 update in the turn minus the turn-start baseline (`total` minus `last` of
 the first update in the turn), computed per counter and mapped to
 `TurnUsage` at `turn` scope, bound to the exact thread/generation/turn. Raw

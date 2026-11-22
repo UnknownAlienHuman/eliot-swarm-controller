@@ -2312,9 +2312,8 @@ fn session_usage_from_token_usage(
     });
     let mut changed = false;
     let last = &token_usage.last;
-    if last.has_response_counters()
-        && let Some(total) = &token_usage.total
-    {
+    let has_response = last.has_response_counters();
+    if has_response && let Some(total) = &token_usage.total {
         let totals = SessionTokenTotals {
             input_tokens: counter(total.input_tokens),
             output_tokens: counter(total.output_tokens),
@@ -2332,11 +2331,16 @@ fn session_usage_from_token_usage(
         }
     }
     let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
-    merged.context_used_tokens = last
-        .has_response_counters()
-        .then_some(last.total_tokens)
-        .flatten();
-    merged.context_window_tokens = token_usage.model_context_window;
+    if has_response {
+        merged.context_used_tokens = last.total_tokens;
+        merged.context_window_tokens = token_usage.model_context_window;
+    } else if let Some(window) = token_usage.model_context_window
+        && merged.context_window_tokens != Some(window)
+    {
+        // A capacity-only update cannot pair a new window with old occupancy.
+        merged.context_used_tokens = None;
+        merged.context_window_tokens = Some(window);
+    }
     merged.retain_valid_context();
     changed |= previous_context != (merged.context_used_tokens, merged.context_window_tokens);
     if !changed {
