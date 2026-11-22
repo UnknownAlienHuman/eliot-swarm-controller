@@ -37,11 +37,14 @@ mod rule_edit;
 mod rules;
 mod script_edit;
 mod scripts;
+mod string_list;
 mod switch;
 mod timers;
 mod usage;
 mod waits;
 mod workspaces;
+
+pub(crate) use string_list::deserialize_string_list;
 
 pub use agent_requests::{
     AgentEditsRequest, AgentGetRequest, AgentGitRequest, AgentListRequest, AgentPatchDigestRequest,

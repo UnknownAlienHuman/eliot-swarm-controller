@@ -542,6 +542,7 @@ pub(crate) async fn run_result(
         generation: GenerationArgs { generation },
         turn_id,
         page: PageArgs { limit },
+        metadata,
     }: ResultArgs,
     data_dir: PathBuf,
     json_output: bool,
@@ -552,6 +553,7 @@ pub(crate) async fn run_result(
         generation,
         turn_id,
         limit,
+        metadata,
     };
     read_and_print!(
         &data_dir,

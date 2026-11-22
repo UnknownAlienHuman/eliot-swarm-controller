@@ -83,15 +83,19 @@ impl TurnGetRequest {
 
 impl AgentResultRequest {
     pub fn validate_response(&self, response: &AgentResultResponse) -> Result<()> {
-        let expected_generation = self
-            .generation
-            .unwrap_or(response.agent_metadata.generation);
+        let metadata_matches = response.agent_metadata.as_ref().is_none_or(|metadata| {
+            metadata.id == self.id
+                && metadata.generation >= 0
+                && (self.generation.is_some() || metadata.generation == response.generation)
+        });
         if self.validate().is_err()
             || response.agent != self.id
-            || response.agent_metadata.id != self.id
             || response.generation < 0
-            || response.agent_metadata.generation < 0
-            || response.generation != expected_generation
+            || self
+                .generation
+                .is_some_and(|generation| generation != response.generation)
+            || (self.metadata && response.agent_metadata.is_none())
+            || !metadata_matches
             || response.turns.len() > self.limit
             || response.turns.iter().any(|turn| {
                 turn.agent != response.agent

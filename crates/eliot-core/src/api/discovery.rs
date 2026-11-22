@@ -151,8 +151,10 @@ pub struct MethodHelpResponse {
     /// DTO schema. Compact help carries these instead of the full JSON
     /// Schemas.
     pub fields: Vec<String>,
-    pub request_schema: Value,
-    pub response_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Value>,
     pub example: Value,
     pub mutation_id: String,
     pub scopes: Vec<String>,
@@ -246,21 +248,37 @@ pub fn decode_params_at<T: DeserializeOwned + JsonSchema>(params: Value, root: &
         if unknown_field {
             path.push_str(".<unknown-field>");
         }
-        let mut expectation = json!({
-            "allowed_fields": node.get("properties").and_then(Value::as_object).map(|properties| properties.keys().collect::<Vec<_>>()),
-            "type": node.get("type"), "enum": node.get("enum"),
-            "minimum": node.get("minimum"), "maximum": node.get("maximum"),
-            "description": node.get("description"), "required": node.get("required"),
-        });
-        if let Some(object) = expectation.as_object_mut() {
-            object.retain(|_, value| !value.is_null());
-            for key in ["anyOf", "oneOf", "minItems", "maxItems", "minLength", "maxLength", "pattern", "x-maxBytes", "x-maxEncodedBytes"] {
-                if let Some(value) = node.get(key) { object.insert(key.to_owned(), value.clone()); }
+        let mut expectation = serde_json::Map::new();
+        for key in [
+            "type",
+            "enum",
+            "minimum",
+            "maximum",
+            "description",
+            "anyOf",
+            "oneOf",
+            "minItems",
+            "maxItems",
+            "minLength",
+            "maxLength",
+            "pattern",
+            "x-maxBytes",
+            "x-maxEncodedBytes",
+        ] {
+            if let Some(value) = node.get(key) {
+                expectation.insert(key.to_owned(), value.clone());
             }
         }
-        let expected =
-            serde_json::to_string(&expectation).unwrap_or_else(|_| "DTO field shape".to_owned());
-        Error::invalid_field(path, expected.chars().take(512).collect::<String>())
+        if unknown_field {
+            expectation.insert("additionalProperties".to_owned(), Value::Bool(false));
+        }
+        if expectation.is_empty() {
+            expectation.insert(
+                "description".to_owned(),
+                json!("Use api.help for the field constraints."),
+            );
+        }
+        Error::invalid_field_schema(path, Value::Object(expectation))
     })
 }
 

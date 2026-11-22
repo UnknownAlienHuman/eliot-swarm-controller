@@ -97,7 +97,7 @@ const METHODS: &[Method] = &[
     method!("inference.cancel", InferenceCancelRequest, InferenceMutationResponse, false, true, "Cancel an own queued call; sending calls honestly report too_late.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID}),
     method!("inference.release", InferenceReleaseRequest, InferenceMutationResponse, false, true, "Fence publication and clean owned copies after backup classification.", {"id":EXAMPLE_ID,"call_id":EXAMPLE_ID,"disposition":"abandon_for_erasure","result_sha256":null,"backup_dependency":"no_backup_dependencies"}),
     method!("api.methods", MethodsRequest, MethodsResponse, false, false, "List/search callable canonical methods in bounded pages.", {"query":"mail", "limit":20}),
-    method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read a method's DTO schemas, example and limits.", {"method":"mail.send"}),
+    method!("api.help", MethodHelpRequest, MethodHelpResponse, false, false, "Read compact DTO fields and an example; full schemas are opt-in.", {"method":"mail.send"}),
     method!(
         "api.identity",
         IdentityRequest,
@@ -354,6 +354,51 @@ fn request_takes_id(method: &Method) -> bool {
         .is_some()
 }
 
+fn method_suggestions(requested: &str, principal: &Principal) -> Vec<&'static str> {
+    let normalized = requested.strip_prefix("swarm.").unwrap_or(requested);
+    let mut candidates = METHODS
+        .iter()
+        .filter(|method| visible(method, principal))
+        .filter_map(|method| {
+            let distance =
+                edit_distance(normalized, method.name).min(edit_distance(requested, method.name));
+            (distance <= 3).then_some((distance, method.name))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(distance, name)| (*distance, *name));
+    candidates
+        .into_iter()
+        .take(3)
+        .map(|(_, name)| name)
+        .collect()
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (row, left_char) in left.iter().enumerate() {
+        let mut current = Vec::with_capacity(right.len() + 1);
+        current.push(row + 1);
+        for (column, right_char) in right.iter().enumerate() {
+            let substitution = previous[column] + if left_char == right_char { 0 } else { 1 };
+            current.push(
+                (current[column] + 1)
+                    .min(previous[column + 1] + 1)
+                    .min(substitution),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+pub(super) fn owner_only_read(name: &str) -> bool {
+    METHODS
+        .iter()
+        .any(|method| method.name == name && method.owner_only && !method.mutation)
+}
+
 fn visible(method: &Method, principal: &Principal) -> bool {
     // Discovery lists callable methods, so it shares the RPC gate's own
     // principal/method classification: Memory-only entries such as
@@ -487,15 +532,25 @@ impl Router {
     pub(super) async fn method_help(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: MethodHelpRequest = decode_params(params.clone())?;
         request.validate()?;
-        let method = METHODS
+        let Some(method) = METHODS
             .iter()
             .find(|m| m.name == request.method && visible(m, principal))
-            .ok_or_else(|| {
-                Error::new(
-                    "unsupported",
-                    "method is unavailable; use api.methods for callable canonical names",
+        else {
+            let suggestions = method_suggestions(&request.method, principal);
+            let message = if suggestions.is_empty() {
+                "method is unavailable; use api.methods for callable canonical names".to_owned()
+            } else {
+                let names = suggestions
+                    .iter()
+                    .map(|name| format!("'{name}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "method is unavailable; did you mean {names}? Use api.methods for callable names"
                 )
-            })?;
+            };
+            return Err(Error::new("unsupported", message));
+        };
         let identity = self.identity(principal).await?;
         let aliases: &[&str] = match method.name {
             "api.identity" => &["swarm identity"],
@@ -570,9 +625,9 @@ impl Router {
         // shapes.
         let fields: Vec<String> = compact_field_descriptors(&(method.input)());
         let (request_schema, response_schema) = if request.full.unwrap_or(false) {
-            ((method.input)(), (method.output)())
+            (Some((method.input)()), Some((method.output)()))
         } else {
-            (Value::Null, Value::Null)
+            (None, None)
         };
         encode(MethodHelpResponse {
             method: method.name.to_owned(),

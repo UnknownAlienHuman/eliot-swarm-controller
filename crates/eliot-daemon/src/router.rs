@@ -652,6 +652,15 @@ impl Router {
                 format!("daemon method {method} is not implemented"),
             )),
         };
+        let result = result.map_err(|mut error| {
+            if error.code == "not_allowed"
+                && matches!(principal, Principal::Agent { .. })
+                && discovery::owner_only_read(method)
+            {
+                error.message = "Owner-only read. Agent scope is available via api.identity, who, and agent.get on yourself; other Owner data is not needed for Agent work.".to_owned().into();
+            }
+            error
+        });
         // Every RPC is timed here for debug mode: method, elapsed
         // milliseconds and ok/error. The method vocabulary is ours; params
         // and results never enter the record.
@@ -4636,7 +4645,7 @@ impl Router {
             agent: request.id,
             generation,
             turns,
-            agent_metadata,
+            agent_metadata: request.metadata.then_some(agent_metadata),
         })
         .map_err(|_| Error::new("internal", "agent.result response could not be encoded"))
     }

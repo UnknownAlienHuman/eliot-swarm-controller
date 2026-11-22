@@ -181,6 +181,10 @@ pub struct AgentResultRequest {
     )]
     #[schemars(range(min = 1, max = 1000))]
     pub limit: usize,
+    /// Include the current Agent DTO; omitted metadata keeps result reads compact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(description = "Include agent_metadata; defaults to false.")]
+    pub metadata: bool,
 }
 
 impl AgentResultRequest {
@@ -190,6 +194,7 @@ impl AgentResultRequest {
             generation: None,
             turn_id: None,
             limit: super::DEFAULT_LIMIT,
+            metadata: false,
         }
     }
 
@@ -270,8 +275,8 @@ pub struct AgentResultResponse {
     pub generation: i64,
     #[serde(deserialize_with = "object_turns")]
     pub turns: Vec<Turn>,
-    #[serde(deserialize_with = "object_agent")]
-    pub agent_metadata: Agent,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_metadata: Option<Agent>,
 }
 
 fn required_command_id<'de, D: serde::Deserializer<'de>>(
@@ -344,13 +349,6 @@ fn present_id<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<String>, D::Error> {
     required_id(deserializer).map(Some)
-}
-
-fn object_agent<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Agent, D::Error> {
-    let object = Map::<String, Value>::deserialize(deserializer)?;
-    serde_json::from_value(Value::Object(object)).map_err(serde::de::Error::custom)
 }
 
 fn object_turns<'de, D: serde::Deserializer<'de>>(

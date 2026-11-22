@@ -752,6 +752,9 @@ pub(crate) struct ResultArgs {
     pub(crate) turn_id: Option<String>,
     #[command(flatten)]
     pub(crate) page: PageArgs,
+    /// Include current Agent metadata; by default result output contains turns only.
+    #[arg(long)]
+    pub(crate) metadata: bool,
 }
 
 #[derive(Args)]

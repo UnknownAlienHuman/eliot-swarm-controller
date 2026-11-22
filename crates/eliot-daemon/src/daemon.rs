@@ -1762,6 +1762,23 @@ fn decode_request(line: &str) -> std::result::Result<RpcRequest, (Value, RpcErro
     Ok(request)
 }
 
+fn redact_schema_strings(policy: &SecretPolicy, value: &mut Value) {
+    match value {
+        Value::String(text) => *text = policy.redact_text(text),
+        Value::Array(values) => {
+            for value in values {
+                redact_schema_strings(policy, value);
+            }
+        }
+        Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_schema_strings(policy, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
     error.message = policy
         .redact_text(&error.message)
@@ -1774,7 +1791,7 @@ fn rpc_error(mut error: Error, policy: &SecretPolicy) -> RpcError {
     }
     if let Some(detail) = error.details.as_mut() {
         detail.field = policy.redact_text(&detail.field);
-        detail.expected = policy.redact_text(&detail.expected);
+        redact_schema_strings(policy, &mut detail.expected);
     }
     bound_stderr_diagnostics(&mut error.diagnostics, MAX_STDERR_DIAGNOSTIC_BYTES);
     let code = match error.code.as_str() {

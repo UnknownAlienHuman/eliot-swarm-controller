@@ -1493,13 +1493,48 @@ pub struct Error {
 #[serde(deny_unknown_fields)]
 pub struct InvalidParam {
     pub field: String,
-    pub expected: String,
+    #[serde(deserialize_with = "deserialize_expected_schema")]
+    pub expected: serde_json::Value,
+}
+
+fn deserialize_expected_schema<'de, D>(
+    deserializer: D,
+) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    let schema = match value {
+        serde_json::Value::Object(_) => value,
+        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(schema @ serde_json::Value::Object(_)) => schema,
+            _ => serde_json::json!({ "description": text }),
+        },
+        _ => return Err(serde::de::Error::custom("expected a field schema object")),
+    };
+    Ok(bound_invalid_param_schema(schema))
+}
+
+fn bound_invalid_param_schema(schema: serde_json::Value) -> serde_json::Value {
+    const MAX_EXPECTED_SCHEMA_BYTES: usize = 512;
+    if !schema.is_object()
+        || serde_json::to_vec(&schema).map_or(true, |bytes| bytes.len() > MAX_EXPECTED_SCHEMA_BYTES)
+    {
+        serde_json::json!({ "description": "Use api.help for the field constraints." })
+    } else {
+        schema
+    }
 }
 
 impl Error {
     /// A bounded, schema-owned field path and expectation; never a rejected value.
     pub fn invalid_field(field: impl Into<String>, expected: impl Into<String>) -> Self {
         Self::new("invalid", "invalid parameters").with_field(field, expected)
+    }
+
+    /// Attach a compact JSON Schema fragment to a field error.
+    pub fn invalid_field_schema(field: impl Into<String>, expected: serde_json::Value) -> Self {
+        Self::new("invalid", "invalid parameters").with_field_schema(field, expected)
     }
 
     /// Mutation-id format rejection shared by Store admission and the Router
@@ -1513,10 +1548,23 @@ impl Error {
         )
     }
 
-    pub fn with_field(mut self, field: impl Into<String>, expected: impl Into<String>) -> Self {
+    pub fn with_field(self, field: impl Into<String>, expected: impl Into<String>) -> Self {
+        let description: String = expected.into().chars().take(400).collect();
+        self.with_field_schema(field, serde_json::json!({ "description": description }))
+    }
+
+    pub fn with_field_schema(
+        mut self,
+        field: impl Into<String>,
+        expected: serde_json::Value,
+    ) -> Self {
         let field: String = field.into().chars().take(256).collect();
-        let expected: String = expected.into().chars().take(512).collect();
-        self.message = format!("{field}: expected {expected}").into();
+        let expected = bound_invalid_param_schema(expected);
+        self.message = if self.code == "invalid" {
+            format!("invalid parameter: {field}").into()
+        } else {
+            format!("{}: {field}", self.code).into()
+        };
         self.details = Some(Box::new(InvalidParam { field, expected }));
         self
     }
@@ -1766,7 +1814,7 @@ impl Serialize for Error {
             ntstatus,
             details: self.details.as_ref().map(|detail| InvalidParam {
                 field: detail.field.chars().take(256).collect(),
-                expected: detail.expected.chars().take(512).collect(),
+                expected: bound_invalid_param_schema(detail.expected.clone()),
             }),
             routing: self.routing.as_deref(),
         }
