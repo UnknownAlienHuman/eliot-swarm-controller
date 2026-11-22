@@ -1609,14 +1609,18 @@ fn freeze_profile_quota_policy(
     let snapshot = snapshot.as_object_mut().ok_or_else(|| {
         core::Error::new("internal", "resolved profile snapshot must be an object")
     })?;
-    snapshot.insert(
-        "quota_reserve_percent".to_owned(),
-        Value::from(reserve_percent),
-    );
-    snapshot.insert(
-        "quota_unknown".to_owned(),
-        Value::String(quota_unknown.to_owned()),
-    );
+    if reserve_percent > 0 {
+        snapshot.insert(
+            "quota_reserve_percent".to_owned(),
+            Value::from(reserve_percent),
+        );
+    }
+    if quota_unknown != "admit" {
+        snapshot.insert(
+            "quota_unknown".to_owned(),
+            Value::String(quota_unknown.to_owned()),
+        );
+    }
     Ok(())
 }
 
