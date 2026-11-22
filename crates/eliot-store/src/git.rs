@@ -700,9 +700,11 @@ impl Store {
 }
 
 /// The canonical persisted `git.changed` representation: the full snapshot
-/// identity plus the given dirty and committed-path coverage and completion
-/// flags. Built in one place so the Store budget and the persisted bytes
-/// share exact serialization rules. `view_digest` is the digest of the full
+/// identity plus the dirty content digest, path coverage and completion
+/// flags. Including the content digest makes a new write to an already
+/// dirty path observable even if status and the path list stay the same.
+/// Built in one place so the Store budget and the persisted bytes share
+/// exact serialization rules. `view_digest` is the digest of the full
 /// canonical view (untruncated coverage, observed flags), so a change wholly
 /// outside the retained prefix still compares different instead of hiding
 /// behind an equal truncation.
@@ -717,6 +719,7 @@ fn git_changed_data(
     json!({
         "workspace": snapshot.workspace, "head": snapshot.head, "branch": snapshot.branch,
         "dirty": dirty, "complete": complete,
+        "dirty_digest": snapshot.work.as_ref().and_then(|work| work.dirty_digest.as_deref()),
         "history_complete": snapshot.history_complete, "history_gap": snapshot.history_gap,
         "base_oid": snapshot.base_oid, "committed_paths": committed_paths, "base_complete": base_complete,
         "view_digest": view_digest,
