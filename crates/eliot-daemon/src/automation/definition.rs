@@ -23,6 +23,7 @@ use std::{
 
 // Canonical Agent IDs are `a` plus at most 19 positive-i64 decimal digits.
 const MAX_AGENT_ID_BYTES: usize = 20;
+const MAX_RULE_KEY_BYTES: usize = 4096;
 const MAX_RULE_CAUSE_DEPTH: u8 = 5;
 const MAX_MATCH_ALTERNATIVES: usize = 32;
 
@@ -42,6 +43,8 @@ pub struct RuleDefinition {
         deserialize_with = "deserialize_rule_limit"
     )]
     limit: Option<RuleLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    once_per: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_self: bool,
     #[serde(
@@ -88,7 +91,7 @@ impl RuleDefinition {
         }
         let mut passed = terminal.clone();
         passed.kind = "project.worktree.check.passed".to_owned();
-        matches!(evaluate(self, &passed), Ok(RuleEvaluation::Command(_)))
+        matches!(evaluate(self, &passed), Ok(RuleEvaluation::Command { .. }))
     }
 
     pub(super) fn inserts_launch_result(&self) -> bool {
@@ -575,6 +578,12 @@ struct RuleLimitInput {
     window: Option<String>,
     #[serde(default)]
     window_ms: Option<i64>,
+    #[serde(default)]
+    min_interval: Option<String>,
+    #[serde(default)]
+    min_interval_ms: Option<i64>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -809,10 +818,26 @@ where
             ));
         }
     };
+    let min_interval_ms = match (input.min_interval, input.min_interval_ms) {
+        (Some(interval), None) => Some(
+            super::schedule::parse_positive_duration_ms(&interval).map_err(|_| {
+                D::Error::custom("limit min_interval must be positive whole milliseconds")
+            })?,
+        ),
+        (None, Some(interval_ms)) => Some(interval_ms),
+        (None, None) => None,
+        _ => {
+            return Err(D::Error::custom(
+                "limit requires at most one min_interval or normalized min_interval_ms",
+            ));
+        }
+    };
     let limit = RuleLimit {
         max: input.max,
         per: input.per,
         window_ms,
+        min_interval_ms,
+        key: input.key,
     };
     limit.validate().map_err(D::Error::custom)?;
     Ok(Some(limit))
@@ -923,6 +948,14 @@ impl RuleDefinition {
         &self.catch_up
     }
 
+    pub fn has_keyed_firing(&self) -> bool {
+        self.once_per.is_some()
+            || self
+                .limit
+                .as_ref()
+                .is_some_and(|limit| limit.per == RuleLimitScope::Key)
+    }
+
     /// Render the frozen literal Agent command. Lifecycle and admission gates are
     /// enforced by the caller before invoking this projection.
     pub fn evaluate_timer(&self) -> Result<SubmitCommand, Error> {
@@ -943,11 +976,35 @@ impl TriggerDefinition {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RuleEventKeys {
+    pub once_per: Option<[u8; 32]>,
+    pub rate: Option<[u8; 32]>,
+}
+
+impl RuleEventKeys {
+    pub(super) fn command(self, action: SubmitCommand) -> RuleEvaluation {
+        RuleEvaluation::Command {
+            action,
+            once_per: self.once_per,
+            rate: self.rate,
+        }
+    }
+}
+
 pub(super) enum RuleEvaluation {
     NoMatch,
     CauseDepth,
-    Command(SubmitCommand),
-    LaunchResultInsertion(LaunchResultInsertion),
+    IncompleteKey,
+    Command {
+        action: SubmitCommand,
+        once_per: Option<[u8; 32]>,
+        rate: Option<[u8; 32]>,
+    },
+    LaunchResultInsertion {
+        insertion: LaunchResultInsertion,
+        keys: RuleEventKeys,
+    },
 }
 
 /// Matches a committed event and projects its one ordinary command action.
@@ -983,6 +1040,15 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
     {
         return Ok(RuleEvaluation::CauseDepth);
     }
+    let roots = TemplateRoots {
+        event: &event_value,
+        subject,
+        data: &event.data,
+    };
+    let keys = match render_rule_event_keys(rule, &roots)? {
+        Some(keys) => keys,
+        None => return Ok(RuleEvaluation::IncompleteKey),
+    };
 
     let action = rule
         .actions
@@ -990,31 +1056,35 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         .ok_or_else(|| Error::new("invalid", "rule has no action"))?;
     let action = match action {
         ActionDefinition::Run { definition } => {
-            return submit_run_command(definition).map(RuleEvaluation::Command);
+            return submit_run_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::GitFetch { definition } => {
-            return submit_git_fetch_command(definition).map(RuleEvaluation::Command);
+            return submit_git_fetch_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::GitIntegrate { definition } => {
             return submit_git_integrate_command(definition).map(RuleEvaluation::Command);
         }
         ActionDefinition::GitPublish { definition } => {
-            return submit_git_publish_command(definition, event).map(RuleEvaluation::Command);
+            return submit_git_publish_command(definition, event)
+                .map(|action| keys.command(action));
         }
         ActionDefinition::Notify { definition } => {
-            return submit_notify_command(definition).map(RuleEvaluation::Command);
+            return submit_notify_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::Emit { definition } => {
-            return submit_emit_command(definition).map(RuleEvaluation::Command);
+            return submit_emit_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::Mail { definition } => {
-            return submit_mail_command(definition).map(RuleEvaluation::Command);
+            return submit_mail_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::LaunchResultInsertion(definition) => {
-            return Ok(RuleEvaluation::LaunchResultInsertion(definition.clone()));
+            return Ok(RuleEvaluation::LaunchResultInsertion {
+                insertion: definition.clone(),
+                keys,
+            });
         }
         ActionDefinition::Var { definition } => {
-            return submit_var_command(definition).map(RuleEvaluation::Command);
+            return submit_var_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::Inject { definition } => {
             return submit_inject_event_command(
@@ -1024,14 +1094,9 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
                 subject,
                 &event.data,
             )
-            .map(RuleEvaluation::Command);
+            .map(|action| keys.command(action));
         }
         ActionDefinition::Agent(action) => action,
-    };
-    let roots = TemplateRoots {
-        event: &event_value,
-        subject,
-        data: &event.data,
     };
     if let AgentActionDefinition::Launch(LaunchActionDefinition {
         profile,
@@ -1058,7 +1123,7 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
             no_policy.as_deref(),
             text,
         )
-        .map(RuleEvaluation::Command);
+        .map(|action| keys.command(action));
     }
     let target_source = action
         .target()
@@ -1127,7 +1192,7 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         request_id,
     );
     command.probe = action.probe();
-    Ok(RuleEvaluation::Command(command))
+    Ok(keys.command(command))
 }
 
 fn approval_reply_args(
@@ -1619,6 +1684,32 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
     if rule.id.trim().is_empty() || rule.id.contains("${") {
         return Err(Error::new("invalid", "rule id must be a nonempty literal"));
     }
+    if let Some(once_per) = &rule.once_per {
+        if rule.trigger.event.is_none() || rule.trigger.has_timer_fields() {
+            return Err(Error::new("invalid", "once_per requires an event trigger"));
+        }
+        validate_rule_key_template(once_per, "once_per")?;
+    }
+    if let Some(limit) = &rule.limit {
+        limit.validate()?;
+        if let Some(key) = &limit.key {
+            validate_rule_key_template(key, "limit.key")?;
+        }
+        if limit.per == RuleLimitScope::Key {
+            if rule.trigger.event.is_none() || rule.trigger.has_timer_fields() {
+                return Err(Error::new(
+                    "invalid",
+                    "limit.per=key requires an event trigger",
+                ));
+            }
+            if limit.key.is_none() && rule.once_per.is_none() {
+                return Err(Error::new(
+                    "invalid",
+                    "limit.per=key requires limit.key or once_per",
+                ));
+            }
+        }
+    }
     if rule.actions.len() != 1 {
         let code = if rule.actions.is_empty() {
             "invalid"
@@ -1726,6 +1817,71 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
     rule.schedule = Some(schedule);
     timer_action(rule)?;
     Ok(())
+}
+
+fn validate_rule_key_template(source: &str, field: &str) -> Result<(), Error> {
+    if source.trim().is_empty() || source.len() > MAX_RULE_KEY_BYTES {
+        return Err(Error::new(
+            "invalid",
+            format!("{field} template is empty or too large"),
+        ));
+    }
+    let parts = parse_template(source)?;
+    if !has_templates(&parts) {
+        return Err(Error::new(
+            "invalid",
+            format!("{field} must contain an event field template"),
+        ));
+    }
+    Ok(())
+}
+
+fn render_rule_key(source: &str, roots: &TemplateRoots<'_>) -> Option<[u8; 32]> {
+    let parts = parse_template(source).ok()?;
+    let mut rendered = String::new();
+    for part in parts {
+        match part {
+            TemplatePart::Literal(text) => rendered.push_str(text),
+            TemplatePart::Placeholder(path) => {
+                let value = lookup(path, roots.event, roots.subject, roots.data)?;
+                rendered.push_str(scalar_text(value).ok()?.as_ref());
+            }
+        }
+        if rendered.len() > MAX_RULE_KEY_BYTES {
+            return None;
+        }
+    }
+    if rendered.trim().is_empty() {
+        return None;
+    }
+    canonical_json_sha256(&json!({"rule_key": rendered})).ok()
+}
+
+fn render_rule_event_keys(
+    rule: &RuleDefinition,
+    roots: &TemplateRoots<'_>,
+) -> Result<Option<RuleEventKeys>, Error> {
+    let once_per = match rule.once_per.as_deref() {
+        Some(source) => match render_rule_key(source, roots) {
+            Some(key) => Some(key),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let rate = match rule.limit.as_ref() {
+        Some(limit) if limit.per == RuleLimitScope::Key => {
+            let source = limit.key.as_deref().or(rule.once_per.as_deref());
+            let Some(source) = source else {
+                return Ok(None);
+            };
+            match render_rule_key(source, roots) {
+                Some(key) => Some(key),
+                None => return Ok(None),
+            }
+        }
+        _ => None,
+    };
+    Ok(Some(RuleEventKeys { once_per, rate }))
 }
 
 fn validate_event_matches(trigger: &mut TriggerDefinition) -> Result<(), Error> {

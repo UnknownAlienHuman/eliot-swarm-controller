@@ -57,6 +57,8 @@ pub struct RuleStateView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retire_through: Option<i64>,
     pub enabled: bool,
+    #[serde(default)]
+    pub suppressed_count: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_reason: Option<String>,
 }
@@ -67,10 +69,10 @@ impl RuleStateView {
         if let Some(project) = &self.project {
             validate_id(project)?;
         }
-        if self.revision < 0 || self.current_cursor < 0 {
+        if self.revision < 0 || self.current_cursor < 0 || self.suppressed_count < 0 {
             return Err(Error::new(
                 "invalid",
-                "rule revision and cursor must be nonnegative",
+                "rule revision, cursor and suppression count must be nonnegative",
             ));
         }
         if self

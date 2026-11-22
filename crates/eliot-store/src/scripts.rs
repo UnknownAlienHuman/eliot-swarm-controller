@@ -169,6 +169,7 @@ impl Store {
                     "new script child could not be bound to its Run",
                 ));
             }
+            rules::record_script_output_rate_key_tx(&tx, origin, &child_id, now)?;
             let child_cause = core::EventCause {
                 command_id: child_id.clone(),
                 rule: Some(origin.rule.clone()),

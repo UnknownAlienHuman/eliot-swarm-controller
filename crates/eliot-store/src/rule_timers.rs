@@ -56,6 +56,8 @@ impl<'a> RuleFiringKey<'a> {
             principal,
             state,
             trigger_cause: None,
+            once_per_key: None,
+            rate_key: None,
             identity: RuleFiringIdentity::Timer {
                 schedule_revision,
                 slot_ms,
@@ -88,6 +90,8 @@ impl<'a> RuleFiringKey<'a> {
             principal,
             state,
             trigger_cause: None,
+            once_per_key: None,
+            rate_key: None,
             identity: RuleFiringIdentity::Manual,
             verb: "timer.run",
             args,
@@ -533,15 +537,17 @@ impl Store {
                     Err(error) => return Err(error),
                     Ok(_) => {
                         let limit = rule_action_limit(&rule)?;
-                        let (scoped_count, global) = rule_action_counts(
+                        let (scoped_count, last_action_at, global) = rule_action_counts(
                             &tx,
                             principal,
                             &state.id,
-                            action.target.as_deref(),
+                            action.target.as_deref().map(parse_agent_id).transpose()?,
                             &limit,
+                            None,
                             now,
                         )?;
                         if rule_limit_reached(scoped_count, limit.max)
+                            || rule_min_interval_reached(last_action_at, &limit, now)
                             || global >= GLOBAL_RULE_ACTION_LIMIT
                         {
                             Some("rate_limited".to_owned())
@@ -818,15 +824,19 @@ impl Store {
             });
         }
         let limit = rule_action_limit(&rule)?;
-        let (scoped_count, global) = rule_action_counts(
+        let (scoped_count, last_action_at, global) = rule_action_counts(
             &tx,
             principal,
             &request.rule,
-            action.target.as_deref(),
+            action.target.as_deref().map(parse_agent_id).transpose()?,
             &limit,
+            None,
             now,
         )?;
-        if rule_limit_reached(scoped_count, limit.max) || global >= GLOBAL_RULE_ACTION_LIMIT {
+        if rule_limit_reached(scoped_count, limit.max)
+            || rule_min_interval_reached(last_action_at, &limit, now)
+            || global >= GLOBAL_RULE_ACTION_LIMIT
+        {
             return Err(Error::new(
                 "bad_state",
                 "timer action rate limit is reached",
@@ -1456,6 +1466,7 @@ pub(super) fn resolve_timer_script_run_origin_tx(
             rule: script_rule.id.clone(),
             cause,
             limit,
+            rate_key_digest: None,
         });
     }
     // Rows committed before the parent policy freeze fall back to the retained
@@ -1484,6 +1495,7 @@ pub(super) fn resolve_timer_script_run_origin_tx(
         rule: script_rule.id.clone(),
         cause,
         limit,
+        rate_key_digest: None,
     })
 }
 

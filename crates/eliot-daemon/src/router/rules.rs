@@ -638,6 +638,8 @@ impl Router {
         revision: i64,
         event_seq: i64,
         prepared: PreparedSubmission,
+        once_per_key: Option<[u8; 32]>,
+        rate_key: Option<[u8; 32]>,
     ) -> Result<Option<eliot_store::RuleEventAdmission>> {
         if matches!(
             prepared.request.verb.as_str(),
@@ -804,6 +806,8 @@ impl Router {
                     state,
                     event_seq,
                     request,
+                    once_per_key,
+                    rate_key,
                     now_ms(),
                     &secret_policy,
                 )?

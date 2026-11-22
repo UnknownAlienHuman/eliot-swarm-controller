@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 95;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 96;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2259,6 +2259,39 @@ impl Store {
                      ON workspaces(repo_common_dir, requested_branch)
                      WHERE phase <> 'removed' AND branch_reservation = 1;
                  INSERT INTO schema_migrations(version) VALUES (95);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 96 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE rule_state ADD COLUMN suppressed_count INTEGER NOT NULL DEFAULT 0
+                     CHECK(suppressed_count >= 0);
+                 CREATE TABLE rule_once_keys (
+                     principal TEXT NOT NULL,
+                     rule TEXT NOT NULL,
+                     key_digest BLOB NOT NULL CHECK(length(key_digest) = 32),
+                     fired_at INTEGER NOT NULL,
+                     expires_at INTEGER NOT NULL,
+                     PRIMARY KEY(principal, rule, key_digest),
+                     FOREIGN KEY(principal, rule) REFERENCES rule_state(principal, rule)
+                         ON DELETE CASCADE
+                 );
+                 CREATE INDEX rule_once_keys_expiry ON rule_once_keys(expires_at);
+                 CREATE TABLE rule_key_usage (
+                     action_id TEXT PRIMARY KEY REFERENCES commands(id) ON DELETE CASCADE,
+                     principal TEXT NOT NULL,
+                     rule TEXT NOT NULL,
+                     key_digest BLOB NOT NULL CHECK(length(key_digest) = 32),
+                     used_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX rule_key_usage_window
+                     ON rule_key_usage(principal, rule, key_digest, used_at);
+                 INSERT INTO schema_migrations(version) VALUES (96);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
