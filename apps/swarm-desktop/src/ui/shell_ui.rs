@@ -62,7 +62,7 @@ pub(super) enum ShellMsg {
     OpenDataFolder,
     /// The daemon runs (started when needed), the opened checkout was
     /// discovered, and the settings were read.
-    DaemonReady(MutationResult<(Option<String>, eliot_core::api::SettingsReadResponse)>),
+    DaemonReady(MutationResult<(Option<String>, eliot_core::api::SettingsReadResponse, bool)>),
     /// What `daemon.status` found after a failed read (or while stopped).
     LinkProbed(super::link_ui::Probe),
     /// The owner chose another existing Swarm data directory.
@@ -377,7 +377,7 @@ impl DesktopApp {
                 }
             }
             ShellMsg::DaemonReady(result) => match result {
-                Ok((discovered, read)) => {
+                Ok((discovered, read, acl_repaired)) => {
                     self.startup_error = None;
                     let restarted = self.link_ready(context);
                     let before = self.palette();
@@ -420,6 +420,9 @@ impl DesktopApp {
                         if self.monitor_panel() {
                             self.read_monitor(0, context);
                         }
+                    }
+                    if acl_repaired {
+                        self.alert("Swarm repaired the data directory ACL.");
                     }
                 }
                 Err(error) => self.link_failed(error, context),
@@ -1756,7 +1759,8 @@ impl DesktopApp {
                             )
                         })?
                         .with_file_name("swarm.exe");
-                    eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
+                    let acl_repaired =
+                        eliot_daemon::startup::ensure_running(&data_dir, &executable).await?;
                     let mut discovered = None;
                     if let Some(workspace) = workspace {
                         let request = eliot_core::api::ProjectDiscoverRequest {
@@ -1774,7 +1778,7 @@ impl DesktopApp {
                         discovered = reply.project.map(|project| project.checkout);
                     }
                     let read = config_client::read_settings(&data_dir).await?;
-                    Ok((discovered, read))
+                    Ok((discovered, read, acl_repaired))
                 },
                 &cancelled,
             ));

@@ -151,6 +151,7 @@ struct RunResult {
 }
 
 struct State {
+    acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
     store: StoreHandle,
     bus: Bus,
@@ -191,9 +192,11 @@ impl WorkspaceManager {
         secrets: SecretSet,
         progress: watch::Sender<u64>,
         monitoring: Monitoring,
+        acl_notices: Arc<crate::acl_notice::AclNotices>,
     ) -> Self {
         Self {
             inner: Arc::new(State {
+                acl_notices,
                 data_root,
                 store,
                 bus,
@@ -362,6 +365,7 @@ impl WorkspaceManager {
                     let _gate = slot.gate.clone().lock_owned().await;
                     self.require_current(&current, WorkspacePhase::Ready)
                         .await?;
+                    self.repair_managed_worktree_acl(&slot, &current).await?;
                     return Ok(());
                 }
                 WorkspacePhase::Creating => {
@@ -480,6 +484,7 @@ impl WorkspaceManager {
                     let gate = slot.gate.clone().lock_owned().await;
                     self.require_current(&current, WorkspacePhase::SetupReady)
                         .await?;
+                    self.repair_managed_worktree_acl(&slot, &current).await?;
                     let entry = current
                         .frozen_setup
                         .get(current.setup_index)
@@ -1529,6 +1534,57 @@ impl WorkspaceManager {
                 "workspace marker changed or cancellation is pending",
             ));
         }
+        Ok(())
+    }
+
+    /// Repair only a Store-retained, Git-verified daemon worktree at a lifecycle
+    /// boundary. SetupReady and Ready cannot have the removal ACL fence active.
+    async fn repair_managed_worktree_acl(
+        &self,
+        slot: &Slot,
+        preparation: &WorkspacePreparation,
+    ) -> Result<()> {
+        if !matches!(
+            preparation.phase,
+            WorkspacePhase::SetupReady | WorkspacePhase::Ready
+        ) {
+            return Err(problem(
+                "bad_state",
+                "worktree ACL repair is outside a managed workspace lifecycle boundary",
+            ));
+        }
+        if slot.removal_write_guard.lock_recover().is_some() {
+            return Err(problem(
+                "bad_state",
+                "worktree ACL repair is blocked by the active removal fence",
+            ));
+        }
+
+        let path = Path::new(&preparation.worktree_path);
+        reject_links(path)?;
+        let managed_root = fs::canonicalize(self.inner.data_root.join("worktrees"))
+            .map_err(|_| problem("unavailable", "managed worktree root is unavailable"))?;
+        reject_links(&managed_root)?;
+        let path = fs::canonicalize(path)
+            .map_err(|_| problem("unavailable", "managed worktree is unavailable"))?;
+        reject_links(&path)?;
+        if path == managed_root || !path.starts_with(&managed_root) {
+            return Err(problem(
+                "not_allowed",
+                "worktree ACL repair is limited to daemon-managed worktrees",
+            ));
+        }
+
+        let foreign_aces = crate::platform::repair_managed_dir_acl(&path)?;
+        if foreign_aces.is_empty() {
+            return Ok(());
+        }
+        let secrets: Vec<_> = self.inner.secrets.lock_recover().iter().cloned().collect();
+        let policy = SecretPolicy::new(secrets);
+        self.inner
+            .acl_notices
+            .report(&self.inner.store, &self.inner.bus, &policy, foreign_aces)
+            .await;
         Ok(())
     }
 

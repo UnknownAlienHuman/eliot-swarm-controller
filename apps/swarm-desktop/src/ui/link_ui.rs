@@ -332,15 +332,21 @@ impl DesktopApp {
             Err(error) => return self.alert(error),
         };
         let _task = context.spawn_background(move |_| {
-            let checked = eliot_daemon::DataDir::open_existing(&picked)
-                .map(|root| root.path().to_path_buf())
-                .map_err(|error| {
-                    format!(
-                        "{} cannot be used: {}",
-                        picked.display(),
-                        error.user_message()
-                    )
-                });
+            let eligible = match eliot_daemon::DataDir::open_existing(&picked) {
+                Ok(root) => Ok(root.path().to_path_buf()),
+                Err(error) if eliot_daemon::startup::repairable_data_dir_acl(&error) => {
+                    eliot_daemon::startup::check_acl_repair_target(&picked, error)
+                        .map(|()| picked.clone())
+                }
+                Err(error) => Err(error),
+            };
+            let checked = eligible.map_err(|error| {
+                format!(
+                    "{} cannot be used: {}",
+                    picked.display(),
+                    error.user_message()
+                )
+            });
             Message::Shell(ShellMsg::CandidateChecked(checked))
         });
     }

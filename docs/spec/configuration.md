@@ -23,8 +23,9 @@ this page is the final configuration contract, not an L1 checklist.
 ## Private data directory
 
 Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_HOME` or
-`--data-dir`. Root and private files are current-user-only. Do not accept redirected
-symlink/reparse roots or unsafe ownership.
+`--data-dir`. The data root must be a real directory owned by the current OS user;
+symlink and reparse traversal is refused. Private files remain current-user-only.
+Windows directory ACLs follow the narrow rule below.
 
 Linux is distributed as the [supported Docker image](../../docker/README.md).
 It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
@@ -35,12 +36,68 @@ guide specifies per-vendor mounts and the risk of exposing credentials to Agents
 Keep the root short enough for `<data-dir>/daemon.sock` (107 UTF-8 bytes total).
 
 On first use, create the directory with a protected current-user ACL before publishing
-private files. Owner and ACL checks open the root by handle through the verbatim form,
-so roots past the Win32 parse limit keep the same current-user-only protection.
-An existing unsafe root is refused; never repair ownership, weaken the
-check or copy its contents silently. The error offers one explicit command selecting
-a fresh private per-user directory; the desktop offers it as the last, explicitly
-named choice of its startup failure view (below). The user must choose it. Existing roots and configuration are not overwritten by bootstrap.
+private files. Windows checks every existing component of the data-root path for
+reparse points, then checks the root's owner and DACL through a handle. Ordinary
+ancestor ACLs are outside this check. Each checked directory must belong to the
+current Windows user. Its DACL must be present and protected from inheritance.
+It contains exactly one basic allow ACE for that user with `FILE_ALL_ACCESS` and
+directory inheritance flags
+`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`, plus zero or more basic allow ACEs for
+capability SIDs matching `S-1-15-3-*`. Each capability ACE is explicit (flags zero)
+and grants exactly `FILE_TRAVERSE | SYNCHRONIZE` (`0x00100020`). No other ACEs
+may remain in a repaired DACL. The daemon removes other entries after verifying
+ownership. A private file belongs to the current user and has a protected DACL
+containing exactly one non-inheritable basic allow ACE for that user with
+`FILE_ALL_ACCESS`. `owner.token` and `daemon.lock` retain this protected rule.
+SQLite private files also accept an already-existing DACL with a sole inherited
+basic allow ACE for the current user granting `FILE_ALL_ACCESS`. The daemon's
+data-directory manager validates this accepted ACL and never rewrites SQLite file
+ACLs. All other deviations on existing private files fail closed: changing an ACL
+cannot establish that existing bytes retained confidentiality or integrity.
+
+A Windows startup repair of an existing data root first verifies its current owner
+and independently verifies the existing `owner.token` file as a private regular file:
+current-user owner, protected DACL, and exactly one non-inheritable current-user basic
+allow ACE with `FILE_ALL_ACCESS`. This gate reads the marker's security metadata.
+Startup uses a non-reparse directory handle opened through the verbatim path to
+replace and read back the protected DACL. The current-user baseline and exact
+capability ACEs described above must pass readback. Ownership stays with the
+current user. If ownership, the marker, or ACL repair cannot be verified, startup
+reports the exact refusal, including the offending SID and rights where available.
+The daemon records removed grants in `daemon.log` and commits Owner notices with
+the SID, rights mask, and path. Successful removal logs and Owner notices are
+deduplicated by path, SID, and rights mask for that daemon run. Linux continues to
+refuse unsafe mounts without chmod or chown repair.
+
+The selected-root pointer directory must already satisfy the same protected
+directory ACE rule, but is not automatically repaired because it is not daemon-owned.
+The pointer file remains subject to the strict private-file rule. Windows rejects
+reparse traversal through the root and pointer paths; ordinary ancestor ACLs are not
+rewritten just because their path components are checked.
+
+After acquiring the data-directory lock and before serving, startup repairs the
+daemon-owned `logs/` and `skills/` ACLs. The active timer checks the root and the
+existing `logs/`, `plugins/`, and `worktrees/` parent directories. It checks
+each path every second until a failure or a recurring grant raises that path's
+retry delay, starting at two seconds and doubling up to 30 seconds. Log rotation requires a validated
+`logs/` ACL. Managed plugin homes and worktrees are repaired only when exact daemon
+creation or retained provenance identifies the path and a safe lifecycle check permits
+repair. Adopted workspaces and active worktree fences are outside this scope. Existing
+descendants change only at their owned lifecycle checks or through normal NTFS
+inheritance; the daemon does not recursively rewrite them. Eliot private files are
+validated under the file rules above; ordinary worktree files are not treated as
+private data.
+An isolated managed-folder repair failure leaves the daemon serving while its
+root remains valid. The daemon logs failures at the retry cadence. It stops
+serving on a root owner mismatch or an unrepairable root. Transient root failures
+are retried with backoff. The daemon validates existing credentials, the lock,
+and SQLite files before root ACL repair so directory inheritance cannot hide a
+file deviation. Startup and desktop
+surfaces report that repair completed or give the exact refusal reason.
+Existing roots are never copied or silently replaced. On refusal, the CLI offers one
+explicit command selecting a fresh private per-user directory; the desktop offers it
+as the last, explicitly named choice of its startup failure view (below). The user
+must choose it. Existing roots and configuration are not overwritten by bootstrap.
 
 The desktop's explicitly chosen fresh root is retained in a private per-user pointer:
 `%LOCALAPPDATA%\Eliot-bootstrap\selected-data-dir` on Windows, or
@@ -48,8 +105,9 @@ The desktop's explicitly chosen fresh root is retained in a private per-user poi
 `~/.config/eliot-bootstrap/selected-data-dir`) on Unix. The pointer lives outside the
 possibly unsafe default data root. CLI and desktop share resolution order:
 `--data-dir`, `ELIOT_HOME`, selected-root pointer, then the platform default. The
-pointer and target must pass the private-directory checks; failures never silently
-select another root. Selection creates and validates the fresh root before publication.
+pointer directory and pointer file pass their separate private checks, and the target
+passes the applicable data-root checks; failures never silently select another root.
+Selection creates and validates the fresh root before publication.
 
 After acquiring the data-directory lock and before serving, daemon startup
 materializes the bundled `eliot-swarm` Agent skill under `skills/` with a

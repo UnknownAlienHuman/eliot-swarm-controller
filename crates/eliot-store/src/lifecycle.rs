@@ -201,6 +201,36 @@ impl Store {
         })
     }
 
+    /// Commit a notice for an ACL repair already performed by the daemon.
+    /// The caller publishes the event while holding the writer guard.
+    pub fn commit_acl_repair_notice(
+        &mut self,
+        notice: &core::api::NotifyDefinitionArgs,
+        now: i64,
+    ) -> Result<Event> {
+        notice.validate()?;
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                "x.user.notify",
+                "daemon",
+                None,
+                None,
+                json!({"title": notice.title, "message": notice.message}),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(event)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Commit one daemon-observed diagnostic event (`activity.heavy`,
     /// `session.growth`, `harness.drift`) with optional Agent/generation
     /// binding, in a single transaction. Kinds are closed: anything else

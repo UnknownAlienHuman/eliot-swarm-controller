@@ -5,6 +5,154 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 const OWNER_TOKEN_FILE: &str = "owner.token";
+pub(crate) const DATA_DIR_ACL_LOCATION: &str = "data_dir.acl";
+pub(crate) const DATA_DIR_OWNER_LOCATION: &str = "data_dir.owner";
+pub(crate) const DATA_DIR_ACL_UNREPAIRABLE_LOCATION: &str = "data_dir.acl.unrepairable";
+
+pub(crate) fn unrepairable_root_acl(error: &Error) -> bool {
+    matches!(
+        error.failure_where.as_deref(),
+        Some(DATA_DIR_OWNER_LOCATION | DATA_DIR_ACL_UNREPAIRABLE_LOCATION)
+    )
+}
+
+pub fn repairable_data_dir_acl(error: &Error) -> bool {
+    error.code == "unsafe_data_dir" && error.failure_where.as_deref() == Some(DATA_DIR_ACL_LOCATION)
+}
+
+/// Confirm an existing unsafe target was initialized by Swarm without reading
+/// its token or any data from the root.
+pub fn check_acl_repair_target(path: &Path, mut problem: Error) -> Result<()> {
+    if let Err(error) = validate_private_file(&path.join(OWNER_TOKEN_FILE)) {
+        if error.code == "unsafe_private_file" {
+            return Err(error);
+        }
+        *problem.message = format!(
+            "{}. Cannot identify this directory as initialized by Swarm: {}",
+            problem.message, error.message
+        );
+        return Err(problem);
+    }
+    #[cfg(windows)]
+    super::windows::check_acl_write_access(path, &problem)?;
+    Ok(())
+}
+
+pub(crate) fn repair_startup_data_root(path: &Path) -> Result<Vec<ForeignDataDirAce>> {
+    // DataDir::open handles a new root and reports any other refusal.
+    #[cfg(windows)]
+    if let Err(error) = DataDir::open_existing(path)
+        && repairable_data_dir_acl(&error)
+    {
+        check_acl_repair_target(path, error)?;
+        validate_root_files_before_repair(path)?;
+        return repair_managed_dir_acl(path);
+    }
+    let _ = path;
+    Ok(Vec::new())
+}
+
+pub(crate) fn repair_live_data_root(path: &Path) -> Result<Vec<ForeignDataDirAce>> {
+    match validate_private_root(path) {
+        Ok(()) => Ok(Vec::new()),
+        Err(error) if repairable_data_dir_acl(&error) => {
+            validate_root_files_before_repair(path)?;
+            repair_managed_dir_acl(path)
+        }
+        Err(error) if error.code == "unsafe_data_dir" && error.failure_where.is_none() => {
+            Err(error.with_where(DATA_DIR_ACL_UNREPAIRABLE_LOCATION))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn validate_root_files_before_repair(path: &Path) -> Result<()> {
+    let checked = validate_existing_file(&path.join(OWNER_TOKEN_FILE), validate_private_file)
+        .and_then(|()| validate_existing_file(&path.join(DAEMON_LOCK_FILE), validate_private_file))
+        .and_then(|()| validate_store_files(path));
+    checked.map_err(|error| {
+        if error.code == "unsafe_private_file" {
+            error.with_where(DATA_DIR_ACL_UNREPAIRABLE_LOCATION)
+        } else {
+            error
+        }
+    })
+}
+
+/// Validate existing SQLite files before opening a database or repairing its
+/// directory, where NTFS might otherwise replace inherited file access.
+pub(crate) fn validate_store_files(root: &Path) -> Result<()> {
+    #[cfg(windows)]
+    for name in [
+        "eliot.db",
+        "eliot.db-wal",
+        "eliot.db-shm",
+        "eliot.db-journal",
+    ] {
+        validate_existing_file(&root.join(name), super::windows::validate_store_file)?;
+    }
+    let _ = root;
+    Ok(())
+}
+
+fn validate_existing_file(path: &Path, validate: fn(&Path) -> Result<()>) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(io_error(&format!("inspect {}", path.display()), error)),
+    }
+}
+
+/// Check a daemon-owned directory, changing its ACL only if it needs repair.
+pub(crate) fn repair_managed_dir_acl(path: &Path) -> Result<Vec<ForeignDataDirAce>> {
+    #[cfg(windows)]
+    {
+        super::windows::repair_managed_dir_acl(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+}
+
+/// Missing managed directories are initialized by their existing creation
+/// path. Existing directories are checked before daemon state is opened.
+pub(crate) fn repair_existing_managed_dir_acl(path: &Path) -> Result<Vec<ForeignDataDirAce>> {
+    #[cfg(windows)]
+    match fs::symlink_metadata(path) {
+        Ok(_) => repair_managed_dir_acl(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(io_error("inspect daemon-owned directory", error)),
+    }
+    #[cfg(not(windows))]
+    repair_managed_dir_acl(path)
+}
+
+/// An entry outside the expected current-user entry on a Windows private root.
+#[derive(Serialize)]
+pub struct ForeignDataDirAce {
+    pub path: PathBuf,
+    pub sid: Option<String>,
+    pub rights: Option<u32>,
+    pub ace_type: u8,
+    pub flags: u8,
+    pub allowed: bool,
+}
+
+/// Read the ACL of an existing root for local diagnostics, including entries
+/// that fail private-root validation. No state or credentials are opened.
+pub fn data_dir_acl_report(path: &Path) -> Result<Vec<ForeignDataDirAce>> {
+    #[cfg(windows)]
+    {
+        super::windows::data_dir_acl_report(&absolute_path(path)?)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(Vec::new())
+    }
+}
 const DAEMON_LOCK_FILE: &str = "daemon.lock";
 #[cfg(not(windows))]
 const OPERATOR_LOCK_FILE: &str = "operator.lock";
@@ -52,7 +200,7 @@ impl DataDir {
         let path = absolute_path(path.as_ref())?;
         ensure_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
-                unsafe_data_dir_error(&path)
+                unsafe_data_dir_error(&path, error)
             } else {
                 error
             }
@@ -77,7 +225,7 @@ impl DataDir {
         }
         validate_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
-                unsafe_data_dir_error(&path)
+                unsafe_data_dir_error(&path, error)
             } else {
                 error
             }
@@ -108,7 +256,7 @@ impl DataDir {
     pub fn acquire_daemon_lock(&self) -> Result<DaemonLock> {
         let path = self.path.join(DAEMON_LOCK_FILE);
         let file = open_or_create_lock_file(&path)?;
-        ensure_private_file(&path)?;
+        validate_private_file(&path)?;
 
         match file.try_lock() {
             Ok(()) => Ok(DaemonLock {
@@ -187,7 +335,7 @@ impl DataDir {
                 .map_err(|error| Error::new("daemon_metadata", error.to_string()))?;
             let target = self.path.join(DAEMON_INFO_FILE);
             match fs::symlink_metadata(&target) {
-                Ok(_) => ensure_private_file(&target)?,
+                Ok(_) => validate_private_file(&target)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(io_error("inspect daemon metadata", error)),
             }
@@ -207,7 +355,7 @@ impl DataDir {
                     .map_err(|error| io_error("sync daemon metadata", error))?;
                 drop(file);
                 replace_file(&temporary, &target)?;
-                ensure_private_file(&target)?;
+                validate_private_file(&target)?;
                 sync_directory(&self.path)?;
                 Ok(info.clone())
             })();
@@ -276,7 +424,10 @@ impl DataDir {
     }
 }
 
-fn unsafe_data_dir_error(path: &Path) -> Error {
+fn unsafe_data_dir_error(path: &Path, mut error: Error) -> Error {
+    if repairable_data_dir_acl(&error) {
+        return error;
+    }
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -286,12 +437,11 @@ fn unsafe_data_dir_error(path: &Path) -> Error {
     let fresh_path = parent.join(format!("{name}-{}", ulid::Ulid::new()));
     // PowerShell single-quoted literals double embedded apostrophes.
     let command_path = fresh_path.to_string_lossy().replace('\'', "''");
-    Error::new(
-        "unsafe_data_dir",
-        format!(
-            "the selected data directory is unsafe and was not changed; create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)"
-        ),
-    )
+    *error.message = format!(
+        "the selected data directory is unsafe and was not changed: {}. Create a fresh private directory with `swarm --data-dir '{command_path}' daemon` (the desktop offers the same remedy)",
+        error.message
+    );
+    error
 }
 
 /// Record, in the serving daemon's validated root, that the Owner asked it to
@@ -363,7 +513,11 @@ fn resolve_selected_root_at(pointer_dir: &Path) -> Result<Option<PathBuf>> {
                     "selected-root pointer is not an absolute path",
                 ));
             }
-            DataDir::open_existing(&path)?;
+            if let Err(error) = DataDir::open_existing(&path)
+                && !repairable_data_dir_acl(&error)
+            {
+                return Err(error);
+            }
             Ok(Some(path))
         }
     }
@@ -607,7 +761,6 @@ fn load_or_create_owner_token(root: &Path) -> Result<String> {
             Ok(token)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure_private_file(&path)?;
             read_existing_owner_token(root)
         }
         Err(error) => Err(io_error("create owner token", error)),
@@ -701,13 +854,13 @@ fn open_or_create_lock_file(path: &Path) -> Result<File> {
         match create_new_private_file(path) {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                ensure_private_file(path)?;
+                validate_private_file(path)?;
                 let file = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(path)
                     .map_err(|error| io_error("open daemon lock", error))?;
-                ensure_private_file(path)?;
+                validate_private_file(path)?;
                 Ok(file)
             }
             Err(error) => Err(io_error("create daemon lock", error)),
@@ -903,7 +1056,7 @@ pub(crate) fn replace_file_atomically(
                     "replaced file must not be a link",
                 ));
             }
-            Ok(_) if private => ensure_private_file(&target)?,
+            Ok(_) if private => validate_private_file(&target)?,
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(io_error("inspect replaced file", error)),
@@ -931,7 +1084,7 @@ pub(crate) fn replace_file_atomically(
             drop(file);
             replace_file(&temporary, &target)?;
             let after = if private {
-                ensure_private_file(&target)
+                validate_private_file(&target)
             } else {
                 Ok(())
             };

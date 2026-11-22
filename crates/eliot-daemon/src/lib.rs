@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+mod acl_notice;
 pub(crate) mod adhoc;
 pub(crate) mod automation;
 pub mod bootstrap;
@@ -50,7 +51,8 @@ pub use daemon::{
 };
 pub use daemon::{client_call_with_remote_context, client_call_with_remote_mcp_tool};
 pub use platform::data_dir::{
-    DataDir, owner_stopped, persist_selected_root, resolve_data_dir, resolve_selected_root,
+    DataDir, ForeignDataDirAce, data_dir_acl_report, owner_stopped, persist_selected_root,
+    resolve_data_dir, resolve_selected_root,
 };
 pub use router::discovery::is_mutation_id_method;
 pub use router::discovery::mutation_id_methods;
