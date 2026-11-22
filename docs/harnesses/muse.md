@@ -111,8 +111,9 @@ completions can never inflate the terminal count. The adapter folds them
 into the retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (sources `muse:session/tokenUsage` and
 `muse:session/contextUsage`), with `observed_at` captured at acceptance:
-the `cumulative` counted-once input/output/cache counters replace the
-retained cumulative counters (no total is derived), the server-computed
+the `cumulative` counted-once prompt/output/cache counters replace the
+retained cumulative counters. Store projects uncached input by removing
+cache reads from the cumulative prompt total. The server-computed
 estimated `cost.usd` maps with unit `usd_estimate`, and each context
 notification replaces both context counters (absent members become null,
 never keeping the previous window). Missing counters stay

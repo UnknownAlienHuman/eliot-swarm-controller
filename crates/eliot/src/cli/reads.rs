@@ -1211,7 +1211,13 @@ pub(crate) fn fleet_usage_cell(summary: &AgentSummary) -> String {
     match summary.fleet_usage() {
         None => "-".to_owned(),
         Some((tokens, scope)) => {
-            format!("{tokens}{}", if scope == "session" { "(s)" } else { "(t)" })
+            let scope = if scope == "session" { "s" } else { "t" };
+            let partial = if summary.fleet_usage_is_partial() {
+                ",partial"
+            } else {
+                ""
+            };
+            format!("{tokens}({scope}{partial})")
         }
     }
 }
@@ -1235,8 +1241,9 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         "-".to_owned()
     };
     println!(
-        "usage {scope} agents {} generations {} truncated {} history {} (pruned_through {})",
+        "usage {scope} agents {} ({} observed native) generations {} truncated {} history {} (pruned_through {})",
         response.agents_included,
+        response.observed_native_agents,
         response.generations_included,
         yes_no(response.truncated),
         if response.history_complete {
@@ -1274,6 +1281,12 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         "SCOPE", "COUNTED", "INPUT", "OUTPUT", "REASON", "THINK", "CACHE_R", "CACHE_W", "TOTAL"
     );
     for entry in &response.turns.by_scope {
+        let total = counter_cell(entry.totals.reported_total());
+        let partial = if entry.turns_missing.total_tokens > 0 {
+            "*"
+        } else {
+            ""
+        };
         println!(
             "  {:<14} {:<7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
             truncate_cell(&entry.scope, 14),
@@ -1284,8 +1297,16 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
             counter_cell(entry.totals.thinking_tokens),
             counter_cell(entry.totals.cache_read_tokens),
             counter_cell(entry.totals.cache_write_tokens),
-            counter_cell(entry.totals.total_tokens),
+            format!("{total}{partial}"),
         );
+    }
+    if response
+        .turns
+        .by_scope
+        .iter()
+        .any(|entry| entry.turns_missing.total_tokens > 0)
+    {
+        println!("  * partial token count");
     }
     println!(
         "  turns missing counters: {}",

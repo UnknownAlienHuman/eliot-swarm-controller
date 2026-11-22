@@ -134,10 +134,10 @@ installed harnesses through the settings writer as `bootstrap`. On a fresh root,
 the managers are the installed ones of `codex`, `claude` and `opencode` in that
 order (the harnesses that can disable native subagents per session), otherwise the
 first installed profile in name order. Each manager has `control = "tree"` and
-`child_profiles` listing the other installed bootstrap profiles, so on those
-harnesses its omitted `native_subagents` resolves to `deny`. A Muse or Antigravity
-manager, which has no per-session switch, is written with
-`native_subagents = "allow"` so the bootstrap settings stay valid. The `default`
+`child_profiles` listing the other installed bootstrap profiles. Bootstrap writes
+`native_subagents = "deny"` for Codex, Claude and OpenCode managers, and writes
+`native_subagents = "allow"` for a Muse or Antigravity fallback manager, which has
+no per-session switch. The `default`
 routing role lists the managers followed by the other installed profiles in name
 order, so routing passes over one whose quota is used up or whose provider is on
 hold and starts the task on the next. The `worker` routing role and each manager's
@@ -170,8 +170,8 @@ below). The harness pages
 [OpenCode](../harnesses/opencode.md), [Muse](../harnesses/muse.md),
 [Antigravity](../harnesses/antigravity.md)) own their native mappings.
 [The example config](../../config/controller.example.toml) shows explicit
-Codex, Muse and Claude profiles; OpenCode and Antigravity follow the same
-explicit-profile shape with their own harness-specific fields.
+profiles for Codex, Muse, Claude, OpenCode and Antigravity; its omitted
+`native_subagents` fields use the defaults described below.
 
 ## First profile
 
@@ -301,17 +301,20 @@ The parent's own profile scope is replaced by the child's. See the launch author
 check in [api](api.md) and [coordination](coordination.md#claims-and-hierarchy).
 
 A profile selects its harness-native subagent surface in `native_subagents`:
-`allow` (the default without `child_profiles`) keeps today's behavior, while
 `deny` asks the harness plugin to disable its native subagent tool for the
 session so delegation goes through Swarm (`launch` with `role` or an allowed
-profile, claims, mail, `wait`/`digest`). An omitted value defaults to `deny`
-for profiles with a non-empty `child_profiles` allow-list (managers delegate
-through Swarm) and to `allow` otherwise. The frozen value is captured in the
-profile snapshot and reported truthfully in the effective settings. Explicit
-`allow` on a manager preserves native subagents (audit profiles that rely on
-Codex native subagents set `allow`). `deny` has a per-session mapping on
-Codex, Claude and OpenCode only; on Muse and Antigravity the installed
-binaries expose no verified switch, so `deny` is `unsupported` at config load.
+profile, claims, mail, `wait`/`digest`). When omitted, it defaults to `deny`
+on Codex, Claude and OpenCode, whether or not `child_profiles` is set. An
+explicit `native_subagents = "allow"` opts that profile into native subagents
+and remains valid for audit or other profiles that rely on them. The frozen
+value is captured in the profile snapshot and reported truthfully in effective
+settings. Ad-hoc Owner launches use the same per-harness defaults.
+
+Muse and Antigravity have no verified per-session switch and resolve to
+`allow` when the field is omitted or explicitly set to `allow`. Explicit
+`native_subagents = "deny"` is `unsupported` at config load on those harnesses;
+the daemon does not claim to disable a capability it cannot control. `deny`
+has a per-session mapping on Codex, Claude and OpenCode only.
 On OpenCode the denial is a per-session `subagent` wildcard deny stored as
 the final entry in the session's entire ruleset and verified by readback of that
 exact session on create and resume: the server merges session rules after

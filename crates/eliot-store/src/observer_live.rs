@@ -64,6 +64,19 @@ fn optional_text<'a>(data: &'a Value, field: &str) -> Result<Option<&'a str>> {
     }
 }
 
+fn optional_turn_usage(data: &Value) -> Result<Option<TurnUsage>> {
+    match data.get("usage") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(_)) => serde_json::from_value(data["usage"].clone())
+            .map(Some)
+            .map_err(|_| Error::new("invalid", "observed turn usage must be a usage object")),
+        Some(_) => Err(Error::new(
+            "invalid",
+            "observed turn usage must be a usage object",
+        )),
+    }
+}
+
 fn optional_time(data: &Value, field: &str) -> Result<Option<i64>> {
     match data.get(field) {
         None | Some(Value::Null) => Ok(None),
@@ -109,6 +122,7 @@ pub(super) fn persist_turn_fact(
         effective_model: None,
         native_error_message: None,
     });
+    let mut terminal_usage = None;
     match event.kind.as_str() {
         "turn.started" => {
             if turn.state == TurnState::Completed {
@@ -168,6 +182,7 @@ pub(super) fn persist_turn_fact(
             if let Some(text) = optional_text(&event.data, "final_text")? {
                 turn.final_text = Some(text.to_owned());
             }
+            terminal_usage = optional_turn_usage(&event.data)?;
         }
         "message.completed" => {
             if turn.state != TurnState::Completed
@@ -179,6 +194,7 @@ pub(super) fn persist_turn_fact(
         }
         _ => return Ok(()),
     }
+    let usage = terminal_usage.as_ref().map(encode_json).transpose()?;
     if existing.is_none() {
         insert_turn(
             tx,
@@ -194,7 +210,7 @@ pub(super) fn persist_turn_fact(
                 final_text: turn.final_text.as_deref(),
                 started_at: turn.started_at,
                 completed_at: turn.completed_at,
-                usage: None,
+                usage: usage.as_deref(),
                 config_revision: turn.config_revision,
                 preceded_by: turn.preceded_by.as_deref(),
                 effective_model: None,
@@ -205,8 +221,8 @@ pub(super) fn persist_turn_fact(
             "UPDATE turns SET state = ?1, status = ?2, outcome = COALESCE(?3, outcome),
                               native_status = COALESCE(?4, native_status),
                               final_text = ?5, started_at = ?6, completed_at = ?7,
-                              messages = messages + ?8
-             WHERE agent = ?9 AND generation = ?10 AND turn_id = ?11",
+                              usage = COALESCE(?8, usage), messages = messages + ?9
+             WHERE agent = ?10 AND generation = ?11 AND turn_id = ?12",
             params![
                 turn_state_name(turn.state),
                 turn.status,
@@ -215,6 +231,7 @@ pub(super) fn persist_turn_fact(
                 turn.final_text,
                 turn.started_at,
                 turn.completed_at,
+                usage,
                 i64::from(event.kind == "message.completed"),
                 id,
                 agent.generation,

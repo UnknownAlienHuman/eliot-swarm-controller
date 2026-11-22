@@ -569,13 +569,13 @@ pub struct MonitorRow {
     pub progress_age_ms: Option<i64>,
     pub last_outcome: Option<String>,
     /// Fleet token count from the shared [`AgentSummary::fleet_usage`]
-    /// derivation: the native total when supplied, otherwise the
-    /// input+output fleet signal. `None` when the summary carries no usage.
+    /// derivation from normalized input, cached input and output.
     pub tokens: Option<i64>,
     /// Provenance of [`MonitorRow::tokens`]: `"turn"` or `"session"`,
     /// matching the summary `usage_scope`. `None` exactly when `tokens`
     /// is `None`; a session count never renders without its marker.
     pub tokens_scope: Option<String>,
+    pub tokens_partial: bool,
     pub obs: Obs,
     /// A native observed child (the daemon reports `activity` only for
     /// those): it nests under its parent.
@@ -614,8 +614,9 @@ pub fn group(value: i64) -> String {
 pub fn tokens_label(row: &MonitorRow) -> String {
     match (row.tokens, row.tokens_scope.as_deref()) {
         (Some(tokens), Some(scope)) => format!(
-            "{} tokens · {}",
+            "{} {}tokens · {}",
             group(tokens),
+            if row.tokens_partial { "reported " } else { "" },
             if scope == "session" {
                 "whole session"
             } else {
@@ -656,6 +657,7 @@ impl MonitorRow {
                 .map(|outcome| outcome.as_str().to_owned()),
             tokens,
             tokens_scope,
+            tokens_partial: summary.fleet_usage_is_partial(),
             obs: Obs::from_view(row.observation.as_ref()),
             native_child: summary.activity.is_some(),
             updated_at: summary.updated_at,

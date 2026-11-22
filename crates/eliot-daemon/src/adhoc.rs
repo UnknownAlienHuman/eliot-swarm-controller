@@ -1,5 +1,6 @@
 //! Ad-hoc Owner launch: freeze a profile-equivalent snapshot from built-in
 //! per-harness defaults plus flags, with deterministic executable discovery.
+//! Native subagents follow the same harness defaults as stored profiles.
 //!
 //! Owning contract: docs/spec/configuration.md (ad-hoc launch) and the five
 //! harness pages. Profiles stay the durable explicit record; ad-hoc is the
@@ -526,9 +527,15 @@ pub(crate) fn adhoc_snapshot(
     snapshot.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));
+    let native_subagents = crate::config::native_subagents_default(&harness).ok_or_else(|| {
+        core::Error::new(
+            "unsupported",
+            format!("ad-hoc native_subagents has no default mapping for {harness}"),
+        )
+    })?;
     snapshot.insert(
         "native_subagents".to_owned(),
-        Value::String("allow".to_owned()),
+        Value::String(native_subagents.to_owned()),
     );
     let pass_env = if harness == "claude" {
         json!(["CLAUDE_CONFIG_DIR"])

@@ -970,14 +970,15 @@ capability/orphans, provider hold, workspace phase, requested/effective route an
 Git/edit facts. A stale or unknown value is shown explicitly, never hidden or converted
 to zero.
 
-Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`) prefer the newest
-terminal turn's native turn usage. When the last turn carries none, they fall
-back to the generation's latest retained `session.usage` snapshot (cumulative
-counters only, never a derived total) with the `usage_scope: "session"`
-marker; turn-backed usage carries `"turn"`. The fallback is fleet
-visibility, never turn expenditure: per-turn accounting stays on
-`usage.summary`, whose `turns_without_usage` and per-counter coverage name
-exactly what the native stream did not supply.
+Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
+sum uncached input, cached input and output on the [shared usage basis](core.md).
+They prefer the newest terminal turn (`usage_scope: "turn"`) and fall back
+to the latest cumulative snapshot (`usage_scope: "session"`) when that turn
+has no usage. A subtotal missing any component is marked partial. Agent
+usage summaries include usage from observed native descendants of the
+requested generations within the caller's read scope. Child rows retain
+their own usage and the project and tree summaries count each turn once.
+
 The authenticated Swarm MCP tool boundary records semantic tool.started and
 tool.completed events with the exact RPC method, call ID, origin, and exact
 active Agent turn. The event data contains no RPC parameters, result text, or
@@ -1015,9 +1016,10 @@ Three event families capture heavy work, session growth, and vendor drift.
 - `session.growth`: one warning per basis (context occupancy at
   `daemon.session_growth_ratio_permille`, native session file size at
   `daemon.session_file_bytes`). The warning clears when
-  the retained signal drops back under threshold. Suppliers are harness-native
+  the retained signal drops back under threshold. An absent or out-of-range
+  context observation cannot trigger a context reaction. Suppliers are harness-native
   only: Codex `thread/tokenUsage/updated` (latest context occupancy against
-  `modelContextWindow`), Claude stream-json `usage` plus the frame-reported
+  `modelContextWindow` for the same turn or model), Claude stream-json plus the reported
   model window plus the transcript file size, Muse `session/contextUsage`,
   Antigravity ACP `usage_update`. OpenCode exposes no session-level signal
   through its API and the Muse event log exposes no size, so those stay

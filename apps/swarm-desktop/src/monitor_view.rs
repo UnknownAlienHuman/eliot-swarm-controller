@@ -397,33 +397,74 @@ pub fn observe_lines(read: &DetailRead) -> Vec<String> {
     lines
 }
 
-/// Token usage and cost of the detail read, in words; counters that are
-/// zero or unreported are left out.
+/// Normalized token usage, context fill, and cost for the selected Agent.
 pub fn usage_lines(read: &DetailRead) -> Vec<String> {
-    let mut lines = Vec::new();
+    let context = read
+        .agent
+        .session_usage
+        .as_ref()
+        .and_then(eliot_core::SessionUsage::context_tokens);
+    let mut lines = vec![match context {
+        Some((used, window)) => format!(
+            "Context {:.1}% filled · {} of {} tokens",
+            100.0 * used as f64 / window as f64,
+            group(used),
+            group(window)
+        ),
+        None => "Context fill unavailable.".to_owned(),
+    }];
     match &read.usage {
         Ok(usage) => {
             let turns = &usage.turns;
-            let (mut input, mut output, mut total) = (0_i64, 0_i64, 0_i64);
-            for scope in &turns.by_scope {
-                input += scope.totals.input_tokens.unwrap_or(0);
-                output += scope.totals.output_tokens.unwrap_or(0);
-                total += scope.totals.total_tokens.unwrap_or(0);
-            }
-            if total == 0 {
-                total = input + output;
-            }
-            if turns.turns_counted == 0 && total == 0 {
-                lines.push("No token usage reported yet.".to_owned());
-            } else {
+            if let Some(total) = turns.reported_total() {
+                let qualifier = if turns.turns_missing.total_tokens > 0 {
+                    "reported "
+                } else {
+                    ""
+                };
                 lines.push(format!(
-                    "{} tokens over {}",
+                    "{} {qualifier}tokens over {}",
                     group(total),
                     eliot_core::count_words(turns.turns_counted as u64, "turn", "turns")
                 ));
-                if input > 0 || output > 0 {
-                    lines.push(format!("{} in · {} out", group(input), group(output)));
+                for (name, counter) in [
+                    (
+                        "uncached input",
+                        |t: &eliot_core::api::TurnCounterTotals| t.input_tokens,
+                    ),
+                    ("cached input", |t: &eliot_core::api::TurnCounterTotals| {
+                        t.cache_read_tokens
+                    }),
+                    ("output", |t: &eliot_core::api::TurnCounterTotals| {
+                        t.output_tokens
+                    }),
+                    ("reasoning", |t: &eliot_core::api::TurnCounterTotals| {
+                        t.reasoning_tokens
+                    }),
+                ]
+                    as [(&str, fn(&eliot_core::api::TurnCounterTotals) -> Option<i64>); 4]
+                {
+                    if let Some(count) = turns
+                        .by_scope
+                        .iter()
+                        .filter_map(|scope| counter(&scope.totals))
+                        .reduce(i64::saturating_add)
+                    {
+                        lines.push(format!("{} {name} tokens", group(count)));
+                    }
                 }
+            } else {
+                lines.push("No token usage reported yet.".to_owned());
+            }
+            if usage.observed_native_agents > 0 {
+                lines.push(format!(
+                    "{} included",
+                    eliot_core::count_words(
+                        usage.observed_native_agents as u64,
+                        "native Agent",
+                        "native Agents"
+                    )
+                ));
             }
             if turns.turns_without_usage > 0 {
                 lines.push(format!(

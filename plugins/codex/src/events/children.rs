@@ -1,9 +1,7 @@
 //! Codex child-event registration, buffering and settlement.
 //!
 //! Parent turns own their facts; this module owns child-thread tracking,
-//! child-frame buffering and child-gap settlement behind narrow `pub(super)`
-//! interfaces. Pure move from `super`: signatures, transactions, locking and
-//! event order unchanged.
+//! usage attribution, frame buffering and gap settlement for child threads.
 use super::*;
 /// Bound on tracked child threads, unconfirmed threads and in-flight spawns per
 /// generation; overflow is a source gap.
@@ -18,6 +16,9 @@ pub(super) struct ChildState {
     failure: Option<String>,
     final_text: Option<String>,
     active_turn_id: Option<String>,
+    /// Baseline and latest cumulative token snapshot for this exact child
+    /// turn. The terminal event carries only their difference.
+    turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
     ready_committed: bool,
 }
 
@@ -33,6 +34,7 @@ impl ChildState {
             failure: None,
             final_text: None,
             active_turn_id: None,
+            turn_usage: None,
             ready_committed: false,
         }
     }
@@ -1008,6 +1010,7 @@ impl EventProcessor {
                     .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
                 state.active_turn_id = Some(turn_id.to_owned());
                 state.final_text = None;
+                state.turn_usage = None;
                 let native_id = event_id(child_thread, turn_id, turn_id, "turn.started")?;
                 state
                     .commit_event(
@@ -1047,7 +1050,47 @@ impl EventProcessor {
             "turn/completed" => {
                 self.complete_child_turn(child_thread, params).await?;
             }
+            "thread/tokenUsage/updated" => {
+                self.note_child_token_usage(child_thread, &params)?;
+            }
             _ => {}
+        }
+        Ok(())
+    }
+
+    fn note_child_token_usage(&mut self, child_thread: &str, params: &Value) -> Result<()> {
+        let notification: NativeThreadTokenUsageUpdatedNotification =
+            serde_json::from_value(params.clone()).map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "Codex child thread/tokenUsage/updated did not match the 0.167 schema",
+                )
+            })?;
+        if notification.thread_id != child_thread || notification.turn_id.trim().is_empty() {
+            return Err(Error::new(
+                "source_integrity",
+                "Codex child token usage did not belong to its exact thread and turn",
+            ));
+        }
+        let state = self
+            .child_states
+            .get_mut(child_thread)
+            .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+        if state.active_turn_id.as_deref() != Some(notification.turn_id.as_str())
+            || !notification.token_usage.last.has_response_counters()
+        {
+            // A late or stale update must never bind to another child turn.
+            return Ok(());
+        }
+        let Some(total) = notification.token_usage.total else {
+            return Ok(());
+        };
+        match state.turn_usage.as_mut() {
+            Some((turn_id, _, latest)) if turn_id == &notification.turn_id => *latest = total,
+            _ => {
+                let baseline = usage_baseline(&total, &notification.token_usage.last);
+                state.turn_usage = Some((notification.turn_id, baseline, total));
+            }
         }
         Ok(())
     }
@@ -1131,6 +1174,16 @@ impl EventProcessor {
             "turn_id": notification.turn.id,
             "status": status_text,
         });
+        let turn_usage = state
+            .turn_usage
+            .take()
+            .filter(|(turn_id, _, _)| turn_id == &notification.turn.id)
+            .and_then(|(_, baseline, latest)| turn_expenditure(&baseline, &latest));
+        if let Some(usage) = turn_usage {
+            data["usage"] = serde_json::to_value(usage).map_err(|_| {
+                Error::new("internal", "Codex child turn usage could not be encoded")
+            })?;
+        }
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         attach_native_error(&mut data, notification.turn.error.as_ref(), &policy);
         if let Some(text) = state.final_text.take() {

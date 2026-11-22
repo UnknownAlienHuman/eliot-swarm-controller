@@ -478,13 +478,16 @@ Verified read-only 2026-11-13 against installed Codex 0.167.1
 field (a Turn has id/items/status/error/timestamps only). Per-turn
 expenditure arrives separately as `thread/tokenUsage/updated`
 `{threadId, turnId, tokenUsage: {last, total, modelContextWindow}}`.
-`tokenUsage.last` is the latest per-response delta for that exact `turnId`
+`tokenUsage.last` reports the latest model response for that exact `turnId`
 (`inputTokens`, `cachedInputTokens`, `outputTokens`,
 `reasoningOutputTokens`, `totalTokens`, `cacheWriteInputTokens`): usage
 flows once per upstream model response inside a turn (the installed
 `RawResponseCompletedNotification` is "the exact usage from one upstream
 Responses API completion", keyed by turn), so one turn with tool calls sees
-several updates. Turn expenditure is the cumulative `total` of the latest
+several updates. The protocol can also send a synthetic window-fill update
+with zero input and output counters. That update contributes no response
+expenditure. A prior measured context pair stays available while its window
+is unchanged. Turn expenditure is the cumulative `total` of the latest
 update in the turn minus the turn-start baseline (`total` minus `last` of
 the first update in the turn), computed per counter and mapped to
 `TurnUsage` at `turn` scope, bound to the exact thread/generation/turn. Raw
@@ -500,12 +503,16 @@ into the retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (source `codex:thread/tokenUsage/updated`), with `observed_at`
 captured at acceptance: the cumulative `total` replaces
 the retained input/output/cache counters (never a derived total),
-`last.totalTokens` projects to `context_used_tokens` (the latest active context size,
-per upstream TUI `tokens_in_context_window`) read against `modelContextWindow`, and
-`modelContextWindow` replaces the retained capacity; account-level
+`last.totalTokens` projects to context occupancy for a model response
+against `modelContextWindow` when it fits in the window. A response without
+capacity can reuse a window observed for the same turn or associated model.
+The Store removes cache hits from Codex's cache-inclusive
+`inputTokens` when projecting usage reads. Account-level
 cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
 counters stay null. Idle updates merge and commit without waiting for a
-terminal.
+terminal. Registered native child threads use independent baselines bound to
+their exact thread and active turn. Their terminal event carries the resulting
+delta once into the child's retained turn row.
 
 ## Recovery and later capabilities
 

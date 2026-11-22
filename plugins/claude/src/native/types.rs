@@ -342,17 +342,27 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
     })
 }
 
-/// Context occupancy sample from a terminal `result` record: there is no
-/// native occupancy snapshot in the installed stream-json `result` shape.
-/// `result.usage` is cumulative spend across model calls (per-step spend
-/// lives on `assistant` messages), so summing its input-side counters
-/// would report accumulated expenditure as live occupancy and can exceed
-/// the model capacity. Occupancy therefore stays null here; cumulative
-/// spend below still maps from `modelUsage` with provenance
-/// `claude:result`, and capacity still maps from `context_window`.
-/// See Agent SDK cost-tracking and `sdkcontrol/getContextUsage`.
-pub(crate) fn result_context_used(_record: &Value) -> Option<i64> {
-    None
+/// Context occupancy from one native main-thread `assistant` message.
+/// Anthropic `message.usage` separates uncached input from cache-read and
+/// cache-creation input. All four nonnegative counters describe one call's
+/// context footprint; omitted cache buckets mean zero, while missing or
+/// malformed required counters and overflow leave the sample unavailable.
+pub(crate) fn assistant_context_used(record: &Value) -> Option<i64> {
+    let usage = record.get("message")?.get("usage")?.as_object()?;
+    let required = |key: &str| {
+        usage
+            .get(key)
+            .and_then(Value::as_i64)
+            .filter(|value| *value >= 0)
+    };
+    let optional_cache = |key: &str| match usage.get(key) {
+        Some(Value::Null) | None => Some(0),
+        Some(value) => value.as_i64().filter(|count| *count >= 0),
+    };
+    required("input_tokens")?
+        .checked_add(optional_cache("cache_read_input_tokens")?)?
+        .checked_add(optional_cache("cache_creation_input_tokens")?)?
+        .checked_add(required("output_tokens")?)
 }
 
 /// Model context window from an init or result frame: the installed
@@ -423,29 +433,45 @@ pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option
 }
 
 /// Extract the session-scoped fact from a terminal `result` record:
-/// cumulative token counters from `modelUsage` plus the cumulative cost
-/// from `total_cost_usd` and the model context window where the frame
-/// reports it. Occupancy is never derived from `usage` (no native
-/// snapshot; see `result_context_used`). With persistent streaming input
+/// cumulative token counters from `modelUsage`, cumulative cost from
+/// `total_cost_usd`, the latest single-call context sample retained from a
+/// main-thread assistant message, and the model's window from the result
+/// or the matching init frame. Neither `result.usage` nor cumulative
+/// `modelUsage` counters supply occupancy. With persistent streaming input
 /// the cumulative halves are cumulative for the session (resumed cost
 /// included) and estimated, so they map to a session-scoped snapshot with
 /// source `claude:result`, never to turn expenditure and never converted.
-/// Any mapped quarter yields a fact; only when all are absent is there no
+/// Any mapped value yields a fact; only when all are absent is there no
 /// session fact, so completion proceeds without one. The transcript file
 /// size is filled by the caller (it needs the retained session id), never
 /// guessed here.
-pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
+pub(crate) fn result_session_usage(
+    record: &Value,
+    latest_context_sample: Option<&(String, i64)>,
+    init_context_window: Option<&(String, i64)>,
+) -> Option<SessionUsage> {
     let cumulative_tokens = result_session_tokens(record);
     let amount = record
         .get("total_cost_usd")
         .and_then(Value::as_f64)
         .filter(|amount| amount.is_finite() && *amount >= 0.0);
-    let used = result_context_used(record);
-    let window = frame_context_window(record);
+    let used = latest_context_sample.map(|(_, used)| *used);
+    let window = latest_context_sample
+        .and_then(|(model, _)| {
+            record["modelUsage"]
+                .get(model)
+                .and_then(frame_context_window)
+        })
+        .or_else(|| frame_context_window(record))
+        .or_else(|| {
+            let (model, _) = latest_context_sample?;
+            let (initialized_model, window) = init_context_window?;
+            (model == initialized_model).then_some(*window)
+        });
     if cumulative_tokens.is_none() && amount.is_none() && used.is_none() && window.is_none() {
         return None;
     }
-    Some(SessionUsage {
+    let mut usage = SessionUsage {
         context_used_tokens: used,
         context_window_tokens: window,
         cumulative_tokens,
@@ -456,7 +482,9 @@ pub(crate) fn result_session_usage(record: &Value) -> Option<SessionUsage> {
         session_file_bytes: None,
         source: Some("claude:result".to_owned()),
         observed_at: None,
-    })
+    };
+    usage.retain_valid_context();
+    Some(usage)
 }
 
 /// One proven MCP server entry from a `system`/`init` record: the native

@@ -893,8 +893,8 @@ pub struct Turn {
 /// `turn` for one turn's aggregate or per-turn-delta usage); unknown fields
 /// are ignored so harnesses decode forward. Context occupancy/capacity and
 /// cumulative session cost are session-scoped facts, never turn expenditure:
-/// they are not represented here, and `total_tokens` is set only when the
-/// native signal supplies a turn-scoped total, never derived.
+/// they are not represented here. The Store projects adapter counters into
+/// the shared accounting basis when serving usage reads.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TurnUsage {
     #[serde(default)]
@@ -915,6 +915,71 @@ pub struct TurnUsage {
     pub cache_write_tokens: Option<i64>,
     #[serde(default)]
     pub total_tokens: Option<i64>,
+}
+
+impl TurnUsage {
+    /// Project the retained vendor counters onto uncached input, cached
+    /// input, and output. Native totals can include overlapping categories.
+    pub fn normalized(mut self, harness: &str) -> Self {
+        self.input_tokens = uncached_input(
+            harness,
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+        );
+        if harness == "opencode" {
+            // OpenCode's output is visible text only; reasoning is disjoint.
+            self.output_tokens = self
+                .output_tokens
+                .zip(self.reasoning_tokens)
+                .and_then(|(visible, reasoning)| visible.checked_add(reasoning));
+        }
+        self.reasoning_tokens = self.reasoning_tokens.or(self.thinking_tokens);
+        self.total_tokens = self
+            .input_tokens
+            .zip(self.cache_read_tokens)
+            .zip(self.output_tokens)
+            .and_then(|((input, cached), output)| input.checked_add(cached)?.checked_add(output));
+        self
+    }
+
+    pub fn reported_total(&self) -> Option<i64> {
+        reported_token_total(
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.output_tokens,
+        )
+    }
+}
+
+/// Subtotal of the reported disjoint counters. Callers retain coverage
+/// independently so missing components cannot read as a complete count.
+pub fn reported_token_total(
+    input: Option<i64>,
+    cached: Option<i64>,
+    output: Option<i64>,
+) -> Option<i64> {
+    [input, cached, output]
+        .into_iter()
+        .flatten()
+        .reduce(i64::saturating_add)
+}
+
+fn uncached_input(
+    harness: &str,
+    input: Option<i64>,
+    cached: Option<i64>,
+    written: Option<i64>,
+) -> Option<i64> {
+    let input = input?;
+    match harness {
+        // Codex includes cache hits in its input count.
+        "codex" => input.checked_sub(cached?).filter(|input| *input >= 0),
+        // These harnesses report cache creation outside input. Creation
+        // spends fresh input tokens that can serve future cache hits.
+        "claude" | "opencode" => input.checked_add(written?),
+        _ => Some(input),
+    }
 }
 
 /// Session-scoped usage snapshot for one Agent generation. Every member is
@@ -980,6 +1045,41 @@ pub struct SessionCost {
 }
 
 impl SessionUsage {
+    /// Returns an observed occupancy and its compatible context window.
+    pub fn context_tokens(&self) -> Option<(i64, i64)> {
+        let (used, window) = self.context_used_tokens.zip(self.context_window_tokens)?;
+        (window > 0 && (0..=window).contains(&used)).then_some((used, window))
+    }
+
+    pub fn retain_valid_context(&mut self) {
+        if self.context_tokens().is_none() {
+            self.context_used_tokens = None;
+        }
+        self.context_window_tokens = self.context_window_tokens.filter(|window| *window > 0);
+    }
+
+    pub fn normalized(mut self, harness: &str) -> Self {
+        self.retain_valid_context();
+        if let Some(tokens) = &mut self.cumulative_tokens {
+            tokens.input_tokens = if harness == "muse" {
+                // Muse supplies its counted-once prompt total for sessions.
+                tokens
+                    .input_tokens
+                    .zip(tokens.cache_read_tokens)
+                    .and_then(|(prompt, cached)| prompt.checked_sub(cached))
+                    .filter(|input| *input >= 0)
+            } else {
+                uncached_input(
+                    harness,
+                    tokens.input_tokens,
+                    tokens.cache_read_tokens,
+                    tokens.cache_write_tokens,
+                )
+            };
+        }
+        self
+    }
+
     /// Validate one decoded session snapshot at its owning boundary. Absent
     /// members stay null; present counters must be nonnegative, the cost
     /// amount must be finite and nonnegative, and present text must be
@@ -2146,6 +2246,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             let mut usage = optional_session_usage(event)?
                 .ok_or_else(|| Error::new("invalid", "session.usage requires a usage object"))?;
             usage.validate()?;
+            usage.retain_valid_context();
             if usage.observed_at.is_none() {
                 usage.observed_at = event.ts.or(Some(now));
             }

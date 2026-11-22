@@ -4935,7 +4935,11 @@ fn turn_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TurnRecord>
 }
 
 fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
-    let usage = record.usage.as_deref().map(decode_turn_usage).transpose()?;
+    let usage = record
+        .usage
+        .as_deref()
+        .map(|value| decode_turn_usage(value, harness))
+        .transpose()?;
     let state: TurnState = parse_enum(&record.state, "turn state")?;
     let resolution_source = record
         .resolution_source
@@ -4975,13 +4979,15 @@ fn turn_from_record(record: TurnRecord, harness: &str) -> Result<Turn> {
     })
 }
 
-fn decode_turn_usage(value: &str) -> Result<TurnUsage> {
+fn decode_turn_usage(value: &str, harness: &str) -> Result<TurnUsage> {
     serde_json::from_str(value)
+        .map(|usage: TurnUsage| usage.normalized(harness))
         .map_err(|error| Error::new("internal", format!("invalid stored turn usage: {error}")))
 }
 
-fn decode_session_usage(value: &str) -> Result<SessionUsage> {
+fn decode_session_usage(value: &str, harness: &str) -> Result<SessionUsage> {
     serde_json::from_str(value)
+        .map(|usage: SessionUsage| usage.normalized(harness))
         .map_err(|error| Error::new("internal", format!("invalid stored session usage: {error}")))
 }
 
@@ -5029,17 +5035,18 @@ impl Store {
     /// snapshot is retained: older and duplicate snapshots never replace it.
     pub fn get_session_usage(&self, agent: &str, generation: i64) -> Result<Option<SessionUsage>> {
         let agent_num = parse_agent_id(agent)?;
-        let snapshot: Option<String> = self
+        let snapshot: Option<(String, String)> = self
             .connection
             .query_row(
-                "SELECT snapshot FROM session_usage WHERE agent = ?1 AND generation = ?2",
+                "SELECT s.snapshot, a.harness FROM session_usage s JOIN agents a ON a.id = s.agent
+                 WHERE s.agent = ?1 AND s.generation = ?2",
                 params![agent_num, generation],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(sql_error)?;
         snapshot
-            .map(|value| decode_session_usage(&value))
+            .map(|(value, harness)| decode_session_usage(&value, &harness))
             .transpose()
     }
     /// Heavy-work rollup for one Agent generation, or `None` when no heavy

@@ -180,17 +180,15 @@ uncertain unassociated input holds the next input lane until association/drop/re
 
 ## Usage attribution
 
-Terminal readback maps the installed per-message `tokens`
-(`TokenUsage.Info`: `{input, output, reasoning, cache: {read, write}}`) on
-the newest assistant message strictly between the exact user input and the
-selected terminal idle message, at `message` scope with that message id. No
-assistant message in that slice (or no native tokens on the newest one)
-means unavailable usage: never an earlier message's usage, never a sum,
-never zero. The per-message counters' delta-vs-cumulative semantics are
-unverified, so the adapter retains message scope and does not aggregate
-across the slice. No verified session-scoped usage field exists on this
-harness (per-message `tokens` are the only installed usage signal), so the
-adapter commits no `session.usage` fact; `session_usage` stays null.
+Terminal readback translates `TokenUsage.Info`
+(`{input, output, reasoning, cache: {read, write}}`) from each distinct
+assistant message strictly between the exact user input and selected idle.
+OpenCode v2.2.7 records these counters from a model step's finish and
+writes them to that step's assistant message. The terminal reports their
+sum at `main_loop_turn` scope, with each counter available when every
+included message supplies it. The Store folds cache creation into
+uncached input and reasoning into output when projecting these counters.
+The OpenCode adapter has no session usage source.
 
 ## Source ownership and recovery
 

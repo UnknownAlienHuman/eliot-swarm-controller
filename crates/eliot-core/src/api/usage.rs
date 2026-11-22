@@ -134,6 +134,16 @@ pub struct TurnCounterTotals {
     pub total_tokens: Option<i64>,
 }
 
+impl TurnCounterTotals {
+    pub fn reported_total(&self) -> Option<i64> {
+        crate::reported_token_total(
+            self.input_tokens,
+            self.cache_read_tokens,
+            self.output_tokens,
+        )
+    }
+}
+
 /// How many counted turns lacked each turn counter. Turns without any usage
 /// row count as missing every counter.
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +187,15 @@ pub struct TurnExpenditure {
     pub turns_running_excluded: usize,
     pub turns_missing: TurnCounterMissing,
     pub by_scope: Vec<TurnScopeTotals>,
+}
+
+impl TurnExpenditure {
+    pub fn reported_total(&self) -> Option<i64> {
+        self.by_scope
+            .iter()
+            .filter_map(|scope| scope.totals.reported_total())
+            .reduce(i64::saturating_add)
+    }
 }
 
 /// One cumulative session counter: the subtotal over the snapshots that
@@ -236,6 +255,8 @@ pub struct SessionFacts {
 pub struct UsageSummaryResponse {
     pub scope: UsageScopeView,
     pub agents_included: usize,
+    #[serde(default)]
+    pub observed_native_agents: usize,
     pub generations_included: usize,
     pub truncated: bool,
     pub history_complete: bool,
@@ -252,6 +273,9 @@ pub struct UsageSummaryResponse {
 impl UsageSummaryResponse {
     pub fn validate(&self) -> Result<()> {
         if self.history_reason.trim().is_empty() {
+            return Err(invalid_response());
+        }
+        if self.observed_native_agents > self.agents_included {
             return Err(invalid_response());
         }
         if self.pruned_through < 0 {

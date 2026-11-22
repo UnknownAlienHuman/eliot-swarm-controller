@@ -35,10 +35,11 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
-        HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord, assistant_model,
-        assistant_text, assistant_tool_use_count, assistant_tool_use_ids, assistant_tool_uses,
-        attach_mcp_readback, frame_context_window, init_mcp_servers, result_session_usage,
-        result_usage, transcript_bytes_in, transcript_config_roots, user_tool_results,
+        HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord,
+        assistant_context_used, assistant_model, assistant_text, assistant_tool_use_count,
+        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, frame_context_window,
+        init_mcp_servers, result_session_usage, result_usage, transcript_bytes_in,
+        transcript_config_roots, user_tool_results,
     },
 };
 
@@ -362,7 +363,10 @@ struct EventProcessor {
     /// where the harness reports one. Retained on observation and merged
     /// into the terminal session fact when the result frame carries none;
     /// absent until observed, never guessed.
-    init_context_window: Option<i64>,
+    init_context_window: Option<(String, i64)>,
+    /// Latest main-thread assistant call's exact native context usage for
+    /// the active turn. Reset at turn boundaries; missing usage stays absent.
+    latest_context_sample: Option<(String, i64)>,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -908,6 +912,7 @@ impl EventProcessor {
             native_failure: None,
             init_mcp_servers: None,
             init_context_window: None,
+            latest_context_sample: None,
             closed: false,
             native: None,
             status_tx,
@@ -1350,9 +1355,10 @@ impl EventProcessor {
         if record.get("subtype").and_then(Value::as_str) != Some("init") {
             return;
         }
-        if let Some(window) = frame_context_window(record) {
-            self.init_context_window = Some(window);
-        }
+        self.init_context_window = record["model"]
+            .as_str()
+            .map(str::to_owned)
+            .zip(frame_context_window(record));
         let Some(servers) = init_mcp_servers(record) else {
             return;
         };
@@ -1442,6 +1448,7 @@ impl EventProcessor {
                 }
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
+                self.latest_context_sample = None;
                 self.native_failure = None;
                 self.final_text = None;
                 self.publish_now();
@@ -1550,6 +1557,13 @@ impl EventProcessor {
         let model_output = main_thread
             && record.get("error").is_none_or(Value::is_null)
             && model.as_deref() != Some("<synthetic>");
+        if main_thread {
+            self.latest_context_sample = if model_output {
+                model.clone().zip(assistant_context_used(record))
+            } else {
+                None
+            };
+        }
         let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
         if main_thread {
             self.native_failure = record
@@ -3093,20 +3107,20 @@ impl EventProcessor {
         // carries the readback into the effective set. Unobserved stays
         // unattached and the effective set stays unknown.
         attach_mcp_readback(&mut data, self.init_mcp_servers.as_deref());
-        // Optional session-scoped fact from the terminal record (occupancy
-        // sample from `usage`, cumulative `modelUsage` counters, cumulative
-        // `total_cost_usd`, model window where a frame reports one), held
+        // Optional session-scoped fact from the terminal record (latest
+        // main-thread single-call context, cumulative `modelUsage` counters,
+        // cumulative `total_cost_usd`, and model window where reported), held
         // for the session fact that commits after the accepted terminal.
-        // The window prefers the terminal frame and falls back to the
-        // retained init value; the transcript file size comes from a
-        // read-only scan for the exact session filename (never a guessed
-        // slug). Absent quarters simply contribute nothing; with none there
-        // is no session fact.
-        let mut session_usage = result_session_usage(record);
+        // Occupancy comes only from the exact active turn's latest assistant
+        // message usage; the window prefers the result's matching model.
+        // Transcript size is a read-only exact-filename scan, never a guessed
+        // slug. If all native fields are absent, no session fact is emitted.
+        let mut session_usage = result_session_usage(
+            record,
+            self.latest_context_sample.as_ref(),
+            self.init_context_window.as_ref(),
+        );
         if let Some(usage) = session_usage.as_mut() {
-            if usage.context_window_tokens.is_none() {
-                usage.context_window_tokens = self.init_context_window;
-            }
             let session_id = self.status.session_id.clone().unwrap_or_default();
             if !session_id.is_empty() {
                 let roots = transcript_config_roots();
@@ -3146,6 +3160,7 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        self.latest_context_sample = None;
         self.interrupted_turn = None;
         self.tool_use_turns.clear();
         self.cancelled_hook_requests.clear();
