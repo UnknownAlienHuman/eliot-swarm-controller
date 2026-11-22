@@ -524,6 +524,16 @@ impl PluginHost {
         }
     }
 
+    pub(crate) fn remove_completion_interest(&self, principal: &str, id: &str) {
+        let mut stored = self.state.completion_interests.lock_recover();
+        if let Some(rules) = stored.get_mut(principal) {
+            rules.retain(|rule| rule.id != id);
+            if rules.is_empty() {
+                stored.remove(principal);
+            }
+        }
+    }
+
     pub(crate) async fn start(
         &self,
         agent: Agent,

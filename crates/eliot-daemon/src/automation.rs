@@ -1663,6 +1663,7 @@ async fn reconcile_event_rules(
             rule.state = processing.view;
             refresh_retiring(rule)?;
             if rule.state.paused_reason.as_deref() == Some("backlog_exceeded") {
+                router.remove_completion_interest(&rule.principal, &rule.state.id);
                 continue;
             }
         }

@@ -94,6 +94,7 @@ impl CompletionFields {
 }
 
 pub(crate) struct CompletionRuleInterest {
+    pub(crate) id: String,
     pub(crate) fields: CompletionFields,
     matches: MatchGroup,
     alternatives: Vec<MatchGroup>,
@@ -183,6 +184,7 @@ impl RuleDefinition {
                 .collect()
         };
         Some(CompletionRuleInterest {
+            id: self.id.clone(),
             fields,
             matches: stable_subject(&self.trigger.compiled_matches),
             alternatives: self

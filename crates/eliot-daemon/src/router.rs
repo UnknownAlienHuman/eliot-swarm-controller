@@ -4156,6 +4156,12 @@ impl Router {
             .install_completion_interests(principal, completion_interests);
     }
 
+    pub(crate) fn remove_completion_interest(&self, principal: &str, id: &str) {
+        self.inner
+            .plugin_host
+            .remove_completion_interest(principal, id);
+    }
+
     fn rule_definition(&self, principal: &str, id: &str) -> Option<(i64, RuleDefinition)> {
         self.inner
             .rule_definitions
