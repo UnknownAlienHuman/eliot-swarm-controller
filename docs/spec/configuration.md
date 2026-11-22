@@ -1444,6 +1444,7 @@ The daemon reuses the [switch and handoff](coordination.md#agent-switch-implemen
 transaction with fresh command IDs, the retained workspace and the next eligible
 candidate. Each switch consumes part of the frozen order. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
+An automated launch's provider successor applies the same quota admission policy.
 
 ### CLI editing
 

@@ -37,6 +37,7 @@ pub struct SwitchWork {
     pub plan: SwitchResponse,
     pub provider_failure: Option<ProviderSwitchFailure>,
     pub profile_authority: Option<[u8; 32]>,
+    pub owner_automation: bool,
 }
 
 struct RetainedSwitch {
@@ -393,6 +394,11 @@ impl Store {
                 provider_failure,
                 profile_authority,
             } = decode_switch(command.args)?;
+            let owner_automation = command_cause_tx(&tx, id)?
+                .is_some_and(|cause| cause.rule.is_some())
+                || (provider_failure.is_some()
+                    && command_cause_tx(&tx, &request.task_command)?
+                        .is_some_and(|cause| cause.rule.is_some()));
             update_command_state(
                 &tx,
                 id,
@@ -417,6 +423,7 @@ impl Store {
                     plan: value,
                     provider_failure,
                     profile_authority,
+                    owner_automation,
                 }),
                 events,
             })

@@ -21,6 +21,9 @@ pub struct RoutingDecision {
     /// Frozen, ordered tail of an Owner's opted-in role launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_failover: Option<Vec<String>>,
+    /// Preserve automation admission policy on a provider successor.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub owner_automation: bool,
 }
 
 /// Why an ordered routing candidate was not selected.
