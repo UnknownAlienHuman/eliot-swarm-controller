@@ -16,8 +16,8 @@ use crate::platform::OwnedChild;
 use crate::platform::custody::{AgentCustodies, AgentSpawnError, LocalPeer};
 use actor::run_agent_inner;
 use eliot_core::{
-    Agent, Command, ContextItem, Error, InjectArgs, InjectPoint, Result, SecretPolicy, SourceBatch,
-    SourceGap, SourceGapAck, StderrSource,
+    Agent, Command, ContextItem, Error, InjectPoint, Result, SecretPolicy, SourceBatch, SourceGap,
+    SourceGapAck, StderrSource,
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
@@ -2508,7 +2508,7 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
             // captured turn. Any builder failure here is known before plugin
             // I/O, so it classifies native_not_dispatched (Rejected), never
             // a generic unsupported Unknown.
-            let typed: InjectArgs = serde_json::from_value(command.args.clone())
+            let typed = eliot_core::decode_retained_inject_args(&command.args)
                 .map_err(|_| Error::new("native_not_dispatched", "inject args are malformed"))?;
             if typed.point != InjectPoint::ActiveTurn {
                 return Err(Error::new(

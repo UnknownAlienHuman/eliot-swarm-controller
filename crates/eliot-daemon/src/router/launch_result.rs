@@ -1,6 +1,9 @@
 use super::Router;
 use crate::git_monitor::GitProbe;
-use eliot_core::{Command, Error, Event, InjectArgs, InjectPoint, Result, SubmitCommand};
+use eliot_core::{
+    Command, Error, Event, InjectArgs, InjectPoint, Result, ReviewWorktreeState, SubmitCommand,
+    TrustedReviewLabels,
+};
 
 pub(crate) const RULE_WORKTREE_GUARD_ARG: &str = "_rule_worktree_guard";
 
@@ -105,10 +108,10 @@ impl Router {
             .as_str()
             .filter(|text| !text.trim().is_empty())
             .ok_or_else(|| Error::new("invalid", "launch result has no retained final text"))?;
-        let state = if self.rule_worktree_is_current(principal, &origin).await? {
-            "Fingerprint still current at delivery check."
+        let worktree_state = if self.rule_worktree_is_current(principal, &origin).await? {
+            ReviewWorktreeState::CurrentAtDeliveryCheck
         } else {
-            "Fingerprint changed or could not be confirmed at delivery check."
+            ReviewWorktreeState::ChangedOrUnconfirmedAtDeliveryCheck
         };
         let mut request = SubmitCommand::new(String::new(), "inject");
         request.target = Some(recipient.id);
@@ -117,10 +120,13 @@ impl Router {
         request.args = serde_json::to_value(InjectArgs {
             point: InjectPoint::Soonest,
             expires_at_ms: None,
-            text: format!(
-                "Worktree review for Agent {author}, turn {turn}\nFingerprint {fingerprint}\n{state}\n{answer}",
-            ),
-        }).map_err(|_| Error::new("internal", "launch result insertion could not be encoded"))?;
+            text: format!("Worktree review for Agent {author}, turn {turn}\n{answer}"),
+        })
+        .map_err(|_| Error::new("internal", "launch result insertion could not be encoded"))?;
+        request.trusted_review_labels = Some(TrustedReviewLabels {
+            worktree_fingerprint: fingerprint.to_owned(),
+            worktree_state,
+        });
         request.validate()?;
         Ok(Some(request))
     }

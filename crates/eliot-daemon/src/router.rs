@@ -1208,6 +1208,7 @@ impl Router {
             expected_turn_id: None,
             request_id: None,
             probe: false,
+            trusted_review_labels: None,
         };
         let prepared = match self.prepare_submission(request, &Principal::Owner).await {
             Ok(prepared) => prepared,
@@ -7074,7 +7075,7 @@ fn freeze_attach_profile(
 
 fn command_needs_worker(command: &Command) -> bool {
     command.verb != "inject"
-        || serde_json::from_value::<eliot_core::InjectArgs>(command.args.clone())
+        || eliot_core::decode_retained_inject_args(&command.args)
             .is_ok_and(|args| args.point == eliot_core::InjectPoint::ActiveTurn)
 }
 

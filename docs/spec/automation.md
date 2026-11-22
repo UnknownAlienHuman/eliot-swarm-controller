@@ -589,9 +589,9 @@ at those points. A reviewer reads the author's worktree, which can change during
 
 A second rule uses `inject` with `from_launch` set to the initiating rule ID.
 Swarm follows the linked initial SEND in that rule's namespace. It submits the
-complete retained final text, the original author turn and fingerprint via
-`soonest`, using the [shared insertion frame](#inject-context-at-the-safe-point).
-The note records whether the fingerprint is still current at its delivery check.
+complete retained final text and the original author turn via `soonest`, using
+the [shared insertion frame](#inject-context-at-the-safe-point). The daemon's
+worktree fingerprint and delivery recheck state appear before the fenced review.
 The optional `to` selects a local Agent explicitly. Otherwise Swarm uses the
 author's parent, or the assigned local project manager for a top-level author.
 Swarm rechecks the recipient and launch binding at admission. The normal insertion

@@ -2562,6 +2562,7 @@ fn submit_command(
         expected_turn_id,
         request_id,
         probe: false,
+        trusted_review_labels: None,
     }
 }
 

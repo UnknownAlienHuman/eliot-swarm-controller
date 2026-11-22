@@ -125,23 +125,34 @@ pub(super) fn rule_launch_insertion_binding(
     event_seq: i64,
     request: &SubmitCommand,
 ) -> Result<Option<bool>> {
+    if request.trusted_review_labels.is_some() && request.verb != "inject" {
+        return Ok(Some(false));
+    }
     if request.verb != "inject" {
         return Ok(None);
     }
     let definition = decode_json(definition)?;
     let action = &definition["do"][0];
     let Some(rule) = action["from_launch"].as_str() else {
-        return Ok(None);
+        return Ok(request.trusted_review_labels.is_some().then_some(false));
     };
     if action["action"] != "inject" || request.args["point"] != "soonest" {
         return Ok(Some(false));
     }
     let terminal = scripts::load_event_tx(tx, event_seq)?;
     let result = rule_launch_result(tx, principal, rule, action["to"].as_str(), &terminal)?;
-    Ok(Some(result.is_some_and(|(_, recipient)| {
+    Ok(Some(result.is_some_and(|(origin, recipient)| {
         request.target.as_deref() == Some(recipient.id.as_str())
             && request.expected_generation == Some(recipient.generation)
+            && request
+                .trusted_review_labels
+                .as_ref()
+                .is_none_or(|labels| trusted_review_labels_match(labels, &origin))
     })))
+}
+
+fn trusted_review_labels_match(labels: &core::TrustedReviewLabels, origin: &Event) -> bool {
+    event_worktree_fingerprint(origin) == Some(labels.worktree_fingerprint.as_str())
 }
 
 fn worktree_check_outcome_exists(

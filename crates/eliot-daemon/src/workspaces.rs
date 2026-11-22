@@ -1397,6 +1397,7 @@ impl WorkspaceManager {
                         expected_turn_id: None,
                         request_id: None,
                         probe: false,
+                        trusted_review_labels: None,
                     };
                     let Ok(admission) = store.submit("owner", request, now_ms()) else {
                         continue;

@@ -43,7 +43,8 @@ pub use command::{
 };
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
-    InjectArgs, InjectPoint, turn_started_data,
+    InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, TrustedReviewLabels,
+    decode_retained_inject_args, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
@@ -81,7 +82,7 @@ pub use observe::{
 };
 pub use presentation::{
     count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
-    reason_words, swarm_note,
+    reason_words, swarm_note, swarm_note_with_trusted_review_labels,
 };
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
@@ -1316,6 +1317,11 @@ pub struct SubmitCommand {
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub probe: bool,
+    /// Internal-only context metadata. Serde skip keeps it out of the command
+    /// wire schema; Store admission persists it only for a bound review rule.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub trusted_review_labels: Option<context::TrustedReviewLabels>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
