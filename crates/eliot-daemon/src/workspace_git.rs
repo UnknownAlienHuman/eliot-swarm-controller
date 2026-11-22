@@ -19,6 +19,7 @@ use tokio::{
     time::{Instant, timeout_at},
 };
 
+pub(crate) mod containment;
 mod readback;
 
 const READ_TIME: Duration = Duration::from_secs(15);
@@ -657,13 +658,37 @@ impl WorkspaceGit {
     /// directory recursively or use this list as authority for tracked files.
     pub(crate) async fn removal_candidates(
         &self,
+        data_root: &Path,
         preparation: &WorkspacePreparation,
         scratch: &[String],
-    ) -> Result<Vec<PathBuf>> {
-        let deadline = Instant::now() + READ_TIME;
+        expected_tip: Option<&str>,
+        fetches: Option<&mut containment::CleanupFetches>,
+        deadline: Instant,
+    ) -> Result<(containment::BranchClassification, Vec<PathBuf>)> {
         let subject = self.subject(preparation, deadline).await?;
-        self.require_merged(preparation, &subject, deadline).await?;
+        if expected_tip.is_some_and(|tip| tip != subject.head) {
+            return Err(problem(
+                "identity_changed",
+                "worktree tip moved since the plan",
+            ));
+        }
         self.require_tracked_clean(&subject, deadline).await?;
+        let branch = containment::classify_branch(
+            data_root,
+            &preparation.repo_path,
+            &subject.source.common_dir,
+            &preparation.requested_branch,
+            containment::ContainmentScope::Worktree,
+            fetches,
+            deadline,
+        )
+        .await?;
+        if branch.tip != subject.head {
+            return Err(problem(
+                "identity_changed",
+                "worktree tip moved during containment check",
+            ));
+        }
         let root = &subject.target.root;
         let mut allowed = BTreeSet::new();
         for prefix in scratch {
@@ -694,7 +719,7 @@ impl WorkspaceGit {
         if other.is_empty() && ignored.is_empty() {
             self.confirm_subject(preparation, &subject, deadline)
                 .await?;
-            return Ok(Vec::new());
+            return Ok((branch, Vec::new()));
         }
         let cached = scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
         let mut tracked = BTreeSet::new();
@@ -748,7 +773,6 @@ impl WorkspaceGit {
         }
 
         self.require_tracked_clean(&subject, deadline).await?;
-        self.require_merged(preparation, &subject, deadline).await?;
         let cached_readback =
             scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
         if cached != cached_readback
@@ -762,7 +786,7 @@ impl WorkspaceGit {
         }
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
-        Ok(candidates.into_iter().collect())
+        Ok((branch, candidates.into_iter().collect()))
     }
 
     async fn require_tracked_clean(&self, subject: &Subject, deadline: Instant) -> Result<()> {
@@ -798,6 +822,8 @@ impl WorkspaceGit {
     pub(crate) async fn prepare_remove(
         &self,
         preparation: &WorkspacePreparation,
+        verified_tip: &str,
+        deadline: Instant,
     ) -> Result<Command> {
         if preparation.phase != WorkspacePhase::Removing {
             return Err(problem(
@@ -805,9 +831,13 @@ impl WorkspaceGit {
                 "workspace remove requires its removing marker",
             ));
         }
-        let deadline = Instant::now() + READ_TIME;
         let subject = self.subject(preparation, deadline).await?;
-        self.require_merged(preparation, &subject, deadline).await?;
+        if subject.head != verified_tip {
+            return Err(problem(
+                "identity_changed",
+                "worktree tip moved before removal",
+            ));
+        }
         self.require_clean(&subject, true, deadline).await?;
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
@@ -824,46 +854,6 @@ impl WorkspaceGit {
                 deadline,
             )
             .await
-    }
-
-    async fn require_merged(
-        &self,
-        preparation: &WorkspacePreparation,
-        subject: &Subject,
-        deadline: Instant,
-    ) -> Result<()> {
-        if !is_git_oid(&preparation.base_oid) || !is_git_oid(&subject.head) {
-            return Err(problem(
-                "source_integrity",
-                "workspace merge identity is malformed",
-            ));
-        }
-        let output = self
-            .git
-            .workspace_command_bound_with_config_roots(
-                &subject.source.root,
-                &[
-                    "merge-base",
-                    "--is-ancestor",
-                    &subject.head,
-                    &preparation.base_oid,
-                ],
-                GitBinding {
-                    git_dir: &subject.source.git_dir,
-                    common_dir: &subject.source.common_dir,
-                },
-                &[&subject.target.root],
-                deadline,
-            )
-            .await?;
-        match output.code {
-            0 => Ok(()),
-            1 => Err(problem(
-                "unmerged",
-                "workspace branch is not merged into its frozen base",
-            )),
-            _ => Err(problem("unavailable", "workspace merge readback failed")),
-        }
     }
 
     /// Call only after confirmed mutator quiescence. Present/partial/conflicting

@@ -558,11 +558,20 @@ async fn initialize_runtime(
         let mut store = store.lock().await;
         store.set_hierarchy_limits(daemon_config.limits)?;
     }
-    // Parse global definitions and seed only new rules before publishing ready.
-    let (global_rules, initial_deferred_notice) =
-        automation::initialize_global_rules(&router, data_dir.path(), &policy).await?;
-    let project_rule_namespaces =
-        automation::initialize_project_rules(&router, data_dir.path(), &policy).await?;
+    // Rule initialization carries nested reconciliation state. Keep it off the
+    // startup stack, which also has to deserialize populated project config.
+    let (global_rules, initial_deferred_notice) = Box::pin(automation::initialize_global_rules(
+        &router,
+        data_dir.path(),
+        &policy,
+    ))
+    .await?;
+    let project_rule_namespaces = Box::pin(automation::initialize_project_rules(
+        &router,
+        data_dir.path(),
+        &policy,
+    ))
+    .await?;
     logging::record(&policy, "daemon.rules_loaded", &[], None);
     Ok(DaemonRuntime {
         store,

@@ -1210,26 +1210,6 @@ impl GitProbe {
         self.build_command(root, args, &overrides, Some(binding))
     }
 
-    /// Run a bounded read using the union of safe overrides from every relevant
-    /// checkout's effective configuration.
-    pub(crate) async fn workspace_command_bound_with_config_roots(
-        &self,
-        root: &Path,
-        args: &[&str],
-        binding: GitBinding<'_>,
-        additional_roots: &[&Path],
-        deadline: Instant,
-    ) -> Result<Captured> {
-        let overrides = self
-            .workspace_overrides(root, Some(binding), additional_roots, deadline)
-            .await?;
-        if Instant::now() >= deadline {
-            return Err(unavailable("bound workspace command deadline elapsed"));
-        }
-        self.run_scoped(root, args, &overrides, &[], deadline, Some(binding))
-            .await
-    }
-
     async fn workspace_overrides(
         &self,
         root: &Path,
@@ -1651,7 +1631,7 @@ async fn read_index(
 ) -> Result<([u8; 32], BTreeMap<String, bool>)> {
     let mut index = BTreeMap::<String, bool>::new();
     let mut digest = Sha256::new();
-    let mut buffer = [0u8; 8192];
+    let mut buffer = vec![0u8; 8192];
     let mut record = Vec::new();
     let mut records = 0;
     let mut bytes = 0;
