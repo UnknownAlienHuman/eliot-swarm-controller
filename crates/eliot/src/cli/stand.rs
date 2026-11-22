@@ -8,12 +8,13 @@ use eliot_core::api::{
 };
 use eliot_daemon::operator::{
     PinnedStandRoot, STAND_MARKER, StandExternalCleanupReport, StandMarker, StandRegistration,
-    StandRegistryScan, UnusableStandRegistration, check_directory_chain, check_nested_roots,
-    cleanup_stand_external_git, create_stand_root, daemon_alive, daemon_info, data_dirs_match,
-    ensure_registry_is_external, inherited_agent_parent_data_dir, list_stand_registrations,
-    lock_offline, lock_transition, parse_stand_ttl_ms, read_stand_registration, registry_name,
-    remove_offline_stand_root, remove_stand_registration, stand_base, stand_now_ms, stand_registry,
-    verify_stand_marker, verify_stand_target, write_stand_registration,
+    StandRegistryScan, UnusableStandRegistration, add_former_registrations, check_directory_chain,
+    check_nested_roots, cleanup_stand_external_git, create_stand_root, daemon_alive, daemon_info,
+    data_dirs_match, ensure_registry_is_external, inherited_agent_parent_data_dir,
+    list_stand_registrations, locate_stand_registration, lock_offline, lock_transition,
+    parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
+    remove_stand_registration, settle_former_registration, stand_base, stand_now_ms,
+    stand_registry, verify_stand_marker, verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -280,6 +281,21 @@ struct DownOutcome {
     external_worktrees: Vec<eliot_daemon::operator::StandWorktreeOutcome>,
     external_branches: Vec<eliot_daemon::operator::StandBranchOutcome>,
     unusable_records: Vec<String>,
+    /// What happened to a former-location registration, and its path.
+    former_registration: Option<(&'static str, String)>,
+}
+
+fn former_value(former: Option<&(&'static str, String)>) -> Value {
+    former.map_or(
+        Value::Null,
+        |(action, path)| json!({ "action": action, "path": path }),
+    )
+}
+
+fn print_former(former: Option<&(&'static str, String)>) {
+    if let Some((action, path)) = former {
+        println!("  former-location registration {path}: {action}");
+    }
 }
 
 pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure> {
@@ -293,6 +309,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
         "external_worktrees": outcome.external_worktrees,
         "external_branches": outcome.external_branches,
         "unusable_records": outcome.unusable_records,
+        "former_registration": former_value(outcome.former_registration.as_ref()),
     });
     if json_output {
         print_value(&payload, true);
@@ -301,12 +318,14 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
             "Removed {} after daemon PID {} and its owned processes exited",
             outcome.data_dir, outcome.daemon_pid
         );
+        print_former(outcome.former_registration.as_ref());
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
     } else {
         eprintln!(
             "Retained {} (daemon PID {} stopped) because one or more external Git resources or creation records were kept or unknown:",
             outcome.data_dir, outcome.daemon_pid
         );
+        print_former(outcome.former_registration.as_ref());
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
         for message in &outcome.unusable_records {
             println!("  {message}");
@@ -322,7 +341,6 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
 async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let path =
         std::path::absolute(path).map_err(|error| io_failure("resolve stand path", error))?;
-    let registry = stand_registry(false).map_err(Failure::for_read)?;
     let parent = path
         .parent()
         .ok_or_else(|| Failure::new(2, "stand path has no parent"))?;
@@ -335,14 +353,14 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         .map_err(|error| io_failure("resolve stand parent", error))?
         .join(name);
     let reg_name = registry_name(&root);
-    ensure_registry_is_external(&root, &registry).map_err(Failure::for_read)?;
-    let mut record =
-        read_stand_registration(&registry, &reg_name, &root).map_err(Failure::for_read)?;
+    let located = locate_stand_registration(&root).map_err(Failure::for_read)?;
+    ensure_registry_is_external(&root, &located.registry).map_err(Failure::for_read)?;
+    let mut record = located.record.clone();
     match fs::symlink_metadata(&root) {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && record.removing_pid.is_some() =>
         {
-            remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
+            remove_stand_registration(&located.registry, &reg_name).map_err(Failure::for_read)?;
             return Ok(DownOutcome {
                 state: "removed",
                 data_dir: display(&root),
@@ -350,6 +368,12 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
                 external_worktrees: Vec::new(),
                 external_branches: Vec::new(),
                 unusable_records: Vec::new(),
+                former_registration: located.former.then(|| {
+                    (
+                        "removed",
+                        located.registry.join(&reg_name).display().to_string(),
+                    )
+                }),
             });
         }
         Err(error) => return Err(io_failure("inspect stand root", error)),
@@ -361,7 +385,8 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     // root, and only the stand whose owner token `stand up` bound.
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     let _transition = lock_transition(&root).map_err(Failure::for_read)?;
-    record = read_stand_registration(&registry, &reg_name, &root).map_err(Failure::for_read)?;
+    record =
+        read_stand_registration(&located.registry, &reg_name, &root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
     check_nested_roots(&root).map_err(Failure::for_read)?;
     let pid = match record.removing_pid {
@@ -378,6 +403,16 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
             "stand daemon identity changed; files retained",
         ));
     }
+    // The old daemon has exited and the offline lock is held: it can no
+    // longer add a record, so a former-location registration moves now.
+    let (registry, moved_from) =
+        settle_former_registration(&root, &located, &record).map_err(Failure::for_read)?;
+    let former_registration = moved_from.map(|path| {
+        (
+            "migrated to the current registry",
+            path.display().to_string(),
+        )
+    });
     let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
         &root,
         &root,
@@ -395,6 +430,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
             external_worktrees: report.worktrees,
             external_branches: report.branches,
             unusable_records: report.unusable_records,
+            former_registration,
         });
     }
     record.removing_pid = Some(pid);
@@ -408,6 +444,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         external_worktrees: report.worktrees,
         external_branches: report.branches,
         unusable_records: report.unusable_records,
+        former_registration,
     })
 }
 
@@ -417,25 +454,18 @@ fn scan_registry() -> Result<StandRegistryScan, Failure> {
         Err(error) if error.code == "not_found" => StandRegistryScan::default(),
         Err(error) => return Err(Failure::for_read(error)),
     };
-    scan.former = eliot_daemon::operator::former_stand_registrations();
+    add_former_registrations(&mut scan);
     Ok(scan)
 }
 
-fn print_unusable(unusable: &[UnusableStandRegistration], former: &[UnusableStandRegistration]) {
+fn print_unusable(unusable: &[UnusableStandRegistration]) {
     for item in unusable {
         println!("{} | unusable: {}", item.registry_path, item.detail);
-    }
-    for item in former {
-        println!("{} | {}", item.registry_path, item.detail);
     }
 }
 
 pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
-    let StandRegistryScan {
-        entries,
-        unusable,
-        former,
-    } = scan_registry()?;
+    let StandRegistryScan { entries, unusable } = scan_registry()?;
     let now = stand_now_ms();
     let mut stands = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -460,36 +490,36 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
             "expired": expired,
             "artifact_id": entry.registration.artifact_id,
             "removing_pid": entry.registration.removing_pid,
+            "former_registry": entry.former_path,
         }));
     }
-    let payload = json!({ "stands": stands, "unusable": unusable, "former": former });
+    let payload = json!({ "stands": stands, "unusable": unusable });
     if json_output {
         print_value(&payload, true);
-    } else if stands.is_empty() && unusable.is_empty() && former.is_empty() {
+    } else if stands.is_empty() && unusable.is_empty() {
         println!("No registered stands.");
     } else {
         for item in &stands {
             println!(
-                "{} | alive={} | expired={} | expires_at={}",
+                "{} | alive={} | expired={} | expires_at={}{}",
                 item["data_dir"].as_str().unwrap_or(""),
                 item["alive"].as_bool().unwrap_or(false),
                 item["expired"].as_bool().unwrap_or(false),
                 item["expires_at"]
                     .as_i64()
                     .map_or_else(|| "none".to_owned(), |v| v.to_string()),
+                item["former_registry"]
+                    .as_str()
+                    .map_or_else(String::new, |path| format!(" | former_registry={path}")),
             );
         }
-        print_unusable(&unusable, &former);
+        print_unusable(&unusable);
     }
     Ok(0)
 }
 
 pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
-    let StandRegistryScan {
-        entries,
-        unusable,
-        former,
-    } = scan_registry()?;
+    let StandRegistryScan { entries, unusable } = scan_registry()?;
     let now = stand_now_ms();
     let mut results: Vec<Value> = Vec::with_capacity(entries.len());
     // An unusable registration cannot prove its expiry or root, so it is
@@ -509,6 +539,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 "outcome": "skipped",
                 "reason": "not_expired",
                 "expires_at": entry.registration.marker.expires_at,
+                "former_registry": entry.former_path,
             }));
             continue;
         }
@@ -524,6 +555,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     "daemon_pid": outcome.daemon_pid,
                     "external_worktrees": outcome.external_worktrees,
                     "external_branches": outcome.external_branches,
+                    "former_registration": former_value(outcome.former_registration.as_ref()),
                 }));
             }
             Ok(outcome) => {
@@ -535,6 +567,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     "external_worktrees": outcome.external_worktrees,
                     "external_branches": outcome.external_branches,
                     "unusable_records": outcome.unusable_records,
+                    "former_registration": former_value(outcome.former_registration.as_ref()),
                 }));
             }
             Err(error) => {
@@ -544,14 +577,15 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                     "outcome": "error",
                     "reason": error.code.unwrap_or_else(|| "error".to_owned()),
                     "message": error.message,
+                    "former_registry": entry.former_path,
                 }));
             }
         }
     }
-    let payload = json!({ "stands": results, "unusable": unusable, "former": former });
+    let payload = json!({ "stands": results, "unusable": unusable });
     if json_output {
         print_value(&payload, true);
-    } else if results.is_empty() && unusable.is_empty() && former.is_empty() {
+    } else if results.is_empty() && unusable.is_empty() {
         println!("No registered stands to prune.");
     } else {
         for item in &results {
@@ -570,6 +604,18 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 item["data_dir"].as_str().unwrap_or(""),
                 item["outcome"].as_str().unwrap_or(""),
             );
+            if let Some(path) = item
+                .get("former_registry")
+                .and_then(Value::as_str)
+                .or_else(|| item["former_registration"]["path"].as_str())
+            {
+                println!(
+                    "  former-location registration {path}: {}",
+                    item["former_registration"]["action"]
+                        .as_str()
+                        .unwrap_or("not moved")
+                );
+            }
             for key in ["external_worktrees", "external_branches"] {
                 for detail in item[key]
                     .as_array()
@@ -589,7 +635,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 println!("  {message}");
             }
         }
-        print_unusable(&unusable, &former);
+        print_unusable(&unusable);
     }
     Ok(if any_blocked { 4 } else { 0 })
 }

@@ -242,6 +242,8 @@ fn leak_static_known_reason(reason: Option<&str>) -> &'static str {
 pub struct StandEntry {
     pub registry_file: String,
     pub registration: StandRegistration,
+    /// The record's path while it is still at the former AppData location.
+    pub former_path: Option<String>,
 }
 
 /// A registry file that exists but cannot be used as a stand registration.
@@ -256,8 +258,34 @@ pub struct UnusableStandRegistration {
 pub struct StandRegistryScan {
     pub entries: Vec<StandEntry>,
     pub unusable: Vec<UnusableStandRegistration>,
-    /// Records an earlier build left at the former location: reported only.
-    pub former: Vec<UnusableStandRegistration>,
+}
+
+impl StandRegistryScan {
+    fn sort(&mut self) {
+        self.unusable
+            .sort_by(|left, right| left.registry_path.cmp(&right.registry_path));
+        self.entries.sort_by(|left, right| {
+            left.registration
+                .marker
+                .created_at
+                .cmp(&right.registration.marker.created_at)
+                .then_with(|| {
+                    left.registration
+                        .marker
+                        .root
+                        .cmp(&right.registration.marker.root)
+                })
+        });
+    }
+}
+
+/// One stand's registration and the directory that holds it now.
+#[derive(Clone, Debug)]
+pub struct LocatedRegistration {
+    pub registry: PathBuf,
+    pub record: StandRegistration,
+    /// The record is still at the former AppData location.
+    pub former: bool,
 }
 
 pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
@@ -479,6 +507,7 @@ pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
                 scan.entries.push(StandEntry {
                     registry_file: name.to_owned(),
                     registration: reg,
+                    former_path: None,
                 });
                 continue;
             }
@@ -493,68 +522,275 @@ pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
             detail,
         });
     }
-    scan.unusable
-        .sort_by(|left, right| left.registry_path.cmp(&right.registry_path));
-    scan.entries.sort_by(|left, right| {
-        left.registration
-            .marker
-            .created_at
-            .cmp(&right.registration.marker.created_at)
-            .then_with(|| {
-                left.registration
-                    .marker
-                    .root
-                    .cmp(&right.registration.marker.root)
-            })
-    });
+    scan.sort();
     Ok(scan)
 }
 
-/// Registrations an earlier build left in the former AppData stand home. They
-/// are reported and never used: the build that created them tears them down.
-pub fn former_stand_registrations() -> Vec<UnusableStandRegistration> {
+/// The AppData registry used before the stand home moved out of MSIX
+/// redirection. `Ok(None)` on platforms that never had it.
+fn former_registry() -> Result<Option<PathBuf>> {
     #[cfg(windows)]
     {
-        let Ok(local) = crate::platform::windows::account_local_app_data() else {
-            return Vec::new();
-        };
-        let dir = local.join("EliotStands").join(".registry");
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(error) => {
-                return vec![UnusableStandRegistration {
-                    registry_path: dir.display().to_string(),
-                    detail: format!("former stand registry cannot be listed: {error}"),
-                }];
-            }
-        };
-        let mut former: Vec<_> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| {
-                path.extension().is_some_and(|ext| ext == "json")
-                    && !path
-                        .file_name()
-                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-            })
-            .map(|path| {
-                let stand = read_record::<StandRegistration>(&path).map_or_else(
-                    |_| "unreadable stand".to_owned(),
-                    |record| format!("stand {}", record.marker.root.display()),
-                );
-                UnusableStandRegistration {
-                    detail: format!(
-                        "former registry location ({stand}); tear it down with the build that created it, or if that build is gone, stop its daemon and delete the stand directory and this file"
-                    ),
-                    registry_path: path.display().to_string(),
-                }
-            })
-            .collect();
-        former.sort_by(|left, right| left.registry_path.cmp(&right.registry_path));
-        former
+        crate::platform::windows::account_local_app_data()
+            .map(|local| Some(local.join("EliotStands").join(".registry")))
     }
     #[cfg(not(windows))]
-    Vec::new()
+    {
+        Ok(None)
+    }
+}
+
+/// Add the stands an earlier build registered at the former location, each
+/// with that path, and report every former file that cannot be used.
+pub fn add_former_registrations(scan: &mut StandRegistryScan) {
+    let dir = match former_registry() {
+        Ok(Some(dir)) => dir,
+        Ok(None) => return,
+        Err(error) => {
+            scan.unusable.push(UnusableStandRegistration {
+                registry_path: r"%LOCALAPPDATA%\EliotStands\.registry".to_owned(),
+                detail: format!("former stand registry cannot be located: {}", error.message),
+            });
+            return;
+        }
+    };
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            scan.unusable.push(UnusableStandRegistration {
+                registry_path: dir.display().to_string(),
+                detail: format!("former stand registry cannot be listed: {error}"),
+            });
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                scan.unusable.push(UnusableStandRegistration {
+                    registry_path: dir.display().to_string(),
+                    detail: format!("former stand registry entry cannot be read: {error}"),
+                });
+                continue;
+            }
+        };
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let detail = match read_record::<StandRegistration>(&path) {
+            Ok(reg) if reg.marker.format == 2 && registry_name(&reg.marker.root) == name => {
+                match scan
+                    .entries
+                    .iter()
+                    .find(|current| current.registry_file == name)
+                {
+                    None => {
+                        scan.entries.push(StandEntry {
+                            registry_file: name.to_owned(),
+                            registration: reg,
+                            former_path: Some(path.display().to_string()),
+                        });
+                        continue;
+                    }
+                    // A move interrupted before the former file was removed.
+                    Some(current) if current.registration.marker.token == reg.marker.token => {
+                        continue;
+                    }
+                    Some(_) => "this directory now has a different current registration".to_owned(),
+                }
+            }
+            Ok(_) => "binding check failed: marker format or root does not match this file name"
+                .to_owned(),
+            Err(RecordFailure::Missing) => continue,
+            Err(RecordFailure::Unusable(detail)) => detail,
+        };
+        scan.unusable.push(UnusableStandRegistration {
+            registry_path: path.display().to_string(),
+            detail: format!("former registry location: {detail}"),
+        });
+    }
+    scan.sort();
+}
+
+/// Find one stand's registration: the current registry first, then the former
+/// location. Every caller applies the same marker, identity and owner checks.
+pub fn locate_stand_registration(root: &Path) -> Result<LocatedRegistration> {
+    let name = registry_name(root);
+    match stand_registry(false) {
+        Ok(registry) => match read_stand_registration(&registry, &name, root) {
+            Ok(record) => {
+                return Ok(LocatedRegistration {
+                    registry,
+                    record,
+                    former: false,
+                });
+            }
+            Err(error) if error.code == "not_found" => {}
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.code == "not_found" => {}
+        Err(error) => return Err(error),
+    }
+    let current = fixed_stand_home()?.join(".registry").join(&name);
+    let Some(former) = former_registry()? else {
+        return Err(Error::new(
+            "not_found",
+            format!(
+                "directory is not registered by swarm stand up: no registration at {}",
+                current.display()
+            ),
+        ));
+    };
+    if fs::symlink_metadata(former.join(&name))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(Error::new(
+            "not_found",
+            format!(
+                "directory is not registered by swarm stand up: no registration at {} or the former location {}",
+                current.display(),
+                former.join(&name).display()
+            ),
+        ));
+    }
+    check_directory_chain(&former)?;
+    crate::platform::data_dir::validate_former_registry(&former)?;
+    let record = read_stand_registration(&former, &name, root)?;
+    Ok(LocatedRegistration {
+        registry: former,
+        record,
+        former: true,
+    })
+}
+
+/// Move a former-location registration and its worktree records into the
+/// current registry. Call it only after the stand's daemon exit is proven and
+/// under its offline lock, so the old daemon cannot add a record. Safe to
+/// repeat after a crash. Returns the current registry and the former file
+/// when this call retired one.
+pub fn settle_former_registration(
+    root: &Path,
+    located: &LocatedRegistration,
+    record: &StandRegistration,
+) -> Result<(PathBuf, Option<PathBuf>)> {
+    let name = registry_name(root);
+    let former = match former_registry() {
+        Ok(Some(former)) => former,
+        Ok(None) => return Ok((located.registry.clone(), None)),
+        Err(error) if located.former => return Err(error),
+        Err(_) => return Ok((located.registry.clone(), None)),
+    };
+    let former_file = former.join(&name);
+    let same_stand = read_record::<StandRegistration>(&former_file).is_ok_and(|found| {
+        found.marker.token == record.marker.token && registry_name(&found.marker.root) == name
+    });
+    if !same_stand {
+        if located.former {
+            return Err(Error::new(
+                "identity_changed",
+                format!(
+                    "former stand registration at {} changed before it could be moved",
+                    former_file.display()
+                ),
+            ));
+        }
+        return Ok((located.registry.clone(), None));
+    }
+    let former_records = read_former_worktree_records(&worktree_records_dir(&former, &name))?;
+    let registry = stand_registry(true)?;
+    if !former_records.is_empty() {
+        let dir = worktree_records_dir(&registry, &name);
+        if !dir.exists()
+            && let Err(error) = create_stand_root(&dir)
+            && !dir.exists()
+        {
+            return Err(error);
+        }
+        check_directory_chain(&dir)?;
+        validate_stand_directory(&dir)?;
+        for (file, moved) in &former_records {
+            let path = dir.join(file);
+            match read_record::<StandWorktreeRecord>(&path) {
+                Ok(existing) if existing == *moved => continue,
+                Ok(_) => {
+                    return Err(Error::new(
+                        "identity_changed",
+                        format!(
+                            "stand worktree record at {} differs from the former record",
+                            path.display()
+                        ),
+                    ));
+                }
+                Err(RecordFailure::Unusable(detail)) => {
+                    return Err(unusable_record("stand worktree record", &path, &detail));
+                }
+                Err(RecordFailure::Missing) => {}
+            }
+            let bytes = serde_json::to_vec(moved)
+                .map_err(|_| Error::new("internal", "encode stand worktree record"))?;
+            write_stand_record(&dir, file, &bytes)?;
+        }
+    }
+    if located.former {
+        write_stand_registration(&registry, &name, record)?;
+    }
+    remove_stand_registration(&former, &name)?;
+    Ok((registry, Some(former_file)))
+}
+
+/// Every former worktree record, or a refusal naming the first unusable one,
+/// before anything is moved.
+fn read_former_worktree_records(dir: &Path) -> Result<Vec<(String, StandWorktreeRecord)>> {
+    let list_failed = |error: std::io::Error| {
+        Error::new(
+            "platform_io",
+            format!(
+                "list former stand worktree records at {}: {error}",
+                dir.display()
+            ),
+        )
+    };
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(list_failed(error)),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(list_failed)?;
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        match read_record::<StandWorktreeRecord>(&path) {
+            Ok(record) if record.file_name() == name => records.push((name, record)),
+            Ok(_) => {
+                return Err(unusable_record(
+                    "former stand worktree record",
+                    &path,
+                    "binding check failed: record does not match this file name",
+                ));
+            }
+            Err(RecordFailure::Missing) => {}
+            Err(RecordFailure::Unusable(detail)) => {
+                return Err(unusable_record(
+                    "former stand worktree record",
+                    &path,
+                    &detail,
+                ));
+            }
+        }
+    }
+    Ok(records)
 }
 
 /// A refusal before any effect, so a caller on a write path never reports it

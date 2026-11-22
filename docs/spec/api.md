@@ -2880,10 +2880,12 @@ from a process inside an MSIX package, such as a shell started by Claude
 Desktop, to that package's private cache, where the out-of-package stand daemon
 cannot see them. A packaged process refuses a stand root or designated parent
 under AppData ([packaged-process rule](configuration.md#private-data-directory)).
-`stand list` and `stand prune` report a registration an earlier build left in
-`%LOCALAPPDATA%\EliotStands\.registry` and never use it, and it does not change
-the prune exit code. The build that created it tears it down; if that build is
-gone, the owner stops its daemon and deletes the stand directory and the file.
+A registration an earlier build left in `%LOCALAPPDATA%\EliotStands\.registry`
+is still a stand. `stand list` shows it with that path, and `stand down` and
+`stand prune` tear it down under the same marker, identity and owner-token
+checks. Once its daemon exit is proven and the offline lock is held, the record
+and its worktree records move once to the current registry, and the output
+names the former path. Parent `cleanup` reads only the current registry.
 It binds the random creation token to the canonical stand path outside the
 stand itself and records the handle identity (volume serial and file index) of
 the directory `stand up` created and the issuing daemon root when created

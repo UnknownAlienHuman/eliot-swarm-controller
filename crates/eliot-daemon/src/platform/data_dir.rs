@@ -946,6 +946,12 @@ pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
     }
 }
 
+/// Check the former AppData stand registry before trusting a record in it. A
+/// packaged process may read it, so this does not apply the redirection refusal.
+pub(crate) fn validate_former_registry(path: &Path) -> Result<()> {
+    validate_private_root(path)
+}
+
 pub(crate) fn ensure_private_root(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {

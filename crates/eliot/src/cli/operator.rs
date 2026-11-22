@@ -53,11 +53,9 @@ async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
             "a stand operation cannot target a daemon root this process resolves as its own",
         ));
     }
-    let registry = eliot_daemon::operator::stand_registry(false)?;
-    eliot_daemon::operator::ensure_registry_is_external(&canonical, &registry)?;
-    let reg_name = eliot_daemon::operator::registry_name(&canonical);
-    let registration =
-        eliot_daemon::operator::read_stand_registration(&registry, &reg_name, &canonical)?;
+    let located = eliot_daemon::operator::locate_stand_registration(&canonical)?;
+    eliot_daemon::operator::ensure_registry_is_external(&canonical, &located.registry)?;
+    let registration = located.record;
     eliot_daemon::operator::verify_stand_marker(&canonical, &registration)?;
     let token = eliot_daemon::operator::verify_stand_target(&canonical, &registration)?
         .ok_or_else(|| CoreError::new("not_allowed", "stand has no live owner binding"))?;
