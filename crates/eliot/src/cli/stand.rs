@@ -164,6 +164,8 @@ pub(crate) async fn up(
         .write_all(&bytes)
         .and_then(|()| marker.sync_all())
         .map_err(|error| io_failure("write stand marker", error))?;
+    // Close the marker before the bind reads it through the pinned root.
+    drop(marker);
     write_stand_registration(&registry, &reg_name, &registration).map_err(Failure::for_read)?;
 
     if let Some(parent_dir) = agent_parent.as_ref()
