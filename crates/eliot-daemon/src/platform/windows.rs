@@ -2060,6 +2060,40 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
     Ok(available)
 }
 
+/// The current account's Local AppData folder from the Known Folder API.
+/// The process environment cannot redirect it.
+pub(crate) fn account_local_app_data() -> Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+    let mut raw: *mut u16 = null_mut();
+    // SAFETY: the GUID is a static constant, the null token selects the
+    // current user, and `raw` receives a CoTaskMem string freed below.
+    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, null_mut(), &mut raw) };
+    if status < 0 || raw.is_null() {
+        if !raw.is_null() {
+            // SAFETY: the API allocated `raw`; free it even on failure.
+            unsafe { CoTaskMemFree(raw.cast()) };
+        }
+        return Err(Error::new(
+            "platform_io",
+            "the account Local AppData folder is unavailable",
+        ));
+    }
+    let mut len = 0;
+    // SAFETY: a successful call returns a NUL-terminated wide string.
+    while unsafe { *raw.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `raw` is valid for `len` UTF-16 units until freed.
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        slice::from_raw_parts(raw, len)
+    }));
+    // SAFETY: `raw` was allocated by SHGetKnownFolderPath.
+    unsafe { CoTaskMemFree(raw.cast()) };
+    Ok(path)
+}
+
 fn wide_path(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
 }

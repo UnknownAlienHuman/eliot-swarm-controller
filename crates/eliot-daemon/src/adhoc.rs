@@ -1256,11 +1256,9 @@ fn missing_claude_profile_command(
 ) -> core::Error {
     let replacement = verified_claude_candidate_from_candidates(candidates).map(|candidate| {
         let version = candidate.version.as_deref().unwrap_or("version unknown");
-        let command = claude_settings_command(profile, &candidate.cmd);
-        format!(
-            "installed Claude Code {version} at {}; replace it with {command}",
-            candidate.cmd
-        )
+        let candidate_cmd = core::display_path(&candidate.cmd);
+        let command = claude_settings_command(profile, &candidate_cmd);
+        format!("installed Claude Code {version} at {candidate_cmd}; replace it with {command}")
     });
     let detail = replacement.unwrap_or_else(|| {
         if candidates.is_empty() {
@@ -1272,15 +1270,10 @@ fn missing_claude_profile_command(
             "Claude executables were found, but none had a successful parseable --version result; repair an installation before using automatic selection".to_owned()
         }
     });
-    core::Error::new(
-        "profile_error",
-        format!("{profile}: Claude executable was not found at {cmd}; {detail}"),
-    )
-    .with_where("router.admission.profile_cmd")
-    .with_origin(
-        core::FailureOrigin::Environment,
-        "configured profile executable is missing",
-    )
+    core::AdmissionRefusal::ProfileCommand.error(format!(
+        "{profile}: Claude executable was not found at {}; {detail}",
+        core::display_path(cmd)
+    ))
 }
 
 pub(crate) fn claude_settings_command(profile: &str, cmd: &str) -> String {

@@ -378,7 +378,15 @@ impl WorkspaceManager {
                     let outcome = if reuse {
                         git.inspect_retained(&current).await
                     } else {
-                        match git.prepare_create(&current).await {
+                        // A stand records the creation externally before
+                        // any Git effect; a refused record dispatches nothing.
+                        match git.prepare_create(&current).await.and_then(|command| {
+                            crate::stand_cleanup::record_stand_worktree(
+                                &self.inner.data_root,
+                                &current,
+                            )?;
+                            Ok(command)
+                        }) {
                             Ok(command) => {
                                 let gate = slot.gate.clone().lock_owned().await;
                                 self.require_current(&current, WorkspacePhase::Creating)

@@ -59,6 +59,36 @@ pub struct StandWriteGuardJournal {
     pub journal: serde_json::Value,
 }
 
+/// One stand-created managed worktree, recorded in the external registration
+/// by the stand daemon before Git creates it. Cleanup trusts repository,
+/// branch and creation OID only when the stand Store agrees with this record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandWorktreeRecord {
+    pub repo_common_dir: String,
+    pub branch: String,
+    pub base_oid: String,
+    pub worktree_path: String,
+}
+
+impl StandWorktreeRecord {
+    fn of(preparation: &WorkspacePreparation) -> Self {
+        Self {
+            repo_common_dir: workspace_path_key(&preparation.repo_common_dir).into_owned(),
+            branch: preparation.requested_branch.clone(),
+            base_oid: preparation.base_oid.clone(),
+            worktree_path: workspace_path_key(&preparation.worktree_path).into_owned(),
+        }
+    }
+
+    fn file_name(&self) -> String {
+        format!(
+            "{}.json",
+            eliot_core::api::inference::sha256_hex(self.worktree_path.as_bytes())
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StandRegistration {
@@ -68,6 +98,9 @@ pub struct StandRegistration {
     pub artifact_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_data_dir: Option<PathBuf>,
+    /// SHA-256 of the owner token the stand's own daemon minted at creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_token_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_write_guard: Option<StandWriteGuardJournal>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -157,6 +190,7 @@ fn leak_static_known_reason(reason: Option<&str>) -> &'static str {
         Some("ahead") => "ahead",
         Some("content_not_at_tip") => "content_not_at_tip",
         Some("worktree_attached") => "worktree_attached",
+        Some("unregistered_worktree") => "unregistered_worktree",
         Some("branch_checked_out") => "branch_checked_out",
         Some("no_upstream_remote") => "no_upstream_remote",
         Some("no_default_branch") => "no_default_branch",
@@ -201,34 +235,61 @@ pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
     Ok(ms)
 }
 
-pub fn stand_registry(create: bool) -> Result<(PathBuf, PathBuf)> {
+/// The per-user stand home from the account profile (Known Folder on Windows,
+/// the password database on Unix). The process environment cannot move it.
+#[cfg(windows)]
+fn fixed_stand_home() -> Result<PathBuf> {
+    crate::platform::windows::account_local_app_data().map(|path| path.join("EliotStands"))
+}
+
+#[cfg(unix)]
+fn fixed_stand_home() -> Result<PathBuf> {
+    crate::platform::unix::account_home()
+        .map(|path| path.join(".local").join("state").join("eliot-stands"))
+}
+
+#[cfg(not(any(windows, unix)))]
+fn fixed_stand_home() -> Result<PathBuf> {
+    Err(Error::new(
+        "platform_unsupported",
+        "private stands are unsupported on this platform",
+    ))
+}
+
+/// Designated parent for new stands without `--root`: `SWARM_STANDS_ROOT`,
+/// or the fixed stand home. It never selects the registry.
+pub fn stand_base(create: bool) -> Result<PathBuf> {
     let base = match std::env::var_os("SWARM_STANDS_ROOT") {
         Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => {
-            #[cfg(windows)]
-            let base = std::env::var_os("LOCALAPPDATA")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .map(|p| p.join("EliotStands"));
-            #[cfg(not(windows))]
-            let base = std::env::var_os("XDG_STATE_HOME")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .filter(|v| !v.is_empty())
-                        .map(PathBuf::from)
-                        .map(|p| p.join(".local/state"))
-                })
-                .map(|p| p.join("eliot-stands"));
-            base.ok_or_else(|| {
-                Error::new(
-                    "invalid",
-                    "set SWARM_STANDS_ROOT to a designated stand directory",
-                )
-            })?
-        }
+        _ => fixed_stand_home()?,
     };
+    checked_stand_dir(base, create)
+}
+
+/// The stand registry, always under the fixed stand home and never selected
+/// by the environment.
+pub fn stand_registry(create: bool) -> Result<PathBuf> {
+    let base = checked_stand_dir(fixed_stand_home()?, create)?;
+    let registry = base.join(".registry");
+    if create
+        && !registry.exists()
+        && let Err(error) = create_stand_root(&registry)
+        && !registry.exists()
+    {
+        return Err(error);
+    }
+    if !registry.exists() {
+        return Err(Error::new(
+            "not_found",
+            "stand registry directory does not exist",
+        ));
+    }
+    check_directory_chain(&registry)?;
+    validate_stand_directory(&registry)?;
+    Ok(registry)
+}
+
+fn checked_stand_dir(base: PathBuf, create: bool) -> Result<PathBuf> {
     let base = std::path::absolute(base).map_err(|error| {
         Error::new(
             "platform_io",
@@ -292,23 +353,7 @@ pub fn stand_registry(create: bool) -> Result<(PathBuf, PathBuf)> {
             "the designated stand root must be outside the temporary directory",
         ));
     }
-    let registry = base.join(".registry");
-    if create
-        && !registry.exists()
-        && let Err(error) = create_stand_root(&registry)
-        && !registry.exists()
-    {
-        return Err(error);
-    }
-    if !registry.exists() {
-        return Err(Error::new(
-            "not_found",
-            "stand registry directory does not exist",
-        ));
-    }
-    check_directory_chain(&registry)?;
-    validate_stand_directory(&registry)?;
-    Ok((base, registry))
+    Ok(base)
 }
 
 pub fn ensure_registry_is_external(root: &Path, registry: &Path) -> Result<()> {
@@ -471,6 +516,159 @@ pub fn verify_stand_marker(root: &Path, registration: &StandRegistration) -> Res
         "identity_changed",
         "stand ownership marker does not match the external registration",
     ))
+}
+
+fn owner_token_digest(token: &str) -> String {
+    eliot_core::api::inference::sha256_hex(token.as_bytes())
+}
+
+/// Bind the registration to the owner token the stand's own daemon minted at
+/// creation. Only `stand up` calls this while starting the daemon it just
+/// created; `Ok(false)` means the daemon has not minted the token yet.
+pub fn bind_stand_owner_token(root: &Path) -> Result<bool> {
+    let root = fs::canonicalize(root)
+        .map_err(|error| Error::new("unavailable", format!("resolve stand root: {error}")))?;
+    let registry = stand_registry(false)?;
+    let name = registry_name(&root);
+    let mut registration = read_stand_registration(&registry, &name, &root)?;
+    verify_stand_marker(&root, &registration)?;
+    let Ok(token) = crate::platform::data_dir::DataDir::open_existing(&root)
+        .and_then(|dir| dir.read_owner_token())
+    else {
+        return Ok(false);
+    };
+    let digest = owner_token_digest(&token);
+    match registration.owner_token_sha256.as_deref() {
+        Some(bound) if bound == digest => Ok(true),
+        Some(_) => Err(Error::new(
+            "identity_changed",
+            "stand owner token differs from its creation binding",
+        )),
+        None => {
+            registration.owner_token_sha256 = Some(digest);
+            write_stand_registration(&registry, &name, &registration)?;
+            Ok(true)
+        }
+    }
+}
+
+/// Require the target's owner token to be the one its daemon minted at stand
+/// creation, so a copied or forged marker cannot qualify without the
+/// target's own secret. Returns that token.
+pub fn verify_stand_owner_binding(root: &Path, registration: &StandRegistration) -> Result<String> {
+    let bound = registration.owner_token_sha256.as_deref().ok_or_else(|| {
+        Error::new(
+            "not_allowed",
+            "stand registration carries no owner binding from stand up",
+        )
+    })?;
+    let token = crate::platform::data_dir::DataDir::open_existing(root)?.read_owner_token()?;
+    if owner_token_digest(&token) != bound {
+        return Err(Error::new(
+            "not_allowed",
+            "stand owner token does not match its creation binding",
+        ));
+    }
+    Ok(token)
+}
+
+fn worktree_records_dir(registry: &Path, registry_file: &str) -> PathBuf {
+    registry.join(format!(
+        "{}.worktrees",
+        registry_file.trim_end_matches(".json")
+    ))
+}
+
+/// Record a stand-created worktree in the external registration before Git
+/// creates it. A non-stand daemon records nothing; a stand whose registration
+/// cannot be verified refuses the creation.
+pub(crate) fn record_stand_worktree(
+    data_root: &Path,
+    preparation: &WorkspacePreparation,
+) -> Result<()> {
+    match fs::symlink_metadata(data_root.join(STAND_MARKER)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(Error::new(
+                "platform_io",
+                format!("inspect stand marker: {error}"),
+            ));
+        }
+        Ok(_) => {}
+    }
+    let root = fs::canonicalize(data_root)
+        .map_err(|error| Error::new("unavailable", format!("resolve stand root: {error}")))?;
+    let registry = stand_registry(false)?;
+    let name = registry_name(&root);
+    let registration = read_stand_registration(&registry, &name, &root)?;
+    verify_stand_marker(&root, &registration)?;
+    let dir = worktree_records_dir(&registry, &name);
+    if !dir.exists()
+        && let Err(error) = create_stand_root(&dir)
+        && !dir.exists()
+    {
+        return Err(error);
+    }
+    check_directory_chain(&dir)?;
+    validate_stand_directory(&dir)?;
+    let record = StandWorktreeRecord::of(preparation);
+    let file = record.file_name();
+    if fs::symlink_metadata(dir.join(&file)).is_ok() {
+        return match read_bounded_json::<StandWorktreeRecord>(&dir.join(&file)) {
+            Some(existing) if existing == record => Ok(()),
+            _ => Err(Error::new(
+                "identity_changed",
+                "stand worktree record differs from this creation",
+            )),
+        };
+    }
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| Error::new("internal", "encode stand worktree record"))?;
+    write_stand_record(&dir, &file, &bytes)
+}
+
+fn load_worktree_records(registry: &Path, registry_file: &str) -> Vec<StandWorktreeRecord> {
+    let Ok(entries) = fs::read_dir(worktree_records_dir(registry, registry_file)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .take(512)
+        .filter_map(|entry| {
+            let record = read_bounded_json::<StandWorktreeRecord>(&entry.path())?;
+            (entry.file_name().to_str() == Some(record.file_name().as_str())).then_some(record)
+        })
+        .collect()
+}
+
+fn is_recorded(records: &[StandWorktreeRecord], preparation: &WorkspacePreparation) -> bool {
+    records.contains(&StandWorktreeRecord::of(preparation))
+}
+
+/// Remove the external registration and its worktree records after the
+/// stand root is gone.
+pub fn remove_stand_registration(registry: &Path, registry_file: &str) -> Result<()> {
+    let io_fail = |error: std::io::Error| {
+        Error::new("platform_io", format!("remove stand registration: {error}"))
+    };
+    let dir = worktree_records_dir(registry, registry_file);
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries {
+            let path = entry.map_err(io_fail)?.path();
+            if !fs::symlink_metadata(&path).map_err(io_fail)?.is_file() {
+                return Err(Error::new(
+                    "not_allowed",
+                    "stand worktree records contain an unexpected entry",
+                ));
+            }
+            fs::remove_file(path).map_err(io_fail)?;
+        }
+        fs::remove_dir(&dir).map_err(io_fail)?;
+    }
+    match fs::remove_file(registry.join(registry_file)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(io_fail(error)),
+        _ => Ok(()),
+    }
 }
 
 pub fn check_nested_roots(root: &Path) -> Result<()> {
@@ -931,6 +1129,7 @@ pub(crate) async fn plan_external_git(
     transport_data_root: &Path,
     stand_root: &Path,
     registration: &StandRegistration,
+    records: &[StandWorktreeRecord],
     mut fetches: Option<&mut CleanupFetches>,
 ) -> Result<()> {
     if registration.pending_write_guard.is_some() {
@@ -955,6 +1154,9 @@ pub(crate) async fn plan_external_git(
         }
         if !worktree_present_or_registered(&probe, rec, deadline).await? {
             continue;
+        }
+        if !is_recorded(records, &rec.preparation) {
+            return Err(unregistered_worktree());
         }
         check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)?;
         Box::pin(git.removal_candidates(
@@ -983,6 +1185,9 @@ pub(crate) async fn plan_external_git(
         let common = canonical_root(&rec.preparation.repo_common_dir)?;
         if !branch_exists(&probe, &common, &rec.preparation.requested_branch, deadline).await? {
             continue;
+        }
+        if !is_recorded(records, &rec.preparation) {
+            return Err(unregistered_worktree());
         }
         let branch_ref = format!("refs/heads/{}", rec.preparation.requested_branch);
         let (_, attachments) = worktree_registry_entries(&probe, &common, deadline).await?;
@@ -1026,6 +1231,7 @@ pub async fn cleanup_stand_external_git(
     if workspaces.is_empty() {
         return Ok(report);
     }
+    let records = load_worktree_records(registry, registry_file);
     let git = WorkspaceGit::new()?;
     let probe = GitProbe::new()?;
     let mut fetches = CleanupFetches::default();
@@ -1062,9 +1268,11 @@ pub async fn cleanup_stand_external_git(
             Ok(true) => {}
         }
 
-        if let Err(error) =
+        if let Err(error) = if is_recorded(&records, &rec.preparation) {
             check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)
-        {
+        } else {
+            Err(unregistered_worktree())
+        } {
             blocked_branches.insert(branch_key);
             report.worktrees.push(StandWorktreeOutcome {
                 worktree_path: eliot_core::display_path(&rec.preparation.worktree_path),
@@ -1255,6 +1463,15 @@ pub async fn cleanup_stand_external_git(
             }
             Ok(true) => {}
         }
+        if !is_recorded(&records, &rec.preparation) {
+            report.branches.push(StandBranchOutcome {
+                repo_common_dir: eliot_core::display_path(&rec.preparation.repo_common_dir),
+                branch: rec.preparation.requested_branch.clone(),
+                outcome: "kept".to_owned(),
+                reason: Some("unregistered_worktree".to_owned()),
+            });
+            continue;
+        }
         let classification = match Box::pin(containment::classify_branch(
             transport_data_root,
             &rec.preparation.repo_path,
@@ -1439,6 +1656,13 @@ async fn remove_guarded_stand_worktree(
     }
 }
 
+fn unregistered_worktree() -> Error {
+    Error::new(
+        "unregistered_worktree",
+        "stand Store worktree has no matching external creation record",
+    )
+}
+
 fn verify_stand_stopped(
     stand_root: &Path,
     registration: &StandRegistration,
@@ -1484,16 +1708,18 @@ pub(crate) async fn plan_stand_artifact(
     }
     check_directory_chain(stand_root)?;
     check_nested_roots(stand_root)?;
-    let (_, registry) = stand_registry(false)?;
+    let registry = stand_registry(false)?;
     ensure_registry_is_external(stand_root, &registry)?;
     let reg_name = registry_name(stand_root);
     let registration = read_stand_registration(&registry, &reg_name, stand_root)?;
     verify_stand_marker(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
+    let records = load_worktree_records(&registry, &reg_name);
     Box::pin(plan_external_git(
         daemon_data_root,
         stand_root,
         &registration,
+        &records,
         fetches,
     ))
     .await?;
@@ -1513,7 +1739,7 @@ pub(crate) async fn apply_stand_artifact(
     }
     check_directory_chain(stand_root)?;
     check_nested_roots(stand_root)?;
-    let (_, registry) = stand_registry(false)?;
+    let registry = stand_registry(false)?;
     ensure_registry_is_external(stand_root, &registry)?;
     let reg_name = registry_name(stand_root);
     let _transition = lock_transition(stand_root)?;
@@ -1555,9 +1781,7 @@ pub(crate) async fn apply_stand_artifact(
     registration.removing_pid = Some(pid);
     write_stand_registration(&registry, &reg_name, &registration)?;
     remove_offline_stand_root(stand_root, offline)?;
-    fs::remove_file(registry.join(reg_name)).map_err(|error| {
-        Error::new("platform_io", format!("remove stand registration: {error}"))
-    })?;
+    remove_stand_registration(&registry, &reg_name)?;
     Ok(bytes)
 }
 

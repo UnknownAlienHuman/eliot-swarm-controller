@@ -710,11 +710,15 @@ Redact complete messages and evidence before imposing their persistence/wire bou
 Constructors retain complete text until the owning policy is available. No minimum
 secret or truncated-prefix length is a confidentiality boundary. A failed-start
 conversion preserves the typed origin, location and evidence; proof of no effect
-does not imply a Swarm origin. A plugin panic is diagnostic evidence from the exact
-owned process pipe bound to its Agent/generation or a crash marker recorded for that
-plugin startup/generation. Its summary augments the recorded evidence while preserving
-the original command error, and when matched on a plugin exit or startup failure
-classifies `origin: swarm` (using `where: plugin.exit` when no transport location applies).
+does not imply a Swarm origin. A plugin panic is diagnostic evidence only from the
+exact owned process pipe of that spawn: the daemon passes a per-spawn nonce on the
+plugin's argv (never in its inherited environment), and only a stderr line
+`eliot_crash <nonce> <owned PID> <marker>` counts. Plugins write no data-directory
+crash files and receive no data-directory path in their environment; the daemon
+records each verified marker in its own crash directory for `daemon.status`. Its
+summary augments the recorded evidence while preserving the original command error,
+and when matched on a plugin exit or startup failure classifies `origin: swarm`
+(using `where: plugin.exit` when no transport location applies).
 
 Native mappings are versioned at their owning adapters: Codex 0.167.1
 `CodexErrorInfo` upstream variants/statuses; Claude stream-json structured

@@ -1624,6 +1624,64 @@ impl FailureOrigin {
     }
 }
 
+/// An admission preflight refusal: a typed failure before any command exists.
+/// Only these constructors produce the `command.refused` diagnostic record
+/// that `diagnose` can explain by the caller's exact request ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// A configured local capacity bound is reserved.
+    Capacity,
+    /// An explicit profile executable path does not exist.
+    ProfileCommand,
+}
+
+impl AdmissionRefusal {
+    const ALL: [Self; 2] = [Self::Capacity, Self::ProfileCommand];
+
+    /// `(code, where, origin, evidence)`; schema-owned vocabulary only.
+    pub fn parts(self) -> (&'static str, &'static str, FailureOrigin, &'static str) {
+        match self {
+            Self::Capacity => (
+                "capacity_unavailable",
+                "store.admission.capacity",
+                FailureOrigin::Swarm,
+                "configured local capacity bound is reserved",
+            ),
+            Self::ProfileCommand => (
+                "profile_error",
+                "router.admission.profile_cmd",
+                FailureOrigin::Environment,
+                "configured profile executable is missing",
+            ),
+        }
+    }
+
+    pub fn error(self, message: impl Into<String>) -> Error {
+        let (code, where_, origin, evidence) = self.parts();
+        Error::new(code, message)
+            .with_where(where_)
+            .with_origin(origin, evidence)
+    }
+
+    /// The refusal exactly produced by [`Self::error`], if any.
+    pub fn of_parts(
+        code: &str,
+        where_: Option<&str>,
+        origin: Option<FailureOrigin>,
+    ) -> Option<Self> {
+        Self::ALL.into_iter().find(|refusal| {
+            let (expected_code, expected_where, expected_origin, _) = refusal.parts();
+            code == expected_code
+                && where_ == Some(expected_where)
+                && origin == Some(expected_origin)
+        })
+    }
+
+    pub fn of(error: &Error) -> Option<Self> {
+        Self::of_parts(&error.code, error.failure_where.as_deref(), error.origin)
+    }
+}
+
 /// The loss reason of a daemon restart: Swarm fences every live generation.
 pub const DAEMON_RESTART_REASON: &str = "daemon_restart";
 

@@ -688,13 +688,12 @@ impl Router {
             "command.submit" => {
                 let result = self.submit_bound(&params, &principal, context).await;
                 self.note_command_submission(&principal, context.remote, "command.submit", &result);
-                // Admission preflight (capacity, a missing profile executable)
-                // can refuse with a typed location and origin before a command
-                // exists. Retain diagnostic metadata under the caller's exact
-                // ID in the existing bounded log; this grants no replay authority.
+                // An explicit admission preflight refusal (capacity, a missing
+                // profile executable) happens before a command exists. Retain
+                // diagnostic metadata under the caller's exact ID in the
+                // existing bounded log; this grants no replay authority.
                 if let Err(error) = &result
-                    && error.failure_where.is_some()
-                    && error.origin.is_some()
+                    && eliot_core::AdmissionRefusal::of(error).is_some()
                     && let Some(id) = params.get("id").and_then(Value::as_str)
                     && ulid::Ulid::from_string(id).is_ok()
                 {

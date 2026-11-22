@@ -5,9 +5,12 @@
 //! mode-aware code covers both: `daemon.panicked` in the daemon,
 //! `plugin.panicked` in plugin mode. The hook records the thread,
 //! `file:line`, a payload-omitted notice and a bounded payload-free
-//! backtrace, writes the marker file under `ELIOT_CRASH_DIR`, and echoes
-//! one `eliot_crash` JSON line to stderr (a WMI-started daemon has no
-//! console, so the file is the durable path). The hook never touches the
+//! backtrace. The daemon writes the marker file under its crash directory
+//! and echoes one `eliot_crash` JSON line to stderr (a WMI-started daemon has
+//! no console, so the file is the durable path). A plugin writes no file: it
+//! reports on its owned stderr pipe as `eliot_crash <nonce> <pid> <json>`,
+//! with the per-spawn nonce the daemon passed on argv, and the observing
+//! daemon records only reports bound to that spawn. The hook never touches the
 //! Store, never allocates unboundedly, and never panics itself: logging
 //! and settlement of the marker happen after restart (daemon) or in the
 //! observing daemon (plugin), never inside the hook. Arbitrary panic
@@ -28,6 +31,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Per-spawn nonce a plugin received on argv from its daemon.
+static PLUGIN_CRASH_NONCE: OnceLock<String> = OnceLock::new();
+/// Stderr line tag of a crash report.
+pub const PLUGIN_CRASH_LINE: &str = "eliot_crash";
 const MAX_MARKERS_PER_CODE: usize = 64;
 
 /// In-process crash directory, set once at startup by the owning binary.
@@ -50,6 +57,17 @@ pub(crate) fn panic_and_abort() -> ! {
 /// crash markers mid-run.
 pub fn set_crash_dir(dir: &Path) {
     let _ = CRASH_DIR.set(dir.to_owned());
+}
+
+/// Remember the per-spawn crash nonce from the plugin's argv. Only a bounded
+/// alphanumeric value is accepted; first call wins.
+pub fn set_plugin_crash_nonce(nonce: &str) {
+    if !nonce.is_empty()
+        && nonce.len() <= 64
+        && nonce.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        let _ = PLUGIN_CRASH_NONCE.set(nonce.to_owned());
+    }
 }
 
 /// Marker directory under the data root. Private to the data directory,
@@ -84,15 +102,26 @@ fn install_panic_hook_for(code: &'static str) {
             || name.contains("CREDENTIAL"))
         .then_some(value)
     }));
+    let plugin = code == "plugin.panicked";
     std::panic::set_hook(Box::new(move |info| {
         let marker = capture(code, info, &policy);
+        let line = serde_json::to_string(&marker).unwrap_or_else(|_| "{}".to_owned());
+        if plugin {
+            // The owned stderr pipe is the plugin's only crash channel.
+            match PLUGIN_CRASH_NONCE.get() {
+                Some(nonce) => {
+                    eprintln!("{PLUGIN_CRASH_LINE} {nonce} {} {line}", std::process::id())
+                }
+                None => eprintln!("{PLUGIN_CRASH_LINE} {line}"),
+            }
+            return;
+        }
         let from_process = CRASH_DIR.get().cloned();
         let from_env = std::env::var("ELIOT_CRASH_DIR").ok().map(PathBuf::from);
         if let Some(dir) = from_process.or(from_env) {
             write_marker(&dir, &marker);
         }
-        let line = serde_json::to_string(&marker).unwrap_or_else(|_| "{}".to_owned());
-        eprintln!("eliot_crash {line}");
+        eprintln!("{PLUGIN_CRASH_LINE} {line}");
     }));
 }
 

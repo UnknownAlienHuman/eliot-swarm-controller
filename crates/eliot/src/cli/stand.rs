@@ -12,7 +12,8 @@ use eliot_daemon::operator::{
     daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
     inherited_agent_parent_data_dir, list_stand_registrations, lock_offline, lock_transition,
     parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    stand_now_ms, stand_registry, verify_stand_marker, write_stand_registration,
+    remove_stand_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
+    verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -34,7 +35,7 @@ pub(crate) async fn up(
         Some(value) => parse_stand_ttl_ms(value).map_err(Failure::for_read)?,
         None => DEFAULT_STAND_TTL_MS,
     };
-    let (base, registry) = stand_registry(true).map_err(Failure::for_read)?;
+    let registry = stand_registry(true).map_err(Failure::for_read)?;
     let agent_parent = inherited_agent_parent_data_dir();
     let artifact_root = std::env::var_os("ELIOT_ARTIFACT_ROOT")
         .filter(|val| !val.is_empty())
@@ -50,7 +51,9 @@ pub(crate) async fn up(
                 .expect("checked is_some")
                 .join(format!("swarm-stand-{}", ulid::Ulid::new()))
         }
-        None => base.join(format!("swarm-stand-{}", ulid::Ulid::new())),
+        None => stand_base(true)
+            .map_err(Failure::for_read)?
+            .join(format!("swarm-stand-{}", ulid::Ulid::new())),
     };
     let root =
         std::path::absolute(root).map_err(|error| io_failure("resolve stand path", error))?;
@@ -138,6 +141,7 @@ pub(crate) async fn up(
         removing_pid: None,
         artifact_id: None,
         parent_data_dir: None,
+        owner_token_sha256: None,
         pending_write_guard: None,
         settled_external_worktrees: Vec::new(),
         settled_external_branches: Vec::new(),
@@ -180,7 +184,7 @@ pub(crate) async fn up(
             }
             Err(error) => {
                 drop(_transition);
-                let _ = fs::remove_file(registry.join(&reg_name));
+                let _ = remove_stand_registration(&registry, &reg_name);
                 let _ = super::cleanup::remove_dir_all(&root);
                 return Err(Failure::for_mutation(error));
             }
@@ -299,7 +303,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
 async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let path =
         std::path::absolute(path).map_err(|error| io_failure("resolve stand path", error))?;
-    let (_, registry) = stand_registry(false).map_err(Failure::for_read)?;
+    let registry = stand_registry(false).map_err(Failure::for_read)?;
     let parent = path
         .parent()
         .ok_or_else(|| Failure::new(2, "stand path has no parent"))?;
@@ -319,8 +323,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound && record.removing_pid.is_some() =>
         {
-            fs::remove_file(registry.join(&reg_name))
-                .map_err(|error| io_failure("remove stand registration", error))?;
+            remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
             return Ok(DownOutcome {
                 state: "removed",
                 data_dir: display(&root),
@@ -334,6 +337,9 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     }
     check_directory_chain(&root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
+    // Before any action (desktop stop, drain, removal): never a protected
+    // root, and only the stand whose owner token `stand up` bound.
+    verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     let _transition = lock_transition(&root).map_err(Failure::for_read)?;
     record = read_stand_registration(&registry, &reg_name, &root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
@@ -373,8 +379,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     record.removing_pid = Some(pid);
     write_stand_registration(&registry, &reg_name, &record).map_err(Failure::for_read)?;
     remove_offline_stand_root(&root, offline).map_err(Failure::for_read)?;
-    fs::remove_file(registry.join(&reg_name))
-        .map_err(|error| io_failure("remove stand registration", error))?;
+    remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
     Ok(DownOutcome {
         state: "removed",
         data_dir: display(&root),
@@ -386,7 +391,7 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
 
 pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
     let entries = match stand_registry(false) {
-        Ok((_, registry)) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
+        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
         Err(error) if error.code == "not_found" => Vec::new(),
         Err(error) => return Err(Failure::for_read(error)),
     };
@@ -439,7 +444,7 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
 
 pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
     let entries = match stand_registry(false) {
-        Ok((_, registry)) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
+        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
         Err(error) if error.code == "not_found" => Vec::new(),
         Err(error) => return Err(Failure::for_read(error)),
     };

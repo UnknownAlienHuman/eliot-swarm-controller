@@ -478,7 +478,6 @@ fn is_failure_record(code: &str) -> bool {
 pub(crate) fn admission_refusal(
     data_root: &std::path::Path,
     id: &str,
-    policy: &SecretPolicy,
 ) -> Option<eliot_core::api::DiagnoseStep> {
     if ulid::Ulid::from_string(id).is_err() {
         return None;
@@ -505,25 +504,25 @@ pub(crate) fn admission_refusal(
             if value["code"] != ADMISSION_REFUSAL_CODE || value["ids"]["command"] != id {
                 continue;
             }
-            let (Some(error_code), Some(origin)) = (
-                value["error_code"].as_str(),
-                value["origin"]
-                    .as_str()
-                    .and_then(eliot_core::FailureOrigin::parse),
-            ) else {
+            let Some(refusal) = value["error_code"].as_str().and_then(|code| {
+                eliot_core::AdmissionRefusal::of_parts(
+                    code,
+                    value["where"].as_str(),
+                    value["origin"]
+                        .as_str()
+                        .and_then(eliot_core::FailureOrigin::parse),
+                )
+            }) else {
                 continue;
             };
+            let (code, where_, origin, evidence) = refusal.parts();
             return Some(eliot_core::api::DiagnoseStep {
                 kind: "admission".to_owned(),
-                code: Some(bounded_text(policy, error_code, 64)),
+                code: Some(code.to_owned()),
                 message: Some("refused before command admission".to_owned()),
-                failure_where: value["where"]
-                    .as_str()
-                    .map(|text| bounded_text(policy, text, 128)),
+                failure_where: Some(where_.to_owned()),
                 origin: Some(origin.as_str().to_owned()),
-                origin_evidence: value["origin_evidence"]
-                    .as_str()
-                    .map(|text| bounded_text(policy, text, 512)),
+                origin_evidence: Some(evidence.to_owned()),
                 exit_code: None,
                 ntstatus: None,
                 at: value["ts"].as_i64().filter(|at| *at >= 0),

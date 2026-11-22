@@ -869,15 +869,9 @@ fn scope_capacity_error(scope: &str, max_live: u64) -> Error {
         "manager_assignment" => format!("[capacity.projects.{name}] manager_max_live"),
         _ => "[capacity] global_max_live".to_owned(),
     };
-    Error::new(
-        "capacity_unavailable",
-        format!("configured capacity bound {scope} max_live={max_live} is reserved; Owner may raise it in config.toml {setting}"),
-    )
-    .with_where("store.admission.capacity")
-    .with_origin(
-        core::FailureOrigin::Swarm,
-        "configured local capacity bound is reserved",
-    )
+    core::AdmissionRefusal::Capacity.error(format!(
+        "configured capacity bound {scope} max_live={max_live} is reserved; Owner may raise it in config.toml {setting}"
+    ))
 }
 
 fn toml_key(name: &str) -> String {

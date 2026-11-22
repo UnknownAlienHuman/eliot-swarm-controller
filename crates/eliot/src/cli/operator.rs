@@ -47,21 +47,20 @@ async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     let canonical = std::fs::canonicalize(&absolute)
         .map_err(|error| CoreError::new("unavailable", format!("resolve stand root: {error}")))?;
     eliot_daemon::operator::check_directory_chain(&canonical)?;
-    if eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&absolute)
-        || eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&canonical)
-    {
+    if eliot_daemon::operator::target_is_protected_from_stand_owner_auth(&absolute) {
         return Err(CoreError::new(
             "not_allowed",
-            "stand owner auth cannot target the default daemon or an inherited issuing daemon",
+            "a stand operation cannot target a daemon root this process resolves as its own",
         ));
     }
-    let (_, registry) = eliot_daemon::operator::stand_registry(false)?;
+    let registry = eliot_daemon::operator::stand_registry(false)?;
     eliot_daemon::operator::ensure_registry_is_external(&canonical, &registry)?;
     let reg_name = eliot_daemon::operator::registry_name(&canonical);
     let registration =
         eliot_daemon::operator::read_stand_registration(&registry, &reg_name, &canonical)?;
     eliot_daemon::operator::verify_stand_marker(&canonical, &registration)?;
-    let token = eliot_daemon::DataDir::open_existing(&canonical)?.read_owner_token()?;
+    let token = eliot_daemon::operator::verify_stand_target(&canonical, &registration)?
+        .ok_or_else(|| CoreError::new("not_allowed", "stand has no live owner binding"))?;
     let value =
         eliot_daemon::client_call_with_owner_credential(&canonical, method, payload, &token)
             .await?;
@@ -536,6 +535,19 @@ async fn wait_for_ready(
                         current.pid
                     ),
                 ));
+            }
+            // `stand up` binds its registration to the owner token the
+            // daemon it just started minted, before any owner call.
+            if use_stand_owner
+                && !eliot_daemon::operator::bind_stand_owner_token(data_dir)
+                    .map_err(Failure::for_read)?
+            {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "The stand operator waits for its new daemon to mint the owner token"
+                )]
+                sleep(PROBE_INTERVAL).await;
+                continue;
             }
             if daemon_alive(&current).map_err(Failure::for_read)?
                 && status_inner(data_dir, use_stand_owner)

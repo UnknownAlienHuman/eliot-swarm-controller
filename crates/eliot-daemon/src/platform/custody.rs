@@ -222,6 +222,11 @@ impl AgentSpawnError {
 }
 
 impl OwnedChild {
+    /// The owned root process ID while it is unreaped.
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn integration_root_identity(&self) -> Option<eliot_core::ProcessIdentity> {
         let group = self.identity?;

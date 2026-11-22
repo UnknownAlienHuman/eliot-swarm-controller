@@ -1111,22 +1111,22 @@ impl Router {
             let ended_at = store.terminal_agent_end_time(&agent)?;
             (agent, ended_at)
         };
-        if let Some(expires_at) = artifact.expires_at {
-            if now < expires_at {
-                return Ok(Some(
-                    if is_stand_artifact(artifact) {
-                        "stand_not_expired"
-                    } else {
-                        "not_expired"
-                    }
-                    .to_owned(),
-                ));
-            }
-        } else {
-            let cutoff = now.saturating_sub(retention_ms);
-            if artifact.created_at >= cutoff || ended_at >= cutoff {
-                return Ok(Some("retention_age".to_owned()));
-            }
+        // An explicit expiry only extends retention; it never shortens it.
+        if let Some(expires_at) = artifact.expires_at
+            && now < expires_at
+        {
+            return Ok(Some(
+                if is_stand_artifact(artifact) {
+                    "stand_not_expired"
+                } else {
+                    "not_expired"
+                }
+                .to_owned(),
+            ));
+        }
+        let cutoff = now.saturating_sub(retention_ms);
+        if artifact.created_at >= cutoff || ended_at >= cutoff {
+            return Ok(Some("retention_age".to_owned()));
         }
         if artifact.state == "ownership_root" {
             if artifact.kind != ArtifactKind::Other

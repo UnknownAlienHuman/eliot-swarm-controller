@@ -2871,20 +2871,32 @@ When run inside a managed Agent session with inherited credentials, omitting
 and `stand up` automatically registers the stand with the issuing parent daemon
 via `artifact.register` (`kind: data_dir`, `purpose: SWARM_STAND_ARTIFACT_PURPOSE`,
 `expires_at`). Otherwise `SWARM_STANDS_ROOT` selects the designated parent,
-defaulting to `EliotStands` under local application data on Windows or
-`eliot-stands` under the XDG state directory on Unix. A private registry binds
-the random creation token to the canonical stand path outside the stand itself.
-`stand list` inspects registered stands with expiry and liveness state, and
-`stand prune` tears down expired registered stands.
+defaulting to the fixed stand home: `EliotStands` under the account's Local
+AppData Known Folder on Windows, or `.local/state/eliot-stands` under the
+account's password-database home on Unix. The private registry always lives in
+`.registry` under that fixed stand home; no environment variable selects it.
+It binds the random creation token to the canonical stand path outside the
+stand itself, and while starting the daemon it created `stand up` records the
+SHA-256 of the owner token that daemon minted. While a stand daemon prepares a
+managed worktree, before any Git effect, it records the repository common
+directory, branch, creation OID and worktree path in a sidecar of its
+registration; a stand whose registration cannot be verified refuses the
+creation. `stand list` inspects registered stands with expiry and liveness
+state, and `stand prune` tears down expired registered stands.
 
-`stand down` requires both that registry binding and the stand marker. It
-stops owned processes, records exit proof before removal, and deletes the
-marker last. Its local stand owner-credential helper permits only stand
-lifecycle and readback RPCs (`daemon.status`, `agent.list`, `agent.get`,
-`swarm.wait`, `command.get`, `daemon.shutdown`, and `command.submit` with
-`verb == "stop"`), rejects the caller's inherited issuing parent daemon, and
-requires external stand registration and marker verification, leaving server-side
-`#846`/`#886` owner boundaries unchanged. A retry uses the recorded removal phase. After a crash without
+`stand down` requires that registry binding, the stand marker and the owner
+binding before any action. It refuses every daemon root the caller could resolve
+as its own: the root resolved without `--data-dir`, `ELIOT_HOME`, the durable
+selected root and the default, read from the environment and from the account's
+fixed profile location, plus the inherited issuing daemon. The target's
+`owner.token` must hash to the value `stand up` recorded, so a copied or forged
+marker cannot qualify without the target's own secret, and a running non-stand
+daemon never qualifies. It then stops owned processes, records exit proof
+before removal, and deletes the marker last. Its local stand owner-credential
+helper applies the same checks and permits only stand lifecycle and readback
+RPCs (`daemon.status`, `agent.list`, `agent.get`, `swarm.wait`, `command.get`,
+`daemon.shutdown`, and `command.submit` with `verb == "stop"`), leaving
+server-side `#846`/`#886` owner boundaries unchanged. A retry uses the recorded removal phase. After a crash without
 exit proof, start the registered stand again so boot can reconcile custody,
 then retry teardown.
 
@@ -2892,7 +2904,10 @@ After proving the stand daemon stopped, `stand down`, `stand prune`, and parent
 `cleanup` remove stand files owned by the stand, including its scratch
 repository, and remove stand-created clean/contained worktrees and detached
 contained branches in external repositories using `#885` write-fenced containment
-and branch-deletion proofs. Dirty, unmerged, or uncertain external worktrees or
+and branch-deletion proofs. A worktree or branch from the stand Store is touched
+only when the external creation record matches its repository common directory,
+branch, creation OID and worktree path; otherwise it is kept
+(`unregistered_worktree`). Dirty, unmerged, or uncertain external worktrees or
 branches keep the stand directory and registration (`retained`, CLI exit 4) so
 retried `stand down` after cleanup completes removal (CLI exit 0).
 

@@ -590,6 +590,51 @@ fn resolve_data_dir_with(
     default()
 }
 
+/// Every daemon root this process could resolve as its own: the resolved
+/// root, `ELIOT_HOME`, the durable selection and the default, from the
+/// environment and from the account's fixed profile location alike.
+pub(crate) fn protected_daemon_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    roots.extend(resolve_data_dir(None).ok());
+    roots.extend(
+        std::env::var_os("ELIOT_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from),
+    );
+    roots.extend(default_data_dir().ok());
+    roots.extend(
+        selected_root_pointer_dir()
+            .ok()
+            .and_then(|dir| protected_selection(&dir)),
+    );
+    #[cfg(windows)]
+    if let Ok(local) = super::windows::account_local_app_data() {
+        roots.push(local.join("Eliot"));
+        roots.extend(protected_selection(&local.join("Eliot-bootstrap")));
+    }
+    #[cfg(unix)]
+    if let Ok(home) = super::unix::account_home() {
+        roots.push(home.join(".local").join("share").join("eliot"));
+        roots.extend(protected_selection(
+            &home.join(".config").join("eliot-bootstrap"),
+        ));
+    }
+    roots
+}
+
+/// The selected root named by a pointer, read without the private-file
+/// checks that gate using it: an unsafe pointer must never reduce protection.
+fn protected_selection(pointer_dir: &Path) -> Option<PathBuf> {
+    let pointer = pointer_dir.join("selected-data-dir");
+    let metadata = fs::symlink_metadata(&pointer).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_SELECTED_ROOT_BYTES as u64 {
+        return None;
+    }
+    let text = String::from_utf8(fs::read(&pointer).ok()?).ok()?;
+    let path = PathBuf::from(text.trim());
+    path.is_absolute().then_some(path)
+}
+
 pub(crate) fn default_data_dir() -> Result<PathBuf> {
     #[cfg(windows)]
     let path = std::env::var_os("LOCALAPPDATA")

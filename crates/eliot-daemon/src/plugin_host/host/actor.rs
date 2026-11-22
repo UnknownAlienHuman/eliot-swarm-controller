@@ -184,6 +184,11 @@ pub(super) async fn settle_observed_root_exit(
         .await
         .is_ok();
     if source_settled && control_gone {
+        // A crash report bound to this spawn attributes the exit to Swarm.
+        let crash = super::plugin_crash_marker(&stderr_tail, stderr.crash_line_prefix());
+        if let Some(marker) = crash.as_ref() {
+            super::record_plugin_crash(state, marker);
+        }
         mark_lost_state_with_exit(
             state,
             key,
@@ -191,7 +196,8 @@ pub(super) async fn settle_observed_root_exit(
             AgentLossEvidence {
                 exit: Some(exit),
                 stderr_tail: Some(stderr_tail),
-                ..Default::default()
+                origin: crash.as_ref().map(|_| FailureOrigin::Swarm),
+                origin_evidence: crash.map(|marker| marker.summary()),
             },
         )
         .await;

@@ -8,10 +8,11 @@ pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
 pub use crate::stand_cleanup::{
     STAND_MARKER, StandBranchOutcome, StandEntry, StandExternalCleanupReport, StandMarker,
-    StandRegistration, StandWorktreeOutcome, check_directory_chain, check_nested_roots,
-    cleanup_stand_external_git, ensure_registry_is_external, list_stand_registrations,
-    parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    stand_now_ms, stand_registry, verify_stand_marker, write_stand_registration,
+    StandRegistration, StandWorktreeOutcome, bind_stand_owner_token, check_directory_chain,
+    check_nested_roots, cleanup_stand_external_git, ensure_registry_is_external,
+    list_stand_registrations, parse_stand_ttl_ms, read_stand_registration, registry_name,
+    remove_offline_stand_root, remove_stand_registration, stand_base, stand_now_ms, stand_registry,
+    verify_stand_marker, verify_stand_owner_binding, write_stand_registration,
 };
 pub use crate::update_backup::{
     discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
@@ -58,8 +59,11 @@ pub fn data_dirs_match(left: &Path, right: &Path) -> bool {
     crate::daemon::identity_data_dirs_equal(left, right)
 }
 
-/// Returns whether `target` must never receive stand-owner credential fallback
-/// (matches the default daemon root or the inherited Agent issuing daemon).
+/// Returns whether `target` must never receive stand-owner treatment: any
+/// daemon root this process could resolve as its own (`--data-dir`-less
+/// resolution, `ELIOT_HOME`, the durable selection and the default, from the
+/// environment and the account profile alike) or the inherited Agent issuing
+/// daemon. Stand roots additionally need the owner binding `stand up` recorded.
 pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
     let canonical = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
     let matches_dir = |candidate: &Path| {
@@ -84,7 +88,36 @@ pub fn target_is_protected_from_stand_owner_auth(target: &Path) -> bool {
     {
         return true;
     }
-    crate::platform::data_dir::default_data_dir().is_ok_and(|dir| matches_dir(&dir))
+    crate::platform::data_dir::protected_daemon_roots()
+        .iter()
+        .any(|dir| matches_dir(dir))
+}
+
+/// Refuse any target that is not a stand bound by `stand up`: a protected
+/// daemon root, or a root whose owner token is not the one its own daemon
+/// minted at stand creation. Returns that token. During an interrupted
+/// removal (`removing_pid` recorded and no owner token left) only the root
+/// protection applies and no token is returned.
+pub fn verify_stand_target(
+    root: &Path,
+    registration: &crate::stand_cleanup::StandRegistration,
+) -> Result<Option<String>> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if target_is_protected_from_stand_owner_auth(root)
+        || target_is_protected_from_stand_owner_auth(&canonical)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "a stand operation cannot target a daemon root this process resolves as its own",
+        ));
+    }
+    if registration.removing_pid.is_some()
+        && std::fs::symlink_metadata(root.join("owner.token"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    crate::stand_cleanup::verify_stand_owner_binding(root, registration).map(Some)
 }
 
 pub fn daemon_info(path: &Path) -> Result<Option<DaemonInfo>> {

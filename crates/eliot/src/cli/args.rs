@@ -1186,6 +1186,9 @@ pub(crate) struct ClaimArgs {
 
 #[derive(Args)]
 pub(crate) struct PluginArgs {
+    /// Per-spawn crash-report nonce chosen by the owning daemon.
+    #[arg(long, hide = true)]
+    pub(crate) crash_nonce: Option<String>,
     #[command(subcommand)]
     pub(crate) command: PluginCommand,
 }

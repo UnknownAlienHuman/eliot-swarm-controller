@@ -16,6 +16,42 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+/// The current account's home directory from the password database. The
+/// process environment (`HOME`, `XDG_*`) cannot redirect it.
+pub(crate) fn account_home() -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0_u8; 16 * 1024];
+    // SAFETY: zeroed passwd is a valid out-parameter for getpwuid_r.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: all pointers are valid for the call; the buffer outlives `entry`.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || entry.pw_dir.is_null() {
+        return Err(Error::new(
+            "platform_io",
+            "the account home directory is unavailable",
+        ));
+    }
+    // SAFETY: getpwuid_r returned a NUL-terminated pw_dir inside `buffer`.
+    let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    let home = PathBuf::from(std::ffi::OsStr::from_bytes(home.to_bytes()));
+    if !home.is_absolute() {
+        return Err(Error::new(
+            "platform_io",
+            "the account home directory is not absolute",
+        ));
+    }
+    Ok(home)
+}
+
 pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes())

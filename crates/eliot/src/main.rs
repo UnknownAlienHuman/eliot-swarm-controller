@@ -28,15 +28,15 @@ fn main() -> ExitCode {
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     // One hook for both binaries: the daemon and every plugin share this
     // executable, so the code is mode-aware. A WMI-started daemon has no
-    // console, so the marker file under ELIOT_CRASH_DIR is the durable path.
+    // console, so its marker file is the durable path. A plugin reports only
+    // on its owned stderr pipe, bound by the nonce its daemon put on argv.
+    if let Some(CliCommand::Plugin(args)) = &cli.command
+        && let Some(nonce) = args.crash_nonce.as_deref()
+    {
+        eliot_daemon::crash::set_plugin_crash_nonce(nonce);
+    }
     if !matches!(&cli.command, Some(CliCommand::Stand(_))) {
         eliot_daemon::crash::install_panic_hook(is_plugin);
-    }
-    if is_plugin
-        && std::env::var_os("ELIOT_CRASH_DIR").is_none_or(|dir| dir.is_empty())
-        && let Ok(path) = resolve_data_dir(cli.data_dir.as_deref())
-    {
-        eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
     }
     // Debug-only panic trigger for crash-capture tests. Compiled out of
     // release builds: release binaries cannot panic on demand.
@@ -86,7 +86,8 @@ async fn run_inner(cli: Cli) -> ExitCode {
             Err(failure) => return report_failure(failure),
         };
         // Read lazily by the panic hook for the daemon this process serves.
-        if !is_plugin || std::env::var_os("ELIOT_CRASH_DIR").is_none_or(|dir| dir.is_empty()) {
+        // Plugins never write data-directory crash files.
+        if !is_plugin {
             eliot_daemon::crash::set_crash_dir(&eliot_daemon::crash::crash_dir(&path));
         }
         path
@@ -113,7 +114,7 @@ async fn run_inner(cli: Cli) -> ExitCode {
     };
 
     let result = match command {
-        CliCommand::Plugin(PluginArgs { command }) => run_plugin_command(command).await,
+        CliCommand::Plugin(PluginArgs { command, .. }) => run_plugin_command(command).await,
         command => {
             if !matches!(
                 command,

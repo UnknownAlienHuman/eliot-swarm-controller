@@ -66,11 +66,7 @@ impl Router {
         if is_agent {
             return self.diagnose_agent(target, target, previous_crash).await;
         }
-        if let Some(step) = crate::logging::admission_refusal(
-            &self.inner.data_root,
-            target,
-            &self.secret_policy_snapshot(),
-        ) {
+        if let Some(step) = crate::logging::admission_refusal(&self.inner.data_root, target) {
             let steps = vec![step];
             return Ok(DiagnoseResponse {
                 target: target.to_owned(),
