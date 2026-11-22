@@ -16,6 +16,7 @@ mod goals;
 mod handoff;
 mod hierarchy;
 mod inference;
+mod instructions;
 pub(crate) mod launch_queue;
 mod loss_recovery;
 mod organization;
@@ -2729,7 +2730,10 @@ impl Router {
         // Required sources are read and delivered before the secret check, so
         // their redacted text is checked like any other input text.
         if matches!(request.verb.as_str(), "launch" | "send") {
-            self.deliver_sources(&mut request).await?;
+            let delivered = self.deliver_sources(&mut request).await?;
+            if request.verb == "launch" && !delivered.is_empty() {
+                request.args["instruction_sources"] = json!(delivered);
+            }
         }
         // Emit data and variable values are arbitrary JSON: their object keys
         // can smuggle a known credential past the values-only check. Block
@@ -4306,10 +4310,13 @@ impl Router {
                 contract_mismatch,
             });
         }
+        let (profile_first_calls, profile_first_calls_truncated) = store.profile_first_calls()?;
         drop(store);
         let response = HarnessDoctorResponse {
             harnesses,
             claude_profile_command_issues,
+            profile_first_calls,
+            profile_first_calls_truncated,
         };
         request
             .validate_response(&response)
@@ -4501,13 +4508,21 @@ impl Router {
         let request: AgentGetRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let id = request.id.as_str();
-        let (agent, source_states, observer_active, provider_hold, native_notice) = {
+        let (
+            agent,
+            source_states,
+            observer_active,
+            provider_hold,
+            native_notice,
+            instruction_delivery,
+        ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
+            let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let mut source_states = store.list_source_states(id, agent.generation)?;
             if let Some(workspace) = store.get_workspace(id)?
                 && workspace.target_generation != agent.generation
@@ -4522,6 +4537,7 @@ impl Router {
                 observer_active,
                 provider_hold,
                 native_notice,
+                instruction_delivery,
             )
         };
         let live_presence = if agent.observe_only {
@@ -4599,6 +4615,7 @@ impl Router {
             work,
             provider_hold,
             native_notice,
+            instruction_delivery,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
@@ -5284,9 +5301,11 @@ impl Router {
                 || Self::wait_mode_completed(mode, &snapshot.results)
                 || !poll.wake(|event| snapshot.watches(event)).await?
             {
+                let mut results = snapshot.results;
+                self.attach_wait_facts(&mut results, principal).await;
                 return Self::encode_wait(
                     &request,
-                    snapshot.results,
+                    results,
                     !snapshot.mail_arrived,
                     snapshot.mail_arrived,
                 );
@@ -7207,6 +7226,11 @@ fn display_agent_get_response(response: &mut AgentGetResponse) {
     }
     response.agent.project = eliot_core::display_path(&response.agent.project);
     display_observation(&mut response.observation);
+    if let Some(facts) = &mut response.instruction_delivery
+        && let Some(workspace) = facts.source_workspace.as_deref()
+    {
+        facts.source_workspace = Some(eliot_core::display_path(workspace));
+    }
 }
 
 /// Owner-facing spelling of one project registration view: `checkout`,
@@ -8035,6 +8059,7 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "project_assignment_launch",
         "project_transfer_launch",
         "profile_choice",
+        "instruction_sources",
         "source_plan",
         "target_environment",
         "workspace_preparation",

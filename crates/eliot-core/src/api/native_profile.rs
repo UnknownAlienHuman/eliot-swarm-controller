@@ -3,6 +3,18 @@
 //! desktop lists it. Frozen profiles keep the plain string values.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Codex CLI's documented default for project instructions.
+pub const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
+
+/// The native override shared by the launch report and Codex argv.
+pub fn codex_project_doc_override(profile: &Map<String, Value>) -> Option<u64> {
+    if profile.get(crate::PROVIDER_PROBE_LAUNCH_ARG) == Some(&Value::Bool(true)) {
+        return Some(0);
+    }
+    profile.get("project_doc_max_bytes").and_then(Value::as_u64)
+}
 
 /// Codex `permissions`, its sandbox mode. An omitted value is
 /// `workspace-write`.

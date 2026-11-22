@@ -686,6 +686,24 @@ Claims are project-relative globs with note/TTL, owned by Agent generation. Rele
 terminal state, generation change, detach, expiry or explicit request. Conflicts produce
 one coalesced notice, not a lock or a hidden work reassignment.
 
+`agent.patch_digest` compares changed paths against the target generation's active
+claim globs when the digest is read. `outside_claims` lists paths matched by none of
+those globs. A complete claim read with no active claims returns
+`outside_claims_declared=false`, an empty list, and
+`outside_claims_complete=false`. A missing or incomplete claim read omits the
+declaration. This is
+advisory; claims do not lock work, and live rows do not reconstruct which glob was
+active when an edit occurred. The list is incomplete when Git path coverage, the
+claim listing or the bounded path list is incomplete; known outside paths may remain
+listed when only Git coverage is partial. For a shared workspace it considers only
+generation-attributed edit paths and stays incomplete rather than attributing the
+whole workspace diff to one Agent.
+
+On Windows, advisory matching and overlap use case-folded spelling, and path
+comparison accepts Windows separators. Goal scope keeps its existing matching
+rules. Git reads patch paths with rename detection disabled, so both the removed
+and the added path take part in the scope comparison.
+
 ```sql
 CREATE TABLE claims (
   agent INTEGER NOT NULL, generation INTEGER NOT NULL, glob TEXT NOT NULL,
@@ -782,17 +800,31 @@ wake, including after a daemon restart. A digest retry reuses its registration
 and mail identity.
 
 The compact response contains the exact input status, bound Agent/generation
-when visible, bounded retained `final_text`, and `truncated`. `unknown` remains
-an explicit result and never triggers an effect retry. The same operation id
-continues reading the retained first input. `changed_files` comes only from
-generation-bound observed `agent.edits` rows, with a truncation marker.
-`last_goal_check` contains the exact generation's retained Goal exit code and
-check time, read from `Store` only after the current subtree scope check.
-Workspace line counts and commits are unobserved: child work shares its
-parent's workspace, so the current Git view cannot attribute those counters to
-this run. `outside_claims` is unobserved when retained claim state cannot prove
-coverage at each edit time; claims are live rows and do not provide a
-historical coverage snapshot.
+when visible, bounded retained `final_text`, `truncated` and the shared bounded
+`ChildRunFacts`. The same facts appear on visible settled child results in
+`swarm.wait`; the CLI serializes those `WaitEntryResult` fields. Collection runs
+only after the final child-wait snapshot, once per exact Agent turn, so polling
+does not repeat Git reads. `changed_files` comes from a complete owned workspace
+view or generation-bound `agent.edits` rows (up to 8 paths of at most 128 bytes, with `truncated` for
+omitted or overlong paths). The exact-generation Goal `eliot` check includes its
+exit code and check time.
+
+Workspace-wide Git line counts, observed commit ids and paths are reported only when the
+target child generation is the sole non-terminal Agent bound to that workspace;
+the cached Git view must be observed at or after that turn's completed time.
+Paths and counts use the complete view and commit IDs use the generation's
+retained Git observations. An earlier or undated view leaves workspace facts
+unobserved. A shared workspace leaves
+those facts unobserved. With active claims, a shared-workspace `outside_claims`
+fact may be observed `true` when a generation-attributed edit path matches none
+of the child's claim globs; lack of such a mismatch does not prove `false`. With
+an exclusive workspace and complete Git/claim evidence, the flag compares all
+dirty and committed paths and may be either value. No active claims, stale or
+missing bindings, unknown/pending results, partial Git/history, or an unavailable
+or truncated claim list leave the affected fact `unobserved`. Old-generation
+claims do not count. Claims remain advisory. `unknown` remains an explicit result
+and never triggers an effect retry. The same operation id continues reading the
+retained first input.
 
 ## Project transfer
 

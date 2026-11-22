@@ -65,6 +65,12 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
             .ok_or_else(|| Error::new("invalid", "attach args must be an object"))?
             .remove("profile_snapshot");
     }
+    if request.verb == "launch" {
+        semantic_args
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?
+            .remove("instruction_sources");
+    }
     if request.verb == "launch"
         && semantic_args
             .get("profile_choice")

@@ -3,11 +3,14 @@
 //! checker and lint configuration changes, and added error suppressions.
 //! It is an attention filter from a plain line scan, never a quality score.
 
-use super::{Principal, Router, hierarchy};
+use super::{Principal, Router, hierarchy, principal_name};
 use crate::git_monitor::{GitProbe, PatchRead};
 use eliot_core::{
     Error, Result,
-    api::{AgentPatchDigestRequest, AgentPatchDigestResponse, PatchDigestFile},
+    api::{
+        AgentPatchDigestRequest, AgentPatchDigestResponse, ClaimListRequest, ClaimView,
+        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, PatchDigestFile, advisory_claim_matches,
+    },
 };
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
@@ -93,13 +96,91 @@ impl Router {
         let read = GitProbe::new()?
             .patch_read(workspace, base.as_deref())
             .await?;
+        let (claims, attributed_paths, attributed_truncated, exclusively_bound) = {
+            let store = self.inner.store.lock().await;
+            hierarchy::authorize_agent_read(&store, principal, &agent.id, Some(agent.generation))?;
+            let current = store.get_agent(&agent.id)?.ok_or_else(|| {
+                Error::new("not_found", format!("Agent {} was not found", agent.id))
+            })?;
+            if current.generation != agent.generation {
+                return Err(Error::new(
+                    "stale_generation",
+                    "the patch digest requires the current Agent generation",
+                ));
+            }
+            let claims = store
+                .claim_list(
+                    &principal_name(principal),
+                    &ClaimListRequest {
+                        project: None,
+                        agent: Some(agent.id.clone()),
+                    },
+                    super::now_ms(),
+                )
+                .ok()
+                .filter(|claims| !claims.truncated)
+                .map(|claims| claims.claims);
+            let exclusively_bound = !current.state.is_terminal()
+                && current.workspace.as_deref().is_some_and(|workspace| {
+                    store
+                        .workspace_owner_counts()
+                        .ok()
+                        .and_then(|counts| counts.get(workspace).copied())
+                        == Some(1)
+                });
+            let attributed = if exclusively_bound {
+                None
+            } else {
+                store
+                    .list_agent_edits(
+                        &agent.id,
+                        agent.generation,
+                        None,
+                        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS + 1,
+                    )
+                    .ok()
+                    .map(|edits| {
+                        let mut paths = BTreeSet::new();
+                        let mut truncated = edits.len() > MAX_PATCH_DIGEST_OUTSIDE_CLAIMS;
+                        for edit in edits.into_iter().take(MAX_PATCH_DIGEST_OUTSIDE_CLAIMS) {
+                            if edit.workspace != workspace
+                                || edit.path.len() > eliot_core::api::MAX_PATCH_DIGEST_PATH_BYTES
+                            {
+                                truncated = true;
+                                continue;
+                            }
+                            paths.insert(edit.path);
+                        }
+                        (paths.into_iter().collect::<Vec<_>>(), truncated)
+                    })
+            };
+            let (attributed_paths, attributed_truncated) =
+                attributed.map_or((None, false), |(paths, truncated)| (Some(paths), truncated));
+            (
+                claims,
+                attributed_paths,
+                attributed_truncated,
+                exclusively_bound,
+            )
+        };
+        let outside_claims_declared = claims.as_ref().map(|claims| !claims.is_empty());
         let root = read.root.clone();
-        let digest = tokio::task::spawn_blocking(move || digest(&root, &read))
-            .await
-            .map_err(|_| Error::new("internal", "patch digest task failed"))?;
+        let digest = tokio::task::spawn_blocking(move || {
+            digest(
+                &root,
+                &read,
+                claims.as_deref().filter(|claims| !claims.is_empty()),
+                exclusively_bound,
+                attributed_paths.as_deref(),
+                attributed_truncated,
+            )
+        })
+        .await
+        .map_err(|_| Error::new("internal", "patch digest task failed"))?;
         serde_json::to_value(AgentPatchDigestResponse {
             agent: agent.id,
             generation: agent.generation,
+            outside_claims_declared,
             ..digest
         })
         .map_err(|_| Error::new("internal", "patch digest could not be encoded"))
@@ -108,7 +189,14 @@ impl Router {
 
 /// Classify one patch read. File reads only resolve packages and the
 /// sections of changed manifests.
-fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
+fn digest(
+    root: &Path,
+    read: &PatchRead,
+    claims: Option<&[ClaimView]>,
+    exclusively_bound: bool,
+    attributed_paths: Option<&[String]>,
+    attributed_truncated: bool,
+) -> AgentPatchDigestResponse {
     let mut out = AgentPatchDigestResponse {
         agent: String::new(),
         generation: 0,
@@ -121,6 +209,9 @@ fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
         public_interface: Vec::new(),
         checker_changes: Vec::new(),
         suppressions: Vec::new(),
+        outside_claims: Vec::new(),
+        outside_claims_declared: None,
+        outside_claims_complete: false,
         truncated: false,
     };
     let mut files: Vec<PatchDigestFile> = Vec::new();
@@ -215,6 +306,36 @@ fn digest(root: &Path, read: &PatchRead) -> AgentPatchDigestResponse {
     }
     out.new_dependencies
         .retain(|entry| !removed_keys.contains(entry));
+    if let Some(claims) = claims {
+        let candidate_paths: BTreeSet<String> = if exclusively_bound {
+            files.iter().map(|file| file.path.clone()).collect()
+        } else {
+            attributed_paths
+                .unwrap_or_default()
+                .iter()
+                .cloned()
+                .collect()
+        };
+        let outside: Vec<String> = candidate_paths
+            .into_iter()
+            .filter(|path| {
+                claims
+                    .iter()
+                    .all(|claim| !advisory_claim_matches(&claim.glob, path))
+            })
+            .collect();
+        out.outside_claims_complete = exclusively_bound
+            && read.complete
+            && !attributed_truncated
+            && outside.len() <= MAX_PATCH_DIGEST_OUTSIDE_CLAIMS;
+        if attributed_truncated || outside.len() > MAX_PATCH_DIGEST_OUTSIDE_CLAIMS {
+            out.truncated = true;
+        }
+        out.outside_claims = outside
+            .into_iter()
+            .take(MAX_PATCH_DIGEST_OUTSIDE_CLAIMS)
+            .collect();
+    }
     let mut packages = BTreeSet::new();
     for file in &files {
         packages.insert(package_of(root, &file.path));

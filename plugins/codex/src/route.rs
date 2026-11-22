@@ -106,6 +106,7 @@ impl CodexRoute {
         plugin_disables: &[String],
         native_subagents: Option<&str>,
         provider_probe: bool,
+        project_doc_max_bytes: Option<u64>,
     ) -> Result<Vec<OsString>> {
         if !swarm_executable.is_absolute() || !data_dir.is_absolute() || !cwd.is_absolute() {
             return Err(route_error(
@@ -144,12 +145,18 @@ impl CodexRoute {
         // transport therefore cannot approve the Agent's pending requests.
         let mut mcp_override = Vec::new();
         mcp_override.extend(native_subagents_argv(native_subagents));
+        if let Some(limit) = project_doc_max_bytes {
+            push_override(
+                &mut mcp_override,
+                "project_doc_max_bytes",
+                limit.to_string(),
+            );
+        }
         if provider_probe {
             for (key, value) in [
                 ("features.shell_tool", "false"),
                 ("features.skill_mcp_dependency_install", "false"),
                 ("web_search", "\"disabled\""),
-                ("project_doc_max_bytes", "0"),
             ] {
                 push_override(&mut mcp_override, key, value.to_owned());
             }

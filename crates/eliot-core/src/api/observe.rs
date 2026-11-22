@@ -425,6 +425,26 @@ impl HarnessDoctorRequest {
         crate::api::harness::validate_claude_profile_command_issues(
             &reply.claude_profile_command_issues,
         )?;
+        let mut profiles = std::collections::HashSet::new();
+        let mut sampled_turns = 0_usize;
+        for sample in &reply.profile_first_calls {
+            sampled_turns = sampled_turns.saturating_add(sample.sampled_turns);
+            if sample.profile.trim().is_empty()
+                || sample.harness.trim().is_empty()
+                || sample.sampled_turns == 0
+                || sample.average_input_tokens < 0
+                || !profiles.insert((
+                    sample.profile.as_str(),
+                    sample.harness.as_str(),
+                    sample.mcp_policy.as_deref(),
+                ))
+            {
+                return Err(Error::new("invalid", "doctor context sample is invalid"));
+            }
+        }
+        if sampled_turns > super::usage::PROFILE_FIRST_CALL_WINDOW {
+            return Err(Error::new("invalid", "doctor context sample is oversized"));
+        }
         Ok(())
     }
 }
@@ -435,6 +455,10 @@ pub struct HarnessDoctorResponse {
     pub harnesses: Vec<DoctorHarnessEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claude_profile_command_issues: Vec<crate::api::harness::ClaudeProfileCommandIssue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_first_calls: Vec<super::usage::ProfileFirstCallInput>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub profile_first_calls_truncated: bool,
 }
 
 /// Bounded per-Agent work summary covering Git progress versus frozen `base_oid`

@@ -1002,6 +1002,19 @@ pub fn claim_glob_matches_normalized(pattern: &str, path: &str) -> bool {
         .is_some_and(|directory| directory == path)
 }
 
+/// Match advisory claims with the platform's path spelling rules.
+/// The Goal scope matcher retains its existing case-sensitive behavior.
+pub fn advisory_claim_matches(pattern: &str, path: &str) -> bool {
+    if cfg!(windows) {
+        claim_glob_matches_normalized(
+            &pattern.to_lowercase(),
+            &path.replace('\\', "/").to_lowercase(),
+        )
+    } else {
+        claim_glob_matches_normalized(pattern, path)
+    }
+}
+
 /// Whether two claim globs may overlap. A literal side reduces to exact
 /// matching against the other side; two wildcard sides stay conservative:
 /// segments are compatible when equal or either side carries a wildcard,
@@ -1022,6 +1035,10 @@ pub fn claim_globs_overlap(left: &str, right: &str) -> Result<bool> {
 /// may compare wrong, so callers with raw input must use
 /// `claim_globs_overlap` instead.
 pub fn claim_globs_overlap_normalized(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    let folded = (left.to_lowercase(), right.to_lowercase());
+    #[cfg(windows)]
+    let (left, right) = (folded.0.as_str(), folded.1.as_str());
     if left == right {
         return true;
     }

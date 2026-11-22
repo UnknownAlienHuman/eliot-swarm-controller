@@ -38,6 +38,10 @@ impl AgentGetRequest {
             || reply.agent.id != self.id
             || !valid_agent(&reply.agent)
             || reply
+                .instruction_delivery
+                .as_ref()
+                .is_some_and(|facts| facts.validate().is_err())
+            || reply
                 .session_usage
                 .as_ref()
                 .is_some_and(|usage| usage.validate().is_err())
@@ -729,6 +733,18 @@ impl AgentPatchDigestRequest {
     pub fn validate_response(&self, reply: &AgentPatchDigestResponse) -> Result<()> {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
+            || reply.outside_claims.len() > super::MAX_PATCH_DIGEST_OUTSIDE_CLAIMS
+            || reply.outside_claims_declared == Some(false)
+                && (reply.outside_claims_complete || !reply.outside_claims.is_empty())
+            || reply.outside_claims.iter().any(|path| {
+                path.trim().is_empty()
+                    || path.len() > super::MAX_PATCH_DIGEST_PATH_BYTES
+                    || path.contains('\0')
+            })
+            || reply
+                .outside_claims
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
         {
             return Err(invalid_response());
         }

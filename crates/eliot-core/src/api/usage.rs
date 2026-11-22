@@ -10,6 +10,28 @@
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
+pub const MAX_FIRST_CALL_TURNS: usize = 64;
+pub const PROFILE_FIRST_CALL_WINDOW: usize = 256;
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirstCallInput {
+    pub agent: String,
+    pub generation: i64,
+    pub turn_id: String,
+    pub input_tokens: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileFirstCallInput {
+    pub profile: String,
+    pub harness: String,
+    pub mcp_policy: Option<String>,
+    pub sampled_turns: usize,
+    pub average_input_tokens: i64,
+}
+
 /// One usage-summary scope: exactly one of `agent`, `project` or `root`.
 /// `generation` narrows only the Agent scope to one retained generation.
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +286,10 @@ pub struct UsageSummaryResponse {
     pub pruned_through: i64,
     pub turns: TurnExpenditure,
     pub sessions: SessionFacts,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub first_calls: Vec<FirstCallInput>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_calls_truncated: bool,
     #[serde(default)]
     pub swarm_mcp: Vec<super::SwarmMcpTurnUsage>,
     #[serde(default)]
@@ -355,6 +381,23 @@ impl UsageSummaryResponse {
             {
                 return Err(invalid_response());
             }
+        }
+        let mut first_calls = std::collections::BTreeSet::new();
+        if self.first_calls.len() > MAX_FIRST_CALL_TURNS
+            || self.first_calls.len() > self.turns.turns_counted
+            || self.first_calls.iter().any(|sample| {
+                crate::parse_agent_id(&sample.agent).is_err()
+                    || sample.generation < 0
+                    || sample.turn_id.trim().is_empty()
+                    || sample.input_tokens < 0
+                    || !first_calls.insert((
+                        sample.agent.as_str(),
+                        sample.generation,
+                        sample.turn_id.as_str(),
+                    ))
+            })
+        {
+            return Err(invalid_response());
         }
         Ok(())
     }

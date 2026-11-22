@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_CHILD_RUN_WAIT_MS: u64 = 20_000;
 /// Hard wait bound for one child.run call; continuation reuses the same limit.
 pub const MAX_CHILD_RUN_WAIT_MS: u64 = 25_000;
+/// Maximum edit paths carried in the shared bounded child-result facts.
+pub const MAX_CHILD_RUN_CHANGED_FILES: usize = 8;
+/// Maximum UTF-8 bytes in one project-relative edit path carried by the facts.
+pub const MAX_CHILD_RUN_FILE_PATH_BYTES: usize = 128;
+/// Maximum complete commit ids carried by the shared bounded child-result facts.
+pub const MAX_CHILD_RUN_COMMITS: usize = 32;
+/// Maximum serialized bytes in one shared child-result facts DTO.
+pub const MAX_CHILD_RUN_FACTS_BYTES: usize = 10 * 1024;
 
 fn valid_child_run_id(id: &str) -> bool {
     id.len() == 26
@@ -140,15 +148,18 @@ impl<T> ChildRunFact<T> {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildRunChangedFile {
+    #[schemars(extend("x-maxBytes" = MAX_CHILD_RUN_FILE_PATH_BYTES))]
     pub path: String,
     pub observed_at: i64,
 }
 
-/// Generation-attributed agent.edits paths. truncated marks the compact
-/// response cap; absence of edit evidence is reported as unobserved.
+/// Observed Git paths or generation-attributed edits. `truncated` marks the compact
+/// response cap or a path too long for this DTO; absence of edit evidence is
+/// reported as unobserved.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildRunChangedFiles {
+    #[schemars(extend("x-maxItems" = MAX_CHILD_RUN_CHANGED_FILES))]
     pub files: Vec<ChildRunChangedFile>,
     pub truncated: bool,
 }
@@ -173,6 +184,7 @@ pub struct ChildRunGoalCheck {
 pub struct ChildRunFacts {
     pub changed_files: ChildRunFact<ChildRunChangedFiles>,
     pub line_counts: ChildRunFact<ChildRunLineCounts>,
+    #[schemars(extend("x-maxItems" = MAX_CHILD_RUN_COMMITS))]
     pub commits: ChildRunFact<Vec<String>>,
     pub last_goal_check: ChildRunFact<ChildRunGoalCheck>,
     pub outside_claims: ChildRunFact<bool>,
@@ -187,6 +199,79 @@ impl ChildRunFacts {
             last_goal_check: ChildRunFact::unobserved(),
             outside_claims: ChildRunFact::unobserved(),
         }
+    }
+
+    pub fn is_unobserved(&self) -> bool {
+        matches!(&self.changed_files, ChildRunFact::Unobserved)
+            && matches!(&self.line_counts, ChildRunFact::Unobserved)
+            && matches!(&self.commits, ChildRunFact::Unobserved)
+            && matches!(&self.last_goal_check, ChildRunFact::Unobserved)
+            && matches!(&self.outside_claims, ChildRunFact::Unobserved)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let ChildRunFact::Observed(files) = &self.changed_files
+            && (files.files.len() > MAX_CHILD_RUN_CHANGED_FILES
+                || files.files.iter().any(|file| {
+                    file.path.trim().is_empty()
+                        || file.path.len() > MAX_CHILD_RUN_FILE_PATH_BYTES
+                        || file.path.contains('\0')
+                        || file.path.chars().any(char::is_control)
+                        || file.observed_at < 0
+                }))
+        {
+            return Err(Error::new(
+                "invalid",
+                "child result changed-file facts are invalid or exceed their bound",
+            ));
+        }
+        if let ChildRunFact::Observed(counts) = &self.line_counts
+            && (counts.files_changed > i64::MAX as u64
+                || counts.insertions > i64::MAX as u64
+                || counts.deletions > i64::MAX as u64)
+        {
+            return Err(Error::new(
+                "invalid",
+                "child result line counts exceed their bound",
+            ));
+        }
+        if let ChildRunFact::Observed(commits) = &self.commits
+            && (commits.len() > MAX_CHILD_RUN_COMMITS
+                || commits.iter().any(|oid| {
+                    !matches!(oid.len(), 40 | 64)
+                        || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }))
+        {
+            return Err(Error::new(
+                "invalid",
+                "child result commit facts are invalid or exceed their bound",
+            ));
+        }
+        if let ChildRunFact::Observed(check) = &self.last_goal_check
+            && check.checked_at < 0
+        {
+            return Err(Error::new(
+                "invalid",
+                "child result Goal check stamp is invalid",
+            ));
+        }
+        if serde_json::to_vec(self)
+            .map_err(|_| Error::new("invalid", "child result facts could not be encoded"))?
+            .len()
+            > MAX_CHILD_RUN_FACTS_BYTES
+        {
+            return Err(Error::new(
+                "invalid",
+                "child result facts exceed their serialized bound",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for ChildRunFacts {
+    fn default() -> Self {
+        Self::unobserved()
     }
 }
 
@@ -209,6 +294,7 @@ pub struct ChildRunResponse {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
     pub completion_wake: ChildRunWake,
+    #[schemars(extend("x-maxBytes" = MAX_CHILD_RUN_FACTS_BYTES))]
     pub facts: ChildRunFacts,
 }
 
@@ -236,33 +322,17 @@ impl ChildRunResponse {
         {
             return Err(Error::new("invalid", "child.run turn id is empty"));
         }
-        if let ChildRunFact::Observed(files) = &self.facts.changed_files
-            && files
-                .files
-                .iter()
-                .any(|file| file.path.trim().is_empty() || file.observed_at < 0)
+        self.facts.validate()?;
+        if (self.agent.is_none()
+            || !matches!(
+                self.status,
+                ChildRunStatus::Succeeded | ChildRunStatus::Failed | ChildRunStatus::Interrupted
+            ))
+            && !self.facts.is_unobserved()
         {
             return Err(Error::new(
                 "invalid",
-                "child.run changed-file fact is invalid",
-            ));
-        }
-        if let ChildRunFact::Observed(counts) = &self.facts.line_counts
-            && (counts.files_changed > i64::MAX as u64
-                || counts.insertions > i64::MAX as u64
-                || counts.deletions > i64::MAX as u64)
-        {
-            return Err(Error::new(
-                "invalid",
-                "child.run line counts exceed their bound",
-            ));
-        }
-        if let ChildRunFact::Observed(check) = &self.facts.last_goal_check
-            && check.checked_at < 0
-        {
-            return Err(Error::new(
-                "invalid",
-                "child.run Goal check stamp is invalid",
+                "child.run facts require a visible settled Agent result",
             ));
         }
         Ok(())

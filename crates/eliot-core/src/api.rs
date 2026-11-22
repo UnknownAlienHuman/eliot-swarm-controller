@@ -63,14 +63,16 @@ pub use agent_views::{
     AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView, CloudMcpCustody,
     CloudMcpHealth, CloudMcpStatus, CrashMarker, DaemonBuildIdentity, DaemonPanicTestResponse,
     DaemonStatusResponse, DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper,
-    MAX_DIAGNOSE_ATTENTION_STEPS, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
-    MAX_DIAGNOSE_SUMMARY_CHARS, NativeNotice, NativeNoticeKind, OwnedProcessKind,
-    OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile, ProcessPageCursor,
-    ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView, ProjectGitPublicationView,
-    ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary, RetentionView,
-    RunningTurnSummary, SourceOwner, SourceState, StatusBlocker, UnsettledCommandSummary,
-    WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView, activity_state_name,
-    agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
+    INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus, InstructionFileView,
+    InstructionReadStatus, InstructionSourceStatus, MAX_DIAGNOSE_ATTENTION_STEPS,
+    MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS,
+    MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES, NativeNotice, NativeNoticeKind,
+    OwnedProcessKind, OwnedProcessSummary, PROCESS_CURSOR_MAX_BYTES, PatchDigestFile,
+    ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse, ProjectGitHubCliView,
+    ProjectGitPublicationView, ProjectGitView, ProjectRegistrationView, RetainedUnknownSummary,
+    RetentionView, RunningTurnSummary, SourceOwner, SourceState, StatusBlocker,
+    UnsettledCommandSummary, WorkerTaskHealth, WorkerTaskStatus, WorkspaceCustodyView,
+    activity_state_name, agent_state_name, agent_status_line, diagnosis_reason, process_state_name,
     repository_name_from_url, stats_coverage_name,
 };
 pub use config_views::{
@@ -91,9 +93,9 @@ pub use coordination::{
     MailAckResponse, MailDefinitionArgs, MailDelivery, MailDeliverySummary, MailInboxRequest,
     MailInboxResponse, MailLimits, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
     VarDefinitionArgs, VarGetRequest, VarGetResponse, VarScope, VarSetRequest, VarSetResponse,
-    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, claim_glob_matches,
-    claim_glob_matches_normalized, claim_globs_overlap, claim_globs_overlap_normalized,
-    normalize_claim_glob, parse_var_scope,
+    WhoRequest, WhoResponse, WhoSharedWorkspace, WhoWorker, advisory_claim_matches,
+    claim_glob_matches, claim_glob_matches_normalized, claim_globs_overlap,
+    claim_globs_overlap_normalized, normalize_claim_glob, parse_var_scope,
 };
 pub use digests::{
     DIGEST_THREAD_PREFIX, SwarmDigestRequest, SwarmDigestResponse, digest_mode_completed,
@@ -214,13 +216,15 @@ pub use switch::{
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{
+    FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
     SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
     TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
     UsageSummaryRequest, UsageSummaryResponse,
 };
 pub use waits::{
-    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES,
-    SwarmWaitRequest, SwarmWaitResponse, WaitEntryResult, WaitTurnRef, truncate_bytes,
+    MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS, MAX_WAIT_FACTS_FRAME_BYTES,
+    MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, SwarmWaitRequest, SwarmWaitResponse,
+    WaitEntryResult, WaitTurnRef, truncate_bytes,
 };
 pub use wakes::{
     AgentWakeCondition, AgentWakeRequest, AgentWakeResponse, DEFAULT_AGENT_WAKE_TIMEOUT_SECS,

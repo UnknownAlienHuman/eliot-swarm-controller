@@ -19,6 +19,7 @@ use eliot_plugin::{
         is_blank_native_text, native_no_write, next_input_outcomes, rejected_control,
         request_event_id, request_reply_applied, unknown_control, with_claimed_context,
     },
+    usage::FirstCallUsage,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -36,7 +37,7 @@ use crate::native::{
     ClaudeClient, ClaudeFrame,
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
-        HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord,
+        HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord, assistant_call_input,
         assistant_context_used, assistant_model, assistant_text, assistant_tool_use_count,
         assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, frame_context_window,
         init_mcp_servers, result_session_usage, result_usage, transcript_bytes_in,
@@ -367,6 +368,7 @@ struct EventProcessor {
     /// Latest main-thread assistant call's exact native context usage for
     /// the active turn. Reset at turn boundaries; missing usage stays absent.
     latest_context_sample: Option<(String, i64)>,
+    first_call_usage: FirstCallUsage,
     closed: bool,
     native: Option<ClaudeClient>,
     status_tx: watch::Sender<EventStatus>,
@@ -890,6 +892,7 @@ impl EventProcessor {
             init_mcp_servers: None,
             init_context_window: None,
             latest_context_sample: None,
+            first_call_usage: FirstCallUsage::default(),
             closed: false,
             native: None,
             status_tx,
@@ -1426,6 +1429,7 @@ impl EventProcessor {
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
                 self.latest_context_sample = None;
+                self.first_call_usage = FirstCallUsage::default();
                 self.native_failure = None;
                 self.final_text = None;
                 self.publish_now();
@@ -1534,6 +1538,8 @@ impl EventProcessor {
         let model_output = main_thread
             && record.get("error").is_none_or(Value::is_null)
             && model.as_deref() != Some("<synthetic>");
+        self.first_call_usage
+            .observe(model_output, assistant_call_input(record));
         if main_thread {
             self.latest_context_sample = if model_output {
                 model.clone().zip(assistant_context_used(record))
@@ -3173,7 +3179,10 @@ impl EventProcessor {
         // blocks or gaps this terminal; it simply leaves `data.usage` unset.
         // Attaches before `attach_final_text` so the existing bounded
         // terminal-text accounting includes the usage bytes.
-        if let Some(usage) = result_usage(record) {
+        if let Some(usage) = self
+            .first_call_usage
+            .finish("main_loop_turn", result_usage(record))
+        {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         // Proven MCP surface from the owned stream's `system`/`init`

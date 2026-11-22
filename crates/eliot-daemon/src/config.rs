@@ -1319,6 +1319,8 @@ struct ProfileEntry {
     #[serde(default)]
     approval_policy: Option<String>,
     #[serde(default)]
+    project_doc_max_bytes: Option<u64>,
+    #[serde(default)]
     mcp: Option<String>,
     #[serde(default)]
     mcp_allow: Option<Vec<String>>,
@@ -1965,11 +1967,18 @@ fn snapshot_from_entry(
     }
     reject_unmapped(
         site,
-        &[(
-            "local_provider",
-            harness != "opencode" && entry.local_provider.is_some(),
-            "local providers have no mapping on this harness",
-        )],
+        &[
+            (
+                "local_provider",
+                harness != "opencode" && entry.local_provider.is_some(),
+                "local providers have no mapping on this harness",
+            ),
+            (
+                "project_doc_max_bytes",
+                harness != "codex" && entry.project_doc_max_bytes.is_some(),
+                "project_doc_max_bytes has no mapping on this harness",
+            ),
+        ],
     )?;
     if harness == "muse" {
         return muse_snapshot_from_entry(name, entry, table_offset, source);
@@ -2037,6 +2046,9 @@ fn snapshot_from_entry(
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
     let mut snapshot = serde_json::Map::new();
     snapshot.insert("harness".to_owned(), Value::String("codex".to_owned()));
+    if let Some(limit) = entry.project_doc_max_bytes {
+        snapshot.insert("project_doc_max_bytes".to_owned(), Value::from(limit));
+    }
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
     }

@@ -4,17 +4,18 @@ use super::{Principal, Router, hierarchy, principal_name};
 use eliot_core::{
     Command, CommandState, Error, Result, SubmitCommand,
     api::{
-        AgentEditsResponse, ChildRunChangedFile, ChildRunChangedFiles, ChildRunFact, ChildRunFacts,
-        ChildRunGoalCheck, ChildRunResponse, ChildRunStatus, ChildRunWake, CommandSubmitResponse,
+        ChildRunChangedFile, ChildRunChangedFiles, ChildRunFact, ChildRunFacts, ChildRunGoalCheck,
+        ChildRunResponse, ChildRunStatus, ChildRunWake, ClaimListRequest, CommandSubmitResponse,
+        GitView, MAX_CHILD_RUN_CHANGED_FILES, MAX_CHILD_RUN_COMMITS, MAX_CHILD_RUN_FILE_PATH_BYTES,
         SwarmDigestRequest, SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse,
-        WaitEntryResult,
+        WaitEntryResult, advisory_claim_matches,
     },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 
-const CHILD_RUN_CHANGED_FILES_MAX: usize = 64;
-const CHILD_RUN_CHANGED_FILES_READ: usize = CHILD_RUN_CHANGED_FILES_MAX + 1;
+const CHILD_RUN_CHANGED_FILES_READ: usize = MAX_CHILD_RUN_CHANGED_FILES + 1;
 
 impl Router {
     pub(super) async fn child_run(&self, params: &Value, principal: &Principal) -> Result<Value> {
@@ -236,11 +237,10 @@ impl Router {
         };
         let truncated = !hidden && entry.truncated;
 
-        let facts = match (agent.as_deref(), generation) {
-            (Some(agent), Some(generation)) if !hidden => {
-                self.child_run_facts(agent, generation, principal).await
-            }
-            _ => ChildRunFacts::unobserved(),
+        let facts = if hidden {
+            ChildRunFacts::unobserved()
+        } else {
+            entry.facts.clone()
         };
 
         let register_digest = register_zero_wait
@@ -309,48 +309,112 @@ impl Router {
         })
     }
 
-    /// Use exact-generation observed edits and Goal counters only. Git
-    /// counters, commits and claim coverage describe the shared workspace or
-    /// live-only claim rows, so those remain explicitly unobserved here.
+    /// Attach one bounded fact snapshot per visible settled Agent turn.
+    /// Called only after a wait's final Store snapshot, never inside its poll
+    /// loop; repeated targets for the same turn share the read.
+    pub(super) async fn attach_wait_facts(
+        &self,
+        results: &mut [WaitEntryResult],
+        principal: &Principal,
+    ) {
+        let mut by_turn: HashMap<(String, i64, Option<String>), ChildRunFacts> = HashMap::new();
+        for entry in results {
+            if !matches!(
+                entry.status.as_str(),
+                "succeeded" | "failed" | "interrupted"
+            ) {
+                continue;
+            }
+            let (Some(agent), Some(generation)) = (entry.agent.as_deref(), entry.generation) else {
+                continue;
+            };
+            let key = (agent.to_owned(), generation, entry.turn_id.clone());
+            let facts = if let Some(facts) = by_turn.get(&key) {
+                facts.clone()
+            } else {
+                let facts = self
+                    .child_run_facts(agent, generation, entry.turn_id.as_deref(), principal)
+                    .await;
+                by_turn.insert(key, facts.clone());
+                facts
+            };
+            entry.facts = facts;
+        }
+    }
+
+    /// Read generation-bound edit and Goal facts alongside one cached Git
+    /// observation and its live claims. Missing, stale or partial evidence is
+    /// left explicitly unobserved.
     async fn child_run_facts(
         &self,
         agent: &str,
         generation: i64,
+        turn_id: Option<&str>,
         principal: &Principal,
     ) -> ChildRunFacts {
         let mut facts = ChildRunFacts::unobserved();
-        let edits_params = json!({
-            "id": agent,
-            "generation": generation,
-            "limit": CHILD_RUN_CHANGED_FILES_READ,
-        });
-        if let Ok(value) = self.agent_edits(&edits_params, principal).await
-            && let Ok(response) = serde_json::from_value::<AgentEditsResponse>(value)
-            && response.agent == agent
-            && response.generation == generation
-            && !response.edits.is_empty()
-        {
-            let truncated = response.edits.len() > CHILD_RUN_CHANGED_FILES_MAX;
-            let files = response
-                .edits
-                .into_iter()
-                .take(CHILD_RUN_CHANGED_FILES_MAX)
-                .map(|edit| ChildRunChangedFile {
-                    path: edit.path,
-                    observed_at: edit.updated_at,
-                })
-                .collect();
-            facts.changed_files = ChildRunFact::Observed(ChildRunChangedFiles { files, truncated });
-        }
-
-        let goal = {
+        let caller = principal_name(principal);
+        let captured = {
             let store = self.inner.store.lock().await;
-            if hierarchy::authorize_agent_read(&store, principal, agent, Some(generation)).is_ok() {
-                store.goal_get(agent, "eliot").ok().flatten()
-            } else {
-                None
+            if hierarchy::authorize_agent_read(&store, principal, agent, Some(generation)).is_err()
+            {
+                return facts;
             }
+            let Ok(Some(target)) = store.get_agent(agent) else {
+                return facts;
+            };
+            if target.generation != generation {
+                return facts;
+            }
+            if target.parent.is_none() {
+                return facts;
+            }
+            let edits = store
+                .list_agent_edits(agent, generation, None, CHILD_RUN_CHANGED_FILES_READ)
+                .ok();
+            let goal = store.goal_get(agent, "eliot").ok().flatten();
+            let claims = store
+                .claim_list(
+                    &caller,
+                    &ClaimListRequest {
+                        project: None,
+                        agent: Some(agent.to_owned()),
+                    },
+                    super::now_ms(),
+                )
+                .ok();
+            let exclusively_bound = !target.state.is_terminal()
+                && target.workspace.as_deref().is_some_and(|workspace| {
+                    store
+                        .workspace_owner_counts()
+                        .ok()
+                        .and_then(|counts| counts.get(workspace).copied())
+                        == Some(1)
+                });
+            let commits = exclusively_bound
+                .then(|| store.observed_git_commits(agent, generation, MAX_CHILD_RUN_COMMITS + 1))
+                .and_then(Result::ok);
+            let settled_at = turn_id
+                .and_then(|turn| store.get_turn(agent, generation, turn).ok().flatten())
+                .and_then(|turn| turn.completed_at);
+            (
+                target,
+                edits,
+                goal,
+                claims,
+                exclusively_bound,
+                commits,
+                settled_at,
+            )
         };
+        let (target, edits, goal, claims, exclusively_bound, commits, settled_at) = captured;
+        if let Some(edits) = edits.as_ref().filter(|edits| !edits.is_empty()) {
+            facts.changed_files = observed_changes(
+                edits
+                    .iter()
+                    .map(|edit| (edit.path.as_str(), edit.updated_at)),
+            );
+        }
         if let Some(goal) = goal
             && goal.agent == agent
             && goal.generation == generation
@@ -362,8 +426,92 @@ impl Router {
                 checked_at,
             });
         }
+
+        let active_claims = claims
+            .as_ref()
+            .filter(|claims| !claims.truncated && !claims.claims.is_empty());
+        if let Some(claims) = active_claims
+            && edits.as_ref().is_some_and(|edits| {
+                edits.iter().any(|edit| {
+                    claims
+                        .claims
+                        .iter()
+                        .all(|claim| !advisory_claim_matches(&claim.glob, &edit.path))
+                })
+            })
+        {
+            // An attributed mismatch proves an outside edit even when the
+            // shared workspace prevents a complete false/true workspace claim.
+            facts.outside_claims = ChildRunFact::Observed(true);
+        }
+
+        if exclusively_bound
+            && let Some(settled_at) = settled_at
+            && let Ok(GitView::Data(view)) = self.inner.monitoring.git_view(&target).await
+            && view.available
+            && view
+                .observed_at
+                .is_some_and(|observed_at| observed_at >= settled_at)
+        {
+            if let Some(counts) = view.line_counts {
+                facts.line_counts = ChildRunFact::Observed(counts);
+            }
+            if view.history_complete == Some(true)
+                && let Some(commits) = commits
+                && commits.len() <= MAX_CHILD_RUN_COMMITS
+            {
+                facts.commits = ChildRunFact::Observed(commits);
+            }
+            if view.complete == Some(true)
+                && view.base_complete == Some(true)
+                && view.base_oid.is_some()
+                && let (Some(dirty), Some(committed_paths), Some(observed_at)) = (
+                    view.dirty.as_ref(),
+                    view.committed_paths.as_ref(),
+                    view.observed_at,
+                )
+            {
+                let mut paths: BTreeSet<&str> =
+                    dirty.iter().map(|file| file.path.as_str()).collect();
+                paths.extend(committed_paths.iter().map(String::as_str));
+                facts.changed_files =
+                    observed_changes(paths.iter().map(|path| (*path, observed_at)));
+                if let Some(claims) = active_claims {
+                    let outside = facts.outside_claims == ChildRunFact::Observed(true)
+                        || paths.iter().any(|path| {
+                            claims
+                                .claims
+                                .iter()
+                                .all(|claim| !advisory_claim_matches(&claim.glob, path))
+                        });
+                    facts.outside_claims = ChildRunFact::Observed(outside);
+                }
+            }
+        }
         facts
     }
+}
+
+fn observed_changes<'a>(
+    mut paths: impl Iterator<Item = (&'a str, i64)>,
+) -> ChildRunFact<ChildRunChangedFiles> {
+    let mut files = Vec::new();
+    let mut truncated = false;
+    for (path, observed_at) in paths.by_ref().take(MAX_CHILD_RUN_CHANGED_FILES) {
+        if path.trim().is_empty()
+            || path.len() > MAX_CHILD_RUN_FILE_PATH_BYTES
+            || path.chars().any(char::is_control)
+        {
+            truncated = true;
+            continue;
+        }
+        files.push(ChildRunChangedFile {
+            path: path.to_owned(),
+            observed_at,
+        });
+    }
+    truncated |= paths.next().is_some();
+    ChildRunFact::Observed(ChildRunChangedFiles { files, truncated })
 }
 
 fn require_agent(principal: &Principal) -> Result<(&str, i64)> {

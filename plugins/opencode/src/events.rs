@@ -3290,23 +3290,26 @@ fn main_loop_usage(
     idle_position: usize,
     user_position: usize,
 ) -> Option<TurnUsage> {
-    let messages = usages
-        .values()
-        .filter(|(position, _)| *position > idle_position && *position < user_position)
-        .map(|(_, tokens)| {
-            let Some(tokens) = tokens else {
-                return TurnUsage::default();
-            };
-            TurnUsage {
+    let messages = usages.values().map(|(position, tokens)| {
+        let usage = tokens
+            .as_ref()
+            .map_or_else(TurnUsage::default, |tokens| TurnUsage {
                 input_tokens: tokens.input,
                 output_tokens: tokens.output,
                 reasoning_tokens: tokens.reasoning,
                 cache_read_tokens: tokens.cache.as_ref().and_then(|cache| cache.read),
                 cache_write_tokens: tokens.cache.as_ref().and_then(|cache| cache.write),
                 ..TurnUsage::default()
-            }
-        });
-    TurnUsage::sum_native("main_loop_turn", messages)
+            });
+        (*position, usage)
+    });
+    eliot_plugin::usage::summarize_newest_first_usage(
+        "opencode",
+        "main_loop_turn",
+        idle_position,
+        user_position,
+        messages,
+    )
 }
 
 /// One Store claim plus one vendor resolve for a bound hook. The Store

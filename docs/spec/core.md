@@ -894,7 +894,16 @@ adjustment. With a missing split, the observed input count stays available
 and the cache counter and complete total stay unavailable. This also applies
 to retained history.
 Context occupancy and cumulative cost belong to session facts. A terminal
-without native turn counters keeps null usage.
+without native turn counters or a first-call measurement keeps null usage.
+
+`first_call_input_tokens` counts the first model response's input, including
+cache hits and cache creation once on the normalized basis. Codex uses the first
+response-bearing token update bound to the turn. The shared runtime keeps a bounded
+set of early samples by native turn ID until the exact input is bound. Claude uses
+the first native main-thread assistant response. OpenCode uses the earliest assistant
+message in the exact user-to-idle slice. Missing counters, including OpenCode's
+cache-write input, leave the first-call value unavailable.
+Session snapshots and whole-turn usage supply their own counters.
 
 `session_usage` retains only the latest serialized `SessionUsage` snapshot
 per Agent generation, committed from `session.usage` `data.usage` (`source`

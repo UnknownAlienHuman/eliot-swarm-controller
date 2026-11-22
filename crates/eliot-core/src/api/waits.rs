@@ -4,6 +4,7 @@
 //! never join it. A child being idle is not success; each entry reports the
 //! terminal outcome of its exact captured command or turn.
 
+use super::ChildRunFacts;
 use crate::{Error, Result, TurnResolutionSource};
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,8 @@ pub const MAX_WAIT_FINAL_TEXT_BYTES: usize = 16 * 1024;
 /// Total bound for retained `final_text` across one `swarm.wait` response,
 /// the same as one retained turn text (`MAX_EVENT_BYTES`).
 pub const MAX_WAIT_FRAME_BYTES: usize = 64 * 1024;
+/// Total serialized child facts allowed across one wait response.
+pub const MAX_WAIT_FACTS_FRAME_BYTES: usize = 3 * 1024 * 1024;
 
 /// Exact turn binding for one wait entry.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +230,10 @@ pub struct WaitEntryResult {
     /// response frame budget; `agent.result` reads the whole text.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// Bounded current-generation work facts for visible settled Agent results.
+    #[serde(default)]
+    #[schemars(extend("x-maxBytes" = super::MAX_CHILD_RUN_FACTS_BYTES))]
+    pub facts: ChildRunFacts,
 }
 
 impl WaitEntryResult {
@@ -241,6 +248,7 @@ impl WaitEntryResult {
             turn_id: None,
             final_text: None,
             truncated: false,
+            facts: ChildRunFacts::unobserved(),
         }
     }
 
@@ -264,6 +272,12 @@ impl WaitEntryResult {
         let (kept, cut) = truncate_bytes(text, budget.min(MAX_WAIT_FINAL_TEXT_BYTES));
         self.truncated = cut;
         self.final_text = (!kept.is_empty() || !cut).then_some(kept);
+        self
+    }
+
+    /// Attach work facts captured for this exact Agent generation.
+    pub fn with_facts(mut self, facts: ChildRunFacts) -> Self {
+        self.facts = facts;
         self
     }
 
@@ -310,6 +324,16 @@ impl WaitEntryResult {
             return Err(Error::new(
                 "invalid",
                 "wait entry final_text needs its turn binding",
+            ));
+        }
+        self.facts.validate()?;
+        if (self.agent.is_none()
+            || !matches!(self.status.as_str(), "succeeded" | "failed" | "interrupted"))
+            && !self.facts.is_unobserved()
+        {
+            return Err(Error::new(
+                "invalid",
+                "wait facts require a visible settled Agent result",
             ));
         }
         Ok(())
@@ -368,6 +392,21 @@ impl SwarmWaitResponse {
             return Err(Error::new(
                 "invalid",
                 "wait response exceeds its final_text frame budget",
+            ));
+        }
+        let facts_frame = serde_json::to_vec(
+            &self
+                .results
+                .iter()
+                .map(|entry| &entry.facts)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|_| Error::new("invalid", "wait facts could not be encoded"))?
+        .len();
+        if facts_frame > MAX_WAIT_FACTS_FRAME_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "wait response exceeds its child facts frame budget",
             ));
         }
         Ok(())
