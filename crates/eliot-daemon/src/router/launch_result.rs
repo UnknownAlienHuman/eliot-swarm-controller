@@ -48,11 +48,15 @@ impl Router {
             .subject
             .as_ref()
             .and_then(|subject| subject.workspace.as_deref());
-        let (Some(agent), Some(generation), Some(workspace), Some(fingerprint)) = (
+        let (Some(agent), Some(generation), Some(workspace), Some(fingerprint), Some(base)) = (
             event.agent.as_deref(),
             event.generation,
             workspace,
             event_worktree_fingerprint(event),
+            event
+                .data
+                .pointer("/worktree/base")
+                .and_then(serde_json::Value::as_str),
         ) else {
             return Ok(false);
         };
@@ -60,6 +64,7 @@ impl Router {
         if current.is_none_or(|agent| {
             agent.generation != generation
                 || agent.workspace.as_deref() != Some(workspace)
+                || agent.base_oid.as_deref() != Some(base)
                 || principal
                     .strip_prefix("project:")
                     .is_some_and(|project| project != agent.project)
