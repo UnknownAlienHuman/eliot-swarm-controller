@@ -2275,9 +2275,16 @@ pub(crate) fn identity_data_dirs_equal(left: &Path, right: &Path) -> bool {
 pub(crate) fn identity_data_scope(path: &Path) -> String {
     let path = normalize_identity_data_dir(path);
     #[cfg(windows)]
-    let path = eliot_core::display_path(&path.to_string_lossy()).to_ascii_lowercase();
+    let bytes = path.to_str().map_or_else(
+        || path.as_os_str().as_encoded_bytes().to_ascii_lowercase(),
+        |path| {
+            eliot_core::display_path(path)
+                .to_ascii_lowercase()
+                .into_bytes()
+        },
+    );
     #[cfg(windows)]
-    let bytes = path.as_bytes();
+    let bytes = bytes.as_slice();
     #[cfg(not(windows))]
     let bytes = path.as_os_str().as_encoded_bytes();
     eliot_core::api::inference::sha256_hex(bytes)
