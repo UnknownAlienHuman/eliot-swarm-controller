@@ -178,6 +178,8 @@ pub struct GoalRoundCommit {
     /// Workspace fingerprint read right after a failed check: the next
     /// round's baseline, so the check's own writes are never progress.
     pub fingerprint_after: Option<String>,
+    /// Exact registered project and unchanged checked worktree fingerprint.
+    pub project_check: Option<(String, String)>,
     pub continuation: Option<GoalContinuation>,
 }
 
@@ -2357,6 +2359,13 @@ impl Store {
             ],
         ));
         let mut events = Vec::new();
+        if matches!(outcome, GoalCommitOutcome::Completed)
+            && let Some((project, fingerprint)) = &commit.project_check
+            && let Some(event) =
+                project_check_passed_event(&tx, agent_num, &agent_row, project, fingerprint, now)?
+        {
+            events.push(event);
+        }
         if let (Some(cause), Some((status, reason))) = (
             state.assignment_cause.clone(),
             match &outcome {
@@ -2432,6 +2441,71 @@ impl Store {
             events,
         })
     }
+}
+
+fn project_check_passed_event(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    agent: &Agent,
+    project: &str,
+    fingerprint: &str,
+    now: i64,
+) -> Result<Option<Event>> {
+    if agent.project != project
+        || agent.branch.is_none()
+        || agent.parent.is_some()
+        || projects::project_registration_tx(tx, project)?.is_none_or(|registration| {
+            !registration
+                .actions
+                .iter()
+                .any(|action| action == "git.publish")
+        })
+    {
+        return Ok(None);
+    }
+    let turn_id: Option<String> = tx
+        .query_row(
+            "SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2
+             ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
+            params![agent_num, agent.generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(turn_id) = turn_id else {
+        return Ok(None);
+    };
+    let Some(turn) = load_turn(tx, agent_num, agent.generation, &turn_id)? else {
+        return Ok(None);
+    };
+    let Some(subject) = turn
+        .final_text
+        .as_deref()
+        .and_then(|text| text.lines().next())
+        .filter(|line| {
+            !line.trim().is_empty() && line.len() <= 1024 && !line.chars().any(char::is_control)
+        })
+    else {
+        return Ok(None);
+    };
+    if turn.state != TurnState::Completed || turn.outcome != Some(core::TurnOutcome::Success) {
+        return Ok(None);
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "project.check.passed",
+        "goal",
+        Some(agent_num),
+        Some(agent.generation),
+        json!({
+            "project": project,
+            "turn_id": turn_id,
+            "fingerprint": fingerprint,
+            "subject": subject,
+        }),
+    )
+    .map(Some)
 }
 
 /// One continuation command row as the probe reads it. Only the fields

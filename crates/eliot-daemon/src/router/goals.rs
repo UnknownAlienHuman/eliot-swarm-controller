@@ -108,6 +108,7 @@ impl ClaimedGoalRound {
             observation,
             fingerprint_before: None,
             fingerprint_after: None,
+            project_check: None,
             continuation: None,
         });
         let result = self
@@ -620,6 +621,7 @@ impl Router {
                 observation: None,
                 fingerprint_before,
                 fingerprint_after,
+                project_check: None,
                 continuation: Some(GoalContinuation {
                     id: continuation_id,
                     text,
@@ -678,6 +680,15 @@ impl Router {
             ));
             GoalRoundDecision::Block(reason.to_owned())
         });
+        let project_check = if decision.is_none()
+            && let Some(fingerprint) = fingerprint_before.as_ref()
+            && let Some(project) = self.publication_check_project(&probe, &definition).await
+            && work_fingerprint(probe.workspace.as_deref()).await.as_ref() == Some(fingerprint)
+        {
+            Some((project, fingerprint.clone()))
+        } else {
+            None
+        };
         let commit = GoalRoundCommit {
             id: request.id.clone(),
             principal: principal.clone(),
@@ -692,10 +703,49 @@ impl Router {
             observation: None,
             fingerprint_before,
             fingerprint_after: None,
+            project_check,
             continuation: None,
         };
         let result = self.commit_goal_round(&principal, &request, &commit).await;
         claimed.complete(result)
+    }
+
+    async fn publication_check_project(
+        &self,
+        probe: &eliot_store::GoalRoundProbe,
+        definition: &GoalDefinition,
+    ) -> Option<String> {
+        let workspace = probe.workspace.as_deref()?;
+        if definition
+            .check_cwd
+            .as_deref()
+            .is_some_and(|cwd| cwd != workspace)
+        {
+            return None;
+        }
+        let agent = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(&probe.view.agent)
+            .ok()??;
+        if agent.generation != probe.view.generation
+            || agent.workspace.as_deref() != Some(workspace)
+            || agent.branch.is_none()
+            || agent.parent.is_some()
+        {
+            return None;
+        }
+        crate::config::load_project_registration_config(&self.inner.data_root)
+            .ok()?
+            .into_iter()
+            .find(|project| {
+                project.id == agent.project
+                    && project.check == definition.check
+                    && project.actions.iter().any(|action| action == "git.publish")
+            })
+            .map(|project| project.id)
     }
 
     /// Retain the error; only proven custody closure may release the marker.
