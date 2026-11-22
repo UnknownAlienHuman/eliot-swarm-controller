@@ -749,8 +749,9 @@ left missing, never inferred by timestamps.
 Admission preflight can refuse before command admission with a typed location
 and origin: a reserved capacity bound (`swarm` at `store.admission.capacity`) or
 a missing explicit profile executable (`environment` at
-`router.admission.profile_cmd`). Only an error built by that preflight
-constructor carries the private in-process refusal marker; a later error with
+`router.admission.profile_cmd`). Only the router's `command.submit` preflight
+call site sets the private in-process refusal marker, and only after the Store
+proves no command was admitted under that request ID; a later-stage error with
 the same code, location and origin is never recorded. `diagnose` can explain that exact request ID
 from a `command.refused` operational record while it remains in the bounded
 rotated log. This admission step carries structured

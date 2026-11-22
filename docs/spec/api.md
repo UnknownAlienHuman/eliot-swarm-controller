@@ -2878,7 +2878,8 @@ account's password-database home on Unix. The private registry always lives in
 It binds the random creation token to the canonical stand path outside the
 stand itself and records the handle identity (volume serial and file index) of
 the directory `stand up` created and the issuing daemon root when created
-inside an Agent session. While starting the daemon it created, `stand up`
+inside an Agent session; a `stand up` run without an Agent environment records
+no issuing parent. While starting the daemon it created, `stand up`
 records the SHA-256 of the owner token that daemon minted. From creation
 through that bind it holds the new root and every ancestor by handle without
 delete sharing, so none can be renamed or swapped for a junction; the bind

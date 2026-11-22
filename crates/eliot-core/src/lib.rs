@@ -1625,8 +1625,9 @@ impl FailureOrigin {
 }
 
 /// An admission preflight refusal: a typed failure before any command exists.
-/// Only these constructors produce the `command.refused` diagnostic record
-/// that `diagnose` can explain by the caller's exact request ID.
+/// [`Self::error`] builds the typed error at any layer; only the router's
+/// preflight call site marks it with [`Self::at_preflight`], and only marked
+/// errors produce the `command.refused` record `diagnose` can explain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionRefusal {
     /// A configured local capacity bound is reserved.
@@ -1656,12 +1657,19 @@ impl AdmissionRefusal {
         }
     }
 
+    /// The typed refusal error, unmarked.
     pub fn error(self, message: impl Into<String>) -> Error {
         let (code, where_, origin, evidence) = self.parts();
-        let mut error = Error::new(code, message)
+        Error::new(code, message)
             .with_where(where_)
-            .with_origin(origin, evidence);
-        error.admission = Some(self);
+            .with_origin(origin, evidence)
+    }
+
+    /// Mark a typed refusal at the router's admission preflight call site,
+    /// which calls this only after proving no command was admitted for the
+    /// request. Any other error passes through unmarked.
+    pub fn at_preflight(mut error: Error) -> Error {
+        error.admission = Self::of_parts(&error.code, error.failure_where.as_deref(), error.origin);
         error
     }
 
@@ -1679,8 +1687,8 @@ impl AdmissionRefusal {
         })
     }
 
-    /// The refusal [`Self::error`] produced in this process, if any. Matching
-    /// by value never counts: only the private preflight marker does.
+    /// The refusal marked by [`Self::at_preflight`] in this process, if any.
+    /// Matching by value never counts: only the private preflight marker does.
     pub fn of(error: &Error) -> Option<Self> {
         error.admission
     }
