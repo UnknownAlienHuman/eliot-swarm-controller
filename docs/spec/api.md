@@ -1390,6 +1390,16 @@ implemented bounded server wait over a frozen child command/turn set. Single-tar
 server-side wait semantics further below are retained for a future API layer, not part
 of the current request shape.
 
+Repository integration takes a base branch and an ordered list of local branches in a
+registered project. The daemon merges the committed inputs in its own workspace and
+runs the project's configured check there. The retained command outcome reports the
+checked merge, conflict paths, or a bounded check failure. If the combined check
+fails, the daemon checks each input against the same base and reports the branches
+that fail individually. The requester can explicitly name a permitted local branch
+to fast-forward after a passing check. Integration leaves the manager's working
+tree and index intact and has no remote effect. The same operation is available to
+[authorized automation rules](automation.md#git-actions).
+
 Generation-changing dispatch follows [core](core.md#generation-fence): advance and
 revoke before native I/O, no rollback, no replay after unknown. Terminal settlement
 revokes the token even if degraded Unix custody reports possible escaped descendants.
