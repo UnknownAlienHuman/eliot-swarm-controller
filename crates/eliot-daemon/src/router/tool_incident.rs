@@ -190,6 +190,7 @@ async fn process_event(router: &Router, event: &Event) -> Result<()> {
     let args = serde_json::to_value(EmitDefinitionArgs {
         topic: "agent.attention".to_owned(),
         data: report,
+        key: None,
     })
     .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
     router

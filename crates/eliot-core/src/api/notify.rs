@@ -36,12 +36,15 @@ impl NotifyDefinitionArgs {
     }
 }
 
-/// A named local user event: opaque bounded data persisted as `x.user.<topic>`.
+/// A named local user event: bounded payload persisted as `x.user.<topic>`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmitDefinitionArgs {
     pub topic: String,
     pub data: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-maxBytes" = 128), description = "Optional nonblank event key, at most 128 UTF-8 bytes.")]
+    pub key: Option<String>,
 }
 
 impl EmitDefinitionArgs {
@@ -55,8 +58,19 @@ impl EmitDefinitionArgs {
         {
             return Err(invalid("emit topic must be a bounded dotted name"));
         }
-        // Bound the final persisted wrapper (`{data:...}`), not raw data.
-        bound_payload(&serde_json::json!({"data": self.data}), "emit")?;
+        if let Some(key) = &self.key
+            && (key.trim().is_empty() || key.len() > 128)
+        {
+            return Err(invalid(
+                "emit key must be nonblank and at most 128 UTF-8 bytes",
+            ));
+        }
+        // Bound the complete persisted event object, including the optional key.
+        let mut payload = serde_json::json!({"data": self.data});
+        if let Some(key) = &self.key {
+            payload["key"] = Value::String(key.clone());
+        }
+        bound_payload(&payload, "emit")?;
         Ok(())
     }
 }

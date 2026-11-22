@@ -309,6 +309,7 @@ impl Store {
                         record.command.args.clone(),
                     )
                     .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+                    definition.validate()?;
                     format!("x.user.{}", definition.topic)
                 }
             };
@@ -399,6 +400,7 @@ impl Store {
                 record.command.args.clone(),
             )
             .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
+            definition.validate()?;
             if format!("x.user.{}", definition.topic) != kind {
                 return Err(Error::new(
                     "invalid",

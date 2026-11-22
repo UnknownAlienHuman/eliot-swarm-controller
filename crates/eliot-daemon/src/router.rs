@@ -8055,10 +8055,11 @@ fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
                 "params.args",
             )?;
             definition.validate()?;
-            Ok((
-                format!("x.user.{}", definition.topic),
-                json!({"data": definition.data}),
-            ))
+            let mut data = json!({"data": definition.data});
+            if let Some(key) = definition.key {
+                data["key"] = Value::String(key);
+            }
+            Ok((format!("x.user.{}", definition.topic), data))
         }
         _ => Err(Error::new("invalid", "not a local user-event verb")),
     }

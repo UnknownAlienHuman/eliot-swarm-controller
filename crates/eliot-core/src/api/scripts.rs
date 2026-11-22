@@ -3,7 +3,9 @@
 //! This module contains data and pure validation only. The daemon owns config
 //! resolution, duration parsing, file reads, process custody and admission.
 
-use super::{TimerSchedule, mutations::CommandSubmitRequest, reads::CommandGetRequest};
+use super::{
+    EmitDefinitionArgs, TimerSchedule, mutations::CommandSubmitRequest, reads::CommandGetRequest,
+};
 use crate::{
     Error, Event, EventSubject, FrozenSetupFile, Result, StderrDiagnostic, StderrSnapshot,
     StderrSource, SubmitCommand, bound_stderr_diagnostics, limits::MAX_EVENT_BYTES, parse_agent_id,
@@ -56,6 +58,12 @@ pub enum ScriptActionRecord {
         expected_generation: i64,
         expected_turn_id: String,
     },
+    Emit {
+        topic: String,
+        data: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
+    },
 }
 
 impl ScriptActionRecord {
@@ -82,6 +90,15 @@ impl ScriptActionRecord {
                 validate_target_generation(target, *expected_generation)?;
                 CommandGetRequest::new(expected_turn_id.clone()).validate()
             }
+            Self::Emit { topic, data, key } => {
+                EmitDefinitionArgs {
+                    topic: topic.clone(),
+                    data: data.clone(),
+                    key: key.clone(),
+                }
+                .validate()?;
+                Ok(())
+            }
         }
     }
 
@@ -94,15 +111,21 @@ impl ScriptActionRecord {
             Self::Stop {
                 target,
                 expected_generation,
-            } => ("stop", target, expected_generation, None, json!({})),
+            } => (
+                "stop",
+                Some(target),
+                Some(expected_generation),
+                None,
+                json!({}),
+            ),
             Self::Send {
                 target,
                 expected_generation,
                 text,
             } => (
                 "send",
-                target,
-                expected_generation,
+                Some(target),
+                Some(expected_generation),
                 None,
                 json!({ "text": text }),
             ),
@@ -112,17 +135,23 @@ impl ScriptActionRecord {
                 expected_turn_id,
             } => (
                 "interrupt",
-                target,
-                expected_generation,
+                Some(target),
+                Some(expected_generation),
                 Some(expected_turn_id),
                 json!({}),
             ),
+            Self::Emit { topic, data, key } => {
+                let definition = EmitDefinitionArgs { topic, data, key };
+                let args = serde_json::to_value(definition)
+                    .map_err(|_| invalid("script emit definition cannot be encoded"))?;
+                ("emit", None, None, None, args)
+            }
         };
 
         let mut command = CommandSubmitRequest::new(String::new(), verb);
-        command.target = Some(target);
+        command.target = target;
         command.args = args;
-        command.expected_generation = Some(generation);
+        command.expected_generation = generation;
         command.expected_turn_id = expected_turn_id;
         command.validate()?;
         Ok(command)
