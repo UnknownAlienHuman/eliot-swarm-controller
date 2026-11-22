@@ -203,6 +203,12 @@ impl Store {
                 "Agent already has an active wake for this generation",
             ));
         }
+        db!(tx.execute(
+            "UPDATE background_process_wakes
+             SET state = 'cancelled', settled_at = ?1
+             WHERE agent = ?2 AND generation = ?3 AND state = 'waiting'",
+            params![now, agent_num, generation],
+        ));
         let delivery_command_id = unique_wake_command_id(&tx, &request.id)?;
         let response = AgentWakeResponse {
             id: request.id.clone(),
@@ -925,13 +931,16 @@ fn wake_agent_num(tx: &Transaction<'_>, id: &str, generation: i64) -> Result<Opt
     .map_err(sql_error)
 }
 
-fn unique_wake_command_id(tx: &Transaction<'_>, wake_id: &str) -> Result<String> {
+pub(super) fn unique_wake_command_id(tx: &Transaction<'_>, wake_id: &str) -> Result<String> {
     for _ in 0..8 {
         let id = Ulid::new().to_string();
         let reserved_wake_id: bool = tx
             .query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM agent_wakes
+                     WHERE id = ?1 OR delivery_command_id = ?1
+                 ) OR EXISTS(
+                     SELECT 1 FROM background_process_wakes
                      WHERE id = ?1 OR delivery_command_id = ?1
                  )",
                 [&id],

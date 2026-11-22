@@ -170,6 +170,22 @@ pub(crate) async fn run_show(
             if let Some(owner_rules) = &response.owner_rules_delivery {
                 print_owner_rules_delivery(owner_rules);
             }
+            if let Some(wake) = &response.pending_background_wake {
+                let truncated = if wake.command_truncated {
+                    " [truncated]"
+                } else {
+                    ""
+                };
+                println!(
+                    "Pending background wake: {} (pid {}, state {}, expires_at {}) — {}{}",
+                    wake.id,
+                    wake.process.pid,
+                    wake.state,
+                    wake.expires_at,
+                    wake.command_line,
+                    truncated
+                );
+            }
         });
         Ok(0)
     }
