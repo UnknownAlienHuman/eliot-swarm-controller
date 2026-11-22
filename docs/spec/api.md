@@ -876,10 +876,11 @@ the DTO, and the desktop receives the same project data through its existing API
 Owner-facing views render Windows paths without the verbatim prefix, through Core
 `display_path` ([verbatim.rs](../../crates/eliot-core/src/verbatim.rs)): the registration
 `checkout`, `repo_common_dir` and every `checkouts` path, and the Agent views'
-`workspace`, `project_scope`, `repo_common_dir`, a path-valued `project` label and the
-joined Git observation's `workspace`. Store rows, Git lookups and path-keyed tables keep
-their exact stored spelling; `project.discover` and reads validated against stored
-values stay on it.
+`workspace`, `repo_common_dir` and the joined Git observation's `workspace`.
+The Agent `project` and `project_scope` fields retain their exact stored spelling,
+including path-valued identities, so clients can reuse them as list filters. The human
+CLI formats a path-valued project for display. Store rows, Git lookups and path-keyed
+tables keep their exact stored spelling.
 The bounded `checkouts` inventory carries live verified paths, main-checkout identity,
 and a branch when a bound `symbolic-ref HEAD` supplies one. A linked entry requires a
 reciprocal Git registration in the pinned common directory. A list can carry the

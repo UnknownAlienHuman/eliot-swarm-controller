@@ -7656,9 +7656,8 @@ fn workspace_folder_name(workspace: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Owner-facing spelling of one `agent.list` summary row: only the fields a
-/// person reads lose the Windows verbatim prefix. Retained identity, the
-/// Store's path-keyed rows and Git lookups keep their exact stored form.
+/// Format display paths in an `agent.list` row. Project and scope are exact
+/// filter keys, including when a legacy Agent uses a path as its project.
 fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
     if let Some(workspace) = summary.workspace.as_deref() {
         summary.workspace = Some(eliot_core::display_path(workspace));
@@ -7666,11 +7665,6 @@ fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
     if let Some(repo_common_dir) = summary.repo_common_dir.as_deref() {
         summary.repo_common_dir = Some(eliot_core::display_path(repo_common_dir));
     }
-    if let Some(project_scope) = summary.project_scope.as_deref() {
-        summary.project_scope = Some(eliot_core::display_path(project_scope));
-    }
-    // An unregistered workspace's project label is its canonical path.
-    summary.project = eliot_core::display_path(&summary.project);
     summary
 }
 
@@ -7684,19 +7678,12 @@ fn display_observation(observation: &mut ObservationView) {
     }
 }
 
-/// Owner-facing spelling of one `agent.get`/`swarm show` view: the retained
-/// workspace, its scope and the Git observation that reads them leave without
-/// the verbatim prefix. The workspace feeds Git observation and edit lookups
-/// by exact key, so it renders from the same stored value.
+/// Format display paths in an `agent.get` view using the same spelling as the
+/// summary. Keep its project and scope usable as exact `agent.list` filters.
 fn display_agent_get_response(response: &mut AgentGetResponse) {
-    let workspace = response.agent.workspace.clone();
-    if let Some(workspace) = workspace.as_deref() {
+    if let Some(workspace) = response.agent.workspace.as_deref() {
         response.agent.workspace = Some(eliot_core::display_path(workspace));
     }
-    if let Some(project_scope) = response.agent.project_scope.as_deref() {
-        response.agent.project_scope = Some(eliot_core::display_path(project_scope));
-    }
-    response.agent.project = eliot_core::display_path(&response.agent.project);
     display_observation(&mut response.observation);
     if let Some(facts) = &mut response.instruction_delivery
         && let Some(workspace) = facts.source_workspace.as_deref()
