@@ -9,6 +9,7 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const MAX_FIRST_CALL_TURNS: usize = 64;
 pub const PROFILE_FIRST_CALL_WINDOW: usize = 256;
@@ -269,6 +270,176 @@ pub struct SessionFacts {
     pub context_capacity_supplied: usize,
 }
 
+/// One Agent's child-existence fact. The Store may find children outside
+/// the requested usage scope; child identities and usage are never included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UsageRoleAgent {
+    pub id: i64,
+    pub has_children: bool,
+}
+
+/// One normalized usage observation. input_tokens includes uncached and
+/// cached input exactly once. context_tokens is observed context occupancy;
+/// context_observed counts a retained session.usage fact even when occupancy
+/// is missing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsageRoleObservation {
+    pub agent: i64,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub context_tokens: Option<i64>,
+    pub context_observed: bool,
+}
+
+/// Bounded token aggregates for one Agent role. Per-counter sample counts
+/// make missing retained usage visible; context is averaged only over facts
+/// with valid observed occupancy.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageRoleTotals {
+    pub agents: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    pub input_samples: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
+    pub output_samples: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_context_tokens: Option<i64>,
+    pub context_observations: usize,
+    pub context_samples: usize,
+    pub context_missing: usize,
+}
+
+/// Role usage for the authorized Agent set: Agents with any retained child
+/// are managers; every other included Agent is an executor.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UsageRoleSummary {
+    pub managers: UsageRoleTotals,
+    pub executors: UsageRoleTotals,
+}
+
+#[derive(Default)]
+struct UsageRoleAccum {
+    totals: UsageRoleTotals,
+    input_sum: i128,
+    output_sum: i128,
+    context_sum: i128,
+}
+
+impl UsageRoleAccum {
+    fn observe(&mut self, observation: UsageRoleObservation) {
+        if let Some(tokens) = observation.input_tokens.filter(|tokens| *tokens >= 0) {
+            self.input_sum = self.input_sum.saturating_add(i128::from(tokens));
+            self.totals.input_samples = self.totals.input_samples.saturating_add(1);
+        }
+        if let Some(tokens) = observation.output_tokens.filter(|tokens| *tokens >= 0) {
+            self.output_sum = self.output_sum.saturating_add(i128::from(tokens));
+            self.totals.output_samples = self.totals.output_samples.saturating_add(1);
+        }
+        if observation.context_observed {
+            self.totals.context_observations = self.totals.context_observations.saturating_add(1);
+            if let Some(tokens) = observation.context_tokens.filter(|tokens| *tokens >= 0) {
+                self.context_sum = self.context_sum.saturating_add(i128::from(tokens));
+                self.totals.context_samples = self.totals.context_samples.saturating_add(1);
+            } else {
+                self.totals.context_missing = self.totals.context_missing.saturating_add(1);
+            }
+        }
+    }
+
+    fn finish(mut self) -> UsageRoleTotals {
+        self.totals.input_tokens = (self.totals.input_samples > 0)
+            .then_some(self.input_sum.clamp(0, i128::from(i64::MAX)) as i64);
+        self.totals.output_tokens = (self.totals.output_samples > 0)
+            .then_some(self.output_sum.clamp(0, i128::from(i64::MAX)) as i64);
+        self.totals.average_context_tokens = (self.totals.context_samples > 0).then(|| {
+            (self.context_sum / self.totals.context_samples as i128).clamp(0, i128::from(i64::MAX))
+                as i64
+        });
+        self.totals
+    }
+}
+
+/// Shared streaming attribution and token aggregation for usage and
+/// autonomy. The constructor receives only Agents in the caller's scope,
+/// with child existence determined over all retained Agents. One observation
+/// is one source-specific usage sample.
+pub struct UsageRoleAccumulator {
+    roles: HashMap<i64, bool>,
+    managers: UsageRoleAccum,
+    executors: UsageRoleAccum,
+}
+
+impl UsageRoleAccumulator {
+    pub fn new(agents: impl IntoIterator<Item = UsageRoleAgent>) -> Self {
+        let mut roles = HashMap::new();
+        for agent in agents {
+            roles
+                .entry(agent.id)
+                .and_modify(|has_children| *has_children |= agent.has_children)
+                .or_insert(agent.has_children);
+        }
+        let mut accumulator = Self {
+            roles: HashMap::with_capacity(roles.len()),
+            managers: UsageRoleAccum::default(),
+            executors: UsageRoleAccum::default(),
+        };
+        for (id, is_manager) in roles {
+            accumulator.roles.insert(id, is_manager);
+            if is_manager {
+                accumulator.managers.totals.agents =
+                    accumulator.managers.totals.agents.saturating_add(1);
+            } else {
+                accumulator.executors.totals.agents =
+                    accumulator.executors.totals.agents.saturating_add(1);
+            }
+        }
+        accumulator
+    }
+
+    /// Add one sample. Rows for Agents outside the constructor's authorized
+    /// scope are ignored.
+    pub fn observe(&mut self, observation: UsageRoleObservation) {
+        match self.roles.get(&observation.agent) {
+            Some(true) => self.managers.observe(observation),
+            Some(false) => self.executors.observe(observation),
+            None => {}
+        }
+    }
+
+    pub fn finish(self) -> UsageRoleSummary {
+        UsageRoleSummary {
+            managers: self.managers.finish(),
+            executors: self.executors.finish(),
+        }
+    }
+}
+
+impl UsageRoleTotals {
+    fn valid_for(&self, max_turn_samples: usize) -> bool {
+        self.input_samples <= max_turn_samples
+            && self.output_samples <= max_turn_samples
+            && self.context_samples.checked_add(self.context_missing)
+                == Some(self.context_observations)
+            && self.input_tokens.is_some() == (self.input_samples > 0)
+            && self.output_tokens.is_some() == (self.output_samples > 0)
+            && self.average_context_tokens.is_some() == (self.context_samples > 0)
+            && self.input_tokens.is_none_or(|tokens| tokens >= 0)
+            && self.output_tokens.is_none_or(|tokens| tokens >= 0)
+            && self.average_context_tokens.is_none_or(|tokens| tokens >= 0)
+    }
+}
+
+impl UsageRoleSummary {
+    fn valid_for(&self, agents: usize, max_turn_samples: usize) -> bool {
+        self.managers.agents.checked_add(self.executors.agents) == Some(agents)
+            && self.managers.valid_for(max_turn_samples)
+            && self.executors.valid_for(max_turn_samples)
+    }
+}
+
 /// Bounded usage totals with explicit coverage. No partial sum presents as
 /// complete: turn scopes stay separate, session subtotals carry their
 /// missing counts, and `truncated`/`history_complete` say what was left out.
@@ -286,6 +457,8 @@ pub struct UsageSummaryResponse {
     pub pruned_through: i64,
     pub turns: TurnExpenditure,
     pub sessions: SessionFacts,
+    #[serde(default)]
+    pub by_role: UsageRoleSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub first_calls: Vec<FirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -305,6 +478,12 @@ impl UsageSummaryResponse {
             return Err(invalid_response());
         }
         if self.pruned_through < 0 {
+            return Err(invalid_response());
+        }
+        if !self
+            .by_role
+            .valid_for(self.agents_included, self.turns.turns_counted)
+        {
             return Err(invalid_response());
         }
         if self.generations_included < self.sessions.snapshots {
