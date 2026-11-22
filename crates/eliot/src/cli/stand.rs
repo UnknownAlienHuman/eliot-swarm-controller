@@ -8,12 +8,12 @@ use eliot_core::api::{
 };
 use eliot_daemon::operator::{
     PinnedStandRoot, STAND_MARKER, StandExternalCleanupReport, StandMarker, StandRegistration,
-    check_directory_chain, check_nested_roots, cleanup_stand_external_git, create_stand_root,
-    daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
-    inherited_agent_parent_data_dir, list_stand_registrations, lock_offline, lock_transition,
-    parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    remove_stand_registration, stand_base, stand_now_ms, stand_registry, verify_stand_marker,
-    verify_stand_target, write_stand_registration,
+    StandRegistryScan, UnusableStandRegistration, check_directory_chain, check_nested_roots,
+    cleanup_stand_external_git, create_stand_root, daemon_alive, daemon_info, data_dirs_match,
+    ensure_registry_is_external, inherited_agent_parent_data_dir, list_stand_registrations,
+    lock_offline, lock_transition, parse_stand_ttl_ms, read_stand_registration, registry_name,
+    remove_offline_stand_root, remove_stand_registration, stand_base, stand_now_ms, stand_registry,
+    verify_stand_marker, verify_stand_target, write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -403,12 +403,22 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     })
 }
 
+fn scan_registry() -> Result<StandRegistryScan, Failure> {
+    match stand_registry(false) {
+        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read),
+        Err(error) if error.code == "not_found" => Ok(StandRegistryScan::default()),
+        Err(error) => Err(Failure::for_read(error)),
+    }
+}
+
+fn print_unusable(unusable: &[UnusableStandRegistration]) {
+    for item in unusable {
+        println!("{} | unusable: {}", item.registry_path, item.detail);
+    }
+}
+
 pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
-    let entries = match stand_registry(false) {
-        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
-        Err(error) if error.code == "not_found" => Vec::new(),
-        Err(error) => return Err(Failure::for_read(error)),
-    };
+    let StandRegistryScan { entries, unusable } = scan_registry()?;
     let now = stand_now_ms();
     let mut stands = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -435,10 +445,10 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
             "removing_pid": entry.registration.removing_pid,
         }));
     }
-    let payload = json!({ "stands": stands });
+    let payload = json!({ "stands": stands, "unusable": unusable });
     if json_output {
         print_value(&payload, true);
-    } else if stands.is_empty() {
+    } else if stands.is_empty() && unusable.is_empty() {
         println!("No registered stands.");
     } else {
         for item in &stands {
@@ -452,19 +462,18 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
                     .map_or_else(|| "none".to_owned(), |v| v.to_string()),
             );
         }
+        print_unusable(&unusable);
     }
     Ok(0)
 }
 
 pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
-    let entries = match stand_registry(false) {
-        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
-        Err(error) if error.code == "not_found" => Vec::new(),
-        Err(error) => return Err(Failure::for_read(error)),
-    };
+    let StandRegistryScan { entries, unusable } = scan_registry()?;
     let now = stand_now_ms();
     let mut results: Vec<Value> = Vec::with_capacity(entries.len());
-    let mut any_blocked = false;
+    // An unusable registration cannot prove its expiry or root, so it is
+    // reported and never torn down.
+    let mut any_blocked = !unusable.is_empty();
     for entry in entries {
         let root = entry.registration.marker.root.clone();
         let data_dir = display(&root);
@@ -517,22 +526,40 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
             }
         }
     }
-    let payload = json!({ "stands": results });
+    let payload = json!({ "stands": results, "unusable": unusable });
     if json_output {
         print_value(&payload, true);
-    } else if results.is_empty() {
+    } else if results.is_empty() && unusable.is_empty() {
         println!("No registered stands to prune.");
     } else {
         for item in &results {
+            let why = item
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|message| format!(": {message}"))
+                .or_else(|| {
+                    item.get("reason")
+                        .and_then(Value::as_str)
+                        .map(|reason| format!(" ({reason})"))
+                })
+                .unwrap_or_default();
             println!(
-                "{} | outcome={}{}",
+                "{} | outcome={}{why}",
                 item["data_dir"].as_str().unwrap_or(""),
                 item["outcome"].as_str().unwrap_or(""),
-                item.get("reason")
-                    .and_then(Value::as_str)
-                    .map_or_else(String::new, |r| format!(" ({r})")),
             );
+            for key in ["external_worktrees", "external_branches"] {
+                for detail in item[key]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|outcome| outcome["detail"].as_str())
+                {
+                    println!("  {detail}");
+                }
+            }
         }
+        print_unusable(&unusable);
     }
     Ok(if any_blocked { 4 } else { 0 })
 }
@@ -547,9 +574,7 @@ fn print_external_summary(
             wt.worktree_path,
             wt.branch,
             wt.outcome,
-            wt.reason
-                .as_deref()
-                .map_or_else(String::new, |r| format!(" ({r})"))
+            outcome_note(wt.reason.as_deref(), wt.detail.as_deref())
         );
     }
     for branch in branches {
@@ -558,12 +583,15 @@ fn print_external_summary(
             branch.branch,
             branch.repo_common_dir,
             branch.outcome,
-            branch
-                .reason
-                .as_deref()
-                .map_or_else(String::new, |r| format!(" ({r})"))
+            outcome_note(branch.reason.as_deref(), branch.detail.as_deref())
         );
     }
+}
+
+fn outcome_note(reason: Option<&str>, detail: Option<&str>) -> String {
+    let reason = reason.map_or_else(String::new, |reason| format!(" ({reason})"));
+    let detail = detail.map_or_else(String::new, |detail| format!(": {detail}"));
+    format!("{reason}{detail}")
 }
 
 async fn prove_stand_exit(root: &Path) -> Result<u32, Failure> {

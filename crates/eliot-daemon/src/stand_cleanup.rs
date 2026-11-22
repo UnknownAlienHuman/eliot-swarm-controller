@@ -122,6 +122,9 @@ pub struct StandWorktreeOutcome {
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The refusal text when a record or location check kept this item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,6 +135,9 @@ pub struct StandBranchOutcome {
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The refusal text when a record check kept this item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -171,13 +177,21 @@ impl StandExternalCleanupReport {
         for item in &self.worktrees {
             if item.outcome != "removed" {
                 let code = leak_static_known_reason(item.reason.as_deref());
-                return (code, "stand external worktree could not be safely removed");
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .unwrap_or("stand external worktree could not be safely removed");
+                return (code, detail);
             }
         }
         for item in &self.branches {
             if item.outcome != "removed" {
                 let code = leak_static_known_reason(item.reason.as_deref());
-                return (code, "stand external branch could not be safely removed");
+                let detail = item
+                    .detail
+                    .as_deref()
+                    .unwrap_or("stand external branch could not be safely removed");
+                return (code, detail);
             }
         }
         (
@@ -221,6 +235,20 @@ fn leak_static_known_reason(reason: Option<&str>) -> &'static str {
 pub struct StandEntry {
     pub registry_file: String,
     pub registration: StandRegistration,
+}
+
+/// A registry file that exists but cannot be used as a stand registration.
+#[derive(Clone, Debug, Serialize)]
+pub struct UnusableStandRegistration {
+    pub registry_path: String,
+    pub detail: String,
+}
+
+/// Every registry file, either usable or reported with its failure.
+#[derive(Clone, Debug, Default)]
+pub struct StandRegistryScan {
+    pub entries: Vec<StandEntry>,
+    pub unusable: Vec<UnusableStandRegistration>,
 }
 
 pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
@@ -399,19 +427,15 @@ pub fn read_stand_registration(
     root: &Path,
 ) -> Result<StandRegistration> {
     let path = registry.join(name);
-    // The exact spelling used for the lookup, including any verbatim prefix.
-    let shown = path.display();
     let record: StandRegistration = read_record(&path).map_err(|failure| match failure {
         RecordFailure::Missing => Error::new(
             "not_found",
-            format!("directory is not registered by swarm stand up: no registration at {shown}"),
+            format!(
+                "directory is not registered by swarm stand up: no registration at {}",
+                path.display()
+            ),
         ),
-        // A refusal before any effect: callers on a write path must not
-        // report it as an uncertain outcome.
-        RecordFailure::Unusable(detail) => Error::new(
-            "not_allowed",
-            format!("stand registration at {shown} is unusable: {detail}"),
-        ),
+        RecordFailure::Unusable(detail) => unusable_record("stand registration", &path, &detail),
     })?;
     if record.marker.format != 2 || registry_name(&record.marker.root) != registry_name(root) {
         return Err(Error::new(
@@ -422,8 +446,8 @@ pub fn read_stand_registration(
     Ok(record)
 }
 
-pub fn list_stand_registrations(registry: &Path) -> Result<Vec<StandEntry>> {
-    let mut entries = Vec::new();
+pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
+    let mut scan = StandRegistryScan::default();
     for item in fs::read_dir(registry)
         .map_err(|error| Error::new("platform_io", format!("list stand registry: {error}")))?
     {
@@ -437,18 +461,29 @@ pub fn list_stand_registrations(registry: &Path) -> Result<Vec<StandEntry>> {
         if !name.ends_with(".json") || name.starts_with('.') {
             continue;
         }
-        let Some(reg) = read_bounded_json::<StandRegistration>(&item.path()) else {
-            continue;
+        let path = item.path();
+        let detail = match read_record::<StandRegistration>(&path) {
+            Ok(reg) if reg.marker.format == 2 && registry_name(&reg.marker.root) == name => {
+                scan.entries.push(StandEntry {
+                    registry_file: name.to_owned(),
+                    registration: reg,
+                });
+                continue;
+            }
+            Ok(_) => "binding check failed: marker format or root does not match this file name"
+                .to_owned(),
+            // Removed while the registry was being listed.
+            Err(RecordFailure::Missing) => continue,
+            Err(RecordFailure::Unusable(detail)) => detail,
         };
-        if reg.marker.format != 2 || registry_name(&reg.marker.root) != name {
-            continue;
-        }
-        entries.push(StandEntry {
-            registry_file: name.to_owned(),
-            registration: reg,
+        scan.unusable.push(UnusableStandRegistration {
+            registry_path: path.display().to_string(),
+            detail,
         });
     }
-    entries.sort_by(|left, right| {
+    scan.unusable
+        .sort_by(|left, right| left.registry_path.cmp(&right.registry_path));
+    scan.entries.sort_by(|left, right| {
         left.registration
             .marker
             .created_at
@@ -460,7 +495,16 @@ pub fn list_stand_registrations(registry: &Path) -> Result<Vec<StandEntry>> {
                     .cmp(&right.registration.marker.root)
             })
     });
-    Ok(entries)
+    Ok(scan)
+}
+
+/// A refusal before any effect, so a caller on a write path never reports it
+/// as an uncertain outcome. Names the exact path, including any verbatim prefix.
+fn unusable_record(kind: &str, path: &Path, detail: &str) -> Error {
+    Error::new(
+        "not_allowed",
+        format!("{kind} at {} is unusable: {detail}", path.display()),
+    )
 }
 
 /// Why a bounded stand record could not be used.
@@ -512,10 +556,6 @@ fn read_record<T: serde::de::DeserializeOwned>(
     })
 }
 
-fn read_bounded_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    read_record(path).ok()
-}
-
 pub fn check_directory_chain(path: &Path) -> Result<()> {
     if path.components().any(|part| part == Component::ParentDir) {
         return Err(Error::new(
@@ -549,19 +589,24 @@ pub fn check_directory_chain(path: &Path) -> Result<()> {
 
 pub fn verify_stand_marker(root: &Path, registration: &StandRegistration) -> Result<()> {
     let path = root.join(STAND_MARKER);
-    if let Some(marker) = read_bounded_json::<StandMarker>(&path) {
-        if marker.format == registration.marker.format
-            && marker.root == registration.marker.root
-            && marker.token == registration.marker.token
+    match read_record::<StandMarker>(&path) {
+        Ok(marker)
+            if marker.format == registration.marker.format
+                && marker.root == registration.marker.root
+                && marker.token == registration.marker.token =>
         {
             return Ok(());
         }
-    } else if registration.removing_pid.is_some()
-        && fs::symlink_metadata(&path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none())
-    {
-        return Ok(());
+        Err(RecordFailure::Unusable(detail)) => {
+            return Err(unusable_record("stand marker", &path, &detail));
+        }
+        Err(RecordFailure::Missing)
+            if registration.removing_pid.is_some()
+                && fs::read_dir(root).is_ok_and(|mut entries| entries.next().is_none()) =>
+        {
+            return Ok(());
+        }
+        _ => {}
     }
     Err(Error::new(
         "identity_changed",
@@ -790,36 +835,42 @@ pub(crate) fn record_stand_worktree(
     validate_stand_directory(&dir)?;
     let record = StandWorktreeRecord::of(preparation);
     let file = record.file_name();
-    if fs::symlink_metadata(dir.join(&file)).is_ok() {
-        return match read_bounded_json::<StandWorktreeRecord>(&dir.join(&file)) {
-            Some(existing) if existing == record => Ok(()),
-            _ => Err(Error::new(
+    let path = dir.join(&file);
+    match read_record::<StandWorktreeRecord>(&path) {
+        Ok(existing) if existing == record => return Ok(()),
+        Ok(_) => {
+            return Err(Error::new(
                 "identity_changed",
                 "stand worktree record differs from this creation",
-            )),
-        };
+            ));
+        }
+        Err(RecordFailure::Unusable(detail)) => {
+            return Err(unusable_record("stand worktree record", &path, &detail));
+        }
+        Err(RecordFailure::Missing) => {}
     }
     let bytes = serde_json::to_vec(&record)
         .map_err(|_| Error::new("internal", "encode stand worktree record"))?;
     write_stand_record(&dir, &file, &bytes)
 }
 
-fn load_worktree_records(registry: &Path, registry_file: &str) -> Vec<StandWorktreeRecord> {
-    let Ok(entries) = fs::read_dir(worktree_records_dir(registry, registry_file)) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|entry| entry.ok())
-        .take(512)
-        .filter_map(|entry| {
-            let record = read_bounded_json::<StandWorktreeRecord>(&entry.path())?;
-            (entry.file_name().to_str() == Some(record.file_name().as_str())).then_some(record)
-        })
-        .collect()
-}
-
-fn is_recorded(records: &[StandWorktreeRecord], preparation: &WorkspacePreparation) -> bool {
-    records.contains(&StandWorktreeRecord::of(preparation))
+/// Require this Store worktree's own external creation record. A missing or
+/// different record is `unregistered_worktree`; one that exists but cannot be
+/// used is refused with its path and failed step.
+fn check_worktree_record(
+    registry: &Path,
+    registry_file: &str,
+    preparation: &WorkspacePreparation,
+) -> Result<()> {
+    let expected = StandWorktreeRecord::of(preparation);
+    let path = worktree_records_dir(registry, registry_file).join(expected.file_name());
+    match read_record::<StandWorktreeRecord>(&path) {
+        Ok(existing) if existing == expected => Ok(()),
+        Ok(_) | Err(RecordFailure::Missing) => Err(unregistered_worktree()),
+        Err(RecordFailure::Unusable(detail)) => {
+            Err(unusable_record("stand worktree record", &path, &detail))
+        }
+    }
 }
 
 /// Remove the external registration and its worktree records after the
@@ -1305,8 +1356,9 @@ async fn drain_stand_output<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {
 pub(crate) async fn plan_external_git(
     transport_data_root: &Path,
     stand_root: &Path,
+    registry: &Path,
+    registry_file: &str,
     registration: &StandRegistration,
-    records: &[StandWorktreeRecord],
     mut fetches: Option<&mut CleanupFetches>,
 ) -> Result<()> {
     if registration.pending_write_guard.is_some() {
@@ -1332,9 +1384,7 @@ pub(crate) async fn plan_external_git(
         if !worktree_present_or_registered(&probe, rec, deadline).await? {
             continue;
         }
-        if !is_recorded(records, &rec.preparation) {
-            return Err(unregistered_worktree());
-        }
+        check_worktree_record(registry, registry_file, &rec.preparation)?;
         check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)?;
         Box::pin(git.removal_candidates(
             transport_data_root,
@@ -1363,9 +1413,7 @@ pub(crate) async fn plan_external_git(
         if !branch_exists(&probe, &common, &rec.preparation.requested_branch, deadline).await? {
             continue;
         }
-        if !is_recorded(records, &rec.preparation) {
-            return Err(unregistered_worktree());
-        }
+        check_worktree_record(registry, registry_file, &rec.preparation)?;
         let branch_ref = format!("refs/heads/{}", rec.preparation.requested_branch);
         let (_, attachments) = worktree_registry_entries(&probe, &common, deadline).await?;
         if attachments.iter().any(|(wt_key, attached_branch)| {
@@ -1408,7 +1456,6 @@ pub async fn cleanup_stand_external_git(
     if workspaces.is_empty() {
         return Ok(report);
     }
-    let records = load_worktree_records(registry, registry_file);
     let git = WorkspaceGit::new()?;
     let probe = GitProbe::new()?;
     let mut fetches = CleanupFetches::default();
@@ -1439,17 +1486,18 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
                 continue;
             }
             Ok(true) => {}
         }
 
-        if let Err(error) = if is_recorded(&records, &rec.preparation) {
-            check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)
-        } else {
-            Err(unregistered_worktree())
-        } {
+        if let Err(error) = check_worktree_record(registry, registry_file, &rec.preparation)
+            .and_then(|()| {
+                check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)
+            })
+        {
             blocked_branches.insert(branch_key);
             report.worktrees.push(StandWorktreeOutcome {
                 worktree_path: eliot_core::display_path(&rec.preparation.worktree_path),
@@ -1457,6 +1505,7 @@ pub async fn cleanup_stand_external_git(
                 branch: rec.preparation.requested_branch.clone(),
                 outcome: "kept".to_owned(),
                 reason: Some(error.code),
+                detail: Some(*error.message),
             });
             continue;
         }
@@ -1472,6 +1521,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
                 continue;
             }
@@ -1499,6 +1549,7 @@ pub async fn cleanup_stand_external_git(
                     }
                     .to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
             } else {
                 report.worktrees.push(StandWorktreeOutcome {
@@ -1507,6 +1558,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "unknown".to_owned(),
                     reason: Some("workspace_write_guard_readback".to_owned()),
+                    detail: None,
                 });
             }
             continue;
@@ -1532,6 +1584,7 @@ pub async fn cleanup_stand_external_git(
                         branch: rec.preparation.requested_branch.clone(),
                         outcome: "unknown".to_owned(),
                         reason: Some("workspace_write_guard_readback".to_owned()),
+                        detail: None,
                     });
                     continue;
                 }
@@ -1544,6 +1597,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                 });
             }
             GuardedOutcome::Kept(code) => {
@@ -1557,6 +1611,7 @@ pub async fn cleanup_stand_external_git(
                         branch: rec.preparation.requested_branch.clone(),
                         outcome: "kept".to_owned(),
                         reason: Some(code),
+                        detail: None,
                     });
                 } else {
                     report.worktrees.push(StandWorktreeOutcome {
@@ -1565,6 +1620,7 @@ pub async fn cleanup_stand_external_git(
                         branch: rec.preparation.requested_branch.clone(),
                         outcome: "unknown".to_owned(),
                         reason: Some("workspace_write_guard_readback".to_owned()),
+                        detail: None,
                     });
                 }
             }
@@ -1585,6 +1641,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "unknown".to_owned(),
                     reason: Some(code),
+                    detail: None,
                 });
             }
         }
@@ -1608,6 +1665,7 @@ pub async fn cleanup_stand_external_git(
                 branch: rec.preparation.requested_branch.clone(),
                 outcome: "kept".to_owned(),
                 reason: Some("worktree_attached".to_owned()),
+                detail: None,
             });
             continue;
         }
@@ -1619,6 +1677,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
                 continue;
             }
@@ -1635,17 +1694,19 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
                 continue;
             }
             Ok(true) => {}
         }
-        if !is_recorded(&records, &rec.preparation) {
+        if let Err(error) = check_worktree_record(registry, registry_file, &rec.preparation) {
             report.branches.push(StandBranchOutcome {
                 repo_common_dir: eliot_core::display_path(&rec.preparation.repo_common_dir),
                 branch: rec.preparation.requested_branch.clone(),
                 outcome: "kept".to_owned(),
-                reason: Some("unregistered_worktree".to_owned()),
+                reason: Some(error.code),
+                detail: Some(*error.message),
             });
             continue;
         }
@@ -1667,6 +1728,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
                 continue;
             }
@@ -1694,6 +1756,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                 });
             }
             Err(error) => {
@@ -1707,6 +1770,7 @@ pub async fn cleanup_stand_external_git(
                     }
                     .to_owned(),
                     reason: Some(error.code),
+                    detail: None,
                 });
             }
         }
@@ -1893,12 +1957,12 @@ pub(crate) async fn plan_stand_artifact(
     refuse_parent_root(daemon_data_root, stand_root)?;
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
-    let records = load_worktree_records(&registry, &reg_name);
     Box::pin(plan_external_git(
         daemon_data_root,
         stand_root,
+        &registry,
+        &reg_name,
         &registration,
-        &records,
         fetches,
     ))
     .await?;

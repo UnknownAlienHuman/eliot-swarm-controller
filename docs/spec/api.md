@@ -2893,8 +2893,12 @@ creation. A missing registration refuses with `not_found`. One that exists but
 is not a plain file, exceeds the record size limit, or cannot be inspected,
 opened, read or parsed refuses with `not_allowed`. Both refusals precede any
 effect and name the exact lookup path; the second names the reason without
-quoting file content. `stand list` inspects registered stands with expiry and liveness
-state, and `stand prune` tears down expired registered stands.
+quoting file content. An existing worktree record or stand marker that cannot
+be used is refused the same way. `stand list` inspects registered stands with
+expiry and liveness state, and `stand prune` tears down expired registered
+stands. Both report every registry file they cannot use with its path and
+reason. `stand prune` never tears down such an entry, because it cannot prove
+its expiry or root, and exits 4.
 
 `stand down` requires that registry binding, the stand marker and the owner
 binding before any action. It refuses every daemon root the caller could resolve
@@ -2921,7 +2925,8 @@ contained branches in external repositories using `#885` write-fenced containmen
 and branch-deletion proofs. A worktree or branch from the stand Store is touched
 only when the external creation record matches its repository common directory,
 branch, creation OID and worktree path; otherwise it is kept
-(`unregistered_worktree`). Dirty, unmerged, or uncertain external worktrees or
+(`unregistered_worktree`, or `not_allowed` with the record path and failed step
+when the record exists but cannot be used). Dirty, unmerged, or uncertain external worktrees or
 branches keep the stand directory and registration (`retained`, CLI exit 4) so
 retried `stand down` after cleanup completes removal (CLI exit 0).
 
