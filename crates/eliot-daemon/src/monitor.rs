@@ -159,6 +159,8 @@ pub(crate) struct BackgroundProcessCandidate {
     /// Item id of the completing turn's only tool window containing the process
     /// start; `None` when several windows contain it.
     pub(crate) tool_item: Option<String>,
+    /// The binding used the harness's own tool times, not commit times.
+    pub(crate) native_times: bool,
 }
 
 #[derive(Clone, Default)]
@@ -552,7 +554,7 @@ impl Monitoring {
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
-        configured_mcp_programs: &[String],
+        configured_mcp_servers: &[eliot_core::ConfiguredMcpServer],
         context: &eliot_store::BackgroundWakeArmContext,
         secrets: &eliot_core::SecretPolicy,
     ) -> Result<Option<BackgroundProcessCandidate>> {
@@ -659,8 +661,7 @@ impl Monitoring {
             chain: Vec<u32>,
             command_line: String,
             command_truncated: bool,
-            tool_item: Option<String>,
-            tool_started_at: i64,
+            binding: ToolBinding,
         }
         let mut qualifying: Vec<QualifiedCandidate<'_>> = Vec::new();
         let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
@@ -677,9 +678,7 @@ impl Monitoring {
             else {
                 continue;
             };
-            let Some((tool_item, tool_started_at)) =
-                match_tool_window(proc_start_ms, &context.tool_windows)
-            else {
+            let Some(binding) = match_tool_window(proc_start_ms, &context.tool_windows) else {
                 continue;
             };
             let Some(chain) = harness_descendant_chain(
@@ -700,7 +699,7 @@ impl Monitoring {
                 node.image_path.as_deref(),
                 &node.argv,
                 node.command_line.as_deref(),
-                configured_mcp_programs,
+                configured_mcp_servers,
             ) {
                 continue;
             }
@@ -717,8 +716,7 @@ impl Monitoring {
                 chain,
                 command_line,
                 command_truncated,
-                tool_item,
-                tool_started_at,
+                binding,
             });
         }
 
@@ -740,7 +738,7 @@ impl Monitoring {
         // when a shell runtime (Git Bash) does not keep Windows parent links.
         let Some(winner) = qualifying.into_iter().max_by_key(|candidate| {
             (
-                candidate.tool_started_at,
+                candidate.binding.started_at,
                 std::cmp::Reverse(candidate.sample.record.identity.start_time),
                 std::cmp::Reverse(candidate.sample.record.identity.pid),
             )
@@ -752,7 +750,8 @@ impl Monitoring {
             identity: winner.sample.record.identity.clone(),
             command_line: winner.command_line,
             command_truncated: winner.command_truncated,
-            tool_item: winner.tool_item,
+            tool_item: winner.binding.item_id,
+            native_times: winner.binding.native_times,
         }))
     }
 
@@ -2664,10 +2663,9 @@ fn refresh_process_timestamps(processes: &mut [ProcessRecord], cache: &Cache) {
 const PROCESS_START_ROUNDING_MS: i64 = 16;
 #[cfg(not(windows))]
 const PROCESS_START_ROUNDING_MS: i64 = 1_000;
-/// Extra lower margin for a harness with no native tool times, whose
-/// `tool.started` time is the daemon commit. Measured commit lag was at most
-/// 6 ms with three concurrent Agents.
-const TOOL_COMMIT_LAG_MS: i64 = 100;
+/// Extra lower margin for a call without native tool times: its `tool.started`
+/// time is the daemon commit, which can trail the spawn under Store load.
+const TOOL_COMMIT_LAG_MS: i64 = 1_000;
 /// How long after its start a call with no recorded end can still spawn.
 const OPEN_CALL_SPAWN_MS: i64 = 1_000;
 /// Windows custody is the Agent's Job, so every member descends from the
@@ -2755,11 +2753,18 @@ fn matches_declared_command(
     })
 }
 
-/// The tool call binding of a process start: the item id when exactly one call
-/// contains it, and the start of the newest containing call.
-///
-/// The lower bound allows for start-time rounding, plus commit lag when the
-/// harness reports no tool times. The upper bound is the call's end. A call
+/// The tool call binding of a process start.
+struct ToolBinding {
+    /// The item id when exactly one call contains the start.
+    item_id: Option<String>,
+    /// The start of the newest containing call.
+    started_at: i64,
+    /// Every containing call used the harness's own times.
+    native_times: bool,
+}
+
+/// The lower bound allows for start-time rounding, plus commit lag when a call
+/// has no native tool times. The upper bound is the call's end. A call
 /// with no recorded end covers only its own spawn, because the turn's end is
 /// when a harness starts its helpers. While the harness still runs a call as
 /// its own background task, a process bound only to that call is skipped: the
@@ -2767,7 +2772,7 @@ fn matches_declared_command(
 fn match_tool_window(
     proc_start_ms: i64,
     tool_windows: &[eliot_store::BackgroundWakeToolWindow],
-) -> Option<(Option<String>, i64)> {
+) -> Option<ToolBinding> {
     let containing: Vec<_> = tool_windows
         .iter()
         .filter(|window| {
@@ -2785,8 +2790,16 @@ fn match_tool_window(
     match containing.as_slice() {
         [] => None,
         [window] if window.harness_waiting => None,
-        [window] => Some((Some(window.item_id.clone()), window.started_at)),
-        several => Some((None, several.iter().map(|window| window.started_at).max()?)),
+        [window] => Some(ToolBinding {
+            item_id: Some(window.item_id.clone()),
+            started_at: window.started_at,
+            native_times: window.native_clock,
+        }),
+        several => Some(ToolBinding {
+            item_id: None,
+            started_at: several.iter().map(|window| window.started_at).max()?,
+            native_times: several.iter().all(|window| window.native_clock),
+        }),
     }
 }
 

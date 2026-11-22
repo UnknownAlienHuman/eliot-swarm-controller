@@ -1564,12 +1564,12 @@ impl EventProcessor {
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
             }
-            if tool_use.run_in_background {
+            // Past the bound the end of this task could not be reported, so
+            // the call stays an ordinary one: a duplicate wake, never a lost one.
+            if tool_use.run_in_background && self.background_tools.len() < MAX_BACKGROUND_TOOLS {
                 data["native_background"] = json!(true);
-                if self.background_tools.len() < MAX_BACKGROUND_TOOLS {
-                    self.background_tools
-                        .insert(tool_use.id.clone(), turn_id.clone());
-                }
+                self.background_tools
+                    .insert(tool_use.id.clone(), turn_id.clone());
             }
             if let Some(command) = &tool_use.command {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());

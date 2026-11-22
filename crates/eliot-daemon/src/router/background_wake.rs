@@ -54,7 +54,7 @@ impl Router {
             (agent, context)
         };
 
-        let configured_mcp = eliot_core::extract_configured_mcp_programs(&agent.profile_snapshot);
+        let configured_mcp = eliot_core::extract_configured_mcp_servers(&agent.profile_snapshot);
         let secrets = self.secret_policy_snapshot();
         let Some(candidate) = self
             .inner
@@ -102,6 +102,7 @@ impl Router {
                 generation: agent.generation,
                 turn_id: turn_id.to_owned(),
                 tool_item_id,
+                native_times: candidate.native_times,
                 process: candidate.identity,
                 command_line: candidate.command_line,
                 command_truncated: candidate.command_truncated,

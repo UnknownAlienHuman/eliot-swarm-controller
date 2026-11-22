@@ -30,6 +30,8 @@ pub struct BackgroundWakeArmInput {
     pub generation: i64,
     pub turn_id: String,
     pub tool_item_id: Option<String>,
+    /// The tool binding used the harness's own times, not commit times.
+    pub native_times: bool,
     pub process: ProcessIdentity,
     pub command_line: String,
     pub command_truncated: bool,
@@ -69,7 +71,7 @@ pub struct BackgroundWakeToolWindow {
     pub item_id: String,
     pub started_at: i64,
     pub completed_at: Option<i64>,
-    /// `started_at` is the harness's own clock reading, not a commit time.
+    /// Both recorded edges are the harness's own clock, not commit times.
     pub native_clock: bool,
     /// The harness still runs this call as its own background task and will
     /// wake itself when the task ends.
@@ -173,9 +175,9 @@ impl Store {
                 .map_err(sql_error)?;
             rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
         };
-        let completed: HashMap<String, i64> = read_tool_times("tool.completed")?
+        let completed: HashMap<String, (i64, bool)> = read_tool_times("tool.completed")?
             .into_iter()
-            .map(|(item_id, completed_at, _, _)| (item_id, completed_at))
+            .map(|(item_id, completed_at, native, _)| (item_id, (completed_at, native)))
             .collect();
         // Harness background tasks that have ended. The kind has few rows, so
         // a bounded newest-first scan of its index stays short.
@@ -201,18 +203,19 @@ impl Store {
             .map_err(sql_error)?;
         context.tool_windows = read_tool_times("tool.started")?
             .into_iter()
-            .map(|(item_id, started_at, native_clock, native_background)| {
+            .map(|(item_id, started_at, native_start, native_background)| {
                 let task_end = ended.get(&item_id).copied();
+                let call_end = completed.get(&item_id).copied();
                 BackgroundWakeToolWindow {
                     completed_at: if native_background {
                         task_end
                     } else {
-                        completed.get(&item_id).copied()
+                        call_end.map(|(at, _)| at)
                     },
+                    native_clock: native_start && call_end.is_none_or(|(_, native)| native),
                     harness_waiting: native_background && task_end.is_none(),
                     item_id,
                     started_at,
-                    native_clock,
                 }
             })
             .collect();
@@ -405,8 +408,8 @@ impl Store {
             "INSERT INTO background_process_wakes (
                  id, agent, generation, turn_id, host_boot_id, pid, start_time,
                  command_line, command_truncated, output_tail, state, delivery_command_id,
-                 created_at, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'waiting', ?11, ?12, ?13)",
+                 created_at, expires_at, tool_time_basis
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'waiting', ?11, ?12, ?13, ?14)",
             params![
                 id,
                 agent_num,
@@ -421,6 +424,11 @@ impl Store {
                 delivery_command_id,
                 now,
                 input.expires_at,
+                if input.native_times {
+                    "native"
+                } else {
+                    "commit"
+                },
             ],
         )
         .map_err(sql_error)?;

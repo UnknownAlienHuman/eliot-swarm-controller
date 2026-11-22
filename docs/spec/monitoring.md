@@ -149,30 +149,35 @@ reads custody only. A candidate is a running `child` of the Agent generation wit
 a complete fresh snapshot. Its OS start time (Unix ms) falls inside a native tool
 call window of the completing turn.
 
-Codex and Claude report their own tool start and end times (`native_at_ms`), so a
-helper they start after the call ended is outside the window under any daemon load.
-The lower bound allows for process start rounding: 16 ms on Windows, one second on
-Linux (whole-second `btime`). OpenCode, Muse and Antigravity report no tool times,
-so their window uses the commit times of `tool.started` and `tool.completed`, with
-100 ms more below the start. Measured commit lag was at most 7 ms with three
-concurrent Agents. On those harnesses, a job spawned more than that margin before
-its `tool.started` commit is missed, and a helper spawned after the tool ended but
-before `tool.completed` commits is admitted. A call with no recorded end covers one
+Codex and Claude report their own tool start and end times (`native_at_ms`). When
+both edges are native, a helper they start after the call ended is outside the
+window under any daemon load, and the lower bound allows only for process start
+rounding: 16 ms on Windows, one second on Linux (whole-second `btime`). Every other
+call uses commit times: OpenCode, Muse and Antigravity, or a frame without a native
+time. Its lower bound is one second further below the `tool.started` commit. Commit
+lag has no fixed bound, so under heavy Store load a job spawned earlier than that
+margin is missed, and a helper spawned after the tool ended but before
+`tool.completed` commits is admitted. The wake row records which basis applied in
+`tool_time_basis` (`native` or `commit`). A call with no recorded end covers one
 second after its start, because a harness starts its own helpers at turn end.
 
 While a harness still runs a call as its own background task (`native_background`
 on `tool.started`), a process bound only to that call is not a candidate, because
 the harness wakes itself when the task ends. When `tool.background_ended` commits,
 the window closes at that time and a process that outlived the task becomes a
-candidate. Sampling order and daemon restarts do not change this.
+candidate. When Swarm cannot track the task it does not suppress: a call past the
+plugin's bound of 64 tracked tasks carries no `native_background`, so it can get a
+duplicate wake but not lose one. A daemon restart ends every live generation, so
+tracking never outlives the plugin that holds it.
 
 On Windows custody is the Agent's Job, so every member descends from the session
 and a parent chain may break at an exited launcher, as a detached job's does. On
 Linux custody is a process group, so the exact chain (at most 16 links) must reach
 the live `harness`. Neither chain may pass through the `plugin`. A candidate must
 also not be harness-owned: console hosts, harness runtimes, language
-servers, or Swarm or configured MCP servers. When a candidate's ancestor also
-qualifies, the ancestor wins. On Windows Swarm opens a query handle to the armed
+servers, or Swarm or configured MCP servers. A configured MCP server matches by its
+program and arguments, never by a generic launcher name such as `npx` or `node`.
+When a candidate's ancestor also qualifies, the ancestor wins. On Windows Swarm opens a query handle to the armed
 identity and keeps it only once the wake commits, so the exact exit code survives the harness closing
 its own handle. A refused or failed arm, a self-wake and every retirement close
 it. Without a handle (after a restart or a failed open), each check probes the
@@ -180,6 +185,13 @@ exact boot, PID and start time directly and reopens the handle while the process
 runs, so exit detection does not depend on the monitor target. An exit observed
 without a handle has an unknown code unless custody recorded one; on Unix the
 exit code is always unknown.
+
+Known limits:
+
+- The substring server exclusions in `is_harness_owned_process` can exclude a
+  wrapped command such as `cargo test -p eliot-mcp`.
+- A survivor whose Claude background task ends during a later turn is not woken,
+  because the newer turn makes the earlier one ineligible to arm.
 
 ## Process observation and terminal ordering
 

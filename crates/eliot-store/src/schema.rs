@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 100;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 101;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2396,6 +2396,19 @@ impl Store {
                      ON commands(target, generation, turn_id, created_at)
                      WHERE verb = 'steer' AND state IN ('accepted', 'queued');
                  INSERT INTO schema_migrations(version) VALUES (100);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 101 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE background_process_wakes ADD COLUMN tool_time_basis TEXT
+                     CHECK (tool_time_basis IS NULL OR tool_time_basis IN ('native', 'commit'));
+                 INSERT INTO schema_migrations(version) VALUES (101);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
