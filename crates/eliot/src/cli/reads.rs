@@ -1420,6 +1420,43 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         response.turns.turns_unknown_excluded,
         response.turns.turns_running_excluded,
     );
+    println!(
+        "  usage by role (input counts cache reads once; cache writes are in normalized input)"
+    );
+    println!(
+        "    context average uses retained session.usage observations; missing values are excluded"
+    );
+    println!(
+        "    {:<10} {:>7} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
+        "ROLE",
+        "AGENTS",
+        "INPUT",
+        "INPUT_N",
+        "OUTPUT",
+        "OUTPUT_N",
+        "AVG_CTX/CALL",
+        "CTX_OBS",
+        "CTX_N",
+        "CTX_MISS"
+    );
+    for (name, role) in [
+        ("managers", &response.by_role.managers),
+        ("executors", &response.by_role.executors),
+    ] {
+        println!(
+            "    {:<10} {:>7} {:>12} {:>8} {:>12} {:>8} {:>12} {:>8} {:>8} {:>9}",
+            name,
+            role.agents,
+            counter_cell(role.input_tokens),
+            role.input_samples,
+            counter_cell(role.output_tokens),
+            role.output_samples,
+            counter_cell(role.average_context_tokens),
+            role.context_observations,
+            role.context_samples,
+            role.context_missing,
+        );
+    }
     if response.swarm_mcp.is_empty() {
         println!("  swarm MCP calls per turn: none retained");
     } else {

@@ -1648,6 +1648,33 @@ swarm usage <agent> and swarm usage --agent <agent> for the same Agent scope;
 project and root scopes retain their flags. `swarm usage` renders this response as a compact table;
 `--json` keeps printing the raw response.
 
+`by_role` groups the Agents in the authorized usage scope into managers
+and executors. An Agent is a manager when any retained Agent has it as
+parent, including archived children outside the requested usage scope. The
+scope includes only its authorized Agent generations and usage; the child
+existence check adds no child identity or usage to the response.
+
+The role rows report normalized input (uncached input plus cached input once),
+output, and separate sample counts. `input_samples` and `output_samples` count
+completed-turn usage records that supplied those counters. Normalized uncached
+input includes cache writes once; cache writes are not added again as a
+separate counter.
+`average_context_tokens` averages observed `context_used_tokens` values from
+retained `session.usage` events for the authorized Agent generations. Each
+retained event is one context observation. `context_observations`,
+`context_samples`, and `context_missing` report total observations,
+valid occupancy samples, and observations without valid occupancy; missing
+values are excluded from the mean, which is rounded down to a whole token.
+Later retained observations are included.
+Adapters that emit no `session.usage` event or omit context occupancy provide no
+sample, so the mean describes observed snapshots rather than every possible
+model call. Event pruning is reflected by `history_complete` and its reason;
+that flag does not measure adapter sampling coverage.
+
+The role aggregates use all retained terminal-turn usage records and
+`session.usage` events in scope, independent of the bounded `first_calls`
+display list.
+
 `first_calls` reports known first-call input for exact retained Agent generations
 and turns within that same usage scope, newest completion first.
 `first_calls_truncated` marks older measured turns left out.
