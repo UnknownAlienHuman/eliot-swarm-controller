@@ -256,6 +256,8 @@ pub struct UnusableStandRegistration {
 pub struct StandRegistryScan {
     pub entries: Vec<StandEntry>,
     pub unusable: Vec<UnusableStandRegistration>,
+    /// Records an earlier build left at the former location: reported only.
+    pub former: Vec<UnusableStandRegistration>,
 }
 
 pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
@@ -542,7 +544,7 @@ pub fn former_stand_registrations() -> Vec<UnusableStandRegistration> {
                 );
                 UnusableStandRegistration {
                     detail: format!(
-                        "former registry location ({stand}); tear it down with the build that created it"
+                        "former registry location ({stand}); tear it down with the build that created it, or if that build is gone, stop its daemon and delete the stand directory and this file"
                     ),
                     registry_path: path.display().to_string(),
                 }

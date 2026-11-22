@@ -417,19 +417,25 @@ fn scan_registry() -> Result<StandRegistryScan, Failure> {
         Err(error) if error.code == "not_found" => StandRegistryScan::default(),
         Err(error) => return Err(Failure::for_read(error)),
     };
-    scan.unusable
-        .extend(eliot_daemon::operator::former_stand_registrations());
+    scan.former = eliot_daemon::operator::former_stand_registrations();
     Ok(scan)
 }
 
-fn print_unusable(unusable: &[UnusableStandRegistration]) {
+fn print_unusable(unusable: &[UnusableStandRegistration], former: &[UnusableStandRegistration]) {
     for item in unusable {
         println!("{} | unusable: {}", item.registry_path, item.detail);
+    }
+    for item in former {
+        println!("{} | {}", item.registry_path, item.detail);
     }
 }
 
 pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
-    let StandRegistryScan { entries, unusable } = scan_registry()?;
+    let StandRegistryScan {
+        entries,
+        unusable,
+        former,
+    } = scan_registry()?;
     let now = stand_now_ms();
     let mut stands = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -456,10 +462,10 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
             "removing_pid": entry.registration.removing_pid,
         }));
     }
-    let payload = json!({ "stands": stands, "unusable": unusable });
+    let payload = json!({ "stands": stands, "unusable": unusable, "former": former });
     if json_output {
         print_value(&payload, true);
-    } else if stands.is_empty() && unusable.is_empty() {
+    } else if stands.is_empty() && unusable.is_empty() && former.is_empty() {
         println!("No registered stands.");
     } else {
         for item in &stands {
@@ -473,13 +479,17 @@ pub(crate) async fn list(json_output: bool) -> Result<u8, Failure> {
                     .map_or_else(|| "none".to_owned(), |v| v.to_string()),
             );
         }
-        print_unusable(&unusable);
+        print_unusable(&unusable, &former);
     }
     Ok(0)
 }
 
 pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
-    let StandRegistryScan { entries, unusable } = scan_registry()?;
+    let StandRegistryScan {
+        entries,
+        unusable,
+        former,
+    } = scan_registry()?;
     let now = stand_now_ms();
     let mut results: Vec<Value> = Vec::with_capacity(entries.len());
     // An unusable registration cannot prove its expiry or root, so it is
@@ -538,10 +548,10 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
             }
         }
     }
-    let payload = json!({ "stands": results, "unusable": unusable });
+    let payload = json!({ "stands": results, "unusable": unusable, "former": former });
     if json_output {
         print_value(&payload, true);
-    } else if results.is_empty() && unusable.is_empty() {
+    } else if results.is_empty() && unusable.is_empty() && former.is_empty() {
         println!("No registered stands to prune.");
     } else {
         for item in &results {
@@ -579,7 +589,7 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
                 println!("  {message}");
             }
         }
-        print_unusable(&unusable);
+        print_unusable(&unusable, &former);
     }
     Ok(if any_blocked { 4 } else { 0 })
 }

@@ -2121,12 +2121,17 @@ pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
     };
     let resolved = resolved_through_existing(path);
     let resolved = eliot_core::workspace_path_key(&resolved.to_string_lossy()).into_owned();
+    // Windows also redirects a directory created directly under AppData, and
+    // each known folder can be relocated away from it.
+    let mut folders = vec![account_profile()?.join("AppData")];
     for id in [
         &FOLDERID_LocalAppData,
         &FOLDERID_RoamingAppData,
         &FOLDERID_LocalAppDataLow,
     ] {
-        let folder = known_folder(id)?;
+        folders.push(known_folder(id)?);
+    }
+    for folder in folders {
         let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
         let folder = eliot_core::workspace_path_key(&folder.to_string_lossy()).into_owned();
         if Path::new(&resolved).starts_with(Path::new(&folder)) {

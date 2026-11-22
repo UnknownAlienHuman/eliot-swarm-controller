@@ -31,9 +31,9 @@ Windows directory ACLs follow the narrow rule below.
 process inside an MSIX package to that package's private cache, and only
 processes in the package see the result. A daemon or CLI outside the package
 would use different files. A packaged process therefore refuses any data root
-under Local, LocalLow or Roaming AppData, including the default root, and refuses
-to write the selected-root pointer. Use `--data-dir` or `ELIOT_HOME` with a
-directory outside AppData.
+under the account's `AppData` directory or its Local, LocalLow or Roaming known
+folders, including the default root, and refuses to write the selected-root
+pointer. Use `--data-dir` or `ELIOT_HOME` with a directory outside AppData.
 
 Linux is distributed as the [supported Docker image](../../docker/README.md).
 It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
