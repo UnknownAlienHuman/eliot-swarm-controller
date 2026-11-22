@@ -63,6 +63,26 @@ fn retained_write_binding(
     Ok(Some(old_result))
 }
 
+fn retained_digest_write_binding(
+    connection: &rusqlite::Connection,
+    id: &str,
+    payload_digest: &[u8],
+) -> Result<Option<String>> {
+    let Some((principal, method, digest, result)) = write_binding(connection, id)? else {
+        return Ok(None);
+    };
+    if !matches!(principal.as_str(), "owner" | SWARM_MAIL_SENDER)
+        || method != MAIL_SEND_METHOD
+        || digest != payload_digest
+    {
+        return Err(Error::new(
+            "id_conflict",
+            "mail write id is bound to another principal, method, or payload",
+        ));
+    }
+    Ok(Some(result))
+}
+
 /// Whether one unread attention-thread message row (outer alias `m`) may prove
 /// a wake. Advisory copies never wake. An escalation thread wakes its
 /// recipient at most once per (recipient, thread) — the spent wake is recorded
@@ -205,11 +225,10 @@ const DELIVERY_COLUMNS: &str = "m.delivery_id,
 impl Store {
     fn prepare_mail_send(
         &self,
-        principal: &str,
+        sender: Sender,
         request: &MailSendRequest,
     ) -> Result<PreparedMailSend> {
         request.validate()?;
-        let sender = parse_sender(principal, "mail")?;
         if let Sender::Agent {
             num, generation, ..
         } = &sender
@@ -301,15 +320,15 @@ impl Store {
         now: i64,
         kind: MailSendKind,
     ) -> Result<MailSendResult> {
-        if !matches!(kind, MailSendKind::Ordinary) && principal != "owner" {
-            return Err(Error::new(
-                "not_allowed",
-                "Swarm service mail requires Owner authorization",
-            ));
-        }
         let allow_digest_id = matches!(kind, MailSendKind::Digest);
+        let sender = match kind {
+            MailSendKind::Ordinary => parse_sender(principal, "mail")?,
+            MailSendKind::Service if principal == "owner" => Sender::Owner,
+            MailSendKind::Digest if principal == SWARM_MAIL_SENDER => Sender::Owner,
+            _ => return Err(Error::new("not_allowed", "invalid service mail binding")),
+        };
         self.ensure_committed_reads()?;
-        let prepared = self.prepare_mail_send(principal, request)?;
+        let prepared = self.prepare_mail_send(sender, request)?;
         if command_binding(&self.connection, &request.id)?.is_some() {
             return Err(Error::new(
                 "id_conflict",
@@ -329,8 +348,13 @@ impl Store {
         // thread). A legacy receipt whose payload happens to match but
         // whose delivery thread differs would otherwise replay here and
         // the driver would advance the delivered mark off it.
-        let digest_bound = allow_digest_id && digest_id_bound(&self.connection, &request.id)?;
-        if !digest_bound
+        if allow_digest_id && !digest_id_bound(&self.connection, &request.id)? {
+            return Err(Error::new(
+                "id_conflict",
+                "completion digest registration is required",
+            ));
+        }
+        if !allow_digest_id
             && let Some(retained) = retained_write_binding(
                 &self.connection,
                 principal,
@@ -388,7 +412,8 @@ impl Store {
             ));
         }
         self.ensure_committed_reads()?;
-        const LEGACY_ADVISORY: &str = "sender = 'owner' AND thread GLOB 'attention-*-advisory'";
+        const LEGACY_ADVISORY: &str =
+            "sender IN ('owner', 'swarm') AND thread GLOB 'attention-*-advisory'";
         let count_matches = |connection: &rusqlite::Connection| {
             connection
                 .query_row(
@@ -1067,21 +1092,9 @@ impl Store {
                     // ensure the delivered mark, all in this transaction.
                     // A principal/method mismatch is still a conflicting
                     // rebinding.
-                    if let Some((old_principal, old_method, old_digest, old_result)) =
-                        write_binding(&tx, &request.id)?
+                    if let Some(old_result) =
+                        retained_digest_write_binding(&tx, &request.id, payload_digest)?
                     {
-                        if old_principal != principal || old_method != MAIL_SEND_METHOD {
-                            return Err(Error::new(
-                                "id_conflict",
-                                "mail write id is bound to another principal, method, or payload",
-                            ));
-                        }
-                        if old_digest != *payload_digest {
-                            return Err(Error::new(
-                                "id_conflict",
-                                "retained mail is not this digest's conversion",
-                            ));
-                        }
                         let delivery_id = format!("{}/{}", request.id, parent);
                         let stored_thread: Option<Option<String>> = tx
                             .query_row(
@@ -1123,14 +1136,9 @@ impl Store {
                     // Already delivered: no new mail under this id. Exact
                     // replays return retained; anything else conflicts without
                     // consuming.
-                    if let Some(old_result) = retained_write_binding(
-                        &tx,
-                        principal,
-                        &request.id,
-                        MAIL_SEND_METHOD,
-                        payload_digest,
-                        "mail write id is bound to another principal, method, or payload",
-                    )? {
+                    if let Some(old_result) =
+                        retained_digest_write_binding(&tx, &request.id, payload_digest)?
+                    {
                         let value =
                             serde_json::from_value::<MailSendResponse>(decode_json(&old_result)?)
                                 .map_err(|error| Error::new("internal", error.to_string()))?;
@@ -1188,7 +1196,7 @@ impl Store {
                 request.to == [parent]
                     && request.thread.as_deref() == Some(digest_thread(&request.id).as_str())
             });
-        let service_sender = matches!(kind, MailSendKind::Service) || digest_exempt;
+        let service_sender = matches!(kind, MailSendKind::Service | MailSendKind::Digest);
         if attention_write {
             validate_ulid(&request.id)?;
         } else if digest_exempt {
