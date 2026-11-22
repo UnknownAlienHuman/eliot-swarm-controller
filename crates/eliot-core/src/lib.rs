@@ -1045,7 +1045,7 @@ pub struct SessionCost {
 }
 
 impl SessionUsage {
-    /// Context comes from a single occupancy/window observation.
+    /// Returns an observed occupancy and its compatible context window.
     pub fn context_tokens(&self) -> Option<(i64, i64)> {
         let (used, window) = self.context_used_tokens.zip(self.context_window_tokens)?;
         (window > 0 && (0..=window).contains(&used)).then_some((used, window))

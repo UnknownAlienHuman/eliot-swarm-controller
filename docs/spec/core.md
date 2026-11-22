@@ -888,6 +888,10 @@ is cached input. `output_tokens` includes reasoning, and `reasoning_tokens`
 names that part of output when supplied. `cache_write_tokens` describes the
 portion written to cache. `total_tokens` is uncached input + cached input +
 output when all three are proven. Reported subtotals carry explicit coverage.
+When a harness includes cache hits in its input total or reports cache
+creation separately, the corresponding cache counter is required to
+establish uncached input. A missing split leaves uncached input unavailable
+and counts toward missing-input coverage, including on historical rows.
 Context occupancy and cumulative cost belong to session facts. A terminal
 without native turn counters keeps null usage.
 
@@ -898,10 +902,11 @@ milliseconds defaulted at the owning boundary). A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens`/`context_window_tokens` carry occupancy
-and capacity from the same native observation. Occupancy is available for
-a positive window with a value between zero and that window. `cumulative_tokens`
-projects input/output/cache counters on the same accounting basis as turns,
-and `cumulative_cost` carries the
+and capacity for the same model. An adapter can reuse an observed window
+when it can bind the reading to the same model or native turn. Occupancy is
+available for a positive window with a value between zero and that window.
+`cumulative_tokens` projects input/output/cache counters on the same
+accounting basis as turns, and `cumulative_cost` carries the
 verbatim native amount with its verbatim native unit (for example
 `usd_estimate` for an estimated USD total), never converted and never
 assumed to be money. There is no history table and no rollup: only the
@@ -910,11 +915,10 @@ latest snapshot reads back, through `agent.get`/`agent.stats`
 
 `usage.summary` is the one bounded totals read over one scope: one Agent
 (all retained generations, or one named generation, with observed native
-descendants registered under those generations), one project label, or one
-tree (a root Agent and its descendants). Scope expansion respects the caller's
-read authority, and each included (Agent, generation) pair counts once.
-It reports known subtotals with
-explicit coverage and never presents a partial sum as complete. Turn
+descendants registered under those generations, across each descendant's
+retained generations), one project label, or one tree (a root Agent and its
+descendants). Scope expansion respects the caller's read authority, and each
+included (Agent, generation) pair counts once. Subtotals carry explicit coverage. Turn
 expenditure sums each `TurnUsage` counter over retained terminal turns that
 supply it, grouped by native scope (`turn`, `main_loop_turn`, `message`,
 `unknown`): scopes never merge into a cross-scope total. The response carries

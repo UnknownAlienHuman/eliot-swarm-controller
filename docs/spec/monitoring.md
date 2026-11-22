@@ -1019,7 +1019,7 @@ Three event families capture heavy work, session growth, and vendor drift.
   the retained signal drops back under threshold. An absent or out-of-range
   context observation cannot trigger a context reaction. Suppliers are harness-native
   only: Codex `thread/tokenUsage/updated` (latest context occupancy against
-  `modelContextWindow` in the same frame), Claude stream-json plus the reported
+  `modelContextWindow` for the same turn or model), Claude stream-json plus the reported
   model window plus the transcript file size, Muse `session/contextUsage`,
   Antigravity ACP `usage_update`. OpenCode exposes no session-level signal
   through its API and the Muse event log exposes no size, so those stay

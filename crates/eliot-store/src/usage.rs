@@ -119,8 +119,9 @@ impl Store {
             let mut children = self.usage_native_descendants(num, request.generation, bound)?;
             let truncated = children.len() as i64 >= bound;
             children.truncate(bound.saturating_sub(1).max(0) as usize);
-            let agents_included = 1 + children.len();
-            pairs.extend(children);
+            let children = self.resolve_agent_scope(children)?;
+            let agents_included = 1 + children.agents_included;
+            pairs.extend(children.pairs);
             return Ok(ResolvedUsageScope {
                 pairs,
                 agents_included,
@@ -185,16 +186,15 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "WITH RECURSIVE native(id, generation) AS (
-                SELECT r.child, a.generation FROM native_child_registrations r
-                JOIN agents a ON a.id = r.child
+                "WITH RECURSIVE native(id) AS (
+                SELECT r.child FROM native_child_registrations r
                 WHERE r.parent = ?1 AND (?2 IS NULL OR r.parent_generation = ?2)
                 UNION
-                SELECT r.child, a.generation FROM native_child_registrations r
-                JOIN native n ON n.id = r.parent AND n.generation = r.parent_generation
-                JOIN agents a ON a.id = r.child
+                SELECT r.child FROM native_child_registrations r
+                JOIN native n ON n.id = r.parent
              )
-             SELECT id, generation FROM native ORDER BY id LIMIT ?3",
+             SELECT a.id, a.generation FROM native n JOIN agents a ON a.id = n.id
+             ORDER BY a.id LIMIT ?3",
             )
             .map_err(sql_error)?;
         statement

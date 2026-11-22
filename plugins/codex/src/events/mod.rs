@@ -86,6 +86,12 @@ pub(crate) struct TurnFacts {
     pub terminal: bool,
 }
 
+struct ContextWindow {
+    turn_id: String,
+    model: Option<String>,
+    tokens: i64,
+}
+
 pub(crate) struct EventConfig {
     pub credential: String,
     pub agent_id: String,
@@ -221,6 +227,9 @@ struct EventProcessor {
     /// repeated notification cannot double count and raw `last` values are
     /// never summed.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
+    thread_model: Option<String>,
+    usage_turn_model: Option<(String, String)>,
+    usage_window: Option<ContextWindow>,
     /// Latest merged session-scoped snapshot from
     /// `thread/tokenUsage/updated`: the cumulative per-thread `total` and
     /// `modelContextWindow` capacity. Never turn expenditure; committed as
@@ -456,6 +465,9 @@ impl EventProcessor {
             final_text: None,
             turn_has_work_or_uncertain_effects: false,
             turn_usage: None,
+            thread_model: None,
+            usage_turn_model: None,
+            usage_window: None,
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
@@ -788,6 +800,7 @@ impl EventProcessor {
         }
         self.native_scope = native_scope.clone();
         self.status.thread_id = Some(thread_id.clone());
+        self.thread_model = effective["model"].as_str().map(str::to_owned);
         let native_id = format!("codex:{thread_id}:session.ready");
         self.commit_event(
             "session.ready",
@@ -851,6 +864,13 @@ impl EventProcessor {
         self.final_text = None;
         self.turn_has_work_or_uncertain_effects = false;
         self.turn_usage = None;
+        let associated_model = model.as_ref().or(self.thread_model.as_ref()).cloned();
+        if let Some(window) = &mut self.usage_window
+            && window.turn_id == turn_id
+        {
+            window.model.clone_from(&associated_model);
+        }
+        self.usage_turn_model = associated_model.map(|model| (turn_id.clone(), model));
         let thread_id = self.status.thread_id.as_deref().unwrap_or_default();
         let native_id = event_id(thread_id, &turn_id, &turn_id, "turn.started")?;
         // Report the model/effort the native turn request actually carried,
@@ -1797,9 +1817,32 @@ impl EventProcessor {
                 }
             }
         }
-        let Some(merged) =
-            session_usage_from_token_usage(&notification.token_usage, self.session_usage.as_ref())
-        else {
+        let model = self
+            .usage_turn_model
+            .as_ref()
+            .filter(|(turn, _)| turn == &notification.turn_id)
+            .map(|(_, model)| model.as_str());
+        let cached_window = self
+            .usage_window
+            .as_ref()
+            .filter(|window| {
+                window.turn_id == notification.turn_id
+                    || (model.is_some() && model == window.model.as_deref())
+            })
+            .map(|window| window.tokens);
+        let merged = session_usage_from_token_usage(
+            &notification.token_usage,
+            self.session_usage.as_ref(),
+            cached_window,
+        );
+        if let Some(tokens) = notification.token_usage.model_context_window {
+            self.usage_window = (tokens > 0).then(|| ContextWindow {
+                turn_id: notification.turn_id.clone(),
+                model: model.map(str::to_owned),
+                tokens,
+            });
+        }
+        let Some(merged) = merged else {
             return Ok(());
         };
         self.session_usage = Some(merged.clone());
@@ -2295,10 +2338,11 @@ fn turn_usage_from_delta(delta: &NativeTokenUsageDelta) -> Option<TurnUsage> {
 /// Merge one `thread/tokenUsage/updated` body into the retained session
 /// snapshot: the cumulative per-thread `total` replaces the retained
 /// cumulative counters (input/output/cache only, never a derived total),
-/// Codex's latest response total and window are read from the same frame.
+/// The latest response can use an earlier window for the same model or turn.
 fn session_usage_from_token_usage(
     token_usage: &NativeThreadTokenUsage,
     previous: Option<&SessionUsage>,
+    cached_window: Option<i64>,
 ) -> Option<SessionUsage> {
     let counter = |value: Option<i64>| value.filter(|value| *value >= 0);
     let mut merged = previous.cloned().unwrap_or(SessionUsage {
@@ -2333,9 +2377,9 @@ fn session_usage_from_token_usage(
     let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
     if has_response {
         merged.context_used_tokens = last.total_tokens;
-        merged.context_window_tokens = token_usage.model_context_window;
+        merged.context_window_tokens = token_usage.model_context_window.or(cached_window);
     } else if let Some(window) = token_usage.model_context_window
-        && merged.context_window_tokens != Some(window)
+        && (cached_window.is_none() || merged.context_window_tokens != Some(window))
     {
         // A capacity-only update cannot pair a new window with old occupancy.
         merged.context_used_tokens = None;

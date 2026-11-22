@@ -504,8 +504,9 @@ when accepted (source `codex:thread/tokenUsage/updated`), with `observed_at`
 captured at acceptance: the cumulative `total` replaces
 the retained input/output/cache counters (never a derived total),
 `last.totalTokens` projects to context occupancy for a model response
-against `modelContextWindow` from the same notification when it fits in the
-window. The Store removes cache hits from Codex's cache-inclusive
+against `modelContextWindow` when it fits in the window. A response without
+capacity can reuse a window observed for the same turn or associated model.
+The Store removes cache hits from Codex's cache-inclusive
 `inputTokens` when projecting usage reads. Account-level
 cost/credits (`GetAccountTokenUsage`) stay account scope. Missing per-turn
 counters stay null. Idle updates merge and commit without waiting for a
