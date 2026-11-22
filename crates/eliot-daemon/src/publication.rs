@@ -23,7 +23,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::{process::Command, sync::watch, time::Instant};
@@ -50,6 +53,61 @@ pub(crate) struct GitPublishExecutionContext<'a> {
     pub secret_policy: Arc<SecretPolicy>,
 }
 
+static TEMP_GIT_INDEX_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct TemporaryGitIndex {
+    directory: PathBuf,
+    index_file: PathBuf,
+}
+
+impl TemporaryGitIndex {
+    fn create() -> Result<Self> {
+        let temp_root = fs::canonicalize(std::env::temp_dir()).map_err(|_| {
+            Error::new(
+                "unavailable",
+                "private Git publication temp directory cannot be resolved",
+            )
+        })?;
+        for _ in 0..32 {
+            let sequence = TEMP_GIT_INDEX_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = temp_root.join(format!(
+                "eliot-git-publish-{}-{sequence}",
+                std::process::id()
+            ));
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&directory) {
+                Ok(()) => {
+                    return Ok(Self {
+                        index_file: directory.join("index"),
+                        directory,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => break,
+            }
+        }
+        Err(Error::new(
+            "unavailable",
+            "private Git publication index cannot be created",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.index_file
+    }
+}
+
+impl Drop for TemporaryGitIndex {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 struct PublishCommitContext<'a> {
     router: &'a crate::router::Router,
     data_root: &'a Path,
@@ -61,6 +119,7 @@ struct PublishCommitContext<'a> {
     commit_oid: String,
     commit_subject: String,
     committed: bool,
+    index_file: Option<&'a Path>,
     cancellation: watch::Receiver<bool>,
     secret_policy: Arc<SecretPolicy>,
 }
@@ -329,15 +388,73 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
             }
         }
     };
-    let stage_args = ["add", "--all"];
-    let staged = if existing_commit {
+    let private_index = if existing_commit {
         None
     } else {
+        match TemporaryGitIndex::create() {
+            Ok(index) => Some(index),
+            Err(_) => {
+                return execution(
+                    CommandState::Rejected,
+                    "native_not_dispatched",
+                    json!({}),
+                    None,
+                );
+            }
+        }
+    };
+    let index_file = private_index.as_ref().map(TemporaryGitIndex::path);
+    if let Some(index_file) = index_file {
+        let read_tree_args = ["read-tree", frozen.head_oid.as_str()];
+        let initialized = match git
+            .workspace_effect_command_with_index(
+                root,
+                &read_tree_args,
+                index_file,
+                timeout,
+                Arc::clone(&secret_policy),
+                cancellation.clone(),
+            )
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                return execution(
+                    CommandState::Rejected,
+                    "native_not_dispatched",
+                    json!({}),
+                    None,
+                );
+            }
+        };
+        match effect_exit(&initialized) {
+            Some(0) if effect_quiescent(&initialized) => {}
+            Some(_) if effect_is_definite_exit(&initialized) => {
+                return execution(
+                    CommandState::Failed,
+                    "git_publish_stage_failed",
+                    json!({"code":"git_publish_stage_failed"}),
+                    None,
+                );
+            }
+            _ => {
+                return execution(
+                    CommandState::Unknown,
+                    "git_publish_stage_outcome_unknown",
+                    json!({"code":"git_publish_stage_outcome_unknown"}),
+                    None,
+                );
+            }
+        }
+    }
+    let stage_args = ["add", "--all"];
+    let staged = if let Some(index_file) = index_file {
         Some(
             match git
-                .workspace_effect_command(
+                .workspace_effect_command_with_index(
                     root,
                     &stage_args,
+                    index_file,
                     timeout,
                     Arc::clone(&secret_policy),
                     cancellation.clone(),
@@ -355,6 +472,8 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                 }
             },
         )
+    } else {
+        None
     };
     if let Some(staged) = &staged {
         match effect_exit(staged) {
@@ -379,14 +498,13 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     }
 
     let diff_args = ["diff", "--cached", "--quiet"];
-    let staged_diff = if existing_commit {
-        None
-    } else {
+    let staged_diff = if let Some(index_file) = index_file {
         Some(
             match git
-                .workspace_effect_command(
+                .workspace_effect_command_with_index(
                     root,
                     &diff_args,
+                    index_file,
                     timeout,
                     Arc::clone(&secret_policy),
                     cancellation.clone(),
@@ -404,6 +522,8 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                 }
             },
         )
+    } else {
+        None
     };
     if let Some(staged_diff) = &staged_diff {
         match effect_exit(staged_diff) {
@@ -488,6 +608,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
             commit_oid,
             commit_subject,
             committed: false,
+            index_file: None,
             cancellation,
             secret_policy,
         })
@@ -502,7 +623,15 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
             None,
         );
     };
-    let tree = match checked_commit_tree(&git, root, frozen, contents, timeout).await {
+    let Some(index_file) = index_file else {
+        return execution(
+            CommandState::Failed,
+            "git_publish_temporary_index_missing",
+            json!({}),
+            None,
+        );
+    };
+    let tree = match checked_commit_tree(&git, root, frozen, contents, index_file, timeout).await {
         Ok(tree) => tree,
         Err(_) => {
             return execution(
@@ -526,9 +655,10 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
         subject,
     ];
     let committed = match git
-        .workspace_effect_command(
+        .workspace_effect_command_with_index(
             root,
             &commit_args,
+            index_file,
             timeout,
             Arc::clone(&secret_policy),
             cancellation.clone(),
@@ -574,7 +704,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     }
     let branch_ref = format!("refs/heads/{}", frozen.branch);
     let updated = match git
-        .workspace_effect_command(
+        .workspace_effect_command_with_index(
             root,
             &[
                 "update-ref",
@@ -583,6 +713,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                 commit_object,
                 &frozen.head_oid,
             ],
+            index_file,
             timeout,
             Arc::clone(&secret_policy),
             cancellation.clone(),
@@ -599,7 +730,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
             );
         }
     };
-    let commit_oid = match verify_commit_readback(&git, root, frozen, timeout).await {
+    let commit_oid = match verify_commit_readback(&git, root, frozen, index_file, timeout).await {
         Ok(Some(oid)) if oid == commit_object => oid,
         Ok(None) if effect_is_definite_exit(&updated) => {
             return execution(
@@ -630,6 +761,7 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
         commit_oid,
         commit_subject: frozen.check.subject.clone(),
         committed: true,
+        index_file: Some(index_file),
         cancellation,
         secret_policy,
     })
@@ -648,12 +780,13 @@ async fn publish_commit(context: PublishCommitContext<'_>) -> GitPublishExecutio
         commit_oid,
         commit_subject,
         committed,
+        index_file,
         cancellation,
         secret_policy,
     } = context;
     let timeout = Duration::from_millis(frozen.timeout_ms as u64);
     if router.verify_git_publish_state(frozen).await.is_err()
-        || verify_committed_workspace(git, root, &frozen.branch, &commit_oid)
+        || verify_committed_workspace(git, root, &frozen.branch, &commit_oid, timeout, index_file)
             .await
             .is_err()
         || automation::verify_project_registration(data_root, registration)
@@ -716,9 +849,16 @@ async fn publish_commit(context: PublishCommitContext<'_>) -> GitPublishExecutio
             );
         }
         if router.verify_git_publish_state(frozen).await.is_err()
-            || verify_committed_workspace(git, root, &frozen.branch, &commit_oid)
-                .await
-                .is_err()
+            || verify_committed_workspace(
+                git,
+                root,
+                &frozen.branch,
+                &commit_oid,
+                timeout,
+                index_file,
+            )
+            .await
+            .is_err()
             || automation::verify_project_registration(data_root, registration)
                 .await
                 .is_err()
@@ -1152,12 +1292,13 @@ async fn checked_commit_tree(
     root: &Path,
     frozen: &FrozenGitPublish,
     contents: &BTreeMap<String, String>,
+    index_file: &Path,
     timeout: Duration,
 ) -> Result<String> {
     let deadline = Instant::now()
         .checked_add(timeout)
         .ok_or_else(|| Error::new("invalid", "git.publish timeout is out of range"))?;
-    let tree = read_git_line(git, root, &["write-tree"], deadline).await?;
+    let tree = read_git_line_with_index(git, root, &["write-tree"], index_file, deadline).await?;
     if !is_git_oid(&tree) {
         return Err(Error::new("source_integrity", "Git staged tree is invalid"));
     }
@@ -1207,6 +1348,7 @@ async fn verify_commit_readback(
     git: &GitProbe,
     root: &Path,
     frozen: &FrozenGitPublish,
+    index_file: &Path,
     timeout: Duration,
 ) -> Result<Option<String>> {
     let (branch, head) = read_branch_and_head(git, root, timeout).await?;
@@ -1218,17 +1360,23 @@ async fn verify_commit_readback(
         .ok_or_else(|| Error::new("invalid", "git.publish timeout is out of range"))?;
     let parent = read_git_line(git, root, &["rev-parse", "--verify", "HEAD^"], deadline).await?;
     let subject = read_git_line(git, root, &["log", "-1", "--format=%s"], deadline).await?;
-    let status = git
-        .workspace_command(
+    let worktree_diff = git
+        .workspace_command(root, &["diff", "--quiet", head.as_str(), "--"], deadline)
+        .await?;
+    let untracked = git
+        .workspace_command_with_index(
             root,
-            &["status", "--porcelain=v2", "--untracked-files=all"],
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            index_file,
             deadline,
         )
         .await?;
     if branch != frozen.branch
         || parent != frozen.head_oid
         || subject != frozen.check.subject
-        || !status.stdout.is_empty()
+        || worktree_diff.code != 0
+        || untracked.code != 0
+        || !untracked.stdout.is_empty()
     {
         return Err(Error::new(
             "unknown",
@@ -1243,15 +1391,32 @@ async fn verify_committed_workspace(
     root: &Path,
     branch: &str,
     commit_oid: &str,
+    timeout: Duration,
+    index_file: Option<&Path>,
 ) -> Result<()> {
-    let root = root
-        .to_str()
-        .ok_or_else(|| Error::new("invalid", "publication workspace is not UTF-8"))?;
-    let snapshot = git.probe(root, None, None, &[], now_ms()).await?;
-    if !snapshot.complete
-        || snapshot.branch.as_deref() != Some(branch)
-        || snapshot.head.as_deref() != Some(commit_oid)
-        || !snapshot.dirty.is_empty()
+    let (actual_branch, actual_head) = read_branch_and_head(git, root, timeout).await?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| Error::new("invalid", "git.publish timeout is out of range"))?;
+    let worktree_diff = git
+        .workspace_command(root, &["diff", "--quiet", commit_oid, "--"], deadline)
+        .await?;
+    let untracked_args = ["ls-files", "--others", "--exclude-standard", "-z"];
+    let untracked = match index_file {
+        Some(index_file) => {
+            git.workspace_command_with_index(root, &untracked_args, index_file, deadline)
+                .await?
+        }
+        None => {
+            git.workspace_command(root, &untracked_args, deadline)
+                .await?
+        }
+    };
+    if actual_branch != branch
+        || actual_head != commit_oid
+        || worktree_diff.code != 0
+        || untracked.code != 0
+        || !untracked.stdout.is_empty()
     {
         return Err(Error::new(
             "stale_generation",
@@ -1268,10 +1433,27 @@ async fn read_git_line(
     deadline: Instant,
 ) -> Result<String> {
     let output = git.workspace_command(root, args, deadline).await?;
-    if output.code != 0 {
+    parse_git_line(output.code, &output.stdout)
+}
+
+async fn read_git_line_with_index(
+    git: &GitProbe,
+    root: &Path,
+    args: &[&str],
+    index_file: &Path,
+    deadline: Instant,
+) -> Result<String> {
+    let output = git
+        .workspace_command_with_index(root, args, index_file, deadline)
+        .await?;
+    parse_git_line(output.code, &output.stdout)
+}
+
+fn parse_git_line(code: i32, stdout: &[u8]) -> Result<String> {
+    if code != 0 {
         return Err(Error::new("unavailable", "Git readback failed"));
     }
-    let text = std::str::from_utf8(&output.stdout)
+    let text = std::str::from_utf8(stdout)
         .map_err(|_| Error::new("source_integrity", "Git readback is not UTF-8"))?;
     let line = text.trim_end_matches(['\r', '\n']);
     if line.is_empty()

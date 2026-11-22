@@ -995,7 +995,9 @@ performs no push or PR; if the checked branch already contains commits ahead of 
 a configured remote may publish that exact HEAD without creating another commit.
 
 `git.publish` commits the nonignored changes from the passed snapshot using the
-answer subject. It verifies the staged contents, writes the commit from that
+answer subject. It initializes one private, command-owned `GIT_INDEX_FILE` from
+the checked HEAD and stages with `git add --all`, leaving the Agent's index
+untouched. It verifies the staged contents, writes the commit from that
 immutable tree, and updates the managed branch only if it still points to the
 checked parent. It uses bounded Git argv and existing process custody with hooks
 disabled. A named `remote` selects only an Owner-approved
@@ -1008,9 +1010,11 @@ answer subject, the configured base ref is literal, and the existing owner-selec
 SSH and implicit remote/credential fallbacks are unsupported.
 
 The command is committed before any Git or GitHub effect. Each effect is attempted at most
-once. Commit readback must prove the new HEAD's exact parent, subject, branch, and clean
-worktree. Push readback must prove the configured remote ref equals that commit. PR creation
-uses the explicit repository/branch/base and readback; any uncertain push or PR stays
+once. Commit readback must prove the new HEAD's exact parent, subject, branch, matching
+tracked worktree, and absence of untracked paths relative to the private index. The preserved
+Agent index is not a cleanliness check after the branch update. Push readback must prove the
+configured remote ref equals that commit. PR creation uses the explicit repository/branch/base
+and readback; any uncertain push or PR stays
 `unknown` and is never replayed. A known failed effect is not rolled back; Store command
 state remains authoritative, and private transport cleanup follows durable settlement.
 These actions do not intercept Git run by a coding harness or Run script. There is no

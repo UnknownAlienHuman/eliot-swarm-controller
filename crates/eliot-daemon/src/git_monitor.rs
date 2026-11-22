@@ -1095,6 +1095,28 @@ impl GitProbe {
         self.run(root, args, &overrides, &[], deadline).await
     }
 
+    /// Read using one explicitly scoped index file, without inheriting any
+    /// caller-provided Git index override.
+    pub(crate) async fn workspace_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        self.run_scoped_with_index(
+            root,
+            args,
+            &overrides,
+            &[],
+            deadline,
+            None,
+            Some(index_file),
+        )
+        .await
+    }
+
     /// Run one explicitly dispatched local Git mutation under the same
     /// sanitized config and leaf-process fence as Git observation. Callers
     /// own durable dispatch and settlement around this one attempt.
@@ -1106,6 +1128,41 @@ impl GitProbe {
         policy: std::sync::Arc<eliot_core::SecretPolicy>,
         cancellation: tokio::sync::watch::Receiver<bool>,
     ) -> Result<crate::scripts::process::ProcessOutcome> {
+        self.workspace_effect_command_scoped(root, args, None, timeout, policy, cancellation)
+            .await
+    }
+
+    /// Run one explicitly dispatched local Git mutation with a private index
+    /// scoped to this command.
+    pub(crate) async fn workspace_effect_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: &Path,
+        timeout: Duration,
+        policy: std::sync::Arc<eliot_core::SecretPolicy>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::scripts::process::ProcessOutcome> {
+        self.workspace_effect_command_scoped(
+            root,
+            args,
+            Some(index_file),
+            timeout,
+            policy,
+            cancellation,
+        )
+        .await
+    }
+
+    async fn workspace_effect_command_scoped(
+        &self,
+        root: &Path,
+        args: &[&str],
+        index_file: Option<&Path>,
+        timeout: Duration,
+        policy: std::sync::Arc<eliot_core::SecretPolicy>,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<crate::scripts::process::ProcessOutcome> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| Error::new("invalid", "Git effect timeout is out of range"))?;
@@ -1113,7 +1170,7 @@ impl GitProbe {
         if Instant::now() >= deadline {
             return Err(unavailable("Git effect preparation deadline elapsed"));
         }
-        let command = self.build_command(root, args, &overrides, None)?;
+        let command = self.build_command_with_index(root, args, &overrides, None, index_file)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(unavailable("Git effect preparation deadline elapsed"));
@@ -1276,6 +1333,17 @@ impl GitProbe {
         overrides: &[(String, String)],
         binding: Option<GitBinding<'_>>,
     ) -> Result<Command> {
+        self.build_command_with_index(root, args, overrides, binding, None)
+    }
+
+    fn build_command_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        binding: Option<GitBinding<'_>>,
+        index_file: Option<&Path>,
+    ) -> Result<Command> {
         let mut command = Command::new(&self.program);
         command.current_dir(root).env_clear();
         if let Some(binding) = binding {
@@ -1283,6 +1351,9 @@ impl GitProbe {
                 .env("GIT_DIR", git_path_argument(binding.git_dir)?)
                 .env("GIT_COMMON_DIR", git_path_argument(binding.common_dir)?)
                 .env("GIT_WORK_TREE", git_path_argument(root)?);
+        }
+        if let Some(index_file) = index_file {
+            command.env("GIT_INDEX_FILE", git_path_argument(index_file)?);
         }
         // Only the executable's trusted directory is searched by Git's own helpers.
         let executable_dir = self
@@ -1377,7 +1448,21 @@ impl GitProbe {
         deadline: Instant,
         binding: Option<GitBinding<'_>>,
     ) -> Result<Captured> {
-        let command = self.build_command(root, args, overrides, binding)?;
+        self.run_scoped_with_index(root, args, overrides, input, deadline, binding, None)
+            .await
+    }
+
+    async fn run_scoped_with_index(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        input: &[u8],
+        deadline: Instant,
+        binding: Option<GitBinding<'_>>,
+        index_file: Option<&Path>,
+    ) -> Result<Captured> {
+        let command = self.build_command_with_index(root, args, overrides, binding, index_file)?;
         let (code, stdout) = Self::capture_git(command, input, deadline, |stdout| {
             bounded_read(stdout, OUTPUT_BYTES)
         })
