@@ -2871,10 +2871,18 @@ When run inside a managed Agent session with inherited credentials, omitting
 and `stand up` automatically registers the stand with the issuing parent daemon
 via `artifact.register` (`kind: data_dir`, `purpose: SWARM_STAND_ARTIFACT_PURPOSE`,
 `expires_at`). Otherwise `SWARM_STANDS_ROOT` selects the designated parent,
-defaulting to the fixed stand home: `EliotStands` under the account's Local
-AppData Known Folder on Windows, or `.local/state/eliot-stands` under the
-account's password-database home on Unix. The private registry always lives in
+defaulting to the fixed stand home: `.eliot-stands` under the account's profile
+Known Folder on Windows, or `.local/state/eliot-stands` under the account's
+password-database home on Unix. The private registry always lives in
 `.registry` under that fixed stand home; no environment variable selects it.
+On Windows the home is outside AppData because Windows redirects AppData writes
+from a process inside an MSIX package, such as a shell started by Claude
+Desktop, to that package's private cache, where the out-of-package stand daemon
+cannot see them. A packaged process refuses a stand root or designated parent
+under AppData ([packaged-process rule](configuration.md#private-data-directory)).
+`stand list` and `stand prune` report a registration an earlier build left in
+`%LOCALAPPDATA%\EliotStands\.registry` and never use it; the build that created
+it tears it down.
 It binds the random creation token to the canonical stand path outside the
 stand itself and records the handle identity (volume serial and file index) of
 the directory `stand up` created and the issuing daemon root when created

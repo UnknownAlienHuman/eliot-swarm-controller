@@ -275,10 +275,12 @@ pub fn parse_stand_ttl_ms(value: &str) -> Result<i64> {
 }
 
 /// The per-user stand home from the account profile (Known Folder on Windows,
-/// the password database on Unix). The process environment cannot move it.
+/// the password database on Unix). The process environment cannot move it. On
+/// Windows it stays outside AppData, so a CLI inside an MSIX package and the
+/// out-of-package stand daemon see the same files.
 #[cfg(windows)]
 fn fixed_stand_home() -> Result<PathBuf> {
-    crate::platform::windows::account_local_app_data().map(|path| path.join("EliotStands"))
+    crate::platform::windows::account_profile().map(|path| path.join(".eliot-stands"))
 }
 
 #[cfg(unix)]
@@ -335,6 +337,7 @@ fn checked_stand_dir(base: PathBuf, create: bool) -> Result<PathBuf> {
             format!("resolve designated stand root: {error}"),
         )
     })?;
+    crate::platform::data_dir::refuse_package_redirected(&base)?;
     if base.components().any(|part| part == Component::ParentDir) {
         return Err(Error::new(
             "invalid",
@@ -503,6 +506,53 @@ pub fn list_stand_registrations(registry: &Path) -> Result<StandRegistryScan> {
             })
     });
     Ok(scan)
+}
+
+/// Registrations an earlier build left in the former AppData stand home. They
+/// are reported and never used: the build that created them tears them down.
+pub fn former_stand_registrations() -> Vec<UnusableStandRegistration> {
+    #[cfg(windows)]
+    {
+        let Ok(local) = crate::platform::windows::account_local_app_data() else {
+            return Vec::new();
+        };
+        let dir = local.join("EliotStands").join(".registry");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(error) => {
+                return vec![UnusableStandRegistration {
+                    registry_path: dir.display().to_string(),
+                    detail: format!("former stand registry cannot be listed: {error}"),
+                }];
+            }
+        };
+        let mut former: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension().is_some_and(|ext| ext == "json")
+                    && !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            })
+            .map(|path| {
+                let stand = read_record::<StandRegistration>(&path).map_or_else(
+                    |_| "unreadable stand".to_owned(),
+                    |record| format!("stand {}", record.marker.root.display()),
+                );
+                UnusableStandRegistration {
+                    detail: format!(
+                        "former registry location ({stand}); tear it down with the build that created it"
+                    ),
+                    registry_path: path.display().to_string(),
+                }
+            })
+            .collect();
+        former.sort_by(|left, right| left.registry_path.cmp(&right.registry_path));
+        former
+    }
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 /// A refusal before any effect, so a caller on a write path never reports it

@@ -27,6 +27,14 @@ Default `%LOCALAPPDATA%\Eliot` or `~/.local/share/eliot`; override with `ELIOT_H
 symlink and reparse traversal is refused. Private files remain current-user-only.
 Windows directory ACLs follow the narrow rule below.
 
+**Packaged-process rule (Windows).** Windows redirects AppData writes from a
+process inside an MSIX package to that package's private cache, and only
+processes in the package see the result. A daemon or CLI outside the package
+would use different files. A packaged process therefore refuses any data root
+under Local, LocalLow or Roaming AppData, including the default root, and refuses
+to write the selected-root pointer. Use `--data-dir` or `ELIOT_HOME` with a
+directory outside AppData.
+
 Linux is distributed as the [supported Docker image](../../docker/README.md).
 It runs as UID/GID 10001 with `ELIOT_HOME=/data`, an owned mode-0700 volume;
 existing unsafe mounts are refused without chmod/chown repair. Native executable

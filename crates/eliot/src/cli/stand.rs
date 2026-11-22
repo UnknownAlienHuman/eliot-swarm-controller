@@ -412,11 +412,14 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
 }
 
 fn scan_registry() -> Result<StandRegistryScan, Failure> {
-    match stand_registry(false) {
-        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read),
-        Err(error) if error.code == "not_found" => Ok(StandRegistryScan::default()),
-        Err(error) => Err(Failure::for_read(error)),
-    }
+    let mut scan = match stand_registry(false) {
+        Ok(registry) => list_stand_registrations(&registry).map_err(Failure::for_read)?,
+        Err(error) if error.code == "not_found" => StandRegistryScan::default(),
+        Err(error) => return Err(Failure::for_read(error)),
+    };
+    scan.unusable
+        .extend(eliot_daemon::operator::former_stand_registrations());
+    Ok(scan)
 }
 
 fn print_unusable(unusable: &[UnusableStandRegistration]) {

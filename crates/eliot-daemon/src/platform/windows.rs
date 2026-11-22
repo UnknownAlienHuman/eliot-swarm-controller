@@ -2063,13 +2063,93 @@ pub(crate) fn available_disk_space(path: &Path) -> Result<u64> {
 /// The current account's Local AppData folder from the Known Folder API.
 /// The process environment cannot redirect it.
 pub(crate) fn account_local_app_data() -> Result<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData)
+}
+
+/// The current account's profile directory from the Known Folder API. Windows
+/// does not redirect a packaged process's writes here, unlike AppData.
+pub(crate) fn account_profile() -> Result<PathBuf> {
+    known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Profile)
+}
+
+/// The MSIX package this process belongs to, fixed for its lifetime.
+fn current_package() -> Option<&'static str> {
+    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+    use windows_sys::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+    static PACKAGE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PACKAGE
+        .get_or_init(|| {
+            let mut length = 0u32;
+            // SAFETY: a zero length with a null buffer asks only for the size.
+            let status = unsafe { GetCurrentPackageFullName(&mut length, null_mut()) };
+            if status != ERROR_INSUFFICIENT_BUFFER || length == 0 {
+                return None;
+            }
+            let mut name = vec![0u16; length as usize];
+            // SAFETY: `name` holds the `length` UTF-16 units the API asked for.
+            let status = unsafe { GetCurrentPackageFullName(&mut length, name.as_mut_ptr()) };
+            (status == ERROR_SUCCESS)
+                .then(|| String::from_utf16_lossy(&name[..length.saturating_sub(1) as usize]))
+        })
+        .as_deref()
+}
+
+/// `path` with its longest existing prefix resolved, for a path that may not
+/// exist yet.
+fn resolved_through_existing(path: &Path) -> PathBuf {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    for ancestor in absolute.ancestors() {
+        if let Ok(resolved) = std::fs::canonicalize(ancestor) {
+            return match absolute.strip_prefix(ancestor) {
+                Ok(rest) if !rest.as_os_str().is_empty() => resolved.join(rest),
+                _ => resolved,
+            };
+        }
+    }
+    absolute
+}
+
+/// Refuse a path under AppData from a process inside an MSIX package: Windows
+/// sends its writes there to the package's private cache, where a process
+/// outside the package, such as a WMI-started daemon, cannot see them.
+pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, FOLDERID_LocalAppDataLow, FOLDERID_RoamingAppData,
+    };
+    let Some(package) = current_package() else {
+        return Ok(());
+    };
+    let resolved = resolved_through_existing(path);
+    let resolved = eliot_core::workspace_path_key(&resolved.to_string_lossy()).into_owned();
+    for id in [
+        &FOLDERID_LocalAppData,
+        &FOLDERID_RoamingAppData,
+        &FOLDERID_LocalAppDataLow,
+    ] {
+        let folder = known_folder(id)?;
+        let folder = std::fs::canonicalize(&folder).unwrap_or(folder);
+        let folder = eliot_core::workspace_path_key(&folder.to_string_lossy()).into_owned();
+        if Path::new(&resolved).starts_with(Path::new(&folder)) {
+            return Err(Error::new(
+                "not_allowed",
+                format!(
+                    "{} is under AppData, which Windows redirects for this process (MSIX package {package}), so processes outside the package cannot see it; use a directory outside AppData",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn known_folder(id: &windows_sys::core::GUID) -> Result<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
     let mut raw: *mut u16 = null_mut();
-    // SAFETY: the GUID is a static constant, the null token selects the
-    // current user, and `raw` receives a CoTaskMem string freed below.
-    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, null_mut(), &mut raw) };
+    // SAFETY: the GUID outlives the call, the null token selects the current
+    // user, and `raw` receives a CoTaskMem string freed below.
+    let status = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &mut raw) };
     if status < 0 || raw.is_null() {
         if !raw.is_null() {
             // SAFETY: the API allocated `raw`; free it even on failure.
@@ -2077,7 +2157,7 @@ pub(crate) fn account_local_app_data() -> Result<PathBuf> {
         }
         return Err(Error::new(
             "platform_io",
-            "the account Local AppData folder is unavailable",
+            "an account Known Folder is unavailable",
         ));
     }
     let mut len = 0;

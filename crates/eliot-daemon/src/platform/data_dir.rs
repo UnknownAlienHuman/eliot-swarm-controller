@@ -198,6 +198,7 @@ impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
+        refuse_package_redirected(&path)?;
         ensure_private_root(&path).map_err(|error| {
             if error.code == "unsafe_data_dir" {
                 unsafe_data_dir_error(&path, error)
@@ -216,6 +217,7 @@ impl DataDir {
     /// or opening daemon.lock, the database, or any missing root/token files.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
+        refuse_package_redirected(&path)?;
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(unavailable("data directory does not exist"));
@@ -466,6 +468,7 @@ pub fn persist_selected_root(path: &Path) -> Result<()> {
 
 fn persist_selected_root_at(path: &Path, pointer_dir: &Path) -> Result<()> {
     let selected = DataDir::open_existing(path)?;
+    refuse_package_redirected(pointer_dir)?;
     ensure_private_root(pointer_dir)?;
     validate_private_root(pointer_dir)?;
     let root = selected.path().to_str().ok_or_else(|| {
@@ -926,6 +929,20 @@ fn open_or_create_lock_file(path: &Path) -> Result<File> {
             "platform_unsupported",
             "daemon locks are unsupported on this platform",
         ))
+    }
+}
+
+/// Refuse a directory Windows would redirect for this packaged process; see
+/// the packaged-process rule in `docs/spec/configuration.md`.
+pub(crate) fn refuse_package_redirected(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        super::windows::refuse_package_redirected(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
