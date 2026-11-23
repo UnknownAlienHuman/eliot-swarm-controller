@@ -168,11 +168,14 @@ With a fresh data root, `serve` returned an empty `bundledCatalog` even
 after `session/start`. The installed `muse exec --help` documents
 `exec --list-models`, which fetches models and populates Muse's cache under
 `XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
-The adapter runs that command before starting `serve`, using the same
-executable, working directory, and environment for both processes.
-Successful exit within the deadline lets `serve` read the vendor cache.
-MSP `model/list` then provides the structured `providerCatalog` snapshot
-for the picker and the launch's exact-model check.
+The adapter first reads the host's `model/list` snapshot. An empty
+snapshot or a missing exact launch model triggers one refresh with the
+same executable and environment, from the private plugin directory.
+The refresh and each host query have separate deadlines. A fresh
+`serve` reads the resulting cache even if the refresh failed. If the
+model is still missing, the refusal includes the refresh failure and
+its bounded, redacted stderr. The picker refreshes only an empty
+snapshot.
 
 Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
 `model/list`, resume preflight) return a failed-state start

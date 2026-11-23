@@ -1,3 +1,4 @@
+mod catalogue;
 mod start;
 
 use crate::{
@@ -475,25 +476,47 @@ impl MusePlugin {
                 return Ok(self.retain_proven_no_effect_start(&params, error));
             }
         };
-        if let Err(error) = start::refresh_catalogue(&launch, Instant::now() + RPC_TIMEOUT).await {
-            return Ok(self.retain_proven_no_effect_start(&params, error));
-        }
-        // A spawn failure leaves no child behind: still proven-no-effect.
-        // The OS message is not reused as the reason (it may quote paths);
-        // the reason names the check and carries only the safe error code.
-        let mut session =
-            match start::spawn_owned_session(&params, initialized, launch, secrets, peer).await {
-                Ok(session) => session,
-                Err(error) => {
-                    let reason = format!(
-                        "Muse session host process could not be spawned ({})",
-                        error.code
-                    );
-                    return Ok(
-                        self.retain_proven_no_effect_start(&params, error.with_message(reason))
-                    );
-                }
-            };
+        let skill_pointer = match start::skill_pointer(&params) {
+            Ok(pointer) => pointer,
+            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+        };
+        let policy = SecretPolicy::new(secrets.iter());
+        let mut host = match catalogue::CatalogueHost::open(
+            &launch,
+            Path::new(&initialized.instance_dir),
+            &policy,
+            requested_model.as_deref(),
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(error) if error.code == "unknown" => return Err(self.retain_failed_start(error)),
+            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+        };
+        let initialized_native = match Self::validate_catalogue(
+            &host,
+            requested_model.as_deref(),
+            requested_effort.as_deref(),
+        ) {
+            Ok(validated) => validated,
+            Err(error) => {
+                return match host.close().await {
+                    Ok(()) => Ok(self.retain_proven_no_effect_start(&params, error)),
+                    Err(cleanup) => Err(self.retain_failed_start(cleanup)),
+                };
+            }
+        };
+        let mut session = match start::bind_owned_session(
+            &params,
+            initialized,
+            host.native,
+            secrets,
+            skill_pointer,
+            peer,
+        ) {
+            Ok(session) => session,
+            Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
+        };
 
         if let Err(error) = register_native_process(
             peer,
@@ -528,31 +551,6 @@ impl MusePlugin {
             return Ok(self.retain_proven_no_effect_start(&params, error));
         }
 
-        let initialized_native = match Self::initialize_native(
-            &session.native_client,
-            requested_model.as_deref(),
-            requested_effort.as_deref(),
-        )
-        .await
-        {
-            Ok(initialized) => initialized,
-            Err(error) => {
-                let error = discard_failed_start(&mut session, error).await;
-                if session.phase == SessionPhase::Unknown {
-                    let message = format!(
-                        "{}; owned session host cleanup is unconfirmed; no session/start/resume or input was sent",
-                        error.message
-                    );
-                    self.session = Some(session);
-                    return Err(error.with_code("unknown").with_message(message));
-                }
-                // Only effect-free queries ran (initialize handshake plus the
-                // model catalogue read) and the child is terminated: no
-                // `session/start|resume` was dispatched and no input was sent,
-                // so this is proven-no-effect (failed, never unknown).
-                return Ok(self.retain_proven_no_effect_start(&params, error));
-            }
-        };
         session.selected_effort = initialized_native.effort.clone();
         session.native_scope = initialized_native.scope;
 
@@ -2123,7 +2121,7 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
 /// its resolved default) and otherwise defers to the server default, whose
 /// effective id is read back from the session.
 fn select_launch_model(
-    catalog: NativeModelListResult,
+    catalog: &NativeModelListResult,
     requested_model: Option<&str>,
 ) -> Result<Option<NativeModelCatalogEntry>> {
     use eliot_plugin::session::{LaunchModelMissing, LaunchModelRequest, choose_launch_model};
@@ -2154,7 +2152,7 @@ fn select_launch_model(
         .with_where("plugin.muse.start.model_list")
         .with_origin(
             eliot_core::FailureOrigin::Harness,
-            "native model catalogue omits the exact requested model; upstream error absent",
+            "native model catalogue omits the exact requested model",
         ),
         LaunchModelMissing::Default => Error::new(
             "profile_error",
@@ -2168,8 +2166,8 @@ fn select_launch_model(
 
 impl MusePlugin {
     /// Read-only native model catalogue for `harness.models`. A dedicated
-    /// reader instance refreshes the vendor catalogue, then queries
-    /// `model/list` on a transient `muse serve`. No session, no turn, no input
+    /// reader instance queries `model/list` on a transient `muse serve`
+    /// and refreshes only an empty snapshot. No session, no turn, no input
     /// and no inference. The native `isDefault` marker (when the installed
     /// host supplies it) projects as the catalogue default; absent or
     /// all-false stays unknown and is never invented by list order.
@@ -2185,7 +2183,10 @@ impl MusePlugin {
             required_native_cmd(snapshot, "Muse model.list requires a discovered native cmd")?;
         let cwd = std::env::current_dir()
             .map_err(|_| Error::new("internal", "Muse model.list could not read its cwd"))?;
-        let deadline = Instant::now() + RPC_TIMEOUT;
+        let initialized = self
+            .initialized
+            .as_ref()
+            .ok_or_else(|| not_initialized("Muse"))?;
         let environment = target_environment(
             raw.get("target_environment"),
             snapshot.get("pass_env"),
@@ -2197,72 +2198,23 @@ impl MusePlugin {
             cwd,
             environment: environment.variables,
         };
-        start::refresh_catalogue(&launch, deadline).await?;
-        let mut native =
-            NativeProcess::spawn(launch, SecretPolicy::new(environment.secrets)).await?;
-        let client = native.client();
-        let result: Result<Value> = async {
-            use crate::native::types::NativeInitializeResult;
-            let init = native_initialize_params();
-            let init_value = serde_json::to_value(init).map_err(|_| {
-                Error::new(
-                    "internal",
-                    "Muse model.list initialize params could not be encoded",
-                )
-            })?;
-            let _initialized: NativeInitializeResult = serde_json::from_value(
-                client
-                    .call("initialize", init_value, deadline)
-                    .await
-                    .map_err(|error| {
-                        let detail = error.message.clone();
-                        error.with_message(format!("Muse model.list initialize failed: {detail}"))
-                    })?,
-            )
-            .map_err(|_| {
-                Error::new(
-                    "profile_error",
-                    "Muse model.list initialize response was invalid",
-                )
-            })?;
-            client
-                .notify("initialized", None, deadline)
-                .await
-                .map_err(|error| {
-                    let detail = error.message.clone();
-                    error.with_message(format!(
-                        "Muse model.list initialized notify failed: {detail}"
-                    ))
-                })?;
-            let response = client
-                .call(
-                    "model/list",
-                    serde_json::to_value(NativeModelListParams { session_id: None }).map_err(
-                        |_| Error::new("internal", "Muse model.list params could not be encoded"),
-                    )?,
-                    deadline,
-                )
-                .await
-                .map_err(|error| {
-                    let detail = error.message.clone();
-                    error.with_message(format!(
-                        "Muse model.list did not return a catalogue: {detail}"
-                    ))
-                })?;
-            let catalog: NativeModelListResult =
-                serde_json::from_value(response).map_err(|_| {
-                    Error::new(
-                        "profile_error",
-                        "Muse model/list result did not match the installed schema",
-                    )
-                })?;
-            let (models, default_id) = project_model_catalog(catalog.models);
-            Ok(json!({"models": models, "default": default_id}))
+        let policy = SecretPolicy::new(environment.secrets.iter().chain([&initialized.credential]));
+        let mut host = catalogue::CatalogueHost::open(
+            &launch,
+            Path::new(&initialized.instance_dir),
+            &policy,
+            None,
+        )
+        .await?;
+        host.close().await?;
+        if host.catalogue.models.is_empty() && host.refresh_failed() {
+            return Err(host.catalogue_error(Error::new(
+                "native_model_unavailable",
+                "Muse model/list still returned an empty catalogue",
+            )));
         }
-        .await;
-        let result = result.map_err(|error| client.diagnostic_error(error));
-        let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
-        result
+        let (models, default_id) = project_model_catalog(host.catalogue.models);
+        Ok(json!({"models": models, "default": default_id}))
     }
 
     /// Read-only native subscription usage for `harness.quota`. A dedicated
@@ -2414,40 +2366,6 @@ impl MusePlugin {
         let _ = native.terminate(false, Instant::now() + RPC_TIMEOUT).await;
         result
     }
-}
-
-async fn discover_model(
-    client: &NativeClient,
-    requested_model: Option<&str>,
-) -> Result<Option<NativeModelCatalogEntry>> {
-    // `model/list` is a single snapshot call: v1 has no catalog pagination
-    // and no catalog subscription.
-    let response = client
-        .call(
-            "model/list",
-            serde_json::to_value(NativeModelListParams { session_id: None }).map_err(|_| {
-                Error::new("internal", "Muse model/list params could not be encoded")
-            })?,
-            Instant::now() + RPC_TIMEOUT,
-        )
-        .await
-        .map_err(|error| {
-            // Read-only catalog query before any session effect: even a
-            // transport/internal `unknown` proves no session/start/resume/input
-            // was dispatched. Confirmed cleanup reports `profile_error`.
-            let message = format!(
-                "Muse model/list did not return a catalogue before session/start/resume/input: {}",
-                error.message
-            );
-            error.with_code("profile_error").with_message(message)
-        })?;
-    let catalog: NativeModelListResult = serde_json::from_value(response).map_err(|_| {
-        Error::new(
-            "profile_error",
-            "Muse model/list result did not match the installed schema",
-        )
-    })?;
-    select_launch_model(catalog, requested_model)
 }
 
 async fn read_live_snapshot(

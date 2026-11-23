@@ -387,6 +387,7 @@ pub struct NativeLabels {
     pub server: &'static str,
 }
 
+#[derive(Clone)]
 pub struct NativeLaunch {
     pub program: OsString,
     pub args: Vec<OsString>,

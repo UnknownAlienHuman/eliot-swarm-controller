@@ -285,7 +285,13 @@ impl PluginHost {
         let slot = tokio::time::timeout_at(deadline, self.discovery_slot())
             .await
             .map_err(|_| crate::adhoc::discovery_timeout())??;
-        let until = deadline.min(Instant::now() + READER_DEADLINE);
+        // A Muse cache miss can require a second host after a bounded refresh.
+        let reader_budget = if request.profile["harness"] == "muse" {
+            Duration::from_secs(60)
+        } else {
+            READER_DEADLINE
+        };
+        let until = deadline.min(Instant::now() + reader_budget);
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
         let stop_tx = self.state.readers.lock_recover()[&id].stop.clone();
