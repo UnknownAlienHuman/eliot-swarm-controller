@@ -26,13 +26,6 @@ pub fn retryable(code: &str) -> bool {
 
 /// Start the supplied Swarm executable only when no daemon is reachable.
 /// Returns whether startup observed the daemon restore the root ACL.
-#[cfg_attr(
-    not(windows),
-    expect(
-        clippy::disallowed_types,
-        reason = "Unix startup creates the detached daemon process after the private-root checks."
-    )
-)]
 pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<bool> {
     // daemon.status is Owner-only. Use the same target-bound identity parser
     // as RPC calls so scoped Agent identities remain Agents and malformed role
@@ -71,22 +64,8 @@ pub async fn ensure_running(data_dir: &Path, swarm_executable: &Path) -> Result<
     #[cfg(windows)]
     crate::platform::windows::start_background_daemon_executable(swarm_executable, data_dir)?;
     #[cfg(not(windows))]
-    {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "This statement starts the daemon process."
-        )]
-        std::process::Command::new(swarm_executable)
-            .arg("--data-dir")
-            .arg(data_dir)
-            .arg("daemon")
-            .arg("--foreground")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|_| Error::new("platform_io", "cannot start Swarm daemon"))?;
-    }
+    crate::operator::start_detached_daemon(swarm_executable, data_dir)
+        .map_err(|_| Error::new("platform_io", "cannot start Swarm daemon"))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if daemon_ready(data_dir).await {

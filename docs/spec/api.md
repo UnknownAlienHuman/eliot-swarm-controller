@@ -2893,10 +2893,16 @@ and `pruned_through`. It also reports the automatic cleanup policy and latest
 sweep outcome, and `profile_command_issues` for missing explicitly pinned executables.
 
 Local IPC accept failures are logged and retried with bounded backoff.
-During the delay, admitted work and existing connections continue, and the
-daemon still honors shutdown. A successful accept with a usable listener
-clears the failure count. After 20 consecutive failures, the daemon records
-Owner attention and exits with `ipc_accept_exhausted`.
+On Windows, the listener creates a standby pipe instance before awaiting a
+connection on either instance. Failure to create the standby leaves the
+current instance in place. A client may connect to it during backoff and wait
+for acceptance. The local client's absolute RPC deadline covers connect,
+write and response waits. A failed connection retires the affected instance.
+Cancelling the connection wait preserves both instances. During waits and
+backoff, admitted work and existing connections continue, and the daemon
+still honors shutdown. A successful accept clears the failure count. After
+20 consecutive failures, the daemon records Owner attention and exits with
+`ipc_accept_exhausted`.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
@@ -3063,7 +3069,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 
 ```text
 swarm daemon [--foreground]
-swarm daemon install | uninstall
+swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
 swarm daemon update <RELEASE> [--wait-seconds N]
 swarm stand up [--root PATH] [--profile FILE] [--binary PATH] [--ttl DURATION]

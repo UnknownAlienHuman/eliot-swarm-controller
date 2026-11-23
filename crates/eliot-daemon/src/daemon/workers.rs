@@ -1,5 +1,8 @@
 use crate::{logging, router::Router};
-use eliot_core::{Error, Result, SecretPolicy, api::DaemonStatusResponse};
+use eliot_core::{
+    Error, Result, SecretPolicy,
+    api::{DaemonStatusResponse, WorkerTaskStatus, truncate_bytes},
+};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinSet, time::Instant};
 
@@ -20,7 +23,7 @@ pub(crate) const WORKER_NAMES: [&str; DaemonStatusResponse::MAX_AUTOMATION_TASKS
 const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const HEALTHY_RUN_RESET: Duration = Duration::from_secs(60);
-const WORKER_FAILURE_LIMIT: u32 = 5;
+const ATTENTION_THRESHOLD: u32 = 5;
 
 pub(crate) enum WorkerOutcome {
     Stopped,
@@ -57,9 +60,16 @@ impl WorkerReporter {
         restart_count: u32,
         retry_after: Option<Duration>,
     ) {
+        let policy = self.router.secret_policy_snapshot();
+        let error = error.clone().sanitized(&policy);
         let code = bounded_failure_code(&error.code);
+        let cause = format!("{code}: {}", error.message)
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>();
+        let cause = truncate_bytes(&cause, WorkerTaskStatus::MAX_FAILURE_BYTES).0;
         self.router
-            .note_worker_task_failed(name, code, restart_count);
+            .note_worker_task_failed(name, code, cause, restart_count);
         let restart_count = restart_count.to_string();
         let retry_ms = retry_after.map(|delay| delay.as_millis().to_string());
         let mut fields = vec![("worker", name), ("restart_count", restart_count.as_str())];
@@ -74,7 +84,7 @@ impl WorkerReporter {
                 "daemon.worker_failed"
             },
             &fields,
-            Some(error),
+            Some(&error),
         );
     }
 
@@ -89,7 +99,7 @@ impl WorkerReporter {
             Some(error),
         );
         if let Err(error) = self.router.report_daemon_attention(format!(
-            "The {name} worker stopped after {failures} consecutive failures ({code}). Check the daemon log before restarting Swarm."
+            "The {name} worker has failed {failures} times in a row ({code}). Swarm is still retrying. See the daemon log for the failure cause."
         )).await {
             logging::record(&self.policy, "daemon.attention_delivery_failed", &fields, Some(&error));
         }
@@ -181,14 +191,12 @@ pub(crate) async fn supervise_with<F, Fut, H>(
                     consecutive_failures = 0;
                 }
                 consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= WORKER_FAILURE_LIMIT {
-                    reporter.failed(name, &error, restart_count, None);
-                    reporter.attention(name, consecutive_failures, &error).await;
-                    return;
-                }
                 restart_count = restart_count.saturating_add(1);
                 let delay = retry_backoff(consecutive_failures);
                 reporter.failed(name, &error, restart_count, Some(delay));
+                if consecutive_failures == ATTENTION_THRESHOLD {
+                    reporter.attention(name, consecutive_failures, &error).await;
+                }
                 if !wait_for_retry(&mut shutdown, delay).await {
                     reporter.stopped(name);
                     return;

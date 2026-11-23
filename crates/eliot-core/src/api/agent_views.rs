@@ -2586,7 +2586,8 @@ pub enum WorkerTaskHealth {
 /// `running` means the worker is alive after its startup boundary; it does
 /// not prove a rule/timer/goal delivery. `starting` means spawned but not
 /// yet initialized. `failed` carries only a bounded code, never a raw error
-/// message. `restart_count` is the number of worker restarts in this daemon run.
+/// message. `last_failure` is a bounded, redacted summary retained through recovery.
+/// `restart_count` counts scheduled restart attempts in this daemon run.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTaskStatus {
@@ -2594,11 +2595,15 @@ pub struct WorkerTaskStatus {
     pub health: WorkerTaskHealth,
     #[serde(deserialize_with = "nullable")]
     pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
     #[serde(default)]
     pub restart_count: u32,
 }
 
 impl WorkerTaskStatus {
+    pub const MAX_FAILURE_BYTES: usize = 512;
+
     pub fn validate(&self) -> Result<()> {
         if text(&self.name).is_err() {
             return Err(invalid_response());
@@ -2609,6 +2614,13 @@ impl WorkerTaskStatus {
             return Err(invalid_response());
         }
         if (self.health == WorkerTaskHealth::Failed) != self.failure_code.is_some() {
+            return Err(invalid_response());
+        }
+        if self.last_failure.as_deref().is_some_and(|cause| {
+            cause.is_empty()
+                || cause.len() > Self::MAX_FAILURE_BYTES
+                || cause.chars().any(char::is_control)
+        }) {
             return Err(invalid_response());
         }
         Ok(())

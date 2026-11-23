@@ -1219,10 +1219,18 @@ pub(crate) struct DaemonArgs {
 pub(crate) enum DaemonAction {
     /// Shut down the running daemon.
     Stop(ShutdownArgs),
-    /// Install a current-user logon task that starts the daemon.
-    Install,
-    /// Remove this data directory's verified current-user logon task.
-    Uninstall,
+    /// Install current-user daemon autostart.
+    Install {
+        /// Show the exact registration plan without changing OS state.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove this data directory's verified current-user autostart.
+    Uninstall {
+        /// Show the exact removal plan without changing OS state.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Stop Agents, drain the daemon and start a new release.
     Update {
         /// Release directory or path to the replacement Swarm executable.

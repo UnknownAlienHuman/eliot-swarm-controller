@@ -126,17 +126,10 @@ pub(crate) struct RuleWorkerStart {
     pub initial_notices: ReloadNoticeContext,
 }
 
-/// Reason the rule worker left, propagated to the daemon supervisor so a
-/// normal drain is not misreported as an unexpected exit.
-/// AdmissionClosed covers every Ok(false) site in this module: the
-/// matched-event admission checks, prepared-submission and timer-slot
-/// closes, and admission-returns-None sites, all of which fire only
-/// when router admission is closed. Shutdown covers the supervisor's
-/// own shutdown watch. Any other Ok(()) is an unexpected exit.
+/// Distinguish a shutdown request from an unexpected loss of a wake source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RuleWorkerExit {
     Shutdown,
-    AdmissionClosed,
     Exited,
 }
 
@@ -1302,14 +1295,17 @@ async fn run_global_rules_inner(
                 .await?;
             recover_rule_children = false;
         }
-        let firing_open = router.rule_firings_open();
-        if firing_open {
+        let firing_open = 'firings: {
+            if !router.rule_firings_open() {
+                break 'firings false;
+            }
             let high_water = router.rule_high_water().await?;
             if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
                 .await?
             {
-                join_cleanup_task(cleanup_task).await;
-                return Ok(RuleWorkerExit::AdmissionClosed);
+                // A fence can close during reconciliation. Wait for the next
+                // wake without arming timers that can't currently fire.
+                break 'firings false;
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
@@ -1322,8 +1318,7 @@ async fn run_global_rules_inner(
                     )
                     .await?
                 {
-                    join_cleanup_task(cleanup_task).await;
-                    return Ok(RuleWorkerExit::AdmissionClosed);
+                    break 'firings false;
                 }
             }
 
@@ -1337,8 +1332,8 @@ async fn run_global_rules_inner(
             )
             .await?
             {
-                join_cleanup_task(cleanup_task).await;
-                return Ok(RuleWorkerExit::AdmissionClosed);
+                arbitrate_launches = arbitrate_now;
+                break 'firings false;
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
@@ -1350,11 +1345,11 @@ async fn run_global_rules_inner(
                     )
                     .await?
                 {
-                    join_cleanup_task(cleanup_task).await;
-                    return Ok(RuleWorkerExit::AdmissionClosed);
+                    break 'firings false;
                 }
             }
-        }
+            true
+        };
 
         let now = now_ms();
         let timer_wait = if firing_open {
