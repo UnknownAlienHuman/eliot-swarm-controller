@@ -75,6 +75,19 @@ fn git_path_matches(left: &Path, right: &Path) -> bool {
             .is_some_and(|(left, right)| workspace_path_key(left) == workspace_path_key(right))
 }
 
+fn verify_source_common_dir(source: &Repository, preparation: &WorkspacePreparation) -> Result<()> {
+    if !git_path_matches(
+        &source.common_dir,
+        &canonical_root(&preparation.repo_common_dir)?,
+    ) {
+        return Err(problem(
+            "source_integrity",
+            "source repository common directory differs from the frozen identity",
+        ));
+    }
+    Ok(())
+}
+
 struct WorktreeEntry {
     path: PathBuf,
     branch: Option<String>,
@@ -1083,7 +1096,7 @@ impl WorkspaceGit {
                 "missing worktree path changed during observation",
             ));
         }
-        let source = self.source(preparation, deadline).await?;
+        let (source, missing_source_parent) = self.removal_source(preparation, deadline).await?;
         separate_target(&source, &target)?;
         let branch_tip = self
             .branch_oid(&source.root, &preparation.requested_branch, deadline)
@@ -1098,6 +1111,8 @@ impl WorkspaceGit {
         let entries = self.entries(&source.root, deadline).await?;
         let mut matches = entries.iter().filter(|entry| entry.path == target);
         let Some(entry) = matches.next() else {
+            confirm_missing_source(preparation, missing_source_parent.as_ref())?;
+            confirm_worktree_absence(path, &parent)?;
             return Ok(Some(MissingWorktreeRemoval {
                 parent,
                 branch_tip,
@@ -1142,6 +1157,7 @@ impl WorkspaceGit {
             )
             .await?;
         confirm_worktree_absence(path, &parent)?;
+        confirm_missing_source(preparation, missing_source_parent.as_ref())?;
         Ok(Some(MissingWorktreeRemoval {
             parent,
             branch_tip,
@@ -1247,7 +1263,7 @@ impl WorkspaceGit {
         branch: RemovalBranch<'_>,
     ) -> Result<WorkspaceRemovalOutcome> {
         let deadline = Instant::now() + READ_TIME;
-        let source = self.source(preparation, deadline).await?;
+        let (source, missing_source_parent) = self.removal_source(preparation, deadline).await?;
         let target = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target)?;
         let Some(parent) = observe_worktree_absence(&target)? else {
@@ -1282,6 +1298,7 @@ impl WorkspaceGit {
             ));
         }
         confirm_worktree_absence(&target, &parent)?;
+        confirm_missing_source(preparation, missing_source_parent.as_ref())?;
         Ok(WorkspaceRemovalOutcome::Removed {
             repo_common_dir: path_text(&source.common_dir)?,
             worktree_path: path_text(&target)?,
@@ -1290,6 +1307,45 @@ impl WorkspaceGit {
             directory_absent_before_remove: matches!(branch, RemovalBranch::Absent),
             branch_absent_before_remove: matches!(branch, RemovalBranch::Absent),
         })
+    }
+
+    /// Removal readback may outlive the source checkout that originally
+    /// supplied the repository identity. If that exact path is now absent,
+    /// use the surviving common directory's main checkout and verify that Git
+    /// still reports the frozen common-directory identity. Keep the pinned
+    /// source parent so callers can confirm the path stayed absent throughout
+    /// their registry and branch reads.
+    async fn removal_source(
+        &self,
+        preparation: &WorkspacePreparation,
+        deadline: Instant,
+    ) -> Result<(Repository, Option<Directory>)> {
+        if !is_git_oid(&preparation.base_oid) {
+            return Err(problem(
+                "invalid",
+                "workspace preparation omitted its exact frozen base",
+            ));
+        }
+        match self.source(preparation, deadline).await {
+            Ok(source) => Ok((source, None)),
+            Err(original_error) => {
+                let source_path = Path::new(&preparation.repo_path);
+                let Some(parent) = observe_worktree_absence(source_path)? else {
+                    return Err(original_error);
+                };
+                let common_dir = canonical_root(&preparation.repo_common_dir)?;
+                let common_root = common_dir.parent().ok_or_else(|| {
+                    problem(
+                        "source_integrity",
+                        "frozen repository common directory has no checkout parent",
+                    )
+                })?;
+                let source = self.repository(&path_text(common_root)?, deadline).await?;
+                verify_source_common_dir(&source, preparation)?;
+                confirm_worktree_absence(source_path, &parent)?;
+                Ok((source, Some(parent)))
+            }
+        }
     }
 
     async fn source(
@@ -1304,15 +1360,7 @@ impl WorkspaceGit {
             ));
         }
         let source = self.repository(&preparation.repo_path, deadline).await?;
-        if !git_path_matches(
-            &source.common_dir,
-            &canonical_root(&preparation.repo_common_dir)?,
-        ) {
-            return Err(problem(
-                "source_integrity",
-                "source repository common directory differs from the frozen identity",
-            ));
-        }
+        verify_source_common_dir(&source, preparation)?;
         Ok(source)
     }
 
@@ -1723,6 +1771,16 @@ fn confirm_worktree_absence(path: &Path, previous: &Directory) -> Result<()> {
             "identity_changed",
             "worktree parent changed during absence verification",
         ));
+    }
+    Ok(())
+}
+
+fn confirm_missing_source(
+    preparation: &WorkspacePreparation,
+    parent: Option<&Directory>,
+) -> Result<()> {
+    if let Some(parent) = parent {
+        confirm_worktree_absence(Path::new(&preparation.repo_path), parent)?;
     }
     Ok(())
 }

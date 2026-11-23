@@ -528,6 +528,14 @@ absent, verified absence settles `removed` without dispatching Git writes. The o
 available retained Git observation, which can show that the checkout had
 changes before it vanished. The daemon's missing-worktree reconciliation
 admits one removal at a time and advances after the command settles.
+If the frozen source checkout is also absent, removal may read the Git registry
+through a surviving checkout only after the source path is confirmed absent from
+the same readable, pinned parent and that checkout resolves to the frozen
+repository common directory. The source path is rechecked after Git readback.
+Unverifiable source or target absence, or a changed common-directory identity,
+keeps removal unsettled. An already absent target registration settles without
+a Git write; branch readback still follows the retained-tip or prior-absence
+rules above.
 A `worktree.remove` that a previous daemon left `queued` behind the
 repository write lane is re-admitted by restart recovery, so it is
 dispatched in order and never strands later launches in the same
