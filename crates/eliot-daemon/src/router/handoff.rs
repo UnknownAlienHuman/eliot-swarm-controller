@@ -75,6 +75,7 @@ impl Router {
         request.validate()?;
         let change = {
             let mut store = self.inner.store.lock().await;
+            super::owner_inbox::check_binding(&store)?;
             let change =
                 store.cancel_handoff_input(&principal_name(principal), &request, now_ms())?;
             self.publish_locked(&change.events);

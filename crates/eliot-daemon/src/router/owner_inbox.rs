@@ -158,6 +158,7 @@ impl Router {
                             result
                         }
                         "command.resolve" => self.command_resolve(&action.args, principal).await,
+                        "command.cancel" => self.command_cancel(&action.args, principal).await,
                         "command.settle_stopped" => {
                             self.command_settle_stopped(&action.args, principal).await
                         }

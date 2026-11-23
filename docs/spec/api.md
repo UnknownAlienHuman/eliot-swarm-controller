@@ -774,6 +774,10 @@ the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
+Each stuck command has its own `command:<id>` subject, revision, snooze and
+decision receipt. It offers `command.get` (`inspect`). The available corrections
+are described in the [monitoring spec](monitoring.md#liveness).
+
 `owner.decide.bulk` applies each item's own recommended action for an explicit
 ordered set of 1–100 `OwnerInboxItemRef`s, with at most 16 KiB of encoded refs.
 It is Owner-only. The batch ULID is recorded against the exact ordered refs

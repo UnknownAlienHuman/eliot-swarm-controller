@@ -286,7 +286,10 @@ fn project_unknown_commands(
                     AND COALESCE(json_type(w.outcome,'$.cancel_requested'),'false')='false'),
                 (EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||c.target||'#'||c.generation AND p.state IN ('running','unknown'))),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=c.target AND s.generation=c.generation
-                  AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open')
+                  AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open'),
+                EXISTS(SELECT 1 FROM commands parent
+                  WHERE parent.id=c.parent_command AND c.link_kind='handoff'
+                    AND parent.method='swarm.handoff')
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')", "c.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -305,6 +308,7 @@ fn project_unknown_commands(
                 r.get::<_, bool>(11)?,
                 r.get::<_, bool>(12)?,
                 r.get::<_, bool>(13)?,
+                r.get::<_, bool>(14)?,
             ))
         })
         .map_err(sql_error)?;
@@ -324,6 +328,7 @@ fn project_unknown_commands(
             unstarted_workspace,
             process_active,
             source_open,
+            owner_handoff_send,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -358,7 +363,20 @@ fn project_unknown_commands(
                     )),
                     _ => None,
                 };
-                let choices = recommended.iter().cloned().chain([inspect]).collect();
+                let mut choices = recommended
+                    .iter()
+                    .cloned()
+                    .chain([inspect])
+                    .collect::<Vec<_>>();
+                if owner_handoff_send
+                    && verb == "send"
+                    && matches!(
+                        state,
+                        eliot_core::CommandState::Accepted | eliot_core::CommandState::Queued
+                    )
+                {
+                    choices.push(action("cancel", "command.cancel", json!({"command_id":id})));
+                }
                 items.push(item(
                     OwnerInboxKind::Stuck,
                     format!("command:{id}"),

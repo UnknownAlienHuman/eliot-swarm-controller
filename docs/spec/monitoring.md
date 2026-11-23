@@ -1201,11 +1201,12 @@ correction; available inspection choices remain executable. A stuck managed
 launch offers Stop when the exact generation is still Created and its workspace
 is Creating with explicit proof that Git creation has yet to dispatch. Stop
 uses the normal workspace-cancellation path and exact generation fence. The
-same item offers command inspection.
+same item offers command inspection. A Stuck undispatched `send` from
+`swarm.handoff` offers an explicit `command.cancel` choice. The ordinary
+cancel mutation rechecks its dispatch state and handoff binding.
 
-For a Stuck busy or
-waiting Agent, the Owner-only `stop` recommendation is present only when its
-current generation has no active-turn pointer, pending request, running or
+For a Stuck busy or waiting Agent, the Owner-only `stop` recommendation is
+present only when its current generation has no active-turn pointer, pending request, running or
 unknown turn, or unsettled command, and Store has both an open native source and
 a running owned plugin. The action carries that exact generation, and normal
 command admission rechecks the inbox subject revision before admitting Stop;
