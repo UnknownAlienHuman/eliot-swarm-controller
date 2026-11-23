@@ -1237,7 +1237,12 @@ that branch's check unconfirmed. Unconfirmed effects retain their `unknown` stat
 
 Store commits the integration's scratch and process custody before mutation. Startup and
 the next integration request reconcile interrupted scratch after process exit is proven.
-Reconciliation removes only the recorded checkout, private index, and Git registration.
+The integration check receives no `ELIOT_ARTIFACT_ROOT`; `build/check.py` therefore puts
+Cargo output in `target/project-check` under the temporary checkout. That checkout is
+inside the unique integration scratch root, which reconciliation removes only after
+integration process custody is proven closed. A pending cleanup retains the scratch and
+the command's `unknown` outcome. Reconciliation removes the recorded scratch root,
+including the checkout, private index and build output, plus the unique Git registration.
 It retains the interrupted command's outcome. A cleaned scratch-only interruption
 releases the repository write gate. A possibly modified target ref keeps that gate.
 
