@@ -699,6 +699,7 @@ pub(super) fn handoff_tx(
             policy,
             brief::BriefInput {
                 saved_context: None,
+                transferred: &originals,
                 facts: Some(facts),
                 directive: None,
                 now,
@@ -711,6 +712,7 @@ pub(super) fn handoff_tx(
             policy,
             brief::BriefInput {
                 saved_context: None,
+                transferred: &originals,
                 facts: Some(facts),
                 directive: Some(directive),
                 now,
@@ -723,6 +725,7 @@ pub(super) fn handoff_tx(
             policy,
             brief::BriefInput {
                 saved_context,
+                transferred: &originals,
                 facts: None,
                 directive: None,
                 now,

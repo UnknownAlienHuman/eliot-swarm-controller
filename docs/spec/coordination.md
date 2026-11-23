@@ -1230,6 +1230,11 @@ command or turn of an ended generation cannot still land, so it is named in the 
 and never replayed. On a live idle A, one in its running generation refuses with the
 remedy `swarm stop <agent>`.
 
+The brief does not repeat a selected SEND that the transfer admits separately. It also
+omits a Git task record bound to that same SEND. Unknown or still-dispatched inputs appear
+only as quoted history with their state; the successor does not receive them as new SENDs
+and must verify their effects before continuing.
+
 Before external preparation the Store checks A's exact generation and readiness,
 any named task and selected SENDs, transferable Goal, and controlled child
 limits for the prospective root. The parent freezes the launch and handoff IDs
