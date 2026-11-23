@@ -794,6 +794,21 @@ impl Store {
         result
     }
 
+    /// Read the bound command even after settlement cleared the open claim.
+    pub fn is_notice_cause(&self, recipient: &str, generation: i64, id: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        let recipient = parse_agent_id(recipient)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1 AND target = ?2
+                  AND generation = ?3 AND principal = 'owner' AND verb = 'send'
+                  AND json_extract(args, '$.notice_kind') IN ('mail', 'claim'))",
+                params![id, recipient, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     /// Page recipient ids due a normal mail notice: current `idle`,
     /// non-observer, generation >= 1 agents holding waking unread mail whose
     /// `mail_notices` row is absent or past the normal notice cooldown.

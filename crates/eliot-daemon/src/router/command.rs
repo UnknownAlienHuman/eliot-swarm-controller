@@ -1256,6 +1256,7 @@ impl Router {
                         let fresh = command.state == CommandState::Dispatched
                             && capture_dispatch_seq(&command, &events).is_some();
                         self.publish_locked(&events);
+                        self.note_command_rejection(&command, &events);
                         let plugin = if fresh {
                             self.enqueue_plugin_command(&store, &command, context)
                         } else {

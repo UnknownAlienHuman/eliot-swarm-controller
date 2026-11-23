@@ -1102,10 +1102,14 @@ deduplication and never written to the log. The record includes numeric
 means at least 65 distinct connections. One redacted representative rule id may use
 the existing `source` field. Direct internal producers keep their method labels,
 including internal mail and attribution notices, daemon archive, attention, and
-admitted rule actions. Later dispatch outcomes stay in command history. The daemon
+admitted rule actions. The daemon
 shares the existing 1024-entry repeated-failure counter and flushes qualifying storm
-windows on closure or maintenance shutdown. These diagnostics leave admission and
-retry behavior unchanged.
+windows on closure or maintenance shutdown.
+
+When the Router commits a third rejection of the same command verb for the same
+Agent within one minute, it records `daemon.repeated_command_rejected` and one
+daemon attention notice. Further matching rejections in that window add no
+diagnostics. Each command keeps its own durable outcome and event.
 
 Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
 sum uncached input, cached input and output on the [shared usage basis](core.md).
