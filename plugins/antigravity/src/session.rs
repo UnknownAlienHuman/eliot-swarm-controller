@@ -1027,6 +1027,12 @@ impl Session {
                     })
                 })
                 .await;
+                if cancelled.is_none() {
+                    let mut state = self.state.lock().await;
+                    if let Err(error) = state.settle_unanswered_cancel(turn_id).await {
+                        state.lose(&error.message).await;
+                    }
+                }
                 let mut outcome = interrupt_settlement_outcome(
                     "Antigravity",
                     &params.command_id,
@@ -1086,10 +1092,11 @@ impl Session {
         let state = self.state.lock().await;
         let process_exited = self.native.transport.process_exit_observed();
         let stop = self.stop.as_ref().is_some_and(|s| s.0 == params.command_id);
+        let session_selector = params.command_id == self.start_command;
         let live_turn = state
             .live_turn_for_command(&params.command_id)
             .or_else(|| state.latest_terminal_turn_for_command(&params.command_id));
-        if params.command_id != self.start_command && !stop && live_turn.is_none() {
+        if !session_selector && !stop && live_turn.is_none() {
             return unknown_snapshot(&params, "Antigravity command identity is not live");
         }
         let turn = params.turn_id.as_deref().or(live_turn);
@@ -1106,6 +1113,8 @@ impl Session {
         let mut status = if state.stopped {
             "stopped"
         } else if state.source_unknown || process_exited || !self.ready {
+            "unknown"
+        } else if turn.is_some_and(|turn| state.native_unknown_turn_is(turn)) {
             "unknown"
         } else if state.active_turn().is_some() {
             "busy"
@@ -1130,6 +1139,7 @@ impl Session {
                 &state,
                 &params.command_id,
                 turn_id,
+                session_selector,
                 self.ready && !state.stopped && !process_exited,
                 process_exited && self.task.as_ref().is_none_or(JoinHandle::is_finished),
             )
@@ -1138,6 +1148,23 @@ impl Session {
             Some(TurnEvidence::Running) => {
                 last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
                     "status": "running", "terminal": false});
+            }
+            Some(TurnEvidence::NativeRunning) => {
+                last_turn = json!({"turn_id": params.turn_id,
+                    "status": "running", "terminal": false});
+            }
+            Some(TurnEvidence::NativeUnknown) => {
+                status = "unknown";
+                last_turn = json!({"turn_id": params.turn_id,
+                    "status": "unknown", "terminal": false});
+            }
+            Some(TurnEvidence::NativeReadback) => {
+                status = "unknown";
+                active_turn = None;
+            }
+            Some(TurnEvidence::NativeTerminal) => {
+                status = if state.stopped || process_exited { "terminal" } else { "idle" };
+                active_turn = None;
             }
             Some(TurnEvidence::Terminal) => {
                 // The exact reply ended the turn, even when a later write of
@@ -1302,6 +1329,14 @@ pub(crate) enum TurnEvidence {
     Running,
     /// The exact turn's `session/prompt` reply settled it.
     Terminal,
+    /// The exact native `Stop` hook and ordered `session/list` settled it.
+    NativeTerminal,
+    /// A commandless native run remains open on the exact session.
+    NativeRunning,
+    /// Cancellation ended without a native terminal.
+    NativeUnknown,
+    /// A `Stop` arrived after the run was already retained as unknown.
+    NativeReadback,
     /// The process exited and the drained stream held no reply.
     Exited,
 }
@@ -1311,6 +1346,10 @@ impl TurnEvidence {
         match self {
             Self::Running => "acp session/prompt pending",
             Self::Terminal => "acp session/prompt stopReason",
+            Self::NativeTerminal => "antigravity Stop hook behind session/list",
+            Self::NativeRunning => "antigravity PreInvocation run open",
+            Self::NativeUnknown => "antigravity cancel without native terminal",
+            Self::NativeReadback => "antigravity Stop readback after unknown",
             Self::Exited => "process exit with drained acp stream and no session/prompt reply",
         }
     }
@@ -1324,21 +1363,45 @@ pub(crate) fn exact_turn_evidence(
     state: &events::State,
     command_id: &str,
     turn_id: &str,
+    session_selector: bool,
     live: bool,
     drained_exit: bool,
 ) -> Option<TurnEvidence> {
+    if session_selector && state.native_unknown_turn_is(turn_id) {
+        if state
+            .last_turn
+            .as_ref()
+            .is_some_and(|last| last.turn_id == turn_id && last.terminal)
+        {
+            return Some(TurnEvidence::NativeReadback);
+        }
+        return Some(TurnEvidence::NativeUnknown);
+    }
     if let Some(last) = state
         .last_turn
         .as_ref()
         .filter(|last| last.turn_id == turn_id)
     {
-        return (last.terminal && last.command_id == command_id).then_some(TurnEvidence::Terminal);
+        if !last.terminal {
+            return None;
+        }
+        return match last.command_id.as_deref() {
+            Some(bound) if bound == command_id => Some(TurnEvidence::Terminal),
+            None if session_selector => Some(TurnEvidence::NativeTerminal),
+            _ => None,
+        };
+    }
+    if session_selector && live && state.native_run_is(turn_id) {
+        return Some(TurnEvidence::NativeRunning);
     }
     if live && state.prompt_outstanding(command_id, turn_id) {
         return Some(TurnEvidence::Running);
     }
     // No `session/prompt` reply settled the prepared turn before the exit.
-    (drained_exit && !state.stopped && state.pending_is(command_id, turn_id))
+    (drained_exit
+        && !state.stopped
+        && (state.pending_is(command_id, turn_id)
+            || (session_selector && state.native_run_is(turn_id))))
         .then_some(TurnEvidence::Exited)
 }
 
