@@ -677,25 +677,37 @@ impl WorkspaceManager {
             WorkspaceCreationOutcome::Unknown { message, .. } => Some(message.clone()),
             _ => None,
         };
-        if verification_error.is_some() {
+        if let Some(verification) = verification_error.as_deref() {
             let worktree = match git.prepare_created_worktree_rollback(preparation).await {
                 Ok(command) => command,
-                Err(error) => return Ok(creation_rollback_failed("worktree", &error.message)),
+                Err(error) => {
+                    return Ok(creation_rollback_failed(
+                        verification,
+                        "worktree",
+                        &error.message,
+                    ));
+                }
             };
             if let Some(command) = worktree
                 && let Some(failure) = self
-                    .run_creation_rollback(slot, preparation, command, "worktree")
+                    .run_creation_rollback(slot, preparation, command, verification, "worktree")
                     .await?
             {
                 return Ok(failure);
             }
             let branch = match git.prepare_failed_checkout_rollback(preparation).await {
                 Ok(command) => command,
-                Err(error) => return Ok(creation_rollback_failed("branch", &error.message)),
+                Err(error) => {
+                    return Ok(creation_rollback_failed(
+                        verification,
+                        "branch",
+                        &error.message,
+                    ));
+                }
             };
             if let Some(command) = branch
                 && let Some(failure) = self
-                    .run_creation_rollback(slot, preparation, command, "branch")
+                    .run_creation_rollback(slot, preparation, command, verification, "branch")
                     .await?
             {
                 return Ok(failure);
@@ -706,7 +718,7 @@ impl WorkspaceManager {
                     WorkspaceCreationOutcome::Unknown { message, .. } => message,
                     _ => "the worktree or branch still exists".to_owned(),
                 };
-                return Ok(creation_rollback_failed("readback", &reason));
+                return Ok(creation_rollback_failed(verification, "readback", &reason));
             }
         }
         if let WorkspaceCreationOutcome::Failed {
@@ -745,6 +757,7 @@ impl WorkspaceManager {
         slot: &Arc<Slot>,
         preparation: &WorkspacePreparation,
         command: Command,
+        verification: &str,
         subject: &str,
     ) -> Result<Option<WorkspaceCreationOutcome>> {
         let gate = slot.gate.clone().lock_owned().await;
@@ -769,10 +782,15 @@ impl WorkspaceManager {
         match result.state {
             RunState::Exited(0) => Ok(None),
             RunState::Exited(code) => Ok(Some(creation_rollback_failed(
+                verification,
                 subject,
                 &format!("Git exited with code {code}"),
             ))),
-            RunState::Interrupted => Ok(Some(creation_rollback_failed(subject, result.code))),
+            RunState::Interrupted => Ok(Some(creation_rollback_failed(
+                verification,
+                subject,
+                result.code,
+            ))),
         }
     }
 
@@ -2398,9 +2416,13 @@ fn removal_preflight_error(error: &Error, location: &str) -> WorkspaceRemovalOut
     }
 }
 
-fn creation_rollback_failed(subject: &str, reason: &str) -> WorkspaceCreationOutcome {
+fn creation_rollback_failed(
+    verification: &str,
+    subject: &str,
+    reason: &str,
+) -> WorkspaceCreationOutcome {
     let message = format!(
-        "Git {subject} rollback failed: {reason}. Verify and clean up the remaining workspace artifacts."
+        "Git worktree verification failed ({verification}). Git {subject} rollback failed ({reason}). Verify and clean up the remaining workspace artifacts."
     );
     WorkspaceCreationOutcome::Failed {
         code: "workspace_rollback_failed".to_owned(),

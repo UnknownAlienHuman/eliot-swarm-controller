@@ -421,7 +421,8 @@ requires the creation command's branch reflog marker, the frozen tip and no othe
 registration. Rollback checks a newly created worktree with porcelain status and
 removes it with ordinary Git removal before compare-deleting the exact ref.
 With quiescent custody, a rollback refusal or failed readback settles the launch
-as failed with the specific reason and preserves any remaining artifacts for cleanup.
+as failed. The launch diagnostic retains the verification failure and any
+separate rollback failure. Unremoved artifacts remain available for cleanup.
 A failed checkout reports its exit code once readback proves that the checkout and
 branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
@@ -470,6 +471,9 @@ its stable code, the originating bounded and sanitized message, and the failure
 location in `where`.
 The cached path inventory includes Git links. Cleanup accepts empty or absent
 submodule directories and retains populated submodule checkouts.
+Cleanup checks tracked state and separately streams the untracked and ignored
+path inventories under the Git listing limits. When scratch is present, it
+rechecks the inventories and worktree identity before authorizing deletion.
 
 Once an exclusive filesystem write guard is established, apply rechecks Git,
 deletes approved scratch files and runs ordinary non-force `git worktree remove`
@@ -550,7 +554,10 @@ silently disabling the configured HTTPS/SSH transport itself.
 
 - refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
-- index entries are parsed as a bounded NUL-delimited stream. Filter attributes
+- index entries are parsed as a NUL-delimited stream under record-count,
+  record-size, memory and time bounds. Listing-limit errors report the observed
+  record and byte counts and the applicable limit. The daemon logs the first
+  observation of a listing-limit error for an active worktree. Filter attributes
   are checked in bounded path batches and a second index digest fences the sample;
 - bounded `log --no-ext-diff --no-textconv` on HEAD movement from the last stored HEAD,
   so commits made while daemon was down are recovered; no prior baseline yields an

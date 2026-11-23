@@ -1684,6 +1684,19 @@ impl Monitoring {
                     cache.error = failed;
                 }
                 Err(error) => {
+                    if error.code == crate::git_monitor::GIT_LISTING_LIMIT
+                        && target.cache.lock_recover().error.as_deref() != Some(error.code.as_str())
+                        && let Some(input) = group.inputs.first()
+                    {
+                        let policy =
+                            eliot_core::SecretPolicy::new(self.inner.secrets.lock_recover().iter());
+                        crate::logging::record(
+                            &policy,
+                            &error.code,
+                            &[("agent", &input.key.0), ("method", "agent.git")],
+                            Some(&error),
+                        );
+                    }
                     for input in group.inputs {
                         if (input.terminal || final_flush) && input.native_closed {
                             let _ = self
