@@ -780,9 +780,7 @@ fn reserve_switch_tx(
     if let Some(error) = switch_blocker(tx, request, source_checkout_key.as_deref())? {
         return Err(error);
     }
-    if charge_switch
-        && !Store::charge_switch_reservation_tx(tx, &source, &request.id, now)?
-    {
+    if charge_switch && !Store::charge_switch_reservation_tx(tx, &source, &request.id, now)? {
         return Err(Error::new(
             "switch_budget_unavailable",
             "the task continuation switch budget is exhausted or its previous reservation is unresolved",
