@@ -247,7 +247,7 @@ fn active_turn_recovery(
     let agent_num = parse_agent_id(&agent.id)?;
     // A source can fail between send dispatch and the committed turn.started.
     // Bind the window to that same send, never to an unrelated historical gap.
-    let command: Option<(Option<String>, i64)> = connection
+    let command: Option<(Option<String>, i64, bool)> = connection
         .query_row(
             "SELECT COALESCE(json_extract(start.data, '$.command_id'), (
                  SELECT turn.start_command_id FROM turns turn
@@ -259,19 +259,22 @@ fn active_turn_recovery(
                  AND dispatch.seq < start.seq AND dispatch.kind = 'command.dispatched'
                  AND json_extract(dispatch.data, '$.command_id') = json_extract(start.data, '$.command_id')
                  ORDER BY dispatch.seq DESC LIMIT 1
-             ), start.seq)
+             ), start.seq), json_extract(start.data, '$.native_trigger') IS NOT NULL
              FROM events start
              WHERE start.agent = ?1 AND start.generation = ?2 AND start.kind = 'turn.started'
              AND json_extract(start.data, '$.turn_id') = ?3
              ORDER BY start.seq DESC LIMIT 1",
             params![agent_num, agent.generation, turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((command_id, start_seq)) = command else {
+    let Some((command_id, start_seq, self_started)) = command else {
         return Ok(None);
     };
+    if command_id.is_none() && !self_started {
+        return Ok(None);
+    }
     // Turn or source loss starts recovery. A gap naming only `message` is
     // coverage-only (one unpersisted message): the turn's outcome still
     // arrives on its healthy source, so it never starts outcome settlement.

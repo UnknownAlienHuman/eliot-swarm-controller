@@ -643,7 +643,8 @@ A turn the harness started by itself follows the
 `turn.started` with `native_trigger` and no `command_id`, then omits `command_id` from
 that turn's facts until a send binds. A send it accepts during that turn reports its
 exact association with `turn.input_bound`, and the applied response names the turn it
-joined. Exact-turn `agent.snapshot` for an unbound turn uses the session's start command.
+joined. Exact-turn `agent.snapshot` uses the session's start command as the session
+selector for an unbound turn, and the returned turn facts omit `command_id`.
 
 `turn.completed.data.native_error` optionally summarizes an available native error as
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its

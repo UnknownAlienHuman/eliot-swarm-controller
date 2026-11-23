@@ -174,6 +174,7 @@ struct QuotaTurn {
     completed_at: Option<i64>,
     usage: Option<String>,
     command_id: Option<String>,
+    native_commandless: bool,
 }
 
 fn quota_turn_origin(connection: &Connection, command_id: &str) -> Result<QuotaOriginKind> {
@@ -694,7 +695,8 @@ impl Store {
                 let mut statement = self
                     .connection
                     .prepare(&format!(
-                        "SELECT t.state, t.started_at, t.completed_at, t.usage, c.id
+                        "SELECT t.state, t.started_at, t.completed_at, t.usage, c.id,
+                                t.native_trigger IS NOT NULL AND t.start_command_id IS NULL
                            FROM agents a
                            JOIN turns t ON t.agent = a.id AND t.generation = a.generation
                            LEFT JOIN commands c
@@ -733,6 +735,7 @@ impl Store {
                                 completed_at: row.get(2)?,
                                 usage: row.get(3)?,
                                 command_id: row.get(4)?,
+                                native_commandless: row.get(5)?,
                             })
                         },
                     )
@@ -789,7 +792,13 @@ impl Store {
                     Some(command_id) => quota_turn_origin(&self.connection, command_id)?,
                     None => {
                         coverage.turns_missing_command += 1;
-                        QuotaOriginKind::Unattributed
+                        if turn.native_commandless {
+                            // The exact Agent generation is the native actor
+                            // when a self-started turn has no SEND command.
+                            QuotaOriginKind::Automation
+                        } else {
+                            QuotaOriginKind::Unattributed
+                        }
                     }
                 };
                 let origin = usage_split.origin_mut(origin_kind);

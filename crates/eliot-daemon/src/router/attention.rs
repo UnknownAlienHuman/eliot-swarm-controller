@@ -172,6 +172,7 @@ struct CapturedAgent {
     progress_basis_at: Option<i64>,
     progress_age_ms: Option<i64>,
     turn_command_id: Option<String>,
+    self_started_turn: bool,
     tool_coverage: eliot_store::ActiveToolCoverage,
     pending_kinds: Vec<String>,
     pending_kinds_truncated: bool,

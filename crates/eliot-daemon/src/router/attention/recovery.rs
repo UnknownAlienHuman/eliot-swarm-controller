@@ -100,7 +100,7 @@ pub(super) async fn recover_active_turn(
             .await;
         match snapshot {
             Ok(snapshot) => {
-                match readback(agent, &command_id, &current.turn_id, &snapshot) {
+                match readback(agent, &command_id, &current, &snapshot) {
                     Readback::Running => return Ok(false),
                     Readback::Terminal(mut terminal) => {
                         router.secret_policy_snapshot().redact_values(&mut terminal);
@@ -165,7 +165,13 @@ enum Readback {
     Inconclusive,
 }
 
-fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) -> Readback {
+fn readback(
+    agent: &Agent,
+    snapshot_command: &str,
+    binding: &ActiveTurnRecovery,
+    snapshot: &Value,
+) -> Readback {
+    let turn_id = binding.turn_id.as_str();
     let Some(evidence) = snapshot["turn_evidence"].as_str().filter(|value| {
         !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
     }) else {
@@ -173,7 +179,7 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
     };
     if snapshot["agent_id"].as_str() != Some(agent.id.as_str())
         || snapshot["generation"].as_i64() != Some(agent.generation)
-        || snapshot["command_id"].as_str() != Some(command_id)
+        || snapshot["command_id"].as_str() != Some(snapshot_command)
         || agent.native_ref.is_none()
         || snapshot["native_ref"].as_str() != agent.native_ref.as_deref()
         || snapshot["native_scope"].as_str() != agent.native_scope.as_deref()
@@ -181,7 +187,8 @@ fn readback(agent: &Agent, command_id: &str, turn_id: &str, snapshot: &Value) ->
         return Readback::Inconclusive;
     }
     let turn = &snapshot["last_turn"];
-    if turn["turn_id"].as_str() != Some(turn_id) || turn["command_id"].as_str() != Some(command_id)
+    if turn["turn_id"].as_str() != Some(turn_id)
+        || turn["command_id"].as_str() != binding.command_id.as_deref()
     {
         return Readback::Inconclusive;
     }

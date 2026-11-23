@@ -68,12 +68,13 @@ Claude's self-started turns map to the
 [core contract](../spec/core.md#self-started-native-turns). Verified on installed
 2.1.330 (2026-11-22) with a background shell and a background subagent: the wake is
 `system/task_notification`, then a `system/init` with no `user_message_uuids`, then a
-`result` with `origin.kind = "task-notification"`. With no turn active, that init starts
-the turn, and its `uuid` is the turn id. Its trigger is `task-notification` when the
-notification named a tracked background call. An input written during the run gets
-lifecycle `queued`, then `started` after the running tool, and the single `result` lists
-its UUID. `queued` binds the send to the running turn. A task-notification `result` that
-omits the bound input leaves the turn open for the result that names it.
+`result` with `origin.kind = "task-notification"`. With no turn active, that notification
+and init prove a start with trigger `task-notification` and the init's `uuid` as its turn
+id. A send that overlaps a notification may bind on its exact lifecycle while the
+native turn is open, or on the result that names its UUID if that result arrives first.
+After the native terminal, a late `queued` frame for that send leaves it pending for
+its exact `started` or `cancelled` lifecycle. Once a send is bound, a result settles
+it only when it names the input UUID, regardless of the result origin.
 
 ## Transport
 

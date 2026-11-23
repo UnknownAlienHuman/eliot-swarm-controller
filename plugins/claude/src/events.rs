@@ -63,8 +63,7 @@ pub(crate) struct EventStatus {
     pub background_continuation: bool,
     pub ready: bool,
     pub session_id: Option<String>,
-    /// The send bound to the active turn. For a self-started native turn
-    /// with no send, this is the session's start command: its readback key.
+    /// The send bound to the active turn, if any.
     pub active_command_id: Option<String>,
     pub active_turn_id: Option<String>,
     /// The active turn is self-started and no send has bound to it, so it
@@ -79,7 +78,8 @@ pub(crate) struct EventStatus {
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TurnFacts {
-    pub command_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
     pub turn_id: String,
     /// Universal terminal status (`completed`, `interrupted` or `failed`);
     /// absent while non-terminal or when the native reason maps to no
@@ -98,7 +98,6 @@ pub(crate) struct TurnFacts {
 }
 
 pub(crate) struct EventConfig {
-    pub start_command_id: String,
     pub credential: String,
     pub agent_id: String,
     pub generation: i64,
@@ -181,6 +180,7 @@ struct BufferedRecord {
 struct PendingTurn {
     command_id: String,
     turn_id: String,
+    overlaps_native: bool,
     context: Vec<ContextItem>,
     outcome: Option<oneshot::Sender<TurnOutcome>>,
 }
@@ -411,7 +411,6 @@ struct EventProcessor {
     /// A tracked background task ended, so Claude wakes its main loop without
     /// a SEND: the next init with no input UUID is that self-started turn.
     task_notification_pending: bool,
-    start_command_id: String,
     /// Input UUID the active turn must answer before it can end. A native
     /// result that does not name it only ends the merged prefix.
     active_input: Option<String>,
@@ -884,7 +883,6 @@ impl EventProcessor {
             background_tools: HashMap::new(),
             tool_coverage_gap_reported: false,
             task_notification_pending: false,
-            start_command_id: config.start_command_id,
             active_input: None,
             last_input: None,
             native_prefix_ended: false,
@@ -1028,6 +1026,7 @@ impl EventProcessor {
         self.pending_turn = Some(PendingTurn {
             command_id,
             turn_id,
+            overlaps_native: self.status.native_unbound || self.task_notification_pending,
             context: Vec::new(),
             outcome: Some(outcome),
         });
@@ -1249,28 +1248,28 @@ impl EventProcessor {
             .await
     }
 
-    /// An init naming no input UUID, with no turn active, is Claude starting
-    /// a turn by itself. A SEND's lifecycle always precedes its own init, so
-    /// an in-flight input only yields to a proven task notification.
+    /// Claude announces a background task notification before its init.
+    /// An init without that signal cannot prove an autonomous start.
     async fn observe_task_boundary(&mut self, record: &Value) -> Result<()> {
-        if record.get("subtype").and_then(Value::as_str) == Some("init") {
+        let subtype = record.get("subtype").and_then(Value::as_str);
+        if subtype == Some("task_notification") {
+            self.task_notification_pending = true;
+            if let Some(pending) = self.pending_turn.as_mut() {
+                pending.overlaps_native = true;
+            }
+        } else if subtype == Some("init") {
             let notified = std::mem::take(&mut self.task_notification_pending);
             let names_input = record
                 .get("user_message_uuids")
                 .and_then(Value::as_array)
                 .is_some_and(|uuids| !uuids.is_empty());
-            if !names_input
+            if notified
+                && !names_input
                 && self.status.active_turn_id.is_none()
                 && self.status.ready
                 && !self.planned_stop
-                && (notified || self.pending_turn.is_none())
             {
-                let trigger = if notified {
-                    "task-notification"
-                } else {
-                    "native"
-                };
-                self.start_native_turn(record, trigger).await?;
+                self.start_native_turn(record).await?;
             }
         }
         self.status.background_continuation = self.task_notification_pending;
@@ -1279,7 +1278,7 @@ impl EventProcessor {
 
     /// Commit a turn Claude started by itself. Its id is the native init
     /// record's UUID; it has no command until a send merges into it.
-    async fn start_native_turn(&mut self, record: &Value, trigger: &str) -> Result<()> {
+    async fn start_native_turn(&mut self, record: &Value) -> Result<()> {
         let Some(turn_id) = record
             .get("uuid")
             .and_then(Value::as_str)
@@ -1293,7 +1292,6 @@ impl EventProcessor {
                 )
                 .await;
         };
-        self.status.active_command_id = Some(self.start_command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
         self.status.native_unbound = true;
         self.active_input = None;
@@ -1308,14 +1306,14 @@ impl EventProcessor {
         self.commit_event(
             "turn.started",
             native_id,
-            json!({"turn_id": turn_id, "native_trigger": trigger}),
+            json!({"turn_id": turn_id, "native_trigger": "task-notification"}),
         )
         .await
     }
 
     /// Facts of a self-started turn with no bound send name no command.
     fn scope_turn_command(&self, data: &mut Value) {
-        if self.status.native_unbound
+        if self.status.active_command_id.is_none()
             && let Some(fields) = data.as_object_mut()
         {
             fields.remove("command_id");
@@ -1367,12 +1365,15 @@ impl EventProcessor {
                 "Claude command_lifecycle omitted its turn association",
             ));
         }
-        let pending_match = self
-            .pending_turn
-            .as_ref()
-            .is_some_and(|pending| pending.turn_id == parsed.command_uuid);
-        if pending_match {
-            return self.settle_pending_lifecycle(parsed).await;
+        if let Some(pending) = self.pending_turn.as_ref()
+            && pending.turn_id == parsed.command_uuid
+        {
+            // A queued frame can follow the native result. Queue admission
+            // alone cannot start a new turn after that result.
+            if parsed.state == "queued" && pending.overlaps_native && !self.status.native_unbound {
+                return Ok(());
+            }
+            return self.settle_pending_lifecycle(&parsed.state).await;
         }
         if self.status.active_turn_id.as_deref() == Some(parsed.command_uuid.as_str()) {
             if parsed.state == "cancelled" {
@@ -1404,7 +1405,7 @@ impl EventProcessor {
             .await
     }
 
-    async fn settle_pending_lifecycle(&mut self, parsed: CommandLifecycle) -> Result<()> {
+    async fn settle_pending_lifecycle(&mut self, state: &str) -> Result<()> {
         let Some(pending) = self.pending_turn.take() else {
             return Ok(());
         };
@@ -1413,13 +1414,14 @@ impl EventProcessor {
             turn_id,
             context,
             outcome,
+            ..
         } = pending;
         let settle = |outcome: Option<oneshot::Sender<TurnOutcome>>, settled: TurnOutcome| {
             if let Some(sender) = outcome {
                 let _ = sender.send(settled);
             }
         };
-        match parsed.state.as_str() {
+        match state {
             "queued" | "started" => {
                 if self.writes_blocked {
                     settle(
@@ -1570,6 +1572,7 @@ impl EventProcessor {
             "type": "result",
             "terminal_reason": "cancelled",
             "session_id": session_id,
+            "user_message_uuid": self.active_input,
         }))
         .await
     }
@@ -1635,7 +1638,7 @@ impl EventProcessor {
             return Ok(());
         }
         let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(&text);
-        let command_id = self.status.active_command_id.as_deref().unwrap_or_default();
+        let command_id = self.status.active_command_id.as_deref();
         let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
@@ -1680,12 +1683,10 @@ impl EventProcessor {
                 )
                 .await;
         }
-        let (Some(command_id), Some(turn_id)) = (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) else {
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
             return Ok(());
         };
+        let command_id = self.status.active_command_id.clone();
         for tool_use in assistant_tool_uses(record) {
             self.tool_names
                 .entry(tool_use.id.clone())
@@ -1768,11 +1769,7 @@ impl EventProcessor {
                 )
                 .await;
         }
-        let Some(command_id) = self.status.active_command_id.clone() else {
-            return self
-                .record_gap("Claude tool result has no exact Eliot command")
-                .await;
-        };
+        let command_id = self.status.active_command_id.clone();
         let mut unknown = false;
         for result in results {
             let Some(tool) = self.tool_names.get(&result.tool_use_id).cloned() else {
@@ -1832,7 +1829,6 @@ impl EventProcessor {
         let Some(turn_id) = self.background_tools.remove(item_id) else {
             return Ok(());
         };
-        self.task_notification_pending = true;
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:tool.background_ended:{item_id}");
         let data = json!({ "turn_id": turn_id, "item_id": item_id });
@@ -2648,15 +2644,13 @@ impl EventProcessor {
                 .record_gap("Claude pending native request bound was exceeded")
                 .await;
         }
-        let (Some(command_id), Some(turn_id)) = (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) else {
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
             self.deny_stray_request(request_id).await;
             return self
                 .record_gap("Claude permission ask arrived outside the exact active turn")
                 .await;
         };
+        let command_id = self.status.active_command_id.clone();
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         // The public approval fact carries only a neutral summary (the
         // decision-relevant operation: command/description/cwd and file/path
@@ -3048,46 +3042,52 @@ impl EventProcessor {
         }
         self.task_notification_pending = false;
         self.status.background_continuation = false;
-        if parsed
-            .origin
-            .as_ref()
-            .is_some_and(|origin| origin.kind == "task-notification")
-        {
-            let answers_input = self.active_input.as_deref().is_none_or(|input| {
-                parsed.user_message_uuid.as_deref() == Some(input)
-                    || parsed.user_message_uuids.iter().any(|uuid| uuid == input)
-            });
-            // The native run ended before consuming the queued input. Claude
-            // answers that input next, inside this same Swarm turn.
-            if !answers_input {
-                self.native_prefix_ended = true;
-                self.prefix_usage = TurnUsage::sum_native(
-                    "main_loop_turn",
-                    self.prefix_usage
-                        .take()
-                        .into_iter()
-                        .chain(result_usage(record)),
-                );
-                return Ok(());
-            }
-            if self.status.active_turn_id.is_none() {
-                return self
-                    .record_coverage_gap(
-                        "Claude task-notification result had no observed native turn start",
-                        &["message", "tool"],
-                    )
-                    .await;
-            }
-        }
         if parsed.terminal_reason.trim().is_empty() {
             return self
                 .record_gap("Claude result omitted its terminal reason")
                 .await;
         }
-        let (Some(command_id), Some(turn_id)) = (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) else {
+        // A result may be the first frame to prove that Claude consumed the
+        // pending send inside the native run. Bind before committing it.
+        if self.status.native_unbound
+            && self
+                .pending_turn
+                .as_ref()
+                .is_some_and(|pending| parsed.names_input(&pending.turn_id))
+        {
+            self.settle_pending_lifecycle("started").await?;
+        }
+        // A result that does not name the bound input accounts only for the
+        // prefix. This applies regardless of the result's reported origin.
+        if self
+            .active_input
+            .as_deref()
+            .is_some_and(|input| !parsed.names_input(input))
+        {
+            self.native_prefix_ended = true;
+            self.prefix_usage = TurnUsage::sum_native(
+                "main_loop_turn",
+                self.prefix_usage
+                    .take()
+                    .into_iter()
+                    .chain(result_usage(record)),
+            );
+            return Ok(());
+        }
+        if self.status.active_turn_id.is_none()
+            && parsed
+                .origin
+                .as_ref()
+                .is_some_and(|origin| origin.kind == "task-notification")
+        {
+            return self
+                .record_coverage_gap(
+                    "Claude task-notification result had no observed native turn start",
+                    &["message", "tool"],
+                )
+                .await;
+        }
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
             if let Some(pending) = self.pending_turn.take() {
                 // An uncorrelated terminal before association cannot prove the
                 // pending input ran; its fate stays unknown.
@@ -3102,6 +3102,7 @@ impl EventProcessor {
                 .record_gap("Claude terminal record did not match the exact active turn")
                 .await;
         };
+        let command_id = self.status.active_command_id.clone();
         self.cancel_hook_callbacks_for_turn(&turn_id);
         // Unanswered asks die with their turn: close them before the terminal
         // commit, without a command binding.
@@ -3390,12 +3391,9 @@ impl EventProcessor {
         );
         self.commit_event("session.ended", native_id, json!({}))
             .await?;
-        if let (Some(command_id), Some(turn_id)) = (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) {
+        if let Some(turn_id) = self.status.active_turn_id.clone() {
             self.status.last_turn = Some(TurnFacts {
-                command_id,
+                command_id: self.status.active_command_id.clone(),
                 turn_id,
                 status: None,
                 native_status: None,

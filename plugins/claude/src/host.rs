@@ -1607,11 +1607,14 @@ fn live_session_snapshot(
     } else {
         "unknown"
     };
-    let evidence = exact_turn_evidence(params, event_status, process_exited);
+    let turn_command =
+        (params.command_id != session.start_command_id).then_some(params.command_id.as_str());
+    let evidence = params.turn_id.as_deref().and_then(|turn_id| {
+        exact_turn_evidence(turn_id, turn_command, event_status, process_exited)
+    });
     match evidence {
         Some(TurnEvidence::Running) => {
-            last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
-                "status": "running", "terminal": false});
+            last_turn = in_progress_turn_snapshot(params, turn_command, "running");
         }
         Some(TurnEvidence::Terminal) => {
             // The exact `result` record ended the turn; the CLI then waits
@@ -1621,8 +1624,7 @@ fn live_session_snapshot(
         Some(TurnEvidence::Exited) => {
             state = "lost";
             active_turn = None;
-            last_turn = json!({"command_id": params.command_id, "turn_id": params.turn_id,
-                "status": "lost", "terminal": false});
+            last_turn = in_progress_turn_snapshot(params, turn_command, "lost");
         }
         None => {}
     }
@@ -1641,6 +1643,18 @@ fn live_session_snapshot(
         "result_known": result_known,
         "turn_evidence": evidence.map(TurnEvidence::label),
     }))
+}
+
+fn in_progress_turn_snapshot(
+    params: &AgentSnapshotParams,
+    command_id: Option<&str>,
+    status: &str,
+) -> Value {
+    let mut fact = json!({"turn_id": params.turn_id, "status": status, "terminal": false});
+    if let Some(command_id) = command_id {
+        fact["command_id"] = json!(command_id);
+    }
+    fact
 }
 
 /// What the owned stream-json reader and process waiter proved about the
@@ -1666,18 +1680,18 @@ impl TurnEvidence {
     }
 }
 
-pub(crate) fn exact_turn_evidence(
-    params: &AgentSnapshotParams,
+fn exact_turn_evidence(
+    turn_id: &str,
+    command_id: Option<&str>,
     status: &EventStatus,
     process_exited: bool,
 ) -> Option<TurnEvidence> {
-    let turn_id = params.turn_id.as_deref()?;
     if let Some(last) = status
         .last_turn
         .as_ref()
         .filter(|last| last.turn_id == turn_id)
     {
-        return (last.command_id == params.command_id
+        return (last.command_id.as_deref() == command_id
             && last.terminal
             && last.status.is_some()
             && status.active_turn_id.is_none()
@@ -1685,7 +1699,7 @@ pub(crate) fn exact_turn_evidence(
             .then_some(TurnEvidence::Terminal);
     }
     if status.active_turn_id.as_deref() != Some(turn_id)
-        || status.active_command_id.as_deref() != Some(params.command_id.as_str())
+        || status.active_command_id.as_deref() != command_id
         || status.stopped
     {
         return None;
@@ -1707,16 +1721,24 @@ fn snapshot_turn_facts<'a>(
         return if params.command_id == start_command_id
             || stop_command_id == Some(params.command_id.as_str())
         {
-            Ok(status.last_turn.as_ref())
+            Ok(status
+                .last_turn
+                .as_ref()
+                .filter(|last| last.command_id.is_some()))
         } else {
             Err("Claude command has no exact native turn association")
         };
     };
+    // The start command identifies the session for an exact commandless
+    // readback. It cannot identify a send or claim a turn as its own.
+    let command_id = (params.command_id != start_command_id).then_some(params.command_id.as_str());
     let retained = status
         .last_turn
         .as_ref()
-        .filter(|last| last.turn_id == turn_id);
-    if status.active_turn_id.as_deref() != Some(turn_id) && retained.is_none() {
+        .filter(|last| last.turn_id == turn_id && last.command_id.as_deref() == command_id);
+    let active = status.active_turn_id.as_deref() == Some(turn_id)
+        && status.active_command_id.as_deref() == command_id;
+    if !active && retained.is_none() {
         return Err("Claude readback did not prove the exact requested turn");
     }
     Ok(retained)
@@ -2021,7 +2043,6 @@ async fn launch_session(
         stream,
         peer.clone(),
         EventConfig {
-            start_command_id: params.command_id.clone(),
             credential: plan.credential.clone(),
             agent_id: params.agent_id.clone(),
             generation: params.generation,

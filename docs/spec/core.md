@@ -344,7 +344,7 @@ The Store commits event, next projection and derived facts atomically, then publ
 A harness can start a turn with no Eliot input, as Claude Code does when its own
 background task ends. The adapter reports `turn.started` with `native_trigger` and no
 `command_id`, using the native run's id as the turn id. `native_trigger` is
-`task-notification` after a background task the adapter tracked and `native` otherwise.
+the positive native start signal, such as Claude's `task-notification`.
 The Agent is `busy`, and the turn is an ordinary `turns` row with no starting command, so
 results, usage, Goal turn counts, checks and background wakes read it like any other
 turn. No command is invented. Facts of this turn omit `command_id`, and Store accepts
@@ -360,15 +360,19 @@ One Agent generation never runs two overlapping turns. Input follows one rule:
   records it as the turn's starting command. Later facts of the turn name that command.
 - The same rule covers a send written just before the harness started the turn. Its
   association arrives after the native start and binds to that turn.
+- A terminal can prove the association itself when it names the still-pending input.
+  Queue admission reported after the native terminal requires a later native start
+  to open a separate turn.
 - The turn stays open until a native terminal names the bound input. A terminal that
   does not name it ends only the prefix of the run: its usage adds to the turn, and the
   terminal for the input settles the turn and its final text.
 - If the harness drops the bound input, the turn ends with its own native terminal, or
   as interrupted when the prefix already ended.
 
-An unbound self-started turn reads back through `agent.snapshot` with the generation's
-start command. Stop, interrupt, steer, requests and unknown settlement bind to its exact
-turn id as for any turn.
+An unbound self-started turn reads back through `agent.snapshot` with its exact
+turn id and the generation's start command as the session selector. The returned turn
+facts carry no command. Stop, interrupt, steer, requests and unknown settlement bind
+to its exact turn id as for any turn.
 
 ## Profile
 

@@ -16,6 +16,28 @@ pub struct HandoffAdmission {
 }
 
 impl Store {
+    /// Find the task turn before any commandless native continuations.
+    /// An intervening failed or unbound ordinary turn still blocks handoff.
+    pub fn latest_handoff_task_turn(&self, agent: &str, generation: i64) -> Result<Option<Turn>> {
+        let agent_num = parse_agent_id(agent)?;
+        let turn_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2
+                 AND (native_trigger IS NULL OR start_command_id IS NOT NULL)
+                 ORDER BY COALESCE(started_at, completed_at, 0) DESC, turn_id DESC LIMIT 1",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        turn_id
+            .as_deref()
+            .map(|turn_id| self.get_turn(agent, generation, turn_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn is_handoff_brief(&self, command_id: &str) -> Result<bool> {
         is_brief_tx(&self.connection, command_id)
     }
