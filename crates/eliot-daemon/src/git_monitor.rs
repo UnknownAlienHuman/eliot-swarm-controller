@@ -38,20 +38,11 @@ const WORK_UNTRACKED_MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024;
 const WORK_MAX_COMMITS_AHEAD: u64 = 10_000;
 const PROBE_TIME: Duration = Duration::from_secs(15);
 const CLEANUP_TIME: Duration = Duration::from_secs(2);
-const STATUS_ARGS: &[&str] = &[
-    "status",
-    "--porcelain=v2",
-    "--branch",
-    "-z",
-    "--untracked-files=all",
-    "--ignore-submodules=none",
-    "--no-ahead-behind",
-    "--renames",
-];
 const INDEX_ARGS: &[&str] = &["ls-files", "--stage", "-v", "-z"];
-const INDEX_RECORDS: usize = 100_000;
-const INDEX_RECORD_BYTES: usize = 32 * 1024;
-const INDEX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const NUL_LISTING_RECORDS: usize = 100_000;
+const NUL_LISTING_RECORD_BYTES: usize = 32 * 1024;
+const NUL_LISTING_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const GIT_LISTING_LIMIT: &str = "git_listing_limit";
 const ATTRIBUTE_BATCH_BYTES: usize = OUTPUT_BYTES / 4;
 
 #[derive(Clone, Copy)]
@@ -60,6 +51,20 @@ enum Gitlinks<'a> {
     RequireUnpopulated(&'a Path),
     NamesOnly,
 }
+
+fn status_args(untracked: &'static str) -> [&'static str; 8] {
+    [
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        untracked,
+        "--ignore-submodules=none",
+        "--no-ahead-behind",
+        "--renames",
+    ]
+}
+
 /// A Goal's change scope lists a rename as both of its paths. A changed
 /// submodule is reported, so its record makes the change set unverified
 /// instead of hiding edits inside it.
@@ -193,11 +198,17 @@ impl GitProbe {
         } else {
             Gitlinks::Reject
         };
+        // Cleanup streams untracked and ignored paths separately.
+        let status_args = status_args(if for_cleanup {
+            "--untracked-files=no"
+        } else {
+            "--untracked-files=all"
+        });
         let (index_digest, index) = self
             .index_snapshot(&root, &overrides, deadline, gitlinks)
             .await?;
         let status_bytes = self
-            .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
+            .checked(&root, &status_args, &overrides, &[], deadline)
             .await?;
         let status = parse_status(&status_bytes)?;
 
@@ -311,7 +322,7 @@ impl GitProbe {
             .index_snapshot(&root, &overrides, deadline, gitlinks)
             .await?;
         let final_status = self
-            .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
+            .checked(&root, &status_args, &overrides, &[], deadline)
             .await?;
         if index_digest != final_index_digest || status_bytes != final_status {
             return Err(unavailable("Git worktree changed during observation"));
@@ -973,7 +984,13 @@ impl GitProbe {
         self.require_exact_root(&root, &overrides, deadline).await?;
         let status = parse_status(
             &self
-                .checked(&root, STATUS_ARGS, &overrides, &[], deadline)
+                .checked(
+                    &root,
+                    &status_args("--untracked-files=all"),
+                    &overrides,
+                    &[],
+                    deadline,
+                )
                 .await?,
         )?;
         let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
@@ -1121,6 +1138,29 @@ impl GitProbe {
     ) -> Result<Captured> {
         let overrides = self.safe_overrides(root, deadline).await?;
         self.run(root, args, &overrides, &[], deadline).await
+    }
+
+    /// Read a complete NUL-delimited path listing under the shared listing
+    /// bounds. Each path is validated before it is retained for cleanup.
+    pub(crate) async fn workspace_path_listing(
+        &self,
+        root: &Path,
+        args: &[&str],
+        deadline: Instant,
+    ) -> Result<BTreeSet<String>> {
+        if args.first() != Some(&"ls-files") || !args.contains(&"-z") {
+            return Err(Error::new(
+                "invalid",
+                "workspace path listing requires git ls-files -z",
+            ));
+        }
+        let overrides = self.safe_overrides(root, deadline).await?;
+        let command = self.build_command(root, args, &overrides, None)?;
+        let (code, paths) = Self::capture_git(command, &[], deadline, read_path_listing).await?;
+        if code != 0 {
+            return Err(unavailable("Git path listing failed"));
+        }
+        Ok(paths)
     }
 
     /// Read using one explicitly scoped index file, without inheriting any
@@ -1693,45 +1733,82 @@ fn parse_status(bytes: &[u8]) -> Result<Status> {
 }
 
 async fn read_index(
-    mut stdout: ChildStdout,
+    stdout: ChildStdout,
     gitlinks: Gitlinks<'_>,
 ) -> Result<([u8; 32], BTreeMap<String, bool>)> {
     let mut index = BTreeMap::<String, bool>::new();
+    let digest = read_nul_records(stdout, |record| {
+        add_index_record(&mut index, record, gitlinks)
+    })
+    .await?;
+    Ok((digest, index))
+}
+
+async fn read_path_listing(stdout: ChildStdout) -> Result<BTreeSet<String>> {
+    let mut paths = BTreeSet::new();
+    read_nul_records(stdout, |record| {
+        let path = std::str::from_utf8(record)
+            .map_err(|_| unavailable("Git path listing contains non-UTF-8 data"))?;
+        paths.insert(git_path(path)?);
+        Ok(())
+    })
+    .await?;
+    Ok(paths)
+}
+
+/// Stream NUL records into a caller-owned reducer. Bounds are shared by index
+/// and workspace path listings; the digest covers the exact raw byte stream.
+async fn read_nul_records(
+    mut stdout: ChildStdout,
+    mut on_record: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     let mut buffer = vec![0u8; 8192];
     let mut record = Vec::new();
-    let mut records = 0;
-    let mut bytes = 0;
+    let mut records = 0usize;
+    let mut bytes = 0usize;
     loop {
+        // Read no more than one byte past the total bound so the reported size
+        // is precise and an over-limit child is terminated promptly.
+        let read_limit = (NUL_LISTING_TOTAL_BYTES - bytes + 1).min(buffer.len());
         let read = stdout
-            .read(&mut buffer)
+            .read(&mut buffer[..read_limit])
             .await
-            .map_err(|_| unavailable("Git index capture failed"))?;
+            .map_err(|_| unavailable("Git NUL listing capture failed"))?;
         if read == 0 {
             break;
         }
         bytes += read;
-        if bytes > INDEX_TOTAL_BYTES {
-            return Err(unavailable(&format!(
-                "Git index scan read {bytes} bytes and exceeded the {INDEX_TOTAL_BYTES}-byte bound"
-            )));
+        if bytes > NUL_LISTING_TOTAL_BYTES {
+            return Err(listing_limit(
+                records,
+                bytes,
+                &format!("the {NUL_LISTING_TOTAL_BYTES}-byte limit"),
+            ));
         }
         digest.update(&buffer[..read]);
         for chunk in buffer[..read].split_inclusive(|byte| *byte == 0) {
-            if record.len() + chunk.len() > INDEX_RECORD_BYTES {
-                return Err(unavailable(
-                    "Git index record exceeds the observation bound",
+            let observed_record_bytes = record.len() + chunk.len();
+            if observed_record_bytes > NUL_LISTING_RECORD_BYTES {
+                return Err(listing_limit(
+                    records,
+                    bytes,
+                    &format!(
+                        "the {NUL_LISTING_RECORD_BYTES}-byte record limit with a record of at least {observed_record_bytes} bytes"
+                    ),
                 ));
             }
-            if let Some(record_end) = chunk.strip_suffix(&[0]) {
-                record.extend_from_slice(record_end);
+            if let Some(payload) = chunk.strip_suffix(&[0]) {
                 records += 1;
-                if records > INDEX_RECORDS {
-                    return Err(unavailable(&format!(
-                        "Git index scan read {records} records and exceeded the {INDEX_RECORDS}-record bound"
-                    )));
+                if records > NUL_LISTING_RECORDS {
+                    return Err(listing_limit(
+                        records,
+                        bytes,
+                        &format!("the {NUL_LISTING_RECORDS}-record limit"),
+                    ));
                 }
-                add_index_record(&mut index, &record, gitlinks)?;
+                record.extend_from_slice(payload);
+                on_record(&record)?;
                 record.clear();
             } else {
                 record.extend_from_slice(chunk);
@@ -1739,9 +1816,16 @@ async fn read_index(
         }
     }
     if !record.is_empty() {
-        return Err(unavailable("Git index record is truncated"));
+        return Err(unavailable("Git NUL record is truncated"));
     }
-    Ok((digest.finalize().into(), index))
+    Ok(digest.finalize().into())
+}
+
+fn listing_limit(records: usize, bytes: usize, limit: &str) -> Error {
+    Error::new(
+        GIT_LISTING_LIMIT,
+        format!("Git listing reached {records} records and {bytes} bytes and exceeded {limit}"),
+    )
 }
 
 fn add_index_record(

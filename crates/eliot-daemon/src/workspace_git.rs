@@ -26,6 +26,14 @@ pub(crate) mod containment;
 mod readback;
 
 const READ_TIME: Duration = Duration::from_secs(15);
+const UNTRACKED_ARGS: &[&str] = &["ls-files", "--others", "--exclude-standard", "-z"];
+const IGNORED_ARGS: &[&str] = &[
+    "ls-files",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "-z",
+];
 /// Shared Git command budget for a project readback.
 const ORIGIN_READ_TIME: Duration = Duration::from_secs(3);
 const METADATA_BYTES: u64 = 64 * 1024;
@@ -817,22 +825,14 @@ impl WorkspaceGit {
             allowed.insert(prefix);
         }
 
-        let other_args = ["ls-files", "--others", "--exclude-standard", "-z"];
-        let ignored_args = [
-            "ls-files",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-            "-z",
-        ];
-        let other = scratch_paths(&self.read(root, &other_args, deadline).await?)?;
-        let ignored = scratch_paths(&self.read(root, &ignored_args, deadline).await?)?;
+        let other = self.scratch_listing(root, UNTRACKED_ARGS, deadline).await?;
+        let ignored = self.scratch_listing(root, IGNORED_ARGS, deadline).await?;
         if other.is_empty() && ignored.is_empty() {
             self.confirm_subject(preparation, &subject, deadline)
                 .await?;
             return Ok((subject.head, Vec::new()));
         }
-        let cached = scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
+        let cached = scratch_paths(self.git.cached_index_paths(root, deadline).await?)?;
         let mut tracked = BTreeSet::new();
         for relative in &cached {
             if Instant::now() >= deadline {
@@ -884,11 +884,10 @@ impl WorkspaceGit {
         }
 
         self.require_tracked_clean(&subject, deadline).await?;
-        let cached_readback =
-            scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
+        let cached_readback = scratch_paths(self.git.cached_index_paths(root, deadline).await?)?;
         if cached != cached_readback
-            || other != scratch_paths(&self.read(root, &other_args, deadline).await?)?
-            || ignored != scratch_paths(&self.read(root, &ignored_args, deadline).await?)?
+            || other != self.scratch_listing(root, UNTRACKED_ARGS, deadline).await?
+            || ignored != self.scratch_listing(root, IGNORED_ARGS, deadline).await?
         {
             return Err(problem(
                 "unavailable",
@@ -898,6 +897,19 @@ impl WorkspaceGit {
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         Ok((subject.head, candidates.into_iter().collect()))
+    }
+
+    async fn scratch_listing(
+        &self,
+        root: &Path,
+        args: &[&str],
+        deadline: Instant,
+    ) -> Result<BTreeSet<PathBuf>> {
+        scratch_paths(
+            self.git
+                .workspace_path_listing(root, args, deadline)
+                .await?,
+        )
     }
 
     async fn require_tracked_clean(&self, subject: &Subject, deadline: Instant) -> Result<()> {
@@ -919,7 +931,7 @@ impl WorkspaceGit {
                 "scratch Git coverage is incomplete or changed identity",
             ));
         }
-        if snapshot.dirty.iter().any(|entry| entry.status != "??") {
+        if !snapshot.dirty.is_empty() {
             return Err(problem(
                 "dirty",
                 "worktree contains staged or unstaged tracked changes",
@@ -1069,7 +1081,7 @@ impl WorkspaceGit {
                 "worktree tip moved before removal",
             ));
         }
-        self.require_clean(&subject, true, deadline).await?;
+        self.require_clean(&subject, deadline).await?;
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
         let target = git_path_argument(&subject.target.root)?;
@@ -1320,51 +1332,22 @@ impl WorkspaceGit {
         })
     }
 
-    async fn require_clean(
-        &self,
-        subject: &Subject,
-        include_ignored: bool,
-        deadline: Instant,
-    ) -> Result<()> {
-        let path = path_text(&subject.target.root)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()
-            .and_then(|value| i64::try_from(value.as_millis()).ok())
-            .ok_or_else(|| problem("unavailable", "workspace observation clock is unavailable"))?;
-        let snapshot = timeout_at(deadline, self.git.probe_cleanup(&path, &subject.head, now))
-            .await
-            .map_err(|_| problem("unavailable", "workspace clean readback timed out"))??;
-        if !snapshot.complete
-            || snapshot.head.as_deref() != Some(subject.head.as_str())
-            || snapshot.branch.as_deref() != subject.branch.strip_prefix("refs/heads/")
-            || !snapshot.dirty.is_empty()
+    async fn require_clean(&self, subject: &Subject, deadline: Instant) -> Result<()> {
+        self.require_tracked_clean(subject, deadline).await?;
+        let root = &subject.target.root;
+        if !self
+            .scratch_listing(root, UNTRACKED_ARGS, deadline)
+            .await?
+            .is_empty()
+            || !self
+                .scratch_listing(root, IGNORED_ARGS, deadline)
+                .await?
+                .is_empty()
         {
             return Err(problem(
                 "dirty",
-                "workspace population/cleanliness is incomplete, filtered, hidden, or dirty",
+                "workspace contains untracked or ignored files after scratch cleanup",
             ));
-        }
-        if include_ignored {
-            let ignored = self
-                .read(
-                    &subject.target.root,
-                    &[
-                        "ls-files",
-                        "--others",
-                        "--ignored",
-                        "--exclude-standard",
-                        "-z",
-                    ],
-                    deadline,
-                )
-                .await?;
-            if !ignored.is_empty() {
-                return Err(problem(
-                    "dirty",
-                    "workspace contains ignored files; only the manager may delete explicitly allowed scratch",
-                ));
-            }
         }
         Ok(())
     }
@@ -1550,28 +1533,7 @@ fn scratch_relative(path: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-fn scratch_paths(bytes: &[u8]) -> Result<BTreeSet<PathBuf>> {
-    if bytes.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| problem("unavailable", "scratch Git listing is not UTF-8"))?;
-    let text = text
-        .strip_suffix('\0')
-        .ok_or_else(|| problem("unavailable", "scratch Git listing is truncated"))?;
-    text.split('\0')
-        .map(|path| {
-            scratch_relative(path).map_err(|_| {
-                problem(
-                    "unavailable",
-                    "scratch Git listing contains an invalid relative path",
-                )
-            })
-        })
-        .collect()
-}
-
-fn scratch_index_paths(paths: BTreeSet<String>) -> Result<BTreeSet<PathBuf>> {
+fn scratch_paths(paths: BTreeSet<String>) -> Result<BTreeSet<PathBuf>> {
     paths
         .into_iter()
         .map(|path| {
