@@ -47,12 +47,11 @@ use crate::native::{
     },
     sse::SseFrame,
     types::{
-        AgentSelectedData, AssistantContent, AssistantTokens, CompactionEventData,
-        CompactionReason, EliotContextHook, EliotContextResolveInput, ExecutionEventData,
-        FormCancelledData, FormCreatedData, FormRepliedData, InboxEventData, Message, ModelRef,
-        ModelSelectedData, PermissionAskedData, PermissionRepliedData, RetryScheduledData,
-        SessionLifecycleData, SseEnvelope, StepStartedData, StructuredError, ToolEventData,
-        ToolFailedData, ToolInputStartedData,
+        AgentSelectedData, AssistantContent, AssistantTokens, EliotContextHook,
+        EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
+        FormRepliedData, InboxEventData, Message, ModelRef, ModelSelectedData, PermissionAskedData,
+        PermissionRepliedData, RetryScheduledData, SessionLifecycleData, SseEnvelope,
+        StepStartedData, StructuredError, ToolEventData, ToolFailedData, ToolInputStartedData,
     },
 };
 
@@ -1718,49 +1717,71 @@ impl EventProcessor {
     }
 
     async fn observe_compaction(&mut self, envelope: &SseEnvelope) -> Result<()> {
-        let Some(session_id) = self.status.session_id.as_deref() else {
+        let Some(session_id) = self.status.session_id.clone() else {
             return Ok(());
         };
-        if envelope.data["sessionID"].as_str() != Some(session_id) {
+        if envelope.data["sessionID"].as_str() != Some(session_id.as_str()) {
+            if envelope
+                .durable
+                .as_ref()
+                .is_some_and(|durable| durable.aggregate_id.as_str() == session_id.as_str())
+            {
+                self.record_source_gap_once(
+                    "OpenCode compaction event session identity disagreed with its durable aggregate",
+                )
+                .await?;
+            }
             return Ok(());
         }
-        let compaction: CompactionEventData = serde_json::from_value(envelope.data.clone())
-            .map_err(|_| {
-                Error::new(
-                    "native_protocol",
-                    "OpenCode compaction event omitted its session or reason",
-                )
-            })?;
-        if !envelope
+        if envelope
             .durable
             .as_ref()
-            .is_some_and(|durable| durable.aggregate_id == compaction.session_id)
+            .is_some_and(|durable| durable.aggregate_id.as_str() != session_id.as_str())
         {
-            return Err(Error::new(
-                "native_protocol",
-                "OpenCode compaction event was not durable for its exact session",
-            ));
+            self.record_source_gap_once(
+                "OpenCode compaction event durability disagreed with its session",
+            )
+            .await?;
+            return Ok(());
+        }
+        if envelope.durable.is_none() {
+            let reason = if envelope.id.trim().is_empty() {
+                "OpenCode compaction event omitted its durable sequence and native identity"
+            } else {
+                "OpenCode compaction event omitted its durable sequence"
+            };
+            self.record_source_gap_once(reason).await?;
         }
         if envelope.id.trim().is_empty() {
-            return Err(Error::new(
-                "native_protocol",
-                "OpenCode compaction event omitted its native identity",
-            ));
+            self.record_source_gap_once("OpenCode compaction event omitted its native identity")
+                .await?;
+            return Ok(());
         }
 
+        let reason = match envelope.data["reason"].as_str() {
+            Some("auto") => "auto",
+            Some("manual") => "manual",
+            _ => "unknown",
+        };
+        let input_id = envelope.data["inputID"]
+            .as_str()
+            .filter(|input| !input.trim().is_empty());
+
         if self.stashed_started.is_some()
-            && compaction.reason == CompactionReason::Manual
+            && reason != "auto"
             && let Some(watch) = self.compaction.as_mut()
         {
             match envelope.event_type.as_str() {
                 "session.compaction.started" if watch.input.is_none() => {
-                    watch.input = compaction.input_id.filter(|input| !input.trim().is_empty());
+                    watch.input = input_id.map(str::to_owned);
                 }
-                "session.compaction.ended" if watch.input.is_some() => {
+                "session.compaction.ended"
+                    if watch.input.as_deref().is_some() && watch.input.as_deref() == input_id =>
+                {
                     watch.result = Some(true);
                 }
                 "session.compaction.failed"
-                    if watch.input.is_some() && watch.input == compaction.input_id =>
+                    if watch.input.as_deref().is_some() && watch.input.as_deref() == input_id =>
                 {
                     watch.result = Some(false);
                 }
@@ -1770,14 +1791,14 @@ impl EventProcessor {
 
         if envelope.event_type == "session.compaction.ended" {
             let native_id = event_id(
-                session_id,
+                &session_id,
                 "session",
                 &envelope.id,
                 "session.context.compacted",
                 "opencode",
                 "OpenCode",
             )?;
-            let mut data = json!({"reason": compaction.reason.as_str()});
+            let mut data = json!({"reason": reason});
             if let Some(turn_id) = self.status.active_turn_id.as_deref() {
                 data["turn_id"] = json!(turn_id);
             }
@@ -1851,15 +1872,6 @@ impl EventProcessor {
                 self.expected_seq = Some(expected.saturating_add(1));
                 Ok(())
             }
-            Some(expected)
-                if expected.checked_add(1) == Some(durable.seq)
-                    && compaction_reports_private_usage(envelope) =>
-            {
-                // OpenCode 2.2.7 excludes the durable usage record from the
-                // public feed and repeats its figures on the compaction terminal.
-                self.expected_seq = Some(durable.seq.saturating_add(1));
-                Ok(())
-            }
             Some(expected) if durable.seq < expected => {
                 // A duplicate replay of an already-seen record: ignore.
                 Ok(())
@@ -1874,15 +1886,31 @@ impl EventProcessor {
                 } else {
                     "unknown"
                 };
-                self.record_gap(&format!(
+                self.record_source_gap_once(&format!(
                     "OpenCode event stream skipped durable sequence numbers: expected {expected}, saw {} ({kind})",
                     durable.seq
                 ))
                 .await?;
-                Err(Error::new(
-                    "unknown",
-                    "OpenCode native facts were lost in transport",
-                ))
+                // Repeated cost/tokens on a compaction event do not identify the
+                // missing sequence; this remains an acknowledged source gap.
+                let compaction_event = matches!(
+                    envelope.event_type.as_str(),
+                    "session.compaction.started"
+                        | "session.compaction.ended"
+                        | "session.compaction.failed"
+                ) && envelope.data["sessionID"].as_str()
+                    == Some(session_id.as_str());
+                if compaction_event {
+                    // The gap remains unknown; retain this independently attributable
+                    // lifecycle record and continue from its real durable cursor.
+                    self.expected_seq = Some(durable.seq.saturating_add(1));
+                    Ok(())
+                } else {
+                    Err(Error::new(
+                        "unknown",
+                        "OpenCode native facts were lost in transport",
+                    ))
+                }
             }
         }
     }
@@ -3228,6 +3256,13 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
+    async fn record_source_gap_once(&mut self, reason: &str) -> Result<()> {
+        if !self.gap_reported {
+            self.record_gap(reason).await?;
+        }
+        Ok(())
+    }
+
     /// The shared stream-commit half of this processor.
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
@@ -3247,20 +3282,6 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
-}
-
-fn compaction_reports_private_usage(envelope: &SseEnvelope) -> bool {
-    matches!(
-        envelope.event_type.as_str(),
-        "session.compaction.ended" | "session.compaction.failed"
-    ) && matches!(envelope.data["reason"].as_str(), Some("auto" | "manual"))
-        && envelope.data["sessionID"].as_str()
-            == envelope
-                .durable
-                .as_ref()
-                .map(|durable| durable.aggregate_id.as_str())
-        && envelope.data["cost"].is_number()
-        && envelope.data["tokens"].is_object()
 }
 
 fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {
