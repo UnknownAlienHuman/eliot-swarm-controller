@@ -737,6 +737,9 @@ impl Router {
         deadline: Instant,
     ) -> CheckResult<Option<(Command, Option<Turn>)>> {
         let mut progress = self.inner.progress.subscribe();
+        // The native reader commits turn completion directly to the bus.
+        // Subscribe before reading Store so completion cannot race the wait.
+        let mut events = self.inner.bus.subscribe();
         loop {
             if *shutdown.borrow() {
                 return Ok(None);
@@ -832,6 +835,18 @@ impl Router {
             }
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {}
+                completion = async {
+                    loop {
+                        match events.recv().await {
+                            Ok(event) if event.agent != command.target || event.kind != "turn.completed" => {}
+                            result => break result,
+                        }
+                    }
+                }, if !command_settles => {
+                    if matches!(completion, Err(broadcast::error::RecvError::Closed)) {
+                        return Err(CheckEnd::fail(step, "unavailable", "harness check event bus closed"));
+                    }
+                }
                 changed = progress.changed() => {
                     if changed.is_err() {
                         return Err(CheckEnd::fail(step, "unavailable", "harness check progress closed"));
