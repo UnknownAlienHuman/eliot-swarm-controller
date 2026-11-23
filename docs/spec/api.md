@@ -812,7 +812,11 @@ unknown commands remain unknown. Agent list observations appear only when reques
 `owner_inbox` counts visible items by kind. `liveness` counts the current
 Moving, Asked, Parked, Stuck, and Long classifications and groups Parked,
 Stuck, and Long objects by reason. See the [monitoring spec](monitoring.md#liveness)
-for the evidence used to classify a wait.
+for the evidence used to classify a wait. `command_without_dispatcher` reports
+the count and oldest command ID/age from the same current Store projection,
+using the inbox's reportability confirmation and counting before snooze filtering.
+Human `swarm status` renders that count and oldest command. The field is absent
+when talking to a daemon version that predates this projection.
 Absent source cursors and sequence/acknowledgement values remain null.
 When a previous daemon panic marker was consumed once at startup or plugin panic markers exist, `daemon.status` exposes `previous_crash` and `plugin_crashes`, and human `swarm status` renders one summary line for each.
 For a missing pinned executable, `harness.doctor` returns `profile_command_issues`

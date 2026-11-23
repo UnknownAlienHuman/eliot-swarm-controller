@@ -3,8 +3,8 @@ use super::{
     decode_json, digest_id_bound, encode_json, sql_error, validate_id_age, write_binding,
 };
 use eliot_core::api::{
-    OwnerAction, OwnerDecideRequest, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxKind,
-    SwarmLiveness,
+    CommandWithoutDispatcherStatus, OwnerAction, OwnerDecideRequest, OwnerInboxItem,
+    OwnerInboxItemRef, OwnerInboxKind, SwarmLiveness,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -112,7 +112,11 @@ impl Store {
         path: &Path,
         now: i64,
         confirmed: &StuckStates,
-    ) -> Result<(Vec<OwnerInboxItem>, SwarmLiveness)> {
+    ) -> Result<(
+        Vec<OwnerInboxItem>,
+        SwarmLiveness,
+        CommandWithoutDispatcherStatus,
+    )> {
         read_inbox_snapshot(path, |connection| {
             let (mut items, mut liveness) = super::owner_inbox::project(connection, now)?;
             items.retain(|item| {
@@ -126,6 +130,33 @@ impl Store {
                 false
             });
             liveness.reasons.retain(|_, count| *count > 0);
+            let mut command_without_dispatcher_count = 0;
+            let mut oldest_command_without_dispatcher: Option<&OwnerInboxItem> = None;
+            for item in items.iter().filter(|item| {
+                item.kind == OwnerInboxKind::Stuck && item.reason == "command_without_dispatcher"
+            }) {
+                command_without_dispatcher_count += 1;
+                if oldest_command_without_dispatcher
+                    .is_none_or(|oldest| item.age_ms > oldest.age_ms)
+                {
+                    oldest_command_without_dispatcher = Some(item);
+                }
+            }
+            let command_without_dispatcher = match oldest_command_without_dispatcher {
+                Some(item) => {
+                    let id = item
+                        .subject
+                        .strip_prefix("command:")
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| Error::new("corrupt", "invalid command liveness subject"))?;
+                    CommandWithoutDispatcherStatus {
+                        count: command_without_dispatcher_count,
+                        oldest_id: Some(id.to_owned()),
+                        oldest_age_ms: Some(item.age_ms),
+                    }
+                }
+                None => CommandWithoutDispatcherStatus::default(),
+            };
             let snoozes = inbox_snoozes(connection)?;
             let snoozed = snoozes
                 .iter()
@@ -134,7 +165,7 @@ impl Store {
             items.retain(|item| {
                 !snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
             });
-            Ok((items, liveness))
+            Ok((items, liveness, command_without_dispatcher))
         })
     }
 

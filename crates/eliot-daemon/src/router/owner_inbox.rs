@@ -2,9 +2,10 @@ use super::{Principal, Router, SubmissionContext, require_owner};
 use eliot_core::{
     Error, Result,
     api::{
-        LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest, OwnerDecideRequest,
-        OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxRequest,
-        OwnerInboxResponse, SWARM_MAIL_SENDER, SwarmLiveness, discovery::decode_params,
+        CommandWithoutDispatcherStatus, LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest,
+        OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef,
+        OwnerInboxRequest, OwnerInboxResponse, SWARM_MAIL_SENDER, SwarmLiveness,
+        discovery::decode_params,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -39,7 +40,11 @@ impl Router {
 
     pub(super) async fn read_owner_projection(
         &self,
-    ) -> Result<(Vec<OwnerInboxItem>, SwarmLiveness)> {
+    ) -> Result<(
+        Vec<OwnerInboxItem>,
+        SwarmLiveness,
+        CommandWithoutDispatcherStatus,
+    )> {
         let path = self.inner.data_root.join("eliot.db");
         let confirmed = self.confirmed_stuck();
         tokio::task::spawn_blocking(move || {
@@ -53,7 +58,7 @@ impl Router {
         require_owner(principal)?;
         let request: OwnerInboxRequest = decode_params(params.clone())?;
         let limit = request.effective_limit()?;
-        let (items, _) = self.read_owner_projection().await?;
+        let (items, _, _) = self.read_owner_projection().await?;
         let mut items = items
             .into_iter()
             .map(|item| (item.cursor(), item))
