@@ -817,7 +817,7 @@ impl Router {
                     .join(", ");
                 format!("No eligible successor in routing.handoff_fallback. {skipped}")
             } else if error.code == "handoff_unavailable" {
-                error.message
+                *error.message
             } else {
                 return Err(error);
             };
