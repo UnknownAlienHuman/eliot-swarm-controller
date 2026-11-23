@@ -1983,7 +1983,8 @@ impl State {
         // later delta for an already-emitted transition is metadata
         // only (already merged) and never re-emits or poisons the
         // retained comparison.
-        if !self.tool_emitted.insert(format!("{tool_call_id}:{kind}")) {
+        let marker = format!("{tool_call_id}:{kind}");
+        if self.tool_emitted.contains(&marker) {
             return Ok(());
         }
         self.associate().await?;
@@ -2001,6 +2002,7 @@ impl State {
             "item_id": item, "tool": title, "status": status});
         self.policy.redact_values(&mut data);
         self.commit(kind, &turn, &item, data).await?;
+        self.tool_emitted.insert(marker);
         if kind == "tool.completed" && status == "completed" {
             self.tool_completed_successfully
                 .insert(tool_call_id.to_owned());

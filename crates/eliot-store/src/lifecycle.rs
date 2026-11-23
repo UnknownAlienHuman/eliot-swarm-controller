@@ -1818,6 +1818,9 @@ fn mark_lost_turn_unknown_tx(
             )?;
         }
         super::native_events::rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
+        super::native_events::settle_unfinished_tools_tx(
+            tx, agent, agent_num, turn_id, now, events,
+        )?;
         let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
         let mut data = json!({"turn_id": turn_id, "reason": reason});
         if let Some((origin, location)) = failure {
@@ -2054,6 +2057,9 @@ fn stop_agent_tx(
         )?;
     }
     if let Some(turn_id) = agent.active_turn.as_deref() {
+        super::native_events::settle_unfinished_tools_tx(
+            tx, &agent, agent_num, turn_id, now, events,
+        )?;
         settle_stopped_turn_unknown_tx(
             tx, agent_num, generation, command_id, turn_id, now, events,
         )?;

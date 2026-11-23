@@ -361,6 +361,16 @@ pub(super) fn persist_effects(
                     usage.as_ref(),
                     *completed_at,
                 )?);
+                if native_event.kind == "session.ended" {
+                    settle_unfinished_tools_tx(
+                        tx,
+                        next_agent,
+                        agent_num,
+                        turn_id,
+                        now,
+                        &mut provider_events,
+                    )?;
+                }
                 if command_id.is_some() || native_event.kind == "turn.completed" {
                     provider_events.extend(provider_holds::terminal_tx(
                         scope.tx,
@@ -1063,6 +1073,59 @@ pub(super) fn rollback_inline_mail_tx(
            AND inline_ack_pending = 1",
         params![agent, generation, command],
     ));
+    Ok(())
+}
+
+/// Retain the unresolved end of each committed tool start for an exact turn
+/// whose completion or custody loss has already been established.
+pub(super) fn settle_unfinished_tools_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    agent_num: i64,
+    turn: &str,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if !core::api::HarnessCapabilities::of(&agent.harness).reconcile_unfinished_tools {
+        return Ok(());
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(s.data, '$.item_id'), MIN(json_extract(s.data, '$.tool'))
+         FROM events s
+         WHERE s.agent = ?1 AND s.generation = ?2 AND s.source = 'stream'
+           AND s.kind = 'tool.started' AND s.native_id IS NOT NULL
+           AND json_extract(s.data, '$.turn_id') = ?3
+           AND json_type(s.data, '$.item_id') = 'text'
+           AND NOT EXISTS (
+               SELECT 1 FROM events terminal
+               WHERE terminal.agent = s.agent AND terminal.generation = s.generation
+                 AND terminal.kind = 'tool.completed' AND terminal.seq > s.seq
+                 AND json_extract(terminal.data, '$.turn_id') = ?3
+                 AND json_extract(terminal.data, '$.item_id') = json_extract(s.data, '$.item_id')
+           )
+         GROUP BY json_extract(s.data, '$.item_id')",
+        )
+        .map_err(sql_error)?;
+    let tools = statement
+        .query_map(params![agent_num, agent.generation, turn], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    for (item_id, tool) in tools {
+        events.push(insert_daemon_event(
+            tx,
+            now,
+            "tool.completed",
+            "tool",
+            Some(agent_num),
+            Some(agent.generation),
+            json!({"turn_id": turn, "item_id": item_id, "tool": tool,
+                "status": "unknown", "reason": "turn_settled_without_native_tool_terminal"}),
+        )?);
+    }
     Ok(())
 }
 

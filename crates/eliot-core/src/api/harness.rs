@@ -115,6 +115,8 @@ pub struct HarnessCapabilities {
     pub restart_requires_idle: bool,
     /// Resume preflight uses the newest retained turn across promptless generations.
     pub resume_previous_turn: bool,
+    /// Exact Store recovery closes retained tool starts when the stream cannot.
+    pub reconcile_unfinished_tools: bool,
     /// Accepts a reasoning-effort setting.
     pub effort: bool,
     /// Reports the accepted model on a `configure` result.
