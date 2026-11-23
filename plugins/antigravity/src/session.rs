@@ -969,17 +969,26 @@ impl Session {
                     "Antigravity native session is closed",
                 ));
             }
-            if !params.owner_control && (bound_turn.is_none() || state.active_turn() != bound_turn)
+            let Some(turn_id) = bound_turn else {
+                return eliot_plugin::session::idle_interrupt_result(
+                    &params.command_id,
+                    params.owner_control
+                        && self.ready
+                        && state.active_turn().is_none()
+                        && !state.source_unknown
+                        && !state.batch_unknown,
+                );
+            };
+            if state
+                .active_turn()
+                .map_or(!params.owner_control, |active| active != turn_id)
             {
                 return Err(Error::new(
-                    "stale_turn",
+                    "native_not_dispatched",
                     "turn/interrupt does not match the exact active native turn",
                 ));
             }
-            (
-                bound_turn.or(state.active_turn()).map(str::to_owned),
-                state.subscribe_settlement(),
-            )
+            (turn_id, state.subscribe_settlement())
         };
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
@@ -994,21 +1003,13 @@ impl Session {
         let dispatched = self
             .cancel_turn(
                 &params.command_id,
-                turn_id.as_deref(),
+                turn_id,
                 params.owner_control,
                 Instant::now() + TIMEOUT,
             )
             .await;
         match dispatched {
             Ok(()) => {
-                let Some(turn_id) = turn_id.as_deref() else {
-                    let state = self.state.lock().await;
-                    return Ok(json!({
-                        "state": "applied", "command_id": params.command_id, "turn_id": null,
-                        "interrupt_confirmed": self.ready && state.active_turn().is_none()
-                            && !state.source_unknown && !state.batch_unknown,
-                    }));
-                };
                 // Per the ACP cancellation contract, answer every pending
                 // permission ask of this exact turn with `cancelled`
                 // before waiting: the native cannot reach its cancelled
@@ -1033,7 +1034,6 @@ impl Session {
                     cancelled,
                 )?;
                 if params.owner_control {
-                    outcome["turn_id"] = json!(params.turn_id);
                     outcome["interrupt_confirmed"] = json!(cancelled == Some(true));
                 }
                 Ok(outcome)
@@ -1051,19 +1051,18 @@ impl Session {
     async fn cancel_turn(
         &mut self,
         command_id: &str,
-        turn_id: Option<&str>,
+        turn_id: &str,
         owner_control: bool,
         until: Instant,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
         if !owner_control {
-            let turn_id = turn_id.ok_or_else(|| {
-                Error::new(
-                    "stale_turn",
-                    "Antigravity interrupt requires a captured turn",
-                )
-            })?;
             admit_cancel(&state, turn_id)?;
+        } else if state.active_turn().is_some_and(|active| active != turn_id) {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Antigravity is running a different turn",
+            ));
         }
         // Hold the event lock across write and latch so late asks observe intent.
         let dispatched = self
@@ -1075,9 +1074,9 @@ impl Session {
             )
             .await;
         if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
-            state.latch_cancellation(command_id, turn_id);
+            state.latch_cancellation(command_id, Some(turn_id));
             state
-                .answer_pending_cancelled(&self.client, command_id, turn_id)
+                .answer_pending_cancelled(&self.client, command_id, Some(turn_id))
                 .await;
         }
         dispatched

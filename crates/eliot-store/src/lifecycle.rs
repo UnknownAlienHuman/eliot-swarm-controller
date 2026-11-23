@@ -780,7 +780,12 @@ impl Store {
                 .optional()
                 .map_err(sql_error)?;
             if let Some(interrupt_id) = interrupt_id.as_deref() {
-                fields.insert("reason".into(), json!("interrupt_unconfirmed"));
+                let reason = if record.command.args["interrupt_runtime_unavailable"] == true {
+                    "interrupt_runtime_unavailable"
+                } else {
+                    "interrupt_unconfirmed"
+                };
+                fields.insert("reason".into(), json!(reason));
                 fields.insert("interrupt_command_id".into(), json!(interrupt_id));
             }
             if native_ended {
@@ -821,9 +826,8 @@ impl Store {
                 settle_interrupt_after_fallback_tx(
                     &tx,
                     interrupt_id,
-                    id,
-                    agent_num,
-                    generation,
+                    &record.command,
+                    (agent_num, generation),
                     now,
                     &mut events,
                 )?;
@@ -1518,9 +1522,8 @@ fn validate_control_applied_outcome(
 fn settle_interrupt_after_fallback_tx(
     tx: &Transaction<'_>,
     interrupt_id: &str,
-    stop_id: &str,
-    agent: i64,
-    generation: i64,
+    stop: &Command,
+    (agent, generation): (i64, i64),
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -1538,12 +1541,23 @@ fn settle_interrupt_after_fallback_tx(
     if interrupt.state.is_terminal() {
         return Ok(());
     }
+    let (reason, message) = if stop.args["interrupt_runtime_unavailable"] == true {
+        (
+            "interrupt_runtime_unavailable_agent_stopped",
+            "Swarm found no live plugin for the interrupt and proved the Agent stopped.",
+        )
+    } else {
+        (
+            "interrupt_unconfirmed_agent_stopped",
+            "Harness did not confirm the interrupt within 10 seconds. Swarm stopped the Agent.",
+        )
+    };
     let outcome = json!({
         "command_id": interrupt_id,
         "turn_id": interrupt.command.turn_id,
-        "reason": "interrupt_unconfirmed_agent_stopped",
-        "message": "Harness did not confirm the interrupt within 10 seconds. Swarm stopped the Agent.",
-        "fallback_stop_id": stop_id,
+        "reason": reason,
+        "message": message,
+        "fallback_stop_id": stop.id,
     });
     update_command_state(
         tx,
@@ -2022,9 +2036,7 @@ fn stop_agent_tx(
             events,
         )?;
     }
-    if let Some(turn_id) = agent.active_turn.as_deref()
-        && (!owner_stop || captured_turn != Some(turn_id))
-    {
+    if let Some(turn_id) = agent.active_turn.as_deref() {
         settle_stopped_turn_unknown_tx(
             tx, agent_num, generation, command_id, turn_id, now, events,
         )?;
@@ -2076,21 +2088,17 @@ fn settle_owner_interrupted_turn_tx(
     let Some(turn) = load_turn(tx, agent_num, generation, turn_id)? else {
         return Ok(());
     };
-    if turn.resolution_source == Some(eliot_core::TurnResolutionSource::Owner)
-        || (reason == "interrupted_by_owner"
-            && turn.state != eliot_core::TurnState::Unknown
-            && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))
-        || (turn.state == eliot_core::TurnState::Completed
-            && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))
+    if turn.resolution_source.is_some()
+        || turn.state != eliot_core::TurnState::Completed
+        || turn.outcome != Some(eliot_core::TurnOutcome::Interrupted)
     {
         return Ok(());
     }
     let changed = db!(tx.execute(
-        "UPDATE turns SET state = 'completed', status = 'interrupted_by_owner', outcome = 'interrupted',
-                          completed_at = COALESCE(completed_at, ?1), resolution_source = 'owner'
-         WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
-           AND (state IN ('running', 'unknown') OR outcome = 'interrupted')",
-        params![now, agent_num, generation, turn_id],
+        "UPDATE turns SET status = 'interrupted_by_owner', resolution_source = 'owner'
+         WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+           AND state = 'completed' AND outcome = 'interrupted' AND resolution_source IS NULL",
+        params![agent_num, generation, turn_id],
     ));
     if changed != 1 {
         return Err(Error::new(

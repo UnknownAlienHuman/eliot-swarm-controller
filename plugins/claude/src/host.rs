@@ -1360,18 +1360,22 @@ impl ClaudePlugin {
             params.generation,
             "Claude",
         )?;
+        let status = session.events.status();
         if session.phase == SessionPhase::Stopped
-            || (!params.owner_control && session.phase != SessionPhase::Ready)
+            || !status.ready
+            || status.stopped
+            || session.native.transport.process_exit_observed()
+            || session.session_id.is_none()
         {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Claude has no established live session for interrupt",
+            ));
+        }
+        if !params.owner_control && session.phase != SessionPhase::Ready {
             return Err(Error::new(
                 "unknown",
                 "Claude session or event source outcome is unresolved",
-            ));
-        }
-        if session.session_id.is_none() {
-            return Err(Error::new(
-                "unknown",
-                "Claude native session identity is unresolved",
             ));
         }
         if params.request_id.is_some() {
@@ -1381,18 +1385,36 @@ impl ClaudePlugin {
             ));
         }
         let command_id = params.command_id.clone();
-        let status = session.events.status();
-        let native_turn = params
-            .turn_id
+        let Some(turn_id) = params.turn_id.as_deref() else {
+            session.pending_turn.reconcile();
+            return eliot_plugin::session::idle_interrupt_result(
+                &command_id,
+                params.owner_control
+                    && session.phase == SessionPhase::Ready
+                    && status.active_command_id.is_none()
+                    && status.active_turn_id.is_none()
+                    && session.pending_turn.pending.is_none()
+                    && !status.source_unknown
+                    && !status.batch_unknown
+                    && status.failure.is_none(),
+            );
+        };
+        if status
+            .active_turn_id
             .as_deref()
-            .or(status.active_turn_id.as_deref());
+            .is_some_and(|active| active != turn_id)
+        {
+            return Err(Error::new(
+                "native_not_dispatched",
+                "Claude is running a different turn",
+            ));
+        }
+        // The Owner can reach an established live session even when its turn
+        // observation is uncertain. An ordinary interrupt requires the live gate.
         if !params.owner_control {
             if let Some(reason) = status.failure {
                 return Err(Error::new("unknown", reason));
             }
-            let turn_id = params.turn_id.as_deref().ok_or_else(|| {
-                Error::new("invalid", "Claude interrupt requires the exact turn id")
-            })?;
             // The event task answers behind any queued terminal frame.
             let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await?
             else {
@@ -1427,23 +1449,11 @@ impl ClaudePlugin {
                 ));
             }
         };
-        if let Some(turn_id) = native_turn {
-            session.events.mark_interrupted(turn_id).await;
-        }
-        let status = session.events.status();
-        let idle = params.owner_control
-            && params.turn_id.is_none()
-            && status.ready
-            && status.active_turn_id.is_none()
-            && !status.source_unknown
-            && !status.batch_unknown
-            && status.failure.is_none()
-            && !status.stopped;
+        session.events.mark_interrupted(turn_id).await;
         let mut applied = json!({
             "state": "applied",
             "command_id": command_id,
             "turn_id": params.turn_id,
-            "interrupt_confirmed": idle,
         });
         if let Some(still_queued) = response.get("still_queued").cloned() {
             applied["still_queued"] = still_queued;

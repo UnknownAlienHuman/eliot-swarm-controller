@@ -250,16 +250,13 @@ uncertain native call.
 An actor that retires control without proof of exit records the Agent as lost
 and keeps the custody reservation for reconciliation.
 
-When an Owner-requested stop proves both facts, its captured turn becomes
-`interrupted` with status `interrupted_by_owner`, `resolution_source=owner`
-and reason `stopped_by_owner` if the
-turn was unresolved or its native outcome was interrupted. An acknowledged
-Owner interrupt with an exact native interruption also sets
-that status and resolution source and emits `turn.resolved` with
-`reason=interrupted_by_owner`. A SEND dispatched before the stop can supply
-its exact turn binding while the Owner stop is in flight. Preserve natural
-completion and failure, and retain native status, text and usage. A turn not captured by
-that stop, or a non-Owner stop without terminal evidence, stays `unknown`.
+An acknowledged Owner interrupt or a proven Owner stop labels a captured
+turn `interrupted_by_owner` only after its native interrupted terminal is
+committed. The Store retains native status, completion time, text and usage,
+sets `resolution_source=owner`, and emits `turn.resolved` with the control's
+reason. Natural completion and failure keep their original outcomes. A turn
+without terminal evidence stays `unknown` after stop. A SEND dispatched
+before the stop can supply its exact turn binding while that stop is in flight.
 Force stop skips the cooperative interrupt window and uses the same process and
 source proof requirement.
 

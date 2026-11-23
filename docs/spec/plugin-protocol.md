@@ -144,11 +144,12 @@ active or uncertain turn under the stop's authority, then sends `agent.stop` to
 close the controlled session. For an Owner interrupt, the daemon sets
 `owner_control` in [AgentCommandParams](../../crates/eliot-plugin/src/protocol.rs).
 The adapter translates the cancellation for its bound process and session even
-when the source is unhealthy or the turn projection is uncertain. It retains
-the exact native turn binding when the protocol requires it, and echoes the
-command and daemon-captured turn in its result. An adapter may report
-`interrupt_confirmed` only when native evidence establishes that the captured
-work ended or that there is no active work in the bound session.
+when the source is unhealthy or the turn projection is uncertain. It echoes
+the daemon-captured turn in its result. An empty binding allows idle
+confirmation only. The adapter must refuse before cancellation if it cannot
+confirm idle, including when it sees a later turn. An adapter may report
+`interrupt_confirmed` when native evidence proves the captured interruption
+or confirms idle for an empty binding.
 
 The daemon owns the [interrupt deadline and stop custody](monitoring.md#process-identity-and-custody).
 Explicit force uses that custody directly.

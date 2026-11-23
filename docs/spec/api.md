@@ -3207,12 +3207,12 @@ never retried against the new turn.
 
 `interrupt` submits explicit generation and turn constraints unchanged.
 When either is omitted the daemon captures the current binding during admission.
-For the Owner, a controlled live native session is sufficient even when its turn
-is uncertain. The result of a proven fallback stop carries
-`outcome.reason=interrupt_unconfirmed_agent_stopped` and
-`outcome.fallback_stop_id`. A confirmed Owner interruption is visible on the
-bound turn as `status=interrupted_by_owner`, `outcome=interrupted` and
-`resolution_source=owner`.
+An Owner interrupt may capture the latest uncertain turn. An empty binding
+can confirm idle and cannot acquire a different turn at dispatch or fallback.
+A proven fallback stop carries `outcome.fallback_stop_id` and a reason for the
+elapsed confirmation deadline or missing runtime. An acknowledged Owner
+interrupt with a committed native interrupted terminal sets
+`status=interrupted_by_owner`, `outcome=interrupted` and `resolution_source=owner`.
 
 Prompted waits (`send --wait`, and `launch --wait` / `resume --wait` with a
 prompt) return 0 only for a positively recognized `success` outcome. Lifecycle

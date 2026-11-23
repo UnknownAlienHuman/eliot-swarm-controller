@@ -363,6 +363,21 @@ pub fn native_no_write(code: &str) -> bool {
     matches!(code, "native_not_dispatched" | "busy" | "frame_too_large")
 }
 
+/// A turn-less Owner interrupt can acknowledge an idle session. It cannot
+/// acquire a new turn from the adapter's view.
+pub fn idle_interrupt_result(command_id: &str, idle: bool) -> Result<Value> {
+    if !idle {
+        return Err(Error::new(
+            "native_not_dispatched",
+            "No turn was captured and the harness could not confirm an idle session",
+        ));
+    }
+    Ok(json!({
+        "state": "applied", "command_id": command_id, "turn_id": null,
+        "interrupt_confirmed": true,
+    }))
+}
+
 /// Prepend FIFO-claimed context to the original send text for one native input
 /// operation. Items stay in claim order, joined by blank lines, then a blank
 /// line, then the exact original text. The Store has already framed each item
