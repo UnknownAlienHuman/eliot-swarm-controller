@@ -4,14 +4,21 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import re
 import sys
+import tempfile
+import unicodedata
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
+
+from github_ci import github_request
 
 API_ROOT = "https://api.github.com"
 LOOKBACK_DAYS = 14
@@ -22,6 +29,10 @@ MAX_JOB_PAGES = 2
 POLL_INTERVAL_SECONDS = 30 * 60
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ACTION_RECORD_BYTES = 60 * 1024
+MAX_BASELINE_IDS = RUNS_PER_PAGE * MAX_RUN_PAGES
+MAX_BASELINE_BYTES = 32 * 1024
+MAX_DISPLAY_CHARS = 256
+BASELINE_VERSION = 1
 USER_AGENT = "eliot-red-main-recipe"
 
 _REPOSITORY_PART = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
@@ -58,7 +69,7 @@ def api_get(path: str, params: dict[str, object] | None = None) -> dict[str, obj
         "User-Agent": USER_AGENT,
     }
     try:
-        with urlopen(Request(url, headers=headers), timeout=15) as response:
+        with urlopen(github_request(url, headers), timeout=15) as response:
             body = response.read(MAX_RESPONSE_BYTES + 1)
     except HTTPError as exc:
         raise GitHubApiError(
@@ -95,6 +106,118 @@ def run_id_of(run: dict[str, object]) -> str:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise GitHubApiError("GitHub returned a workflow run without a valid ID")
     return str(value)
+
+
+def baseline_path(repository: str, *, replay: bool) -> Path:
+    repo_key = hashlib.sha256(repository.lower().encode("utf-8")).hexdigest()
+    namespace = "replay" if replay else "production"
+    return Path(".eliot/state/red-main") / namespace / f"{repo_key}.json"
+
+
+def load_baseline(path: Path, repository: str) -> set[str] | None:
+    try:
+        with path.open("rb") as source:
+            raw = source.read(MAX_BASELINE_BYTES + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise GitHubApiError("could not read the local failed-run baseline") from None
+
+    if len(raw) > MAX_BASELINE_BYTES:
+        raise GitHubApiError("local failed-run baseline exceeds its size bound")
+    try:
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise GitHubApiError("local failed-run baseline is invalid JSON") from None
+    if (
+        not isinstance(value, dict)
+        or type(value.get("version")) is not int
+        or value["version"] != BASELINE_VERSION
+        or value.get("repository") != repository.lower()
+    ):
+        raise GitHubApiError("local failed-run baseline has an unsupported shape")
+
+    ids = value.get("failed_run_ids")
+    if not isinstance(ids, list) or len(ids) > MAX_BASELINE_IDS:
+        raise GitHubApiError("local failed-run baseline exceeds its ID bound")
+    normalized: set[str] = set()
+    for run_id in ids:
+        if (
+            not isinstance(run_id, str)
+            or not _RUN_ID.fullmatch(run_id)
+            or int(run_id) <= 0
+            or str(int(run_id)) != run_id
+            or run_id in normalized
+        ):
+            raise GitHubApiError("local failed-run baseline contains an invalid ID")
+        normalized.add(run_id)
+    return normalized
+
+
+def save_baseline(path: Path, repository: str, run_ids: set[str]) -> bool:
+    if len(run_ids) > MAX_BASELINE_IDS:
+        raise GitHubApiError("failed-run baseline exceeds its ID bound")
+    value = {
+        "version": BASELINE_VERSION,
+        "repository": repository.lower(),
+        "failed_run_ids": sorted(run_ids, key=int),
+    }
+    pending: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as output:
+            pending = Path(output.name)
+            output.write(json.dumps(value, separators=(",", ":")).encode("utf-8"))
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            os.link(pending, path)
+        except FileExistsError:
+            return False
+        if os.name == "posix":
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except OSError:
+        raise GitHubApiError("could not persist the local failed-run baseline") from None
+    finally:
+        if pending is not None:
+            pending.unlink(missing_ok=True)
+    return True
+
+
+def baseline_for_scan(
+    repository: str, failures: list[dict[str, object]], *, replay: bool
+) -> tuple[set[str], bool]:
+    current_ids = {run_id_of(run) for run in failures}
+    if len(current_ids) > MAX_BASELINE_IDS:
+        raise GitHubApiError("failed-run scan exceeds its ID bound")
+    path = baseline_path(repository, replay=replay)
+    baseline = load_baseline(path, repository)
+    if baseline is not None:
+        return baseline, False
+    if save_baseline(path, repository, current_ids):
+        return current_ids, True
+    baseline = load_baseline(path, repository)
+    if baseline is None:
+        raise GitHubApiError("failed-run baseline disappeared during initialization")
+    return baseline, False
+
+
+def sanitize_display_text(value: str) -> str:
+    safe = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) not in {"Cc", "Cf", "Cs"}
+    )
+    safe = " ".join(safe.split())
+    if len(safe) > MAX_DISPLAY_CHARS:
+        safe = safe[: MAX_DISPLAY_CHARS - 1].rstrip() + "…"
+    return safe
 
 
 def recent_failed_runs(repository: str, now: datetime) -> list[dict[str, object]]:
@@ -188,7 +311,7 @@ def failing_job_names(repository: str, run: dict[str, object]) -> list[str]:
             name = job.get("name")
             if not isinstance(name, str) or not name.strip():
                 raise GitHubApiError(f"GitHub returned an unnamed failing job for run {run_id}")
-            job_names.append(name)
+            job_names.append(sanitize_display_text(name) or "unnamed failing job")
 
         if len(jobs) < RUNS_PER_PAGE or jobs_seen >= total_count:
             break
@@ -203,15 +326,15 @@ def failure_payload(
 ) -> dict[str, object]:
     run_id = run_id_of(run)
     workflow = run.get("name")
-    if not isinstance(workflow, str) or not workflow.strip():
+    if isinstance(workflow, str):
+        workflow = sanitize_display_text(workflow) or "unnamed workflow"
+    else:
         workflow = "unnamed workflow"
-    workflow = " ".join(workflow.split())
-    run_url = run.get("html_url")
-    if not isinstance(run_url, str) or not run_url.startswith("https://github.com/"):
-        run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
+    run_url = f"https://github.com/{repository}/actions/runs/{run_id}"
     created_at = run.get("created_at")
     if not isinstance(created_at, str):
         raise GitHubApiError(f"failed run {run_id} omitted created_at")
+    created_at = parse_timestamp(created_at).isoformat().replace("+00:00", "Z")
 
     jobs_text = ", ".join(json.dumps(name, ensure_ascii=False) for name in job_names)
     jobs_text = jobs_text or "no failing job names returned"
@@ -263,7 +386,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--pinned-run-id",
         type=validate_run_id,
-        help="intentionally re-emit one historical failed main run on every firing",
+        help="read-only replay; seed the isolated baseline, then re-emit unseen pinned runs",
     )
     return parser.parse_args(argv)
 
@@ -273,13 +396,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.pinned_run_id:
             run = pinned_failed_run(args.repo, args.pinned_run_id)
+            baseline, initialized = baseline_for_scan(args.repo, [run], replay=True)
+            if initialized:
+                print(
+                    "red-main: initialized isolated replay baseline; no event emitted",
+                    file=sys.stderr,
+                )
+                return 0
+            if run_id_of(run) in baseline:
+                return 0
             jobs = failing_job_names(args.repo, run)
             write_record(failure_payload(run, args.repo, jobs))
             return 0
 
         now = datetime.now(timezone.utc)
         failures = recent_failed_runs(args.repo, now)
-        for run in select_failure_batch(failures, now):
+        baseline, initialized = baseline_for_scan(args.repo, failures, replay=False)
+        if initialized:
+            print(
+                f"red-main: initialized baseline with {len(baseline)} current failed run IDs; no event emitted",
+                file=sys.stderr,
+            )
+            return 0
+
+        new_failures = [run for run in failures if run_id_of(run) not in baseline]
+        for run in select_failure_batch(new_failures, now):
             try:
                 jobs = failing_job_names(args.repo, run)
                 write_record(failure_payload(run, args.repo, jobs))

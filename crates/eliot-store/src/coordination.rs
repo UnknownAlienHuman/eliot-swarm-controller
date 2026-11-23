@@ -1805,7 +1805,7 @@ impl Store {
                 Error::new("not_found", format!("Agent {recipient} was not found"))
             })?;
             if let Some(project) = project {
-                if agent.project != project && agent.project_scope() != project {
+                if agent.project_scope() != project {
                     return Err(Error::new(
                         "not_allowed",
                         "project rules send mail only within their own project",

@@ -573,27 +573,36 @@ This is an automation increment, not a Task/Issue/acceptance engine.
 ### CI notification recipes
 
 Install [PR checks](../../config/recipes/pr-checks.toml) and [red main](../../config/recipes/red-main.toml)
-as project rules alongside their polling scripts. The recipe headers describe
-the interpreter approval, action grants and placeholders. Set each recipient to
-the Agent that owns the PR or handles failures on `main` in that project.
+as Owner rules with their polling scripts and `github_ci.py` under the private
+script root. The recipe headers describe interpreter approval and placeholders.
+Set each recipient to the Agent that owns the PR or handles failures on `main`.
+The Owner selects the recipient explicitly. Project-rule mail still requires
+the recipient's frozen authorization scope to match the project principal.
 
 The owner starts a one-shot watch after the manager opens or updates the PR.
 One bounded Run backs off while checks are absent or pending or GitHub is
 unavailable. An empty check list on an open PR leaves the result pending, so
-the watch works with on-demand CI. When the checks finish, the PR closes or
-merges, or the polling window expires, the script exits and the timer has no
-later slot. An observed result emits a script event and the rule queues one
-framed note per PR and head. An explicit rerun after a closure or merge can
-re-emit the saved result without a GitHub read. The `once_per` key prevents
-another mail admission while the key is retained.
+the watch works with on-demand CI. Completed checks, closure, merge, expiry and
+an oversized check list end the watch. Expiry reports the last observed state.
+The timer has no later slot. The watch verifies the current head and state
+before using a terminal report stored for that head. An open or changed PR
+gets a fresh observation. An expiry key is distinct from the completed-result
+key so a later result on the same head can still reach the manager.
 
-Red main reads completed failed workflows on `main`, with an optional recorded
-run ID for a read-only replay. The event carries the run ID and the observed
-failing job names. The rule queues one framed note per run ID within the
-standard `once_per` retention and capacity. Keep the recipe's recent-run window
-shorter than key retention. Both scripts use anonymous reads of public GitHub
-repositories. Swarm retains its ordinary rule keys and mail, while GitHub owns
-PR and CI state.
+Red main records the failures observed on its first scan as a silent baseline.
+Later scans report failed runs outside that baseline. The event carries the run
+ID and the observed failing job names. The rule queues one framed note per run
+ID within the standard `once_per` retention and capacity. Keep the recipe's
+recent-run window shorter than key retention. Recorded GitHub runs can exercise
+the baseline with a separate local state file.
+
+Budget about 23 GitHub API requests per hour for a PR watch in its first hour
+and up to 26 per hour for red main. GitHub's anonymous quota is 60 requests per
+hour per IP address, shared across watchers. Both scripts use an available
+`GITHUB_TOKEN` or `GH_TOKEN`, then an existing `gh` login if available. The
+daemon scrubs credential environment variables from Run, so an authenticated
+`gh` in the Run account supplies credentials there. Tokens stay in memory and
+out of rule settings, argv, watch state and event payloads.
 
 ### Worktree review recipe
 

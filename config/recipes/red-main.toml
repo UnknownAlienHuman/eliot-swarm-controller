@@ -1,40 +1,52 @@
 # #875 / #883: deliver one notice for each failed completed GitHub Actions run on main.
 #
-# Copy this file to the registered checkout's .eliot/rules/ directory and
-# red-main.py to its .eliot/scripts/ directory.
+# Copy this file to <data_dir>/rules/ and red-main.py and github_ci.py to
+# <data_dir>/scripts/. These Owner rules use an explicitly configured recipient.
 #
-# In <data_dir>/config.toml, approve run, emit and mail.send in the registration.
-# Replace app with the project ID and set the installed Python executable.
+# In <data_dir>/config.toml, approve the installed Python executable.
 #
-#   [projects.app.interpreters.python]
+#   [automation.run.interpreters.python]
 #   program = "C:/Python313/python.exe"
-#   argv_prefix = []
+#   argv_prefix = ["-B"]
 #
-# Replace both OWNER/REPOSITORY values with the public GitHub repository and
-# replace a1 with the project manager's Agent ID. The watcher uses anonymous
-# public REST reads and requires no run_env entries.
+# Replace both OWNER/REPOSITORY values with the GitHub repository and replace
+# a1 with the project manager's Agent ID. Use an existing gh login in the Run
+# account for authenticated reads. A directly invoked script also recognizes
+# GITHUB_TOKEN or GH_TOKEN from its environment. Keep tokens out of rule files.
 #
-# The timer polls every 30 minutes and supports manually dispatched CI. It scans
-# at most three 100-run pages of completed failures and keeps
-# only runs created in the last 14 days. At most 5 failed runs have their job
-# names fetched per firing; fixed 30-minute buckets rotate through larger sets.
-# The job list is bounded to 200 jobs per run. Runs outside these caps are not
-# reported by this polling window. The 14-day lookback is shorter than once_per's
-# 30-day key retention, so a run leaves polling before its dedup key expires and
-# cannot be re-notified after retention expires.
+# The timer polls every 30 minutes and supports manually dispatched CI. The first
+# successful scan stores a durable, bounded baseline of up to 300 current failed
+# run IDs in .eliot/state/red-main/production/; it fetches no jobs and emits no
+# events. Later scans emit only IDs absent from that baseline. New IDs are not
+# checkpointed, so they are retried on later polls if output admission is uncertain;
+# once_per suppresses duplicate mail. State is per repository in the private
+# script directory. Remove
+# that repository's production baseline only to intentionally re-baseline.
 #
-# For a historical replay, add "--pinned-run-id", "RUN_ID" to cmd and replace
-# RUN_ID with the recorded GitHub Actions run ID. Pinned mode re-emits the same
-# event each timer firing and bypasses the lookback. once_per suppresses the same
-# run ID while its 30-day key is retained; remove the pinned argument after proof
-# because a still-pinned run can be delivered again after that key expires.
+# Each scan reads at most three 100-run pages of failures created in the last 14
+# days. At most 5 new failures have their jobs fetched per firing; fixed 30-minute
+# buckets rotate through larger sets. The job list is bounded to 200 jobs per run.
+# Runs outside these caps are not reported by this polling window. A poll can use
+# up to 13 anonymous REST requests (3 run pages + 5 x 2 job pages), or about 26
+# requests/hour at the 30-minute cadence. GitHub's anonymous REST limit is 60
+# requests/hour per source IP. The 14-day lookback is shorter than once_per's
+# 30-day key retention, so a run leaves polling before its dedup key expires.
+#
+# Historical replay is read-only against GitHub and uses the same baseline logic
+# in the isolated .eliot/state/red-main/replay/ namespace. Temporarily add
+# "--pinned-run-id", "FIRST_RUN_ID" to the poll command and fire it once: this
+# validates and stores that real failed main run without reading jobs or emitting
+# an event. Replace it with "--pinned-run-id", "SECOND_RUN_ID" and fire twice.
+# Both firings re-emit the second ID; the Router's existing once_per admits one
+# notification. Remove the pinned argument and the replay baseline file after
+# proof. The production baseline is not read or changed by pinned replay.
 
 [[rule]]
 id = "poll-main-red-ci"
 on = { every = "30m" }
 catch_up = "none"
 do = [
-  { action = "run", cmd = ["python", ".eliot/scripts/red-main.py", "--repo", "OWNER/REPOSITORY"], timeout = "5m" },
+  { action = "run", cmd = ["python", "red-main.py", "--repo", "OWNER/REPOSITORY"], timeout = "5m" },
 ]
 
 [[rule]]
