@@ -1161,7 +1161,9 @@ every [`HandoffReason`](../../crates/eliot-core/src/api/switch.rs): an Owner or 
 request, a routing choice, a provider hold, and a lost or failed session. A session is
 disposable. [Git and the file system](../architecture.md#work-truth-lives-in-git-and-the-file-system)
 hold the task, so B in the same worktree continues from the files as they are and no
-commit is required first.
+commit is required first. Moving dirty work to a different checkout is refused until
+the source checkout is clean; the new checkout would otherwise omit its uncommitted
+files.
 
 Its sole wire DTOs are
 [`SwitchRequest` / `SwitchResponse`](../../crates/eliot-core/src/api/switch.rs).
@@ -1193,10 +1195,15 @@ admission and transfer. B's authority must be provably equal or narrower than A'
 Credentials, model and executable belong to the profile the Owner named in policy.
 A held account is never replaced by another account of the same harness.
 
-A source generation has at most one open switch. A second switch in the same worktree
-after a transfer is refused and names the successor to switch instead. From then on the
-source refuses `send`, `steer`, `inject` and `resume` with `handed_off`, naming the Agent
-that now holds the worktree, and automatic resume skips it. `stop` still works. The
+A source generation has at most one open switch. The Store records the canonical source
+checkout at reservation and rechecks its current owner at reservation and launch
+admission. The actual target checkout is checked again before native launch. The durable
+`agents.workspace` identity and `agent_successors` relation establish checkout ownership;
+event retention does not release it. A same-checkout transfer records the successor even
+when the caller explicitly repeats the workspace path. A second switch from a retired
+owner is refused and names the current Agent to switch instead. From then on the source
+refuses `send`, `steer`, `inject` and `resume` with `handed_off`, naming the Agent that
+now holds the worktree, and automatic resume skips it. `stop` still works. The
 transfer closes any lost or failed `owner.inbox` item for the source. A busy source is
 refused with the remedy: run `swarm interrupt <agent>`, then retry.
 
@@ -1223,12 +1230,15 @@ increment; writable ref and reflog parents do not isolate object integrity. Hook
 repository config, `packed-refs`, tags and other agents' ref directories stay denied.
 
 A may be idle, or lost, failed or stopped with its process tree proven gone, in any
-generation. The task comes from the named command of any of A's generations, else A's
+generation. The switch first admits and executes an exact-generation source stop. Git
+facts and checkpointing wait until Store proves both the complete owned process-family
+exit and native source drain, including for a Lost source. No successor launch is
+admitted without that proof. The task comes from the named command of any of A's generations, else A's
 first retained instruction, else the [Git task record](monitoring.md). None of them being
 retained does not refuse the switch: the brief says so and points at Git. An uncertain
 command or turn of an ended generation cannot still land, so it is named in the brief
-and never replayed. On a live idle A, one in its running generation refuses with the
-remedy `swarm stop <agent>`.
+and never replayed. On a live idle A, the switch itself applies the source stop before
+reading Git facts.
 
 The brief does not repeat a selected SEND that the transfer admits separately. It also
 omits a Git task record bound to that same SEND. Unknown or still-dispatched inputs appear
@@ -1238,8 +1248,8 @@ and must verify their effects before continuing.
 Before external preparation the Store checks A's exact generation and readiness,
 any named task and selected SENDs, transferable Goal, and controlled child
 limits for the prospective root. The parent freezes the launch and handoff IDs
-after these checks pass. The worker rechecks the source when admitting the
-ordinary promptless launch and its parent link. H2 validates the complete
+after these checks pass. The worker rechecks the source checkout identity and stop
+proof when admitting the ordinary promptless launch and its parent link. H2 validates the complete
 transfer against current A and B.
 
 Only an Applied launch plus the exact generation/command-bound committed
@@ -1278,7 +1288,7 @@ handoff refusal; Unknown retains an uncertain launch or interrupted orchestratio
 The result keeps the child IDs, created Agent/generation, launch state and
 handoff or disposal outcome. Refusals carry a code and a bounded reason in the
 result and daemon log. A terminal failure has an empty `next_action`.
-`command.children` shows the launch, handoff or successor stop. The CLI waits
+`command.children` shows the source stop, launch, handoff and any successor stop. The CLI waits
 for the switch and any admitted successor stop by default. `--no-wait` returns
 the current receipt.
 

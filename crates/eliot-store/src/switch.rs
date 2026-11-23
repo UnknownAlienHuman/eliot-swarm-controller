@@ -15,6 +15,12 @@ const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 const OWNER_AUTOMATION: &str = "owner_automation";
 const CONTINUATION: &str = "continuation";
 const REQUESTED_BY: &str = "requested_by";
+const SOURCE_STOP_COMMAND: &str = "switch_source_stop_command";
+const SOURCE_CHECKOUT: &str = "switch_source_checkout";
+const SOURCE_CHECKOUT_ROOT: &str = "switch_source_checkout_root";
+const SOURCE_CHECKOUT_KEY: &str = "switch_source_checkout_key";
+const TARGET_CHECKOUT_ROOT: &str = "switch_target_checkout_root";
+const TARGET_CHECKOUT_KEY: &str = "switch_target_checkout_key";
 
 /// Retained reason of a daemon-initiated continuation.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -51,6 +57,10 @@ pub const PROVIDER_SWITCH_SETTLED: &str = "provider.failover_settled";
 pub struct SwitchWork {
     pub request: SwitchRequest,
     pub plan: SwitchResponse,
+    pub source_stop_command: Option<String>,
+    pub source_checkout: Option<String>,
+    pub source_checkout_root: Option<String>,
+    pub source_checkout_key: Option<String>,
     pub provider_failure: Option<ProviderSwitchFailure>,
     pub profile_authority: Option<[u8; 32]>,
     pub owner_automation: bool,
@@ -61,6 +71,12 @@ pub struct SwitchWork {
 
 struct RetainedSwitch {
     request: SwitchRequest,
+    source_stop_command: Option<String>,
+    source_checkout: Option<String>,
+    source_checkout_root: Option<String>,
+    source_checkout_key: Option<String>,
+    target_checkout_root: Option<String>,
+    target_checkout_key: Option<String>,
     provider_failure: Option<ProviderSwitchFailure>,
     profile_authority: Option<[u8; 32]>,
     owner_automation: bool,
@@ -102,9 +118,45 @@ fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
         .map(serde_json::from_value)
         .transpose()
         .map_err(|_| malformed())?;
+    let source_stop_command = args_map
+        .remove(SOURCE_STOP_COMMAND)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let source_checkout = args_map
+        .remove(SOURCE_CHECKOUT)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let source_checkout_root = args_map
+        .remove(SOURCE_CHECKOUT_ROOT)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let source_checkout_key = args_map
+        .remove(SOURCE_CHECKOUT_KEY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let target_checkout_root = args_map
+        .remove(TARGET_CHECKOUT_ROOT)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let target_checkout_key = args_map
+        .remove(TARGET_CHECKOUT_KEY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
     Ok(RetainedSwitch {
         request,
+        source_stop_command,
+        source_checkout,
+        source_checkout_root,
+        source_checkout_key,
+        target_checkout_root,
+        target_checkout_key,
         provider_failure: failure.map(|kind| ProviderSwitchFailure { kind, authority }),
         profile_authority,
         owner_automation,
@@ -214,9 +266,13 @@ fn require_handoff_bounds(
     Ok(())
 }
 
-/// One session's work has one successor at a time. A second switch in the
-/// same worktree would put two Agents on one branch.
-fn switch_blocker(tx: &Connection, request: &SwitchRequest) -> Result<Option<Error>> {
+/// One canonical checkout has one durable owner and at most one in-flight
+/// switch. Both facts survive event retention and explicit path overrides.
+fn switch_blocker(
+    tx: &Connection,
+    request: &SwitchRequest,
+    checkout_key: Option<&str>,
+) -> Result<Option<Error>> {
     let open: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_unsettled_created
@@ -234,33 +290,316 @@ fn switch_blocker(tx: &Connection, request: &SwitchRequest) -> Result<Option<Err
             format!("Agent {} already has a switch in progress", request.from),
         )));
     }
-    let launch = &request.launch;
-    if launch.workspace.is_some() || launch.worktree.is_some() || launch.project.is_some() {
-        return Ok(None);
+    let source = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
+        .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+    if source.generation != request.from_generation {
+        return Err(Error::new("stale_generation", "source generation moved"));
     }
-    let moved: Option<String> = tx
+    let source_num = parse_agent_id(&source.id)?;
+    let successor: Option<i64> = tx
         .query_row(
-            "SELECT json_extract(data, '$.to') FROM events INDEXED BY events_kind
-             WHERE kind = ?1 AND agent = ?2 AND generation = ?3
-             ORDER BY seq DESC LIMIT 1",
-            params![
-                handoff::AGENT_HANDED_OFF,
-                parse_agent_id(&request.from)?,
-                request.from_generation
-            ],
+            "SELECT successor FROM agent_successors WHERE agent = ?1 AND generation = ?2",
+            params![source_num, source.generation],
             |row| row.get(0),
         )
         .optional()
         .map_err(sql_error)?;
-    Ok(moved.map(|successor| {
-        Error::new(
+    if let Some(successor) = successor {
+        return Ok(Some(Error::new(
             "bad_state",
             format!(
-                "Agent {} already handed this work to {successor}; switch that Agent instead",
-                request.from
+                "Agent {} already handed this checkout to {}; switch that Agent instead",
+                source.id,
+                format_agent_id(successor)
             ),
+        )));
+    }
+    if let Some(checkout_key) = checkout_key
+        && let Some((owner, generation, active_switch)) = checkout_fence(tx, checkout_key)?
+        && (owner != source_num || active_switch.is_some())
+    {
+        return Ok(Some(Error::new(
+            "bad_state",
+            format!(
+                "canonical checkout is owned by {}#{}{}",
+                format_agent_id(owner),
+                generation,
+                active_switch
+                    .map(|id| format!(" under switch {id}"))
+                    .unwrap_or_default()
+            ),
+        )));
+    }
+    Ok(None)
+}
+
+fn checkout_fence(
+    connection: &Connection,
+    checkout_key: &str,
+) -> Result<Option<(i64, i64, Option<String>)>> {
+    connection
+        .query_row(
+            "SELECT agent, generation, switch_command FROM switch_checkout_owners
+             WHERE checkout_key = ?1",
+            [checkout_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
-    }))
+        .optional()
+        .map_err(sql_error)
+}
+
+fn live_workspace_inputs(connection: &Connection) -> Result<Vec<(String, i64, String)>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT a.id, a.generation, a.workspace FROM agents a
+             WHERE a.observe_only = 0 AND a.workspace IS NOT NULL
+               AND EXISTS (
+                   SELECT 1 FROM processes p
+                   WHERE p.owner = 'agent:a' || a.id || '#' || a.generation
+                     AND p.state IN ('running','unknown')
+               ) ORDER BY a.id, a.generation",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                format_agent_id(row.get::<_, i64>(0)?),
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)
+}
+
+fn require_live_checkout_snapshot(
+    tx: &Connection,
+    snapshot: &[(String, i64, String, String)],
+    checkout_key: &str,
+    except_agent: &str,
+) -> Result<()> {
+    let current = live_workspace_inputs(tx)?;
+    if current.len() != snapshot.len()
+        || current.iter().any(|(agent, generation, workspace)| {
+            !snapshot
+                .iter()
+                .any(|(known_agent, known_generation, known_workspace, _)| {
+                    known_agent == agent
+                        && known_generation == generation
+                        && known_workspace == workspace
+                })
+        })
+    {
+        return Err(Error::new(
+            "busy",
+            "live workspace custody changed during switch preflight; retry the switch",
+        ));
+    }
+    for (agent, generation, workspace) in current {
+        let key = snapshot
+            .iter()
+            .find(|(known_agent, known_generation, known_workspace, _)| {
+                known_agent == &agent
+                    && *known_generation == generation
+                    && known_workspace == &workspace
+            })
+            .map(|(_, _, _, key)| key.as_str())
+            .ok_or_else(|| Error::new("source_integrity", "live checkout identity is missing"))?;
+        if key == checkout_key && agent != except_agent {
+            return Err(Error::new(
+                "busy",
+                format!("canonical checkout has a competing live writer {agent}#{generation}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn claim_source_checkout(
+    tx: &Transaction<'_>,
+    checkout_key: &str,
+    checkout_root: &str,
+    source: &Agent,
+    switch_id: &str,
+    now: i64,
+) -> Result<()> {
+    let agent = parse_agent_id(&source.id)?;
+    if let Some((owner, generation, active_switch)) = checkout_fence(tx, checkout_key)? {
+        if owner != agent
+            || active_switch
+                .as_deref()
+                .is_some_and(|active| active != switch_id)
+        {
+            return Err(Error::new(
+                "bad_state",
+                format!(
+                    "canonical checkout is owned by {}#{}{}",
+                    format_agent_id(owner),
+                    generation,
+                    active_switch
+                        .map(|id| format!(" under switch {id}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+    }
+    tx.execute(
+        "INSERT INTO switch_checkout_owners(checkout_key, checkout_root, agent, generation,
+             switch_command, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(checkout_key) DO UPDATE SET checkout_root=excluded.checkout_root,
+             agent=excluded.agent, generation=excluded.generation,
+             switch_command=excluded.switch_command, updated_at=excluded.updated_at",
+        params![
+            checkout_key,
+            checkout_root,
+            agent,
+            source.generation,
+            switch_id,
+            now
+        ],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+fn transfer_switch_checkout_fences(
+    tx: &Transaction<'_>,
+    switch_id: &str,
+    source_key: Option<&str>,
+    target_key: &str,
+    target_root: &str,
+    destination: &Agent,
+    now: i64,
+) -> Result<()> {
+    let changed = tx
+        .execute(
+            "UPDATE switch_checkout_owners SET checkout_root=?1, agent=?2, generation=?3,
+                 switch_command=NULL, updated_at=?4
+             WHERE checkout_key=?5 AND switch_command=?6",
+            params![
+                target_root,
+                parse_agent_id(&destination.id)?,
+                destination.generation,
+                now,
+                target_key,
+                switch_id
+            ],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "switch target checkout fence was not retained",
+        ));
+    }
+    if source_key.is_some_and(|source_key| source_key != target_key) {
+        tx.execute(
+            "DELETE FROM switch_checkout_owners WHERE checkout_key=?1 AND switch_command=?2",
+            params![source_key, switch_id],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
+fn retain_live_successor_checkout(
+    tx: &Transaction<'_>,
+    switch_id: &str,
+    source_key: Option<&str>,
+    target_key: &str,
+    destination: &Agent,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "UPDATE switch_checkout_owners SET agent=?1, generation=?2, switch_command=NULL,
+             updated_at=?3 WHERE checkout_key=?4 AND switch_command=?5",
+        params![
+            parse_agent_id(&destination.id)?,
+            destination.generation,
+            now,
+            target_key,
+            switch_id
+        ],
+    )
+    .map_err(sql_error)?;
+    if source_key.is_some_and(|source_key| source_key != target_key) {
+        tx.execute(
+            "UPDATE switch_checkout_owners SET switch_command=NULL, updated_at=?1
+             WHERE checkout_key=?2 AND switch_command=?3",
+            params![now, source_key, switch_id],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
+fn release_switch_checkout_fences(
+    tx: &Transaction<'_>,
+    switch_id: &str,
+    source_key: Option<&str>,
+    target_key: Option<&str>,
+    source: &Agent,
+    now: i64,
+) -> Result<()> {
+    if let Some(target_key) = target_key
+        && source_key != Some(target_key)
+    {
+        tx.execute(
+            "DELETE FROM switch_checkout_owners WHERE checkout_key=?1 AND switch_command=?2",
+            params![target_key, switch_id],
+        )
+        .map_err(sql_error)?;
+    }
+    if let Some(source_key) = source_key {
+        tx.execute(
+            "UPDATE switch_checkout_owners SET agent=?1, generation=?2,
+                 switch_command=NULL, updated_at=?3
+             WHERE checkout_key=?4 AND switch_command=?5",
+            params![
+                parse_agent_id(&source.id)?,
+                source.generation,
+                now,
+                source_key,
+                switch_id
+            ],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
+}
+
+fn require_switch_source_exit(
+    tx: &Connection,
+    switch_id: &str,
+    stop_id: &str,
+    request: &SwitchRequest,
+) -> Result<()> {
+    let stop = component(tx, switch_id, stop_id, 3)?
+        .ok_or_else(|| Error::new("source_integrity", "switch source stop is not retained"))?;
+    if stop.verb != "stop"
+        || stop.target.as_deref() != Some(request.from.as_str())
+        || stop.generation != Some(request.from_generation)
+        || stop.state != CommandState::Applied
+    {
+        return Err(Error::new(
+            "process_custody_unproven",
+            "switch source stop did not settle for the reserved generation",
+        ));
+    }
+    let source = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
+        .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+    if source.generation != request.from_generation
+        || !source.is_terminal()
+        || handoff::session_exit_blocker(tx, &source)?.is_some()
+    {
+        return Err(Error::new(
+            "process_custody_unproven",
+            "switch requires committed process-family exit and native source drain proof",
+        ));
+    }
+    Ok(())
 }
 
 fn continuation_directive(
@@ -322,18 +661,50 @@ pub(super) fn reserve_rule_switch_tx(
             Err(error)
         };
     }
-    reserve_switch_tx(tx, request, args, &digest, now)
+    reserve_switch_tx(tx, request, args, &digest, now, None)
 }
 
 fn reserve_switch_tx(
     tx: &Transaction<'_>,
     request: &SwitchRequest,
-    args: Value,
+    mut args: Value,
     digest: &[u8],
     now: i64,
+    live_checkout_snapshot: Option<&[(String, i64, String, String)]>,
 ) -> Result<Change<SwitchResponse>> {
-    if let Some(error) = switch_blocker(tx, request)? {
+    let source = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
+        .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+    if source.generation != request.from_generation {
+        return Err(Error::new("stale_generation", "source generation moved"));
+    }
+    let source_checkout_root = args
+        .get(SOURCE_CHECKOUT_ROOT)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| source.workspace.clone());
+    let source_checkout_key = args
+        .get(SOURCE_CHECKOUT_KEY)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            source_checkout_root
+                .as_deref()
+                .map(core::workspace_path_key)
+        });
+    args[SOURCE_CHECKOUT] = json!(source.workspace);
+    args[SOURCE_CHECKOUT_ROOT] = json!(source_checkout_root);
+    args[SOURCE_CHECKOUT_KEY] = json!(source_checkout_key);
+    if let Some(error) = switch_blocker(tx, request, source_checkout_key.as_deref())? {
         return Err(error);
+    }
+    if let (Some(checkout_key), Some(checkout_root)) = (
+        source_checkout_key.as_deref(),
+        source_checkout_root.as_deref(),
+    ) {
+        if let Some(snapshot) = live_checkout_snapshot {
+            require_live_checkout_snapshot(tx, snapshot, checkout_key, &source.id)?;
+        }
+        claim_source_checkout(tx, checkout_key, checkout_root, &source, &request.id, now)?;
     }
     let value = SwitchResponse {
         id: request.id.clone(),
@@ -439,7 +810,8 @@ pub(super) fn reserve_provider_switch_tx(
         commands: Vec::new(),
         launch: SwitchLaunch::default(),
     };
-    if switch_blocker(tx, &request)?.is_some() {
+    let checkout_key = agent.workspace.as_deref().map(core::workspace_path_key);
+    if switch_blocker(tx, &request, checkout_key.as_deref())?.is_some() {
         return Ok(());
     }
     let mut args = serde_json::to_value(&request)
@@ -455,7 +827,7 @@ pub(super) fn reserve_provider_switch_tx(
         args[OWNER_AUTOMATION] = json!(true);
     }
     let digest = canonical::digest(&args)?;
-    events.extend(reserve_switch_tx(tx, &request, args, &digest, now)?.events);
+    events.extend(reserve_switch_tx(tx, &request, args, &digest, now, None)?.events);
     events.push(insert_daemon_event(
         tx,
         now,
@@ -534,6 +906,13 @@ impl Store {
         replay_on(&self.connection, "owner", request, &digest)
     }
 
+    /// Current non-observer writer workspaces. Router resolves each path to
+    /// its canonical Git checkout before switch reservation or launch.
+    pub fn switch_live_workspace_inputs(&self) -> Result<Vec<(String, i64, String)>> {
+        self.ensure_committed_reads()?;
+        live_workspace_inputs(&self.connection)
+    }
+
     /// Retain both child identities before any profile/auth/Git/native preparation.
     pub fn reserve_switch(
         &mut self,
@@ -542,6 +921,9 @@ impl Store {
         policy: &core::SecretPolicy,
         owner_process: Option<&OwnerProcess>,
         profile_authority: Option<[u8; 32]>,
+        source_checkout_root: Option<&str>,
+        source_checkout_key: Option<&str>,
+        live_checkout_snapshot: &[(String, i64, String, String)],
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
         if let Some(value) = self.replay_switch(principal, request)? {
@@ -553,6 +935,12 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let (mut args, digest) = switch_args(principal, request)?;
+            if let Some(root) = source_checkout_root {
+                args[SOURCE_CHECKOUT_ROOT] = json!(root);
+            }
+            if let Some(key) = source_checkout_key {
+                args[SOURCE_CHECKOUT_KEY] = json!(key);
+            }
             if let Some(authority) = profile_authority {
                 args[SESSION_GROWTH_AUTHORITY] = json!(authority);
             }
@@ -582,7 +970,14 @@ impl Store {
             }
             require_switch_caller(&tx, principal, request)?;
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
-            let mut change = reserve_switch_tx(&tx, request, args, &digest, now)?;
+            let mut change = reserve_switch_tx(
+                &tx,
+                request,
+                args,
+                &digest,
+                now,
+                Some(live_checkout_snapshot),
+            )?;
             annotate_owner_events(&tx, &mut change.events, owner_process)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(change)
@@ -620,6 +1015,12 @@ impl Store {
             let value = stored_result(&command.outcome)?;
             let RetainedSwitch {
                 request,
+                source_stop_command: _,
+                source_checkout,
+                source_checkout_root,
+                source_checkout_key,
+                target_checkout_root: _,
+                target_checkout_key: _,
                 provider_failure,
                 profile_authority,
                 owner_automation,
@@ -645,6 +1046,66 @@ impl Store {
                         |row| row.get::<_, bool>(0),
                     )
                     .map_err(sql_error)?;
+            let source = load_agent_by_num(&tx, parse_agent_id(&request.from)?)?
+                .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+            if source.generation != request.from_generation {
+                return Err(Error::new("stale_generation", "source generation moved"));
+            }
+            if source.workspace != source_checkout {
+                return Err(Error::new(
+                    "source_integrity",
+                    "source canonical checkout changed after switch reservation",
+                ));
+            }
+            if let (Some(root), Some(key)) = (
+                source_checkout_root.as_deref(),
+                source_checkout_key.as_deref(),
+            ) {
+                if core::workspace_path_key(root) != key {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "reserved source checkout key does not match its canonical root",
+                    ));
+                }
+                let source_num = parse_agent_id(&source.id)?;
+                if checkout_fence(&tx, key)?.is_none_or(|(owner, generation, active)| {
+                    owner != source_num
+                        || generation != source.generation
+                        || active.as_deref() != Some(id)
+                }) {
+                    return Err(Error::new(
+                        "bad_state",
+                        "source checkout ownership changed after reservation",
+                    ));
+                }
+            }
+            let source_stop_command = Ulid::new().to_string();
+            let mut stop = SubmitCommand::new(&source_stop_command, "stop");
+            stop.target = Some(source.id.clone());
+            stop.expected_generation = Some(source.generation);
+            stop.args = json!({"force": true});
+            let admitted = admission::submit_tx(
+                &tx,
+                "owner",
+                stop,
+                None,
+                now,
+                false,
+                self.hierarchy_limits,
+                self.capacity_policy.as_deref(),
+            )?;
+            tx.execute(
+                "UPDATE commands SET args=json_set(args, '$.switch_source_stop_command', ?1)
+                 WHERE id=?2",
+                params![source_stop_command, id],
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=3 WHERE id=?2",
+                params![id, source_stop_command],
+            )
+            .map_err(sql_error)?;
+            events.extend(admitted.events);
             update_command_state(
                 &tx,
                 id,
@@ -667,6 +1128,10 @@ impl Store {
                 value: Some(SwitchWork {
                     request,
                     plan: value,
+                    source_stop_command: Some(source_stop_command),
+                    source_checkout,
+                    source_checkout_root,
+                    source_checkout_key,
                     provider_failure,
                     profile_authority,
                     owner_automation,
@@ -696,6 +1161,22 @@ impl Store {
         }
     }
 
+    /// Whether the reserved source stop completed with exact process-family
+    /// exit and native source-drain proof for this switch generation.
+    pub fn switch_source_exit_proven(&self, id: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        let parent = switch_parent(&self.connection, id)?;
+        let retained = decode_switch(parent.args)?;
+        let Some(stop_id) = retained.source_stop_command.as_deref() else {
+            return Ok(false);
+        };
+        match require_switch_source_exit(&self.connection, id, stop_id, &retained.request) {
+            Ok(()) => Ok(true),
+            Err(error) if error.code == "process_custody_unproven" => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn switch_result(&self, id: &str) -> Result<SwitchResponse> {
         self.ensure_committed_reads()?;
         result_on(&self.connection, id)
@@ -707,6 +1188,9 @@ impl Store {
         id: &str,
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
+        target_checkout_root: &str,
+        target_checkout_key: &str,
+        live_checkout_snapshot: &[(String, i64, String, String)],
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Admission> {
@@ -732,12 +1216,71 @@ impl Store {
             }
             let RetainedSwitch {
                 request: source,
+                source_stop_command,
+                source_checkout,
+                source_checkout_root,
+                source_checkout_key,
                 provider_failure,
                 continuation,
                 requested_by,
                 ..
             } = decode_switch(parent.args)?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
+            if agent.workspace != source_checkout {
+                return Err(Error::new(
+                    "source_integrity",
+                    "source canonical checkout changed after switch reservation",
+                ));
+            }
+            let source_checkout_key = source_checkout_key.as_deref().ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "switch source checkout identity is missing",
+                )
+            })?;
+            let source_checkout_root = source_checkout_root.as_deref().ok_or_else(|| {
+                Error::new("source_integrity", "switch source checkout root is missing")
+            })?;
+            if core::workspace_path_key(source_checkout_root) != source_checkout_key {
+                return Err(Error::new(
+                    "source_integrity",
+                    "reserved source checkout key does not match its canonical root",
+                ));
+            }
+            let source_num = parse_agent_id(&agent.id)?;
+            if checkout_fence(&tx, source_checkout_key)?.is_none_or(
+                |(owner, generation, active)| {
+                    owner != source_num
+                        || generation != agent.generation
+                        || active.as_deref() != Some(id)
+                },
+            ) {
+                return Err(Error::new(
+                    "bad_state",
+                    "source checkout ownership changed before launch admission",
+                ));
+            }
+            let source_stop = source_stop_command.as_deref().ok_or_else(|| {
+                Error::new(
+                    "process_custody_unproven",
+                    "switch has no reserved source stop command",
+                )
+            })?;
+            require_switch_source_exit(&tx, id, source_stop, &source)?;
+            require_live_checkout_snapshot(
+                &tx,
+                live_checkout_snapshot,
+                target_checkout_key,
+                &agent.id,
+            )?;
+            claim_source_checkout(
+                &tx,
+                target_checkout_key,
+                target_checkout_root,
+                &agent,
+                id,
+                now,
+            )?;
             if continuation.is_some() || requested_by.is_some() {
                 require_handoff_bounds(
                     &tx,
@@ -887,6 +1430,15 @@ impl Store {
                     "reserved launch id occupied by another command",
                 ));
             }
+            let mut retained_args = parent.args.clone();
+            retained_args[TARGET_CHECKOUT_ROOT] = json!(target_checkout_root);
+            retained_args[TARGET_CHECKOUT_KEY] = json!(target_checkout_key);
+            tx.execute(
+                "UPDATE commands SET args=?1 WHERE id=?2",
+                params![encode_json(&retained_args)?, id],
+            )
+            .map_err(sql_error)?;
+            super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
             let admission = admission::submit_tx(
                 &tx,
                 "owner",
@@ -934,6 +1486,9 @@ impl Store {
             }
             let RetainedSwitch {
                 request,
+                source_checkout_key,
+                target_checkout_root,
+                target_checkout_key,
                 provider_failure,
                 continuation,
                 requested_by,
@@ -1018,17 +1573,34 @@ impl Store {
                         transfer,
                     )?;
                     super::work_truth::inherit_work_task_tx(&tx, &source, &destination, now)?;
+                    let target_root = target_checkout_root.as_deref().ok_or_else(|| {
+                        Error::new("source_integrity", "switch target checkout root is missing")
+                    })?;
+                    let target_key = target_checkout_key.as_deref().ok_or_else(|| {
+                        Error::new("source_integrity", "switch target checkout key is missing")
+                    })?;
+                    transfer_switch_checkout_fences(
+                        &tx,
+                        id,
+                        source_checkout_key.as_deref(),
+                        target_key,
+                        target_root,
+                        &destination,
+                        now,
+                    )?;
                     tx.execute("UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=1 WHERE id=?2", params![id,plan.handoff_command]).map_err(sql_error)?;
                     // The continuation rides the existing overlay: B's
                     // link records the source it continues. Plain text,
                     // never a foreign key, so deleting the source
                     // afterwards cannot fault the Store writer.
                     let created = parse_agent_id(&destination.id)?;
-                    // B now owns A's worktree, so A takes no further input.
-                    if request.launch.workspace.is_none()
-                        && request.launch.worktree.is_none()
-                        && request.launch.project.is_none()
-                    {
+                    // Persist ownership for the actual canonical checkout,
+                    // including an explicit workspace that names the same path.
+                    let same_checkout = source_checkout_key
+                        .as_deref()
+                        .zip(target_checkout_key.as_deref())
+                        .is_some_and(|(source, target)| source == target);
+                    if same_checkout {
                         db!(tx.execute(
                             "INSERT OR REPLACE INTO agent_successors(agent, generation, successor)
                              VALUES (?1, ?2, ?3)",
@@ -1165,6 +1737,38 @@ impl Store {
                             disposal = Some(admitted.command);
                         }
                     }
+                    if refusal.code != "unknown" && disposal.is_none() {
+                        if disposal_reason.is_some() {
+                            if let Some(destination) = launch_destination_tx(&tx, &launch)? {
+                                let target_key =
+                                    target_checkout_key.as_deref().ok_or_else(|| {
+                                        Error::new(
+                                            "source_integrity",
+                                            "switch target checkout key is missing",
+                                        )
+                                    })?;
+                                retain_live_successor_checkout(
+                                    &tx,
+                                    id,
+                                    source_checkout_key.as_deref(),
+                                    target_key,
+                                    &destination,
+                                    now,
+                                )?;
+                            }
+                        } else if let Some(source) =
+                            load_agent_by_num(&tx, parse_agent_id(&request.from)?)?
+                        {
+                            release_switch_checkout_fences(
+                                &tx,
+                                id,
+                                source_checkout_key.as_deref(),
+                                target_checkout_key.as_deref(),
+                                &source,
+                                now,
+                            )?;
+                        }
+                    }
                     error = Some(refusal);
                 }
             }
@@ -1244,6 +1848,46 @@ impl Store {
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Change<Command>> {
+        let parent = switch_parent(&self.connection, id)?;
+        let retained = decode_switch(parent.args)?;
+        let source = load_agent_by_num(&self.connection, parse_agent_id(&retained.request.from)?)?;
+        if let Some(source) = source {
+            let stop = retained
+                .source_stop_command
+                .as_deref()
+                .map(|stop_id| load_command(&self.connection, stop_id))
+                .transpose()?
+                .flatten();
+            let stop_settled = stop.as_ref().is_none_or(|stop| {
+                matches!(
+                    stop.state,
+                    CommandState::Failed
+                        | CommandState::Rejected
+                        | CommandState::Cancelled
+                        | CommandState::Applied
+                )
+            });
+            let exit_proven = stop.as_ref().is_none_or(|stop| {
+                stop.state != CommandState::Applied
+                    || handoff::session_exit_blocker(&self.connection, &source)
+                        .is_ok_and(|blocker| blocker.is_none())
+            });
+            if stop_settled && exit_proven {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql_error)?;
+                release_switch_checkout_fences(
+                    &tx,
+                    id,
+                    retained.source_checkout_key.as_deref(),
+                    retained.target_checkout_key.as_deref(),
+                    &source,
+                    now,
+                )?;
+                commit_transaction(tx, &self.write_faulted)?;
+            }
+        }
         let mut value = self.switch_result(id)?;
         set_switch_error(&mut value, error, policy);
         value.state = CommandState::Rejected;
@@ -1414,7 +2058,72 @@ pub(super) fn refresh_disposal_parent_tx(
          WHERE id=(SELECT parent_command FROM commands WHERE id=?1 AND link_kind='switch' AND ordinal=2 AND verb='stop')
            AND method='swarm.switch' AND state='failed' AND json_extract(outcome,'$.disposal_command')=?1",
         params![command_id, command_state_name(state), now],
-    ).map_err(sql_error)?;
+    )
+    .map_err(sql_error)?;
+    if state == CommandState::Applied {
+        let switch_id: Option<String> = tx
+            .query_row(
+                "SELECT parent_command FROM commands
+                 WHERE id=?1 AND link_kind='switch' AND ordinal=2",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(switch_id) = switch_id {
+            let parent = switch_parent(tx, &switch_id)?;
+            let retained = decode_switch(parent.args)?;
+            if let Some(source) = load_agent_by_num(tx, parse_agent_id(&retained.request.from)?)? {
+                release_switch_checkout_fences(
+                    tx,
+                    &switch_id,
+                    retained.source_checkout_key.as_deref(),
+                    retained.target_checkout_key.as_deref(),
+                    &source,
+                    now,
+                )?;
+            }
+        }
+    }
+    if matches!(
+        state,
+        CommandState::Applied
+            | CommandState::Failed
+            | CommandState::Rejected
+            | CommandState::Cancelled
+    ) {
+        let switch_id: Option<String> = tx
+            .query_row(
+                "SELECT parent_command FROM commands
+                 WHERE id=?1 AND link_kind='switch' AND ordinal=3",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(switch_id) = switch_id {
+            let parent = switch_parent(tx, &switch_id)?;
+            if parent.state == CommandState::Rejected {
+                let retained = decode_switch(parent.args)?;
+                if let Some(source) =
+                    load_agent_by_num(tx, parse_agent_id(&retained.request.from)?)?
+                {
+                    let exit_proven = state != CommandState::Applied
+                        || handoff::session_exit_blocker(tx, &source)?.is_none();
+                    if exit_proven {
+                        release_switch_checkout_fences(
+                            tx,
+                            &switch_id,
+                            retained.source_checkout_key.as_deref(),
+                            retained.target_checkout_key.as_deref(),
+                            &source,
+                            now,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 

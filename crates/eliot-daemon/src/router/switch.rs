@@ -5,6 +5,13 @@ use eliot_core::api::{
     HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest,
 };
 
+async fn canonical_checkout_identity(workspace: &str) -> Result<(String, String)> {
+    let git = crate::workspace_git::WorkspaceGit::new()?;
+    let (root, _, _) = git.discover_repository_identity(workspace).await?;
+    let key = eliot_core::workspace_path_key(&root);
+    Ok((root, key))
+}
+
 fn log_refusal(policy: &eliot_core::SecretPolicy, id: &str, code: &str, reason: &str) {
     let error = Error::new(code, reason).with_origin(eliot_core::FailureOrigin::Swarm, reason);
     crate::logging::record(policy, "switch.refused", &[("command", id)], Some(&error));
@@ -37,6 +44,25 @@ fn reuse_retained_checkout(
 }
 
 impl Router {
+    async fn switch_live_checkout_snapshot(&self) -> Result<Vec<(String, i64, String, String)>> {
+        let inputs = {
+            let store = self.inner.store.lock().await;
+            store.switch_live_workspace_inputs()?
+        };
+        let git = crate::workspace_git::WorkspaceGit::new()?;
+        let mut snapshot = Vec::with_capacity(inputs.len());
+        for (agent, generation, workspace) in inputs {
+            let (checkout, _, _) = git.discover_repository_identity(&workspace).await?;
+            snapshot.push((
+                agent,
+                generation,
+                workspace,
+                eliot_core::workspace_path_key(&checkout),
+            ));
+        }
+        Ok(snapshot)
+    }
+
     /// The profiles a manager may place a worker on: the worker's own and the
     /// manager's frozen child profiles.
     async fn manager_successors(&self, manager: &str, source: &Agent) -> Result<Vec<String>> {
@@ -116,6 +142,28 @@ impl Router {
         }
         let request: SwitchRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
+        let replay = {
+            let store = self.inner.store.lock().await;
+            store.replay_switch(&principal_name(principal), &request)?
+        };
+        if let Some(value) = replay {
+            return serde_json::to_value(value)
+                .map_err(|_| Error::new("internal", "cannot encode switch replay"));
+        }
+        let source = {
+            let store = self.inner.store.lock().await;
+            store
+                .get_agent(&request.from)?
+                .ok_or_else(|| Error::new("not_found", "source Agent missing"))?
+        };
+        if source.generation != request.from_generation {
+            return Err(Error::new("stale_generation", "source generation moved"));
+        }
+        let source_identity = match source.workspace.as_deref() {
+            Some(workspace) => Some(canonical_checkout_identity(workspace).await?),
+            None => None,
+        };
+        let live_checkout_snapshot = self.switch_live_checkout_snapshot().await?;
         let policy = self.secret_policy_snapshot();
         let change = {
             let mut store = self.inner.store.lock().await;
@@ -133,6 +181,9 @@ impl Router {
                     &policy,
                     owner_process,
                     profile_authority,
+                    source_identity.as_ref().map(|(root, _)| root.as_str()),
+                    source_identity.as_ref().map(|(_, key)| key.as_str()),
+                    &live_checkout_snapshot,
                     now_ms(),
                 )
                 .inspect_err(|error| {
@@ -165,6 +216,10 @@ impl Router {
         let Some(eliot_store::SwitchWork {
             request,
             plan,
+            source_stop_command,
+            source_checkout,
+            source_checkout_root,
+            source_checkout_key,
             provider_failure,
             profile_authority,
             owner_automation,
@@ -174,14 +229,102 @@ impl Router {
         else {
             return;
         };
+        let source = {
+            let store = self.inner.store.lock().await;
+            store.get_agent(&request.from).ok().flatten()
+        };
+        let Some(source) = source.filter(|source| {
+            source.generation == request.from_generation
+                && source.workspace == source_checkout
+                && match (
+                    source_checkout_root.as_deref(),
+                    source_checkout_key.as_deref(),
+                ) {
+                    (Some(root), Some(key)) => eliot_core::workspace_path_key(root) == key,
+                    (None, None) => true,
+                    _ => false,
+                }
+        }) else {
+            let error = Error::new(
+                "source_integrity",
+                "source generation or canonical checkout changed after reservation",
+            );
+            let policy = self.secret_policy_snapshot();
+            let mut store = self.inner.store.lock().await;
+            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                self.publish_locked(&change.events);
+            }
+            self.signal_progress();
+            self.signal_launch_arbitration();
+            return;
+        };
+        let Some(source_stop_command) = source_stop_command else {
+            let error = Error::new(
+                "source_integrity",
+                "switch has no reserved source stop command",
+            );
+            let policy = self.secret_policy_snapshot();
+            let mut store = self.inner.store.lock().await;
+            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                self.publish_locked(&change.events);
+            }
+            self.signal_progress();
+            self.signal_launch_arbitration();
+            return;
+        };
+        if let Err(error) = self.check_command_admission_mode("launch") {
+            let policy = self.secret_policy_snapshot();
+            let mut store = self.inner.store.lock().await;
+            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                self.publish_locked(&change.events);
+            }
+            self.signal_progress();
+            self.signal_launch_arbitration();
+            return;
+        }
+        self.process_command(source_stop_command, None).await;
+        let source_exit_proven = {
+            let store = self.inner.store.lock().await;
+            store.switch_source_exit_proven(id)
+        };
+        let source_exit_error = match source_exit_proven {
+            Ok(true) => None,
+            Ok(false) => Some(Error::new(
+                "process_custody_unproven",
+                "source process-family exit and native source drain are unproven",
+            )),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = source_exit_error {
+            let policy = self.secret_policy_snapshot();
+            let mut store = self.inner.store.lock().await;
+            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                self.publish_locked(&change.events);
+            }
+            self.signal_progress();
+            self.signal_launch_arbitration();
+            return;
+        }
+        // Capture the source only after Store and native custody prove the
+        // exact process family is gone, and before any successor launch.
+        let facts = self
+            .handoff_git_facts(&request.from, Some(&request.task_command))
+            .await;
+        let source_clean = match source.workspace.as_deref() {
+            None => Some(true),
+            Some(workspace) => match crate::git_monitor::GitProbe::new() {
+                Ok(git) => match git
+                    .probe(workspace, None, source.base_oid.as_deref(), &[], now_ms())
+                    .await
+                {
+                    Ok(snapshot) if snapshot.complete => Some(snapshot.dirty.is_empty()),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
+        };
         let prepared = async {
             self.check_command_admission_mode("launch")?;
-            let source = {
-                let store = self.inner.store.lock().await;
-                store
-                    .get_agent(&request.from)?
-                    .ok_or_else(|| Error::new("not_found", "source Agent missing"))?
-            };
             // Continue-in-project resolves the target checkout before any
             // preparation: an omitted workspace uses the target
             // registration's checkout, never the source repo. The
@@ -315,6 +458,31 @@ impl Router {
                     true,
                 )
                 .await?;
+            let (target_checkout_root, target_checkout_key) = match prepared.workspace.as_ref() {
+                Some(workspace) => {
+                    let root = workspace.worktree_path.clone();
+                    let key = eliot_core::workspace_path_key(&root);
+                    (root, key)
+                }
+                None => {
+                    let workspace = prepared
+                        .request
+                        .args
+                        .get("workspace")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::new("invalid", "switch launch has no checkout"))?;
+                    canonical_checkout_identity(workspace).await?
+                }
+            };
+            let same_checkout = source_checkout_key
+                .as_deref()
+                .is_some_and(|key| key == target_checkout_key);
+            if !same_checkout && source_clean != Some(true) {
+                return Err(Error::new(
+                    "dirty",
+                    "switch to a different checkout requires a fully verified clean source worktree",
+                ));
+            }
             if let Some(authority) = profile_authority
                 && eliot_core::provider_switch_authority(
                     &prepared.request.args["profile_snapshot"],
@@ -431,12 +599,16 @@ impl Router {
                     "switch launch contains a known secret",
                 ));
             }
+            let live_checkout_snapshot = self.switch_live_checkout_snapshot().await?;
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
             let admission = store.admit_switch_launch(
                 id,
                 prepared.request,
                 prepared.workspace,
+                &target_checkout_root,
+                &target_checkout_key,
+                &live_checkout_snapshot,
                 &policy,
                 now_ms(),
             )?;
@@ -484,14 +656,9 @@ impl Router {
         })
         .await;
         let policy = self.secret_policy_snapshot();
-        // Git and the file system are the state B continues from. Outside the
-        // Store lock: reading them can take seconds.
-        let git = self
-            .handoff_git_facts(&request.from, Some(&request.task_command))
-            .await;
         let result = {
             let mut store = self.inner.store.lock().await;
-            let result = store.finish_switch(id, &policy, &git, now_ms());
+            let result = store.finish_switch(id, &policy, &facts, now_ms());
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
                 if let Some(handoff) = &change.value.handoff {
