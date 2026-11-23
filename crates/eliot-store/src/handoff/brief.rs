@@ -55,13 +55,18 @@ pub(super) fn build(
         .map(|id| load_command(tx, id))
         .transpose()?
         .flatten();
+    let task_command_binding = task_command
+        .map(|id| crate::Store::work_task_binding(tx, &request.from, request.from_generation, id))
+        .transpose()?
+        .flatten();
     let task_command_unknown = task_command.is_some()
-        && task_command_record.as_ref().is_none_or(|command| {
-            matches!(
+        && match task_command_record.as_ref() {
+            Some(command) => matches!(
                 command.state,
                 CommandState::Unknown | CommandState::Dispatched
-            )
-        });
+            ),
+            None => task_command_binding.is_none(),
+        };
     let task_transferred =
         task.is_some_and(|task| transferred.iter().any(|send| send.id == task.id));
     let task_is_brief = task

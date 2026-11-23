@@ -126,6 +126,24 @@ pub(super) fn inherit_work_task_generation_tx(
     now: i64,
 ) -> Result<()> {
     tx.execute(
+        "INSERT INTO git_work_tasks(agent, generation, task_command, task_ref, principal, updated_at)
+         SELECT ?3, ?4, checkpoint.task_command, checkpoint.task_ref,
+                COALESCE(task.principal, original.principal), ?5
+         FROM git_checkpoints checkpoint
+         LEFT JOIN git_work_tasks task
+           ON task.agent = checkpoint.agent AND task.generation = checkpoint.generation
+          AND task.task_command = checkpoint.task_command
+         LEFT JOIN commands original ON original.id = checkpoint.task_command
+         WHERE checkpoint.agent = ?1 AND checkpoint.generation = ?2
+           AND checkpoint.task_ref IS NOT NULL AND checkpoint.task_command IS NOT NULL
+         ON CONFLICT(agent, generation, task_command) DO UPDATE SET
+             task_ref = excluded.task_ref,
+             principal = COALESCE(excluded.principal, git_work_tasks.principal),
+             updated_at = excluded.updated_at",
+        params![from.0, from.1, to.0, to.1, now],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
         "INSERT INTO git_checkpoints(agent, generation, state, task_ref, task_command, updated_at)
          SELECT ?3, ?4, 'none', task_ref, task_command, ?5
          FROM git_checkpoints WHERE agent = ?1 AND generation = ?2 AND task_ref IS NOT NULL
@@ -550,6 +568,74 @@ impl Store {
         Ok(value.flatten())
     }
 
+    pub(super) fn work_task_binding(
+        connection: &Connection,
+        agent: &str,
+        generation: i64,
+        command: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        connection
+            .query_row(
+                "SELECT task_ref, principal FROM git_work_tasks
+                 WHERE agent = ?1 AND generation = ?2 AND task_command = ?3",
+                params![parse_agent_id(agent)?, generation, command],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
+    pub(super) fn selected_work_task_command(
+        connection: &Connection,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        connection
+            .query_row(
+                "SELECT task_command FROM git_checkpoints
+                 WHERE agent = ?1 AND generation = ?2",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value: Option<Option<String>>| value.flatten())
+            .map_err(sql_error)
+    }
+
+    /// Select an already-recorded original SEND, even after command retention.
+    pub fn select_work_task(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        command: &str,
+        now: i64,
+    ) -> Result<Option<String>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let Some((task_ref, _)) = Self::work_task_binding(&tx, agent, generation, command)?
+            else {
+                return Ok(None);
+            };
+            tx.execute(
+                "INSERT INTO git_checkpoints(agent, generation, state, task_ref,
+                         task_command, updated_at)
+                 VALUES (?1, ?2, 'none', ?3, ?4, ?5)
+                 ON CONFLICT(agent, generation) DO UPDATE SET
+                     task_ref = excluded.task_ref, task_command = excluded.task_command",
+                params![parse_agent_id(agent)?, generation, task_ref, command, now],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Some(task_ref))
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Find an original SEND for an Agent launched without a prompt. A
     /// queued input is eligible for transfer as its own command.
     pub fn first_work_task_send(&self, agent: &str) -> Result<Option<Command>> {
@@ -582,6 +668,7 @@ impl Store {
         };
         if command.verb != "send"
             || command.target.as_deref() != Some(agent)
+            || command.principal.starts_with("swarm_note:")
             || handoff::is_brief_tx(&self.connection, id)?
             || !matches!(
                 command.state,
@@ -599,20 +686,37 @@ impl Store {
         generation: i64,
         task_ref: &str,
         command: &str,
+        principal: &str,
         now: i64,
     ) -> Result<()> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            self.connection
-                .execute(
-                    "INSERT INTO git_checkpoints(agent, generation, state, task_ref,
-                             task_command, updated_at)
-                     VALUES (?1, ?2, 'none', ?3, ?4, ?5)
-                     ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref,
-                         task_command = excluded.task_command",
-                    params![parse_agent_id(agent)?, generation, task_ref, command, now],
-                )
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            let agent = parse_agent_id(agent)?;
+            tx.execute(
+                "INSERT INTO git_work_tasks(agent, generation, task_command, task_ref,
+                         principal, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(agent, generation, task_command) DO UPDATE SET
+                     task_ref = excluded.task_ref,
+                     principal = COALESCE(excluded.principal, git_work_tasks.principal),
+                     updated_at = excluded.updated_at",
+                params![agent, generation, command, task_ref, principal, now],
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO git_checkpoints(agent, generation, state, task_ref,
+                         task_command, updated_at)
+                 VALUES (?1, ?2, 'none', ?3, ?4, ?5)
+                 ON CONFLICT(agent, generation) DO UPDATE SET
+                     task_ref = excluded.task_ref, task_command = excluded.task_command",
+                params![agent, generation, task_ref, command, now],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
             Ok(())
         })();
         self.fault_on_persistence_error(&result);

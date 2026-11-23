@@ -805,10 +805,12 @@ names it next to the original task. A file holding a known secret is neither has
 saved. Other files stay out of this repository. To keep such a file with the task,
 deliver it with `--source`. The journal gains each finished turn's report when work
 changes or the session ends, and keeps its newest 128 KiB. The digest identifies the
-exact original SEND. Switch and Resume carry its binding through their Store
-transactions so a successor can find the record after command retention. Agents
-sharing a branch can hold different task records. The daemon keeps these refs outside
-the project repository, including for mirror pushes.
+exact original SEND. Store keeps each SEND-to-ref binding per generation alongside
+the currently selected task, so selecting another task does not erase an earlier
+record. Switch and Resume inherit the selected SEND identity and its Git ref in their
+Store transactions; the task and its task card remain available after command
+retention. Agents sharing a branch can hold different task records. The daemon keeps
+these refs outside the project repository, including for mirror pushes.
 
 **Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
 Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.

@@ -100,13 +100,17 @@ impl Router {
         ) && event.source == "stream"
             && let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation)
         {
-            let mut store = self.inner.store.lock().await;
-            if event.kind == "session.context.compacted"
-                || store
-                    .generation_start_command(agent, generation)?
-                    .is_some_and(|command| command.verb == "resume")
-            {
-                self.queue_task_card_locked(&mut store, event, None)?;
+            let queue_task_card = {
+                let store = self.inner.store.lock().await;
+                event.kind == "session.context.compacted"
+                    || store
+                        .generation_start_command(agent, generation)?
+                        .is_some_and(|command| command.verb == "resume")
+            };
+            if queue_task_card {
+                let selected_task = self.selected_task_text_for_card(agent, generation).await?;
+                let mut store = self.inner.store.lock().await;
+                self.queue_task_card_locked(&mut store, event, None, selected_task.as_deref())?;
             }
         }
         let facts = self.insertion_facts(event).await?;
@@ -202,6 +206,7 @@ impl Router {
         store: &mut Store,
         event: &Event,
         brief: Option<&str>,
+        selected_task: Option<&str>,
     ) -> Result<()> {
         if let (Some(agent), Some(generation)) = (event.agent.as_deref(), event.generation)
             && let Some(text) = super::task_card::read_task_card(
@@ -209,12 +214,37 @@ impl Router {
                 agent,
                 generation,
                 brief,
+                selected_task,
                 &self.secret_policy_snapshot(),
             )?
         {
             self.queue_fact_note_locked(store, event, "task_card", &text, None)?;
         }
         Ok(())
+    }
+
+    async fn selected_task_text_for_card(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Result<Option<String>> {
+        let (workspace, task_ref) = {
+            let store = self.inner.store.lock().await;
+            let Some(row) = store
+                .get_agent(agent)?
+                .filter(|row| row.generation == generation && !row.is_terminal())
+            else {
+                return Ok(None);
+            };
+            let Some(workspace) = row.workspace else {
+                return Ok(None);
+            };
+            let Some(task_ref) = store.work_task_ref(agent, generation)? else {
+                return Ok(None);
+            };
+            (workspace, task_ref)
+        };
+        Ok(crate::work_truth::task_record_text(&self.inner.data_root, &workspace, &task_ref).await)
     }
 
     pub(super) fn queue_handoff_task_card(
@@ -234,17 +264,25 @@ impl Router {
                 store,
                 &event,
                 Some(&handoff.brief_command),
+                None,
             ));
         }
     }
 
     pub(super) async fn queue_resume_task_card(&self, agent: &str, generation: i64) {
+        let selected_task = match self.selected_task_text_for_card(agent, generation).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.log_task_card_error(Err(error));
+                return;
+            }
+        };
         let mut store = self.inner.store.lock().await;
         let result = store
             .session_ready_event(agent, generation)
             .and_then(|ready| {
                 ready.map_or(Ok(()), |event| {
-                    self.queue_task_card_locked(&mut store, &event, None)
+                    self.queue_task_card_locked(&mut store, &event, None, selected_task.as_deref())
                 })
             });
         self.log_task_card_error(result);

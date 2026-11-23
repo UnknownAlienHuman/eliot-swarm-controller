@@ -1237,9 +1237,12 @@ A may be idle, or lost, failed or stopped with its process tree proven gone, in 
 generation. The switch first admits and executes an exact-generation source stop. Git
 facts and checkpointing wait until Store proves both the complete owned process-family
 exit and native source drain, including for a Lost source. No successor launch is
-admitted without that proof. The task comes from the named command of any of A's generations, else A's
-first retained instruction, else the [Git task record](monitoring.md). None of them being
-retained does not refuse the switch: the brief says so and points at Git. An uncertain
+admitted without that proof. The task comes from the named command of any of A's
+generations, else its currently selected durable SEND binding, else A's first retained
+instruction, else the [Git task record](monitoring.md). A pruned named SEND with a Git
+binding uses that exact record; without one, the first retained instruction remains
+the fallback. None of them being retained does not refuse the switch: the brief says so
+and points at Git. An uncertain
 command or turn of an ended generation cannot still land, so it is named in the brief
 and never replayed. On a live idle A, the switch itself applies the source stop before
 reading Git facts.

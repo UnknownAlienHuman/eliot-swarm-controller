@@ -366,16 +366,27 @@ fn source_task(
     from: &Agent,
     task_command: &str,
     principal: Option<&str>,
-) -> Result<Command> {
-    let task = load_command(connection, task_command)?.ok_or_else(|| {
-        Error::new(
+) -> Result<Option<Command>> {
+    let binding =
+        crate::Store::work_task_binding(connection, &from.id, from.generation, task_command)?;
+    let Some(task) = load_command(connection, task_command)? else {
+        if let Some((_, issuer)) = binding {
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
+        }
+        return Err(Error::new(
             "not_found",
             format!("original task SEND {task_command} is not retained"),
-        )
-    })?;
+        ));
+    };
     if task.verb != "send"
         || task.target.as_deref() != Some(&from.id)
-        || task.generation != Some(from.generation)
+        || (task.generation != Some(from.generation) && binding.is_none())
     {
         return Err(Error::new(
             "invalid",
@@ -391,37 +402,51 @@ fn source_task(
             "handoff transfers only SENDs issued by the caller",
         ));
     }
-    Ok(task)
+    Ok(Some(task))
 }
 
-/// The command stating this Agent's task, from any of its generations. A
-/// named command that retention removed is not an error: the first retained
-/// instruction serves instead, and the Git task record when there is none.
+/// Resolve the selected original SEND, including a pruned command with a Git record.
 fn continuation_task(
     connection: &Connection,
     from: &Agent,
     task_command: &str,
     principal: Option<&str>,
 ) -> Result<Option<Command>> {
-    if !task_command.is_empty()
-        && let Some(task) = load_command(connection, task_command)?
-    {
-        if task.target.as_deref() != Some(&from.id)
-            || !matches!(task.verb.as_str(), "send" | "launch")
-            || task.args.get("text").and_then(Value::as_str).is_none()
+    let selected = if task_command.is_empty() {
+        crate::Store::selected_work_task_command(connection, &from.id, from.generation)?
+    } else {
+        Some(task_command.to_owned())
+    };
+    if let Some(id) = selected.filter(|id| !id.is_empty()) {
+        if let Some(task) = load_command(connection, &id)? {
+            if task.target.as_deref() != Some(&from.id)
+                || !matches!(task.verb.as_str(), "send" | "launch")
+                || task.args.get("text").and_then(Value::as_str).is_none()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    format!("task {id} is not an instruction to {}", from.id),
+                ));
+            }
+            if principal.is_some_and(|principal| task.principal != principal) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(Some(task));
+        }
+        if let Some((_, issuer)) =
+            crate::Store::work_task_binding(connection, &from.id, from.generation, &id)?
         {
-            return Err(Error::new(
-                "invalid",
-                format!("task {task_command} is not an instruction to {}", from.id),
-            ));
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
         }
-        if principal.is_some_and(|principal| task.principal != principal) {
-            return Err(Error::new(
-                "not_allowed",
-                "handoff transfers only SENDs issued by the caller",
-            ));
-        }
-        return Ok(Some(task));
     }
     let id: Option<String> = connection
         .query_row(
@@ -672,12 +697,7 @@ pub(super) fn handoff_tx(
     } else if project_transfer && request.task_command.is_empty() {
         None
     } else {
-        Some(source_task(
-            tx,
-            &from,
-            &request.task_command,
-            input_principal,
-        )?)
+        source_task(tx, &from, &request.task_command, input_principal)?
     };
     let originals = source_sends(
         tx,

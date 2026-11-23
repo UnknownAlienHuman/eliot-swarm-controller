@@ -207,8 +207,19 @@ impl Router {
             return Ok(());
         };
         match (event.kind.as_str(), event.source.as_str()) {
-            ("session.ready" | "turn.started", "stream") => {
-                self.ensure_work_task(agent, generation, None).await
+            ("session.ready", "stream") => self.ensure_work_task(agent, generation, None).await,
+            ("turn.started", "stream") => {
+                let task_command = match event.data["turn_id"].as_str() {
+                    Some(turn) => self
+                        .inner
+                        .store
+                        .lock()
+                        .await
+                        .turn_command_id(agent, generation, turn)?,
+                    None => None,
+                };
+                self.ensure_work_task(agent, generation, task_command.as_deref())
+                    .await
             }
             ("turn.completed", "stream") => {
                 let turn = event.data["turn_id"].as_str().map(str::to_owned);
@@ -554,11 +565,21 @@ impl Router {
         generation: i64,
         task_command: Option<&str>,
     ) -> Result<()> {
-        let (row, known, command, goal) = {
-            let store = self.inner.store.lock().await;
-            let row = store.get_agent(agent)?;
+        let (row, known, selected, command, goal) = {
+            let mut store = self.inner.store.lock().await;
+            let Some(row) = store
+                .get_agent(agent)?
+                .filter(|row| row.generation == generation && records_work(row))
+            else {
+                return Ok(());
+            };
             let known = store.work_task_ref(agent, generation)?;
+            let selected = match task_command.filter(|id| !id.is_empty()) {
+                Some(id) => store.select_work_task(agent, generation, id, now_ms())?,
+                None => None,
+            };
             let command = match task_command.filter(|id| !id.is_empty()) {
+                Some(_) if selected.is_some() => None,
                 Some(id) => store.work_task_send(agent, id)?,
                 None if known.is_none() => store.first_work_task_send(agent)?,
                 None => None,
@@ -570,11 +591,11 @@ impl Router {
                 Some(goal) => Some(goal.definition),
                 None => store.launch_goal_definition(agent, generation)?,
             };
-            (row, known, command, goal)
+            (row, known, selected, command, goal)
         };
-        let Some(row) = row.filter(|row| row.generation == generation && records_work(row)) else {
+        if selected.is_some() {
             return Ok(());
-        };
+        }
         let Some(command) = command else {
             return Ok(());
         };
@@ -650,6 +671,7 @@ impl Router {
             generation,
             &task_ref,
             &command.id,
+            &command.principal,
             now_ms(),
         )
     }

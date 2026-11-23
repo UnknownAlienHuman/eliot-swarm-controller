@@ -18,6 +18,7 @@ pub(super) fn read_task_card(
     agent: &str,
     generation: i64,
     handoff: Option<&str>,
+    selected_task: Option<&str>,
     policy: &SecretPolicy,
 ) -> Result<Option<String>> {
     let Some(current) = store.get_agent(agent)? else {
@@ -28,13 +29,19 @@ pub(super) fn read_task_card(
     }
     let brief = match handoff {
         Some(id) => store.get_command(id)?,
-        None => store.task_card_handoff_brief(agent, generation)?,
+        None if selected_task.is_none() => store.task_card_handoff_brief(agent, generation)?,
+        None => None,
     }
     .filter(|brief| brief.target.as_deref() == Some(agent) && brief.verb == "send");
-    if brief.is_none() && (handoff.is_some() || store.task_card_has_handoff(agent, generation)?) {
+    if brief.is_none()
+        && selected_task.is_none()
+        && (handoff.is_some() || store.task_card_has_handoff(agent, generation)?)
+    {
         return Ok(None);
     }
-    let text = if let Some(brief) = brief {
+    let text = if let Some(task) = selected_task {
+        Some(task.to_owned())
+    } else if let Some(brief) = brief {
         let Some(text) = brief.args["text"]
             .as_str()
             .filter(|text| !text.trim().is_empty())

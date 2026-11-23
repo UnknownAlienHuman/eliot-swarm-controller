@@ -397,7 +397,7 @@ fn owed_work(
         )
         .map_err(sql_error)?;
     let unfinished = handoff::last_unfinished_turn(connection, num, agent.generation)?;
-    let turn_owed = match (reason, unfinished) {
+    let turn_owed = match (reason, unfinished.as_deref()) {
         (HandoffReason::ProviderHold, Some(turn)) => connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_kind
@@ -413,19 +413,58 @@ fn owed_work(
     if commands.is_empty() && !goal_active && !turn_owed {
         return Ok(None);
     }
-    // The first real instruction is the task. A successor that never received
-    // one carries its predecessor's brief, which quotes the original task.
-    let task: Option<String> = connection
-        .query_row(
-            "SELECT id FROM commands INDEXED BY commands_target
-             WHERE target = ?1 AND generation = ?2 AND verb = 'send' AND state <> 'rejected'
-             ORDER BY (link_kind IS 'handoff' AND ordinal = 0), created_at, rowid LIMIT 1",
-            params![num, agent.generation],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    // An empty task lets the switch find it in earlier generations or Git.
+    let unfinished_task = unfinished
+        .as_deref()
+        .map(|turn| {
+            connection
+                .query_row(
+                    "SELECT start_command_id FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+                   AND start_command_id IS NOT NULL",
+                    params![num, agent.generation, turn],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(sql_error)
+        })
+        .transpose()?
+        .flatten();
+    let task = if let Some(id) = unfinished_task {
+        let retained = load_command(connection, &id)?;
+        let binding =
+            crate::Store::work_task_binding(connection, &agent.id, agent.generation, &id)?;
+        let is_task = match retained {
+            Some(command) => {
+                command.verb == "send"
+                    && command.target.as_deref() == Some(agent.id.as_str())
+                    && command.generation == Some(agent.generation)
+                    && !command.principal.starts_with("swarm_note:")
+                    && !handoff::is_brief_tx(connection, &id)?
+            }
+            None => binding.is_some(),
+        };
+        is_task.then_some(id)
+    } else {
+        None
+    };
+    let task = match task {
+        Some(task) => Some(task),
+        None => crate::Store::selected_work_task_command(connection, &agent.id, agent.generation)?,
+    };
+    // A successor with no selected binding carries its predecessor's brief.
+    let task = match task {
+        Some(task) => Some(task),
+        None => connection
+            .query_row(
+                "SELECT id FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND generation = ?2 AND verb = 'send' AND state <> 'rejected'
+                 ORDER BY (link_kind IS 'handoff' AND ordinal = 0), created_at, rowid LIMIT 1",
+                params![num, agent.generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?,
+    };
     Ok(Some(OwedWork {
         task: task.unwrap_or_default(),
         commands,
