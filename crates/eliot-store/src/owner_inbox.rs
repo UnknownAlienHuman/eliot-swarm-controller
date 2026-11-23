@@ -9,6 +9,8 @@ use eliot_core::liveness::{self, AgentWaitEvidence, LivenessObject, Mover};
 use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
 
+pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
+
 pub(crate) fn project(
     connection: &Connection,
     now: i64,
@@ -534,7 +536,7 @@ fn project_switch_fences(
     db: &Connection,
     now: i64,
     items: &mut Vec<OwnerInboxItem>,
-    _stats: &mut SwarmLiveness,
+    stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
@@ -553,6 +555,11 @@ fn project_switch_fences(
         .map_err(sql_error)?;
     for row in rows {
         let (id, updated) = row.map_err(sql_error)?;
+        stats.stuck += 1;
+        *stats
+            .reasons
+            .entry(SWITCH_FENCE_NEEDS_OWNER.to_owned())
+            .or_insert(0) += 1;
         let choices = vec![
             action("inspect", "command.get", json!({"id":id})),
             action(
@@ -567,7 +574,7 @@ fn project_switch_fences(
             format!("fence:{updated}"),
             now,
             updated,
-            "switch_checkout_release_needs_owner",
+            SWITCH_FENCE_NEEDS_OWNER,
             None,
             choices,
         ));

@@ -49,6 +49,8 @@ pub struct OwnerInboxSweep {
 
 pub(crate) fn is_reportable(item: &OwnerInboxItem, now: i64, confirmed: &StuckStates) -> bool {
     item.kind != OwnerInboxKind::Stuck
+        // A persisted interrupted fence already establishes the wait.
+        || item.reason == super::owner_inbox::SWITCH_FENCE_NEEDS_OWNER
         || confirmed.get(&item.subject).is_some_and(|state| {
             state.reason == item.reason && state.due_at == StuckState::due_at(item, now)
         })
