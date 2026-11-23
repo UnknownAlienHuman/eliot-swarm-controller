@@ -26,7 +26,7 @@ const RESTART_RESUME_ELIGIBILITY: &str = r#"
     AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
     AND a.state IN ('lost', 'stopped')
     AND a.capacity_generation IS NULL
-    AND a.harness IN ('codex', 'muse', 'claude', 'opencode', 'antigravity')
+    AND a.harness IN (SELECT value FROM json_each(?3))
     AND TRIM(COALESCE(a.native_scope, '')) <> ''
     AND TRIM(COALESCE(a.native_ref, '')) <> ''
     AND EXISTS (
@@ -128,7 +128,15 @@ pub(super) fn restart_resume_candidate_tx(
          WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_RESUME_ELIGIBILITY})"
     );
     let candidate: bool = connection
-        .query_row(&query, params![agent_num, generation], |row| row.get(0))
+        .query_row(
+            &query,
+            params![
+                agent_num,
+                generation,
+                encode_json(&json!(core::api::SUPPORTED_HARNESSES))?
+            ],
+            |row| row.get(0),
+        )
         .map_err(sql_error)?;
     Ok(candidate
         && has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)?
@@ -466,19 +474,27 @@ impl Store {
                     json_extract(restart.data, '$.turn_id')
              FROM agents a {RESTART_RESUME_EVENT}
              WHERE (a.depth, a.id) > (?1, ?2) AND {RESTART_RESUME_ELIGIBILITY}
-             ORDER BY a.depth, a.id LIMIT ?3"
+             ORDER BY a.depth, a.id LIMIT ?4"
         );
         let mut statement = self.connection.prepare(&query).map_err(sql_error)?;
         let rows = statement
-            .query_map(params![depth, after_id, RETAINED_PAGE_SIZE], |row| {
-                Ok(RestartResumeCandidate {
-                    agent: format_agent_id(row.get(0)?),
-                    generation: row.get(1)?,
-                    depth: row.get(2)?,
-                    interrupted: row.get(3)?,
-                    turn_id: row.get(4)?,
-                })
-            })
+            .query_map(
+                params![
+                    depth,
+                    after_id,
+                    encode_json(&core::api::SUPPORTED_HARNESSES)?,
+                    RETAINED_PAGE_SIZE
+                ],
+                |row| {
+                    Ok(RestartResumeCandidate {
+                        agent: format_agent_id(row.get(0)?),
+                        generation: row.get(1)?,
+                        depth: row.get(2)?,
+                        interrupted: row.get(3)?,
+                        turn_id: row.get(4)?,
+                    })
+                },
+            )
             .map_err(sql_error)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)

@@ -1861,14 +1861,20 @@ impl Store {
     /// Exact gate for a planned restart. The router holds the writer while
     /// evaluating this gate and closing the last control admissions.
     pub fn has_restart_work(&self) -> Result<bool> {
-        // A bound native turn can be interrupted by retiring its owned runtime.
-        // Starts and unsettled commands must still reach their effect boundary.
+        let needs_idle = core::api::SUPPORTED_HARNESSES
+            .iter()
+            .filter(|harness| core::api::HarnessCapabilities::of(harness).restart_requires_idle)
+            .collect::<Vec<_>>();
+        // Some runtimes preserve a busy session across process exit. Their
+        // turns must reach a terminal before we seal the Store.
         let starting: bool = self
             .connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM agents WHERE observe_only = 0 AND
-                state IN ('created', 'starting'))",
-                [],
+                (state IN ('created', 'starting') OR
+                 ((active_turn IS NOT NULL OR state IN ('busy','waiting'))
+                   AND harness IN (SELECT value FROM json_each(?1)))))",
+                [encode_json(&needs_idle)?],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;

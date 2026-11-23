@@ -21,12 +21,6 @@ pub const BACKGROUND_SERVER_TOPIC: &str = "background.server";
 const SWARM_INFRA_SUBCOMMANDS: &[&str] = &["mcp", "hook", "plugin", "daemon"];
 
 const HARNESS_OWNED_STEMS: &[&str] = &[
-    "agy",
-    "antigravity",
-    "claude",
-    "codex",
-    "opencode",
-    "muse",
     "language_server",
     "language-server",
     "rust-analyzer",
@@ -229,6 +223,7 @@ pub fn is_harness_owned_process(
     if let Some(stem) = stem.as_deref() {
         if crate::CONSOLE_HOST_PROGRAMS.contains(&stem)
             || matches!(stem, "winpty-agent" | "conpty")
+            || crate::api::HarnessCapabilities::is_harness_executable_stem(stem)
             || HARNESS_OWNED_STEMS.contains(&stem)
             || stem.starts_with("language_server_")
             || stem.starts_with("language-server-")

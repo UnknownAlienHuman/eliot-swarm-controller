@@ -23,6 +23,7 @@ use eliot_plugin::{
     protocol::{
         AgentModelsParams, ModelListParams, ModelListPart, NativeArchiveParams, stream_sources,
     },
+    retry::{Retry, RetryOperation},
     session::{
         ModelSelection, ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop,
         decode, ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid,
@@ -31,6 +32,7 @@ use eliot_plugin::{
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
         with_claimed_context, with_context_points, with_model_catalogue_diagnostic,
     },
+    settle::settle_unproven_input,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1802,7 +1804,7 @@ impl OpenCodePlugin {
                 Err(error) => return Err(self.fail_resume(session, error, envelope).await),
             };
         session.session_id = Some(retained.id.clone());
-        // Read model metadata before the quiesce can interrupt a retained turn.
+        // Read model metadata before any retained-session configuration write.
         let model_catalogue =
             match Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await {
                 Ok(limits) => limits,
@@ -1817,13 +1819,8 @@ impl OpenCodePlugin {
                     ));
                 }
             };
-        // Effective MCP proof before the quiesce below can abort a running
-        // retained execution: the settled inventory is gated and the
-        // winning effective documents must carry no owner transport (plus
-        // the exact managed transport while the Agent-scoped entry serves),
-        // exactly like the create path. Nothing has been written yet, so a
-        // miss or an unreadable readback fails here with proven no effect
-        // instead of aborting that turn and then failing.
+        // Check settled MCP inventory and winning effective documents before
+        // any retained-session write, so a refusal here has proven no effect.
         let (mcp_servers, mcp_servers_verified) =
             match Self::resume_prove_mcp(&parsed, &session, deadline).await {
                 Ok(proof) => proof,
@@ -2061,9 +2058,8 @@ impl OpenCodePlugin {
                 .or(parsed.requested_effort.as_deref())
         };
         // The fragment membership rule matches the create path before any
-        // write: a model outside the fragment refuses here,
-        // before the quiesce interrupt aborts a running retained turn. No
-        // workspace file scan runs here either: the resumed serve regenerates
+        // write: a model outside the fragment refuses here. Without scanning
+        // workspace files, the resumed serve regenerates its configuration
         // under the same native project-config disable switch, so workspace
         // project layers stay unloaded for the session lifetime.
         if let (Some(provider), Some(target)) = (parsed.local_provider.as_ref(), target_model)
@@ -2121,10 +2117,8 @@ impl OpenCodePlugin {
     /// Resume MCP proof: gate the settled inventory and prove the winning
     /// effective documents carry no owner transport (plus the exact
     /// generated transport while the Agent-scoped entry serves), BEFORE
-    /// the retained session is touched. The quiesce interrupt below aborts
-    /// a running retained execution, so an unexpected or owner-identity
-    /// server must fail here with proven no effect instead of aborting
-    /// that turn and then failing. An unreadable inventory or effective
+    /// the retained session is touched. An unexpected or owner-identity
+    /// server must fail here with proven no effect. An unreadable inventory or effective
     /// config is a pre-write readback failure (`native_readback`), also
     /// with proven no effect; a proven owner hit, transport mismatch or
     /// unexpected serving server is a `profile_error`. Returns the
@@ -2179,7 +2173,7 @@ impl OpenCodePlugin {
     /// to the frozen profile, then prove the effective values with a fresh
     /// `session.get`. The location must be the workspace; the requested
     /// agent must be installed (the switch validates nothing itself).
-    /// Catalogue metadata and MCP proof come from the pre-quiesce reads.
+    /// Catalogue metadata and MCP proof come from the preflight reads.
     async fn resume_configure(
         parsed: &ParsedStart,
         session: &AgentSession,
@@ -2233,7 +2227,9 @@ impl OpenCodePlugin {
         // contradicted denial fails the resume: the session must not run
         // without it.
         let deny_native_subagents = parsed.native_subagents.as_deref() != Some("allow");
-        if deny_native_subagents && !OpenCodeHttp::session_subagent_deny_verified(&current) {
+        let repair_needed =
+            deny_native_subagents && !OpenCodeHttp::session_subagent_deny_verified(&current);
+        if repair_needed {
             let existing = current.permissions.clone().unwrap_or_default();
             Self::resume_repair_subagent_deny(&session.http, session_id, &existing, deadline)
                 .await?;
@@ -2307,9 +2303,12 @@ impl OpenCodePlugin {
                 )
             })?;
             if !installed.iter().any(|agent| agent == &wanted) {
-                return Err(Error::new(
-                    "profile_error",
-                    format!("OpenCode profile agent {wanted} is not installed"),
+                return Err(Self::resume_configure_error(
+                    Error::new(
+                        "profile_error",
+                        format!("OpenCode profile agent {wanted} is not installed"),
+                    ),
+                    repair_needed,
                 ));
             }
             Self::resume_switch(
@@ -2320,16 +2319,22 @@ impl OpenCodePlugin {
                 "agent",
             )?;
         }
-        if model_needed || variant_needed {
+        // Reaching this point proves each requested earlier setter returned success.
+        let earlier_write = repair_needed || agent_needed;
+        let switch_model = model_needed || variant_needed;
+        if switch_model {
             let mut model_ref = match target_ref.cloned() {
                 Some(model_ref) => model_ref,
                 // An effort-only overlay on a session the server started
                 // without reporting a model keeps the retained model and
                 // only selects the variant.
                 None => current.model.clone().ok_or_else(|| {
-                    Error::new(
-                        "source_integrity",
-                        "OpenCode resume needs a model ref for its retained target model",
+                    Self::resume_configure_error(
+                        Error::new(
+                            "source_integrity",
+                            "OpenCode resume needs a model ref for its retained target model",
+                        ),
+                        earlier_write,
                     )
                 })?,
             };
@@ -2340,7 +2345,8 @@ impl OpenCodePlugin {
                     .switch_model(session_id, &model_ref, deadline)
                     .await,
                 "model",
-            )?;
+            )
+            .map_err(|error| Self::resume_configure_error(error, earlier_write))?;
         }
         // The single shared echo verification proves the session runs
         // the realignment target (overlay or frozen), never a reverted
@@ -2436,18 +2442,30 @@ impl OpenCodePlugin {
             && let Some(model) = effective.model.as_ref()
             && !provider.contains_model(&model.provider_id, &model.id)
         {
-            return Err(Error::new(
-                "profile_error",
-                "OpenCode local provider does not declare the retained model",
+            return Err(Self::resume_configure_error(
+                Error::new(
+                    "profile_error",
+                    "OpenCode local provider does not declare the retained model",
+                ),
+                earlier_write || switch_model,
             ));
         }
-        // The effective MCP proof ran pre-quiesce (`resume_prove_mcp`): no
-        // inventory or effective-config read happens here after the
-        // interrupt or setters, only the proven pair joins the record.
+        // Keep the effective MCP proof read before the setters.
         effective_value["mcp_servers"] = mcp_servers;
         effective_value["mcp_servers_verified"] = json!(mcp_servers_verified);
         effective_value["mcp_policy"] = json!(parsed.requested_mcp_policy.as_str());
         Ok(effective_value)
+    }
+
+    fn resume_configure_error(error: Error, earlier_write: bool) -> Error {
+        if !earlier_write || error.code == "unknown" {
+            return error;
+        }
+        let message = format!(
+            "OpenCode resume stopped after an accepted retained-session write ({})",
+            error.message
+        );
+        error.with_code("unknown").with_message(message)
     }
 
     /// Re-read the session and prove it runs `target`: the single echo
@@ -2457,11 +2475,9 @@ impl OpenCodePlugin {
     /// contradicts the target is `unknown` (the switch may have applied
     /// without echoing). `context` names the caller (`resume configure`,
     /// `configure`). The switch dispatch itself stays per-caller: resume
-    /// maps every write failure to `unknown` (an earlier setter in the
-    /// same realign may have applied), while configure maps a proven
-    /// no-effect refusal to its `rejected` value. The target is the native
-    /// ref, never a joined string: re-splitting a `provider/model` display
-    /// form would change the target when the provider ID contains a slash.
+    /// preserves a definite model refusal unless an earlier setter applied;
+    /// configure maps a proven no-effect refusal to its `rejected` value.
+    /// The native ref preserves a provider ID that itself contains a slash.
     async fn readback_session_model(
         http: &OpenCodeHttp,
         session_id: &str,
@@ -3454,15 +3470,11 @@ impl OpenCodePlugin {
             .cancel_inbox(session_id, inbox_id, deadline)
             .await;
         let removed = Self::steer_input_removed(session, session_id, inbox_id).await;
-        if removed {
-            Error::new("unknown", message.to_owned())
-        } else {
+        let settlement = settle_unproven_input(removed, message);
+        if settlement.latch_unknown {
             session.phase = SessionPhase::Unknown;
-            Error::new(
-                "unknown",
-                format!("{message}; the session is latched unknown behind the unresolved input"),
-            )
         }
+        settlement.error
     }
 
     /// Removal proof for one steered inbox id: absent from the pending
@@ -3951,9 +3963,9 @@ fn policy_from_snapshot(profile: &serde_json::Map<String, Value>) -> Result<McpP
 /// installed 2.2.7 server); a single instant query almost always races
 /// them and reports an empty surface. Polling is bounded well under one
 /// RPC budget so neither the create nor the resume path can stall on it.
+/// The backoff is the shared readiness-settle policy (50 ms doubling to
+/// 1 s, clamped to this cap).
 const MCP_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const MCP_SETTLE_FIRST_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-const MCP_SETTLE_MAX_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Polled Agent-scoped MCP readback for the effective record:
 /// `GET /api/mcp` (`mcp.list`) after the session exists, re-polled until
@@ -3974,7 +3986,7 @@ async fn observe_mcp_servers(
     deadline: Instant,
 ) -> (Value, bool, Option<Vec<McpServerReadback>>) {
     let cap = (Instant::now() + MCP_SETTLE_TIMEOUT).min(deadline);
-    let mut poll = MCP_SETTLE_FIRST_POLL;
+    let mut retry = Retry::new(RetryOperation::ReadinessSettle);
     let mut last: Option<Vec<McpServerReadback>> = None;
     loop {
         let read_timing = crate::native::startup::Step::new("mcp_inventory_read");
@@ -3995,10 +4007,10 @@ async fn observe_mcp_servers(
             break;
         }
         // Hot MCP startup should not pay a whole second after the first
-        // pending observation. Back off for cold starts, clamping both
-        // the native reads and sleeps to the same settle/start deadline.
-        tokio::time::sleep_until((Instant::now() + poll).min(cap)).await;
-        poll = (poll * 2).min(MCP_SETTLE_MAX_POLL);
+        // pending observation. The shared readiness-settle backoff waits
+        // from 50 ms up to 1 s, clamping both the native reads and the
+        // sleeps to the same settle/start deadline.
+        retry.wait_settle(cap).await;
     }
     match last {
         Some(servers) => (mcp_names(&servers), false, Some(servers)),

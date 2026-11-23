@@ -45,7 +45,7 @@ fn refused_initial_model_workspace(
     turn_id: &str,
     allowed_stop: Option<&str>,
 ) -> Result<Option<WorkspacePreparation>> {
-    if agent.harness != "opencode"
+    if !core::api::HarnessCapabilities::of(&agent.harness).initial_model_refusal_cleanup
         || !matches!(agent.state, AgentState::Idle | AgentState::Stopped)
         || (allowed_stop.is_none() && agent.state != AgentState::Idle)
     {

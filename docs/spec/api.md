@@ -142,7 +142,9 @@ The sole profile `memory-text-v1` maps to fresh Claude Code 2.1.325 print mode w
 `claude-haiku-5-5`. Private `<data-root>/inference.json` contains only the absolute
 `claude_executable`; the owner provisions a private native OAuth login under
 `<data-root>/inference-native`. No API-key helper or vendor routing is inherited.
-The Claude plugin owns fixed argv/result decoding; the daemon owns process custody.
+The Swarm executable registers the Claude plugin's one-shot translator. It
+supplies the fixed arguments, native environment and result decoding. The
+daemon owns the private login boundary and process custody.
 Use safe mode, empty built-in tools, MCP tools denied, settings sources empty, one
 turn, permission prompts disabled and no session persistence. Prompt goes to stdin.
 Set `CLAUDE_CODE_MAX_RETRIES=0`, `CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES=0` and
@@ -2940,8 +2942,11 @@ fence before the CLI submits any Agent Stop commands. A new launch, including
 `child.run`, is refused during the fence with `daemon_update_in_progress`
 and an instruction to retry after the update. Previously queued launches stay
 queued. The writer accepts `restart` after Agent starts, unsettled commands
-and daemon-owned workers settle. Restart may interrupt in-flight native turns
-and cancels unclaimed deferred notes with their old generation.
+and daemon-owned workers settle. Claude requires a native terminal before
+replacement. The CLI stops an exact busy Claude generation under the fence
+and verifies its terminal, process exit, and reader drain while the Store is
+still writable. Other in-flight native turns can be interrupted during
+restart. Unclaimed deferred notes are cancelled with their old generation.
 The default deadline action is `cancel_restart`,
 which reopens the same daemon. With `--interrupt-on-deadline`, the CLI sends
 ordinary non-force Stop commands bound to the captured Agent generations and
@@ -2962,8 +2967,10 @@ Agent process groups on Linux, subject to the platform's custody limits.
 If a committed restart outlives its exit deadline on Windows, the operator
 verifies the previous daemon's process identity and retires it before opening
 the Store in a replacement. An unconfirmed exit reports restarting admission.
-Under `continue` the CLI submits promptless Resume commands
-for its confirmed Stops with proven custody exit and source drain, and waits
+Under `continue` the CLI resumes its confirmed Stops with proven custody
+exit and source drain. A stopped Claude Agent starts with a fresh framed
+Swarm note naming the old turn. Other deadline Stops resume without input.
+The CLI waits
 for each interrupted parent's resume before its children. Under `hold` it
 leaves them stopped. An unknown turn outcome remains unknown. The
 output identifies the previous and running release, the deadline policy and

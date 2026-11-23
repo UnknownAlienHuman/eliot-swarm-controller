@@ -1,5 +1,6 @@
 //! First-use configuration for a private Swarm installation.
 
+use crate::harness_capabilities::HarnessCapabilities;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -313,11 +314,15 @@ fn ensure_bootstrap_settings(
 
 /// The hot-start managers, in native subagent-denial preference order.
 fn bootstrap_managers(names: &[String]) -> Vec<String> {
-    let managers: Vec<String> = crate::config::NATIVE_SUBAGENT_DENY_HARNESSES
+    let mut ranked: Vec<(u8, String)> = names
         .iter()
-        .filter_map(|preferred| names.iter().find(|name| name.as_str() == *preferred))
-        .cloned()
+        .filter_map(|name| {
+            let rank = HarnessCapabilities::of(name).manager_preference?;
+            Some((rank, name.clone()))
+        })
         .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    let managers: Vec<String> = ranked.into_iter().map(|(_, name)| name).collect();
     if managers.is_empty() {
         names.first().cloned().into_iter().collect()
     } else {

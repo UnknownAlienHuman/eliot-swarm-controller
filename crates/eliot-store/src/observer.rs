@@ -5,13 +5,14 @@ use eliot_core::SecretPolicy;
 const SOURCE: &str = "observe";
 
 fn observed_families(harness: &str) -> Result<&'static [&'static str]> {
-    match harness {
-        "codex" => Ok(eliot_core::OBSERVED_ROLLOUT_FAMILIES),
-        _ => Err(Error::new(
+    let families = eliot_core::api::HarnessCapabilities::of(harness).observed_families;
+    if families.is_empty() {
+        return Err(Error::new(
             "unsupported",
             "harness has no implemented observer reader",
-        )),
+        ));
     }
+    Ok(families)
 }
 
 pub(super) fn require_controlled(agent: &Agent) -> Result<()> {
@@ -137,13 +138,14 @@ pub(super) fn require_reader_source(
 }
 
 pub(super) fn live_families(harness: &str) -> Result<&'static [&'static str]> {
-    match harness {
-        "codex" => Ok(eliot_core::OBSERVED_ROLLOUT_FAMILIES),
-        _ => Err(Error::new(
+    let families = eliot_core::api::HarnessCapabilities::of(harness).observed_live_families;
+    if families.is_empty() {
+        return Err(Error::new(
             "unsupported",
             "harness has no observed live-fact grant",
-        )),
+        ));
     }
+    Ok(families)
 }
 
 /// This is committed attach readiness, never native activity or completion.

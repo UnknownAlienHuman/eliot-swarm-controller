@@ -13,7 +13,7 @@ use eliot_core::{
     Error, Result,
     api::{discovery::decode_params, inference::*},
 };
-use eliot_plugin::sync::LockExt;
+use eliot_plugin::{sync::LockExt, text_inference};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -344,6 +344,7 @@ impl Router {
                 "M1 inference is qualified only on Windows",
             ));
         }
+        let adapter = text_inference::configured()?;
         let route: Route = serde_json::from_slice(&read_private_bytes(
             &self.inner.data_root.join("inference.json"),
             4096,
@@ -415,7 +416,9 @@ impl Router {
                 workers.insert(
                     id,
                     tokio::spawn(async move {
-                        router.run_inference(client, request, route, deadline).await;
+                        router
+                            .run_inference(client, request, route, adapter, deadline)
+                            .await;
                     }),
                 );
             }
@@ -428,6 +431,7 @@ impl Router {
         client: String,
         request: InferenceTextRequest,
         route: Route,
+        adapter: text_inference::TextInferenceAdapter,
         deadline: tokio::time::Instant,
     ) {
         let single = tokio::time::timeout_at(deadline, self.inner.inference_runner.lock()).await;
@@ -436,7 +440,7 @@ impl Router {
         // fence below.
         let quiescent = if let Ok(_single) = single {
             match self
-                .run_inference_inner(&client, &request, route, deadline)
+                .run_inference_inner(&client, &request, route, adapter, deadline)
                 .await
             {
                 Ok(quiescent) => quiescent,
@@ -489,6 +493,7 @@ impl Router {
         client: &str,
         request: &InferenceTextRequest,
         route: Route,
+        adapter: text_inference::TextInferenceAdapter,
         deadline: tokio::time::Instant,
     ) -> Result<bool> {
         let cancellation = self.inner.run_cancellation.subscribe();
@@ -527,19 +532,12 @@ impl Router {
         )]
         let mut command = Command::new(route.claude_executable);
         command
-            .args(eliot_plugin_claude::inference::arguments())
+            .args((adapter.arguments)())
             .current_dir(&cwd)
-            .env_clear();
-        command.env("CLAUDE_CODE_MAX_RETRIES", "0");
-        command.env("CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES", "0");
-        // Installed 2.1.325's refusal-retry predicate separately checks this
-        // switch; the general HTTP retry count does not cover that path.
-        command.env("CLAUDE_CODE_DISABLE_REFUSAL_RETRY", "1");
-        command.env("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1");
-        command.env(
-            "CLAUDE_CONFIG_DIR",
-            self.inner.data_root.join("inference-native"),
-        );
+            .env_clear()
+            .envs((adapter.environment)(
+                &self.inner.data_root.join("inference-native"),
+            ));
         for key in [
             "SYSTEMROOT",
             "WINDIR",
@@ -574,8 +572,7 @@ impl Router {
             ProcessOutcome::Completed(capture)
                 if capture.status.success() && capture.stdout_complete =>
             {
-                eliot_plugin_claude::inference::result(&capture.stdout, request.max_result_bytes)
-                    .ok()
+                (adapter.result)(&capture.stdout, request.max_result_bytes).ok()
             }
             _ => None,
         };

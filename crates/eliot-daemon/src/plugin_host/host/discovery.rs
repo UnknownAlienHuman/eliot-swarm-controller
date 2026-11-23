@@ -6,7 +6,7 @@ use super::{
 };
 use eliot_core::{
     Error, Result, SecretPolicy, StderrSource,
-    api::{DiscoverPage, is_supported_harness},
+    api::{DiscoverPage, HarnessCapabilities, harness::NativeArchiveBinding, is_supported_harness},
 };
 use eliot_plugin::protocol::{
     ModelListParams, ModelListPart, NativeArchiveParams, ProfileStoreParams, ProfileStoreResult,
@@ -113,10 +113,9 @@ impl PluginHost {
                 return Err(Error::new("invalid", format!("invalid discovery {name}")));
             }
         }
-        if !matches!(
-            profile.get("harness").and_then(Value::as_str),
-            Some("codex")
-        ) {
+        if !HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .native_discovery
+        {
             return Err(Error::new(
                 "unsupported",
                 "profile does not support discovery",
@@ -163,10 +162,10 @@ impl PluginHost {
         native_ref: &str,
         agent: &eliot_core::Agent,
     ) -> Result<()> {
-        if !matches!(
-            profile.get("harness").and_then(Value::as_str),
-            Some("codex") | Some("opencode")
-        ) {
+        if HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .native_archive
+            .is_none()
+        {
             return Err(Error::new(
                 "unsupported",
                 "native archive needs a codex or opencode profile",
@@ -201,7 +200,9 @@ impl PluginHost {
         profile: Value,
         workspace: &str,
     ) -> Result<ProfileStoreResult> {
-        if profile.get("harness").and_then(Value::as_str) != Some("codex") {
+        if !HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .requires_frozen_store_inputs
+        {
             return Err(Error::new(
                 "unsupported",
                 "profile.store requires a Codex profile",
@@ -531,6 +532,8 @@ impl PluginHost {
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets = metadata_secret_snapshot(&profile, &environment, known);
         let until = Instant::now() + READER_DEADLINE;
+        let workspace_bound = HarnessCapabilities::of(&harness).native_archive
+            == Some(NativeArchiveBinding::Workspace);
         let mut archive_dispatched = false;
         let read = async {
             let manifest = reader.initialize(&harness, until).await?;
@@ -539,13 +542,14 @@ impl PluginHost {
             // retained scope before the delete; the workspace binds the
             // server's directory context. Codex pins its store through the
             // frozen binding inside the profile.
-            let opencode = harness == "opencode";
             let request = NativeArchiveParams {
                 profile,
                 native_ref,
-                agent_id: opencode.then(|| agent.id.clone()),
-                native_scope: opencode.then(|| agent.native_scope.clone()).flatten(),
-                workspace: opencode.then(|| agent.workspace.clone()).flatten(),
+                agent_id: workspace_bound.then(|| agent.id.clone()),
+                native_scope: workspace_bound
+                    .then(|| agent.native_scope.clone())
+                    .flatten(),
+                workspace: workspace_bound.then(|| agent.workspace.clone()).flatten(),
             };
             let request = serde_json::to_value(&request)
                 .map_err(|_| Error::new("invalid", "native.archive params cannot encode"))?;
@@ -572,7 +576,7 @@ impl PluginHost {
             _ = stop.changed() => Err(Error::new("cancelled", "native.archive was cancelled")),
         };
         let result = result.map_err(|error| {
-            let refused = harness == "opencode" && error.code == "native_archive_refused";
+            let refused = workspace_bound && error.code == "native_archive_refused";
             let error = if archive_dispatched && !refused {
                 Error::new("unknown", "native.archive may have taken effect; no replay")
             } else {

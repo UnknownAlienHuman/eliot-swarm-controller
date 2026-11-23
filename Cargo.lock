@@ -554,7 +554,6 @@ dependencies = [
  "croner",
  "eliot-core",
  "eliot-plugin",
- "eliot-plugin-claude",
  "eliot-store",
  "futures-util",
  "globset",

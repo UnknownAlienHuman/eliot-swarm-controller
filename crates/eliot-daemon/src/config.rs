@@ -8,6 +8,7 @@
 //!
 //! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
 //! route selectors are bound by digest and resolved only in the process environment.
+use crate::harness_capabilities::ProfileCapabilities;
 use core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
     CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
@@ -127,7 +128,7 @@ pub(crate) fn private_route_selector(name: &str) -> bool {
 /// Claude can echo a model pin as native metadata. An explicitly bound API
 /// key still contributes a credential, even when it uses a model pin's name.
 pub(crate) fn claude_model_selector(profile: &Value, name: &str) -> bool {
-    profile["harness"] == "claude"
+    profile_capabilities(profile).model_pin_selectors
         && CLAUDE_MODEL_SELECTORS
             .iter()
             .any(|selector| env_name_matches(name, selector))
@@ -135,7 +136,7 @@ pub(crate) fn claude_model_selector(profile: &Value, name: &str) -> bool {
 }
 
 pub(crate) fn claude_provider_mode_flag(profile: &Value, name: &str, value: &Value) -> bool {
-    profile["harness"] == "claude"
+    profile_capabilities(profile).model_pin_selectors
         && matches!(value.as_str(), Some("0" | "1" | "false" | "true"))
         && CLAUDE_PROVIDER_MODES
             .iter()
@@ -198,8 +199,10 @@ pub(crate) fn metadata_route_scope_known(
     profile: &Value,
     environment: &serde_json::Map<String, Value>,
 ) -> bool {
-    let harness = profile["harness"].as_str().unwrap_or_default();
-    if harness == "claude" && !claude_route_selectors_resolved(profile, environment) {
+    let capabilities = profile_capabilities(profile);
+    if capabilities.route_selectors_resolved
+        && !claude_route_selectors_resolved(profile, environment)
+    {
         return false;
     }
     environment
@@ -207,8 +210,10 @@ pub(crate) fn metadata_route_scope_known(
         .filter_map(|(name, value)| value.as_str().map(|value| (name, value)))
         .filter(|(_, value)| !value.is_empty())
         .all(|(name, value)| {
-            if (harness == "claude" && env_name_matches(name, "CLAUDE_CODE_OAUTH_TOKEN"))
-                || (harness == "opencode" && env_name_matches(name, "OPENCODE_CONFIG_CONTENT"))
+            if capabilities
+                .route_scope_secret_names
+                .iter()
+                .any(|secret| env_name_matches(name, secret))
             {
                 return false;
             }
@@ -271,7 +276,8 @@ fn capture_native_store_inputs_inner(
         .filter_map(Value::as_str)
         .filter(|name| {
             (!private_route_selector(name)
-                || (profile["harness"] == "claude" && env_name_matches(name, "CLAUDE_CONFIG_DIR")))
+                || (profile_capabilities(profile).config_dir_credential
+                    && env_name_matches(name, "CLAUDE_CONFIG_DIR")))
                 && !claude_model_selector(profile, name)
         })
         .chain(profile["api_key_env"].as_str())
@@ -1710,18 +1716,14 @@ fn freeze_child_profiles(
     snapshot["child_profiles"] = Value::Array(frozen);
     Ok(snapshot)
 }
-/// Harnesses that can enforce native subagent denial per session.
-pub(crate) const NATIVE_SUBAGENT_DENY_HARNESSES: [&str; 3] = ["codex", "claude", "opencode"];
-
 /// Default native subagent policy for each supported harness.
 pub(crate) fn native_subagents_default(harness: &str) -> Option<&'static str> {
-    if NATIVE_SUBAGENT_DENY_HARNESSES.contains(&harness)
-        || matches!(harness, "muse" | "antigravity")
-    {
-        Some("deny")
-    } else {
-        None
-    }
+    ProfileCapabilities::for_harness(harness)?.native_subagents_default
+}
+
+/// Capabilities of a profile's `harness` field; a missing or unknown harness has none.
+fn profile_capabilities(profile: &Value) -> ProfileCapabilities {
+    ProfileCapabilities::of(profile["harness"].as_str().unwrap_or_default())
 }
 
 /// Freeze the harness-native subagent switch for this profile: `allow` is an
@@ -1997,7 +1999,8 @@ pub(crate) fn missing_profile_commands(data_root: &Path) -> Vec<(String, String,
             if cmd.is_empty()
                 || cmd.len() > 4096
                 || cmd.chars().any(char::is_control)
-                || (harness == "claude" && cmd.eq_ignore_ascii_case("latest"))
+                || (ProfileCapabilities::of(harness).latest_cmd
+                    && cmd.eq_ignore_ascii_case("latest"))
                 || crate::adhoc::profile_command_exists(cmd)
             {
                 return None;
@@ -2122,12 +2125,13 @@ fn snapshot_from_entry(
         &[
             (
                 "local_provider",
-                harness != "opencode" && entry.local_provider.is_some(),
+                !ProfileCapabilities::of(harness).local_provider && entry.local_provider.is_some(),
                 "local providers have no mapping on this harness",
             ),
             (
                 "project_doc_max_bytes",
-                harness != "codex" && entry.project_doc_max_bytes.is_some(),
+                !ProfileCapabilities::of(harness).project_doc_max_bytes
+                    && entry.project_doc_max_bytes.is_some(),
                 "project_doc_max_bytes has no mapping on this harness",
             ),
         ],
@@ -2264,7 +2268,10 @@ fn validate_profile_tail(
     };
     let harness = entry.harness.trim();
     let cmd = match entry.cmd.as_deref() {
-        Some(cmd) if harness == "claude" && cmd.trim().eq_ignore_ascii_case("latest") => {
+        Some(cmd)
+            if ProfileCapabilities::of(harness).latest_cmd
+                && cmd.trim().eq_ignore_ascii_case("latest") =>
+        {
             Some("latest".to_owned())
         }
         Some(cmd) => {
@@ -2273,7 +2280,7 @@ fn validate_profile_tail(
                     profile_field_error(source, table_offset, name, "cmd", class, "profile_error")
                 })?
                 .to_owned();
-            let cmd = if harness == "codex" {
+            let cmd = if ProfileCapabilities::of(harness).script_wrapper_cmd {
                 cmd
             } else {
                 reject_script_wrapper(name, cmd, source, table_offset)?
@@ -3332,7 +3339,7 @@ fn require_native_antigravity_cmd(
     source: &str,
     offset: usize,
 ) -> core::Result<String> {
-    if !crate::adhoc::antigravity_cli_identity(&cmd) {
+    if !eliot_plugin::install::cli_identity_matches(&cmd, "agy") {
         return Err(profile_field_error(
             source,
             offset,

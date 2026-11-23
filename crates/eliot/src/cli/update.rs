@@ -8,7 +8,10 @@ use super::support::{
     Failure, mutation_id, print_value_or_human, submit_command, submit_request, wait_for_command,
 };
 use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
-use eliot_core::api::{AgentGetRequest, AgentGetResponse, DaemonShutdownRequest, ShutdownMode};
+use eliot_core::api::{
+    AgentGetRequest, AgentGetResponse, AgentSummary, DaemonShutdownRequest, HarnessCapabilities,
+    ShutdownMode, TurnGetRequest,
+};
 use eliot_core::{Agent, AgentState, CommandState};
 use eliot_daemon::operator::{
     DaemonInfo, binary_sha256, continue_after_restart, copy_store_for_update_check, daemon_alive,
@@ -234,7 +237,8 @@ async fn run_update(
         &prepare,
         &commit,
         Duration::from_secs(wait_seconds),
-        interrupt.then_some(&mut stopped),
+        interrupt,
+        &mut stopped,
     ))
     .await;
     let commit_reply_uncertain = committed.is_err();
@@ -551,9 +555,20 @@ async fn quiesce(
     prepare: &DaemonShutdownRequest,
     commit: &DaemonShutdownRequest,
     wait: Duration,
-    mut interrupted: Option<&mut Vec<StoppedAgent>>,
+    mut interrupt_on_deadline: bool,
+    stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
     call_shutdown(path, prepare).await?;
+    // Stop through the native protocol while terminal events can still commit.
+    // A forced process exit can leave the retained session marked busy.
+    Box::pin(stop_active_turns(
+        path,
+        old,
+        Instant::now() + INTERRUPT_SETTLE_WAIT,
+        stopped,
+        |agent| HarnessCapabilities::of(&agent.harness).restart_requires_idle,
+    ))
+    .await?;
     let mut deadline = Instant::now() + wait;
     loop {
         check_same_daemon(path, old)?;
@@ -561,14 +576,14 @@ async fn quiesce(
             Ok(()) => return Ok(()),
             Err(error) if error.code.as_deref() == Some("restart_busy") => {
                 if Instant::now() >= deadline {
-                    let Some(stopped) = interrupted.take() else {
+                    if !std::mem::take(&mut interrupt_on_deadline) {
                         return Err(Failure::new(
                             5,
                             "admitted work did not finish before the update deadline",
                         ));
-                    };
+                    }
                     deadline = Instant::now() + INTERRUPT_SETTLE_WAIT;
-                    Box::pin(stop_active_turns(path, old, deadline, stopped)).await?;
+                    Box::pin(stop_active_turns(path, old, deadline, stopped, |_| true)).await?;
                 }
             }
             Err(error) => return Err(error),
@@ -594,13 +609,14 @@ async fn stop_active_turns(
     old: &DaemonInfo,
     deadline: Instant,
     stopped: &mut Vec<StoppedAgent>,
+    include: fn(&AgentSummary) -> bool,
 ) -> Result<(), Failure> {
     let summaries = timeout_at(deadline, agents(path))
         .await
         .map_err(|_| Failure::timeout())??;
     let mut active: Vec<_> = summaries
         .into_values()
-        .filter(|agent| agent.active_turn.is_some())
+        .filter(|agent| agent.active_turn.is_some() && include(agent))
         .collect();
     active.sort_by_key(|agent| agent.parent.is_some());
     let mut submitted = Vec::new();
@@ -673,6 +689,37 @@ async fn stop_active_turns(
                             && outcome["native_source_drain_proven"] == true
                     }) =>
             {
+                let terminal =
+                    if HarnessCapabilities::of(&candidate.agent.harness).restart_requires_idle {
+                        let request = TurnGetRequest::new(
+                            &candidate.agent.id,
+                            candidate.agent.generation,
+                            &candidate.turn,
+                        );
+                        match timeout_at(
+                            deadline,
+                            eliot_daemon::client_call_typed(path, "turn.get", &request),
+                        )
+                        .await
+                        {
+                            Ok(Ok(turn)) => {
+                                request.validate_response(&turn).is_ok()
+                                    && turn.state == eliot_core::TurnState::Completed
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        true
+                    };
+                if !terminal {
+                    failure = Some(Failure::new(
+                        4,
+                        format!(
+                            "Stop did not prove a terminal for {}#{} turn {} before replacement",
+                            candidate.agent.id, candidate.agent.generation, candidate.turn,
+                        ),
+                    ));
+                }
                 stopped.push(candidate)
             }
             Ok(_) => {
@@ -774,8 +821,8 @@ async fn resume_stopped(
     deadline: Instant,
 ) -> Result<(), Failure> {
     let agent = &candidate.agent;
-    // The applied Stop proves custody closed even when the old turn has
-    // no terminal observation. Promptless resume carries no previous input.
+    // The applied Stop proves custody closed. A pre-restart native stop
+    // carries a fresh continuation note for its captured turn.
     let request = AgentGetRequest::new(&agent.id);
     let details: AgentGetResponse = eliot_daemon::client_call_typed(path, "agent.get", &request)
         .await
@@ -789,7 +836,16 @@ async fn resume_stopped(
             "the stopped generation changed before resume",
         ));
     }
-    let mut resume = submit_request(None, Some(agent.id.clone()), "resume", json!({}))?;
+    let args = if HarnessCapabilities::of(&agent.harness).restart_requires_idle {
+        let body = format!(
+            "The daemon update stopped {} while turn {} of generation {} was active. +             Read its retained outcome and reconcile the worktree (git status and git log on +             the task branch, plus the task card), then continue the task from the files as they are.",
+            agent.id, candidate.turn, agent.generation,
+        );
+        json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+    } else {
+        json!({})
+    };
+    let mut resume = submit_request(None, Some(agent.id.clone()), "resume", args)?;
     resume.expected_generation = Some(agent.generation);
     match submit_command(path, &resume).await {
         Err(error) if error.exit_code != 4 => return Err(error),

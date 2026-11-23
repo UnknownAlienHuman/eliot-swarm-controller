@@ -33,6 +33,7 @@ use eliot_plugin::{
     InitializeParams, MAX_EVENT_BYTES, MAX_TEXT_BYTES, ObserverAttachParams, ObserverDetachParams,
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ProfileStoreParams, stream_sources},
+    resume::ResumePreflight,
     session::{
         ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, is_passed_env, is_secret_name,
@@ -3181,41 +3182,24 @@ async fn verify_resume_preflight(
 ) -> Result<()> {
     let thread = read_owned_thread(client, thread_id).await?;
     let newest_turn = read_latest_native_turn_status(client, thread_id).await?;
-    validate_resume_preflight(
-        thread
-            .get("status")
-            .and_then(|status| status.get("type"))
-            .and_then(Value::as_str),
+    ResumePreflight {
+        vendor: "Codex",
+        subject: "thread",
+        runtime_resumable: matches!(
+            thread.pointer("/status/type").and_then(Value::as_str),
+            Some("idle" | "notLoaded")
+        ),
         retained_turn,
-        newest_turn
-            .as_ref()
-            .map(|(id, status)| (id.as_str(), status.as_str())),
-    )
-}
-
-fn validate_resume_preflight(
-    native_status: Option<&str>,
-    retained_turn: Option<&str>,
-    newest_turn: Option<(&str, &str)>,
-) -> Result<()> {
-    if !matches!(native_status, Some("idle" | "notLoaded")) {
-        return Err(Error::new(
-            "native_readback",
-            "Codex retained thread is active or has no resumable runtime status",
-        ));
+        newest_turn: newest_turn.as_ref().map(|(id, status)| {
+            (
+                id.as_str(),
+                matches!(status.as_str(), "completed" | "interrupted" | "failed"),
+            )
+        }),
+        active_turn: false,
+        proves_no_turn: newest_turn.is_none(),
     }
-    match (retained_turn, newest_turn) {
-        (Some(expected), Some((actual, status)))
-            if actual == expected && terminal_turn_status(status) =>
-        {
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        _ => Err(Error::new(
-            "native_readback",
-            "Codex newest native turn does not match the exact retained terminal turn",
-        )),
-    }
+    .verify()
 }
 
 async fn read_latest_native_turn_status(
@@ -3258,10 +3242,6 @@ async fn read_latest_native_turn_status(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| Error::new("native_readback", "Codex newest turn omitted its status"))?;
     Ok(Some((id.to_owned(), status.to_owned())))
-}
-
-fn terminal_turn_status(status: &str) -> bool {
-    matches!(status, "completed" | "interrupted" | "failed")
 }
 
 /// Shared error re-coding, kept under the local path for the sibling

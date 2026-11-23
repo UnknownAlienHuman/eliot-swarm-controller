@@ -233,6 +233,8 @@ pub async fn run_for_update(path: PathBuf, attempt: &str) -> Result<()> {
 }
 
 async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
+    eliot_core::api::HarnessCapabilities::require_registered()?;
+
     // Daemon-private files carry explicit current-user-only creation modes
     // (0600 files, 0700 directories) at each creation site; the process umask
     // is left alone so Agents' files in shared workspaces keep the ambient

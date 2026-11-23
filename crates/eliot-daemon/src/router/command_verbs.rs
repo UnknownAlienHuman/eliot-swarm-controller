@@ -1125,8 +1125,9 @@ impl Router {
             .await;
             return;
         };
+        let capabilities = eliot_core::api::HarnessCapabilities::of(&agent.harness);
         let native_model = proven
-            .get(if agent.harness == "claude" {
+            .get(if capabilities.configure_reports_accepted_model {
                 "accepted_model"
             } else {
                 "model"
@@ -1169,11 +1170,11 @@ impl Router {
                 if proven.get("catalogue_omits_model").and_then(Value::as_bool) == Some(true) {
                     outcome["catalogue_omits_model"] = Value::Bool(true);
                 }
-                if agent.harness == "claude" {
+                if capabilities.configure_reports_accepted_model {
                     outcome["accepted_model"] = json!(config.model);
                     outcome["effective"]["model"] = Value::Null;
                 }
-                if matches!(agent.harness.as_str(), "antigravity" | "muse") {
+                if capabilities.configure_reports_effort_verification {
                     outcome["effort_verified"] = json!(effort_verified);
                 }
                 let _ = self.settle(id, CommandState::Applied, Some(outcome)).await;

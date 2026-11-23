@@ -8,7 +8,7 @@ pub struct ActiveTurnRecovery {
     pub command_id: Option<String>,
     pub turn_id: String,
     source_event_seq: i64,
-    muse_projection_gap: bool,
+    view_projection_gap: bool,
 }
 
 /// The daemon monitor's readback result for one active turn.
@@ -68,14 +68,14 @@ impl Store {
 
         let (kind, mut data) = match outcome {
             RecoveredTurn::Terminal(mut terminal) => {
-                if binding.muse_projection_gap {
+                if binding.view_projection_gap {
                     terminal[core::VIEW_RECOVERY_MARKER_FIELD] =
                         json!(core::VIEW_RECOVERY_READBACK);
                 }
                 ("turn.completed", terminal)
             }
             unknown => {
-                let reason = if binding.muse_projection_gap {
+                let reason = if binding.view_projection_gap {
                     core::MUSE_VIEW_UNKNOWN_REASON_PREFIX
                 } else if matches!(unknown, RecoveredTurn::NativeExited) {
                     "native_exit_without_session_terminal"
@@ -324,7 +324,8 @@ fn active_turn_recovery(
             command_id,
             turn_id: turn_id.to_owned(),
             source_event_seq,
-            muse_projection_gap: agent.harness == "muse"
+            view_projection_gap: eliot_core::api::HarnessCapabilities::of(&agent.harness)
+                .view_projection_gap_recovery
                 && reason.is_some_and(|value| {
                     value.starts_with(core::MUSE_VIEW_UNAVAILABLE_REASON_PREFIX)
                 }),

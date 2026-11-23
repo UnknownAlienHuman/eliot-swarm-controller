@@ -16,6 +16,7 @@ mod fs_invalidation;
 mod git_actions;
 mod git_integration;
 mod git_monitor;
+mod harness_capabilities;
 pub(crate) mod logging;
 mod maintenance;
 mod monitor;

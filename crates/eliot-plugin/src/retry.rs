@@ -18,6 +18,18 @@ pub enum RetryOperation {
     OutstandingOffer,
     HookPoll,
     ReadinessPoll,
+    /// Settle a polled native readback that becomes observable
+    /// asynchronously (installed MCP inventory): 50 ms doubling to 1 s.
+    ReadinessSettle,
+}
+
+const READINESS_SETTLE_FIRST: Duration = Duration::from_millis(50);
+const READINESS_SETTLE_MAX: Duration = Duration::from_secs(1);
+
+fn readiness_settle_delay(retries: u32) -> Duration {
+    READINESS_SETTLE_FIRST
+        .saturating_mul(1 << retries.min(5))
+        .min(READINESS_SETTLE_MAX)
 }
 
 pub enum StartupAfterFailure {
@@ -45,7 +57,8 @@ impl Retry {
             RetryOperation::SessionBinding => self.retries >= 2,
             RetryOperation::OutstandingOffer
             | RetryOperation::HookPoll
-            | RetryOperation::ReadinessPoll => false,
+            | RetryOperation::ReadinessPoll
+            | RetryOperation::ReadinessSettle => false,
         }
     }
 
@@ -87,6 +100,7 @@ impl Retry {
                 Duration::from_millis(250 * (1 << self.retries.min(3)))
             }
             RetryOperation::HookPoll | RetryOperation::ReadinessPoll => Duration::from_millis(250),
+            RetryOperation::ReadinessSettle => readiness_settle_delay(self.retries),
         };
         let wake = Instant::now() + delay;
         if deadline.is_some_and(|end| wake >= end) {
@@ -98,5 +112,16 @@ impl Retry {
         }
         self.retries = self.retries.saturating_add(1);
         true
+    }
+
+    /// Wait one readiness-settle interval, clamped to `deadline` so a polled
+    /// readback never runs past its budget. The caller re-reads after every
+    /// wait, including the wait that lands exactly on the deadline, because
+    /// the observation at the settle cap decides the result.
+    pub async fn wait_settle(&mut self, deadline: Instant) {
+        debug_assert!(matches!(self.operation, RetryOperation::ReadinessSettle));
+        let delay = readiness_settle_delay(self.retries);
+        sleep_until((Instant::now() + delay).min(deadline)).await;
+        self.retries = self.retries.saturating_add(1);
     }
 }

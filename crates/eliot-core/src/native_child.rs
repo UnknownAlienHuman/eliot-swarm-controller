@@ -31,11 +31,8 @@ pub struct NativeChildActivity {
 
 /// Observation stream families currently implemented for each supported native-child harness.
 pub fn native_child_families_for_harness(harness: &str) -> Option<&'static [&'static str]> {
-    match harness {
-        "codex" => Some(&CODEX_NATIVE_CHILD_FAMILIES),
-        "muse" => Some(&MUSE_NATIVE_CHILD_FAMILIES),
-        _ => None,
-    }
+    let families = crate::api::HarnessCapabilities::for_harness(harness)?.native_child_families;
+    (!families.is_empty()).then_some(families)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
