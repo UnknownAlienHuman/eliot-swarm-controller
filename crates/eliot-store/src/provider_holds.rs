@@ -215,7 +215,7 @@ impl Store {
                      JOIN agents a ON a.id = c.target
                      WHERE h.state = 'probing' AND c.verb = 'send' AND c.probe = 1
                        AND c.link_kind = 'send' AND c.ordinal = 0 AND c.generation = 1
-                       AND p.verb = 'launch' AND p.generation = 0
+                       AND p.verb = 'launch' AND p.generation = c.generation
                        AND json_type(p.args, '$._provider_probe') IS NULL
                        AND a.observe_only = 0
                        AND c.state IN ('dispatched','unknown','applied')
