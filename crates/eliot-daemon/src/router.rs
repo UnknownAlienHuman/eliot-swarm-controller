@@ -475,6 +475,7 @@ impl Router {
                             name: (*name).to_owned(),
                             health: WorkerTaskHealth::Starting,
                             failure_code: None,
+                            last_failure: None,
                             restart_count: 0,
                         })
                         .collect(),
@@ -1367,12 +1368,13 @@ impl Router {
         &self,
         name: &str,
         failure_code: String,
+        cause: String,
         restart_count: u32,
     ) {
         self.update_worker_task(
             name,
             WorkerTaskHealth::Failed,
-            Some((failure_code, restart_count)),
+            Some((failure_code, cause, restart_count)),
         );
     }
 
@@ -1384,7 +1386,7 @@ impl Router {
         &self,
         name: &str,
         health: WorkerTaskHealth,
-        failure: Option<(String, u32)>,
+        failure: Option<(String, String, u32)>,
     ) {
         if let Some(task) = self
             .inner
@@ -1395,8 +1397,9 @@ impl Router {
         {
             task.health = health;
             task.failure_code = None;
-            if let Some((code, restart_count)) = failure {
+            if let Some((code, cause, restart_count)) = failure {
                 task.failure_code = Some(code);
+                task.last_failure = Some(cause);
                 task.restart_count = restart_count;
             }
         }

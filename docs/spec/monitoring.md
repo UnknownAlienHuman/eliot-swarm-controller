@@ -1088,14 +1088,15 @@ page shows no line.
 
 ## Views
 
-The daemon supervises long-lived rule, Goal, retention, monitoring, Git,
-attention, mail reoffer and completion digest workers. An unexpected failure
-is logged and retried with bounded backoff. `daemon.status` exposes worker
-health, a bounded failure code while failed, and the restart count. A healthy
-run of at least one minute clears the consecutive-failure count. After five
-consecutive failures, the worker stays failed and the daemon records Owner
-attention. The daemon log retains the final error if the notice cannot be
-committed. Failure records identify the authenticated principal, an
+The daemon uses the same supervisor for long-lived rule, Goal, retention,
+process monitoring, Git, attention, mail reoffer and completion digest workers.
+Each worker restarts independently after an unexpected failure. Retry delays
+increase from 250 ms to at most 30 s. `swarm status` exposes worker health,
+the last redacted failure cause and the number of scheduled restart attempts.
+A run of at least one minute clears the consecutive-failure count. The fifth
+failure in a row raises one Owner attention notice through the daemon's
+notification path. Retries continue, and the log records any notice delivery
+failure. Failure records identify the authenticated principal, an
 unauthenticated caller, or the system producer, and name the RPC method or
 internal operation/command. Each carries a bounded, redacted cause and available
 typed failure diagnostics. Logs omit request payloads, credentials, and

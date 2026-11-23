@@ -387,6 +387,19 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
             "healthy"
         }
     );
+    for worker in &response.automation_tasks {
+        if worker.restart_count > 0 || worker.failure_code.is_some() {
+            let cause = worker
+                .last_failure
+                .as_deref()
+                .or(worker.failure_code.as_deref())
+                .unwrap_or("unavailable");
+            println!(
+                "Worker {} | {:?} | restarts: {} | last failure: {cause}",
+                worker.name, worker.health, worker.restart_count
+            );
+        }
+    }
     println!(
         "Commands: {} unknown · {} unsettled",
         response.unknown_commands_count, response.unsettled_commands_count

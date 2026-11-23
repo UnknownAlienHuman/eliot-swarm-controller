@@ -38,6 +38,7 @@ use ulid::Ulid;
 
 pub const MAX_RPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
 const MANAGED_ACL_DIRECTORIES: [&str; 3] = ["logs", "plugins", "worktrees"];
+const MONITOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
 
 /// Nonsemantic IPC timings. Handler time includes authentication, lock waits and
 /// Store work; the remaining round trip includes framing/serialization and I/O.
@@ -685,9 +686,26 @@ async fn spawn_workers(
     monitor_tasks.spawn(crate::daemon::workers::supervise_with(
         "monitor",
         worker_reporter.clone(),
-        monitor_shutdown,
+        monitor_shutdown.clone(),
         monitor_factory,
         move |error| monitor_failure_state.mark_unavailable(&error.code),
+    ));
+    let git_monitoring = monitoring.clone();
+    let git_failure_state = monitoring.clone();
+    let git_reporter = worker_reporter.clone();
+    monitor_tasks.spawn(crate::daemon::workers::supervise_with(
+        "git_sampler",
+        worker_reporter.clone(),
+        monitor_shutdown,
+        move |shutdown: watch::Receiver<bool>| {
+            let monitoring = git_monitoring.clone();
+            let reporter = git_reporter.clone();
+            async move {
+                let result = monitoring.run_git(shutdown.clone(), reporter).await;
+                crate::daemon::workers::from_result(result, &shutdown)
+            }
+        },
+        move |error| git_failure_state.mark_git_unavailable(&error.code),
     ));
 
     let (worker_stop, _) = watch::channel(false);
@@ -886,10 +904,9 @@ async fn spawn_workers(
                 }
             };
             match automation::run_global_rules(router, start, shutdown).await {
-                Ok(
-                    automation::RuleWorkerExit::Shutdown
-                    | automation::RuleWorkerExit::AdmissionClosed,
-                ) => crate::daemon::workers::WorkerOutcome::Stopped,
+                Ok(automation::RuleWorkerExit::Shutdown) => {
+                    crate::daemon::workers::WorkerOutcome::Stopped
+                }
                 Ok(automation::RuleWorkerExit::Exited) => {
                     crate::daemon::workers::WorkerOutcome::Failed(Error::new(
                         "worker_exited",
@@ -1066,7 +1083,6 @@ async fn supervise(
         listener,
         workers,
         monitor_tasks,
-        monitoring,
         recovery,
         cloud_mcp_tasks,
         progress,
@@ -1205,7 +1221,6 @@ async fn supervise(
                         ],
                         Some(&error),
                     );
-                    monitoring.mark_unavailable("monitor_supervisor_failed");
                     break Err(Error::new(
                         "monitor_supervisor_failed",
                         "monitor supervisor stopped unexpectedly",
@@ -1465,11 +1480,9 @@ async fn shutdown_supervision(
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     monitor_stop.send_replace(true);
-    while let Some(joined) = monitor_tasks.join_next().await {
-        match joined {
-            Ok(()) => {}
-            Err(_) => {
-                monitoring.mark_unavailable("monitor_supervisor_failed");
+    let shutdown = timeout(MONITOR_SHUTDOWN_GRACE, async {
+        while let Some(joined) = monitor_tasks.join_next().await {
+            if joined.is_err() {
                 let error = Error::new(
                     "monitor_supervisor_failed",
                     "monitor supervisor observed a panicked or cancelled task",
@@ -1485,7 +1498,20 @@ async fn shutdown_supervision(
                 );
             }
         }
+    })
+    .await;
+    if shutdown.is_err() {
+        monitor_tasks.shutdown().await;
+        let error = Error::new("monitor_shutdown_incomplete", "monitor shutdown timed out");
+        monitoring.mark_git_unavailable(&error.code);
+        logging::record(
+            &policy,
+            "daemon.monitor_shutdown_incomplete",
+            &[],
+            Some(&error),
+        );
     }
+    monitoring.finish_git().await;
     outcome
 }
 
