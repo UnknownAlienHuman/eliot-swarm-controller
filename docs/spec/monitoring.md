@@ -412,6 +412,8 @@ A preparation error with an exact creation marker proving no Git write or setup
 dispatch settles the command and workspace with the original error code and message.
 A refused Resume restores its exact prior `ready` marker. Later Resume attempts
 verify Git and worktree identity again before native dispatch.
+A Ready Resume whose retained marker cannot prove a no-write refusal settles
+unknown on a preparation error, retaining the error and fencing native dispatch.
 
 A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
 checkout can leave its new Git branch after Git has removed the worktree. Cleanup
@@ -438,6 +440,8 @@ write and the creation stage rules out setup dispatch for that attempt. Recovery
 retains uncertainty and the original bindings when Git or setup effects may have
 occurred. It never repeats either effect. For cancelled creation with a possible Git
 write, see [Owner resolution](api.md#input-turn-and-unknown-gates).
+An invalid cancellation candidate remains unresolved and records
+`workspace.cancel_recovery_skipped`. Recovery continues with the remaining rows.
 On Windows, step completion waits for the owned Job to empty. On supported Linux,
 successful leader completion and an empty observed process group permit degraded
 completion; escaped descendants remain possible. A signal-zero group query is

@@ -2152,7 +2152,6 @@ impl Store {
                 let unknown = matches!(&outcome, WorkspaceCreationOutcome::Unknown { .. });
                 let ready_resume_unknown = workspace.phase == WorkspacePhase::Ready
                     && command.command.verb == "resume"
-                    && reuse
                     && workspace.setup_index == workspace.frozen_setup.len()
                     && pending
                     && unknown;
@@ -2173,7 +2172,11 @@ impl Store {
                     )
                     && pending
                     && unknown;
-                if manager_identity_unknown {
+                let creation = workspace
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|value| value["stage"] == "creation");
+                if manager_identity_unknown || (ready_resume_unknown && !(reuse && creation)) {
                     // A lost identity after verified creation is distinct
                     // from unknown creation. It cannot reopen setup.
                     marker["stage"] = json!("identity");
@@ -2181,12 +2184,7 @@ impl Store {
                     workspace.phase,
                     WorkspacePhase::Creating | WorkspacePhase::Unknown
                 ) || ready_resume_unknown)
-                    || workspace
-                        .outcome
-                        .as_ref()
-                        .and_then(|value| value.get("stage"))
-                        .and_then(Value::as_str)
-                        != Some("creation")
+                    || !creation
                     || workspace.setup_index
                         != if reuse {
                             workspace.frozen_setup.len()
@@ -2339,7 +2337,12 @@ impl Store {
                     }
                 }
             }
-            WorkspaceAction::Cancel(_, _) => unreachable!(),
+            WorkspaceAction::Cancel(_, _) => {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace cancellation requires its dedicated settlement path",
+                ));
+            }
             WorkspaceAction::Removal(outcome) => {
                 let write_guard = old
                     .outcome
@@ -2564,7 +2567,8 @@ pub(super) fn recover_workspaces(
 ) -> Result<()> {
     let mut statement = tx.prepare(&format!(
         "SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE phase IN ('creating','setup_running','removing')
-         OR (json_extract(outcome, '$.cancel_requested') = 1 AND phase IN ('setup_ready','ready'))"
+         OR (phase IN ('setup_ready','ready') AND
+             CASE WHEN json_valid(outcome) THEN json_extract(outcome, '$.cancel_requested') = 1 END)"
     )).map_err(sql_error)?;
     let rows = statement
         .query_map([], workspace_from_row)
@@ -2597,98 +2601,131 @@ pub(super) fn recover_workspace_cancellations(
     let mut statement = tx
         .prepare(&format!(
             "SELECT {WORKSPACE_COLUMNS} FROM workspaces
-             WHERE phase = 'unknown'
-               AND json_extract(outcome, '$.stage') = 'creation'
-               AND json_extract(outcome, '$.cancel_requested') = 1
-               AND json_extract(outcome, '$.native_git_write_dispatched') = 0"
+             WHERE phase = 'unknown' AND CASE WHEN json_valid(outcome) THEN
+                 json_extract(outcome, '$.stage') = 'creation'
+                 AND json_extract(outcome, '$.cancel_requested') = 1
+                 AND json_extract(outcome, '$.native_git_write_dispatched') = 0
+             END"
         ))
         .map_err(sql_error)?;
     let rows = statement
-        .query_map([], workspace_from_row)
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, workspace_from_row(row)))
+        })
         .map_err(sql_error)?;
     let workspaces = rows
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
     drop(statement);
 
-    for workspace in workspaces {
-        if !no_git_write_creation_cancel(&workspace) {
-            continue;
-        }
-        let (start, agent) = match preparation_command(tx, &workspace) {
-            Ok(binding) => binding,
-            Err(error) if matches!(error.code.as_str(), "not_found" | "stale_generation") => {
-                continue;
+    for (agent, workspace) in workspaces {
+        // The shared settlement can write before discovering a bad retained
+        // binding. Keep that row's writes and unpublished events together.
+        tx.execute_batch("SAVEPOINT recover_workspace_cancel")
+            .map_err(sql_error)?;
+        let event_count = events.len();
+        let result = workspace
+            .map_err(sql_error)
+            .and_then(|workspace| recover_workspace_cancellation(tx, &workspace, now, events));
+        match result {
+            Ok(()) => tx
+                .execute_batch("RELEASE recover_workspace_cancel")
+                .map_err(sql_error)?,
+            Err(error) => {
+                tx.execute_batch(
+                    "ROLLBACK TO recover_workspace_cancel; RELEASE recover_workspace_cancel",
+                )
+                .map_err(sql_error)?;
+                events.truncate(event_count);
+                events.push(insert_daemon_event(
+                    tx,
+                    now,
+                    "workspace.cancel_recovery_skipped",
+                    "workspace",
+                    None,
+                    None,
+                    json!({"agent": format_agent_id(agent), "code": error.code}),
+                )?);
             }
-            Err(error) => return Err(error),
-        };
-        let agent_num = parse_agent_id(&agent.id)?;
-        let Some(stop_id) = workspace
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.get("stop_command_id"))
-            .and_then(Value::as_str)
-        else {
-            continue;
-        };
-        let Some(stop) = load_command_record(tx, stop_id)? else {
-            continue;
-        };
-        let reuse = workspace
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.get("reuse"))
-            .and_then(Value::as_bool)
-            == Some(true);
-        let exact_creation = if reuse {
-            start.command.verb == "resume"
-                && workspace.setup_index == workspace.frozen_setup.len()
-                && workspace
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.get("resume_previous"))
-                    .is_some()
-        } else {
-            start.command.verb == "launch" && workspace.setup_index == 0
-        };
-        let pending_start = matches!(
-            start.state,
-            CommandState::Accepted | CommandState::Queued | CommandState::Unknown
-        );
-        let owner_resolved_resume =
-            start.command.verb == "resume" && owner_resolved_failure(&start);
-        if !exact_creation
-            || !pending_start && !owner_resolved_resume
-            || stop.command.verb != "stop"
-            || stop.target != Some(agent_num)
-            || stop.command.generation != Some(agent.generation)
-            || stop.expected_turn_id.is_some()
-            || !matches!(stop.state, CommandState::Dispatched | CommandState::Unknown)
-        {
-            continue;
         }
-        if let Some(linked) = load_linked_command(tx, &start.command.id)?
-            && !matches!(
-                linked.state,
-                CommandState::Accepted
-                    | CommandState::Queued
-                    | CommandState::Rejected
-                    | CommandState::Cancelled
-            )
-        {
-            continue;
-        }
-        let marker =
-            workspace_cancel_marker(&workspace, stop_id, &WorkspaceCancelOutcome::Stopped)?;
-        let _ = settle_workspace_cancel_tx(
-            tx,
-            &workspace,
-            stop_id,
-            &WorkspaceCancelOutcome::Stopped,
-            marker,
-            now,
-            events,
-        )?;
     }
+    Ok(())
+}
+
+fn recover_workspace_cancellation(
+    tx: &Transaction<'_>,
+    workspace: &WorkspacePreparation,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    if !no_git_write_creation_cancel(workspace) {
+        return Ok(());
+    }
+    let (start, agent) = preparation_command(tx, workspace)?;
+    let agent_num = parse_agent_id(&agent.id)?;
+    let Some(stop_id) = workspace
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("stop_command_id"))
+        .and_then(Value::as_str)
+    else {
+        return Ok(());
+    };
+    let Some(stop) = load_command_record(tx, stop_id)? else {
+        return Ok(());
+    };
+    let reuse = workspace
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("reuse"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let exact_creation = if reuse {
+        start.command.verb == "resume"
+            && workspace.setup_index == workspace.frozen_setup.len()
+            && workspace
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("resume_previous"))
+                .is_some()
+    } else {
+        start.command.verb == "launch" && workspace.setup_index == 0
+    };
+    let pending_start = matches!(
+        start.state,
+        CommandState::Accepted | CommandState::Queued | CommandState::Unknown
+    );
+    let owner_resolved_resume = start.command.verb == "resume" && owner_resolved_failure(&start);
+    if !exact_creation
+        || !pending_start && !owner_resolved_resume
+        || stop.command.verb != "stop"
+        || stop.target != Some(agent_num)
+        || stop.command.generation != Some(agent.generation)
+        || stop.expected_turn_id.is_some()
+        || !matches!(stop.state, CommandState::Dispatched | CommandState::Unknown)
+    {
+        return Ok(());
+    }
+    if let Some(linked) = load_linked_command(tx, &start.command.id)?
+        && !matches!(
+            linked.state,
+            CommandState::Accepted
+                | CommandState::Queued
+                | CommandState::Rejected
+                | CommandState::Cancelled
+        )
+    {
+        return Ok(());
+    }
+    let marker = workspace_cancel_marker(workspace, stop_id, &WorkspaceCancelOutcome::Stopped)?;
+    settle_workspace_cancel_tx(
+        tx,
+        workspace,
+        stop_id,
+        &WorkspaceCancelOutcome::Stopped,
+        marker,
+        now,
+        events,
+    )?;
     Ok(())
 }
