@@ -582,7 +582,7 @@ async fn wants_checked_review(router: &Router, event: &Event) -> bool {
         .iter()
         .any(|((owner, _), (_, rule))| {
             (owner == "owner" || owner == &project)
-                && rule.matches_project_review(event, &agent.project)
+                && rule.matches_project_review(event, &agent.project, owner)
         })
 }
 

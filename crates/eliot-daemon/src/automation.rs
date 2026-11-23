@@ -2716,7 +2716,7 @@ async fn evaluate_event_action(
     definition: &RuleDefinition,
     event: &Event,
 ) -> Result<RuleEvaluation> {
-    match definition::evaluate(definition, event)? {
+    match definition::evaluate(definition, event, principal)? {
         RuleEvaluation::Command { .. }
             if definition.guards_launch_worktree()
                 && !router.rule_worktree_is_current(principal, event).await? =>
@@ -2762,8 +2762,12 @@ pub(crate) async fn prepare_rule_catch_up_actions(
     }
     let mut actions = Vec::new();
     let mut rendered = Vec::new();
+    let rule_principal = project.map_or_else(
+        || "owner".to_owned(),
+        |project| format!("project:{}", project.id),
+    );
     for event in events {
-        let request = match definition::evaluate(definition, event) {
+        let request = match definition::evaluate(definition, event, &rule_principal) {
             Ok(RuleEvaluation::Command { action, .. }) => action,
             Ok(RuleEvaluation::NoMatch) => continue,
             Ok(RuleEvaluation::CauseDepth) => {

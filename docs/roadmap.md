@@ -332,6 +332,8 @@ No second executor, workflow graph or acceptance engine.
 - [x] **L4.6 Worktree review and keyed rules (#874, #875).** A configured review
       uses a passed project check and the author fingerprint, then inserts the
       review for the manager. Script events drive rules with bounded keys and limits.
+      The [CI recipes](spec/automation.md#ci-notification-recipes) deliver keyed
+      manager notes for PR check results and failed runs on `main`.
 
 **Result:** the first harness can work unattended under explicit limits. Hook support
 is added only for a native decision not expressible by the already-working stream.

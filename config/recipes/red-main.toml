@@ -1,0 +1,46 @@
+# #875 / #883: deliver one notice for each failed completed GitHub Actions run on main.
+#
+# Copy this file to the registered checkout's .eliot/rules/ directory and
+# red-main.py to its .eliot/scripts/ directory.
+#
+# In <data_dir>/config.toml, approve run, emit and mail.send in the registration.
+# Replace app with the project ID and set the installed Python executable.
+#
+#   [projects.app.interpreters.python]
+#   program = "C:/Python313/python.exe"
+#   argv_prefix = []
+#
+# Replace both OWNER/REPOSITORY values with the public GitHub repository and
+# replace a1 with the project manager's Agent ID. The watcher uses anonymous
+# public REST reads and requires no run_env entries.
+#
+# The timer polls every 30 minutes and supports manually dispatched CI. It scans
+# at most three 100-run pages of completed failures and keeps
+# only runs created in the last 14 days. At most 5 failed runs have their job
+# names fetched per firing; fixed 30-minute buckets rotate through larger sets.
+# The job list is bounded to 200 jobs per run. Runs outside these caps are not
+# reported by this polling window. The 14-day lookback is shorter than once_per's
+# 30-day key retention, so a run leaves polling before its dedup key expires and
+# cannot be re-notified after retention expires.
+#
+# For a historical replay, add "--pinned-run-id", "RUN_ID" to cmd and replace
+# RUN_ID with the recorded GitHub Actions run ID. Pinned mode re-emits the same
+# event each timer firing and bypasses the lookback. once_per suppresses the same
+# run ID while its 30-day key is retained; remove the pinned argument after proof
+# because a still-pinned run can be delivered again after that key expires.
+
+[[rule]]
+id = "poll-main-red-ci"
+on = { every = "30m" }
+catch_up = "none"
+do = [
+  { action = "run", cmd = ["python", ".eliot/scripts/red-main.py", "--repo", "OWNER/REPOSITORY"], timeout = "5m" },
+]
+
+[[rule]]
+id = "deliver-red-main"
+on = { event = "x.user.ci.red", match = { "event.cause.rule" = "poll-main-red-ci", "data.data.branch" = "main", "data.data.repository" = "OWNER/REPOSITORY" } }
+once_per = "${data.data.run_id}"
+do = [
+  { action = "mail.send", to = "a1", note = true, text = "GitHub Actions failed on main: ${data.data.summary}" },
+]

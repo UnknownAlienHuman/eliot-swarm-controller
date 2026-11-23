@@ -1,0 +1,40 @@
+# One watch per pull request. Copy this file to the registered checkout's
+# .eliot/rules/ directory and pr-checks.py to its .eliot/scripts/ directory.
+# After opening or updating a PR, replace both OWNER/REPO values, all PR_NUMBER
+# values and the literal recipient a1. Use the Agent that owns this PR.
+#
+# In <data_dir>/config.toml, approve run, emit and mail.send in the registration.
+# Replace app with the project ID and set the installed Python executable.
+#
+#   [projects.app.interpreters.python]
+#   program = "C:/Python313/python.exe"
+#   argv_prefix = []
+#
+# After the manager opens or updates the PR, start a watch with
+# swarm timer run pr-checks-PR_NUMBER --project app. The past date makes the
+# one-shot timer manual-only. Set at to a future RFC3339 time to schedule it once.
+# The watch polls public GitHub anonymously for up to six hours with backoff to
+# 15 minutes, or honors GitHub's rate-limit reset. A single result reads up to
+# 100 check runs and 100 commit statuses. An open PR can have zero checks when
+# CI runs on demand. Completed checks, closure, merge or expiry end the watch.
+# If the PR closed or merged, subsequent explicit runs replay its saved result
+# locally. The delivery rule suppresses duplicates by PR and head.
+# Keep the generated .eliot/state/pr-checks/ directory local. To watch a
+# reopened PR, remove its saved state before invoking the timer again.
+# The rule delivers a note and performs no GitHub writes.
+
+[[rule]]
+id = "pr-checks-PR_NUMBER"
+on = { at = "2000-01-01T00:00:00Z" }
+catch_up = "none"
+do = [
+  { action = "run", cmd = ["python", ".eliot/scripts/pr-checks.py", "OWNER/REPO", "PR_NUMBER"], cwd = ".", timeout = "6h1m" },
+]
+
+[[rule]]
+id = "deliver-pr-checks-PR_NUMBER"
+on = { event = "x.user.pr_checks_result", match = { "event.cause.rule" = "pr-checks-PR_NUMBER", "data.data.repository" = "OWNER/REPO", "data.data.pull_number" = "PR_NUMBER" } }
+once_per = "${data.key}"
+do = [
+  { action = "mail.send", to = "a1", note = true, text = "GitHub PR checks\n${data.data.summary}" },
+]

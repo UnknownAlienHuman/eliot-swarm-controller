@@ -3,8 +3,9 @@ use eliot_core::{
     api::{
         CatchUp, CommandSubmitRequest, EmitDefinitionArgs, GitFetchDefinitionArgs,
         GitIntegrateDefinitionArgs, GitPublishDefinitionArgs, GitPublishTrigger,
-        MAX_RULE_FILE_BYTES, MailDefinitionArgs, NotifyDefinitionArgs, ProjectCheckPassed,
-        RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule, VarDefinitionArgs,
+        MAX_MAIL_TEXT_BYTES, MAX_RULE_FILE_BYTES, MailDefinitionArgs, NotifyDefinitionArgs,
+        ProjectCheckPassed, RuleLimit, RuleLimitScope, RunDefinitionArgs, TimerSchedule,
+        VarDefinitionArgs,
     },
     canonical_json_sha256,
     limits::{MAX_EVENT_BYTES, MAX_TEXT_BYTES},
@@ -196,7 +197,12 @@ impl RuleDefinition {
         })
     }
 
-    pub(crate) fn matches_project_review(&self, terminal: &Event, project: &str) -> bool {
+    pub(crate) fn matches_project_review(
+        &self,
+        terminal: &Event,
+        project: &str,
+        rule_principal: &str,
+    ) -> bool {
         if !self.enabled || self.trigger.event.as_deref() != Some("project.worktree.check.passed") {
             return false;
         }
@@ -210,7 +216,10 @@ impl RuleDefinition {
             "worktree": terminal.data["worktree"],
             "completion_seq": terminal.seq,
         });
-        matches!(evaluate(self, &passed), Ok(RuleEvaluation::Command { .. }))
+        matches!(
+            evaluate(self, &passed, rule_principal),
+            Ok(RuleEvaluation::Command { .. })
+        )
     }
 
     pub(super) fn inserts_launch_result(&self) -> bool {
@@ -399,6 +408,7 @@ enum ActionDefinition {
     },
     Mail {
         definition: MailDefinitionArgs,
+        note: bool,
     },
     LaunchResultInsertion(LaunchResultInsertion),
     Var {
@@ -473,9 +483,26 @@ impl ActionDefinition {
         if action == "mail.send" || action == "msg.send" {
             let mut fields = object.clone();
             fields.remove("action");
+            let note = if action == "mail.send" {
+                match fields.remove("note") {
+                    None => false,
+                    Some(Value::Bool(note)) => note,
+                    Some(_) => {
+                        return Err(Error::invalid_field(format!("{root}.note"), "boolean"));
+                    }
+                }
+            } else {
+                if fields.contains_key("note") {
+                    return Err(Error::invalid_field(
+                        format!("{root}.note"),
+                        "mail.send action",
+                    ));
+                }
+                false
+            };
             let definition =
                 eliot_core::api::discovery::decode_params_at(Value::Object(fields), root)?;
-            return Ok(Self::Mail { definition });
+            return Ok(Self::Mail { definition, note });
         }
         if action == "var.set" {
             let mut fields = object.clone();
@@ -632,7 +659,7 @@ impl Serialize for ActionDefinition {
                 fields.insert("action".to_owned(), Value::String("emit".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
-            Self::Mail { definition } => {
+            Self::Mail { definition, note } => {
                 let mut fields =
                     match serde_json::to_value(definition).map_err(serde::ser::Error::custom)? {
                         Value::Object(fields) => fields,
@@ -642,6 +669,9 @@ impl Serialize for ActionDefinition {
                             ));
                         }
                     };
+                if *note {
+                    fields.insert("note".to_owned(), Value::Bool(true));
+                }
                 fields.insert("action".to_owned(), Value::String("mail.send".to_owned()));
                 Value::Object(fields).serialize(serializer)
             }
@@ -1127,7 +1157,11 @@ pub(super) enum RuleEvaluation {
 }
 
 /// Matches a committed event and projects its one ordinary command action.
-pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvaluation, Error> {
+pub(super) fn evaluate(
+    rule: &RuleDefinition,
+    event: &Event,
+    rule_principal: &str,
+) -> Result<RuleEvaluation, Error> {
     if !rule.enabled || rule.trigger.event.as_deref() != Some(event.kind.as_str()) {
         return Ok(RuleEvaluation::NoMatch);
     }
@@ -1193,7 +1227,20 @@ pub(super) fn evaluate(rule: &RuleDefinition, event: &Event) -> Result<RuleEvalu
         ActionDefinition::Emit { definition } => {
             return submit_emit_command(definition).map(|action| keys.command(action));
         }
-        ActionDefinition::Mail { definition } => {
+        ActionDefinition::Mail { definition, note } => {
+            if *note {
+                let mut definition = definition.clone();
+                let template = Value::String(std::mem::take(&mut definition.text));
+                let text = render_text(
+                    &template,
+                    &roots,
+                    MAX_MAIL_TEXT_BYTES,
+                    "mail.send",
+                    "32 KiB mail body bound",
+                )?;
+                definition.text = eliot_core::swarm_note(&text, rule_principal);
+                return submit_mail_command(&definition).map(|action| keys.command(action));
+            }
             return submit_mail_command(definition).map(|action| keys.command(action));
         }
         ActionDefinition::LaunchResultInsertion(definition) => {
@@ -2123,13 +2170,23 @@ fn validate_event_action(action: &ActionDefinition) -> Result<(), Error> {
         }
         ActionDefinition::Notify { definition } => return definition.validate(),
         ActionDefinition::Emit { definition } => return definition.validate(),
-        ActionDefinition::Mail { definition } => {
-            return definition.validate().map_err(|error| {
+        ActionDefinition::Mail { definition, note } => {
+            definition.validate().map_err(|error| {
                 Error::new(
                     error.code.clone(),
                     format!("mail.send definition invalid: {}", error.message),
                 )
-            });
+            })?;
+            if *note {
+                validate_text_template(
+                    &Value::String(definition.text.clone()),
+                    true,
+                    MAX_MAIL_TEXT_BYTES,
+                    "mail.send",
+                    "32 KiB mail body bound",
+                )?;
+            }
+            return Ok(());
         }
         ActionDefinition::LaunchResultInsertion(definition) => {
             if definition.from_launch.trim().is_empty() || definition.from_launch.contains("${") {
@@ -2375,7 +2432,15 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
         }
         ActionDefinition::Notify { definition } => return submit_notify_command(definition),
         ActionDefinition::Emit { definition } => return submit_emit_command(definition),
-        ActionDefinition::Mail { definition } => return submit_mail_command(definition),
+        ActionDefinition::Mail { definition, note } => {
+            if *note {
+                return Err(Error::new(
+                    "unsupported",
+                    "mail.send note actions require an event trigger",
+                ));
+            }
+            return submit_mail_command(definition);
+        }
         ActionDefinition::LaunchResultInsertion(_) => {
             return Err(Error::invalid_field(
                 "on",
