@@ -6,13 +6,13 @@ use super::args::{
 };
 use super::support::{Failure, mutation_id, print_value, read_and_print, response_exit_code};
 use crate::mcp;
-use eliot_core::ProviderHold;
 use eliot_core::api::{
     AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, MaintenancePurgeLegacyAttentionRequest,
     MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
     ProviderHoldsRequest, ProviderHoldsResponse, ShutdownMode, StatusBlocker,
 };
+use eliot_core::{ProviderHold, ProviderHoldState};
 use serde_json::Value;
 use serde_json::json;
 #[cfg(not(windows))]
@@ -206,7 +206,18 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
-    let provider_holds = read_all_provider_holds(&data_dir).await?;
+    let hold_request = ProviderHoldsRequest::default();
+    let hold_page: ProviderHoldsResponse =
+        eliot_daemon::client_call_typed(&data_dir, "provider.holds", &hold_request)
+            .await
+            .map_err(Failure::for_read)?;
+    hold_request
+        .validate_response(&hold_page)
+        .map_err(Failure::invalid_response)?;
+    let more_holds = hold_page
+        .next
+        .as_deref()
+        .filter(|_| hold_page.holds.len() == hold_request.effective_limit());
     let status_time_ms = status_now_ms();
     #[cfg(windows)]
     if acl_repair_was_pending {
@@ -257,11 +268,17 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         let mut value = serde_json::to_value(&response)
             .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
         value["data_dir"] = Value::String(data_dir.to_string_lossy().into_owned());
-        value["provider_holds"] = provider_hold_values(&provider_holds, status_time_ms)?;
+        value["provider_holds"] = provider_hold_values(&hold_page.holds, status_time_ms)?;
+        value["provider_holds_next"] = json!(more_holds);
         print_value(&value, true);
     } else {
         print_status_summary(&response, &data_dir);
-        print_provider_holds(&provider_holds, status_time_ms);
+        print_provider_holds(&hold_page.holds, status_time_ms);
+        if let Some(after) = more_holds {
+            println!(
+                "More provider holds may be available with swarm provider holds --after {after}"
+            );
+        }
         if let Some(line) = build_line {
             println!("{line}");
         }
@@ -270,31 +287,6 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         }
     }
     Ok(0)
-}
-
-async fn read_all_provider_holds(data_dir: &Path) -> Result<Vec<ProviderHold>, Failure> {
-    let mut after = None;
-    let mut holds = Vec::new();
-    loop {
-        let request = ProviderHoldsRequest {
-            after: after.clone(),
-            limit: None,
-        };
-        request.validate().map_err(Failure::for_read)?;
-        let response: ProviderHoldsResponse =
-            eliot_daemon::client_call_typed(data_dir, "provider.holds", &request)
-                .await
-                .map_err(Failure::for_read)?;
-        request
-            .validate_response(&response)
-            .map_err(Failure::invalid_response)?;
-        holds.extend(response.holds);
-        let Some(next) = response.next else {
-            break;
-        };
-        after = Some(next);
-    }
-    Ok(holds)
 }
 
 fn provider_hold_values(holds: &[ProviderHold], now_ms: i64) -> Result<Value, Failure> {
@@ -339,6 +331,9 @@ fn print_provider_holds(holds: &[ProviderHold], now_ms: i64) {
 }
 
 fn provider_hold_schedule(hold: &ProviderHold, now_ms: i64) -> String {
+    if hold.state == ProviderHoldState::Probing {
+        return "probe settling".to_owned();
+    }
     let (action, at) = match (hold.retry_after, hold.next_probe_at) {
         (Some(at), _) => ("retry", Some(at)),
         (None, Some(at)) => ("probe", Some(at)),
@@ -356,8 +351,11 @@ fn provider_hold_schedule(hold: &ProviderHold, now_ms: i64) -> String {
 }
 
 fn provider_timestamp(millis: i64) -> String {
+    // RFC 3339 uses a four-digit year.
+    const LAST_RFC3339_MILLISECOND: i64 = 253_402_300_799_999;
     u64::try_from(millis)
         .ok()
+        .filter(|_| millis <= LAST_RFC3339_MILLISECOND)
         .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
         .map_or_else(
             || format!("{millis} ms since Unix epoch"),
