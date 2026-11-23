@@ -149,8 +149,11 @@ impl Store {
             }
             events.push(event);
         }
-        events.sort_by_key(|event| event.seq);
         update_agent_projection(&tx, &next)?;
+        if kind == "turn.completed" {
+            super::goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut events)?;
+        }
+        events.sort_by_key(|event| event.seq);
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }

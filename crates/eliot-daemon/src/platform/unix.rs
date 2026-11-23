@@ -16,6 +16,16 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+pub(crate) fn check_execute_access(path: &Path) -> std::io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let native = CString::new(path.as_os_str().as_bytes())?;
+    // SAFETY: native is a NUL-terminated C string valid for this call.
+    if unsafe { libc::access(native.as_ptr(), libc::X_OK) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// The current account's home directory from the password database. The
 /// process environment (`HOME`, `XDG_*`) cannot redirect it.
 pub(crate) fn account_home() -> Result<PathBuf> {

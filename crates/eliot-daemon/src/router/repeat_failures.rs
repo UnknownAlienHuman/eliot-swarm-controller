@@ -2,6 +2,7 @@ use super::{Principal, Router, principal_name};
 use eliot_core::{
     Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun, RemoteCallContext,
     Result,
+    api::{GoalView, inference::sha256_hex},
 };
 use eliot_plugin::sync::LockExt;
 use regex::Regex;
@@ -26,12 +27,26 @@ static VOLATILE_MESSAGE_VALUES: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid pattern for UUIDs, ULIDs, Agent ids and numbers")
 });
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FailureOwner {
+    Rule {
+        principal: String,
+        rule: String,
+    },
+    Goal {
+        goal_id: String,
+        agent: String,
+        generation: i64,
+    },
+}
+
 #[derive(PartialEq, Eq, Hash)]
 struct FailureKey {
-    principal: String,
-    object: String,
+    owner: FailureOwner,
+    failure_class: String,
     code: String,
     message: String,
+    evidence: Option<String>,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -95,16 +110,18 @@ enum RepeatOutcome {
 impl RepeatFailures {
     fn record(
         &mut self,
-        principal: &str,
-        object: &str,
+        owner: FailureOwner,
+        failure_class: &str,
         code: &str,
         message: &str,
+        evidence: Option<&str>,
     ) -> RepeatOutcome {
         let key = WindowKey::Failure(FailureKey {
-            principal: principal.to_owned(),
-            object: object.to_owned(),
+            owner,
+            failure_class: failure_class.to_owned(),
             code: code.to_owned(),
             message: normalized_message(message),
+            evidence: evidence.map(str::to_owned),
         });
         let now = Instant::now();
         match self
@@ -171,6 +188,51 @@ fn normalized_message(message: &str) -> String {
 }
 
 impl Router {
+    /// Count currently live failure, command-rejection, and command-storm windows.
+    pub(super) fn active_repeat_windows(&self) -> usize {
+        let now = Instant::now();
+        self.inner
+            .repeat_failures
+            .lock_recover()
+            .windows
+            .iter()
+            .filter(|(key, window)| {
+                now < window.ends && (!matches!(key, WindowKey::Storm(_)) || window.refused > 0)
+            })
+            .count()
+    }
+
+    /// Record a failed Goal check in the shared repeat counter. A matching
+    /// failure is bound to this Goal, Agent generation, failure class, code,
+    /// normalized diagnostic text and any exact check-output digest.
+    pub(super) fn note_goal_failure(
+        &self,
+        principal: &str,
+        goal: &GoalView,
+        failure_class: &str,
+        code: &str,
+        message: &str,
+        evidence: Option<&str>,
+    ) {
+        // A Goal's revision advances after each round; its definition is
+        // stable across those rounds and separates replacement definitions.
+        let Ok(definition) = serde_json::to_vec(&goal.definition) else {
+            return;
+        };
+        self.note_repeated_failure(
+            FailureOwner::Goal {
+                goal_id: sha256_hex(&definition),
+                agent: goal.agent.clone(),
+                generation: goal.generation,
+            },
+            principal,
+            failure_class,
+            code,
+            message,
+            evidence,
+        );
+    }
+
     pub(super) fn note_command_rejection(&self, command: &Command, events: &[Event]) {
         let Some(agent) = command.target.as_deref().filter(|_| {
             command.state == CommandState::Rejected
@@ -317,6 +379,12 @@ impl Router {
                     connections_overflow: window.storm.connections_overflow,
                 },
             );
+            if source.method != "daemon.attention" {
+                self.report_repeated_failure(format!(
+                    "Command rejection storm from {} on {}: {} of {} submissions were refused in one {} ms window.",
+                    source.principal, source.method, window.refused, window.count, STORM_WINDOW_MS
+                ));
+            }
         }
     }
 
@@ -327,7 +395,17 @@ impl Router {
                 event.data["code"].as_str(),
                 event.data["message"].as_str(),
             ) {
-                self.note_repeated_failure(principal, rule, code, message);
+                self.note_repeated_failure(
+                    FailureOwner::Rule {
+                        principal: principal.to_owned(),
+                        rule: rule.to_owned(),
+                    },
+                    principal,
+                    "rule",
+                    code,
+                    message,
+                    None,
+                );
             }
         }
     }
@@ -354,32 +432,84 @@ impl Router {
             .as_i64()
             .map(|code| format!("Run action exited with code {code}"))
             .unwrap_or_else(|| "Run action failed".to_owned());
-        self.note_repeated_failure(&command.principal, &rule.id, cause, &message);
+        self.note_repeated_failure(
+            FailureOwner::Rule {
+                principal: command.principal.clone(),
+                rule: rule.id.clone(),
+            },
+            &command.principal,
+            "rule",
+            cause,
+            &message,
+            None,
+        );
     }
 
-    fn note_repeated_failure(&self, principal: &str, rule: &str, code: &str, message: &str) {
+    fn note_repeated_failure(
+        &self,
+        owner: FailureOwner,
+        principal: &str,
+        failure_class: &str,
+        code: &str,
+        message: &str,
+        evidence: Option<&str>,
+    ) {
         let policy = self.secret_policy_snapshot();
+        let failure_class = eliot_core::bound_chars(&policy.redact_text(failure_class), 64);
+        let code = eliot_core::bound_chars(&policy.redact_text(code), 64);
         let message = eliot_core::bound_chars(&policy.redact_text(message), 512);
-        let outcome = self
-            .inner
-            .repeat_failures
-            .lock_recover()
-            .record(principal, rule, code, &message);
+        let outcome = self.inner.repeat_failures.lock_recover().record(
+            owner.clone(),
+            &failure_class,
+            &code,
+            &message,
+            evidence,
+        );
         match outcome {
             RepeatOutcome::Quiet => return,
             RepeatOutcome::Overflow => {
-                crate::logging::record(&policy, "daemon.rule_failure_counter_overflow", &[], None);
+                let event = match owner {
+                    FailureOwner::Rule { .. } => "daemon.rule_failure_counter_overflow",
+                    FailureOwner::Goal { .. } => "daemon.goal_failure_counter_overflow",
+                };
+                crate::logging::record(&policy, event, &[], None);
                 return;
             }
             RepeatOutcome::Threshold => {}
         }
         let count = REPEAT_THRESHOLD;
-        crate::logging::record_repeated_rule_failure(
-            &policy, principal, rule, code, &message, count,
-        );
-        let text = format!(
-            "Rule {rule} ({principal}) failed {count} times in one minute ({code}). {message}"
-        );
+        let text = match owner {
+            FailureOwner::Rule { principal, rule } => {
+                crate::logging::record_repeated_rule_failure(
+                    &policy, &principal, &rule, &code, &message, count,
+                );
+                format!(
+                    "Rule {rule} ({principal}) failed {count} times in one minute ({code}). {message}"
+                )
+            }
+            FailureOwner::Goal {
+                goal_id,
+                agent,
+                generation,
+            } => {
+                crate::logging::record_repeated_goal_failure(
+                    &policy,
+                    crate::logging::RepeatedGoalFailure {
+                        goal_id: &goal_id,
+                        principal,
+                        agent: &agent,
+                        generation,
+                        failure_class: &failure_class,
+                        code: &code,
+                        message: &message,
+                    },
+                    count,
+                );
+                format!(
+                    "Goal for Agent {agent}#{generation} failed {count} times in one minute ({failure_class}: {code}). {message}"
+                )
+            }
+        };
         self.report_repeated_failure(text);
     }
 

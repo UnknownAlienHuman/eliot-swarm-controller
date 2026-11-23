@@ -160,6 +160,52 @@ pub(crate) fn record_repeated_rule_failure(
     write_record(policy, "repeated", &[], None, Some(detail), None);
 }
 
+pub(crate) struct RepeatedGoalFailure<'a> {
+    pub(crate) goal_id: &'a str,
+    pub(crate) principal: &'a str,
+    pub(crate) agent: &'a str,
+    pub(crate) generation: i64,
+    pub(crate) failure_class: &'a str,
+    pub(crate) code: &'a str,
+    pub(crate) message: &'a str,
+}
+
+pub(crate) fn record_repeated_goal_failure(
+    policy: &SecretPolicy,
+    failure: RepeatedGoalFailure<'_>,
+    count: u32,
+) {
+    let detail = Map::from_iter([
+        (
+            "goal_id".to_owned(),
+            json!(bounded_text(policy, failure.goal_id, 256)),
+        ),
+        (
+            "principal".to_owned(),
+            json!(bounded_text(policy, failure.principal, 256)),
+        ),
+        (
+            "agent".to_owned(),
+            json!(bounded_text(policy, failure.agent, 64)),
+        ),
+        ("generation".to_owned(), json!(failure.generation)),
+        (
+            "failure_class".to_owned(),
+            json!(bounded_text(policy, failure.failure_class, 64)),
+        ),
+        (
+            "failure_code".to_owned(),
+            json!(bounded_text(policy, failure.code, 64)),
+        ),
+        (
+            "message".to_owned(),
+            json!(bounded_text(policy, failure.message, 512)),
+        ),
+        ("count".to_owned(), json!(count)),
+    ]);
+    write_record(policy, "repeated", &[], None, Some(detail), None);
+}
+
 /// Debug-only record: typed nonnegative numeric fields next to bounded
 /// string ids. Numbers are encoded as JSON numbers; callers pass no
 /// free-form text here, so secrets cannot enter through this path. Dropped

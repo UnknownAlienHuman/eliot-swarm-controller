@@ -2510,3 +2510,23 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
 unsafe extern "system" {
     fn NtResumeProcess(process_handle: HANDLE) -> i32;
 }
+pub(crate) fn check_executable_image(path: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::GetBinaryTypeW;
+
+    const SCS_32BIT_BINARY: u32 = 0;
+    const SCS_64BIT_BINARY: u32 = 6;
+
+    let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+    let mut binary_type = 0;
+    // SAFETY: wide is NUL-terminated and binary_type is writable for this call.
+    if unsafe { GetBinaryTypeW(wide.as_ptr(), &mut binary_type) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if !matches!(binary_type, SCS_32BIT_BINARY | SCS_64BIT_BINARY) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows did not identify a 32-bit or 64-bit executable image",
+        ));
+    }
+    Ok(())
+}

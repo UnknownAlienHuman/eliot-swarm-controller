@@ -925,15 +925,20 @@ fn project_goals(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(db, "SELECT g.agent,g.mode,g.generation,g.revision,json_extract(g.state,'$.status'),g.updated_at,
+    let deferral_limit_reason = crate::goals::COMPLETION_DEFERRAL_LIMIT_REASON;
+    let sql = format!("SELECT g.agent,g.mode,g.generation,g.revision,json_extract(g.state,'$.status'),g.updated_at,
        a.generation=g.generation AND a.state IN ('idle','busy','waiting')
          AND NOT EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode
             AND m.generation=g.generation AND m.revision=g.revision AND m.state='unknown'),
        EXISTS(SELECT 1 FROM goal_markers m WHERE m.agent=g.agent AND m.mode=g.mode AND m.generation=g.generation AND m.revision=g.revision AND m.state='running'),
        COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=g.agent AND e.generation=g.generation AND e.kind='goal.changed'),0),
        json_extract(g.state,'$.cadence_anchor_ms') + json_extract(g.definition,'$.cadence_ms')
-           * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1)
-       FROM goals g JOIN agents a ON a.id=g.agent WHERE json_extract(g.state,'$.status') IN ('active','blocked')", "g.agent=?1 AND g.mode=?2", bindings)?;
+           * (COALESCE(json_extract(g.state,'$.last_committed_slot'),0) + 1),
+       COALESCE(json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}',0)
+       FROM goals g JOIN agents a ON a.id=g.agent WHERE (json_extract(g.state,'$.status') IN ('active','blocked')
+         OR (json_extract(g.state,'$.status') = 'paused'
+             AND json_extract(g.state,'$.paused_reason') = '{deferral_limit_reason}'))");
+    let mut stmt = projection_query(db, &sql, "g.agent=?1 AND g.mode=?2", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -947,6 +952,7 @@ fn project_goals(
                 r.get::<_, bool>(7)?,
                 r.get::<_, i64>(8)?,
                 r.get::<_, Option<i64>>(9)?,
+                r.get::<_, bool>(10)?,
             ))
         })
         .map_err(sql_error)?;
@@ -962,6 +968,7 @@ fn project_goals(
             round_active,
             event_seq,
             timer_due,
+            deferral_paused,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "active" => GoalStatus::Active,
@@ -979,7 +986,7 @@ fn project_goals(
             &LivenessObject::Goal {
                 state: status,
                 since,
-                owner_item: status == GoalStatus::Blocked,
+                owner_item: status == GoalStatus::Blocked || deferral_paused,
                 round_active: round_active || (reconciler_active && timer_due.is_none()),
                 timer_due: timer_due.filter(|_| reconciler_active),
             },
@@ -992,7 +999,12 @@ fn project_goals(
             _ => return Err(crate::Error::new("corrupt", "invalid goal mode")),
         };
         let subject = format!("a{agent}:{}", mode_name(mode));
-        if status == GoalStatus::Blocked {
+        if status == GoalStatus::Blocked || deferral_paused {
+            let reason = if deferral_paused {
+                deferral_limit_reason
+            } else {
+                "goal_blocked"
+            };
             let clear = action(
                 "clear",
                 "goal.clear",
@@ -1004,7 +1016,7 @@ fn project_goals(
                 format!("g{generation}:goal:{revision}:event:{event_seq}"),
                 now,
                 since,
-                "goal_blocked",
+                reason,
                 None,
                 vec![clear],
             ));

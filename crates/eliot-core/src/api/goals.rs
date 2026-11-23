@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 /// Longest retained check-output snippet in a Goal view.
 pub const MAX_GOAL_OBSERVATION_BYTES: usize = 4 * 1024;
 pub const CHECK_SPAWN_RETRYABLE: &str = "check_spawn_retryable";
+pub const UNSUCCESSFUL_TURN_NO_WORK: &str = "unsuccessful_turn_no_work";
+pub const UNSUCCESSFUL_TURN_WORK_UNVERIFIED: &str = "unsuccessful_turn_work_unverified";
 /// Longest Goal objective text.
 pub const MAX_GOAL_TEXT_BYTES: usize = 64 * 1024;
 /// Longest single check argv element or cwd.
@@ -498,6 +500,8 @@ pub struct GoalCounters {
     pub last_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_observation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_retry_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_at: Option<i64>,
     /// Session cost spent since `set` in the `max_cost` unit, in millionths,
@@ -1038,11 +1042,18 @@ impl GoalRoundRequest {
                 }
                 if response.outcome == GoalRoundOutcome::Retryable
                     && (response.view.status != GoalStatus::Active
-                        || response.reason.as_deref() != Some(CHECK_SPAWN_RETRYABLE))
+                        || !matches!(
+                            response.reason.as_deref(),
+                            Some(
+                                CHECK_SPAWN_RETRYABLE
+                                    | UNSUCCESSFUL_TURN_NO_WORK
+                                    | UNSUCCESSFUL_TURN_WORK_UNVERIFIED
+                            )
+                        ))
                 {
                     return Err(Error::new(
                         "unknown",
-                        "retryable goal.round response requires an active Goal and a start failure",
+                        "retryable goal.round response requires an active Goal and a recognized retry reason",
                     ));
                 }
             }

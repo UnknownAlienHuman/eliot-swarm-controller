@@ -48,6 +48,8 @@ pub struct GoalRoundProbe {
     /// spent-budget round still run its final check.
     pub spent_by_goal_continuation: bool,
     pub workspace: Option<String>,
+    pub task_base: Option<String>,
+    pub unsuccessful_turn: bool,
     /// Starting point of a Goal with `scope` or `check_inputs`.
     pub scope_base: Option<core::api::GoalScopeBase>,
 }
@@ -256,6 +258,7 @@ pub struct GoalRoundCommit {
 pub enum GoalRoundDecision {
     Block(String),
     RetryCheck,
+    RetryCompletion(&'static str),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -440,15 +443,48 @@ fn update_goal_round_tx(tx: &Transaction<'_>, record: &GoalRoundRecord) -> Resul
     Ok(())
 }
 
-fn abandon_goal_marker_tx(tx: &Transaction<'_>, record: &GoalRoundRecord, now: i64) -> Result<()> {
+fn abandon_goal_marker_tx(
+    tx: &Transaction<'_>,
+    record: &GoalRoundRecord,
+    custody_closed: bool,
+    now: i64,
+) -> Result<()> {
+    let agent = parse_agent_id(&record.request.agent)?;
+    let mode = record.request.mode.as_str();
+    if custody_closed
+        && load_goal_row(tx, agent, mode)?.is_some_and(|goal| {
+            goal.generation == record.generation
+                && goal
+                    .state
+                    .round_reset_revision
+                    .is_some_and(|revision| revision >= record.revision)
+        })
+    {
+        db!(tx.execute(
+            "DELETE FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND revision = ?4
+               AND round_key = ?5 AND round_key_kind = ?6 AND holder = ?7",
+            params![
+                agent,
+                mode,
+                record.generation,
+                record.revision,
+                record.key.value(),
+                record.key.kind(),
+                record.holder
+            ],
+        ));
+        return Ok(());
+    }
     db!(tx.execute(
-        "UPDATE goal_markers SET state = 'unknown', updated_at = ?1
-         WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5
-           AND round_key = ?6 AND round_key_kind = ?7 AND state = 'running' AND holder = ?8",
+        "UPDATE goal_markers SET state = 'unknown', updated_at = ?1, custody_closed = ?2
+         WHERE agent = ?3 AND mode = ?4 AND generation = ?5 AND revision = ?6
+           AND round_key = ?7 AND round_key_kind = ?8 AND state = 'running' AND holder = ?9",
         params![
             now,
-            parse_agent_id(&record.request.agent)?,
-            record.request.mode.as_str(),
+            custody_closed,
+            agent,
+            mode,
             record.generation,
             record.revision,
             record.key.value(),
@@ -521,7 +557,7 @@ fn replay_goal_round_tx(
             "goal round already in flight",
         ))));
     }
-    abandon_goal_marker_tx(tx, &record, now)?;
+    abandon_goal_marker_tx(tx, &record, false, now)?;
     let error = retain_goal_round_error_tx(tx, &mut record, &unknown_goal_round_error())?;
     Ok(Some(Err(error)))
 }
@@ -540,8 +576,14 @@ struct GoalStatePersist {
     paused_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     blocked_reason: Option<String>,
+    /// Latest Goal revision explicitly cleared by the Owner, for this
+    /// generation. A late custody proof may release markers through it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    round_reset_revision: Option<i64>,
     #[serde(default)]
     counters: GoalCounters,
+    #[serde(default)]
+    unverified_completion_rounds: i64,
     /// Slot-grid anchor captured when a cadence was set; stable across
     /// pause/clear/resume. Absent without a cadence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -571,6 +613,10 @@ struct GoalStatePersist {
     /// when launch admission binds it to a new native session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cost_base: Option<GoalCostBase>,
+    /// Set only when a confirmed Agent stop paused this Goal; the next resume of
+    /// that Agent continues it. Any manual pause, set, clear or other pause clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stop_paused: bool,
 }
 
 struct GoalRow {
@@ -638,9 +684,122 @@ pub(super) fn pause_for_restart_tx(
     Ok(())
 }
 
-/// Carry a settled Goal to a resumed generation without rearming an uncertain
-/// round or unresolved Agent effect. Turn accounting is rebased while the
-/// native session and its cost baseline remain the same retained subject.
+/// Pause an active Goal after a confirmed Agent stop. The flag marks it for
+/// automatic continuation on this Agent's next resume, which
+/// `advance_resume_tx` applies behind its custody fence.
+pub(super) fn pause_for_stop_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
+        return Ok(());
+    };
+    if row.generation != generation || row.state.status != GoalStatus::Active {
+        return Ok(());
+    }
+    row.state.status = GoalStatus::Paused;
+    row.state.paused_reason = Some("agent_stopped".to_owned());
+    row.state.stop_paused = true;
+    update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)?;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "goal.changed",
+        "goal",
+        Some(agent_num),
+        Some(generation),
+        json!({"status": "paused", "reason": "agent_stopped"}),
+    )?);
+    Ok(())
+}
+
+/// Restart reconciliation for Goals left active by a stop that predates
+/// stop-pausing: each active Eliot Goal on a Stopped Agent of its own
+/// generation takes the same stop pause. Manual pauses are untouched.
+pub(super) fn pause_stopped_active_goals_tx(
+    tx: &Transaction<'_>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let stopped: Vec<(i64, i64)> = {
+        let mut statement = tx
+            .prepare(
+                "SELECT g.agent, g.generation FROM goals g JOIN agents a ON a.id = g.agent
+                 WHERE g.mode = 'eliot' AND a.state = 'stopped'
+                   AND a.generation = g.generation
+                   AND json_extract(g.state, '$.status') = 'active'",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<(i64, i64)>>>()
+            .map_err(sql_error)?
+    };
+    for (agent_num, generation) in stopped {
+        pause_for_stop_tx(tx, agent_num, generation, now, events)?;
+    }
+    Ok(())
+}
+
+/// Resume dispatch rebinds the Goal. Native readiness or a later settlement
+/// can continue it once the Agent and Goal have no unresolved work.
+pub(super) fn continue_stop_paused_goal_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
+        return Ok(());
+    };
+    if row.state.status != GoalStatus::Paused || !row.state.stop_paused {
+        return Ok(());
+    }
+    let ready = db!(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND generation = ?2
+                      AND state IN ('idle', 'busy', 'waiting'))",
+        params![agent_num, row.generation],
+        |record| record.get::<_, bool>(0)
+    ));
+    if !ready
+        || super::has_unknown_gate(tx, agent_num)?
+        || has_unresolved_goal_round(tx, agent_num, &row.mode)?
+    {
+        return Ok(());
+    }
+    row.state.status = GoalStatus::Active;
+    row.state.paused_reason = None;
+    row.state.stop_paused = false;
+    update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)?;
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        "goal.changed",
+        "goal",
+        Some(agent_num),
+        Some(row.generation),
+        json!({"status": "active", "reason": "agent_resumed"}),
+    )?);
+    Ok(())
+}
+
+fn has_unresolved_goal_round(tx: &Transaction<'_>, agent_num: i64, mode: &str) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM goal_markers
+         WHERE agent = ?1 AND mode = ?2 AND state IN ('running', 'unknown'))",
+        params![agent_num, mode],
+        |record| record.get(0),
+    )
+    .map_err(sql_error)
+}
+
+/// Carry a Goal to a resumed generation without rearming an uncertain round
+/// or unresolved Agent effect. A stop-paused Goal follows the generation for
+/// accounting and stays paused behind the prior work fence.
 pub(super) fn advance_resume_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -657,16 +816,9 @@ pub(super) fn advance_resume_tx(
     {
         return Ok(());
     }
-    let unresolved_goal_round: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM goal_markers
-             WHERE agent = ?1 AND mode = ?2 AND state IN ('running', 'unknown'))",
-            params![agent_num, row.mode],
-            |record| record.get(0),
-        )
-        .map_err(sql_error)?;
-    let unresolved_agent_work = super::has_unknown_gate(tx, agent_num)?;
-    if unresolved_goal_round || unresolved_agent_work {
+    let unresolved_work = has_unresolved_goal_round(tx, agent_num, &row.mode)?
+        || super::has_unknown_gate(tx, agent_num)?;
+    if unresolved_work && !row.state.stop_paused {
         if row.state.status == GoalStatus::Active {
             row.state.status = GoalStatus::Paused;
             row.state.paused_reason = Some("prior Agent work is unresolved".to_owned());
@@ -683,6 +835,9 @@ pub(super) fn advance_resume_tx(
         }
         return Ok(());
     }
+    if unresolved_work {
+        row.state.paused_reason = Some("prior Agent work is unresolved".to_owned());
+    }
 
     let old_turn_count = count_turns(tx, agent_num, old_generation)?;
     row.state.counters.turns_used = row.state.counters.turns_used.max(
@@ -693,6 +848,7 @@ pub(super) fn advance_resume_tx(
     row.state.transferred_turns = row.state.counters.turns_used;
     row.state.counters.turns_at_set = count_turns(tx, agent_num, next_generation)?;
     row.state.last_continuation_command_id = None;
+    row.state.round_reset_revision = None;
     let revision = row
         .revision
         .checked_add(1)
@@ -853,6 +1009,7 @@ pub(super) fn transfer_goal_tx(
     let mut cleared = source.state.clone();
     cleared.status = GoalStatus::Cleared;
     cleared.paused_reason = None;
+    cleared.stop_paused = false;
     cleared.last_continuation_command_id = None;
     tx.execute("UPDATE goals SET revision=?1,state=?2,last_round_key=NULL,updated_at=?3 WHERE agent=?4 AND mode='eliot'",
         params![source.revision.checked_add(1).ok_or_else(||Error::new("bad_state","Goal revision overflow"))?,encode_json(&cleared)?,now,from_num]).map_err(sql_error)?;
@@ -860,6 +1017,7 @@ pub(super) fn transfer_goal_tx(
         .map_or(Some(1), |row| row.revision.checked_add(1))
         .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
     source.state.status = GoalStatus::Paused;
+    source.state.stop_paused = false;
     // The assignment launch cause names the source Agent's launch: the
     // destination was not launched by the assignment, so its Goal is not
     // assignment-owned and never claims that Agent's retirement.
@@ -883,6 +1041,7 @@ pub(super) fn transfer_goal_tx(
     source.state.counters.turns_at_set = count_turns(tx, to_num, to.generation)?;
     source.state.last_committed_slot = None;
     source.state.last_continuation_command_id = None;
+    source.state.round_reset_revision = None;
     source.state.cadence_anchor_ms = source.definition.cadence_ms.map(|_| now);
     tx.execute("INSERT INTO goals(agent,mode,generation,revision,definition,state,last_round_key,updated_at)
         VALUES (?1,'eliot',?2,?3,?4,?5,NULL,?6) ON CONFLICT(agent,mode) DO UPDATE SET
@@ -1281,9 +1440,8 @@ impl Store {
         {
             return Err(Error::new("busy", "goal round already in flight"));
         }
-        // The burn ignores revision: pause/clear/resume bump it but never
-        // unburn an unknown round key of this generation. It still separates
-        // key forms: a burned idle seq never blocks the same slot number.
+        // A retained marker burns its key across revisions and separates key
+        // forms. An explicit clear can remove it only after proven closure.
         if markers.iter().any(|marker| {
             marker.round_key == key.value()
                 && marker.kind == key.kind()
@@ -1324,6 +1482,8 @@ impl Store {
         )?;
         let scope_base = row.state.scope_base.clone();
         let project_default = row.state.project_default;
+        let unsuccessful_turn = self.goal_last_task_turn_unsuccessful(agent, &row)?;
+        let max_seq = max_agent_seq(&self.connection, &row)?;
         let view = self.goal_view(row)?;
         let probe = GoalRoundProbe {
             scope_base,
@@ -1335,13 +1495,44 @@ impl Store {
                 &agent_row,
                 agent_row.generation,
             )?,
-            max_seq: max_agent_seq(&self.connection, agent_num, agent_row.generation)?,
+            max_seq,
             turn_count,
             spent_by_goal_continuation,
             workspace: agent_row.workspace.clone(),
+            task_base: agent_row.base_oid.clone(),
+            unsuccessful_turn,
             view,
         };
         Ok(probe)
+    }
+
+    /// Resume can open a new generation before another task turn runs.
+    /// Until then, the last turn on this Agent is still the completion evidence.
+    fn goal_last_task_turn_unsuccessful(&self, agent: &str, goal: &GoalRow) -> Result<bool> {
+        let latest: Option<(i64, String)> = self
+            .connection
+            .query_row(
+                "SELECT generation, turn_id FROM turns
+                 WHERE agent = ?1 AND generation <= ?2
+                   AND (native_trigger IS NULL OR start_command_id IS NOT NULL)
+                 ORDER BY generation DESC, COALESCE(started_at, completed_at, 0) DESC, turn_id DESC
+                 LIMIT 1",
+                params![goal.agent_num, goal.generation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((generation, turn_id)) = latest else {
+            return Ok(false);
+        };
+        let turn = self
+            .get_turn(agent, generation, &turn_id)?
+            .ok_or_else(|| Error::new("source_integrity", "Goal's latest task turn is missing"))?;
+        let outcome = turn.outcome.unwrap_or(core::TurnOutcome::Unknown);
+        let reported = turn
+            .resolution_source
+            .map_or(outcome, |source| source.reported_outcome(outcome));
+        Ok(reported != core::TurnOutcome::Success)
     }
 
     /// Commit the durable in-flight marker for one round, re-validating the
@@ -1474,7 +1665,7 @@ impl Store {
             if release_marker && record.holder == self.goal_holder {
                 // A later proven closure may release the marker without
                 // replacing an already retained original request error.
-                abandon_goal_marker_tx(&tx, &record, now)?;
+                abandon_goal_marker_tx(&tx, &record, true, now)?;
             }
             let mut events = Vec::new();
             let retained = if matches!(record.outcome, StoredGoalRoundOutcome::Running)
@@ -1574,10 +1765,18 @@ impl Store {
                 "goal definition exceeds 64 KiB",
             ));
         }
+        let stop_paused = agent_row.state == AgentState::Stopped;
+        let status = if stop_paused {
+            GoalStatus::Paused
+        } else {
+            GoalStatus::Active
+        };
+        let paused_reason = stop_paused.then(|| "agent_stopped".to_owned());
         let turn_count = count_turns(&tx, agent_num, agent_row.generation)?;
         if let Some(row) = load_goal_row(&tx, agent_num, mode)? {
             if row.generation == agent_row.generation
-                && row.state.status == GoalStatus::Active
+                && row.state.status == status
+                && row.state.stop_paused == stop_paused
                 && !row.state.project_default
                 && encode_json(&row.definition)? == encoded
             {
@@ -1591,11 +1790,16 @@ impl Store {
             let revision = row.revision + 1;
             let state = GoalStatePersist {
                 transferred_turns: 0,
+                unverified_completion_rounds: 0,
                 await_first_turn: false,
                 project_default: false,
-                status: GoalStatus::Active,
-                paused_reason: None,
+                status,
+                paused_reason,
                 blocked_reason: None,
+                round_reset_revision: row
+                    .state
+                    .round_reset_revision
+                    .filter(|_| row.generation == agent_row.generation),
                 counters: GoalCounters {
                     turns_at_set: turn_count,
                     cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
@@ -1607,6 +1811,7 @@ impl Store {
                 assignment_cause: row.state.assignment_cause.clone(),
                 scope_base: scope_base.clone(),
                 cost_base: cost_base.clone(),
+                stop_paused,
             };
             db!(tx.execute(
                 "UPDATE goals SET generation = ?1, revision = ?2, definition = ?3,
@@ -1633,11 +1838,13 @@ impl Store {
             goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
         let state = GoalStatePersist {
             transferred_turns: 0,
+            unverified_completion_rounds: 0,
             await_first_turn: false,
             project_default: false,
-            status: GoalStatus::Active,
-            paused_reason: None,
+            status,
+            paused_reason,
             blocked_reason: None,
+            round_reset_revision: None,
             counters: GoalCounters {
                 turns_at_set: turn_count,
                 cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
@@ -1649,6 +1856,7 @@ impl Store {
             assignment_cause: None,
             scope_base: scope_base.clone(),
             cost_base: cost_base.clone(),
+            stop_paused,
         };
         db!(tx.execute(
             "INSERT INTO goals(agent, mode, generation, revision, definition,
@@ -1771,12 +1979,14 @@ impl Store {
                 format!("goal is {} and cannot pause", row.state.status.as_str()),
             ));
         }
-        let view = if row.state.status == GoalStatus::Paused {
+        // A stop-paused Goal becomes a manual pause, so it stops auto-continuing.
+        let view = if row.state.status == GoalStatus::Paused && !row.state.stop_paused {
             goal_view_on(&tx, &goal_holder, row)?
         } else {
             let mut state = row.state;
             state.status = GoalStatus::Paused;
             state.paused_reason = reason.map(ToOwned::to_owned);
+            state.stop_paused = false;
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after pause"))?;
@@ -1822,16 +2032,25 @@ impl Store {
         let Some(row) = load_goal_row(&tx, agent_num, mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
-        let view = if row.state.status == GoalStatus::Cleared {
+        db!(tx.execute(
+            "DELETE FROM goal_markers
+             WHERE agent = ?1 AND mode = ?2 AND generation = ?3 AND custody_closed = 1",
+            params![agent_num, mode, row.generation],
+        ));
+        let view = if row.state.status == GoalStatus::Cleared
+            && row.state.round_reset_revision.is_some()
+        {
             goal_view_on(&tx, &goal_holder, row)?
         } else {
             let state = GoalStatePersist {
                 transferred_turns: row.state.transferred_turns,
+                unverified_completion_rounds: 0,
                 await_first_turn: row.state.await_first_turn,
                 project_default: row.state.project_default,
                 status: GoalStatus::Cleared,
                 paused_reason: None,
                 blocked_reason: None,
+                round_reset_revision: Some(row.revision),
                 counters: row.state.counters,
                 cadence_anchor_ms: row.state.cadence_anchor_ms,
                 last_committed_slot: row.state.last_committed_slot,
@@ -1839,6 +2058,7 @@ impl Store {
                 assignment_cause: row.state.assignment_cause.clone(),
                 scope_base: row.state.scope_base.clone(),
                 cost_base: row.state.cost_base.clone(),
+                stop_paused: false,
             };
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
@@ -1905,6 +2125,12 @@ impl Store {
                     "observe-only Agents take no Goals",
                 ));
             }
+            if agent_row.state == AgentState::Stopped {
+                return Err(Error::new(
+                    "bad_state",
+                    "Agent is stopped; resume the Agent, which continues its Goal",
+                ));
+            }
             if row.generation != agent_row.generation {
                 return Err(Error::new(
                     "stale_generation",
@@ -1913,7 +2139,9 @@ impl Store {
             }
             let mut state = row.state;
             state.status = GoalStatus::Active;
+            state.unverified_completion_rounds = 0;
             state.paused_reason = None;
+            state.stop_paused = false;
             update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
             let updated = load_goal_row(&tx, agent_num, mode)?
                 .ok_or_else(|| Error::new("internal", "goal disappeared after resume"))?;
@@ -1945,11 +2173,13 @@ impl Store {
             .map_err(sql_error)?;
         let state = GoalStatePersist {
             transferred_turns: row.state.transferred_turns,
+            unverified_completion_rounds: row.state.unverified_completion_rounds,
             await_first_turn: row.state.await_first_turn,
             project_default: row.state.project_default,
             status: GoalStatus::Paused,
             paused_reason: Some(reason.to_owned()),
             blocked_reason: row.state.blocked_reason.clone(),
+            round_reset_revision: row.state.round_reset_revision,
             counters: row.state.counters.clone(),
             cadence_anchor_ms: row.state.cadence_anchor_ms,
             last_committed_slot: row.state.last_committed_slot,
@@ -1957,6 +2187,7 @@ impl Store {
             assignment_cause: row.state.assignment_cause.clone(),
             scope_base: row.state.scope_base.clone(),
             cost_base: row.state.cost_base.clone(),
+            stop_paused: false,
         };
         update_goal_state_tx(&tx, agent_num, &row.mode, row.revision, &state, now)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -2006,11 +2237,13 @@ impl Store {
             if row.state.status == GoalStatus::Active {
                 let state = GoalStatePersist {
                     transferred_turns: row.state.transferred_turns,
+                    unverified_completion_rounds: row.state.unverified_completion_rounds,
                     await_first_turn: row.state.await_first_turn,
                     project_default: row.state.project_default,
                     status: GoalStatus::Paused,
                     paused_reason: Some("Agent generation advanced".to_owned()),
                     blocked_reason: row.state.blocked_reason.clone(),
+                    round_reset_revision: row.state.round_reset_revision,
                     counters: row.state.counters.clone(),
                     cadence_anchor_ms: row.state.cadence_anchor_ms,
                     last_committed_slot: row.state.last_committed_slot,
@@ -2018,6 +2251,7 @@ impl Store {
                     assignment_cause: row.state.assignment_cause.clone(),
                     scope_base: row.state.scope_base.clone(),
                     cost_base: row.state.cost_base.clone(),
+                    stop_paused: false,
                 };
                 update_goal_state_tx(&tx, agent_num, mode, row.revision, &state, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
@@ -2056,8 +2290,8 @@ impl Store {
         {
             return Err(Error::new("busy", "goal round already in flight"));
         }
-        // The burn ignores revision: pause/clear/resume bump it but never
-        // unburn an unknown round key of this generation.
+        // A marker burns its key across revisions until an explicit clear
+        // and a custody proof have both occurred.
         if row.last_round_key.as_deref() == Some(&key.text())
             || markers.iter().any(|marker| {
                 marker.round_key == key.value()
@@ -2091,7 +2325,7 @@ impl Store {
                 "goal turn budget state changed since the probe",
             ));
         }
-        let claim_seq = max_agent_seq(&tx, agent_num, row.generation)?;
+        let claim_seq = max_agent_seq(&tx, &row)?;
         match key {
             GoalRoundKey::Idle(idle_seq) => {
                 if !round_key_names_idle_event(&tx, &row, idle_seq)? {
@@ -2227,6 +2461,24 @@ impl Store {
             _ => None,
         };
         let retry_check = matches!(commit.decision, Some(GoalRoundDecision::RetryCheck));
+        let retry_completion = match commit.decision {
+            Some(GoalRoundDecision::RetryCompletion(reason)) => Some(reason),
+            _ => None,
+        };
+        if retry_completion.is_some()
+            && (commit.continuation.is_some()
+                || commit.check_history.is_some()
+                || commit.project_check.is_some()
+                || commit
+                    .check
+                    .as_ref()
+                    .is_none_or(|check| check.exit_code != Some(0)))
+        {
+            return Err(Error::new(
+                "internal",
+                "deferred Goal completion requires a check pass without success effects",
+            ));
+        }
         if retry_check && commit.check.is_some() {
             return Err(Error::new(
                 "internal",
@@ -2295,12 +2547,6 @@ impl Store {
         let Some(row) = load_goal_row(&tx, agent_num, &commit.mode)? else {
             return Err(Error::new("not_found", "goal was not found"));
         };
-        if row.state.status != GoalStatus::Active {
-            return Err(Error::new(
-                "bad_state",
-                format!("goal is {} and takes no rounds", row.state.status.as_str()),
-            ));
-        }
         if row.generation != commit.expected_generation {
             return Err(Error::new(
                 "stale_generation",
@@ -2311,6 +2557,12 @@ impl Store {
             return Err(Error::new(
                 "stale_round",
                 "goal revision changed during the round",
+            ));
+        }
+        if row.state.status != GoalStatus::Active {
+            return Err(Error::new(
+                "bad_state",
+                format!("goal is {} and takes no rounds", row.state.status.as_str()),
             ));
         }
         if row.last_round_key.as_deref() == Some(&commit.round_key.text()) {
@@ -2341,7 +2593,7 @@ impl Store {
                         "round key does not name an idle event of this Agent generation",
                     ));
                 }
-                if max_agent_seq(&tx, agent_num, row.generation)? != idle_seq {
+                if max_agent_seq(&tx, &row)? != idle_seq {
                     return Err(Error::new(
                         "stale_round",
                         "Agent events advanced past the round key",
@@ -2350,7 +2602,7 @@ impl Store {
             }
             GoalRoundKey::Slot(slot) => {
                 require_slot_due(&row, slot, now)?;
-                if max_agent_seq(&tx, agent_num, row.generation)? != commit.claim_seq {
+                if max_agent_seq(&tx, &row)? != commit.claim_seq {
                     return Err(Error::new(
                         "stale_round",
                         "Agent events advanced during the round",
@@ -2403,6 +2655,13 @@ impl Store {
         }
         let turn_count = count_turns(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
+        counters.last_retry_reason = retry_completion.map(str::to_owned);
+        let unverified_completion_rounds =
+            if retry_completion == Some(core::api::UNSUCCESSFUL_TURN_WORK_UNVERIFIED) {
+                row.state.unverified_completion_rounds.saturating_add(1)
+            } else {
+                0
+            };
         counters.turns_used = counters.turns_used.max(
             row.state
                 .transferred_turns
@@ -2487,6 +2746,22 @@ impl Store {
             if let Some(reason) = blocked_reason {
                 GoalCommitOutcome::Blocked {
                     reason: reason.clone(),
+                }
+            } else if unverified_completion_rounds > 0
+                && (goal_postcheck_block(&row.definition, &counters).is_some()
+                    || row
+                        .definition
+                        .max_without_progress
+                        .or(row.definition.max_rounds.is_none().then_some(3))
+                        .is_some_and(|limit| unverified_completion_rounds >= limit))
+            {
+                GoalCommitOutcome::Blocked {
+                    reason: COMPLETION_DEFERRAL_LIMIT_REASON.to_owned(),
+                }
+            } else if retry_completion.is_some() {
+                match goal_postcheck_block(&row.definition, &counters) {
+                    Some(reason) => GoalCommitOutcome::Blocked { reason },
+                    None => GoalCommitOutcome::Retryable,
                 }
             } else if check.exit_code == Some(0) {
                 GoalCommitOutcome::Completed
@@ -2620,6 +2895,7 @@ impl Store {
             record_goal_check_history_tx(&tx, history)?;
         }
         let mut state = row.state;
+        state.unverified_completion_rounds = unverified_completion_rounds;
         state.await_first_turn = false;
         // A zero baseline (no session yet at set) binds the first session seen.
         if let (Some(base), Some(source)) = (state.cost_base.as_mut(), learned_cost_source)
@@ -2630,6 +2906,11 @@ impl Store {
         match &outcome {
             GoalCommitOutcome::Completed => {
                 state.status = GoalStatus::Completed;
+                state.last_continuation_command_id = None;
+            }
+            GoalCommitOutcome::Blocked { reason } if reason == COMPLETION_DEFERRAL_LIMIT_REASON => {
+                state.status = GoalStatus::Paused;
+                state.paused_reason = Some(reason.clone());
                 state.last_continuation_command_id = None;
             }
             GoalCommitOutcome::Blocked { reason } => {
@@ -2702,6 +2983,11 @@ impl Store {
             state.assignment_cause.clone(),
             match &outcome {
                 GoalCommitOutcome::Completed => Some(("completed", None)),
+                GoalCommitOutcome::Blocked { reason }
+                    if reason == COMPLETION_DEFERRAL_LIMIT_REASON =>
+                {
+                    Some(("paused", Some(reason.clone())))
+                }
                 GoalCommitOutcome::Blocked { reason } => Some(("blocked", Some(reason.clone()))),
                 GoalCommitOutcome::Continued { .. } | GoalCommitOutcome::Retryable => None,
             },
@@ -2732,7 +3018,7 @@ impl Store {
             }
             GoalCommitOutcome::Retryable => (
                 GoalRoundOutcome::Retryable,
-                Some(CHECK_SPAWN_RETRYABLE.to_owned()),
+                Some(retry_completion.unwrap_or(CHECK_SPAWN_RETRYABLE).to_owned()),
                 None,
             ),
         };
@@ -3117,6 +3403,8 @@ fn escalation_admissible(principal: &str, definition: &GoalDefinition, agent: &A
         })
 }
 
+pub(crate) const COMPLETION_DEFERRAL_LIMIT_REASON: &str = "unsuccessful_turn_deferral_limit";
+
 fn goal_postcheck_block(definition: &GoalDefinition, counters: &GoalCounters) -> Option<String> {
     if definition
         .max_rounds
@@ -3417,7 +3705,7 @@ fn latest_idle_key(
     goal: &GoalRow,
     holder: &str,
 ) -> Result<Option<(i64, bool)>> {
-    let seq = max_agent_seq(connection, goal.agent_num, goal.generation)?;
+    let seq = max_agent_seq(connection, goal)?;
     if seq <= 0 || !round_key_names_automatic_idle_event(connection, goal, seq)? {
         return Ok(None);
     }
@@ -3517,6 +3805,7 @@ fn round_key_names_idle_event_with(
              AND json_extract(data, '$.revision') + 1 < ?3
          ) OR (
              json_extract(data, '$.outcome') = 'retryable'
+             AND json_extract(data, '$.reason') = 'check_spawn_retryable'
              AND json_extract(data, '$.revision') + 1 = ?3
          ) OR (
              ?4 = 1
@@ -3657,7 +3946,7 @@ fn count_turns(connection: &Connection, agent_num: i64, generation: i64) -> Resu
         .map_err(sql_error)
 }
 
-fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Result<i64> {
+fn max_agent_seq(connection: &Connection, goal: &GoalRow) -> Result<i64> {
     let sql = format!(
         "SELECT COALESCE((
              SELECT seq FROM events INDEXED BY events_agent
@@ -3665,12 +3954,25 @@ fn max_agent_seq(connection: &Connection, agent_num: i64, generation: i64) -> Re
                AND NOT {SWARM_NOTE_EVENT_SQL}
                AND NOT (kind = 'goal.round'
                         AND json_extract(data, '$.outcome') = 'unknown'
-                        AND json_extract(data, '$.reason') = 'stale_round')
+                        AND (
+                            json_extract(data, '$.reason') = 'stale_round'
+                            OR (json_extract(data, '$.mode') = ?3 AND
+                                json_extract(data, '$.revision') <= COALESCE(?4, 0))
+                        ))
              ORDER BY seq DESC LIMIT 1
          ), 0)"
     );
     connection
-        .query_row(&sql, params![agent_num, generation], |row| row.get(0))
+        .query_row(
+            &sql,
+            params![
+                goal.agent_num,
+                goal.generation,
+                goal.mode,
+                goal.state.round_reset_revision
+            ],
+            |row| row.get(0),
+        )
         .map_err(sql_error)
 }
 
@@ -3772,7 +4074,7 @@ pub(crate) fn stuck_goal_round_args(
             "slot": slot,
         })));
     }
-    let seq = max_agent_seq(connection, agent_num, row.generation)?;
+    let seq = max_agent_seq(connection, &row)?;
     if seq <= 0 || !round_key_names_idle_event(connection, &row, seq)? {
         return Ok(None);
     }
@@ -3809,11 +4111,13 @@ pub(super) fn install_assignment_goal_tx(
     definition.require_auto_bound()?;
     let state = GoalStatePersist {
         transferred_turns: 0,
+        unverified_completion_rounds: 0,
         await_first_turn: true,
         project_default,
         status: GoalStatus::Active,
         paused_reason: None,
         blocked_reason: None,
+        round_reset_revision: None,
         counters: GoalCounters::default(),
         cadence_anchor_ms: definition.cadence_ms.map(|_| now),
         last_committed_slot: None,
@@ -3824,6 +4128,7 @@ pub(super) fn install_assignment_goal_tx(
             .max_cost
             .as_ref()
             .map(|_| GoalCostBase::default()),
+        stop_paused: false,
     };
     db!(tx.execute(
         "INSERT INTO goals(agent, mode, generation, revision, definition,

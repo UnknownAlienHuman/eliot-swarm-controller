@@ -6,6 +6,8 @@
 //! Unknown check outcomes retain no Goal progress or continuation and never
 //! authorize another check; the reservation retains their error.
 
+mod program;
+
 use super::{
     Principal, Router,
     coordination::decode_coordination_request,
@@ -18,9 +20,11 @@ use crate::{
     common::now_ms,
     git_monitor::GitProbe,
     scripts::process::{
-        ProcessCapture, ProcessFailure, ProcessOutcome, local_process_command, run_owned_process,
+        ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV, local_process_command,
+        run_owned_process,
     },
 };
+use eliot_core::api::{UNSUCCESSFUL_TURN_NO_WORK, UNSUCCESSFUL_TURN_WORK_UNVERIFIED};
 use eliot_core::{
     AgentState, Error, Event, Result, SecretPolicy, StderrSnapshot,
     api::{
@@ -299,24 +303,46 @@ impl Router {
         let principal = super::principal_name(principal);
         // A retry is answered from the retained result before the workspace
         // is read again for a starting point.
-        let replay = if request.definition.tracks_changes() {
-            self.inner.store.lock().await.goal_set_replay(
+        let (replay, agent) = {
+            let mut store = self.inner.store.lock().await;
+            let replay = store.goal_set_replay(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
                 &principal,
                 &request.definition,
-            )?
-        } else {
-            None
+            )?;
+            let agent = if replay.is_none() {
+                store.get_agent(&request.agent)?
+            } else {
+                None
+            };
+            (replay, agent)
         };
         let view = match replay {
             Some(view) => view,
             None => {
+                let agent =
+                    agent.ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+                let cwd = request
+                    .definition
+                    .check_cwd
+                    .clone()
+                    .or(agent.workspace.clone());
+                program::resolve(request.definition.check[0].clone(), cwd).await?;
                 let scope_base = self
                     .goal_scope_base(&request.agent, &request.definition)
                     .await?;
-                self.inner.store.lock().await.goal_set(
+                let mut store = self.inner.store.lock().await;
+                if store.get_agent(&request.agent)?.is_none_or(|current| {
+                    current.generation != agent.generation || current.workspace != agent.workspace
+                }) {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "Goal Agent changed while its check was resolved",
+                    ));
+                }
+                store.goal_set(
                     &request.agent,
                     request.mode.as_str(),
                     &request.id,
@@ -689,6 +715,11 @@ impl Router {
         // and before the check can write anything; it is compared with the
         // read taken right after the previous failed check.
         let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
+        let work_before = if probe.unsuccessful_turn {
+            task_work_present(&probe).await
+        } else {
+            None
+        };
         let policy = self.secret_policy_snapshot();
         let retry_safe = deadline_source == eliot_core::api::GoalCheckDeadlineSource::History
             && definition.check_timeout_retry_safe
@@ -696,16 +727,24 @@ impl Router {
         let mut timeout_retry_attempted = false;
         let mut attempt_timeout_ms = check_timeout_ms;
         let mut check_duration_ms = 0_i64;
+        let check_cwd = definition.check_cwd.clone().or(probe.workspace.clone());
         let outcome = loop {
-            let outcome = match local_process_command(&definition.check[0]) {
+            let program =
+                match program::resolve(definition.check[0].clone(), check_cwd.clone()).await {
+                    Ok(path) => path,
+                    Err(error) if error.code == "check_unrunnable" => {
+                        break ProcessOutcome::ProgramUnrunnable(error);
+                    }
+                    Err(error) => break ProcessOutcome::NotSpawned(error),
+                };
+            let outcome = match local_process_command(program) {
                 Err(error) => ProcessOutcome::NotSpawned(error),
                 Ok(mut command) => {
                     command.args(&definition.check[1..]);
-                    if let Some(cwd) = definition
-                        .check_cwd
-                        .as_deref()
-                        .or(probe.workspace.as_deref())
-                    {
+                    if let Some(base) = &probe.task_base {
+                        command.env(TASK_BASE_ENV, base);
+                    }
+                    if let Some(cwd) = check_cwd.as_deref() {
                         command.current_dir(cwd);
                     }
                     let timeout = Duration::from_millis(attempt_timeout_ms as u64);
@@ -869,7 +908,7 @@ impl Router {
             }
             _ => None,
         };
-        let decision = block.map(|(reason, text)| {
+        let mut decision = block.map(|(reason, text)| {
             check.observation = Some(with_finding(
                 &text,
                 check.observation.as_deref(),
@@ -877,6 +916,31 @@ impl Router {
             ));
             GoalRoundDecision::Block(reason.to_owned())
         });
+        if decision.is_none() && probe.unsuccessful_turn {
+            let work = match work_before {
+                Some(true) => task_work_present(&probe).await,
+                other => other,
+            };
+            let defer = match work {
+                Some(true) => None,
+                Some(false) => Some((
+                    UNSUCCESSFUL_TURN_NO_WORK,
+                    "The last task turn was unsuccessful and the worktree is unchanged from the task base.",
+                )),
+                None => Some((
+                    UNSUCCESSFUL_TURN_WORK_UNVERIFIED,
+                    "The last task turn was unsuccessful and work against the task base could not be verified.",
+                )),
+            };
+            if let Some((reason, observation)) = defer {
+                check.observation = Some(with_finding(
+                    observation,
+                    check.observation.as_deref(),
+                    MAX_GOAL_OBSERVATION_BYTES,
+                ));
+                decision = Some(GoalRoundDecision::RetryCompletion(reason));
+            }
+        }
         let project_check = if probe.project_default
             && decision.is_none()
             && let Some(fingerprint) = fingerprint_before.as_ref()
@@ -887,7 +951,9 @@ impl Router {
         } else {
             None
         };
-        let check_history = (!probe.project_id.is_empty()).then(|| GoalCheckHistoryEntry {
+        let check_history = (!probe.project_id.is_empty()
+            && !matches!(decision, Some(GoalRoundDecision::RetryCompletion(_))))
+        .then(|| GoalCheckHistoryEntry {
             project_id: probe.project_id.clone(),
             check_digest: check_digest.clone(),
             duration_ms: check_duration_ms,
@@ -1002,6 +1068,22 @@ impl Router {
         match retained {
             Ok(retained) => {
                 self.publish_locked(&retained.events);
+                if error.code == "unknown"
+                    && let Some(event) = retained.events.first()
+                    && let Ok(Some(goal)) = store.goal_get(&request.agent, request.mode.as_str())
+                    && event.generation == Some(goal.generation)
+                    && event.data["revision"].as_i64() == Some(goal.revision)
+                {
+                    drop(store);
+                    self.note_goal_failure(
+                        principal,
+                        &goal,
+                        "check",
+                        &error.code,
+                        &error.message,
+                        None,
+                    );
+                }
                 retained.value
             }
             Err(error) => {
@@ -1065,6 +1147,34 @@ impl Router {
             self.publish_locked(&result.events);
             result
         };
+        if !result.events.is_empty() {
+            if let Some(check) = &commit.check
+                && let Some(exit_code) = check.exit_code.filter(|code| *code != 0)
+            {
+                self.note_goal_failure(
+                    principal,
+                    &result.view,
+                    "check_exit",
+                    &exit_code.to_string(),
+                    &format!("Check exited with code {exit_code}"),
+                    check.output_digest.as_deref(),
+                );
+            } else if let Some(decision) = &commit.decision {
+                let reason = match decision {
+                    GoalRoundDecision::Block(reason) => reason,
+                    GoalRoundDecision::RetryCheck => CHECK_SPAWN_RETRYABLE,
+                    GoalRoundDecision::RetryCompletion(reason) => reason,
+                };
+                self.note_goal_failure(
+                    principal,
+                    &result.view,
+                    "round",
+                    reason,
+                    commit.observation.as_deref().unwrap_or(reason),
+                    None,
+                );
+            }
+        }
         // The escalation configure was admitted first and is scheduled
         // first; the settings lane keeps the continuation behind it.
         if let Some(escalation) = &result.escalation
@@ -1204,8 +1314,7 @@ pub(crate) async fn run_goal_driver(
     // round resolves; never filled past shutdown.
     let mut pending_reconcile: BTreeMap<String, PendingReconcile> = BTreeMap::new();
     // A worker restart may have missed the idle event that should drive a
-    // Goal. Reconcile from durable idle keys; consumed or unknown-burned keys
-    // stay fenced by Store and are never run twice.
+    // Goal. Reconcile from durable idle keys and honor the Store's burn fence.
     reconcile_idle_goals(
         &router,
         run_check,
@@ -1753,10 +1862,8 @@ async fn drive_goal_at_idle(
 /// and counters, an ineligible subject leaves them untouched. Drifted
 /// generations are skipped without pausing: a set/resume never resumes a
 /// lost Agent, and only the round path itself may pause a drifted Goal.
-/// A consumed subject rearms only through a new Goal revision (a
-/// definition change clears the committed key); unknown-burned keys never
-/// rerun within the generation, so repeated set/retry, reads and daemon
-/// restart cannot create another round.
+/// A consumed subject rearms only through a new Goal revision. A burned
+/// marker also requires an explicit clear and proven check custody closure.
 async fn reconcile_idle_goals(
     router: &Router,
     run_check: GoalCheckRunner,
@@ -2156,6 +2263,12 @@ fn custody_proven_for_capture(capture: &ProcessCapture) -> bool {
 async fn work_fingerprint(workspace: Option<&str>) -> Option<String> {
     let git = GitProbe::new().ok()?;
     git.work_fingerprint(workspace?).await.ok()
+}
+
+async fn task_work_present(probe: &eliot_store::GoalRoundProbe) -> Option<bool> {
+    let (workspace, base) = (probe.workspace.as_deref()?, probe.task_base.as_deref()?);
+    let state = GitProbe::new().ok()?.scope_state(workspace).await.ok()?;
+    Some(state.head.as_deref()? != base || !state.changed.is_empty())
 }
 
 fn goal_continuation_text(

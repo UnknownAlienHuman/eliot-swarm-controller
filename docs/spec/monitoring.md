@@ -1134,6 +1134,12 @@ generation binding when it differs from the current Agent, and any running or un
 round marker. A blocked check includes its bounded observation and can explain the
 diagnosis of an otherwise idle Agent.
 
+`daemon.status.health` and the `swarm status` health line report
+`goals_without_progress` and `active_repeat_windows`. The Goal count reuses
+the Owner inbox projection for blocked Goals and active Goals classified as
+stuck. The repeat count covers unexpired in-memory windows that have observed
+at least one failure or refusal, including windows below the alert threshold.
+
 The standard log records `daemon.command_storm` once when an authenticated
 principal/method pair accumulates at least 32 refused submissions in its ten-second
 window. Accepted attempts still contribute to the reported attempt and accepted
@@ -1145,7 +1151,13 @@ the existing `source` field. Direct internal producers keep their method labels,
 including internal mail and attribution notices, daemon archive, attention, and
 admitted rule actions. The daemon
 shares the existing 1024-entry repeated-failure counter and flushes qualifying storm
-windows on closure or maintenance shutdown.
+windows on closure or maintenance shutdown. A qualifying storm also routes one
+daemon attention notice to the Owner.
+
+The same counter records a repeated Goal failure and routes one Owner attention
+notice at the third matching failure in a minute. A failing exit has the same
+identity whether the round continues or blocks on its budget. Replaying a retained
+Goal round reuses the original outcome without increasing the count.
 
 When the Router commits a third rejection of the same command verb for the same
 Agent within one minute, it records `daemon.repeated_command_rejected` and one

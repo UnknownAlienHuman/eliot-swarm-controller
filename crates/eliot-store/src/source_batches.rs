@@ -1017,13 +1017,30 @@ impl Store {
             )?);
         }
         committed_events.extend(provider_events);
-        if !observed && projection.is_terminal() {
-            native_children::end_native_children_with_parent_tx(
-                &tx,
-                Some((agent_num, batch.generation)),
-                now,
-                &mut committed_events,
-            )?;
+        if !observed {
+            if projection.state == AgentState::Stopped {
+                goals::pause_for_stop_tx(
+                    &tx,
+                    agent_num,
+                    batch.generation,
+                    now,
+                    &mut committed_events,
+                )?;
+            }
+            if projection.is_terminal() {
+                native_children::end_native_children_with_parent_tx(
+                    &tx,
+                    Some((agent_num, batch.generation)),
+                    now,
+                    &mut committed_events,
+                )?;
+            } else if batch
+                .events
+                .iter()
+                .any(|event| matches!(event.kind.as_str(), "session.ready" | "turn.completed"))
+            {
+                goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut committed_events)?;
+            }
         }
         committed_events.sort_by_key(|event| event.seq);
         let source_state = if projection.is_terminal() {

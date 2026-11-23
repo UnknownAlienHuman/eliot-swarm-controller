@@ -428,6 +428,12 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         "Liveness: {} moving · {} asked · {} parked · {} stuck · {} long",
         liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
     );
+    if let Some(health) = &response.health {
+        println!(
+            "Health: {} Goals without progress · {} active repeat windows",
+            health.goals_without_progress, health.active_repeat_windows
+        );
+    }
     match response.command_without_dispatcher.as_ref() {
         Some(status) => {
             let oldest = status

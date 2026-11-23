@@ -259,15 +259,18 @@ impl Router {
             let reason = goal
                 .blocked_reason
                 .as_deref()
-                .or(goal.paused_reason.as_deref());
+                .or(goal.paused_reason.as_deref())
+                .or(goal.counters.last_retry_reason.as_deref());
             let mut message = format!("Goal {state}");
             if let Some(reason) = reason {
                 message.push_str(&format!(" ({reason})"));
             }
-            if matches!(
-                goal.blocked_reason.as_deref(),
-                Some("check_unrunnable" | "check_timeout" | "check_output_limit")
-            ) && let Some(observation) = goal.counters.last_observation.as_deref()
+            if (goal.counters.last_retry_reason.is_some()
+                || matches!(
+                    goal.blocked_reason.as_deref(),
+                    Some("check_unrunnable" | "check_timeout" | "check_output_limit")
+                ))
+                && let Some(observation) = goal.counters.last_observation.as_deref()
             {
                 message.push_str(". ");
                 message.push_str(observation);
