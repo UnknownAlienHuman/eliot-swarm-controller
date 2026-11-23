@@ -1804,13 +1804,20 @@ impl Store {
             let agent = load_agent_by_num(tx, num)?.ok_or_else(|| {
                 Error::new("not_found", format!("Agent {recipient} was not found"))
             })?;
-            if let Some(project) = project
-                && agent.project_scope() != project
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "project rules send mail only within their own project",
-                ));
+            if let Some(project) = project {
+                if agent.project_scope() != project {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "project rules send mail only within their own project",
+                    ));
+                }
+                super::projects::validate_project_rule_admission_tx(
+                    tx,
+                    principal,
+                    recipient,
+                    agent.generation,
+                    "mail.send",
+                )?;
             }
             recipients.push(agent);
         }

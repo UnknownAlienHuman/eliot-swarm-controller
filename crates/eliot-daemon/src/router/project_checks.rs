@@ -574,16 +574,17 @@ async fn wants_checked_review(router: &Router, event: &Event) -> bool {
     if event.generation != Some(agent.generation) || agent.policy_opt_out_reason.is_some() {
         return false;
     }
-    let project = format!("project:{}", agent.project);
-    router
-        .inner
-        .rule_definitions
-        .lock_recover()
-        .iter()
-        .any(|((owner, _), (_, rule))| {
-            (owner == "owner" || owner == &project)
-                && rule.matches_project_review(event, &agent.project)
-        })
+    let project_principal = super::rule_principal(Some(&agent.project));
+    router.inner.rule_definitions.lock_recover().iter().any(
+        |((configured_principal, _), (_, rule))| {
+            let rule_principal = match configured_principal.as_str() {
+                "owner" => "owner",
+                scoped if scoped == project_principal => project_principal.as_str(),
+                _ => return false,
+            };
+            rule.matches_project_review(event, &agent.project, rule_principal)
+        },
+    )
 }
 
 fn is_live_generation(store: &eliot_store::Store, key: &WorkKey) -> bool {

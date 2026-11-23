@@ -1,0 +1,43 @@
+# One watch per pull request. Copy this file to <data_dir>/rules/ and
+# pr-checks.py and github_ci.py to <data_dir>/scripts/.
+# After opening or updating a PR, replace both OWNER/REPO values, all PR_NUMBER
+# values and the literal recipient a1. Use the Agent that owns this PR.
+#
+# In <data_dir>/config.toml, approve the installed Python executable.
+#
+#   [automation.run.interpreters.python]
+#   program = "C:/Python313/python.exe"
+#   argv_prefix = ["-B"]
+#
+# After the manager opens or updates the PR, start a watch with
+# swarm timer run pr-checks-PR_NUMBER. The past date makes the
+# one-shot timer manual-only. Set at to a future RFC3339 time to schedule it once.
+# The watch runs for up to six hours with backoff to 15 minutes and honors
+# GitHub's rate-limit reset. It reports expiry with the last observed state,
+# or reports a check list over 100 check runs or statuses once and stops.
+# An open PR can have zero checks when CI runs on demand. A completed result,
+# closure, or merge also ends the watch. For a shorter watch, append
+# "--watch-seconds", "SECONDS" to the command.
+# Terminal results are stored by repository, PR number and head in the private
+# script directory under .eliot/state/pr-checks/. A live read verifies the head,
+# state and update time before replay. An open or changed PR is observed afresh.
+# Budget about 23 requests in the first hour. GitHub's anonymous REST limit is
+# 60 requests/hour per IP. Use an existing gh login in the Run account for
+# authenticated reads. A direct invocation can use GITHUB_TOKEN or GH_TOKEN from
+# its environment. Keep tokens out of rule files.
+
+[[rule]]
+id = "pr-checks-PR_NUMBER"
+on = { at = "2000-01-01T00:00:00Z" }
+catch_up = "none"
+do = [
+  { action = "run", cmd = ["python", "pr-checks.py", "OWNER/REPO", "PR_NUMBER"], timeout = "6h1m" },
+]
+
+[[rule]]
+id = "deliver-pr-checks-PR_NUMBER"
+on = { event = "x.user.pr_checks_result", match = { "event.cause.rule" = "pr-checks-PR_NUMBER", "data.data.repository" = "OWNER/REPO", "data.data.pull_number" = "PR_NUMBER" } }
+once_per = "${data.key}"
+do = [
+  { action = "mail.send", to = "a1", note = true, text = "GitHub PR checks\n${data.data.summary}" },
+]

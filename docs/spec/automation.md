@@ -537,7 +537,8 @@ This connected event-rule subset supports event actions `stop`, `send`, `launch`
 `interrupt`, `steer`, `approve`, `deny`, `answer`, `mail.send`, `var.set` and `inject`, plus
 project event-rule `run` during live
 evaluation and explicit history catch-up. Event `mail.send` and `var.set` are literal
-targetless coordination actions. Event `inject` normally binds its Agent and turn
+targetless coordination actions, with an opt-in [framed mail note](#framed-rule-mail)
+for event-derived text. Event `inject` normally binds its Agent and turn
 from the captured event. The [linked launch result](#worktree-review-recipe) form
 resolves its manager from the originating launch. Event-rule `resume` is available in live evaluation
 and finite `rule.catch_up`; both use the captured event binding and ordinary command admission.
@@ -568,6 +569,40 @@ the admitted filename in the same transaction as the durable launch command. The
 stays recorded after restart and command retention. An unknown launch keeps its original
 binding and outcome. The brief and any ready marker stay in the folder.
 This is an automation increment, not a Task/Issue/acceptance engine.
+
+### CI notification recipes
+
+Install [PR checks](../../config/recipes/pr-checks.toml) and [red main](../../config/recipes/red-main.toml)
+as Owner rules with their polling scripts and `github_ci.py` under the private
+script root. The recipe headers describe interpreter approval and placeholders.
+Set each recipient to the Agent that owns the PR or handles failures on `main`.
+The Owner selects the recipient explicitly. Project-rule mail still requires
+the recipient's frozen authorization scope to match the project principal.
+
+The owner starts a one-shot watch after the manager opens or updates the PR.
+One bounded Run backs off while checks are absent or pending or GitHub is
+unavailable. An empty check list on an open PR leaves the result pending, so
+the watch works with on-demand CI. Completed checks, closure, merge, expiry and
+an oversized check list end the watch. Expiry reports the last observed state.
+The timer has no later slot. The watch verifies the current head and state
+before using a terminal report stored for that head. An open or changed PR
+gets a fresh observation. An expiry key is distinct from the completed-result
+key so a later result on the same head can still reach the manager.
+
+Red main records the failures observed on its first scan as a silent baseline.
+Later scans report failed runs outside that baseline. The event carries the run
+ID and the observed failing job names. The rule queues one framed note per run
+ID within the standard `once_per` retention and capacity. Keep the recipe's
+recent-run window shorter than key retention. Recorded GitHub runs can exercise
+the baseline with a separate local state file.
+
+Budget about 23 GitHub API requests per hour for a PR watch in its first hour
+and up to 26 per hour for red main. GitHub's anonymous quota is 60 requests per
+hour per IP address, shared across watchers. Both scripts use an available
+`GITHUB_TOKEN` or `GH_TOKEN`, then an existing `gh` login if available. The
+daemon scrubs credential environment variables from Run, so an authenticated
+`gh` in the Run account supplies credentials there. Tokens stay in memory and
+out of rule settings, argv, watch state and event payloads.
 
 ### Worktree review recipe
 
@@ -1110,14 +1145,16 @@ reuse this local path as a transport.
 Router/admission path, not a new executor. Both are targetless ordinary
 commands (`target = null`, no generation/turn/request binding) whose Core
 [`MailDefinitionArgs`/`VarDefinitionArgs`](../../crates/eliot-core/src/api/coordination.rs)
-are validated literally at admission (no templates; bounded, secret-checked
-payloads); the rule file also accepts `msg.send` as a compatibility alias for
+are validated literally at admission (bounded, secret-checked payloads).
+The rule file also accepts `msg.send` as a compatibility alias for
 `mail.send`, and the canonical verb is `mail.send` (the CLI spells the same
 effect `msg send`). Admission freezes recipient/project scope under the saved
 originating principal: Owner reaches any existing Agent and names its variable
 scope explicitly, while a project principal `project:ID` reaches only Agents in
 its own project and writes only its own `project:ID` scope (an omitted scope
-defaults to it). Project registration must grant each canonical verb explicitly in `actions`;
+defaults to it). For project mail, Store resolves the registration ID and checks
+the recipient's approved profile and checkout or managed worktree binding.
+Project registration must grant each canonical verb explicitly in `actions`;
 the captured registration revision is checked at dispatch and effect commit.
 Execution reuses the existing authorization, payload validation, mailbox limits,
 compare-and-swap/version semantics and
@@ -1143,6 +1180,16 @@ Replayed or restarted source events never duplicate the effect: an
 already Applied child returns its recorded result without a new delivery or
 write. Direct control actions stay bound to their event subject, and scripts
 are not turned into Owner RPC clients.
+
+### Framed rule mail
+
+An event rule can set `note = true` on `mail.send` to render its `text` from
+the captured event and wrap it in the shared [Swarm note frame](#inject-context-at-the-safe-point).
+This gives subjectless script events a delivery path to a configured Agent.
+The recipient and optional thread remain literal. The frame and quoted text
+must fit in the ordinary mail body bound after rendering. Swarm submits the
+result as ordinary queued mail and presents it through the normal mail wake
+and acknowledgement path when the recipient is eligible.
 
 ## Git actions
 
