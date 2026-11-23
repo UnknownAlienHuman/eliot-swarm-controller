@@ -4928,7 +4928,7 @@ impl Router {
         }
         let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
         let profile_command_issues = self.profile_command_issues(missing_commands, &probes);
-        let mut store = self.inner.store.lock().await;
+        let store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
             let installed = entry
@@ -4939,16 +4939,20 @@ impl Router {
                 .get("version")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            store.note_harness_installed(harness, version.as_deref(), now_ms())?;
-            let row = store
-                .get_harness_check(harness)?
-                .ok_or_else(|| Error::new("internal", "harness check fact is missing"))?;
-            let check_outcome = match row.outcome.as_str() {
-                eliot_core::OUTCOME_PASSED => HarnessCheckOutcome::Passed,
-                eliot_core::OUTCOME_FAILED => HarnessCheckOutcome::Failed,
+            let row = store.get_harness_check(harness)?.filter(|row| {
+                version
+                    .as_deref()
+                    .zip(row.installed_version.as_deref())
+                    .is_some_and(|(actual, recorded)| {
+                        eliot_core::same_harness_version(harness, actual, recorded)
+                    })
+            });
+            let checked = row.as_ref().filter(|row| row.version_checked());
+            let check_outcome = match checked.map(|row| row.outcome.as_str()) {
+                Some(eliot_core::OUTCOME_PASSED) => HarnessCheckOutcome::Passed,
+                Some(eliot_core::OUTCOME_FAILED) => HarnessCheckOutcome::Failed,
                 _ => HarnessCheckOutcome::NotChecked,
             };
-            let checked = !matches!(check_outcome, HarnessCheckOutcome::NotChecked);
             let contract_mismatch = store
                 .latest_event_data("harness_contract_mismatch")?
                 .and_then(|data| doctor_mismatch_text(&data));
@@ -4957,15 +4961,22 @@ impl Router {
                 installed,
                 version,
                 check_outcome,
-                checked_version: checked.then(|| row.checked_version.clone()).flatten(),
-                checked_at: checked.then_some(row.checked_at),
-                check_profile: row
-                    .check_profile
-                    .clone()
+                checked_version: checked.and_then(|row| row.checked_version.clone()),
+                checked_at: checked.map(|row| row.checked_at),
+                check_profile: checked
+                    .and_then(|row| row.check_profile.clone())
                     .filter(|profile| !profile.is_empty()),
-                not_checked_reason: (!checked).then(|| row.not_checked_reason.clone()).flatten(),
-                failure_step: row.failure_step.clone(),
-                failure_error: row.failure_error.clone(),
+                not_checked_reason: if checked.is_none() && installed {
+                    Some(
+                        row.as_ref()
+                            .and_then(|row| row.not_checked_reason.clone())
+                            .unwrap_or_else(|| eliot_core::NOT_CHECKED_NEW_VERSION.to_owned()),
+                    )
+                } else {
+                    None
+                },
+                failure_step: checked.and_then(|row| row.failure_step.clone()),
+                failure_error: checked.and_then(|row| row.failure_error.clone()),
                 doc_section: eliot_core::harness_doc_section(harness).to_owned(),
                 contract_mismatch,
             });

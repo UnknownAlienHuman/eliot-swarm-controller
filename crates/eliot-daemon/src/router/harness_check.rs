@@ -62,13 +62,13 @@ impl Router {
         let now = now_ms();
         let (due, orphans) = {
             let mut store = self.inner.store.lock().await;
-            let released = store
-                .release_stale_harness_attempts(now, eliot_core::HARNESS_CHECK_STALE_ATTEMPT_MS)?;
-            if !released.is_empty() {
+            let settled = store
+                .settle_stale_harness_attempts(now, eliot_core::HARNESS_CHECK_STALE_ATTEMPT_MS)?;
+            if !settled.is_empty() {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
-                    "harness.check_claim_released",
-                    &[("harness", released.join(",").as_str())],
+                    "harness.check_claim_expired",
+                    &[("harness", settled.join(",").as_str())],
                     None,
                 );
             }
@@ -397,8 +397,7 @@ impl Router {
     }
 
     /// Drive one admitted scenario to its recorded outcome, then delete its
-    /// Agent. A daemon shutdown records nothing: the stale window releases
-    /// the claim for a later tick.
+    /// Agent. On shutdown, restart maintenance settles any expired claim.
     pub(crate) async fn drive_harness_check(
         &self,
         work: HarnessCheckWork,

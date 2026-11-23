@@ -114,7 +114,9 @@ reader reaps the owned helper on a deadline or read failure.
 An initial plugin may declare:
 
 The [`PluginManifest`](../../crates/eliot-plugin/src/protocol.rs) DTO owns the manifest
-field catalog.
+field catalog. The manifest carries the adapter package version. Swarm reads
+the installed vendor version through install discovery and reports its check in
+[`harness.doctor`](monitoring.md#heavy-work-session-growth-and-harness-checks).
 
 `proxy` remains a string capability. "none" remains valid for direct native
 adapters (for example direct Codex). A controlled Codex profile with an adopted Responses route

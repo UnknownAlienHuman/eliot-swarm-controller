@@ -1433,7 +1433,9 @@ harness self-check fact.
    or the failed step with the vendor's error. A quota refusal stays
    "not checked" and runs again after the hold ends. A failed check removes
    the harness from automatic routing until a later check passes; explicit
-   Owner launches still work.
+   Owner launches still work. An installation change preserves that routing
+   block while the new version awaits its check. Swarm retains prior outcomes
+   to avoid checking the same version again after a downgrade.
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
 (per-harness installed version plus its self-check record, also `swarm doctor`),

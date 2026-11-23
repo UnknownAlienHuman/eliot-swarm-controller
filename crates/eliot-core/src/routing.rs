@@ -58,7 +58,7 @@ impl RouteSkipReason {
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
             Self::InvalidProfile => "profile does not resolve",
-            Self::HarnessCheckFailed => "harness self-check failed for the installed version",
+            Self::HarnessCheckFailed => "harness self-check failed and awaits a later pass",
         }
     }
 }

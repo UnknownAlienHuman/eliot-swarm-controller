@@ -617,12 +617,21 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             }
             HarnessCheckOutcome::Passed => {
                 println!(
-                    "  check: version {} passed{}",
-                    entry.checked_version.as_deref().unwrap_or("-"),
+                    "  check: passed{}{}",
                     entry
                         .check_profile
                         .as_deref()
-                        .map_or(String::new(), |profile| format!(" on {profile}"))
+                        .map_or(String::new(), |profile| format!(" on {profile}")),
+                    entry
+                        .checked_at
+                        .and_then(|ms| {
+                            std::time::UNIX_EPOCH
+                                .checked_add(Duration::from_millis(u64::try_from(ms).ok()?))
+                        })
+                        .map_or(String::new(), |time| format!(
+                            " at {}",
+                            humantime::format_rfc3339(time)
+                        ))
                 );
             }
             HarnessCheckOutcome::Failed => {
@@ -647,9 +656,6 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             .harnesses
             .iter()
             .find(|row| row.harness == issue.harness);
-        if let Some(harness) = harness {
-            println!("  adapter verified with {}", harness.verified_version);
-        }
         match (&issue.replacement, harness) {
             (Some(replacement), _) => {
                 let version = replacement.version.as_deref().unwrap_or("version unknown");

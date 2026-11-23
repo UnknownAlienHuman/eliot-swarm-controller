@@ -191,6 +191,7 @@ impl Store {
                     && previous
                         .as_deref()
                         .is_none_or(|before| !core::same_harness_version(harness, before, version))
+                    && harness_check_idle(&tx, harness)?
                 {
                     if current.version_checked()
                         && let Some(checked) = current.checked_version.as_deref()
@@ -574,11 +575,9 @@ impl Store {
             .collect())
     }
 
-    /// Release check claims older than `stale_after_ms`: a dead daemon never
-    /// records their run, and without a release the version could never run
-    /// again. Returns the released harnesses. Live runs always finish inside
-    /// the check timeout, so the threshold must stay above it.
-    pub fn release_stale_harness_attempts(
+    /// Settle expired claims conservatively. A stopped daemon may already have
+    /// sent a native request, so maintenance cannot replay that version.
+    pub fn settle_stale_harness_attempts(
         &mut self,
         now: i64,
         stale_after_ms: i64,
@@ -606,8 +605,11 @@ impl Store {
             drop(released_stmt);
             if !released.is_empty() {
                 tx.execute(
-                    "UPDATE harness_checks SET attempted_version = NULL, attempted_at = 0,
-                         updated_at = ?1
+                    "UPDATE harness_checks SET checked_version = attempted_version,
+                         checked_at = ?1, outcome = 'failed', not_checked_reason = NULL,
+                         automatic_blocked = 1, failure_step = 'launch',
+                         failure_error = 'daemon ended before the scenario outcome was recorded',
+                         attempted_version = NULL, attempted_at = 0, updated_at = ?1
                      WHERE attempted_version IS NOT NULL
                        AND attempted_at > 0 AND attempted_at < ?2",
                     params![now, now.saturating_sub(stale_after_ms.max(0))],
@@ -638,4 +640,13 @@ impl Store {
             .map_err(sql_error)
             .map(|calls| calls.unwrap_or(0))
     }
+}
+
+fn harness_check_idle(db: &rusqlite::Connection, harness: &str) -> Result<bool> {
+    db.query_row(
+        "SELECT attempted_version IS NULL FROM harness_checks WHERE harness = ?1",
+        [harness],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
