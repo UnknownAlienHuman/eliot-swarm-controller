@@ -6,6 +6,7 @@ use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         data_root_only_mcp: true,
+        defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
         launch_default_resolution: true,

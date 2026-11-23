@@ -39,68 +39,63 @@ const CHECK_CLEANUP_WAIT: Duration = Duration::from_secs(5);
 const CHECK_STEER_ARM_WAIT: Duration = Duration::from_secs(30);
 
 impl Router {
-    /// Note current installations and admit at most `available` due checks.
-    /// Store admission claims each version before launch dispatch can spawn a
-    /// native process, so concurrent ticks and restarts never run one version
-    /// twice. Orphaned check Agents from a dead daemon are collected for
-    /// deletion by the caller.
+    /// Refresh the Store from the observed installation and admit one due
+    /// check after interrupted Agents have been cleaned up.
     pub(crate) async fn maintain_harness_checks(
         &self,
         available: usize,
+        inventory: &crate::adhoc::CheckInventory,
     ) -> Result<(Vec<HarnessCheckWork>, Vec<String>)> {
-        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+        if available == 0 || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok((Vec::new(), Vec::new()));
         }
-        // Read-only installation probes run outside the Store lock.
-        let mut probes = Vec::new();
-        for harness in eliot_core::api::harness::SUPPORTED_HARNESSES {
-            probes.push((
-                *harness,
-                crate::adhoc::harness_installation_async(harness).await,
-            ));
-        }
         let now = now_ms();
-        let (due, orphans) = {
+        let due = {
             let mut store = self.inner.store.lock().await;
-            let settled = store
-                .settle_stale_harness_attempts(now, eliot_core::HARNESS_CHECK_STALE_ATTEMPT_MS)?;
-            if !settled.is_empty() {
+            let released = store.release_interrupted_harness_checks(now)?;
+            if !released.is_empty() {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
-                    "harness.check_claim_expired",
-                    &[("harness", settled.join(",").as_str())],
+                    "harness.check_claim_released",
+                    &[("harness", released.join(",").as_str())],
                     None,
                 );
             }
-            for (harness, entry) in &probes {
-                let version = entry
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                store.note_harness_installed(harness, version.as_deref(), now)?;
+            for harness in eliot_core::api::harness::SUPPORTED_HARNESSES {
+                if let Some(candidate) = inventory.candidate(harness) {
+                    store.note_harness_installed(harness, candidate.version.as_deref(), now)?;
+                }
             }
-            // Fetch every due harness: ones without a configured profile are
-            // skipped below, and must not consume the run batch.
-            let due = store.due_harness_checks(now, usize::MAX)?;
-            let orphans = if available > 0 {
-                self.orphaned_harness_check_agents(&store)?
-            } else {
-                Vec::new()
-            };
-            (due, orphans)
+            let orphans = Self::orphaned_harness_check_agents(&store)?;
+            if !orphans.is_empty() {
+                return Ok((Vec::new(), orphans));
+            }
+            store.due_harness_checks(now, usize::MAX)?
         };
         let mut started = Vec::with_capacity(due.len());
         for (harness, version) in due {
             if started.len() >= available.min(eliot_core::HARNESS_CHECK_BATCH_LIMIT) {
                 break;
             }
-            let Some(profile) = self.cheapest_harness_profile(&harness) else {
-                crate::logging::record(
-                    &self.secret_policy_snapshot(),
-                    "harness.check_deferred",
-                    &[("harness", harness.as_str())],
-                    None,
-                );
+            let Some(candidate) = inventory.candidate(&harness) else {
+                continue;
+            };
+            let deferred = if HarnessCapabilities::of(&harness).defer_harness_check {
+                Some(eliot_core::NOT_CHECKED_ROUTE_UNAVAILABLE)
+            } else {
+                None
+            };
+            let profile = deferred
+                .is_none()
+                .then(|| self.cheapest_harness_profile(&harness))
+                .flatten();
+            let Some(profile) = profile else {
+                let reason = deferred.unwrap_or(eliot_core::NOT_CHECKED_NO_CHEAP_PROFILE);
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .defer_harness_check_profile(&harness, reason, now)?;
                 continue;
             };
             let claimed = {
@@ -110,7 +105,10 @@ impl Router {
             if !claimed {
                 continue;
             }
-            match self.start_harness_check(&harness, &version, &profile).await {
+            match self
+                .start_harness_check(&harness, &version, &profile, candidate)
+                .await
+            {
                 Ok(work) => started.push(work),
                 Err((error, step)) => {
                     self.defer_harness_check(&harness, &version, &profile, step, &error)
@@ -118,102 +116,39 @@ impl Router {
                 }
             }
         }
-        Ok((started, orphans))
+        Ok((started, Vec::new()))
     }
 
-    /// Check Agents whose run can no longer complete: no live claim holds
-    /// their harness and version, or their version already has its recorded
-    /// run. Reads committed state only; the caller deletes them unlocked.
-    fn orphaned_harness_check_agents(&self, store: &eliot_store::Store) -> Result<Vec<String>> {
+    /// With no live drives, every retained check Agent needs cleanup.
+    fn orphaned_harness_check_agents(store: &eliot_store::Store) -> Result<Vec<String>> {
         let mut orphans = Vec::new();
         let mut after: Option<String> = None;
         loop {
             let (page, more) = store.list_agents(after.as_deref(), 64)?;
-            if page.is_empty() {
-                break;
-            }
-            for agent in &page {
-                after = Some(agent.id.clone());
-                if !agent.is_harness_check() {
-                    continue;
-                }
-                let marker = agent
-                    .profile_snapshot
-                    .get(eliot_core::HARNESS_CHECK_LAUNCH_ARG);
-                let marker_version = marker
-                    .and_then(|marker| marker.get("version"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let row = store.get_harness_check(&agent.harness)?;
-                let current = row.as_ref().is_some_and(|row| {
-                    !row.version_checked()
-                        && row.installed_version.as_deref().is_some_and(|installed| {
-                            eliot_core::same_harness_version(
-                                &agent.harness,
-                                installed,
-                                marker_version,
-                            )
-                        })
-                });
-                let claimed =
-                    store
-                        .harness_check_attempt(&agent.harness)?
-                        .is_some_and(|(attempted, _)| {
-                            eliot_core::same_harness_version(
-                                &agent.harness,
-                                &attempted,
-                                marker_version,
-                            )
-                        });
-                if !(current && claimed) {
-                    orphans.push(agent.id.clone());
-                }
-            }
-            if !more {
-                break;
+            after = page.last().map(|agent| agent.id.clone());
+            orphans.extend(
+                page.into_iter()
+                    .filter(Agent::is_harness_check)
+                    .map(|agent| agent.id),
+            );
+            if !more || after.is_none() {
+                return Ok(orphans);
             }
         }
-        Ok(orphans)
     }
 
-    /// Cheapest configured profile for one harness, preferring profiles with
-    /// an explicit model. Returns `None` when no profile names the harness:
-    /// the version stays "not checked" and the tick retries the local lookup.
     fn cheapest_harness_profile(&self, harness: &str) -> Option<String> {
-        let mut ranked: Vec<(String, Option<String>)> =
-            crate::config::profile_names_for_harness(&self.inner.data_root, harness)
-                .into_iter()
-                .filter_map(|name| {
-                    let snapshot = self.resolve_profile_cached(&name).ok()?;
-                    if snapshot.get("harness").and_then(Value::as_str)? != harness {
-                        return None;
-                    }
-                    let model = snapshot
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .filter(|model| !model.trim().is_empty())
-                        .or_else(|| {
-                            snapshot
-                                .get("daemon_model")
-                                .and_then(Value::as_str)
-                                .filter(|model| !model.trim().is_empty())
-                        })
-                        .map(str::to_owned);
-                    Some((name, model))
-                })
-                .collect();
-        if ranked.is_empty() {
-            return None;
-        }
-        if ranked.iter().any(|(_, model)| model.is_some()) {
-            ranked.retain(|(_, model)| model.is_some());
-        }
-        ranked.sort_by(|left, right| {
-            eliot_core::cheapest_model_rank(left.1.as_deref().unwrap_or_default()).cmp(
-                &eliot_core::cheapest_model_rank(right.1.as_deref().unwrap_or_default()),
-            )
-        });
-        ranked.into_iter().next().map(|(name, _)| name)
+        crate::config::profile_names_for_harness(&self.inner.data_root, harness)
+            .into_iter()
+            .filter_map(|name| {
+                let snapshot = self.resolve_profile_cached(&name).ok()?;
+                if snapshot.get("harness").and_then(Value::as_str)? != harness {
+                    return None;
+                }
+                Some((check_model_rank(&snapshot)?, name))
+            })
+            .min()
+            .map(|(_, name)| name)
     }
 
     /// Admit the scenario launch for an already-claimed version. Failures
@@ -223,6 +158,7 @@ impl Router {
         harness: &str,
         version: &str,
         profile: &str,
+        candidate: &eliot_core::api::HarnessCandidate,
     ) -> std::result::Result<HarnessCheckWork, (Box<Error>, &'static str)> {
         let snapshot = self.resolve_profile_cached(profile).map_err(|error| {
             (
@@ -265,7 +201,7 @@ impl Router {
                 false,
                 false,
                 routing::LaunchRouting {
-                    harness_check_version: Some(version),
+                    harness_check_candidate: Some(candidate),
                     ..Default::default()
                 },
                 true,
@@ -401,7 +337,7 @@ impl Router {
     }
 
     /// Drive one admitted scenario to its recorded outcome, then delete its
-    /// Agent. On shutdown, restart maintenance settles any expired claim.
+    /// Agent. Restart maintenance releases interrupted claims before admitting another run.
     pub(crate) async fn drive_harness_check(
         &self,
         work: HarnessCheckWork,
@@ -437,8 +373,8 @@ impl Router {
         {
             crate::logging::record(
                 &self.secret_policy_snapshot(),
-                "daemon.harness_check_cleanup_failed",
-                &[("harness", work.harness.as_str())],
+                "daemon.harness_check_cleanup_pending",
+                &[("agent", &work.agent_id)],
                 Some(&error),
             );
         }
@@ -907,7 +843,29 @@ impl Router {
 
     /// Always attempt cleanup after a driven check: stop a live Agent, then
     /// delete it through the ordinary Owner path.
-    pub(crate) async fn cleanup_harness_check_agent(
+    pub(crate) async fn retry_harness_check_cleanup(
+        &self,
+        agent_id: &str,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let result = self
+            .cleanup_harness_check_agent(agent_id, &mut shutdown)
+            .await;
+        let code = if result.is_ok() {
+            "daemon.harness_check_cleanup_retried"
+        } else {
+            "daemon.harness_check_cleanup_pending"
+        };
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            code,
+            &[("agent", agent_id)],
+            result.as_ref().err(),
+        );
+        result
+    }
+
+    async fn cleanup_harness_check_agent(
         &self,
         agent_id: &str,
         shutdown: &mut watch::Receiver<bool>,
@@ -994,6 +952,15 @@ impl Router {
         self.signal_progress();
         Ok(admission)
     }
+}
+
+pub(super) fn check_model_rank(snapshot: &Value) -> Option<(u8, usize)> {
+    let model = snapshot
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| snapshot.get("daemon_model").and_then(Value::as_str))?;
+    eliot_core::cheapest_model_rank(model)
 }
 
 pub(super) fn configure_check_snapshot(snapshot: &mut Value, harness: &str, version: &str) {

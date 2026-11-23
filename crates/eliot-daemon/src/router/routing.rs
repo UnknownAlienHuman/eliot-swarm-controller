@@ -11,7 +11,7 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) owner_automation: bool,
     pub(super) provider_source: Option<&'a Value>,
     pub(super) preview: bool,
-    pub(super) harness_check_version: Option<&'a str>,
+    pub(super) harness_check_candidate: Option<&'a eliot_core::api::HarnessCandidate>,
 }
 
 impl LaunchRouting<'_> {

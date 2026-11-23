@@ -105,6 +105,8 @@ pub struct HarnessCapabilities {
     /// MCP identity comes only from data-root values, not the full target
     /// environment.
     pub data_root_only_mcp: bool,
+    /// The adapter is waiting on a route repair before unattended checks.
+    pub defer_harness_check: bool,
     /// Writes a prepared MCP configuration before start.
     pub prepared_mcp_config: bool,
     /// Resolves the launch executable through reader discovery.

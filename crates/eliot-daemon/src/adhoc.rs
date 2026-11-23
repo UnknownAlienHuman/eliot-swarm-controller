@@ -647,7 +647,9 @@ fn discover_cmd_for_harness(harness: &str, deadline: Instant) -> core::Result<Op
     let decl = discovery_for(harness)?;
     match decl.strategy {
         InstallStrategy::ByName => Ok(None),
-        InstallStrategy::FirstExisting => discover_first_existing(&decl),
+        InstallStrategy::FirstExisting | InstallStrategy::MetadataVersion(_) => {
+            discover_first_existing(&decl)
+        }
         InstallStrategy::NewestVerified => {
             discover_newest_verified(&decl, deadline).map(|candidate| Some(candidate.cmd))
         }
@@ -1122,7 +1124,10 @@ pub(crate) async fn reader_executable(
     let verify = discovery_for(&harness).ok();
     blocking_discovery(deadline, move || {
         let cmd = resolve_native_executable(&cmd, &harness)?;
-        let version = probe_optional_native_version(&cmd, verify.as_ref(), deadline)?;
+        let version = match verify.map(|decl| decl.strategy) {
+            Some(InstallStrategy::MetadataVersion(read)) => read(Path::new(&cmd)),
+            _ => probe_optional_native_version(&cmd, verify.as_ref(), deadline)?,
+        };
         if let Some(probe) = verify.and_then(|decl| decl.capability_probe)
             && version.is_none()
         {
@@ -1161,6 +1166,9 @@ pub(crate) async fn harness_installation_async(harness: &str) -> Value {
         .unwrap_or_else(|error| installation_error(harness, error))
 }
 
+mod check_inventory;
+pub(crate) use check_inventory::CheckInventory;
+
 fn installation_error(harness: &str, error: core::Error) -> Value {
     json!({"harness": harness, "installed": false, "cmd": null, "version": null,
         "error": error.message, "code": error.code})
@@ -1172,7 +1180,10 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
         let verify = discovery_for(harness).ok();
         let cmd = resolve_native_executable(discovered.as_deref().unwrap_or(harness), harness)?;
-        let version = probe_optional_native_version(&cmd, verify.as_ref(), deadline)?;
+        let version = match verify.map(|decl| decl.strategy) {
+            Some(InstallStrategy::MetadataVersion(read)) => read(Path::new(&cmd)),
+            _ => probe_optional_native_version(&cmd, verify.as_ref(), deadline)?,
+        };
         if let Some(probe) = verify.and_then(|decl| decl.capability_probe)
             && version.is_none()
         {
@@ -1203,6 +1214,20 @@ struct VersionKey {
     modified: Option<std::time::SystemTime>,
     size: u64,
     adapter_verification: Option<&'static str>,
+}
+
+impl VersionKey {
+    fn read(program: &str, verify: Option<&InstallDiscovery>) -> Option<Self> {
+        let metadata = Path::new(program).metadata().ok()?;
+        Some(Self {
+            program: program.to_owned(),
+            modified: metadata.modified().ok(),
+            size: metadata.len(),
+            adapter_verification: verify
+                .filter(|decl| decl.capability_probe.is_some())
+                .map(|decl| decl.name),
+        })
+    }
 }
 
 type VersionResult = core::Result<Option<String>>;
@@ -1250,15 +1275,7 @@ fn probe_native_version(
     if !path.is_absolute() || !is_native_executable(path) {
         return Err(native_cmd_unavailable());
     }
-    let metadata = path.metadata().map_err(|_| native_cmd_unavailable())?;
-    let key = VersionKey {
-        program: program.to_owned(),
-        modified: metadata.modified().ok(),
-        size: metadata.len(),
-        adapter_verification: verify
-            .filter(|decl| decl.capability_probe.is_some())
-            .map(|decl| decl.name),
-    };
+    let key = VersionKey::read(program, verify).ok_or_else(native_cmd_unavailable)?;
     let leader = match version_inflight_join(&key) {
         VersionProbeRole::Cached(result) => return Ok(result),
         VersionProbeRole::Leader(probe) => probe,
@@ -1342,6 +1359,12 @@ fn probe_version_uncached(
             return Ok(None);
         }
     }
+    crate::logging::record(
+        &core::SecretPolicy::default(),
+        "harness.version_probe",
+        &[("method", "--version")],
+        None,
+    );
     let bytes = native_capture(
         program,
         &["--version"],

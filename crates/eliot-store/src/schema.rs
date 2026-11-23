@@ -2606,7 +2606,8 @@ impl Store {
                          CHECK(outcome IN ('not_checked', 'passed', 'failed')),
                      not_checked_reason TEXT
                          CHECK(not_checked_reason IS NULL
-                             OR not_checked_reason IN ('new_version', 'quota')),
+                             OR not_checked_reason IN
+                                 ('new_version', 'quota', 'no_cheap_profile', 'route_unavailable')),
                      checked_version TEXT NOT NULL DEFAULT '',
                      checked_at INTEGER NOT NULL DEFAULT 0 CHECK(checked_at >= 0),
                      check_profile TEXT,

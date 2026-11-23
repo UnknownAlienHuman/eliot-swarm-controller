@@ -62,10 +62,8 @@ pub(crate) async fn run(
     Ok(())
 }
 
-/// Swarm's own post-update harness check (#932 item 3). Each tick notes the
-/// installed versions, admits due checks (at most one runs at a time), and
-/// drives admitted scenarios to their recorded outcome on spawned tasks.
-/// Check Agents orphaned by a dead daemon are deleted here.
+/// Maintain post-update checks and retry cleanup before admitting new work.
+/// Inventory discovers executable changes at startup and at most hourly.
 async fn run_harness_check_maintenance(
     router: crate::router::Router,
     policy: Arc<SecretPolicy>,
@@ -80,14 +78,15 @@ async fn run_harness_check_maintenance(
             _ = ticker.tick() => {
                 let available = eliot_core::HARNESS_CHECK_BATCH_LIMIT
                     .saturating_sub(check_tasks.len());
-                match router.maintain_harness_checks(available).await {
+                let inventory = crate::adhoc::CheckInventory::refresh(&policy).await;
+                match router.maintain_harness_checks(available, &inventory).await {
                     Ok((started, orphans)) => {
                         for agent_id in orphans {
                             let orphan_router = router.clone();
-                            let mut orphan_shutdown = shutdown.clone();
+                            let orphan_shutdown = shutdown.clone();
                             check_tasks.spawn(async move {
                                 orphan_router
-                                    .cleanup_harness_check_agent(&agent_id, &mut orphan_shutdown)
+                                    .retry_harness_check_cleanup(&agent_id, orphan_shutdown)
                                     .await
                             });
                         }

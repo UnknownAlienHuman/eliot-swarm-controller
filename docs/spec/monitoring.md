@@ -1434,8 +1434,15 @@ harness self-check fact.
    "not checked" and runs again after the hold ends. A failed check removes
    the harness from automatic routing until a later check passes; explicit
    Owner launches still work. An installation change preserves that routing
-   block while the new version awaits its check. Swarm retains prior outcomes
-   to avoid checking the same version again after a downgrade.
+   block while the new version awaits its check. Swarm restores the recorded
+   outcome and routing eligibility when a previously checked version returns.
+   A daemon interruption releases the claim for a fresh check after cleanup.
+   Maintenance retries and logs incomplete cleanup before admitting new checks.
+   Installation inventory runs at daemon start and at most hourly. It compares
+   resolved executable paths, sizes and modification times before probing.
+   Muse version discovery reads installation metadata, and its scenario is
+   deferred pending #949. A harness without a configured free or known cheap
+   model reports "not checked (no cheap profile)" and spends no inference.
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
 (per-harness installed version plus its self-check record, also `swarm doctor`),

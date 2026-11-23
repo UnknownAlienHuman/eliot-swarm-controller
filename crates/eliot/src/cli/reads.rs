@@ -610,7 +610,7 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
         match entry.check_outcome {
             HarnessCheckOutcome::NotChecked => {
                 if let Some(reason) = &entry.not_checked_reason {
-                    println!("  check: not checked ({reason})");
+                    println!("  check: not checked ({})", reason.replace('_', " "));
                 } else {
                     println!("  check: not checked");
                 }

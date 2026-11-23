@@ -234,9 +234,10 @@ impl Store {
                     tx.execute(
                         "UPDATE harness_checks
                          SET (checked_version, checked_at, outcome, check_profile,
-                              failure_step, failure_error, not_checked_reason) =
+                              failure_step, failure_error, not_checked_reason, automatic_blocked) =
                              (history.checked_version, history.checked_at, history.outcome,
-                              history.check_profile, history.failure_step, history.failure_error, NULL)
+                              history.check_profile, history.failure_step, history.failure_error,
+                              NULL, history.outcome = 'failed')
                          FROM harness_check_history AS history
                          WHERE harness_checks.harness = ?1 AND history.harness = ?1
                            AND history.version_key = ?2",
@@ -456,33 +457,6 @@ impl Store {
         self.record_harness_outcome(harness, version, profile, HarnessOutcome::quota(), now)
     }
 
-    /// The live run claim for one harness, if any: the claimed version and
-    /// when it was claimed.
-    pub fn harness_check_attempt(&self, harness: &str) -> Result<Option<(String, i64)>> {
-        check_harness(harness)?;
-        self.ensure_committed_reads()?;
-        self.connection
-            .query_row(
-                "SELECT attempted_version, attempted_at FROM harness_checks
-                 WHERE harness = ?1",
-                params![harness],
-                |row| {
-                    let version: Option<String> = row.get(0)?;
-                    let at: i64 = row.get(1)?;
-                    Ok((version, at))
-                },
-            )
-            .optional()
-            .map_err(sql_error)
-            .map(|row| {
-                row.and_then(|(version, at)| {
-                    version
-                        .filter(|version| !version.is_empty())
-                        .map(|version| (version, at))
-                })
-            })
-    }
-
     /// Release one live run claim without recording a run, so the version may
     /// run again on a later tick. Returns true when a matching claim existed.
     pub fn release_harness_check_claim(
@@ -575,50 +549,52 @@ impl Store {
             .collect())
     }
 
-    /// Settle expired claims conservatively. A stopped daemon may already have
-    /// sent a native request, so maintenance cannot replay that version.
-    pub fn settle_stale_harness_attempts(
-        &mut self,
-        now: i64,
-        stale_after_ms: i64,
-    ) -> Result<Vec<String>> {
+    /// When the maintenance worker has no active drive, surviving claims
+    /// belong to an interrupted check. A new check uses a fresh Agent.
+    pub fn release_interrupted_harness_checks(&mut self, now: i64) -> Result<Vec<String>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let mut released_stmt = tx
-                .prepare_cached(
-                    "SELECT harness FROM harness_checks
-                     WHERE attempted_version IS NOT NULL
-                       AND attempted_at > 0 AND attempted_at < ?1",
-                )
-                .map_err(sql_error)?;
-            let released: Vec<String> = released_stmt
-                .query_map(params![now.saturating_sub(stale_after_ms.max(0))], |row| {
-                    row.get(0)
-                })
-                .map_err(sql_error)?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(sql_error)?;
-            drop(released_stmt);
-            if !released.is_empty() {
-                tx.execute(
-                    "UPDATE harness_checks SET checked_version = attempted_version,
-                         checked_at = ?1, outcome = 'failed', not_checked_reason = NULL,
-                         automatic_blocked = 1, failure_step = 'launch',
-                         failure_error = 'daemon ended before the scenario outcome was recorded',
-                         attempted_version = NULL, attempted_at = 0, updated_at = ?1
-                     WHERE attempted_version IS NOT NULL
-                       AND attempted_at > 0 AND attempted_at < ?2",
-                    params![now, now.saturating_sub(stale_after_ms.max(0))],
-                )
-                .map_err(sql_error)?;
-            }
+            let released = {
+                let mut stmt = tx
+                    .prepare_cached(
+                        "UPDATE harness_checks SET attempted_version = NULL, attempted_at = 0,
+                         updated_at = ?1 WHERE attempted_version IS NOT NULL RETURNING harness",
+                    )
+                    .map_err(sql_error)?;
+                stmt.query_map([now], |row| row.get(0))
+                    .map_err(sql_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sql_error)?
+            };
             commit_transaction(tx, &self.write_faulted)?;
             Ok(released)
         })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Record an eligibility deferral without claiming or spending a run.
+    pub fn defer_harness_check_profile(
+        &mut self,
+        harness: &str,
+        reason: &str,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = self
+            .connection
+            .execute(
+                "UPDATE harness_checks SET not_checked_reason = ?2, updated_at = ?3
+             WHERE harness = ?1 AND attempted_version IS NULL AND outcome = 'not_checked'
+               AND not_checked_reason IS NOT ?2",
+                params![harness, reason, now],
+            )
+            .map(|_| ())
+            .map_err(sql_error);
         self.fault_on_persistence_error(&result);
         result
     }

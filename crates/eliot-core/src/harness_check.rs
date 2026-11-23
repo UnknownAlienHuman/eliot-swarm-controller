@@ -12,7 +12,7 @@
 
 /// Ordered scenario steps. The check records the first step that fails with
 /// the vendor's error. `select_profile` covers choosing the cheapest
-/// configured model before any launch; it fails when no profile exists.
+/// configured model before any launch.
 pub const CHECK_STEPS: &[&str] = &[
     "select_profile",
     "launch",
@@ -30,6 +30,8 @@ pub const OUTCOME_FAILED: &str = "failed";
 /// Stored reasons for `not_checked` in `harness_checks.not_checked_reason`.
 pub const NOT_CHECKED_NEW_VERSION: &str = "new_version";
 pub const NOT_CHECKED_QUOTA: &str = "quota";
+pub const NOT_CHECKED_NO_CHEAP_PROFILE: &str = "no_cheap_profile";
+pub const NOT_CHECKED_ROUTE_UNAVAILABLE: &str = "route_unavailable";
 
 /// Snapshot marker naming the daemon-owned check Agent's harness and
 /// version, mirroring the provider-probe launch argument.
@@ -42,14 +44,10 @@ pub const HARNESS_CHECK_TIMEOUT_SECS: u64 = 600;
 /// so they never run in parallel.
 pub const HARNESS_CHECK_BATCH_LIMIT: usize = 1;
 
-/// How often the daemon looks for installed versions with a due check, in
-/// seconds. Version changes are rare; the tick only runs read-only `--version`
-/// probes until a check is due.
+/// How often the daemon admits due checks and retries cleanup.
 pub const HARNESS_CHECK_TICK_SECS: u64 = 60;
-
-/// Stale-claim horizon in milliseconds: a live run always finishes inside
-/// the check timeout, so an older claim belongs to a dead daemon.
-pub const HARNESS_CHECK_STALE_ATTEMPT_MS: i64 = (HARNESS_CHECK_TIMEOUT_SECS as i64 + 300) * 1000;
+/// Minimum interval between installation inventories in a daemon process.
+pub const HARNESS_CHECK_INVENTORY_SECS: u64 = 3600;
 
 /// Cooldown before a quota-deferred check may run again, in seconds.
 pub const HARNESS_CHECK_QUOTA_RETRY_SECS: i64 = 900;
@@ -69,34 +67,17 @@ pub const MAX_HARNESS_CHECK_VERSION_BYTES: usize = 256;
 /// Maximum stored vendor failure text length.
 pub const MAX_HARNESS_CHECK_ERROR_BYTES: usize = 1024;
 
-/// Cheapest-model rank for one configured model id: lower runs first.
-/// Explicit free tiers sort before cheap named families (`haiku`, `mini`,
-/// `flash`, `nano`), which sort before anything unrecognized; known
-/// flagship families (`sonnet`, `opus`, `pro`, `max`) sort last. Ties break
-/// on shorter model ids. This is a documented heuristic, not a price feed:
-///
-/// the stand's configured profiles are the only candidates, so the cheapest
-/// configured model is the lowest-ranked one.
-pub fn cheapest_model_rank(model: &str) -> (u8, usize) {
-    let folded = model.trim().to_ascii_lowercase();
-    let tier = if folded.contains("free") {
-        0
-    } else if folded.contains("haiku") {
-        1
-    } else if folded.contains("mini") {
-        2
-    } else if folded.contains("flash") || folded.contains("nano") {
-        3
-    } else if folded.contains("sonnet")
-        || folded.contains("opus")
-        || folded.contains("pro")
-        || folded.contains("max")
-    {
-        6
-    } else {
-        4
-    };
-    (tier, folded.len())
+/// Rank explicit free and known cheap model families by whole model-id tokens.
+pub fn cheapest_model_rank(model: &str) -> Option<(u8, usize)> {
+    let id = model.trim().rsplit('/').next()?;
+    id.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter_map(|token| {
+            ["free", "haiku", "mini", "flash", "nano"]
+                .iter()
+                .position(|family| token.eq_ignore_ascii_case(family))
+        })
+        .min()
+        .map(|rank| (rank as u8, id.len()))
 }
 
 /// True for a terminal per-version outcome: the version must not run again.

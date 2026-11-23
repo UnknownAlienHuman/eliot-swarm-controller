@@ -485,6 +485,8 @@ impl DoctorHarnessEntry {
                 if let Some(reason) = &self.not_checked_reason
                     && reason != crate::NOT_CHECKED_NEW_VERSION
                     && reason != crate::NOT_CHECKED_QUOTA
+                    && reason != crate::NOT_CHECKED_NO_CHEAP_PROFILE
+                    && reason != crate::NOT_CHECKED_ROUTE_UNAVAILABLE
                 {
                     return Err(Error::new("invalid", "doctor unchecked reason is invalid"));
                 }
