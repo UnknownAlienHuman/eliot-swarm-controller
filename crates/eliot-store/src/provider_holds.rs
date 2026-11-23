@@ -9,8 +9,8 @@ mod admin;
 use admin::{clear_hold_tx, get, get_many, list_page};
 
 use eliot_core::{
-    self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldState,
-    ProviderRestriction, ProviderRestrictionKind, TurnState,
+    self as core, Agent, Command, CommandState, ProviderHold, ProviderHoldSource,
+    ProviderHoldState, ProviderRestriction, ProviderRestrictionKind, TurnState,
     api::AgentProviderHold,
     api::{ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderHoldsResponse},
     parse_agent_id,
@@ -25,7 +25,111 @@ const AUTOMATIC_PROBE_BACKOFF_MS: [i64; 3] = [60_000, 300_000, 1_800_000];
 const BACKGROUND_PROBE_DEFER_MS: i64 = 300_000;
 const PROVIDER_HOLD_RELEASE_BATCH: usize = 64;
 
+pub(super) fn migrate_legacy_holds(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute(
+        "UPDATE provider_holds
+         SET retry_after = NULL,
+             next_probe_at = CASE WHEN kind IN ('rate_limit', 'quota') AND state = 'held'
+                  AND probe_outcome_unknown = 0 AND automatic_probes < ?1
+                  THEN updated_at + CASE probe_attempts WHEN 0 THEN ?2 WHEN 1 THEN ?3 ELSE ?4 END END
+         WHERE retry_after - updated_at > ?5",
+        params![
+            core::MAX_AUTOMATIC_PROVIDER_PROBES,
+            AUTOMATIC_PROBE_BACKOFF_MS[0],
+            AUTOMATIC_PROBE_BACKOFF_MS[1],
+            AUTOMATIC_PROBE_BACKOFF_MS[2],
+            core::MAX_PROVIDER_RESET_HORIZON_MS,
+        ],
+    )
+    .map_err(sql_error)?;
+    // Only the last refusal on the same uninterrupted hold can attribute a
+    // legacy account scope. A probe on the old shared scope may belong to a
+    // different harness. Preserve that uncertainty without transferring its claim.
+    tx.execute_batch(
+        "WITH last_refusals AS (
+            SELECT json_extract(data, '$.scope') AS scope, MAX(seq) AS seq
+            FROM events
+            WHERE kind = 'provider.hold_updated' AND json_type(data, '$.turn_id') = 'text'
+              AND json_extract(data, '$.scope') LIKE 'account:%'
+            GROUP BY 1
+         ), attributable AS (
+            SELECT hold.scope, hold.scope || '.' || producer.harness AS new_scope,
+                   producer.harness,
+                   hold.probe_command IS NOT NULL AND probe_owner.id IS NULL AS foreign_probe
+            FROM provider_holds hold
+            JOIN last_refusals refusal ON refusal.scope = hold.scope
+            JOIN events event ON event.seq = refusal.seq
+            JOIN agents producer ON producer.id = event.agent AND producer.generation = event.generation
+            LEFT JOIN commands probe ON probe.id = hold.probe_command
+            LEFT JOIN agents probe_owner ON probe_owner.id = probe.target
+              AND probe_owner.generation = probe.generation AND probe_owner.harness = producer.harness
+              AND json_extract(probe_owner.profile_snapshot, '$.account') = substr(hold.scope, 9)
+            WHERE json_extract(event.data, '$.held_since') = hold.held_since
+              AND json_extract(producer.profile_snapshot, '$.account') = substr(hold.scope, 9)
+         )
+         UPDATE provider_holds AS hold
+         SET scope = attributable.new_scope,
+             source = json_object('harness', attributable.harness),
+             probe_command = CASE WHEN attributable.foreign_probe THEN NULL ELSE hold.probe_command END,
+             state = CASE WHEN attributable.foreign_probe THEN 'held' ELSE hold.state END,
+             probe_outcome_unknown = MAX(hold.probe_outcome_unknown, attributable.foreign_probe)
+         FROM attributable WHERE hold.scope = attributable.scope;
+
+         UPDATE provider_holds SET next_probe_at = NULL
+         WHERE scope LIKE 'account:%' AND instr(substr(scope, 9), '.') = 0;",
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
 impl Store {
+    /// Use unambiguous configured accounts for unclaimed legacy holds whose
+    /// original refusal could not be attributed from retained evidence.
+    pub fn attribute_legacy_provider_holds(
+        &mut self,
+        configured_scopes: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        if configured_scopes.is_empty() {
+            return Ok(());
+        }
+        self.ensure_writer_healthy()?;
+        let updated = self
+            .connection
+            .execute(
+                "WITH candidates AS (
+                SELECT hold.scope, MIN(profile.value) AS new_scope,
+                       COALESCE(MAX(CASE WHEN profile.key = hold.probe_profile
+                                         THEN profile.key END), MIN(profile.key)) AS probe_profile
+                FROM provider_holds hold
+                JOIN json_each(?1) profile
+                  ON substr(profile.value, 1, instr(profile.value, '.') - 1) = hold.scope
+                WHERE hold.state = 'held' AND hold.probe_command IS NULL
+                GROUP BY hold.scope HAVING COUNT(DISTINCT profile.value) = 1
+             )
+             UPDATE provider_holds AS hold
+             SET scope = candidates.new_scope,
+                 probe_profile = candidates.probe_profile,
+                 next_probe_at = CASE WHEN hold.kind IN ('rate_limit', 'quota')
+                     AND hold.retry_after IS NULL AND hold.probe_outcome_unknown = 0
+                     AND hold.automatic_probes < ?2
+                     THEN hold.updated_at + CASE hold.probe_attempts
+                         WHEN 0 THEN ?3 WHEN 1 THEN ?4 ELSE ?5 END END
+             FROM candidates WHERE hold.scope = candidates.scope
+               AND NOT EXISTS (SELECT 1 FROM provider_holds WHERE scope = candidates.new_scope)",
+                params![
+                    encode_json(configured_scopes)?,
+                    core::MAX_AUTOMATIC_PROVIDER_PROBES,
+                    AUTOMATIC_PROBE_BACKOFF_MS[0],
+                    AUTOMATIC_PROBE_BACKOFF_MS[1],
+                    AUTOMATIC_PROBE_BACKOFF_MS[2],
+                ],
+            )
+            .map(|_| ())
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&updated);
+        updated
+    }
+
     /// Bind the final owner notice to the live hold in the same transaction
     /// that admits its ordinary local notify command.
     pub fn admit_provider_attention_notices(
@@ -286,6 +390,7 @@ impl Store {
                     .prepare(
                         "SELECT scope, kind, retry_after FROM provider_holds
                          WHERE state = 'held' AND kind IN ('rate_limit','quota')
+                           AND NOT (scope LIKE 'account:%' AND instr(substr(scope, 9), '.') = 0)
                            AND retry_after IS NOT NULL AND retry_after <= ?1
                          ORDER BY retry_after, scope LIMIT ?2",
                     )
@@ -969,7 +1074,9 @@ pub(super) fn terminal_tx(
         .transpose()?;
 
     let restriction_value = native_event.data.get("provider_restriction");
-    let restriction = restriction_value.and_then(parse_restriction);
+    let restriction = restriction_value
+        .and_then(|value| serde_json::from_value::<ProviderRestriction>(value.clone()).ok())
+        .filter(|restriction| restriction.validate().is_ok());
     let mut events = Vec::new();
     if let Some(restriction) = &restriction
         && let Some(event) = record_restriction_tx(tx, agent, turn_id, restriction, now)?
@@ -1160,15 +1267,6 @@ fn record_restriction_tx(
     restriction: &ProviderRestriction,
     now: i64,
 ) -> Result<Option<core::Event>> {
-    if restriction
-        .retry_after
-        .is_some_and(|retry_after| retry_after < 0)
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "provider restriction retry_after must be non-negative",
-        ));
-    }
     let scope = core::frozen_provider_scope(agent)?;
     let current = get(tx, &scope)?;
     if let Some(current) = &current
@@ -1178,6 +1276,28 @@ fn record_restriction_tx(
         // A delayed rate/quota result cannot downgrade a permanent hold.
         return Ok(None);
     }
+    let permanent = is_permanent(restriction.kind);
+    let latest_reset = now.saturating_add(core::MAX_PROVIDER_RESET_HORIZON_MS);
+    let reset_ignored = restriction.retry_after.and_then(|at| {
+        if at > latest_reset {
+            Some("beyond_horizon")
+        } else if at <= now {
+            Some("elapsed")
+        } else {
+            None
+        }
+    });
+    let vendor_reset = restriction.retry_after.filter(|_| reset_ignored.is_none());
+    let retry_after = if permanent {
+        vendor_reset
+    } else {
+        // Already-admitted turns may finish after a refusal set a future deadline.
+        let active_reset = current
+            .as_ref()
+            .and_then(|hold| hold.retry_after)
+            .filter(|at| *at > now && *at <= latest_reset);
+        vendor_reset.max(active_reset)
+    };
     let (automatic_probes, probe_outcome_unknown) = current.as_ref().map_or((0, false), |hold| {
         (hold.automatic_probes, hold.probe_outcome_unknown)
     });
@@ -1194,7 +1314,7 @@ fn record_restriction_tx(
         }
         None => (None, ProviderHoldState::Held, 0, now),
     };
-    let attempts = if restriction.retry_after.is_some() || is_permanent(restriction.kind) {
+    let attempts = if retry_after.is_some() || permanent {
         0
     } else {
         attempts
@@ -1202,7 +1322,7 @@ fn record_restriction_tx(
     let next_probe_at = if matches!(
         restriction.kind,
         ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
-    ) && restriction.retry_after.is_none()
+    ) && retry_after.is_none()
         && state == ProviderHoldState::Held
         && !probe_outcome_unknown
         && automatic_probes < core::MAX_AUTOMATIC_PROVIDER_PROBES
@@ -1214,7 +1334,12 @@ fn record_restriction_tx(
     let hold = ProviderHold {
         scope: scope.clone(),
         kind: restriction.kind,
-        retry_after: restriction.retry_after,
+        source: Some(ProviderHoldSource {
+            harness: agent.harness.clone(),
+            code: restriction.code.clone(),
+            http_status: restriction.http_status,
+        }),
+        retry_after,
         next_probe_at,
         probe_command: probe_command.clone(),
         state,
@@ -1226,13 +1351,14 @@ fn record_restriction_tx(
     hold.validate()?;
     tx.execute(
         "INSERT INTO provider_holds(scope, kind, retry_after, next_probe_at, probe_attempts,
-                                    probe_profile, probe_command, state, updated_at, held_since)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                    probe_profile, probe_command, state, updated_at, held_since, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(scope) DO UPDATE SET kind = excluded.kind,
              retry_after = excluded.retry_after, next_probe_at = excluded.next_probe_at,
              probe_attempts = excluded.probe_attempts, probe_profile = excluded.probe_profile,
              probe_command = excluded.probe_command, state = excluded.state,
-             updated_at = excluded.updated_at, held_since = excluded.held_since",
+             updated_at = excluded.updated_at, held_since = excluded.held_since,
+             source = excluded.source",
         params![
             hold.scope,
             hold.kind.as_str(),
@@ -1244,6 +1370,7 @@ fn record_restriction_tx(
             hold.state.as_str(),
             hold.updated_at,
             hold.held_since,
+            encode_json(&hold.source)?,
         ],
     )
     .map_err(sql_error)?;
@@ -1258,7 +1385,9 @@ fn record_restriction_tx(
             "turn_id": turn_id,
             "scope": hold.scope,
             "kind": hold.kind.as_str(),
+            "source": hold.source,
             "retry_after": hold.retry_after,
+            "reset_ignored": reset_ignored,
             "next_probe_at": hold.next_probe_at,
             "held_since": hold.held_since,
             "probe_command": hold.probe_command,
@@ -1453,10 +1582,7 @@ fn has_intervening_same_scope_restriction_tx(
             else {
                 continue;
             };
-            if restriction
-                .retry_after
-                .is_some_and(|retry_after| retry_after < 0)
-            {
+            if restriction.validate().is_err() {
                 continue;
             }
             let Some(candidate_agent) = load_agent_by_num(tx, candidate_agent_num)? else {
@@ -1472,17 +1598,6 @@ fn has_intervening_same_scope_restriction_tx(
             }
         }
     }
-}
-
-fn parse_restriction(value: &Value) -> Option<ProviderRestriction> {
-    let restriction = serde_json::from_value::<ProviderRestriction>(value.clone()).ok()?;
-    if restriction
-        .retry_after
-        .is_some_and(|retry_after| retry_after < 0)
-    {
-        return None;
-    }
-    Some(restriction)
 }
 
 fn is_permanent(kind: ProviderRestrictionKind) -> bool {

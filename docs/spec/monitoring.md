@@ -713,24 +713,28 @@ never counts as no progress. No temporary index, `git add`, `write-tree` or obje
 
 Provider holds are durable local coordination state. Their view and restriction shapes
 are the shared Core [`ProviderHold` and `ProviderRestriction` DTOs](../../crates/eliot-core/src/routing.rs);
-keep the serialized field catalog in Core. Derive scope only from the frozen profile snapshot: explicitly
-selected account name first, otherwise exact profile name. A shared adopted proxy is a
+keep the serialized field catalog in Core. Derive scope from the frozen launch identity
+and profile snapshot: harness and configured account name when present, otherwise the
+exact profile name. A shared adopted proxy is a
 capacity scope only, never a provider-hold scope: a per-turn restriction proves only
 the admitted account/profile restriction, not that the whole proxy service is held.
 Never infer a vendor account from credentials, endpoint responses or model metadata.
-Existing `proxy:*` hold rows remain query-visible as historical scopes; no migration
-or clearing is implied.
+Existing `proxy:*` hold rows remain query-visible. Upgrade attributes an older account
+hold to its harness when the retained refusal proves it. At daemon startup, an
+unclaimed legacy hold can also use the named account's configured profiles when
+they identify one harness. An unattributed account hold keeps its old scope and
+requires Owner clearance. Status and the Owner inbox report the missing harness
+attribution. The hold does not gate new work or schedule probes.
 
-Create or update a hold only from a structured restriction attached to the exact
-generation- and turn-bound controlled `turn.completed`. Generic failure, native error
-text, HTTP status, or a vendor-owned model-catalog response is not a restriction and
-does not create a hold.
-Antigravity's explicitly documented exception is the complete native quota
-warning matched at its plugin boundary when ACP supplies only `end_turn`;
-see [the exact fallback and captured surface](../harnesses/antigravity.md#facts-and-recovery).
-The plugin emits the same typed, exact-turn restriction; Store never parses text.
+Every harness reports confirmed native quota and rate-limit refusals through the
+same structured restriction on its exact generation- and turn-bound controlled
+`turn.completed` (#941). The adapter translates the vendor's code, HTTP status
+and reset time when available. The Store consumes the structured fact and owns hold
+policy. Generic failures, diagnostics, and model-catalog responses cannot create
+a hold. `swarm status` shows the scope, the latest recorded refusal's harness and
+available code and HTTP status, and the vendor reset time or next probe schedule.
 
-The pinned Codex 0.161 projection recognizes three exact structured codes:
+The Codex adapter recognizes three exact structured codes:
 `rateLimitExceeded` maps to rate-limit, `usageLimitExceeded` to quota, and
 `unauthorized` to auth. Four typed `codexErrorInfo` variants map to rate-limit only
 when their typed `httpStatusCode` is 429: `httpConnectionFailed`,
@@ -771,8 +775,13 @@ credentials for this mode. Its linked SEND claim and launch commit atomically be
 native spawn. The outer internal launch marker carries the frozen scope and cannot
 be submitted by a client.
 
-A provider-supplied `retry_after` is a known reset time. Bounded maintenance removes a
-held rate-limit/quota row at or after that time and records `provider.hold_cleared`.
+A provider-supplied `retry_after` is a known reset time when it is later than the
+Store's current time and at most eight days ahead. `provider.hold_updated` records
+`reset_ignored` for elapsed or out-of-range deadlines. Those refusals use the same
+backoff as a refusal without a reset unless a valid reset is already active.
+Refusals from already admitted turns can extend an active reset deadline.
+Bounded maintenance removes a held
+rate-limit/quota row at or after that deadline and records `provider.hold_cleared` (#828).
 An unresolved `Probing` claim is never cleared by time. When no reset is supplied, the
 Store persists `next_probe_at` and the completed-probe count. The initial probe is due
 after one minute. Known failed probes back off to five minutes and then thirty minutes.

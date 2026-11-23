@@ -2,7 +2,8 @@
 
 use super::{DEFAULT_LIMIT, MAX_LIMIT, mutations::nullable};
 use crate::limits::MAX_COMMAND_ID_BYTES;
-use crate::{CapacityScope, Error, ProviderHold, Result};
+use crate::routing::validate_provider_scope;
+use crate::{Error, ProviderHold, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,7 +24,7 @@ impl ProviderHoldsRequest {
         if self
             .after
             .as_deref()
-            .is_some_and(|scope| validate_scope(scope).is_err())
+            .is_some_and(|scope| validate_provider_scope(scope).is_err())
             || !(1..=MAX_LIMIT).contains(&self.effective_limit())
         {
             return Err(Error::new("invalid", "invalid provider hold page"));
@@ -94,7 +95,7 @@ pub struct ProviderClearHoldRequest {
 impl ProviderClearHoldRequest {
     pub fn validate(&self) -> Result<()> {
         validate_write_id(&self.id)?;
-        validate_scope(&self.scope)?;
+        validate_provider_scope(&self.scope)?;
         if self
             .expected_probe_command
             .as_deref()
@@ -122,14 +123,6 @@ pub struct ProviderClearHoldResponse {
     pub id: String,
     pub scope: String,
     pub cleared: bool,
-}
-
-fn validate_scope(scope: &str) -> Result<()> {
-    CapacityScope {
-        scope: scope.to_owned(),
-        max_live: None,
-    }
-    .validate()
 }
 
 fn validate_write_id(id: &str) -> Result<()> {

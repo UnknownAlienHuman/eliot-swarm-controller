@@ -419,9 +419,11 @@ pub struct MessageTime {
     pub created: i64,
 }
 
-/// Installed `Session.StructuredError`: `{type, message, status?, response?}`.
+/// Installed OpenCode 2.2.7 `Session.StructuredError`:
+/// `{type, message, status?, response?, retryAfterMs?}`.
 /// `type` is an open string (observed: `provider.no-route`); the plugin
-/// attaches it as `native_error` and never maps it to a restriction kind.
+/// attaches it as `native_error`; only exact quota/rate-limit types become a
+/// provider restriction. `retryAfterMs` is a duration, not an absolute time.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StructuredError {
@@ -430,6 +432,18 @@ pub struct StructuredError {
     pub message: String,
     #[serde(default)]
     pub status: Option<u16>,
+    #[serde(default, deserialize_with = "deserialize_retry_after_ms")]
+    pub retry_after_ms: Option<i64>,
+}
+
+fn deserialize_retry_after_ms<'de, D>(deserializer: D) -> std::result::Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_i64())
+        .filter(|retry_after_ms| *retry_after_ms >= 0))
 }
 
 impl StructuredError {
@@ -445,6 +459,9 @@ impl StructuredError {
                 | "provider.quota"
                 | "provider.free-limit"
                 | "provider.chatgpt-limit"
+                | "provider.go-limit"
+                | "provider.budget-limit"
+                | "provider.model-budget-limit"
         ) || self.error_type.starts_with("provider.")
             && self
                 .status

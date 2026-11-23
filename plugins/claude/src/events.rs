@@ -416,6 +416,12 @@ enum NativeReplyState {
     Unknown,
 }
 
+struct PendingRateLimitEvent {
+    session_id: String,
+    turn_id: String,
+    retry_after: Option<i64>,
+}
+
 struct EventProcessor {
     host: PeerClient,
     sink: CommitSink,
@@ -479,6 +485,10 @@ struct EventProcessor {
     pending_fault_gap: Option<String>,
     final_text: Option<String>,
     native_failure: Option<Error>,
+    /// Exact assistant error fact retained only through its bound terminal.
+    native_provider_restriction: Option<eliot_core::ProviderRestriction>,
+    /// Exact SDK rate-limit observation bound to the session and active turn.
+    native_rate_limit_event: Option<PendingRateLimitEvent>,
     /// Proven MCP surface from the owned stream's `system`/`init` record
     /// (names plus statuses). Retained on observation and attached to the
     /// next turn terminal so the reducer merges it into the effective set;
@@ -960,6 +970,8 @@ impl EventProcessor {
             pending_fault_gap: None,
             final_text: None,
             native_failure: None,
+            native_provider_restriction: None,
+            native_rate_limit_event: None,
             init_mcp_servers: None,
             init_context_window: None,
             latest_context_sample: None,
@@ -1233,6 +1245,7 @@ impl EventProcessor {
                 self.cancel_hook_callback(&record);
                 Ok(())
             }
+            "rate_limit_event" => self.observe_rate_limit_event(&record).await,
             _ => {
                 if record
                     .get("session_id")
@@ -1252,6 +1265,58 @@ impl EventProcessor {
                 self.record_unclassified("claude.record.type", kind).await
             }
         }
+    }
+
+    /// Keep an SDKRateLimitEvent tied to its exact session and active turn;
+    /// it contributes to the provider fact only if that turn later fails.
+    async fn observe_rate_limit_event(&mut self, record: &Value) -> Result<()> {
+        let Some(session_id) = record.get("session_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        self.check_session(session_id)?;
+        let (Some(turn_id), Some(rate_limit_info)) = (
+            self.status.active_turn_id.clone(),
+            record.get("rate_limit_info"),
+        ) else {
+            return Ok(());
+        };
+        let Some(status) = rate_limit_info.get("status").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        match status {
+            "rejected" => {
+                let previous_reset = self
+                    .native_rate_limit_event
+                    .as_ref()
+                    .filter(|event| event.session_id == session_id && event.turn_id == turn_id)
+                    .and_then(|event| event.retry_after);
+                let retry_after = rate_limit_info
+                    .get("resetsAt")
+                    .and_then(Value::as_i64)
+                    .filter(|resets_at| *resets_at >= 0)
+                    .map(|resets_at| resets_at.saturating_mul(1_000))
+                    .max(previous_reset);
+                self.native_rate_limit_event = Some(PendingRateLimitEvent {
+                    session_id: session_id.to_owned(),
+                    turn_id,
+                    retry_after,
+                });
+            }
+            "allowed" | "allowed_warning" => {
+                if self
+                    .native_rate_limit_event
+                    .as_ref()
+                    .is_some_and(|event| event.session_id == session_id && event.turn_id == turn_id)
+                {
+                    self.native_rate_limit_event = None;
+                }
+            }
+            _ => {
+                self.record_unclassified("claude.rate_limit_info.status", status)
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Every `system` line naming a session must name the exact minted id,
@@ -1376,6 +1441,8 @@ impl EventProcessor {
         self.latest_context_sample = None;
         self.first_call_usage = FirstCallUsage::default();
         self.native_failure = None;
+        self.native_provider_restriction = None;
+        self.native_rate_limit_event = None;
         self.final_text = None;
         self.empty_after_tool_hooks = 0;
         self.publish_now();
@@ -1566,6 +1633,8 @@ impl EventProcessor {
                 self.latest_context_sample = None;
                 self.first_call_usage = FirstCallUsage::default();
                 self.native_failure = None;
+                self.native_provider_restriction = None;
+                self.native_rate_limit_event = None;
                 self.final_text = None;
                 self.publish_now();
                 let session_id = self.status.session_id.as_deref().unwrap_or_default();
@@ -1723,10 +1792,10 @@ impl EventProcessor {
         }
         let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
         if main_thread {
-            self.native_failure = record
-                .get("error")
-                .and_then(Value::as_str)
-                .and_then(claude_api_failure);
+            let native_error_kind = record.get("error").and_then(Value::as_str);
+            self.native_failure = native_error_kind.and_then(claude_api_failure);
+            self.native_provider_restriction =
+                native_error_kind.and_then(claude_provider_restriction);
             if has_tool_uses {
                 self.final_text = None;
             }
@@ -3287,39 +3356,72 @@ impl EventProcessor {
             "native_status": terminal_reason.clone(),
         });
         self.scope_turn_command(&mut data);
-        // Optional native main-loop turn usage: absent/malformed usage never
+        let mut provider_restriction = self.native_provider_restriction.take();
+        let rate_limit_event = self.native_rate_limit_event.take();
         if outcome == "failure" {
             let error = self.native_failure.take();
+            if let Some(rate_limit_event) = rate_limit_event.filter(|event| {
+                self.status.session_id.as_deref() == Some(event.session_id.as_str())
+                    && event.turn_id == turn_id
+            }) {
+                match provider_restriction.as_mut() {
+                    Some(restriction)
+                        if restriction.kind == eliot_core::ProviderRestrictionKind::RateLimit =>
+                    {
+                        restriction.retry_after =
+                            restriction.retry_after.max(rate_limit_event.retry_after);
+                    }
+                    None => {
+                        provider_restriction = Some(eliot_core::ProviderRestriction {
+                            kind: eliot_core::ProviderRestrictionKind::RateLimit,
+                            retry_after: rate_limit_event.retry_after,
+                            code: Some("rate_limit_event".to_owned()),
+                            http_status: None,
+                        });
+                    }
+                    _ => {}
+                }
+            }
             if error
                 .as_ref()
                 .is_some_and(|error| error.code == "quota_exhausted")
             {
                 data["native_error"] =
                     json!({"code":"quota_exhausted", "message":"provider billing/quota refusal"});
+            }
+            let failure_origin = error
+                .as_ref()
+                .and_then(|error| error.origin)
+                .or_else(|| {
+                    provider_restriction
+                        .as_ref()
+                        .map(|_| eliot_core::FailureOrigin::Provider)
+                })
+                .unwrap_or(eliot_core::FailureOrigin::Unknown);
+            let failure_evidence = error
+                .as_ref()
+                .and_then(|error| error.origin_evidence.as_deref())
+                .unwrap_or(if provider_restriction.is_some() {
+                    "rate_limit_event reported rejected status for this session and turn"
+                } else {
+                    "terminal reason lacks a structured assistant API error"
+                });
+            if let Some(provider_restriction) = provider_restriction {
                 eliot_plugin::session::attach_provider_restriction(
                     &mut data,
-                    eliot_core::ProviderRestriction {
-                        kind: eliot_core::ProviderRestrictionKind::Quota,
-                        retry_after: None,
-                    },
+                    provider_restriction,
                     &secrets,
                 );
             }
             eliot_plugin::session::attach_failure_origin(
                 &mut data,
                 "claude",
-                error
-                    .as_ref()
-                    .and_then(|error| error.origin)
-                    .unwrap_or(eliot_core::FailureOrigin::Unknown),
-                error
-                    .as_ref()
-                    .and_then(|error| error.origin_evidence.as_deref())
-                    .unwrap_or("terminal reason lacks a structured assistant API error"),
+                failure_origin,
+                failure_evidence,
                 &secrets,
             );
         }
-        // blocks or gaps this terminal; it simply leaves `data.usage` unset.
+        // Absent or malformed native usage leaves `data.usage` unset.
         // Attaches before `attach_final_text` so the existing bounded
         // terminal-text accounting includes the usage bytes.
         let turn_usage = match self.prefix_usage.take() {
@@ -3738,8 +3840,22 @@ fn assistant_prompt_id(record: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// SDKAssistantMessage.error enum, verified in the vendor stream-json/SDK
-/// reference on 2026-11-16. Free text and generic api_error are not evidence.
+/// SDKAssistantMessage.error enum, verified against the installed Claude Code
+/// 2.1.278 bundle on 2026-11-23. Free text and generic api_error are not evidence.
+fn claude_provider_restriction(kind: &str) -> Option<eliot_core::ProviderRestriction> {
+    let restriction_kind = match kind {
+        "billing_error" => eliot_core::ProviderRestrictionKind::Quota,
+        "rate_limit" => eliot_core::ProviderRestrictionKind::RateLimit,
+        _ => return None,
+    };
+    Some(eliot_core::ProviderRestriction {
+        kind: restriction_kind,
+        retry_after: None,
+        code: Some(kind.to_owned()),
+        http_status: None,
+    })
+}
+
 fn claude_api_failure(kind: &str) -> Option<Error> {
     use eliot_core::FailureOrigin;
     if kind == "billing_error" {

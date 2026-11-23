@@ -46,10 +46,9 @@ use crate::native::{
         NativeSessionContextUsageNotification, NativeSessionReadResult,
         NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
-        NativeTurnError, NativeTurnStartedNotification, NativeTurnTerminal,
-        NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
-        NativeWorkflowItemNotification, session_usage_from_context_usage,
+        NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
+        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
+        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
         session_usage_from_token_usage, turn_usage,
     },
 };
@@ -3071,7 +3070,7 @@ impl EventProcessor {
                 "muse",
                 origin,
                 if origin == eliot_core::FailureOrigin::Provider {
-                    "MSP structured authRequired upstream error"
+                    "MSP authRequired or exact API 429 rate_limit_error refusal"
                 } else {
                     "no documented structured upstream error on native terminal"
                 },
@@ -4645,15 +4644,11 @@ fn terminal_provider_restriction(
     status: &EventStatus,
     notification: &NativeTurnCompletedNotification,
 ) -> Option<ProviderRestriction> {
-    if notification.terminal != NativeTurnTerminal::Failed
-        || status.session_id.as_deref() != Some(notification.session_id.as_str())
+    if status.session_id.as_deref() != Some(notification.session_id.as_str())
         || status.active_turn_id.as_deref() != Some(notification.turn_id.as_str())
         || status.active_command_id.is_none()
     {
         return None;
     }
-    notification
-        .error
-        .as_ref()
-        .and_then(NativeTurnError::provider_restriction)
+    notification.provider_restriction()
 }

@@ -98,11 +98,12 @@ pub use presentation::{
 };
 pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use routing::{
-    CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, PROVIDER_LAUNCH_OVERRIDE_FIELDS,
-    PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT, ProviderHold, ProviderHoldState,
-    ProviderRestriction, ProviderRestrictionKind, RouteBinding, RouteQuotaStatus, RouteSkip,
-    RouteSkipReason, RoutingDecision, frozen_provider_scope, frozen_provider_scope_for,
-    provider_switch_authority,
+    CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, MAX_PROVIDER_RESET_HORIZON_MS,
+    PROVIDER_LAUNCH_OVERRIDE_FIELDS, PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT,
+    ProviderHold, ProviderHoldSource, ProviderHoldState, ProviderRestriction,
+    ProviderRestrictionKind, RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason,
+    RoutingDecision, UNATTRIBUTED_PROVIDER_HOLD_REASON, frozen_provider_scope,
+    frozen_provider_scope_for, is_unattributed_provider_hold, provider_switch_authority,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};

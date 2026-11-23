@@ -562,27 +562,99 @@ pub enum NativeTurnTerminal {
     Other,
 }
 
-/// The settled turn-failure object: `{kind, message, retryable}`.
+/// The settled turn-failure object, with optional typed quota detail in MSP 1.4.25.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeTurnError {
     pub kind: String,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<NativeQuotaDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeQuotaDetail {
+    limit_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resets_at_ms: Option<Value>,
 }
 
 impl NativeTurnError {
-    /// Project only the installed structured auth kind. Free text, the
-    /// retryable hint and unknown future kinds stay inert.
+    /// Project the installed structured auth kind or Muse's exact native
+    /// API rate-limit error form. Generic text, the retryable hint and
+    /// unknown codes stay inert.
     pub fn provider_restriction(&self) -> Option<ProviderRestriction> {
-        if self.kind != "authRequired" {
+        if self.kind == "authRequired" {
+            return Some(ProviderRestriction {
+                kind: ProviderRestrictionKind::Auth,
+                retry_after: None,
+                code: None,
+                http_status: None,
+            });
+        }
+
+        if let Some(quota) = &self.quota {
+            let retry_after = quota
+                .resets_at_ms
+                .as_ref()
+                .and_then(|at| {
+                    at.as_i64()
+                        .filter(|at| *at >= 0)
+                        .or_else(|| at.as_u64().map(|_| i64::MAX))
+                })
+                .or_else(|| muse_api_rate_limit_restriction(&self.message)?.retry_after);
+            return Some(ProviderRestriction {
+                kind: ProviderRestrictionKind::Quota,
+                retry_after,
+                code: (quota.limit_kind == "tierLimit").then(|| "tierLimit".to_owned()),
+                http_status: None,
+            });
+        }
+
+        muse_api_rate_limit_restriction(&self.message)
+    }
+}
+
+fn muse_api_rate_limit_restriction(message: &str) -> Option<ProviderRestriction> {
+    let after_status = message.strip_prefix("API error ")?.strip_prefix("429")?;
+    let vendor_message = if let Some(after_request_id) = after_status.strip_prefix(" [request_id=")
+    {
+        let (request_id, vendor_message) = after_request_id.split_once("]: ")?;
+        if request_id.is_empty()
+            || request_id.len() > 256
+            || request_id
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b']')
+        {
             return None;
         }
-        Some(ProviderRestriction {
-            kind: ProviderRestrictionKind::Auth,
-            retry_after: None,
-        })
+        vendor_message
+    } else {
+        after_status.strip_prefix(": ")?
+    };
+    let (details, code) = vendor_message.rsplit_once(" (")?;
+    if code.strip_suffix(')')? != "rate_limit_error" || details.is_empty() {
+        return None;
     }
+
+    let retry_after = details
+        .split_once("Your usage window resets at ")
+        .and_then(|(_, reset)| reset.strip_suffix('.'))
+        .and_then(|reset| eliot_plugin::quota::reset(Some(&Value::String(reset.to_owned()))));
+    let kind = if details.starts_with("Subscription quota exhausted.") {
+        ProviderRestrictionKind::Quota
+    } else {
+        ProviderRestrictionKind::RateLimit
+    };
+
+    Some(ProviderRestriction {
+        kind,
+        retry_after,
+        code: Some("rate_limit_error".to_owned()),
+        http_status: Some(429),
+    })
 }
 
 /// `turn/completed` params: the run's durable terminal record landed.
@@ -606,6 +678,17 @@ pub struct NativeTurnCompletedNotification {
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<NativeTurnUsage>,
+}
+
+impl NativeTurnCompletedNotification {
+    /// Project only a failed terminal's structured runtime error. The
+    /// free-text reason may echo model output and is display-only.
+    pub fn provider_restriction(&self) -> Option<ProviderRestriction> {
+        if self.terminal != NativeTurnTerminal::Failed {
+            return None;
+        }
+        self.error.as_ref()?.provider_restriction()
+    }
 }
 
 /// Installed `TokenUsage` (the runtime's `Usage`, camelCased): raw token

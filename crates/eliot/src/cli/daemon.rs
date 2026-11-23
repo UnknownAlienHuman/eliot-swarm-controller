@@ -288,6 +288,9 @@ fn provider_hold_values(holds: &[ProviderHold], now_ms: i64) -> Result<Value, Fa
         return Err(Failure::new(4, "provider.holds response is invalid"));
     };
     for (row, hold) in rows.iter_mut().zip(holds) {
+        if eliot_core::is_unattributed_provider_hold(&hold.scope) {
+            row["owner_clear_reason"] = json!(eliot_core::UNATTRIBUTED_PROVIDER_HOLD_REASON);
+        }
         row["age_ms"] = if hold.held_since > 0 {
             json!(now_ms.saturating_sub(hold.held_since).max(0))
         } else {
@@ -311,23 +314,47 @@ fn print_provider_holds(holds: &[ProviderHold], now_ms: i64) {
         } else {
             "unknown".to_owned()
         };
+        let source = hold.source.as_ref().map_or_else(
+            || "source unknown".to_owned(),
+            |source| {
+                let mut label = format!("source {}", source.harness);
+                if let Some(status) = source.http_status {
+                    label.push_str(&format!(" HTTP {status}"));
+                }
+                if let Some(code) = &source.code {
+                    label.push_str(&format!(" ({code})"));
+                }
+                label
+            },
+        );
         println!(
-            "  {} · {} {} · held {} · {}",
+            "  {} · {} {} · held {} · {} · {}",
             hold.scope,
             hold.kind.as_str(),
             hold.state.as_str(),
             age,
+            source,
             provider_hold_schedule(hold, now_ms),
         );
     }
 }
 
 fn provider_hold_schedule(hold: &ProviderHold, now_ms: i64) -> String {
-    if hold.state == ProviderHoldState::Probing {
-        return "probe settling".to_owned();
+    if eliot_core::is_unattributed_provider_hold(&hold.scope) {
+        return format!(
+            "needs Owner clear ({})",
+            eliot_core::UNATTRIBUTED_PROVIDER_HOLD_REASON
+        );
+    }
+    match (hold.state, hold.retry_after) {
+        (ProviderHoldState::Probing, Some(at)) => {
+            return format!("probe settling · reset {}", provider_timestamp(at));
+        }
+        (ProviderHoldState::Probing, None) => return "probe settling".to_owned(),
+        (ProviderHoldState::Held, _) => {}
     }
     let (action, at) = match (hold.retry_after, hold.next_probe_at) {
-        (Some(at), _) => ("retry", Some(at)),
+        (Some(at), _) => ("reset", Some(at)),
         (None, Some(at)) => ("probe", Some(at)),
         (None, None) => ("retry/probe", None),
     };

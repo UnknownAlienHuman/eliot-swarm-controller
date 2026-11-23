@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 105;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 106;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2484,6 +2484,18 @@ impl Store {
                  INSERT INTO schema_migrations(version) VALUES (105);",
             )
             .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 106 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch("ALTER TABLE provider_holds ADD COLUMN source TEXT;")
+                .map_err(sql_error)?;
+            provider_holds::migrate_legacy_holds(&tx)?;
+            tx.execute_batch("INSERT INTO schema_migrations(version) VALUES (106);")
+                .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
         Ok(())

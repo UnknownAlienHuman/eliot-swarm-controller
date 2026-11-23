@@ -263,6 +263,7 @@ impl Store {
                 last_progress_at,
                 provider_scope: core::frozen_provider_scope_for(
                     &record.profile,
+                    &record.harness,
                     &profile_snapshot,
                 )?,
             });
