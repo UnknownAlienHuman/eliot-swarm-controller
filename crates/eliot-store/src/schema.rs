@@ -31,7 +31,8 @@ impl Store {
             ));
         }
         self.migrate_through_42(current)?;
-        self.migrate_after_42(current)
+        self.migrate_after_42(current)?;
+        self.migrate_work_truth(current)
     }
 
     // Keep the debug-build migration frames small enough for Windows.
@@ -2653,6 +2654,10 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
+        Ok(())
+    }
+
+    fn migrate_work_truth(&mut self, current: i64) -> Result<()> {
         if current < WORK_TRUTH_VERSION {
             let tx = self
                 .connection
