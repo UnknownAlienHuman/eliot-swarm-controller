@@ -2079,10 +2079,16 @@ impl Router {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                     bytes_reclaimed: bytes,
                 },
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
+                    detail: (item.artifact.kind == ArtifactKind::Branch).then(|| {
+                        let secrets: Vec<_> =
+                            self.inner.secrets.lock_recover().iter().cloned().collect();
+                        eliot_core::SecretPolicy::new(secrets).redact_bounded(&error.message, 512)
+                    }),
                     outcome: if matches!(error.code.as_str(), "unknown" | "remote_delete_failed") {
                         // A failed remote deletion lands here only after the
                         // local branch is already gone: the item is partial,
@@ -2662,7 +2668,7 @@ impl Router {
         let transaction = format!(
             "start\noption no-deref\n{archive}\noption no-deref\ndelete {branch_ref} {expected_tip}\nprepare\ncommit\n"
         );
-        let applied =
+        let refusal =
             Self::run_branch_ref_transaction(&probe, repo, common, &transaction, deadline).await?;
         let unknown = || {
             Error::new(
@@ -2679,11 +2685,24 @@ impl Router {
         if archive_after.as_deref() == Some(expected_tip) && branch_after.is_none() {
             return Ok(());
         }
-        if !applied && branch_after.is_some() {
-            return Err(Error::new(
-                "branch_delete_refused",
-                "Git refused the atomic archive and delete transaction and the local branch still exists",
-            ));
+        if let Some(refusal) = refusal
+            && branch_after == branch_tip
+            && archive_after == archive_tip
+        {
+            // Git is run with LC_ALL=C. This D/F conflict includes the
+            // blocking ref and the exact archive ref Git tried to create.
+            let conflict = format!("' exists; cannot create '{archive_ref}'");
+            if let Some((before, _)) = refusal.split_once(&conflict)
+                && let Some((_, blocking_ref)) = before.rsplit_once(": '")
+            {
+                return Err(Error::new(
+                    "archive_collision",
+                    format!(
+                        "Git could not create the archive because {blocking_ref} already exists"
+                    ),
+                ));
+            }
+            return Err(Error::new("branch_delete_refused", refusal));
         }
         Err(unknown())
     }
@@ -2783,13 +2802,16 @@ impl Router {
         Ok(None)
     }
 
+    /// Return a known Git refusal only for a quiescent nonzero exit.
+    /// The caller must read the refs to classify the effect.
     async fn run_branch_ref_transaction(
         probe: &crate::git_monitor::GitProbe,
         repo: &str,
         common: &Path,
         transaction: &str,
         deadline: Instant,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
+        use crate::scripts::process::{ProcessFailure, ProcessOutcome};
         let binding = GitBinding {
             git_dir: common,
             common_dir: common,
@@ -2819,14 +2841,37 @@ impl Router {
         )
         .await
         {
-            crate::scripts::process::ProcessOutcome::Completed(_) => Ok(true),
-            crate::scripts::process::ProcessOutcome::Unknown {
+            ProcessOutcome::Completed(capture) if capture.status.success() => Ok(None),
+            ProcessOutcome::Completed(capture)
+            | ProcessOutcome::Failed {
+                reason: ProcessFailure::Exit,
+                capture: Some(capture),
+            } => {
+                let stderr = capture.stderr.text.trim();
+                let detail = stderr
+                    .lines()
+                    .find(|line| line.starts_with("fatal:"))
+                    .unwrap_or(stderr);
+                Ok(Some(if detail.is_empty() {
+                    format!("Git update-ref exited with {}", capture.status)
+                } else {
+                    eliot_core::SecretPolicy::default().redact_bounded(detail, 1024)
+                }))
+            }
+            ProcessOutcome::Failed {
+                reason: ProcessFailure::Exit,
+                capture: None,
+            } => Ok(Some("Git update-ref exited unsuccessfully".to_owned())),
+            ProcessOutcome::NotSpawned(error) | ProcessOutcome::ProgramUnrunnable(error) => {
+                Err(error)
+            }
+            ProcessOutcome::Unknown {
                 quiescent: false, ..
             } => Err(Error::new(
                 "unknown",
                 "local branch retirement process custody is uncertain",
             )),
-            _ => Ok(false),
+            _ => Ok(None),
         }
     }
 
@@ -3267,10 +3312,12 @@ impl Router {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                     bytes_reclaimed: bytes,
                 },
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
+                    detail: None,
                     outcome: if error.code == "unknown" {
                         "unknown"
                     } else {

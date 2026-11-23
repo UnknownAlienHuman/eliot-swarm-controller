@@ -68,7 +68,10 @@ applicable cleanup policy.
 After confirming the branch's planned tip is still current and no worktree uses
 it, one Git ref transaction creates `refs/eliot/archive/<branch>` at that exact
 tip and deletes the local branch name. A conflicting archive ref or changed tip
-keeps the branch. An uncertain transaction remains `unknown` until exact branch
+keeps the branch. If Git exits unsuccessfully and both refs match the preflight
+readback, cleanup retains the refusal code and bounded Git detail. A ref-name
+prefix conflict reports `archive_collision` and names the blocking ref.
+An uncertain transaction remains `unknown` until exact branch
 and archive readback settles it. Archive refs stay local. An explicitly selected
 remote-branch deletion uses its existing remote-state checks. Stand
 plan/apply and `stand down` retain their independent root, registry, marker,

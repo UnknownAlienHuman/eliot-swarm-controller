@@ -398,6 +398,8 @@ pub struct CleanupItemOutcome {
     pub artifact_id: String,
     pub outcome: String,
     pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub bytes_reclaimed: u64,
 }
 

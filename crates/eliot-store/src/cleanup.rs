@@ -899,6 +899,7 @@ impl Store {
                     artifact_id: artifact.id.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                     bytes_reclaimed: 0,
                 };
                 response.items[index] = settled.clone();
@@ -931,6 +932,7 @@ impl Store {
                 .iter()
                 .map(|item| CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
+                    detail: None,
                     outcome: if attempted(item) {
                         "unknown"
                     } else {

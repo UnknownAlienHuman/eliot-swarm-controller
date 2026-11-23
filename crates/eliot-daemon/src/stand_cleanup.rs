@@ -2121,7 +2121,7 @@ pub async fn cleanup_stand_external_git(
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
-                    detail: None,
+                    detail: Some(*error.message),
                 });
                 continue;
             }
@@ -2158,7 +2158,7 @@ pub async fn cleanup_stand_external_git(
                     }
                     .to_owned(),
                     reason: Some(error.code),
-                    detail: None,
+                    detail: Some(*error.message),
                 });
             }
         }
