@@ -464,8 +464,8 @@ impl Router {
     }
 
     /// Record one driven failure: quota refusals and a freshly held provider
-    /// release the run for after the hold, transient capacity releases the
-    /// claim for the next tick, and anything else is the version's run.
+    /// release the run for after the hold. Once launch is admitted, other
+    /// failures consume this version's run.
     async fn record_drive_failure(&self, work: &HarnessCheckWork, step: &str, error: &Error) {
         let now = now_ms();
         let quota =
@@ -473,14 +473,6 @@ impl Router {
         let mut store = self.inner.store.lock().await;
         let record = if quota {
             store.record_harness_check_quota(&work.harness, &work.version, &work.profile, now)
-        } else if matches!(
-            error.code.as_str(),
-            "busy" | "unavailable" | "capacity_unavailable"
-        ) {
-            store
-                .release_harness_check_claim(&work.harness, &work.version, now)
-                .map(|_| ())
-                .map_err(|_| Error::new("internal", "harness check claim release failed"))
         } else {
             store.record_harness_check_failed(
                 &work.harness,

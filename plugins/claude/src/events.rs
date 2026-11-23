@@ -1794,14 +1794,8 @@ impl EventProcessor {
         let text = assistant_text(record);
         if main_thread {
             let native_error_kind = record.get("error").and_then(Value::as_str);
-            self.native_failure = native_error_kind.and_then(claude_api_failure);
-            if let Some(failure) = self.native_failure.as_mut()
-                && record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
-                && !is_blank_native_text(&text)
-            {
-                let policy = SecretPolicy::new(self.secrets.iter().cloned());
-                failure.message = Error::new("native_failure", policy.redact_text(&text)).message;
-            }
+            self.native_failure =
+                native_error_kind.and_then(|kind| claude_api_failure(kind, &text));
             self.native_provider_restriction =
                 native_error_kind.and_then(claude_provider_restriction);
             if has_tool_uses {
@@ -3865,7 +3859,7 @@ fn claude_provider_restriction(kind: &str) -> Option<eliot_core::ProviderRestric
     })
 }
 
-fn claude_api_failure(kind: &str) -> Option<Error> {
+fn claude_api_failure(kind: &str, text: &str) -> Option<Error> {
     use eliot_core::FailureOrigin;
     if kind == "billing_error" {
         return Some(Error::provider(
@@ -3901,5 +3895,10 @@ fn claude_api_failure(kind: &str) -> Option<Error> {
         ),
         _ => return None,
     };
-    Some(Error::new("native_failure", "native API failure").with_origin(origin, evidence))
+    let message = if is_blank_native_text(text) {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {}", text.trim())
+    };
+    Some(Error::new("native_failure", message).with_origin(origin, evidence))
 }
