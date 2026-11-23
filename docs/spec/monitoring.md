@@ -767,7 +767,7 @@ blocks a turn, stop, handoff or removal.
 Before writing an object, the daemon scans every candidate path and the exact bytes for
 both layers. It writes those bytes with Git filters and encoding conversion disabled.
 Credential paths (including `.env`, private-key files and authentication directories),
-content holding a value Swarm knows is secret, nested repositories, unmerged index paths,
+known secret values and recognized credential shapes, nested repositories, unmerged index paths,
 and anything it cannot safely read are withheld. A checkpoint does not copy a file over
 `daemon.checkpoint_max_file_bytes` (default 16 MiB), past
 `daemon.checkpoint_max_total_bytes` per checkpoint (default 64 MiB), past 512 changed
@@ -779,9 +779,10 @@ as not fully in Git. A checkpoint that could capture nothing is a failed one.
 An Owner restores a retained checkpoint with `swarm checkpoint restore` after recreating
 the worktree. Restore requires a clean target at the captured HEAD and in the same Git
 common directory, and refuses while an Agent uses the target. It revalidates every path
-and stored blob before writing, restores the captured staged layer to the index, and
-restores the disk layer to the files. It imports only the needed file blobs into the
-project object store; checkpoint refs remain in the daemon-owned repository.
+and stored blob before writing. It imports the staged blobs into the project object
+store for the index and writes the captured disk bytes directly to the files. The
+checkpoint ref remains in the daemon-owned repository. An interrupted restore without
+a retained result reports an unknown effect on exact retry.
 
 The final checkpoint of a session waits for the
 [owned exit proof](#process-identity-and-custody): the process family has exited and the

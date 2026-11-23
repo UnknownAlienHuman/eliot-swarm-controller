@@ -239,6 +239,7 @@ impl Store {
                     "restore id is already used by a command",
                 ));
             }
+            validate_id_age(&request.id, now)?;
             let oid = self
                 .agent_work_truth(&request.agent, request.generation)?
                 .and_then(|truth| truth.checkpoint)

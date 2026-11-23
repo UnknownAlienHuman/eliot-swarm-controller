@@ -29,7 +29,7 @@ use std::{
 use tokio::time::Instant;
 
 mod restore;
-pub(crate) use restore::{CheckpointRestoreOutcome, restore_checkpoint};
+pub(crate) use restore::restore_checkpoint;
 
 const GIT_TIME: Duration = Duration::from_secs(30);
 /// Owner decision on #922: the newest 20 checkpoints per generation.
@@ -248,20 +248,18 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         .await?;
     let previous_oids =
         previous_checkpoint_oids(&git, &repository, request.previous_snapshot.as_deref()).await;
-    let prepared = prepare_layers(
+    let mut prepared = prepare_layers(
         &git,
         &repository,
         &overrides,
-        staged_files,
-        worktree_files,
-        &head,
+        [staged_files, worktree_files],
         &request,
         previous_oids,
         withheld,
     )
     .await?;
     input.captured_bytes = prepared.captured_bytes;
-    set_withheld(&mut input, prepared.withheld);
+    set_withheld(&mut input, std::mem::take(&mut prepared.withheld));
     if prepared.staged.is_empty() && prepared.worktree.is_empty() {
         input.state = GitCheckpointState::Failed;
         input.fingerprint = None;
@@ -284,9 +282,7 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         &request,
         &head,
         &repository_common_dir,
-        prepared.staged,
-        prepared.worktree,
-        prepared.blobs,
+        prepared,
     )
     .await
     {
@@ -565,8 +561,8 @@ pub(crate) fn contains_checkpoint_credential(bytes: &[u8], policy: &SecretPolicy
         [0xfe, 0xff, payload @ ..] => (false, payload),
         _ => return false,
     };
-    let text = char::decode_utf16(payload.chunks_exact(2).map(|pair| {
-        let pair = [pair[0], pair[1]];
+    let (units, _) = payload.as_chunks::<2>();
+    let text = char::decode_utf16(units.iter().map(|&pair| {
         if little_endian {
             u16::from_le_bytes(pair)
         } else {
@@ -664,9 +660,7 @@ async fn prepare_layers(
     git: &GitProbe,
     repository: &Path,
     overrides: &[(String, String)],
-    staged_files: Vec<ScannedFile>,
-    worktree_files: Vec<ScannedFile>,
-    head: &str,
+    [staged_files, worktree_files]: [Vec<ScannedFile>; 2],
     request: &CheckpointRequest<'_>,
     previous_oids: HashSet<String>,
     mut withheld: Vec<GitCheckpointWithheld>,
@@ -763,7 +757,6 @@ async fn prepare_layers(
             });
         }
     }
-    let _ = (head, request.agent, request.generation);
     Ok(PreparedLayers {
         staged,
         worktree,
@@ -780,10 +773,14 @@ async fn write_checkpoint(
     request: &CheckpointRequest<'_>,
     head: &str,
     repository_common_dir: &str,
-    staged: Vec<SnapshotFile>,
-    worktree: Vec<SnapshotFile>,
-    blobs: BTreeMap<String, Vec<u8>>,
+    prepared: PreparedLayers,
 ) -> Result<(String, String)> {
+    let PreparedLayers {
+        staged,
+        worktree,
+        blobs,
+        ..
+    } = prepared;
     let mut blob_entries = Vec::with_capacity(blobs.len());
     for (oid, bytes) in blobs {
         let written = git
@@ -1824,14 +1821,11 @@ pub(crate) async fn handoff_facts(
         policy,
     )
     .await;
-    let task = task.map_or_else(
-        || "Task record: none".to_owned(),
-        |_reference| {
-            format!(
-                "Task record and sources are held in Eliot's private work-truth repository; the task text and saved task sources follow in this brief. Its card records referenced-file hashes, and its journal keeps earlier turn reports."
-            )
-        },
-    );
+    let task = if task.is_some() {
+        "The private work-truth repository holds the task record. This brief includes retained task text and saved source excerpts. The card records source hashes and the journal keeps earlier turn reports."
+    } else {
+        "Task record: none"
+    };
     let snapshot = match checkpoint {
         Some(GitCheckpointView {
             state: GitCheckpointState::Snapshot,

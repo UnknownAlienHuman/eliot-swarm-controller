@@ -16,6 +16,22 @@ const OWNER_AUTOMATION: &str = "owner_automation";
 const CONTINUATION: &str = "continuation";
 const REQUESTED_BY: &str = "requested_by";
 
+pub type SwitchLiveCheckout = (String, i64, String, String);
+
+pub struct SwitchReservation<'a> {
+    pub owner_process: Option<&'a OwnerProcess>,
+    pub profile_authority: Option<[u8; 32]>,
+    pub source_checkout: Option<(&'a str, &'a str)>,
+    pub live_checkouts: &'a [SwitchLiveCheckout],
+}
+
+pub struct SwitchLaunchCheckout<'a> {
+    pub root: &'a str,
+    pub key: &'a str,
+    pub live_checkouts: &'a [SwitchLiveCheckout],
+    pub source_clean: Option<bool>,
+}
+
 /// A resumed source must not race the successor after the switch has stopped it.
 pub(super) fn require_no_active_checkout_switch(connection: &Connection, agent: i64) -> Result<()> {
     let active: bool = connection
@@ -490,24 +506,23 @@ fn claim_source_checkout(
     now: i64,
 ) -> Result<()> {
     let agent = parse_agent_id(&source.id)?;
-    if let Some((owner, generation, active_switch)) = checkout_fence(tx, checkout_key)? {
-        if owner != agent
+    if let Some((owner, generation, active_switch)) = checkout_fence(tx, checkout_key)?
+        && (owner != agent
             || active_switch
                 .as_deref()
-                .is_some_and(|active| active != switch_id)
-        {
-            return Err(Error::new(
-                "bad_state",
-                format!(
-                    "canonical checkout is owned by {}#{}{}",
-                    format_agent_id(owner),
-                    generation,
-                    active_switch
-                        .map(|id| format!(" under switch {id}"))
-                        .unwrap_or_default()
-                ),
-            ));
-        }
+                .is_some_and(|active| active != switch_id))
+    {
+        return Err(Error::new(
+            "bad_state",
+            format!(
+                "canonical checkout is owned by {}#{}{}",
+                format_agent_id(owner),
+                generation,
+                active_switch
+                    .map(|id| format!(" under switch {id}"))
+                    .unwrap_or_default()
+            ),
+        ));
     }
     tx.execute(
         "INSERT INTO switch_checkout_owners(checkout_key, checkout_root, agent, generation,
@@ -984,13 +999,15 @@ impl Store {
         principal: &str,
         request: &SwitchRequest,
         policy: &core::SecretPolicy,
-        owner_process: Option<&OwnerProcess>,
-        profile_authority: Option<[u8; 32]>,
-        source_checkout_root: Option<&str>,
-        source_checkout_key: Option<&str>,
-        live_checkout_snapshot: &[(String, i64, String, String)],
+        reservation: SwitchReservation<'_>,
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
+        let SwitchReservation {
+            owner_process,
+            profile_authority,
+            source_checkout,
+            live_checkouts,
+        } = reservation;
         if let Some(value) = self.replay_switch(principal, request)? {
             return Ok(Change {
                 value,
@@ -1000,10 +1017,8 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let (mut args, digest) = switch_args(principal, request)?;
-            if let Some(root) = source_checkout_root {
+            if let Some((root, key)) = source_checkout {
                 args[SOURCE_CHECKOUT_ROOT] = json!(root);
-            }
-            if let Some(key) = source_checkout_key {
                 args[SOURCE_CHECKOUT_KEY] = json!(key);
             }
             if let Some(authority) = profile_authority {
@@ -1035,14 +1050,8 @@ impl Store {
             }
             require_switch_caller(&tx, principal, request)?;
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
-            let mut change = reserve_switch_tx(
-                &tx,
-                request,
-                args,
-                &digest,
-                now,
-                Some(live_checkout_snapshot),
-            )?;
+            let mut change =
+                reserve_switch_tx(&tx, request, args, &digest, now, Some(live_checkouts))?;
             annotate_owner_events(&tx, &mut change.events, owner_process)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(change)
@@ -1253,13 +1262,16 @@ impl Store {
         id: &str,
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
-        target_checkout_root: &str,
-        target_checkout_key: &str,
-        live_checkout_snapshot: &[(String, i64, String, String)],
-        source_checkout_clean: Option<bool>,
+        checkout: SwitchLaunchCheckout<'_>,
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Admission> {
+        let SwitchLaunchCheckout {
+            root: target_checkout_root,
+            key: target_checkout_key,
+            live_checkouts: live_checkout_snapshot,
+            source_clean: source_checkout_clean,
+        } = checkout;
         self.ensure_writer_healthy()?;
         let generated_target = preparation
             .as_ref()

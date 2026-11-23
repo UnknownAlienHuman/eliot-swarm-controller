@@ -4,6 +4,7 @@ use super::*;
 use eliot_core::api::{
     HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest,
 };
+use eliot_store::{SwitchLaunchCheckout, SwitchLiveCheckout, SwitchReservation};
 
 async fn canonical_checkout_identity(workspace: &str) -> (String, String) {
     let root = match crate::workspace_git::WorkspaceGit::new() {
@@ -55,7 +56,7 @@ fn reuse_retained_checkout(
 }
 
 impl Router {
-    async fn switch_live_checkout_snapshot(&self) -> Result<Vec<(String, i64, String, String)>> {
+    async fn switch_live_checkout_snapshot(&self) -> Result<Vec<SwitchLiveCheckout>> {
         let inputs = {
             let store = self.inner.store.lock().await;
             store.switch_live_workspace_inputs()?
@@ -184,11 +185,14 @@ impl Router {
                     &principal_name(principal),
                     &request,
                     &policy,
-                    owner_process,
-                    profile_authority,
-                    source_identity.as_ref().map(|(root, _)| root.as_str()),
-                    source_identity.as_ref().map(|(_, key)| key.as_str()),
-                    &live_checkout_snapshot,
+                    SwitchReservation {
+                        owner_process,
+                        profile_authority,
+                        source_checkout: source_identity
+                            .as_ref()
+                            .map(|(root, key)| (root.as_str(), key.as_str())),
+                        live_checkouts: &live_checkout_snapshot,
+                    },
                     now_ms(),
                 )
                 .inspect_err(|error| {
@@ -613,10 +617,12 @@ impl Router {
                 id,
                 prepared.request,
                 prepared.workspace,
-                &target_checkout_root,
-                &target_checkout_key,
-                &live_checkout_snapshot,
-                source_clean,
+                SwitchLaunchCheckout {
+                    root: &target_checkout_root,
+                    key: &target_checkout_key,
+                    live_checkouts: &live_checkout_snapshot,
+                    source_clean,
+                },
                 &policy,
                 now_ms(),
             )?;

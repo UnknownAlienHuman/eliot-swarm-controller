@@ -91,8 +91,7 @@ pub(crate) async fn restore_checkpoint(
         &private_overrides,
         expected_oid,
         manifest.staged,
-        policy,
-        limits,
+        (policy, limits),
         &mut total_bytes,
     )
     .await?;
@@ -102,8 +101,7 @@ pub(crate) async fn restore_checkpoint(
         &private_overrides,
         expected_oid,
         manifest.worktree,
-        policy,
-        limits,
+        (policy, limits),
         &mut total_bytes,
     )
     .await?;
@@ -313,8 +311,7 @@ async fn load_restore_layer(
     overrides: &[(String, String)],
     reference: &str,
     files: Vec<SnapshotFile>,
-    policy: &SecretPolicy,
-    limits: CheckpointLimits,
+    (policy, limits): (&SecretPolicy, CheckpointLimits),
     total_bytes: &mut u64,
 ) -> Result<Vec<RestoredFile>> {
     let mut seen = HashSet::new();
