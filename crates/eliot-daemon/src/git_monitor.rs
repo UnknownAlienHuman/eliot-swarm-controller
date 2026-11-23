@@ -1174,6 +1174,28 @@ impl GitProbe {
         self.run(root, args, &overrides, &[], deadline).await
     }
 
+    /// Read exactly the already-sized blob, under the caller's checkpoint
+    /// limit rather than the status command's smaller output limit.
+    pub(crate) async fn workspace_blob(
+        &self,
+        root: &Path,
+        oid: &str,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        if !eliot_core::api::is_git_oid(oid) {
+            return Err(unavailable("Git blob identity is invalid"));
+        }
+        let overrides = self.safe_overrides(root, deadline).await?;
+        let command = self.build_command(root, &["cat-file", "blob", oid], &overrides, None)?;
+        let (code, content) =
+            Self::capture_git(command, &[], deadline, |stdout| bounded_read(stdout, bytes)).await?;
+        if code != 0 || content.len() != bytes {
+            return Err(unavailable("Git blob readback differs from its bound size"));
+        }
+        Ok(content)
+    }
+
     /// Read a complete NUL-delimited path listing under the shared listing
     /// bounds. Each path is validated before it is retained for cleanup.
     pub(crate) async fn workspace_path_listing(
