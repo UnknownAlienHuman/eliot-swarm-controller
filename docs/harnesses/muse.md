@@ -164,8 +164,18 @@ MSP v1 publishes no catalogue subscription.
 and [host operations](https://meta-models.github.io/muse-code-sdk/1.4/guides/host-operations/)
 describe the query and the host's startup provider and XDG roots.
 
-Pre-session-effect refusals (profile, spawn,
-initialize, `model/list`, resume preflight) return a failed-state start
+With a fresh data root, `serve` returned an empty `bundledCatalog` even
+after `session/start`. The installed `muse exec --help` documents
+`exec --list-models`, which fetches models and populates Muse's cache under
+`XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
+The adapter runs that command before starting `serve`, using the same
+executable, working directory, and environment for both processes.
+Successful exit within the deadline lets `serve` read the vendor cache.
+MSP `model/list` then provides the structured `providerCatalog` snapshot
+for the picker and the launch's exact-model check.
+
+Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
+`model/list`, resume preflight) return a failed-state start
 result carrying a short non-secret reason, and the launch settles failed,
 never unknown; any failure after a native session effect stays unknown.
 `projectionUnavailable` is the projection-failed-closed health reason on the
@@ -366,10 +376,11 @@ documented configuration prerequisite or proof that this host cannot construct
 session MCP servers. Follow-up on 2026-11-14 tested the documented
 [settings directory](https://meta-models.github.io/muse-code-sdk/1.4/guides/extend/mcp-servers/)
 in fresh private directories, without changing the owner's config or creating a
-workspace `.mcp.json`. Exact construction sequence: set `XDG_CONFIG_HOME=<private
-config root>`; run `muse-bin-1.4.0-R4161.1.exe serve --disable-sandbox`; call
-`initialize` with `capabilities.requestedCapabilities=["sessionMcp"]`; send
-`initialized`; then call `session/start` with a fresh UUIDv7 `commandId`,
+workspace `.mcp.json`. The historical probe set `XDG_CONFIG_HOME` to the
+private config root and ran `serve --disable-sandbox` on the then-installed
+1.4.0-R4161.1 binary. It called `initialize` with
+`capabilities.requestedCapabilities=["sessionMcp"]`, sent `initialized`,
+then called `session/start` with a fresh UUIDv7 `commandId`,
 `modelId="muse-spark-1.3-contributor"`, `workspaceRoot=<workspace>` and
 `approvalMode="allowAll"`. `HOME`, `USERPROFILE` and `XDG_DATA_HOME` were unchanged;
 no feature switch, login, credential copy or model turn was used.
@@ -479,7 +490,7 @@ for redaction, and keep them out of files, argv and public semantic metadata.
 This guide's published schema fingerprint differs from the installed host's;
 actual child identity and connectivity still need live qualification.
 
-Trust/HOME follow-up, 2026-11-15, against the same pinned executable and the
+Trust/HOME follow-up, 2026-11-15, against the same installed executable and the
 owner's real config (now including the owner-approved static `eliot-swarm`
 entry): eight no-model host probes made sixteen `session/start` calls. All used
 `serve --disable-sandbox`, the same worktree and model selection, the Windows
