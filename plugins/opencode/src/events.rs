@@ -992,6 +992,11 @@ impl EventProcessor {
         if !self.status.ready {
             return event_type != "server.connected";
         }
+        // Idle compaction has no pending send. Its execution terminal must
+        // reach the watcher while the native start is still stashed.
+        if self.compaction.is_some() {
+            return false;
+        }
         if matches!(
             event_type,
             "session.execution.succeeded"
