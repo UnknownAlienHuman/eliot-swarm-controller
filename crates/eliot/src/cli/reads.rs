@@ -602,26 +602,18 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             println!("  contract mismatch: {mismatch}");
         }
     }
-    for issue in &response.claude_profile_command_issues {
+    for issue in &response.profile_command_issues {
         println!(
-            "Claude profile {}: configured executable is missing: {}",
-            issue.profile, issue.configured_cmd
+            "Profile {} ({}): configured executable is missing: {}",
+            issue.profile, issue.harness, issue.configured_cmd
         );
-        if let Some(cmd) = &issue.replacement_cmd {
-            println!(
-                "  installed replacement: {} ({})",
-                issue
-                    .replacement_version
-                    .as_deref()
-                    .unwrap_or("version unknown"),
-                cmd
-            );
-            if let Some(command) = &issue.repair_command {
-                println!("  repair: {command}");
-            }
+        if let Some(replacement) = &issue.replacement {
+            let version = replacement.version.as_deref().unwrap_or("version unknown");
+            println!("  installed replacement: {} ({version})", replacement.cmd);
         } else {
-            println!("  no installed Claude replacement was discovered");
+            println!("  no installed replacement was discovered");
         }
+        println!("  repair: omit cmd from this profile to follow the vendor installation");
     }
     if response.owner_rules_check_unavailable {
         println!("Owner rules comparison unavailable");

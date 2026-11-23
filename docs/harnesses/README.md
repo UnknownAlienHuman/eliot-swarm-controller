@@ -31,9 +31,10 @@ shared pools enter only with their actual callers.
 
 ## Verified versions and `swarm doctor`
 
-`crates/eliot-core/src/observe.rs` pins the verified contract per harness.
-`swarm doctor` compares the live installed version and contract marker against that
-table and reports drift without blocking launch:
+`crates/eliot-core/src/observe.rs` records the integration-time diagnostic baseline
+per harness. The table is not a vendor executable pin or a launch gate. `swarm doctor`
+compares the live installed version and contract marker against it and reports drift
+without blocking launch:
 
 | Harness | Verified version | Contract marker |
 | --- | --- | --- |
@@ -44,15 +45,20 @@ table and reports drift without blocking launch:
 | antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
 
 A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
-`harness.drift` event and the launch flag. Doctor also reports missing explicit
-Claude profile executable paths with an installed replacement and repair command;
-`swarm status` exposes the same profile warnings. Historical source-check dates
-on adapter pages are not fresh verification; `swarm doctor` is the live readback.
+`harness.drift` event and the launch flag. Every profile with an explicitly pinned
+executable path that has disappeared is reported with the configured path, an
+installed replacement when available, and instructions to omit `cmd`. `cmd` may be
+omitted from any of the five harness profiles; the profile and ad-hoc launch use the
+same harness-specific discovery, and only the launched generation freezes its
+selected executable. Historical source-check dates on adapter pages are not fresh
+verification; `swarm doctor` is the live readback.
 
 ## Current versions and mechanisms
 
-Installed versions verified while integrating each native route (see the harness page
-for the exact check, including the skill and MCP mechanism k61/k62 implemented):
+Installed versions observed while integrating each native route (see the harness page
+for the dated check, including the skill and MCP mechanism k61/k62 implemented). These
+are historical diagnostic snapshots, not constraints on vendor updates or profile
+executable selection:
 
 | Harness | Installed version | Worker MCP default | `eliot-swarm` skill delivery |
 | --- | --- | --- | --- |

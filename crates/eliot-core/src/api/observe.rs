@@ -369,6 +369,61 @@ pub struct DoctorHarnessEntry {
     pub contract_mismatch: Option<String>,
 }
 
+/// An explicit profile command whose executable is absent.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileCommandIssue {
+    pub profile: String,
+    pub harness: String,
+    pub configured_cmd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement: Option<crate::api::harness::HarnessCandidate>,
+}
+
+impl ProfileCommandIssue {
+    pub fn validate(&self) -> Result<()> {
+        let valid = |value: &str, max: usize| {
+            !value.trim().is_empty() && value.len() <= max && !value.chars().any(char::is_control)
+        };
+        if !valid(&self.profile, 128)
+            || !super::is_supported_harness(&self.harness)
+            || !valid(&self.configured_cmd, 4096)
+            || self.replacement.as_ref().is_some_and(|replacement| {
+                !valid(&replacement.cmd, 4096)
+                    || replacement
+                        .version
+                        .as_deref()
+                        .is_some_and(|version| !valid(version, 256))
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "doctor profile command issue is invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_list(issues: &[Self]) -> Result<()> {
+        if issues.len() > super::MAX_LISTED_PROFILES {
+            return Err(Error::new(
+                "invalid",
+                "doctor profile command issues are oversized",
+            ));
+        }
+        let mut profiles = std::collections::HashSet::new();
+        for issue in issues {
+            issue.validate()?;
+            if !profiles.insert(issue.profile.as_str()) {
+                return Err(Error::new(
+                    "invalid",
+                    "doctor profile command issues repeat",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DoctorHarnessEntry {
     pub fn validate(&self) -> Result<()> {
         text(&self.harness, "doctor harness")?;
@@ -422,9 +477,7 @@ impl HarnessDoctorRequest {
                 return Err(Error::new("invalid", "doctor harnesses repeat"));
             }
         }
-        crate::api::harness::validate_claude_profile_command_issues(
-            &reply.claude_profile_command_issues,
-        )?;
+        ProfileCommandIssue::validate_list(&reply.profile_command_issues)?;
         let mut files = std::collections::HashSet::new();
         if reply.owner_rules_drift.len() > MAX_DOCTOR_HARNESSES
             || (reply.owner_rules_check_unavailable && !reply.owner_rules_drift.is_empty())
@@ -472,7 +525,7 @@ impl HarnessDoctorRequest {
 pub struct HarnessDoctorResponse {
     pub harnesses: Vec<DoctorHarnessEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub claude_profile_command_issues: Vec<crate::api::harness::ClaudeProfileCommandIssue>,
+    pub profile_command_issues: Vec<ProfileCommandIssue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_first_calls: Vec<super::usage::ProfileFirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

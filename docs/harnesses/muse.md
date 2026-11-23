@@ -643,9 +643,11 @@ catalogue marks a row with `isDefault` (an empty catalogue,
 e.g. Muse 1.4.20's `bundledCatalog` with zero models, fails honestly); the
 effective id is read back from the session. An unavailable requested model
 fails without substitution. `cmd` is discovered from the launcher dir version
-the launcher marks current (`muse.cmd` wrappers are never frozen); `--cmd`
-pins one explicit binary version instead (e.g. the 1.4.0 binary while the
-launcher marks 1.4.20). On Linux the native payload installs directly (`muse`
+the launcher marks current (`muse.cmd` wrappers are never frozen); omitted
+profile `cmd` uses this same discovery. The selected native executable is
+frozen only in the launch generation. `--cmd` is the Owner's one-launch
+override and profile `cmd` is an explicit saved pin. On Linux the native payload
+installs directly (`muse`
 on `PATH`, `/usr/local/bin/muse`) with no launcher selection; the
 extensionless binary counts as native only after an ELF or Mach-O header
 check, and a script is never a hot-start candidate.

@@ -3075,7 +3075,7 @@ impl Router {
         principal: &Principal,
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
         if request
@@ -3192,6 +3192,7 @@ impl Router {
                     &self.inner.data_root,
                     &mut request,
                 )
+                .await
                 && !self.hydrate_retained_attach(&mut request).await?
             {
                 return Err(error);
@@ -3437,7 +3438,7 @@ impl Router {
         request: &mut SubmitCommand,
         resolve_project: bool,
         parent_workspace_shared: bool,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if matches!(principal, Principal::Agent { .. })
             && request.args.get("base").is_some()
@@ -3723,7 +3724,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
     ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
@@ -3743,8 +3744,10 @@ impl Router {
                 .args
                 .get("harness")
                 .and_then(Value::as_str)
-                .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?
-                .to_owned();
+                .ok_or_else(|| {
+                    Error::new("invalid", "launch harness must be a non-empty string")
+                })?;
+            let harness = crate::adhoc::validate_adhoc_harness(harness)?;
             let model = request
                 .args
                 .get("model")
@@ -3799,22 +3802,22 @@ impl Router {
             // otherwise the installed executable is discovered on the
             // blocking pool. Shape is validated with the frozen snapshot
             // below.
-            let (cmd, selected_version) = if harness == "claude" {
-                let selector = explicit_cmd
-                    .as_deref()
-                    .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd));
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &crate::adhoc::adhoc_profile_name(&harness),
-                    selector,
-                )
-                .await?;
-                (Some(candidate.cmd), candidate.version)
-            } else {
-                let cmd = match explicit_cmd {
-                    Some(cmd) => Some(cmd),
-                    None => crate::adhoc::discover_cmd_for_harness_async(&harness).await?,
-                };
-                (cmd, None)
+            let profile_name = crate::adhoc::adhoc_profile_name(&harness);
+            let (cmd, selected_version) = match explicit_cmd.as_deref() {
+                Some(cmd) if harness == "muse" => {
+                    let cmd = crate::adhoc::validate_native_cmd(&profile_name, cmd)?;
+                    let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+                    let (cmd, version) =
+                        crate::adhoc::reader_executable(&cmd, &harness, deadline).await?;
+                    (Some(cmd), version)
+                }
+                Some(_) if harness != "claude" => (explicit_cmd, None),
+                selector => {
+                    let candidate =
+                        crate::adhoc::resolve_profile_command(&profile_name, &harness, selector)
+                            .await?;
+                    (Some(candidate.cmd), candidate.version)
+                }
             };
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             let mut snapshot = crate::adhoc::blocking_discovery(deadline, move || {
@@ -3867,14 +3870,6 @@ impl Router {
                 .route_launch_profile(principal, request, routing)
                 .await?;
             request.args["profile"] = Value::String(name.clone());
-            if harness == "claude" {
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &name,
-                    snapshot.get("cmd").and_then(Value::as_str),
-                )
-                .await?;
-                crate::adhoc::write_claude_command_snapshot(&mut snapshot, candidate)?;
-            }
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             self.resolve_launch_default(&harness, &name, &mut snapshot, deadline)
                 .await?;
@@ -3946,7 +3941,15 @@ impl Router {
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
                 hierarchy::inherit_child_launch_bounds(&mut snapshot, &parent)?;
-                Some((name.to_owned(), harness, snapshot, false))
+                let command_bound = harness == parent.harness;
+                if command_bound {
+                    crate::adhoc::inherit_profile_command(
+                        &mut snapshot,
+                        &parent.profile_snapshot,
+                        &harness,
+                    )?;
+                }
+                Some((name.to_owned(), harness, snapshot, command_bound))
             } else {
                 Some((
                     parent.profile.clone(),
@@ -3958,8 +3961,8 @@ impl Router {
         } else {
             None
         };
-        let (profile_name, mut snapshot, harness, inherited_snapshot) = match agent_child_snapshot {
-            Some((name, harness, snapshot, inherited)) => (name, snapshot, harness, inherited),
+        let (profile_name, mut snapshot, harness, command_bound) = match agent_child_snapshot {
+            Some((name, harness, snapshot, bound)) => (name, snapshot, harness, bound),
             None => {
                 let profile_name = match request.args.get("profile") {
                     Some(Value::String(name)) => name.to_owned(),
@@ -3977,7 +3980,21 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
-                (profile_name, snapshot, harness, false)
+                let command_bound = if let Some(source) = routing.provider_source {
+                    crate::adhoc::inherit_profile_command(&mut snapshot, source, &harness)?;
+                    if eliot_core::provider_switch_authority(&snapshot)?
+                        != eliot_core::provider_switch_authority(source)?
+                    {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "profile authority differs from the source generation",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                };
+                (profile_name, snapshot, harness, command_bound)
             }
         };
         // The retained wire shape keeps the named profile so Store admission
@@ -3985,27 +4002,37 @@ impl Router {
         if let Some(args) = request.args.as_object_mut() {
             args.insert("profile".to_owned(), Value::String(profile_name.clone()));
         }
-        if harness == "claude" {
-            if inherited_snapshot {
-                let cmd = snapshot
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd))
-                    .ok_or_else(|| {
-                        Error::new(
-                            "bad_state",
-                            "inherited Claude snapshot has no frozen executable path",
-                        )
-                    })?;
-                crate::adhoc::ensure_claude_profile_command(&profile_name, cmd).await?;
-            } else {
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &profile_name,
-                    snapshot.get("cmd").and_then(Value::as_str),
-                )
-                .await?;
-                crate::adhoc::write_claude_command_snapshot(&mut snapshot, candidate)?;
+        if matches!(principal, Principal::Agent { .. }) {
+            install_frozen_profile(request, &harness, snapshot.clone(), true)?;
+            let store = self.inner.store.lock().await;
+            hierarchy::check_agent_launch_authority(&store, principal, request)?;
+        }
+        if command_bound {
+            let cmd = crate::adhoc::explicit_profile_command(&snapshot, &harness);
+            if harness == "claude" && cmd.is_none() {
+                return Err(Error::new(
+                    "bad_state",
+                    "inherited Claude snapshot has no frozen executable path",
+                ));
             }
+            if let Some(cmd) = cmd
+                && !crate::adhoc::profile_command_exists(cmd)
+            {
+                return Err(crate::adhoc::missing_profile_command_refusal(
+                    &profile_name,
+                    &harness,
+                    cmd,
+                    None,
+                ));
+            }
+        } else {
+            let candidate = crate::adhoc::resolve_profile_command(
+                &profile_name,
+                &harness,
+                snapshot.get("cmd").and_then(Value::as_str),
+            )
+            .await?;
+            crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
         }
         // Reused parent snapshots already carry their frozen default; only
         // freshly resolved child snapshots need a freeze. The label matches
@@ -4663,25 +4690,28 @@ impl Router {
             ));
         }
         let mut profile = self.resolve_profile_cached(&request.profile)?;
-        if profile.get("harness").and_then(Value::as_str) == Some("claude") {
-            let candidate = crate::adhoc::resolve_claude_profile_command(
-                &request.profile,
-                profile.get("cmd").and_then(Value::as_str),
-            )
-            .await?;
-            crate::adhoc::write_claude_command_snapshot(&mut profile, candidate)?;
-        }
-        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
+        let harness = profile
+            .get("harness")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("profile_error", "resolved profile has no harness"))?;
         if request
             .harness
             .as_deref()
-            .is_some_and(|harness| profile.get("harness").and_then(Value::as_str) != Some(harness))
+            .is_some_and(|name| name != harness)
         {
             return Err(Error::new(
                 "invalid",
                 "harness does not match the selected profile",
             ));
         }
+        let candidate = crate::adhoc::resolve_profile_command(
+            &request.profile,
+            harness,
+            profile.get("cmd").and_then(Value::as_str),
+        )
+        .await?;
+        crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
+        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
@@ -4818,13 +4848,8 @@ impl Router {
                 crate::adhoc::harness_installation_async(verified.harness).await,
             ));
         }
-        let claude_installation = probes
-            .iter()
-            .find(|(harness, _)| *harness == "claude")
-            .map(|(_, installation)| installation);
-        let claude_profile_command_issues = self
-            .claude_profile_command_issues(claude_installation)
-            .await;
+        let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
+        let profile_command_issues = self.profile_command_issues(missing_commands, &probes);
         let store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
@@ -4867,7 +4892,7 @@ impl Router {
         };
         let response = HarnessDoctorResponse {
             harnesses,
-            claude_profile_command_issues,
+            profile_command_issues,
             profile_first_calls,
             profile_first_calls_truncated,
             goal_check_deadlines: self.goal_check_deadlines().await?,
@@ -7217,7 +7242,7 @@ impl Router {
     }
 }
 
-fn freeze_attach_profile(
+async fn freeze_attach_profile(
     cache: &Mutex<crate::config::ProfileCache>,
     data_root: &std::path::Path,
     request: &mut SubmitCommand,
@@ -7231,6 +7256,13 @@ fn freeze_attach_profile(
             "attach harness does not match the selected profile",
         ));
     }
+    let candidate = crate::adhoc::resolve_profile_command(
+        profile_name,
+        &harness,
+        snapshot.get("cmd").and_then(Value::as_str),
+    )
+    .await?;
+    crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
     crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
     install_frozen_profile(request, &harness, snapshot, true)
 }

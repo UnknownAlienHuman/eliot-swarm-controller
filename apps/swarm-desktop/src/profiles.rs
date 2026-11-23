@@ -308,13 +308,63 @@ fn set_line(draft: &str, name: &str, key: &str, raw: Option<&str>) -> Result<Str
     ))
 }
 
-/// Copy profile `from` (and its `[profiles.from.*]` subtables) as `to`.
+#[derive(serde::Deserialize)]
+struct DuplicateDocument {
+    #[serde(default)]
+    profiles: std::collections::HashMap<String, DuplicateProfile>,
+}
+
+#[derive(serde::Deserialize)]
+struct DuplicateProfile {
+    #[serde(default)]
+    cmd: Option<toml::Spanned<String>>,
+}
+
+/// Full source-line range of the profile's top-level `cmd`, if present.
+/// TOML decoding handles quoted and escaped keys, while the value span
+/// identifies every line of a multiline command string.
+fn duplicate_command_range(
+    draft: &str,
+    from: &str,
+) -> Result<Option<std::ops::Range<usize>>, String> {
+    let document: DuplicateDocument = toml::from_str(draft).map_err(|_| {
+        "The profile source has invalid TOML; correct it before duplicating.".to_owned()
+    })?;
+    let Some(command) = document
+        .profiles
+        .get(from)
+        .and_then(|profile| profile.cmd.as_ref())
+    else {
+        return Ok(None);
+    };
+    let span = command.span();
+    let start = draft[..span.start]
+        .rfind('\n')
+        .map_or(0, |newline| newline + 1);
+    let end = draft[span.end..]
+        .find('\n')
+        .map_or(draft.len(), |newline| span.end + newline + 1);
+    Ok(Some(start..end))
+}
+
+/// Copy profile `from` (and its `[profiles.from.*]` subtables) as `to`,
+/// leaving the top-level `cmd` omitted so a copy uses the installed default.
 pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
     let to = to.trim();
     check_new_name(draft, to)?;
+    let command_range = duplicate_command_range(draft, from)?;
     let mut copied = String::new();
     let mut inside = false;
+    let mut offset = 0;
     for line in draft.split_inclusive('\n') {
+        let line_start = offset;
+        offset += line.len();
+        if command_range
+            .as_ref()
+            .is_some_and(|range| range.contains(&line_start))
+        {
+            continue;
+        }
         if let Some(header) = header_path(line) {
             let path = &header.path;
             inside = path.len() >= 2 && path[0] == "profiles" && path[1] == from;
@@ -419,28 +469,13 @@ fn check_new_name(draft: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `cmd` another profile of `harness` names, read with the TOML
-/// parser so any string form (literal, multi-line, escaped) is decoded.
-fn harness_cmd(draft: &str, harness: &str) -> Option<String> {
-    let document: toml::Table = toml::from_str(draft).ok()?;
-    document
-        .get("profiles")?
-        .as_table()?
-        .values()
-        .filter_map(toml::Value::as_table)
-        .filter(|profile| profile.get("harness").and_then(toml::Value::as_str) == Some(harness))
-        .find_map(|profile| profile.get("cmd").and_then(toml::Value::as_str))
-        .map(str::to_owned)
-}
-
 /// Append a new `[profiles.<name>]` table for `harness`; its model and
-/// the rest keep the harness defaults until chosen. The executable
-/// (`cmd`, which every harness but Codex requires) is the one another
-/// preset of that harness names, as the daemon discovered it at setup.
+/// other settings keep the harness defaults until chosen. Leave `cmd`
+/// omitted so the daemon follows the harness's installed default; explicit
+/// Owner command overrides remain in the source.
 pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> {
     let name = name.trim();
     check_new_name(draft, name)?;
-    let cmd = harness_cmd(draft, harness).map(|cmd| format!("cmd = {}\n", quote(&cmd)));
     let mut out = draft.to_owned();
     if !out.is_empty() && !out.ends_with('\n') {
         out.push('\n');
@@ -449,8 +484,7 @@ pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> 
         out.push('\n');
     }
     out.push_str(&format!(
-        "[profiles.{name}]\n{}harness = {}\n",
-        cmd.unwrap_or_default(),
+        "[profiles.{name}]\nharness = {}\n",
         quote(harness)
     ));
     Ok(out)
@@ -489,10 +523,6 @@ pub fn field_error(message: &str) -> Option<(String, String, String)> {
     let words = match (key, reason) {
         (_, "native_subagents deny has no mapping on this harness") => {
             "This app cannot turn its own subagents off.".to_owned()
-        }
-        ("cmd", "required explicit cmd is missing") => {
-            "Swarm does not know where this app is installed: add its path as cmd with Edit as TOML."
-                .to_owned()
         }
         ("child_profiles", reason) if reason.starts_with("unknown child profile ") => format!(
             "There is no preset named {}.",

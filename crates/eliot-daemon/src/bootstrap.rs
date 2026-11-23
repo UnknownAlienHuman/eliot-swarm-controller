@@ -46,28 +46,9 @@ pub(crate) async fn ensure_hot_start(
             bootstrap_needed(data_root, &mut store, policy)?
         };
         let profiles = if needs {
-            let (cmd, skipped, budget_exhausted) = crate::adhoc::select_muse_hot_start_cmd().await;
-            for cmd in &skipped {
-                crate::logging::record(
-                    policy,
-                    "bootstrap.muse_empty_catalogue_skipped",
-                    &[("cmd", cmd.as_str())],
-                    None,
-                );
-            }
-            if budget_exhausted {
-                crate::logging::record(
-                    policy,
-                    "bootstrap.muse_catalogue_budget_exhausted",
-                    &[],
-                    None,
-                );
-            }
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
-            crate::adhoc::blocking_discovery(deadline, move || {
-                installed_default_profiles(cmd, deadline)
-            })
-            .await?
+            crate::adhoc::blocking_discovery(deadline, move || installed_default_profiles(deadline))
+                .await?
         } else {
             serde_json::Map::new()
         };
@@ -379,23 +360,9 @@ fn bootstrap_worker_profiles(names: &[String], manager: &str) -> Vec<String> {
         .collect()
 }
 
-fn installed_default_profiles(
-    muse_cmd: Option<String>,
-    deadline: std::time::Instant,
-) -> serde_json::Map<String, Value> {
+fn installed_default_profiles(deadline: std::time::Instant) -> serde_json::Map<String, Value> {
     let mut profiles = serde_json::Map::new();
     for harness in SUPPORTED_HARNESSES {
-        if *harness == "muse" {
-            let Some(cmd) = muse_cmd.clone() else {
-                continue;
-            };
-            let mut profile = serde_json::Map::new();
-            profile.insert("harness".to_owned(), Value::String("muse".to_owned()));
-            profile.insert("mcp".to_owned(), Value::String("inherit".to_owned()));
-            profile.insert("cmd".to_owned(), Value::String(cmd));
-            profiles.insert("muse".to_owned(), Value::Object(profile));
-            continue;
-        }
         let discovered = crate::adhoc::harness_installation(harness, deadline);
         if discovered.get("installed").and_then(Value::as_bool) != Some(true) {
             continue;
@@ -412,13 +379,6 @@ fn installed_default_profiles(
             _ => "minimal",
         };
         profile.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
-        if *harness != "claude" {
-            if let Some(cmd) = discovered.get("cmd").and_then(Value::as_str) {
-                profile.insert("cmd".to_owned(), Value::String(cmd.to_owned()));
-            } else if *harness != "codex" {
-                continue;
-            }
-        }
         profiles.insert((*harness).to_owned(), Value::Object(profile));
     }
     profiles

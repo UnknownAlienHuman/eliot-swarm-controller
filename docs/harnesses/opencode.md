@@ -16,16 +16,17 @@ The working Eliot Swarm profile for the installed OpenCode 2.2.7 is:
 ```toml
 [profiles.opencode-free]
 harness = "opencode"
-cmd = "<explicit native opencode executable>"
 model = "opencode/deepseek-v4.1-flash-free"
 auth_integration = "opencode-go"
 ```
 
 `auth_integration` is required by the plugin at start, not optional: it is the
 frozen nonsecret selector naming the one native integration whose canonical
-credential is prepared before `serve`. `cmd` is the explicit native executable
-(no script wrapper, no PATH default). The model string is split at its first
-slash only (see below).
+credential is prepared before `serve`. An omitted `cmd` uses the same native
+executable discovery as ad-hoc launch; discovery resolves the npm shim to the
+installed package binary, never a script wrapper. An explicit profile `cmd`
+pins a native executable. The model string is split at its first slash only
+(see below).
 
 The model provider and the transferred credential are independent: the
 `opencode` provider carries its own server-side credential (it has no
@@ -387,7 +388,10 @@ Anything else refuses before spawning with a typed `profile_error` naming
 `--auth` and listing the available integration ids — another provider's
 credential is never picked silently. `--effort` freezes the installed
 per-model variant id verbatim (the live catalogue proves membership at
-launch). `cmd` is discovered by following the npm shim to the native
+launch). Omitted profile `cmd` uses this same discovery. The selected native
+executable is frozen in the launch generation; explicit `--cmd PATH` is an
+Owner-only override for that launch and a profile `cmd` is a saved pin. `cmd`
+is discovered by following the npm shim to the native
 `opencode.exe` inside the package (the shim target
 `<shim-dir>/node_modules/@opencode/cli/bin/opencode.exe`, then the known
 package-local paths under every roaming root including the

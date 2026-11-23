@@ -14,7 +14,6 @@
 //! readback; no substitution is ever made for an unavailable requested model.
 
 use core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
-use core::limits::MAX_NATIVE_INBOUND_FRAME_BYTES;
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
@@ -552,7 +551,7 @@ pub(crate) fn adhoc_snapshot(
 }
 
 /// Ad-hoc cmd shape: one explicit executable path, never a shell command.
-fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<String> {
+pub(crate) fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<String> {
     let cmd = crate::config::validate_executable_name(cmd).map_err(|class| {
         core::Error::new("profile_error", format!("ad-hoc {profile}: cmd {class}"))
     })?;
@@ -639,10 +638,6 @@ fn has_native_executable_magic(path: &std::path::Path) -> bool {
 /// enumeration plus the bounded `--version` probes runs on the blocking
 /// pool, so slow native CLIs never stall async command/event service while
 /// cached catalogue data already exists.
-pub(crate) async fn discover_cmd_for_harness_async(harness: &str) -> core::Result<Option<String>> {
-    discover_cmd_until(harness, Instant::now() + DISCOVERY_BUDGET).await
-}
-
 pub(crate) async fn discover_cmd_until(
     harness: &str,
     deadline: Instant,
@@ -720,6 +715,21 @@ pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Check the presence of an explicit command without probing or executing it.
+pub(crate) fn profile_command_exists(cmd: &str) -> bool {
+    let path = Path::new(cmd);
+    if path.is_absolute() || path.components().count() != 1 {
+        return path.is_file();
+    }
+    let windows_exe = (cfg!(windows) && path.extension().is_none()).then(|| native_exe_name(cmd));
+    path_search_dirs().iter().any(|dir| {
+        dir.join(path).is_file()
+            || windows_exe
+                .as_ref()
+                .is_some_and(|exe| dir.join(exe).is_file())
+    })
 }
 
 fn user_profile() -> Option<PathBuf> {
@@ -1184,12 +1194,12 @@ pub(crate) fn claude_candidate_available() -> bool {
         .any(|path| is_native_executable(path))
 }
 
-pub(crate) fn write_claude_command_snapshot(
+pub(crate) fn write_profile_command_snapshot(
     snapshot: &mut Value,
     candidate: core::api::HarnessCandidate,
 ) -> core::Result<()> {
     let profile = snapshot.as_object_mut().ok_or_else(|| {
-        core::Error::new("profile_error", "Claude launch snapshot must be an object")
+        core::Error::new("profile_error", "launch profile snapshot must be an object")
     })?;
     profile.insert("cmd".to_owned(), Value::String(candidate.cmd));
     if let Some(version) = candidate.version {
@@ -1200,13 +1210,140 @@ pub(crate) fn write_claude_command_snapshot(
     Ok(())
 }
 
-pub(crate) async fn resolve_claude_profile_command(
+/// Build one shared refusal for an explicit pin that no longer resolves.
+/// `replacement` is one bounded candidate from the same native discovery path
+/// used for launch; the repair always omits `cmd` so future launches follow
+/// the installed executable.
+pub(crate) fn missing_profile_command_refusal(
+    profile: &str,
+    harness: &str,
+    configured_cmd: &str,
+    replacement: Option<&core::api::HarnessCandidate>,
+) -> core::Error {
+    let fallback = if harness == "claude" {
+        format!(
+            "omit cmd from profiles.{profile} to follow the installed version, or use {}",
+            claude_latest_settings_command(profile)
+        )
+    } else {
+        format!("omit cmd from profiles.{profile} to follow the installed version")
+    };
+    let replacement_note = match replacement {
+        Some(candidate) => {
+            let version = candidate
+                .version
+                .as_deref()
+                .map(|version| format!(" version {version}"))
+                .unwrap_or_default();
+            format!(
+                "an installed native {harness}{version} was found at {}",
+                core::display_path(&candidate.cmd)
+            )
+        }
+        None => format!("no installed native {harness} replacement was discovered"),
+    };
+    core::AdmissionRefusal::ProfileCommand.error(format!(
+        "{profile}: configured {harness} executable was not found at {}; {replacement_note}; {fallback}",
+        core::display_path(configured_cmd)
+    ))
+}
+
+/// Resolve a named profile's configured executable pin, or discover the
+/// installed native executable when the profile omits `cmd`. The returned
+/// candidate is frozen into the launch snapshot by the caller.
+pub(crate) async fn resolve_profile_command(
+    profile: &str,
+    harness: &str,
+    cmd: Option<&str>,
+) -> core::Result<core::api::HarnessCandidate> {
+    resolve_profile_command_until(profile, harness, cmd, Instant::now() + DISCOVERY_BUDGET).await
+}
+
+/// A confined launch keeps the executable authority of the source generation.
+/// Check explicit pins by path and carry the frozen command facts without
+/// running an executable during authorization.
+pub(crate) fn inherit_profile_command(
+    snapshot: &mut Value,
+    source: &Value,
+    harness: &str,
+) -> core::Result<()> {
+    let source_cmd = source["cmd"].as_str();
+    if let Some(cmd) = explicit_profile_command(snapshot, harness)
+        && Some(cmd) != source_cmd
+        && (source_cmd.is_none()
+            || resolve_native_executable(cmd, harness).ok().as_deref() != source_cmd)
+    {
+        return Err(core::Error::new(
+            "not_allowed",
+            "profile executable differs from the frozen launch authority",
+        ));
+    }
+    let profile = snapshot.as_object_mut().ok_or_else(|| {
+        core::Error::new("profile_error", "launch profile snapshot must be an object")
+    })?;
+    for key in ["cmd", "cmd_version"] {
+        if let Some(value) = source.get(key) {
+            profile.insert(key.to_owned(), value.clone());
+        } else {
+            profile.remove(key);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn explicit_profile_command<'a>(snapshot: &'a Value, harness: &str) -> Option<&'a str> {
+    snapshot["cmd"]
+        .as_str()
+        .filter(|cmd| !(harness == "claude" && is_latest_claude_selector(cmd)))
+}
+
+pub(crate) async fn resolve_profile_command_until(
+    profile: &str,
+    harness: &str,
+    cmd: Option<&str>,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    if harness == "claude" {
+        return resolve_claude_profile_command_until(profile, cmd, deadline).await;
+    }
+    let Some(cmd) = cmd else {
+        return discover_profile_command_candidate(harness, deadline).await;
+    };
+    match reader_executable(cmd, harness, deadline).await {
+        Ok((cmd, version)) => Ok(core::api::HarnessCandidate { cmd, version }),
+        Err(_) if !profile_command_exists(cmd) => {
+            let replacement = discover_profile_command_candidate(harness, deadline)
+                .await
+                .ok();
+            Err(missing_profile_command_refusal(
+                profile,
+                harness,
+                cmd,
+                replacement.as_ref(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn discover_profile_command_candidate(
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    let selected = discover_cmd_until(harness, deadline)
+        .await?
+        .unwrap_or_else(|| harness.to_owned());
+    let (cmd, version) = reader_executable(&selected, harness, deadline).await?;
+    Ok(core::api::HarnessCandidate { cmd, version })
+}
+
+async fn resolve_claude_profile_command_until(
     profile: &str,
     cmd: Option<&str>,
+    deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
     let profile = profile.to_owned();
     let cmd = cmd.map(str::to_owned);
-    let deadline = Instant::now() + DISCOVERY_BUDGET;
     blocking_discovery(deadline, move || {
         resolve_claude_profile_command_sync(&profile, cmd.as_deref(), deadline)
     })
@@ -1234,54 +1371,13 @@ fn resolve_claude_profile_command_sync(
         .map_err(|error| core::Error::new(error.code, format!("{profile}: {}", error.message)))
 }
 
-pub(crate) async fn ensure_claude_profile_command(profile: &str, cmd: &str) -> core::Result<()> {
-    let profile = profile.to_owned();
-    let cmd = cmd.to_owned();
-    let deadline = Instant::now() + DISCOVERY_BUDGET;
-    blocking_discovery(deadline, move || {
-        let cmd = validate_claude_cmd(&profile, &cmd)?;
-        if is_native_executable(Path::new(&cmd)) {
-            return Ok(());
-        }
-        let candidates = discover_claude_candidates(deadline);
-        Err(missing_claude_profile_command(&profile, &cmd, &candidates))
-    })
-    .await?
-}
-
 fn missing_claude_profile_command(
     profile: &str,
     cmd: &str,
     candidates: &[core::api::HarnessCandidate],
 ) -> core::Error {
-    let replacement = verified_claude_candidate_from_candidates(candidates).map(|candidate| {
-        let version = candidate.version.as_deref().unwrap_or("version unknown");
-        let candidate_cmd = core::display_path(&candidate.cmd);
-        let command = claude_settings_command(profile, &candidate_cmd);
-        format!("installed Claude Code {version} at {candidate_cmd}; replace it with {command}")
-    });
-    let detail = replacement.unwrap_or_else(|| {
-        if candidates.is_empty() {
-            format!(
-                "Install Claude Code or reset the profile with {} after installation",
-                claude_latest_settings_command(profile)
-            )
-        } else {
-            "Claude executables were found, but none had a successful parseable --version result; repair an installation before using automatic selection".to_owned()
-        }
-    });
-    core::AdmissionRefusal::ProfileCommand.error(format!(
-        "{profile}: Claude executable was not found at {}; {detail}",
-        core::display_path(cmd)
-    ))
-}
-
-pub(crate) fn claude_settings_command(profile: &str, cmd: &str) -> String {
-    format!(
-        "swarm settings claude-cmd {} --cmd {}",
-        shell_quote_settings_arg(profile),
-        shell_quote_settings_arg(cmd)
-    )
+    let replacement = verified_claude_candidate_from_candidates(candidates);
+    missing_profile_command_refusal(profile, "claude", cmd, replacement)
 }
 
 pub(crate) fn claude_latest_settings_command(profile: &str) -> String {
@@ -1541,225 +1637,6 @@ fn discover_muse_cmd_windows(launcher_dir: &Path) -> core::Result<String> {
     ))
 }
 
-type MuseVersionedPath = (Option<(u64, u64, u64)>, String);
-
-pub(crate) fn discover_muse_candidates(launcher_dir: &Path) -> Vec<String> {
-    let mut versioned: Vec<MuseVersionedPath> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(launcher_dir) else {
-        return Vec::new();
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if !name.starts_with("muse-bin-") || !name.ends_with(".exe") {
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
-        let version_text = name
-            .strip_prefix("muse-bin-")
-            .and_then(|r| r.strip_suffix(".exe"))
-            .unwrap_or_default();
-        let triple = parse_muse_version_triple(version_text);
-        versioned.push((triple, path.to_string_lossy().into_owned()));
-    }
-    versioned.sort_by(|l, r| match (&l.0, &r.0) {
-        (Some(a), Some(b)) => b.cmp(a),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => l.1.cmp(&r.1),
-    });
-    versioned.into_iter().map(|(_, c)| c).collect()
-}
-
-fn parse_muse_version_triple(text: &str) -> Option<(u64, u64, u64)> {
-    let core = text.split('-').next().unwrap_or(text);
-    let mut parts = core.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(a), Some(b), Some(c), None) => match (a.parse(), b.parse(), c.parse()) {
-            (Ok(a), Ok(b), Ok(c)) => Some((a, b, c)),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-const MUSE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
-const MUSE_SELECTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
-// Leave room for a full model/list reply after initialization and notifications.
-const MUSE_PROBE_TOTAL_BYTES: u64 = MAX_NATIVE_INBOUND_FRAME_BYTES as u64 + 4 * 1024 * 1024;
-const MUSE_PROBE_FRAMES: usize = 100;
-
-fn default_muse_launcher_dir() -> std::path::PathBuf {
-    Path::new("C:/Tools/MuseCode").to_path_buf()
-}
-
-#[expect(
-    clippy::disallowed_types,
-    reason = "This probe launches Muse's native model-catalogue server for bounded readback."
-)]
-pub(crate) async fn probe_muse_catalogue_nonempty(cmd: &str) -> bool {
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "This statement constructs a process owned by this module."
-    )]
-    let mut command = tokio::process::Command::new(cmd);
-    command.arg("serve");
-    probe_muse_command(command, MUSE_PROBE_TIMEOUT).await
-}
-
-#[expect(
-    clippy::disallowed_types,
-    reason = "This helper owns the command used to inspect Muse's native catalogue."
-)]
-async fn probe_muse_command(
-    mut command: tokio::process::Command,
-    budget: std::time::Duration,
-) -> bool {
-    command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    // Assign the Job before the suspended process resumes. On cancellation,
-    // OwnedChild drops the Job and Tokio kills/reaps the direct child as well.
-    let Ok(mut child) = crate::platform::custody::OwnedChild::spawn(command) else {
-        return false;
-    };
-    let probe = async { muse_probe_catalogue(child.take_stdin()?, child.take_stdout()?).await };
-    let nonempty = tokio::time::timeout(budget, probe)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(false);
-    let terminated = child.terminate().is_ok();
-    let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
-        .await
-        .is_ok_and(|result| result.is_ok());
-    #[cfg(windows)]
-    let empty = child
-        .wait_family_empty(std::time::Duration::from_secs(2))
-        .await
-        .is_ok_and(|empty| empty);
-    #[cfg(not(windows))]
-    let empty = true; // Unix custody remains explicitly degraded.
-    nonempty && terminated && reaped && empty
-}
-
-async fn muse_probe_catalogue(
-    mut stdin: impl tokio::io::AsyncWrite + Unpin,
-    stdout: impl tokio::io::AsyncRead + Unpin,
-) -> Option<bool> {
-    use futures_util::StreamExt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_util::codec::{FramedRead, LinesCodec};
-
-    // Cap bytes at the reader, line length before String/JSON allocation, and
-    // frames across both initialize and model/list (including notifications).
-    let mut lines = FramedRead::with_capacity(
-        stdout.take(MUSE_PROBE_TOTAL_BYTES),
-        LinesCodec::new_with_max_length(MAX_NATIVE_INBOUND_FRAME_BYTES - 1),
-        4096,
-    );
-    let init = json!({
-        "jsonrpc": "2.0", "id": "muse-bootstrap-1", "method": "initialize",
-        "params": {
-            "clientInfo": {"name": "eliot", "version": env!("CARGO_PKG_VERSION"), "title": "Eliot"},
-            "capabilities": {"userInputDialogs": true}
-        }
-    });
-    let mut frame = serde_json::to_vec(&init).ok()?;
-    frame.push(b'\n');
-    stdin.write_all(&frame).await.ok()?;
-    let mut initialized = false;
-    for _ in 0..MUSE_PROBE_FRAMES {
-        let line = lines.next().await?.ok()?;
-        let value: Value = serde_json::from_str(&line).ok()?;
-        let id = value.get("id").and_then(Value::as_str);
-        if !initialized && id == Some("muse-bootstrap-1") {
-            if value.get("error").is_some() || value.get("result").is_none() {
-                return None;
-            }
-            stdin
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}\n")
-                .await
-                .ok()?;
-            stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"muse-bootstrap-2\",\"method\":\"model/list\",\"params\":{}}\n").await.ok()?;
-            initialized = true;
-        } else if initialized && id == Some("muse-bootstrap-2") {
-            return Some(
-                value.get("error").is_none()
-                    && value
-                        .get("result")
-                        .and_then(|result| result.get("models"))
-                        .and_then(Value::as_array)
-                        .is_some_and(|models| !models.is_empty()),
-            );
-        }
-    }
-    None
-}
-
-pub(crate) async fn select_muse_hot_start_cmd() -> (Option<String>, Vec<String>, bool) {
-    let candidates = muse_hot_start_candidates();
-    select_muse_with_probe(&candidates, MUSE_SELECTION_BUDGET, |cmd| async move {
-        probe_muse_catalogue_nonempty(&cmd).await
-    })
-    .await
-}
-
-/// Hot-start candidate binaries in priority order: the Windows launcher
-/// payloads, or on Unix the `PATH` binary plus the documented absolute
-/// install path (no launcher selection there).
-fn muse_hot_start_candidates() -> Vec<String> {
-    if cfg!(windows) {
-        return discover_muse_candidates(&default_muse_launcher_dir());
-    }
-    let mut cmds = Vec::new();
-    if let Some(found) = find_on_path("muse") {
-        cmds.push(found.to_string_lossy().into_owned());
-    }
-    let fixed = Path::new("/usr/local/bin/muse")
-        .to_string_lossy()
-        .into_owned();
-    // The hot-start probe launches `muse serve`: only a verified native
-    // payload is ever a candidate, never a script on PATH.
-    if is_native_executable(Path::new(&fixed)) && !cmds.contains(&fixed) {
-        cmds.push(fixed);
-    }
-    cmds
-}
-
-async fn select_muse_with_probe<F, Fut>(
-    candidates: &[String],
-    budget: std::time::Duration,
-    mut probe: F,
-) -> (Option<String>, Vec<String>, bool)
-where
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = tokio::time::Instant::now() + budget;
-    let mut skipped = Vec::new();
-    for cmd in candidates {
-        if tokio::time::Instant::now() >= deadline {
-            return (None, skipped, true);
-        }
-        match tokio::time::timeout_at(deadline, probe(cmd.clone())).await {
-            Ok(true) => return (Some(cmd.clone()), skipped, false),
-            Ok(false) => skipped.push(cmd.clone()),
-            Err(_) => {
-                skipped.push(cmd.clone());
-                return (None, skipped, true);
-            }
-        }
-    }
-    (None, skipped, false)
-}
-
 fn discover_antigravity_cmd() -> core::Result<String> {
     // The `agy` CLI serves both `acp` (launch) and `models` (catalogue);
     // prefer it over the Electron app path, which boots the IDE and serves
@@ -1818,7 +1695,8 @@ pub(crate) fn antigravity_ide_unsupported(cmd: &str) -> core::Error {
 
 /// Resolve and check the exact executable before any probe. An IDE symlink
 /// cannot pass the CLI name check on its resolved target.
-fn resolve_native_executable(cmd: &str, antigravity: bool) -> core::Result<String> {
+fn resolve_native_executable(cmd: &str, harness: &str) -> core::Result<String> {
+    let antigravity = harness == "antigravity";
     if antigravity && !antigravity_cli_identity(cmd) {
         return Err(antigravity_ide_unsupported(cmd));
     }
@@ -1841,7 +1719,9 @@ fn resolve_native_executable(cmd: &str, antigravity: bool) -> core::Result<Strin
     if antigravity && !antigravity_cli_identity(&canonical.to_string_lossy()) {
         return Err(antigravity_ide_unsupported(cmd));
     }
-    if !is_native_executable(&canonical) {
+    if !is_native_executable(&canonical)
+        || (harness != "codex" && is_script_wrapper(&canonical.to_string_lossy()))
+    {
         return Err(native_cmd_unavailable());
     }
     // Keep ordinary platform path spelling; Windows native CLIs may reject
@@ -1930,9 +1810,10 @@ pub(crate) async fn reader_executable(
     deadline: Instant,
 ) -> core::Result<(String, Option<String>)> {
     let cmd = cmd.to_owned();
+    let harness = harness.to_owned();
     let agy = harness == "antigravity";
     blocking_discovery(deadline, move || {
-        let cmd = resolve_native_executable(&cmd, agy)?;
+        let cmd = resolve_native_executable(&cmd, &harness)?;
         let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
@@ -1949,7 +1830,7 @@ pub(crate) async fn claude_reader_executable(
 ) -> core::Result<core::api::HarnessCandidate> {
     blocking_discovery(deadline, move || {
         let best = discover_verified_claude(deadline)?;
-        let cmd = resolve_native_executable(&best.cmd, false)?;
+        let cmd = resolve_native_executable(&best.cmd, "claude")?;
         Ok(core::api::HarnessCandidate {
             cmd,
             version: best.version.clone(),
@@ -1998,12 +1879,11 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     let read = || -> core::Result<Value> {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
         let agy = harness == "antigravity";
-        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or("codex"), agy)?;
+        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or(harness), harness)?;
         let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
         }
-        let cmd = if agy { Some(cmd) } else { discovered };
         Ok(json!({"harness": harness, "installed": true, "cmd": cmd, "version": version}))
     };
     read().unwrap_or_else(|error| installation_error(harness, error))

@@ -1247,11 +1247,12 @@ Three event families capture heavy work, session growth, and vendor drift.
   session-file-size source, and the Muse event log exposes no size; those signals
   remain unavailable rather than guessed.
 - `harness.drift`: one event per harness and installed surface while the installed
-  version or contract marker differs from `VERIFIED_HARNESSES`
-  (`crates/eliot-core/src/observe.rs`). Versions compare normalized per harness
-  (product prefix stripped, build metadata kept), so `codex-cli 0.167.1` meets
-  pinned `0.167.1` while `1.4.20` still drifts against `1.4.0-R4161.1`. Drift
-  never blocks launch; it annotates `swarm doctor` and the launch flag only.
+   version or contract marker differs from the diagnostic `VERIFIED_HARNESSES`
+   baseline (`crates/eliot-core/src/observe.rs`). Versions compare normalized per
+   harness (product prefix stripped, build metadata kept), so `codex-cli 0.167.1`
+   matches `0.167.1` while `1.4.20` differs from `1.4.0-R4161.1`. This baseline
+   does not pin the executable selected for a launch. Drift never blocks launch; it
+   annotates `swarm doctor` and the launch flag only.
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
 (per-harness installed vs verified, also `swarm doctor`), `heavy`/`session_growth` on
