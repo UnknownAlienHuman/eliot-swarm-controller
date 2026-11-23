@@ -1054,7 +1054,7 @@ commands, uncertain turns, active or uncertain cleanup attempts, or a pinned his
 floor return `busy`; oversized operations return `unavailable` before cleanup. Before
 removing the records, Delete uses the [cleanup ledger](coordination.md#registered-artifacts-and-cleanup-k69)
 to archive eligible Codex chats, delete eligible OpenCode chats and remove the tree's
-eligible Swarm-created worktrees. It uses the same worktree ownership, clean and merged
+eligible Swarm-created worktrees. It uses the same worktree ownership and cleanliness
 checks as `cleanup.apply`. Ordinary checkouts, Git branches, external sessions and
 Claude Code, Muse and Antigravity chat history stay in place. The desktop confirms
 the scope and offers Delete only for eligible stopped or failed task trees.
@@ -1600,8 +1600,8 @@ command.submit {id, target:AGENT, verb:"worktree.remove",
 
 The Router/Store enforce owner authority, the captured generation and terminal-only,
 clean removal under the admitted scratch policy. When supplied, `expected_tip`
-must match the managed worktree's HEAD. The freshly classified branch tip must
-also equal that HEAD. Cleanup apply supplies the tip retained in its plan.
+must match the managed worktree's HEAD. Cleanup apply supplies the tip retained
+in its plan.
 The daemon selects the retained managed worktree,
 preserves its branch and never removes a caller-supplied path. The
 CLI offers no force/path argument and uses its normal ULID binding and exit codes.
@@ -2991,16 +2991,17 @@ its own proof for any remaining Git artifacts.
 
 After proving the stand daemon stopped, `stand down`, `stand prune`, and parent
 `cleanup` remove stand files owned by the stand, including its scratch
-repository, and remove stand-created clean/contained worktrees and detached
-contained branches in external repositories using `#885` write-fenced containment
-and branch-deletion proofs. A worktree or branch from the stand Store is touched
+repository, and remove stand-created clean worktrees in external repositories
+under the `#885` write fence. Detached stand-created branches in external
+repositories are retired to local `refs/eliot/archive/<branch>` refs. A worktree
+or branch from the stand Store is touched
 only when the external creation record matches its repository common directory,
 branch, creation OID and worktree path; otherwise it is kept
 (`unregistered_worktree`, or `not_allowed` with the record path and failed step
 when the record exists but cannot be used). Any unusable file among the
 creation records, even one no Store worktree refers to, is reported the same
-way and keeps the stand until it is repaired or removed. Dirty, unmerged, or
-uncertain external worktrees or branches keep the stand directory and
+way and keeps the stand until it is repaired or removed. Dirty or uncertain
+external worktrees and branches whose retirement is blocked keep the stand directory and
 registration (`retained`, CLI exit 4) so retried `stand down` after cleanup
 completes removal (CLI exit 0).
 

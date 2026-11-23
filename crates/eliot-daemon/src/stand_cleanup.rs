@@ -10,7 +10,7 @@ use crate::platform::script_file::directory_identity;
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
 use crate::workspace_git::{
     WorkspaceGit,
-    containment::{self, BranchClassification, CleanupFetches, ContainmentScope, branch_rev_parse},
+    containment::{self, CleanupFetches, ContainmentScope, branch_rev_parse},
 };
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
 use eliot_core::{
@@ -1804,15 +1804,7 @@ pub(crate) async fn plan_external_git(
         }
         check_worktree_record(registry, registry_file, &rec.preparation)?;
         check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)?;
-        Box::pin(git.removal_candidates(
-            transport_data_root,
-            &rec.preparation,
-            &rec.scratch,
-            None,
-            fetches.as_deref_mut(),
-            deadline,
-        ))
-        .await?;
+        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)).await?;
         planned_worktrees.insert(wt_key);
     }
 
@@ -1985,13 +1977,7 @@ pub async fn cleanup_stand_external_git(
         }
 
         let outcome = Box::pin(remove_guarded_stand_worktree(
-            transport_data_root,
-            stand_root,
-            &git,
-            rec,
-            &mut guard,
-            &mut fetches,
-            deadline,
+            stand_root, &git, rec, &mut guard, deadline,
         ))
         .await;
         match outcome {
@@ -2222,24 +2208,15 @@ enum GuardedOutcome {
 }
 
 async fn remove_guarded_stand_worktree(
-    transport_data_root: &Path,
     stand_root: &Path,
     git: &WorkspaceGit,
     rec: &StandWorkspaceRecord,
     _guard: &mut WorktreeWriteGuard,
-    fetches: &mut CleanupFetches,
     deadline: Instant,
 ) -> GuardedOutcome {
-    let (branch_class, files): (BranchClassification, Vec<PathBuf>) = match timeout_at(
+    let (tip, files) = match timeout_at(
         deadline,
-        Box::pin(git.removal_candidates(
-            transport_data_root,
-            &rec.preparation,
-            &rec.scratch,
-            None,
-            Some(fetches),
-            deadline,
-        )),
+        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)),
     )
     .await
     {
@@ -2279,7 +2256,7 @@ async fn remove_guarded_stand_worktree(
 
     let command = match timeout_at(
         deadline,
-        Box::pin(git.prepare_stand_worktree_remove(&rec.preparation, &branch_class.tip, deadline)),
+        Box::pin(git.prepare_stand_worktree_remove(&rec.preparation, &tip, deadline)),
     )
     .await
     {

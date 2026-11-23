@@ -1048,7 +1048,6 @@ impl Router {
     async fn automatic_cleanup_worktree_keep_reason(
         &self,
         agent: &Agent,
-        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let artifact = {
             let store = self.inner.store.lock().await;
@@ -1080,7 +1079,7 @@ impl Router {
         if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
             return Ok(Some(error.code));
         }
-        match self.worktree_cleanup_preflight(&artifact, fetches).await {
+        match self.worktree_cleanup_preflight(&artifact).await {
             Ok(_) => Ok(None),
             Err(error) => Ok(Some(error.code)),
         }
@@ -1092,7 +1091,6 @@ impl Router {
         retention_ms: i64,
         now: i64,
         allow_fenced_root: bool,
-        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
@@ -1151,10 +1149,7 @@ impl Router {
             return Ok(Some("manual_only".to_owned()));
         }
         if artifact.kind != ArtifactKind::Worktree {
-            match self
-                .automatic_cleanup_worktree_keep_reason(&agent, fetches)
-                .await
-            {
+            match self.automatic_cleanup_worktree_keep_reason(&agent).await {
                 Ok(Some(reason)) => return Ok(Some(reason)),
                 Err(error) => return Ok(Some(error.code)),
                 Ok(None) => {}
@@ -1420,7 +1415,6 @@ impl Router {
                         retention_ms,
                         now_ms(),
                         false,
-                        Some(&mut fetches),
                     )
                     .await
                 {
@@ -1453,8 +1447,7 @@ impl Router {
                 {
                     break;
                 }
-                self.classify_worktree(&mut candidate, Some(&mut fetches))
-                    .await;
+                self.classify_worktree(&mut candidate).await;
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
                     candidate.reason = "source_integrity".to_owned();
@@ -1674,35 +1667,24 @@ impl Router {
         Ok(after)
     }
 
-    async fn classify_worktree(
-        &self,
-        candidate: &mut CleanupCandidate,
-        fetches: Option<&mut CleanupFetches>,
-    ) {
+    async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
         if candidate.artifact.state != "registered" {
             candidate.reason = candidate.artifact.state.clone();
             return;
         }
-        match self
-            .worktree_cleanup_preflight(&candidate.artifact, fetches)
-            .await
-        {
-            Ok(classification) => {
+        match self.worktree_cleanup_preflight(&candidate.artifact).await {
+            Ok(tip) => {
                 if let Some(git) = candidate.artifact.git.as_mut() {
-                    git.planned_tip = Some(classification.tip);
+                    git.planned_tip = Some(tip);
                 }
                 candidate.verdict = "safe".to_owned();
-                candidate.reason = classification.reason;
+                candidate.reason = "clean_worktree".to_owned();
             }
             Err(error) => candidate.reason = error.code,
         }
     }
 
-    async fn worktree_cleanup_preflight(
-        &self,
-        artifact: &ArtifactView,
-        fetches: Option<&mut CleanupFetches>,
-    ) -> Result<BranchClassification> {
+    async fn worktree_cleanup_preflight(&self, artifact: &ArtifactView) -> Result<String> {
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -1733,11 +1715,10 @@ impl Router {
                 &preparation,
                 &profile,
                 None,
-                fetches,
                 Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
             )
             .await?;
-        Ok(preflight.branch)
+        Ok(preflight.tip)
     }
 
     pub(crate) async fn auto_cleanup_worktrees(&self, after: &mut Option<String>) {
@@ -1838,7 +1819,7 @@ impl Router {
         }
         let age = crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
         if let Some(reason) = self
-            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true, None)
+            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true)
             .await?
         {
             return Err(Error::new(reason, "automatic cleanup eligibility changed"));
@@ -2455,10 +2436,13 @@ impl Router {
                             .and_then(|outcome| outcome.get("code"))
                             .and_then(Value::as_str)
                             .unwrap_or("worktree_remove_refused");
-                        return Err(Error::new(
-                            code,
-                            "worktree removal was refused before mutation",
-                        ));
+                        let message = command
+                            .outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("worktree removal settled without a recorded reason");
+                        return Err(Error::new(code, message));
                     }
                     _ => {}
                 }
@@ -2899,7 +2883,7 @@ impl Router {
             reason: "retirement_preflight".to_owned(),
         };
         if candidate.artifact.kind == ArtifactKind::Worktree {
-            self.classify_worktree(&mut candidate, None).await;
+            self.classify_worktree(&mut candidate).await;
             return candidate;
         }
         let gate = self
