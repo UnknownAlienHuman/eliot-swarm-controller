@@ -200,14 +200,14 @@ struct PendingNativeRequest {
 /// Canonical outcome for one Claude terminal reason, decided here at the
 /// plugin boundary; the verbatim reason is preserved as `native_status`
 /// next to it. `success` (2.1.278) and `completed` (live 2.1.321 terminal
-/// frame) are the recognized successes. `cancelled` and `interrupted` are
-/// interrupts; supported native failures (`error`, `failed`, `failure`
+/// frame) are the recognized successes. Cancellation and native abort
+/// reasons are interrupts. Supported native failures (`error`, `failed`, `failure`
 /// and the `api_error...` family) fail. Anything else is unknown: an
 /// unrecognized reason never defaults to success.
 fn claude_outcome(reason: &str) -> &'static str {
     match reason.trim() {
         "success" | "completed" => "success",
-        "cancelled" | "interrupted" | "aborted_streaming" => "interrupted",
+        "cancelled" | "interrupted" | "aborted_streaming" | "aborted_tools" => "interrupted",
         "error" | "failed" | "failure" => "failure",
         reason => {
             let lower = reason.to_lowercase();
