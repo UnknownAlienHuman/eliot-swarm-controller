@@ -10,6 +10,8 @@ CREATE TABLE git_work_tasks (
     PRIMARY KEY (agent, generation, task_command)
 );
 
+CREATE INDEX git_work_tasks_ref ON git_work_tasks(task_ref, agent, generation);
+
 INSERT OR IGNORE INTO git_work_tasks(
     agent, generation, task_command, task_ref, principal, updated_at
 )
