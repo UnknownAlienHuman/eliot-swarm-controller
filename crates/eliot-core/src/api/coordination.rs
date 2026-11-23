@@ -15,6 +15,8 @@ use std::collections::HashSet;
 pub const MAX_MAIL_TEXT_BYTES: usize = 32 * 1024;
 /// Service identity used for daemon-produced mailbox messages.
 pub const SWARM_MAIL_SENDER: &str = "swarm";
+/// Service mail carrying a framed command liveness note.
+pub const LIVENESS_MAIL_THREAD_PREFIX: &str = "liveness-";
 /// One admission fans out to at most this many concrete recipients.
 pub const MAX_MAIL_RECIPIENTS: usize = 100;
 /// Thread labels stay small enough for list output.

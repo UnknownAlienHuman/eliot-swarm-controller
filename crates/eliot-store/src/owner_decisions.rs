@@ -95,6 +95,19 @@ fn read_inbox_snapshot<T>(path: &Path, read: impl FnOnce(&Connection) -> Result<
 }
 
 impl Store {
+    /// Check that a sampled reason still names the current command before mailing its issuer.
+    pub fn command_still_stuck(&self, subject: &str, reason: &str, now: i64) -> Result<bool> {
+        Ok(
+            super::owner_inbox::project_item(
+                &self.connection,
+                OwnerInboxKind::Stuck,
+                subject,
+                now,
+            )?
+            .is_some_and(|item| item.reason == reason),
+        )
+    }
+
     pub fn read_owner_projection(
         path: &Path,
         now: i64,

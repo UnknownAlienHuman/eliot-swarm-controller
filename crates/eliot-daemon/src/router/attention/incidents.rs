@@ -163,7 +163,7 @@ pub(super) async fn loss_report_already_complete(
         return Ok(true);
     }
     if let Some(parent) = agent.parent.as_deref()
-        && store.attention_thread_mailed_to(&attention_thread(incident_id), parent)?
+        && store.swarm_mail_thread_exists(&attention_thread(incident_id), parent)?
     {
         return Ok(true);
     }

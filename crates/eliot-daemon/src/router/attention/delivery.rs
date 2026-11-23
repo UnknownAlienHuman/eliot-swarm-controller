@@ -375,7 +375,7 @@ async fn loss_notice_exists(router: &Router, delivery: &FrozenReport) -> Result<
     Ok(store.get_command(&delivery.owner_notify_id)?.is_some()
         || store.attention_owner_notice_exists(&report.incident_id)?
         || report.parent_agent.as_deref().map_or(Ok(false), |parent| {
-            store.attention_thread_mailed_to(&attention_thread(&report.incident_id), parent)
+            store.swarm_mail_thread_exists(&attention_thread(&report.incident_id), parent)
         })?)
 }
 

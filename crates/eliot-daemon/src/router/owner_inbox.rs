@@ -2,13 +2,15 @@ use super::{Principal, Router, SubmissionContext, require_owner};
 use eliot_core::{
     Error, Result,
     api::{
-        OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef,
-        OwnerInboxRequest, OwnerInboxResponse, SwarmLiveness, discovery::decode_params,
+        LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest, OwnerDecideRequest,
+        OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxRequest,
+        OwnerInboxResponse, SWARM_MAIL_SENDER, SwarmLiveness, discovery::decode_params,
     },
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{OwnerDecisionAdmission, Store, StuckStates};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 struct DecisionBinding {
@@ -214,7 +216,11 @@ impl Router {
         Ok(sweep.candidates)
     }
 
-    pub(super) fn publish_liveness(&self, current: StuckStates, previous: &mut StuckStates) {
+    pub(super) fn publish_liveness(
+        &self,
+        current: StuckStates,
+        previous: &mut StuckStates,
+    ) -> Arc<StuckStates> {
         let old = self.confirmed_stuck();
         let confirmed: StuckStates = current
             .iter()
@@ -229,7 +235,67 @@ impl Router {
                 crate::logging::record_liveness_stuck(&policy, subject, &state.reason);
             }
         }
-        *self.inner.confirmed_stuck.lock_recover() = Arc::new(confirmed);
+        let confirmed = Arc::new(confirmed);
+        *self.inner.confirmed_stuck.lock_recover() = Arc::clone(&confirmed);
         *previous = current;
+        confirmed
+    }
+
+    pub(super) async fn notify_stuck_command_issuers(&self, confirmed: &StuckStates) {
+        for (subject, state) in confirmed {
+            let Some(id) = subject.strip_prefix("command:") else {
+                continue;
+            };
+            if let Err(error) = self.notify_stuck_command(subject, id, &state.reason).await {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.liveness_note_failed",
+                    &[("subject", subject.as_str())],
+                    Some(&error),
+                );
+            }
+        }
+    }
+
+    async fn notify_stuck_command(&self, subject: &str, id: &str, reason: &str) -> Result<()> {
+        let (request, change) = {
+            let mut store = self.inner.store.lock().await;
+            let Some(command) = store.get_command(id)? else {
+                return Ok(());
+            };
+            let Some((issuer, _)) = command
+                .principal
+                .strip_prefix("agent:")
+                .and_then(|principal| principal.split_once(':'))
+            else {
+                return Ok(());
+            };
+            let key = Sha256::digest(format!("{reason}:{id}"))
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let thread = format!("{LIVENESS_MAIL_THREAD_PREFIX}{key}");
+            if store.swarm_mail_thread_exists(&thread, issuer)?
+                || !store.command_still_stuck(subject, reason, super::now_ms())?
+            {
+                return Ok(());
+            }
+            let body = self.secret_policy_snapshot().redact_text(&format!(
+                "Command {id} ({}) is stuck: {reason}. Inspect with command.get (swarm cmd show {id}). The Owner inbox has the current actions.",
+                command.verb,
+            ));
+            let request = MailSendRequest {
+                id: ulid::Ulid::new().to_string(),
+                to: vec![issuer.to_owned()],
+                mode: MailMode::Queue,
+                text: eliot_core::swarm_note(&body, SWARM_MAIL_SENDER),
+                thread: Some(thread),
+                reply_to_delivery: None,
+            };
+            let change = self.mail_send_locked(&mut store, SWARM_MAIL_SENDER, &request, false)?;
+            (request, change)
+        };
+        self.mail_send_finish(&request, change).await?;
+        Ok(())
     }
 }
