@@ -202,6 +202,17 @@ supplies effort variants when known, so a known model/effort mismatch fails
 before a native start or resume. The effective session `modelId` must match
 the request to set `model_verified`.
 
+Muse makes a profile's standing reasoning effort durable when
+`session/setReasoningEffort` acknowledges the exact command. The adapter
+checks the view suffix after the start or resume reply for a conflicting
+effort report. The acknowledgement is sufficient when the suffix omits the
+change. A settings mismatch reports the field and the expected and reported
+values with redaction.
+
+A promptless resume can open another generation without creating a turn.
+Resume preflight compares the newest native turn with the newest retained
+turn on the same Agent, including earlier generations of that session.
+
 Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
 `model/list`, resume preflight) return a failed-state start
 result carrying a short non-secret reason, and the launch settles failed,
