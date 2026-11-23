@@ -5316,6 +5316,7 @@ fn write_command_state(
          WHERE id = ?5",
         params![command_state_name(state), outcome, generation, now, id],
     ));
+    coordination::settle_notice_terminal_tx(tx, id, state, now)?;
     handoff::refresh_parent_tx(tx, id, now)?;
     switch::refresh_disposal_parent_tx(tx, id, state, now)
 }

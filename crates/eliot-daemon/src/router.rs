@@ -6957,6 +6957,7 @@ impl Router {
             && !change.events.is_empty()
         {
             self.note_script_failure(&change.value);
+            self.note_command_rejection(&change.value, &change.events);
         }
         self.finish_settlement(id, result, write_faulted, &persistence_cause, true)
             .await

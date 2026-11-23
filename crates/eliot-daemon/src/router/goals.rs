@@ -1362,13 +1362,16 @@ async fn spawn_auto_round(
     let Some(agent) = event.agent.clone() else {
         return;
     };
-    // Deferred mail wakes re-offer on every idle event through the shared
-    // Store claim, independent of Goal rounds, caps and follow-ups.
-    if event.generation.is_some()
+    // A notice's own lifecycle cannot wake mail again. Other idle events
+    // still offer through the Store claim, independent of Goal eligibility.
+    if let Some(generation) = event.generation
         && event
             .subject
             .as_ref()
             .is_some_and(|subject| subject.state == AgentState::Idle)
+        && router
+            .idle_event_can_reoffer_mail(&agent, generation, &event)
+            .await
     {
         let mail_router = router.clone();
         let mail_agent = agent.clone();

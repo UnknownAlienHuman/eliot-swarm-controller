@@ -412,7 +412,8 @@ impl Router {
     /// revalidation via structured kind) — skips the notice; a skipped
     /// notice never fails the admitted write. When the claimed `send` is
     /// not admitted, the claim is released so the failure does not consume
-    /// the notice cooldown, which otherwise runs from native presentation.
+    /// the notice cooldown. An admitted attempt spends it at native
+    /// presentation or at a definite unsuccessful settlement.
     pub(super) async fn offer_notice(&self, recipient: &str) {
         let agent = {
             let store = self.inner.store.lock().await;
@@ -471,10 +472,27 @@ impl Router {
         }
     }
 
-    /// Re-offer a deferred mail wake after the recipient idles. The shared
-    /// Store gate revalidates unread, generation and every suppression at
-    /// claim time, so idle events without mail are harmless no-ops and no
-    /// cooldown is spent unless a wake is actually claimed.
+    pub(super) async fn idle_event_can_reoffer_mail(
+        &self,
+        agent: &str,
+        generation: i64,
+        event: &eliot_core::Event,
+    ) -> bool {
+        let Some(cause) = event.cause.as_ref() else {
+            return true;
+        };
+        // A failed read leaves the re-offer to the periodic driver.
+        matches!(
+            self.inner
+                .store
+                .lock()
+                .await
+                .is_notice_cause(agent, generation, &cause.command_id,),
+            Ok(false)
+        )
+    }
+
+    /// Re-offer a deferred wake through the authoritative Store claim.
     pub(super) async fn reoffer_mail_notice(&self, recipient: &str) {
         self.offer_notice(recipient).await;
     }

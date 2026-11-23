@@ -794,6 +794,21 @@ impl Store {
         result
     }
 
+    /// Read the bound command even after settlement cleared the open claim.
+    pub fn is_notice_cause(&self, recipient: &str, generation: i64, id: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        let recipient = parse_agent_id(recipient)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1 AND target = ?2
+                  AND generation = ?3 AND principal = 'owner' AND verb = 'send'
+                  AND json_extract(args, '$.notice_kind') IN ('mail', 'claim'))",
+                params![id, recipient, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     /// Page recipient ids due a normal mail notice: current `idle`,
     /// non-observer, generation >= 1 agents holding waking unread mail whose
     /// `mail_notices` row is absent or past the normal notice cooldown.
@@ -1927,6 +1942,32 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(())
     }
+}
+
+/// Spend a notice cooldown only when this exact send still owns its recipient's
+/// open slot; called with every terminal state write to include cancellation
+/// and resolution paths outside `Store::settle_inner`.
+pub(super) fn settle_notice_terminal_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    state: CommandState,
+    now: i64,
+) -> Result<()> {
+    if !matches!(
+        state,
+        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+    ) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE mail_notices SET last_notice_at = ?1, open_notice_command = NULL
+         WHERE recipient = (
+             SELECT target FROM commands WHERE id = ?2 AND verb = 'send'
+         ) AND open_notice_command = ?2",
+        params![now, command_id],
+    )
+    .map_err(sql_error)?;
+    Ok(())
 }
 
 /// Inline ordinary unread messages for agent's current generation and

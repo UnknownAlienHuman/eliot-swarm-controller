@@ -43,6 +43,7 @@ struct StormKey {
 #[derive(PartialEq, Eq, Hash)]
 enum WindowKey {
     Failure(FailureKey),
+    CommandRejection { agent: String, verb: String },
     Storm(StormKey),
 }
 
@@ -147,7 +148,7 @@ impl RepeatFailures {
             None
         };
         let duration = match key {
-            WindowKey::Failure(_) => REPEAT_WINDOW,
+            WindowKey::Failure(_) | WindowKey::CommandRejection { .. } => REPEAT_WINDOW,
             WindowKey::Storm(_) => Duration::from_millis(STORM_WINDOW_MS),
         };
         let window = self.windows.entry(key).or_insert(CounterWindow {
@@ -170,6 +171,40 @@ fn normalized_message(message: &str) -> String {
 }
 
 impl Router {
+    pub(super) fn note_command_rejection(&self, command: &Command, events: &[Event]) {
+        let Some(agent) = command.target.as_deref().filter(|_| {
+            command.state == CommandState::Rejected
+                && events.iter().any(|event| {
+                    event.kind == "command.rejected"
+                        && event.data["command_id"].as_str() == Some(command.id.as_str())
+                })
+        }) else {
+            return;
+        };
+        let verb = command.verb.as_str();
+        let key = WindowKey::CommandRejection {
+            agent: agent.to_owned(),
+            verb: verb.to_owned(),
+        };
+        let reached_threshold = self
+            .inner
+            .repeat_failures
+            .lock_recover()
+            .increment(key, Instant::now(), 1, 0)
+            .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
+        if reached_threshold {
+            crate::logging::record(
+                &self.secret_policy_snapshot(),
+                "daemon.repeated_command_rejected",
+                &[("agent", agent), ("command", verb)],
+                None,
+            );
+            self.report_repeated_failure(format!(
+                "Agent {agent} had {REPEAT_THRESHOLD} rejected {verb} commands in one minute."
+            ));
+        }
+    }
+
     pub(super) fn note_command_submission(
         &self,
         principal: &Principal,
@@ -342,10 +377,14 @@ impl Router {
         crate::logging::record_repeated_rule_failure(
             &policy, principal, rule, code, &message, count,
         );
-        let router = self.clone();
         let text = format!(
             "Rule {rule} ({principal}) failed {count} times in one minute ({code}). {message}"
         );
+        self.report_repeated_failure(text);
+    }
+
+    fn report_repeated_failure(&self, text: String) {
+        let router = self.clone();
         tokio::spawn(async move {
             if let Err(error) = router.report_daemon_attention(text).await {
                 crate::logging::record(
@@ -354,7 +393,7 @@ impl Router {
                     &[],
                     Some(&Error::new(
                         error.code,
-                        "rule failure notice could not be delivered",
+                        "repeated failure notice could not be delivered",
                     )),
                 );
             }
