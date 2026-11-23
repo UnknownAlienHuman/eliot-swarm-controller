@@ -1182,7 +1182,8 @@ A daemon-initiated or manager switch must pass
 [`handoff_authority_refusal`](../../crates/eliot-core/src/routing.rs) at routing, launch
 admission and transfer. B's authority must be provably equal or narrower than A's:
 
-- Native access maps to a range on one ladder (read-only, ask, automatic, full). B's
+- Each adapter reports native access as a range on one ladder (read-only, ask,
+  automatic, full). B's
   highest possible level must not exceed A's lowest. A value that native settings can
   still change spans every level it could resolve to. OpenCode has no frozen permission
   knob or OS sandbox, so it counts as ask through full.

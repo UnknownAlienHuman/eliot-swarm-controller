@@ -1,10 +1,13 @@
 //! Antigravity native adapter capability declaration.
 
 use eliot_core::InjectPoint;
+use eliot_core::api::harness::NativeAccessBounds;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_access_bounds: Some(native_access_bounds),
         effort: true,
         prepared_mcp_config: true,
         reader_executable_discovery: true,
@@ -15,5 +18,17 @@ pub fn declaration() -> HarnessCapabilities {
         executable_stems: &["agy", "antigravity"],
         version_prefixes: &["antigravity", "agy"],
         ..HarnessCapabilities::default()
+    }
+}
+
+fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
+    match (
+        snapshot["dangerously_skip_permissions"].as_bool()?,
+        snapshot["mode"].as_str(),
+    ) {
+        (true, _) => Some((3, 3)),
+        (false, Some("plan")) => Some((0, 0)),
+        (false, Some("auto" | "accept-edits") | None) => Some((1, 2)),
+        (false, Some(_)) => None,
     }
 }

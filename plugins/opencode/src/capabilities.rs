@@ -4,6 +4,8 @@ use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccou
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        // No frozen permission knob or OS sandbox constrains this range.
+        native_access_bounds: Some(|_| Some((1, 3))),
         effort: true,
         manager_preference: Some(2),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::OpenCodeAgentsFile,

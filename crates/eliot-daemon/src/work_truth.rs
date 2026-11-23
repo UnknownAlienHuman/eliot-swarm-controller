@@ -1345,7 +1345,7 @@ pub(crate) async fn ensure_task(
 /// Whether this profile runs in a sandbox that needs Git roots to commit.
 /// This profile gate is separate from the worktree and branch checks below.
 pub(crate) fn needs_commit_roots(harness: &str, profile: &Value) -> bool {
-    harness == "codex"
+    eliot_core::api::HarnessCapabilities::of(harness).workspace_write_commit_roots
         && profile
             .get("permissions")
             .and_then(Value::as_str)

@@ -177,47 +177,10 @@ pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
 /// asks, 2 automatic approval, 3 full access. A range states what the frozen
 /// fields can prove: a value that native settings can still change spans every
 /// level it could resolve to. `None` is a value this check does not recognize.
-fn native_access_range(snapshot: &Value) -> Option<(u8, u8)> {
-    let text = |key: &str| snapshot.get(key).and_then(Value::as_str);
-    match snapshot.get("harness")?.as_str()? {
-        "codex" => match (text("permissions")?, text("approval_policy")?) {
-            ("read-only", _) => Some((0, 0)),
-            ("workspace-write", "on-request") => Some((1, 1)),
-            ("workspace-write", "never") => Some((2, 2)),
-            ("danger-full-access", _) => Some((3, 3)),
-            _ => None,
-        },
-        "claude" => match text("permission_mode") {
-            Some("plan") => Some((0, 0)),
-            Some("manual" | "dontAsk") => Some((1, 1)),
-            Some("acceptEdits" | "auto") => Some((2, 2)),
-            Some("bypassPermissions") => Some((3, 3)),
-            // The CLI default comes from settings outside the frozen profile.
-            None => Some((1, 3)),
-            Some(_) => None,
-        },
-        "muse" => match (text("permissions")?, text("approval")) {
-            ("danger-full-access", _) => Some((3, 3)),
-            ("workspace-write", Some("onRequest" | "denyUnmatched")) => Some((1, 1)),
-            ("workspace-write", Some("promptUnmatched" | "allowAll")) => Some((2, 2)),
-            ("workspace-write", None) => Some((1, 2)),
-            _ => None,
-        },
-        // No frozen permission knob and no OS sandbox to rely on.
-        "opencode" => Some((1, 3)),
-        "antigravity" => {
-            match (
-                snapshot.get("dangerously_skip_permissions")?.as_bool()?,
-                text("mode"),
-            ) {
-                (true, _) => Some((3, 3)),
-                (false, Some("plan")) => Some((0, 0)),
-                (false, Some("auto" | "accept-edits") | None) => Some((1, 2)),
-                (false, Some(_)) => None,
-            }
-        }
-        _ => None,
-    }
+fn native_access_range(snapshot: &Value) -> Option<crate::api::harness::NativeAccessBounds> {
+    let harness = snapshot.get("harness")?.as_str()?;
+    let read = crate::api::HarnessCapabilities::for_harness(harness)?.native_access_bounds?;
+    read(snapshot)
 }
 
 fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<String>> {
