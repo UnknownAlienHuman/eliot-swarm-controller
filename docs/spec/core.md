@@ -363,15 +363,16 @@ One Agent generation never runs two overlapping turns. Input follows one rule:
 - A terminal can prove the association itself when it names the still-pending input.
   Queue admission reported after the native terminal requires a later native start
   to open a separate turn.
-- The turn stays open until a native terminal names the bound input. A terminal that
-  does not name it ends only the prefix of the run: its usage adds to the turn, and the
-  terminal for the input settles the turn and its final text.
+- A terminal that names the bound input or supplies no input IDs settles the
+  turn and its final text. A terminal that names only other inputs ends the
+  prefix of the run and adds its usage to the turn.
 - If the harness drops the bound input, the turn ends with its own native terminal, or
   as interrupted when the prefix already ended.
 
 An unbound self-started turn reads back through `agent.snapshot` with its exact
 turn id and the generation's start command as the session selector. The returned turn
-facts carry no command. Stop, interrupt, steer, requests and unknown settlement bind
+facts carry no command. Recovery uses the turn's stored send binding for command
+settlement and attribution. Stop, interrupt, steer, requests and unknown settlement bind
 to its exact turn id as for any turn.
 
 ## Profile

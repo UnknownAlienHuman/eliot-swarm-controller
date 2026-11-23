@@ -3057,12 +3057,12 @@ impl EventProcessor {
         {
             self.settle_pending_lifecycle("started").await?;
         }
-        // A result that does not name the bound input accounts only for the
-        // prefix. This applies regardless of the result's reported origin.
+        // Only a result naming other inputs accounts for the prefix. A
+        // result without input UUIDs can finish an already-associated turn.
         if self
             .active_input
             .as_deref()
-            .is_some_and(|input| !parsed.names_input(input))
+            .is_some_and(|input| parsed.names_only_other_inputs(input))
         {
             self.native_prefix_ended = true;
             self.prefix_usage = TurnUsage::sum_native(

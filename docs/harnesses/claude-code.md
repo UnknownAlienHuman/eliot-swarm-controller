@@ -22,6 +22,10 @@ A UUID-stamped input written while a tool turn was busy emitted its exact
 inside the running turn. An idle follow-up emitted its own exact lifecycle
 and terminal. This observation does not establish that every CLI version or
 every busy input will produce that sequence.
+On 2026-11-22, a fresh plain Haiku 5.5 stream-json capture on Claude Code 2.1.330
+echoed the submitted `user.uuid` in both `result.user_message_uuid` and the sole
+entry in `result.user_message_uuids`. The same UUID appeared as
+`command_lifecycle.command_uuid` in the `queued`, `started`, and `completed` records.
 On 2026-11-15, a real 2.1.325 stream-json turn with 129 native `Read` calls
 reproduced the tool telemetry bound: the 129th `tool_result` was reported as
 unknown, and later sends to the session were rejected. The repaired path keeps
@@ -74,7 +78,8 @@ id. A send that overlaps a notification may bind on its exact lifecycle while th
 native turn is open, or on the result that names its UUID if that result arrives first.
 After the native terminal, a late `queued` frame for that send leaves it pending for
 its exact `started` or `cancelled` lifecycle. Once a send is bound, a result settles
-it only when it names the input UUID, regardless of the result origin.
+it if it names the bound UUID or supplies no input IDs. A result naming only other
+inputs accounts for the prefix, regardless of the result origin.
 
 ## Transport
 

@@ -245,6 +245,11 @@ impl ResultRecord {
         self.user_message_uuid.as_deref() == Some(input)
             || self.user_message_uuids.iter().any(|uuid| uuid == input)
     }
+
+    pub(crate) fn names_only_other_inputs(&self, input: &str) -> bool {
+        (self.user_message_uuid.is_some() || !self.user_message_uuids.is_empty())
+            && !self.names_input(input)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
