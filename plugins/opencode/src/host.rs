@@ -1858,6 +1858,14 @@ impl OpenCodePlugin {
         .await
         {
             Ok(effective) => effective,
+            Err(error) if error.code == "native_rejected" => {
+                let error = discard_failed_start(&mut session, error, envelope).await;
+                return Ok(self.retain_proven_no_effect_start(
+                    &parsed.params,
+                    StartPhase::ResumeRefused,
+                    error,
+                ));
+            }
             Err(error) if error.code == "unknown" => {
                 return Err(self.stash_resume_unknown(session, error).await);
             }
@@ -2574,14 +2582,13 @@ impl OpenCodePlugin {
         }
     }
 
-    /// One resume setter: only its 204 applies. The session existed
-    /// moments ago, so any refusal or loss is unknown, never a profile
-    /// verdict — the readback decides.
+    /// One resume setter: a 204 admits the write for readback. An
+    /// authoritative model refusal preserves the native error.
     fn resume_switch(outcome: std::result::Result<(), HttpOutcome>, what: &str) -> Result<()> {
         match outcome {
             Ok(()) => Ok(()),
             Err(HttpOutcome::Rejected { reason, .. }) if what == "model" => {
-                Err(Error::new("unknown", reason)
+                Err(Error::new("native_rejected", reason)
                     .with_where("plugin.opencode.start.resume_model")
                     .with_origin(
                         FailureOrigin::Harness,
@@ -4466,7 +4473,7 @@ fn validate_catalogue_effort(
     if let Some(effort) = effort
         && !selection.allows_effort(|entry| {
             catalogue_entry_variants(entry)
-                .is_some_and(|variants| variants.iter().any(|variant| variant == effort))
+                .is_none_or(|variants| variants.iter().any(|variant| variant == effort))
         })
     {
         return Err(Error::new(

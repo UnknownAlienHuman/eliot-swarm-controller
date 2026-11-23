@@ -67,8 +67,11 @@ confirmed cleanup; cancellation or unconfirmed closure never becomes success.
 
 A launch or configure passes its explicit or frozen model selector to the
 harness unchanged. An exact catalogue row provides model metadata, including
-any advertised effort variants. A successful catalogue read that omits the model
-adds `catalogue_omits_model: true` to effective start settings or the configure
+any advertised effort variants. Variant validation requires an exact match
+when the list is known, including an empty list with no selectable variants.
+Absent or unknown variant metadata leaves that decision to the harness.
+A successful catalogue read that omits the model adds
+`catalogue_omits_model: true` to effective start settings or the configure
 outcome. The harness receives the requested model and effort and decides whether
 to accept them. A native refusal carries the harness origin and its error
 message. Effective readback establishes `model_verified`; a request or a
