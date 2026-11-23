@@ -637,11 +637,13 @@ impl Router {
             },
         )
         .await?;
-        self.inner
-            .store
-            .lock()
-            .await
-            .record_work_task(agent, generation, &task_ref, now_ms())
+        self.inner.store.lock().await.record_work_task(
+            agent,
+            generation,
+            &task_ref,
+            &command.id,
+            now_ms(),
+        )
     }
 
     /// Checkpoint the source and read the facts its successor's brief quotes.
@@ -681,7 +683,7 @@ impl Router {
         }
         let workspace = source.workspace.as_deref()?;
         // The stored row names the snapshot even when this pass found no change.
-        let (recorded, base) = {
+        let (recorded, base, task_command) = {
             let store = self.inner.store.lock().await;
             (
                 store
@@ -694,6 +696,10 @@ impl Router {
                     .flatten()
                     .map(|(_, base)| base)
                     .or_else(|| source.base_oid.clone()),
+                store
+                    .work_task_command(agent, source.generation)
+                    .ok()
+                    .flatten(),
             )
         };
         let (task, checkpoint) = recorded
@@ -723,6 +729,7 @@ impl Router {
         };
         Some(BriefFacts {
             git,
+            task_command,
             task_note,
             task_text,
         })

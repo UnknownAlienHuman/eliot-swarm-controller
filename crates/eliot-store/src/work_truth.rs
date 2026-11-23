@@ -113,10 +113,11 @@ pub(super) fn inherit_work_task_generation_tx(
     now: i64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO git_checkpoints(agent, generation, state, task_ref, updated_at)
-         SELECT ?3, ?4, 'none', task_ref, ?5
+        "INSERT INTO git_checkpoints(agent, generation, state, task_ref, task_command, updated_at)
+         SELECT ?3, ?4, 'none', task_ref, task_command, ?5
          FROM git_checkpoints WHERE agent = ?1 AND generation = ?2 AND task_ref IS NOT NULL
-         ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref",
+         ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref,
+             task_command = excluded.task_command",
         params![from.0, from.1, to.0, to.1, now],
     )
     .map_err(sql_error)?;
@@ -354,6 +355,20 @@ impl Store {
         Ok(value.flatten())
     }
 
+    pub fn work_task_command(&self, agent: &str, generation: i64) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        let value: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT task_command FROM git_checkpoints WHERE agent = ?1 AND generation = ?2",
+                params![parse_agent_id(agent)?, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        Ok(value.flatten())
+    }
+
     /// Find an original SEND for an Agent launched without a prompt. A
     /// queued input is eligible for transfer as its own command.
     pub fn first_work_task_send(&self, agent: &str) -> Result<Option<Command>> {
@@ -402,16 +417,19 @@ impl Store {
         agent: &str,
         generation: i64,
         task_ref: &str,
+        command: &str,
         now: i64,
     ) -> Result<()> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             self.connection
                 .execute(
-                    "INSERT INTO git_checkpoints(agent, generation, state, task_ref, updated_at)
-                     VALUES (?1, ?2, 'none', ?3, ?4)
-                     ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref",
-                    params![parse_agent_id(agent)?, generation, task_ref, now],
+                    "INSERT INTO git_checkpoints(agent, generation, state, task_ref,
+                             task_command, updated_at)
+                     VALUES (?1, ?2, 'none', ?3, ?4, ?5)
+                     ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref,
+                         task_command = excluded.task_command",
+                    params![parse_agent_id(agent)?, generation, task_ref, command, now],
                 )
                 .map_err(sql_error)?;
             Ok(())

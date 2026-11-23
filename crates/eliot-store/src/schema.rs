@@ -2708,7 +2708,8 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             tx.execute_batch(
-                "CREATE TABLE git_checkpoint_intents (
+                "ALTER TABLE git_checkpoints ADD COLUMN task_command TEXT;
+                 CREATE TABLE git_checkpoint_intents (
                      common_dir TEXT PRIMARY KEY,
                      agent INTEGER NOT NULL,
                      generation INTEGER NOT NULL,

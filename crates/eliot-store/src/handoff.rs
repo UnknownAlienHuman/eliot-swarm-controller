@@ -15,6 +15,8 @@ pub const AGENT_HANDED_OFF: &str = "agent.handed_off";
 #[derive(Clone, Debug, Default)]
 pub struct BriefFacts {
     pub git: Option<String>,
+    /// Exact original SEND bound to the task record read for this brief.
+    pub task_command: Option<String>,
     /// Where the task's own saved files can be read, shown with the task.
     pub task_note: Option<String>,
     /// The task text from the Git record, used when the Store retains none.
