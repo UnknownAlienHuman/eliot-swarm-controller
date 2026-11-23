@@ -1230,6 +1230,8 @@ fn persist_turn_terminal(
                 .and_then(Value::as_str)
         })
         .flatten();
+    let native_followup_pending = native_event.kind == "turn.completed"
+        && native_event.data["native_followup_pending"].as_bool() == Some(true);
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
@@ -1239,8 +1241,9 @@ fn persist_turn_terminal(
                               usage = COALESCE(?7, usage),
                               preceded_by = COALESCE(?8, preceded_by),
                               native_error_message = COALESCE(?9, native_error_message),
-                              effective_model = COALESCE(?10, effective_model)
-             WHERE agent = ?11 AND generation = ?12 AND turn_id = ?13",
+                              effective_model = COALESCE(?10, effective_model),
+                              native_followup_pending = ?11
+             WHERE agent = ?12 AND generation = ?13 AND turn_id = ?14",
             params![
                 turn_state_name(state),
                 status,
@@ -1252,6 +1255,7 @@ fn persist_turn_terminal(
                 preceded_by,
                 native_error_message,
                 effective_model,
+                native_followup_pending,
                 agent_num,
                 generation,
                 turn_id,

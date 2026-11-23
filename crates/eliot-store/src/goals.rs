@@ -3806,11 +3806,9 @@ fn idle_round_refusal(
     let native_followup_pending: bool = connection
         .query_row(
             "SELECT COALESCE((
-                 SELECT kind = 'turn.completed' AND json_extract(data, '$.native_followup_pending') IS 1
-                 FROM events INDEXED BY events_turn_lifecycle
-                 WHERE agent = ?1 AND generation = ?2 AND source = 'stream'
-                   AND kind IN ('turn.started', 'turn.completed', 'turn.unknown')
-                 ORDER BY seq DESC LIMIT 1
+                 SELECT native_followup_pending FROM turns INDEXED BY turns_agent_result_order
+                 WHERE agent = ?1 AND generation = ?2
+                 ORDER BY insertion_seq DESC LIMIT 1
              ), 0)",
             params![agent_num, generation],
             |row| row.get(0),
