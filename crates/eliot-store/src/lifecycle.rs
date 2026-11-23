@@ -194,6 +194,7 @@ impl Store {
             state,
             id,
             initial_launch_never_dispatched,
+            None,
             now,
             &mut events,
         )?;
@@ -847,6 +848,7 @@ impl Store {
                 CommandState::Applied,
                 id,
                 false,
+                None,
                 now,
                 &mut events,
             )?;
@@ -917,6 +919,7 @@ fn settle_applied_tx(
         CommandState::Applied,
         command_id,
         false,
+        None,
         now,
         events,
     )
@@ -1175,12 +1178,17 @@ fn release_settle_capacity(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Command settlement carries the optional workspace disposition through the same transaction."
+)]
 pub(super) fn apply_settle_agent_transition(
     tx: &Transaction<'_>,
     record: &CommandRecord,
     state: CommandState,
     id: &str,
     initial_launch_never_dispatched: bool,
+    workspace_transition: Option<(WorkspacePhase, Value)>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -1196,7 +1204,12 @@ pub(super) fn apply_settle_agent_transition(
             && old_workspace.start_command_id == id
         {
             let mut workspace = old_workspace.clone();
-            workspace.phase = WorkspacePhase::Failed;
+            if let Some((phase, outcome)) = workspace_transition {
+                workspace.phase = phase;
+                workspace.outcome = Some(outcome);
+            } else {
+                workspace.phase = WorkspacePhase::Failed;
+            }
             workspace.updated_at = now;
             workspace::persist_workspace(tx, &old_workspace, &workspace)?;
             events.push(workspace::workspace_event(tx, &workspace, now)?);

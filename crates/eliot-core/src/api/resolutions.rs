@@ -65,6 +65,26 @@ impl CommandResolveRequest {
         {
             return Err(unproven());
         }
+        if let Some(cleanup) = response.workspace_cleanup.as_ref() {
+            let has_text = |field: &str| {
+                cleanup[field]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty())
+            };
+            if response.state != CommandState::Failed
+                || !has_text("worktree_path")
+                || !has_text("branch")
+                || match cleanup["state"].as_str() {
+                    Some("removed") => false,
+                    Some("preserved") => {
+                        !has_text("location") || !has_text("code") || !has_text("message")
+                    }
+                    _ => true,
+                }
+            {
+                return Err(unproven());
+            }
+        }
         Ok(())
     }
 }
@@ -75,6 +95,9 @@ pub struct CommandResolveResponse {
     pub id: String,
     pub command_id: String,
     pub state: CommandState,
+    /// Git cleanup result for an initial managed launch resolved as failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_cleanup: Option<serde_json::Value>,
 }
 
 /// With no review digest, list one page. With a digest, settle exactly the

@@ -44,6 +44,8 @@ pub(crate) struct OptionalAgent {
 pub(crate) struct Cli {
     #[arg(long, hide = true, exclusive = true)]
     pub(crate) operator_release_info: bool,
+    #[arg(long, hide = true, exclusive = true)]
+    pub(crate) operator_check_store: Option<PathBuf>,
 
     /// Private Eliot data directory (defaults to ELIOT_HOME or the platform data location).
     #[arg(long, global = true, value_name = "PATH")]
@@ -1211,6 +1213,9 @@ pub(crate) struct DaemonArgs {
     pub(crate) foreground: bool,
     #[arg(long, hide = true, requires = "foreground")]
     pub(crate) upgrade_attempt: Option<String>,
+    /// Stop active turns through normal custody when the update wait expires.
+    #[arg(long, global = true)]
+    pub(crate) interrupt_on_deadline: bool,
     #[command(subcommand)]
     pub(crate) action: Option<DaemonAction>,
 }
@@ -1254,9 +1259,20 @@ pub(crate) enum StandAction {
         /// Fresh directory to create for the stand.
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Private TOML configuration file for the stand's profiles.
-        #[arg(long, value_name = "FILE")]
-        profile: Option<PathBuf>,
+        /// Settings file from which the named profiles are copied.
+        #[arg(long, value_name = "FILE", requires = "profile")]
+        settings: Option<PathBuf>,
+        /// Copy one or more named profiles from the settings file. A single existing path
+        /// without --settings retains the legacy profiles-only TOML file form.
+        #[arg(long, value_name = "NAME")]
+        profile: Vec<String>,
+        /// Create an offline, read-only copy of this data directory; no daemon is started.
+        #[arg(
+            long,
+            value_name = "DATA_DIR",
+            conflicts_with_all = ["settings", "profile", "binary"]
+        )]
+        read_only_copy: Option<PathBuf>,
         /// Swarm executable to run. Defaults to the current binary.
         #[arg(long)]
         binary: Option<PathBuf>,

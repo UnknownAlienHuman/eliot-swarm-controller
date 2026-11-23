@@ -2317,6 +2317,9 @@ fn verify_stand_stopped(
     if registration.removing_pid.is_some() {
         return Ok(registration.removing_pid.or(daemon.map(|info| info.pid)));
     }
+    if daemon.is_none() && crate::operator::read_only_stand_exists(stand_root)? {
+        return Ok(None);
+    }
     let Some(daemon) = daemon else {
         return Err(Error::new(
             "stand_unproven_exit",

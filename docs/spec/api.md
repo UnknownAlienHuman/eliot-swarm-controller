@@ -1924,16 +1924,18 @@ command to be stored `unknown`. The one additional Owner assertion is
 dispatched, queued and accepted commands refuse with `bad_state`. `launch` and `resume` resolve as `failed`
 only: `applied` is refused with `bad_state`, since an applied start without its
 Agent transition is inconsistent. Resolving a managed `launch` that became unknown
-during workspace preparation requires quiescent workspace custody and fresh Git
-readback proving the reserved path, registration and branch are absent. The same
-transaction marks the created Agent and preparation `failed`, cancels the linked
-initial input and closes its drained workspace process source. For a cancelled
+before native start requires exact initial-generation and quiescent workspace
+custody. Bounded Git cleanup removes the launch's verified clean worktree at the
+frozen base and deletes only its empty owned branch. A dirty checkout or advanced
+branch is preserved. The `workspace_cleanup` receipt reports the verified removal
+or why and where artifacts were preserved. The same transaction marks the created
+Agent `failed`, records workspace disposition, cancels the linked initial input
+and closes its drained workspace process source. For a cancelled
 creation with a possible Git write, the Owner can inspect the exact start and stop
 with `swarm cmd show`, the preparation with `workspace.list`, and target-generation
 custody with `swarm processes A --scope workspace --generation N`. Once custody is
-quiescent and any remaining Git artifacts are accounted for and absent, the Owner
-can run `swarm cmd resolve LAUNCH_ID --status failed --reason TEXT`. Swarm rechecks
-absence and requires the bound stop to be unknown or terminal. The Owner can
+quiescent, the Owner can run `swarm cmd resolve LAUNCH_ID --status failed --reason TEXT`.
+Swarm requires the bound stop to be unknown or terminal. The Owner can
 resolve the unknown stop separately. A workspace-stage
 outcome reports Git dispatch from the workspace's
 retained write marker. An unknown native configure resolves as `applied`
@@ -2930,13 +2932,24 @@ success.
 
 **Daemon update (#836).** The local Owner supplies a release directory or
 Swarm executable. Both releases must support Store backup updates. A schema
-downgrade is refused before the admission fence. The running daemon uses the planned-restart
+downgrade is refused before the admission fence. The CLI takes a consistent
+online copy of the running Store and invokes the candidate executable to migrate
+it and read the event high-water mark and Agent projection. The temporary copy
+is removed before the admission fence. A failed check leaves the old daemon in
+service. The running daemon uses the planned-restart
 `daemon.shutdown` modes. `prepare_restart` records a bounded admission
-fence. The writer accepts `restart` under that fence after Agent starts,
-unsettled commands and daemon-owned operation workers settle. In-flight
-native turns can be interrupted, and unclaimed deferred Swarm notes are
-cancelled with their old generation. If the wait expires, `cancel_restart` reopens the
-same daemon. The fence also expires if its client disappears. Before
+fence before the CLI submits any Agent Stop commands. A new launch, including
+`child.run`, is refused during the fence with `daemon_update_in_progress`
+and an instruction to retry after the update. Previously queued launches stay
+queued. The writer accepts `restart` after Agent starts, unsettled commands
+and daemon-owned workers settle. Restart may interrupt in-flight native turns
+and cancels unclaimed deferred notes with their old generation.
+The default deadline action is `cancel_restart`,
+which reopens the same daemon. With `--interrupt-on-deadline`, the CLI sends
+ordinary non-force Stop commands bound to the captured Agent generations and
+active turns, submitting busy roots first. It allows a bounded interval for
+custody and restart settlement.
+Failure to settle cancels the restart. The fence also expires if its client disappears. Before
 committing the restart, the writer checks free space, creates an online
 SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
 source page count. The restart receipt commits only after the old Store
@@ -2944,30 +2957,49 @@ connection has been sealed. Confirmed cancellation discards its backup.
 
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
-both honor `on_restart` and continue eligible idle and interrupted Agents. The CLI submits no Agent
-Stop or Resume commands during update. The output identifies the previous
-and running release and includes observed Agent state. Boot recovery can
-still be settling when that state is read.
+both honor `on_restart` and continue eligible idle and interrupted Agents.
+An independent watchdog bounds exit after restart commit at 110 seconds.
+It closes Windows Job custody through process exit and signals the captured
+Agent process groups on Linux, subject to the platform's custody limits.
+If a committed restart outlives its exit deadline on Windows, the operator
+verifies the previous daemon's process identity and retires it before opening
+the Store in a replacement. An unconfirmed exit reports restarting admission.
+Under `continue` the CLI submits promptless Resume commands
+for its confirmed Stops with proven custody exit and source drain, and waits
+for each interrupted parent's resume before its children. Under `hold` it
+leaves them stopped. An unknown turn outcome remains unknown. The
+output identifies the previous and running release, the deadline policy and
+the Stop and Resume outcomes. Boot recovery can still be settling when
+Agent state is read.
 
 The replacement publishes its endpoint before admitting RPC or background
 work. A failure before publication restores the backup under the exclusive
 daemon lock and restarts the previous executable. Restore retains the
 original SQLite sidecars until database replacement succeeds. Once publication is
-recorded, failure retains the backup and leaves the Store in place because
-replacement writes may exist. Healthy open admission throughout a short
-health check removes the temporary backup. On Windows the restart preserves the running daemon's
+recorded, a failed health check with equal Store schemas retires the exact
+candidate and starts the previous executable on the current Store, preserving
+admitted writes and removing the backup after rollback. A candidate with a
+published newer schema may still be serving. Update to a healthy release that
+supports that schema. The backup and current Store are retained for that case.
+Healthy open admission throughout a short health check removes the temporary
+backup. On Windows the restart preserves the running daemon's
 explicit absolute directory spelling and starts an included companion
 detached with the same target data directory. For subsequent updates, the
 operator closes a changed companion only when it can verify the process it
 started for that directory.
 
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
-and a scratch Git repository inside it. It accepts an optional private TOML
-file containing the `[profiles]` table (written with private file permissions), an optional alternate Swarm binary, and
+and a scratch Git repository inside it. Repeat `--profile NAME` to import
+profiles from the current settings or from `--settings FILE`. The private
+profiles-only TOML file form `--profile FILE` remains available. It accepts
+an optional alternate Swarm binary and
 `--ttl DURATION` (default `DEFAULT_STAND_TTL_MS` = 24 hours, max `MAX_ARTIFACT_TTL_MS` = 30 days in [`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs)). It prints the new
-data, workspace and expiry after the daemon is ready. Operate on the printed
-directory through explicit `--data-dir`. The stand starts with a fresh Store. A copy of
-production data can retain production process custody names. Launch Agents only from a fresh Store.
+data directory as the only line of stdout after the daemon is ready. `--json`
+returns the structured creation result. Operate on the printed directory
+through explicit `--data-dir`. `--read-only-copy DATA_DIR` instead takes a
+consistent SQLite snapshot into an offline stand and prints its directory.
+`status` and `ls` read the copied Store without a daemon. Launches, mutation,
+and daemon startup are rejected against this directory.
 
 When run inside a managed Agent session with inherited credentials, omitting
 `--root` and `SWARM_STANDS_ROOT` places the stand under `ELIOT_ARTIFACT_ROOT`,
@@ -3028,7 +3060,12 @@ before removal, and deletes the marker last. Its local stand owner-credential
 helper applies the same checks and permits only stand lifecycle and readback
 RPCs (`daemon.status`, `agent.list`, `agent.get`, `swarm.wait`, `command.get`,
 `daemon.shutdown`, and `command.submit` with `verb == "stop"`), leaving
-server-side `#846`/`#886` owner boundaries unchanged. A retry uses the recorded removal phase. After a crash without
+server-side `#846`/`#886` owner boundaries unchanged. If orderly drain fails,
+the CLI requests Force on that same verified daemon and reports the drain
+blocker. Force uses the daemon's owned process custody, and removal still
+requires exact daemon exit and a completed shutdown record. An offline copy
+with no daemon record is removed through the same registry and root checks.
+A retry uses the recorded removal phase. After a crash without
 exit proof, start the registered stand again so boot can reconcile custody,
 then retry teardown. [Workspace cancellation recovery](monitoring.md#workspace-preparation)
 settles exact pre-effect cancellations before drain. Stand cleanup still requires
@@ -3077,8 +3114,9 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 swarm daemon [--foreground]
 swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
-swarm daemon update <RELEASE> [--wait-seconds N]
-swarm stand up [--root PATH] [--profile FILE] [--binary PATH] [--ttl DURATION]
+swarm daemon update <RELEASE> [--wait-seconds N] [--interrupt-on-deadline]
+swarm stand up [--root PATH] [--settings FILE] [--profile NAME]... [--binary PATH] [--ttl DURATION]
+swarm stand up [--root PATH] --read-only-copy DATA_DIR [--ttl DURATION]
 swarm stand down <PATH>
 swarm stand list
 swarm stand prune

@@ -541,20 +541,25 @@ impl WorkspaceGit {
                 "workspace path or Git registration remains",
             ));
         }
-        if self
+        let Some(branch_tip) = self
             .branch_oid(&source.root, &preparation.requested_branch, deadline)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(None);
+        };
+        if branch_tip != preparation.base_oid {
+            return Err(problem(
+                "workspace_commits",
+                "remaining branch tip differs from the frozen base; preserving the branch",
+            ));
         }
         if !self
             .creation_branch_is_owned(preparation, &source, deadline)
             .await?
         {
             return Err(problem(
-                "source_integrity",
-                "remaining branch does not match the launch's creation marker and frozen tip",
+                "workspace_branch_preserved",
+                "remaining branch does not match the launch's creation marker; preserving it",
             ));
         }
         self.git
@@ -590,14 +595,19 @@ impl WorkspaceGit {
         }
         let deadline = Instant::now() + READ_TIME;
         let subject = self.subject(preparation, deadline).await?;
-        if subject.head != preparation.base_oid
-            || !self
-                .creation_branch_is_owned(preparation, &subject.source, deadline)
-                .await?
+        if subject.head != preparation.base_oid {
+            return Err(problem(
+                "workspace_commits",
+                "created worktree contains commits beyond the frozen base; preserving it",
+            ));
+        }
+        if !self
+            .creation_branch_is_owned(preparation, &subject.source, deadline)
+            .await?
         {
             return Err(problem(
-                "source_integrity",
-                "remaining worktree does not match the launch's creation marker and frozen tip",
+                "workspace_branch_preserved",
+                "worktree branch does not match the launch's creation marker; preserving it",
             ));
         }
         self.require_created_clean(&subject, deadline).await?;

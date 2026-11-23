@@ -152,6 +152,14 @@ const MODE_RESTART: u8 = 2;
 const MODE_DRAIN: u8 = 3;
 const MODE_FORCE: u8 = 4;
 const RESTART_LEASE: Duration = Duration::from_secs(120);
+const DAEMON_UPDATE_IN_PROGRESS: &str = "daemon_update_in_progress";
+
+fn update_launch_refusal() -> Error {
+    Error::new(
+        DAEMON_UPDATE_IN_PROGRESS,
+        "daemon update in progress, retry after the update finishes",
+    )
+}
 
 #[derive(Clone)]
 pub(crate) struct Router {
@@ -588,6 +596,12 @@ impl Router {
         let _write = if method != "daemon.shutdown" && discovery::is_mutation(method) {
             let guard = self.inner.restart_writes.read().await;
             if self.is_restart_requested() {
+                if matches!(method, "launch.enqueue" | "project.assignment.launch")
+                    || (method == "child.run" && params.get("text").is_some())
+                    || (method == "command.submit" && params["verb"] == "launch")
+                {
+                    return Err(update_launch_refusal());
+                }
                 return Err(Error::new(
                     "unavailable",
                     "the Store is sealed for replacement",
@@ -971,6 +985,37 @@ impl Router {
     pub(crate) async fn stop_for_restart(&self) {
         self.inner.workspaces.stop_all(true).await;
         self.inner.plugin_host.force_all(true).await;
+    }
+
+    /// Arm only after the restart receipt commits. An independent thread
+    /// can enforce the exit bound even if worker or reply shutdown stalls.
+    fn prepare_restart_exit_watchdog(&self) -> Result<std::sync::mpsc::Sender<()>> {
+        let (commit, armed) = std::sync::mpsc::channel();
+        #[cfg(target_os = "linux")]
+        let groups = self.inner.plugin_host.restart_groups();
+        std::thread::Builder::new()
+            .name("swarm-restart-exit".to_owned())
+            .spawn(move || {
+                if armed.recv().is_err() {
+                    return;
+                }
+                // Leave time for the update client's independent 120s exit check.
+                std::thread::sleep(Duration::from_secs(110));
+                #[cfg(target_os = "linux")]
+                for group in groups {
+                    let _ = crate::platform::unix::terminate_process_group(&group);
+                }
+                // Windows closes the daemon's kill-on-close Job handles on exit.
+                // The sealed Store is reopened only by the replacement process.
+                std::process::exit(1);
+            })
+            .map_err(|error| {
+                Error::new(
+                    "restart_watchdog",
+                    format!("start restart exit watchdog: {error}"),
+                )
+            })?;
+        Ok(commit)
     }
 
     pub(crate) async fn should_exit(&self) -> Result<bool> {
@@ -1699,6 +1744,9 @@ impl Router {
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
         let mode = self.inner.mode.load(Ordering::SeqCst);
+        if verb == "launch" && matches!(mode, MODE_QUIESCE | MODE_RESTART) {
+            return Err(update_launch_refusal());
+        }
         if matches!(mode, MODE_FORCE | MODE_RESTART) {
             return Err(Error::new("unavailable", "daemon is shutting down"));
         }
@@ -6708,6 +6756,11 @@ impl Router {
         {
             return Err(Error::new("restart_busy", "admitted work is still running"));
         }
+        let watchdog = if action == ShutdownMode::Restart {
+            Some(self.prepare_restart_exit_watchdog()?)
+        } else {
+            None
+        };
         let result = json!({"state": "applied", "mode": action});
         if request.backup {
             crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
@@ -6776,6 +6829,9 @@ impl Router {
                     self.inner.shutdown_ready.store(false, Ordering::SeqCst);
                     self.inner.mode.store(MODE_RESTART, Ordering::SeqCst);
                     *lease = None;
+                    if let Some(watchdog) = watchdog {
+                        let _ = watchdog.send(());
+                    }
                 }
                 _ => unreachable!("ordinary shutdown handled separately"),
             }
@@ -7870,7 +7926,7 @@ fn workspace_folder_name(workspace: &str) -> Option<String> {
 
 /// Format display paths in an `agent.list` row. Project and scope are exact
 /// filter keys, including when a legacy Agent uses a path as its project.
-fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
+pub(crate) fn display_agent_summary(mut summary: AgentSummary) -> AgentSummary {
     if let Some(workspace) = summary.workspace.as_deref() {
         summary.workspace = Some(eliot_core::display_path(workspace));
     }

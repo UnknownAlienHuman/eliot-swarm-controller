@@ -287,7 +287,10 @@ impl Router {
             Err(error) if error.code == "arbitration_retry" => {
                 Ok(LaunchArbitrationAttempt::RetryPass)
             }
-            Err(error) if error.code == "unavailable" && !self.rule_firings_open() => {
+            Err(error)
+                if error.code == super::DAEMON_UPDATE_IN_PROGRESS
+                    || (error.code == "unavailable" && !self.rule_firings_open()) =>
+            {
                 Ok(LaunchArbitrationAttempt::Other)
             }
             Err(error)

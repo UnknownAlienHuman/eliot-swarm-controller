@@ -1,11 +1,15 @@
 //! Local process and directory custody used by the operator CLI.
 
-use crate::platform::data_dir::DataDir;
+use crate::platform::data_dir::{DataDir, sync_directory, validate_private_file};
+use eliot_core::api::{AgentListRequest, AgentListResponse, AgentListRow};
 use eliot_core::{Error, Result};
+use eliot_store::{AgentListFilter, Store};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 pub use crate::daemon::run_for_update;
 pub use crate::platform::data_dir::{DaemonInfo, DaemonLock, OperatorLock};
+pub use crate::platform::data_dir::{READ_ONLY_STAND_STORE, read_only_stand_exists};
 pub use crate::stand_cleanup::{
     LocatedRegistration, PinnedStandRoot, STAND_MARKER, StandBranchOutcome, StandEntry,
     StandExternalCleanupReport, StandMarker, StandRegistration, StandRegistryScan,
@@ -18,7 +22,8 @@ pub use crate::stand_cleanup::{
     write_stand_registration,
 };
 pub use crate::update_backup::{
-    discard_update_backup, lock_update_publication, restore_update_backup, update_backup_path,
+    check_update_store_copy, copy_store_for_update_check, discard_update_backup,
+    lock_update_publication, restore_update_backup, update_backup_path,
 };
 pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
 
@@ -60,6 +65,10 @@ pub fn start_detached_daemon(executable: &Path, data_dir: &Path) -> std::io::Res
         }
     }
     command.spawn().map(drop)
+}
+
+pub fn continue_after_restart(path: &Path) -> Result<bool> {
+    Ok(crate::config::load_daemon_config(path)?.on_restart == crate::config::OnRestart::Continue)
 }
 
 /// Returns the issuing parent daemon data directory when running inside a
@@ -246,6 +255,109 @@ pub fn validate_stand_profiles(source: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn select_stand_profiles(source: &[u8], names: &[String]) -> Result<Vec<u8>> {
+    let invalid = || {
+        Error::new(
+            "invalid",
+            "stand settings must be a UTF-8 TOML file with a [profiles] table",
+        )
+    };
+    let text = std::str::from_utf8(source).map_err(|_| invalid())?;
+    let mut settings: toml::Table = text.parse().map_err(|_| invalid())?;
+    let Some(toml::Value::Table(mut profiles)) = settings.remove("profiles") else {
+        return Err(invalid());
+    };
+    let mut selected = toml::Table::new();
+    for name in names {
+        if selected.contains_key(name) {
+            return Err(Error::new(
+                "invalid",
+                format!("duplicate stand profile {name:?}"),
+            ));
+        }
+        let profile = profiles.remove(name).ok_or_else(|| {
+            Error::new(
+                "not_found",
+                format!("settings profile {name:?} was not found"),
+            )
+        })?;
+        selected.insert(name.clone(), profile);
+    }
+    let output = toml::Table::from_iter([("profiles".to_owned(), toml::Value::Table(selected))]);
+    toml::to_string(&output)
+        .map(String::into_bytes)
+        .map_err(|_| invalid())
+}
+
+pub fn copy_stand_read_only(source: &Path, stand: &Path) -> Result<()> {
+    let target = stand.join(READ_ONLY_STAND_STORE);
+    if read_only_stand_exists(stand)? {
+        return Err(Error::new("invalid", "read-only stand copy already exists"));
+    }
+    // Keep the same external registry and owner binding as a live stand.
+    DataDir::open(stand)?;
+    let id = ulid::Ulid::new().to_string();
+    let copy = crate::update_backup::copy_store_to_private_root(source, stand, &id)?;
+    fs::rename(copy, target).map_err(|error| {
+        Error::new(
+            "platform_io",
+            format!("install read-only Store copy: {error}"),
+        )
+    })?;
+    sync_directory(stand)
+}
+
+fn open_stand_copy(stand: &Path) -> Result<Store> {
+    let data = DataDir::open_existing(stand)?;
+    let path = data.path().join(READ_ONLY_STAND_STORE);
+    validate_private_file(&path)?;
+    Store::open_read_only(&path)
+}
+
+pub fn stand_copy_event_high_water(stand: &Path) -> Result<i64> {
+    open_stand_copy(stand)?.high_water()
+}
+
+pub fn stand_copy_agents(stand: &Path, request: &AgentListRequest) -> Result<AgentListResponse> {
+    request.validate()?;
+    let filter = AgentListFilter {
+        archived: request.archived,
+        order: request.order,
+        state: request.state,
+        states: request.states.clone(),
+        project: request.project.clone(),
+        project_scope: request.project_scope.clone(),
+        harness: request.harness.clone(),
+        parent: request.parent.clone(),
+        root: request.root.clone(),
+        query: request.query.clone(),
+    };
+    let page = open_stand_copy(stand)?.list_agent_summaries(
+        &filter,
+        request.after.as_deref(),
+        request.limit,
+        crate::common::now_ms(),
+        &Default::default(),
+    )?;
+    let result = AgentListResponse {
+        state_totals: page.state_totals,
+        agents: page
+            .summaries
+            .into_iter()
+            .map(crate::router::display_agent_summary)
+            .map(|summary| AgentListRow {
+                summary,
+                observation: None,
+            })
+            .collect(),
+        next: page.next,
+        total: page.total,
+        truncated: page.truncated,
+    };
+    request.validate_response(&result)?;
+    Ok(result)
+}
+
 pub fn validate_stand_directory(path: &Path) -> Result<()> {
     DataDir::open_existing(path)?;
     Ok(())
@@ -322,6 +434,11 @@ pub fn candidate_birth(pid: u32) -> Result<u64> {
 #[cfg(windows)]
 pub fn stop_candidate(pid: u32, birth: u64) -> Result<()> {
     crate::platform::windows::terminate_recorded_process(pid, birth)
+}
+
+#[cfg(windows)]
+pub fn stop_published_candidate(info: &DaemonInfo) -> Result<()> {
+    stop_candidate(info.pid, birth_time(info, "windows-creation-filetime:")?)
 }
 
 /// Preserve the directory spelling given to the old process. On Windows a

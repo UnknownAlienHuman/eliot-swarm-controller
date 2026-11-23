@@ -1365,6 +1365,11 @@ impl PluginHost {
         self.state.startup_closed.store(true, Ordering::SeqCst);
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restart_groups(&self) -> Vec<crate::platform::unix::ProcessGroupIdentity> {
+        self.state.agent_custodies.restart_groups()
+    }
+
     pub(crate) async fn force_all(&self, restart: bool) {
         self.close_startup_admission();
         let entries: Vec<_> = {
