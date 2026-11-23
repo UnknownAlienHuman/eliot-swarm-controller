@@ -462,6 +462,9 @@ impl Store {
             .map_err(sql_error)?;
             super::close_drained_workspace_process_source(&tx, agent_num, 1, now, &mut events)?;
         }
+        if let Some(agent_num) = record.target {
+            super::goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut events)?;
+        }
         let value = CommandResolveResponse {
             id: request.id.clone(),
             command_id: request.command_id.clone(),
@@ -599,7 +602,8 @@ impl Store {
                 "turn resolution needs a stored terminal generation or a native readback proving the turn inactive",
             ));
         }
-        let event = resolve_turn_tx(&tx, agent_num, request, now)?;
+        let mut events = vec![resolve_turn_tx(&tx, agent_num, request, now)?];
+        super::goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut events)?;
         let value = TurnResolveResponse {
             id: request.id.clone(),
             agent: request.agent.clone(),
@@ -617,10 +621,7 @@ impl Store {
             now,
         )?;
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(Change {
-            value,
-            events: vec![event],
-        })
+        Ok(Change { value, events })
     }
 
     /// Stored response for a turn-resolution write id already bound to this

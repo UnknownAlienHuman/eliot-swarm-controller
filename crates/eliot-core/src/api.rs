@@ -67,8 +67,8 @@ pub use agent_views::{
     AgentProcessesResponse, AgentProviderHold, AgentStateTotal, AgentStatsResponse, AgentSummary,
     AttentionStepReadback, AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView,
     CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, CommandWithoutDispatcherStatus, CrashMarker,
-    DaemonBuildIdentity, DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse,
-    DiagnoseStep, DrainReport, GitCredentialHelper, INSTRUCTION_FILE_PATHS,
+    DaemonBuildIdentity, DaemonHealthSummary, DaemonPanicTestResponse, DaemonStatusResponse,
+    DiagnoseResponse, DiagnoseStep, DrainReport, GitCredentialHelper, INSTRUCTION_FILE_PATHS,
     InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionReadStatus,
     InstructionSourceStatus, MAX_DIAGNOSE_ATTENTION_STEPS, MAX_DIAGNOSE_MESSAGE_CHARS,
     MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS, MAX_PATCH_DIGEST_OUTSIDE_CLAIMS,
@@ -137,8 +137,8 @@ pub use goals::{
     MAX_GOAL_CADENCE_MS, MAX_GOAL_CHECK_ARG_BYTES, MAX_GOAL_CHECK_ARGS,
     MAX_GOAL_CHECK_DEADLINE_STATUS, MAX_GOAL_CHECK_TIMEOUT_MS, MAX_GOAL_LIMIT,
     MAX_GOAL_OBSERVATION_BYTES, MAX_GOAL_SCOPE_BASE_PATHS, MAX_GOAL_SCOPE_GLOBS,
-    MIN_GOAL_CADENCE_MS, MIN_GOAL_CHECK_TIMEOUT_MS, derive_goal_check_deadline_ms,
-    goal_check_digest,
+    MIN_GOAL_CADENCE_MS, MIN_GOAL_CHECK_TIMEOUT_MS, UNSUCCESSFUL_TURN_NO_WORK,
+    UNSUCCESSFUL_TURN_WORK_UNVERIFIED, derive_goal_check_deadline_ms, goal_check_digest,
 };
 pub use handoff::{
     CommandCancelRequest, CommandCancelResponse, HandoffRequest, HandoffResponse,

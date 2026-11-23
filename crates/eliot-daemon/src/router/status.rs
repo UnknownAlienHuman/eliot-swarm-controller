@@ -4,9 +4,9 @@ use super::{Router, STATUS_BLOCKER_MAX};
 use eliot_core::{
     AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
-        AutonomyRequest, DaemonStatusResponse, DrainReport, OwnedProcessKind, OwnedProcessSummary,
-        OwnerInboxKind, RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
-        UnsettledCommandSummary, WorkspaceCustodyView,
+        AutonomyRequest, DaemonHealthSummary, DaemonStatusResponse, DrainReport, OwnedProcessKind,
+        OwnedProcessSummary, OwnerInboxKind, RetainedUnknownSummary, RetentionView,
+        RunningTurnSummary, StatusBlocker, UnsettledCommandSummary, WorkspaceCustodyView,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -37,6 +37,13 @@ impl Router {
 
     pub(super) async fn status(&self) -> Result<Value> {
         let (inbox, liveness, command_without_dispatcher) = self.read_owner_projection().await?;
+        let goals_without_progress = inbox
+            .iter()
+            .filter(|item| {
+                item.kind == OwnerInboxKind::BlockedGoal
+                    || (item.kind == OwnerInboxKind::Stuck && item.subject.starts_with("goal:"))
+            })
+            .count();
         let mut owner_inbox = OwnerInboxKind::ALL
             .into_iter()
             .map(|kind| (kind, 0))
@@ -104,6 +111,10 @@ impl Router {
         serde_json::to_value(DaemonStatusResponse {
             owner_inbox,
             liveness,
+            health: Some(DaemonHealthSummary {
+                goals_without_progress,
+                active_repeat_windows: self.active_repeat_windows(),
+            }),
             command_without_dispatcher: Some(command_without_dispatcher),
             build_identity: Some(crate::build_identity::current().clone()),
             provider_probe_attention,

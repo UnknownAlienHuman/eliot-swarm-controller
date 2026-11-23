@@ -2718,6 +2718,7 @@ impl Store {
         // Settle only the exact pre-Git creation cancellation after restart
         // has reconciled both dispatched commands and Agent custody.
         workspace::recover_workspace_cancellations(&tx, now, &mut events)?;
+        goals::pause_stopped_active_goals_tx(&tx, now, &mut events)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }

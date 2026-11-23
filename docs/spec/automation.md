@@ -1703,6 +1703,18 @@ identities never transfer. A private additive turn baseline preserves all consum
 turns while charging B's subsequent turns immediately; resetting a definition resets
 that baseline. Explicit resume is required. Cadence re-anchors at transfer time.
 
+A confirmed Agent stop (a native session end or an applied stop)
+pauses its active Eliot Goal in the same transaction with reason `agent_stopped`
+and marks it stop-paused. The Goal follows the resumed generation and keeps its
+definition, counters and any unresolved round marker. After native readiness, it
+returns to `active` once no Goal round marker is running or unknown and no Agent
+work is unresolved. If work is unresolved at readiness, a later settlement
+rechecks the same gates.
+Setting a Goal while its Agent is stopped also marks it to continue on Agent
+resume. An explicit Owner pause clears that mark, and `goal.resume` requires
+the Agent to leave the stopped state. Startup reconciles retained active Goals
+on stopped Agents through the same stop pause.
+
 Goal set, pause, clear and resume each take a required external mutation id
 (see Mutation ids in api.md); the DTO link in Core api/goals.rs is the only
 field catalog. The CLI supplies the global --id to all four. Each applies its
@@ -1770,7 +1782,7 @@ reason and known direct exit code in [GoalRoundEvent](../../crates/eliot-core/sr
 The event and the retained result commit together. Event readers, watch and rules
 can observe the result. The idle driver does not schedule itself from these events.
 Setting a Goal on an idle Agent can reconcile from the retained terminal result of
-its previous Goal. A retryable result can supply a fresh idle key for its immediate
+its previous Goal. A retryable spawn result can supply a fresh idle key for its immediate
 successor revision. Continued round events and `stale_round` abandonment events
 supply no idle key. A non-`stale_round` `unknown` `goal.round` event at the current
 revision never triggers automatic reconciliation or automatic driving, but can supply
@@ -1778,7 +1790,16 @@ an explicit Owner `goal.round` key after a burned round key (#904, #871).
 
 The check is the frozen explicit argv from `goal set`, run through the shared
 owned-process custody outside the Store lock with a bounded timeout, a small
-round-context stdin and the daemon environment. An explicit check deadline
+round-context stdin and the daemon environment. Before admitting an Eliot Goal,
+`goal set` resolves the program using the check's working directory for relative
+paths and the daemon's PATH for bare names. It refuses a missing or non-executable
+program with `check_unrunnable`. Windows batch wrappers require an explicit
+interpreter such as `cmd.exe /d /c npm test`. The same lookup runs immediately
+before the check, so a changed or removed program can still block a round.
+Goal and project checks receive the managed worktree's frozen base commit as
+`ELIOT_TASK_BASE` when available. The integration check receives its frozen
+integration base. The variable is supplied to the check process only.
+An explicit check deadline
 of 1–600 seconds in the Goal or its project policy takes precedence. With at
 least three successful runs with the same argv and working-directory
 override in the same project, the default is five times the median of the
@@ -1803,7 +1824,17 @@ key, or since the claim for a slot), sources still healthy, no open or
 unknown command, no active turn, no pending request — together with an
 optional ordinary `send` continuation admitted by the same transaction:
 completion on check exit 0, `round_budget`, `turn_limit` or `no_progress`
-block, or one continuation. Success always completes, even on a spent budget.
+block, or one continuation. A passing check completes even on a spent budget
+when the round qualifies for completion. If the last task turn was unsuccessful
+or its outcome is unknown, a passing check requires verified work against the
+immutable task base. Check-created changes alone cannot establish that work.
+With no changes, the round records `unsuccessful_turn_no_work`; an unavailable
+base or Git observation records `unsuccessful_turn_work_unverified`. The Goal
+waits for new Agent activity within its remaining budget and `swarm why` shows
+the retained reason. When verification keeps deferring, the Goal pauses at its
+round or no-progress limit, or after three deferrals if neither is configured.
+`swarm why` and the Owner inbox show `unsuccessful_turn_deferral_limit`.
+Neither outcome publishes a project-check pass.
 If the Goal's own continuation is rejected before native dispatch, that
 rejection and any resulting context rejections cannot supply a new idle key
 for the same Goal. A later eligible Agent event can still drive a round.
@@ -1831,10 +1862,15 @@ bound decision through the Store and does not run the check again.
 An unknown check outcome (including unproven custody or a check with no exit code
 such as a signal kill) commits no Goal progress or continuation, and
 neither does a commit that finds the Agent left idle during the check: the marker goes `unknown`
-and that round key is never rerun — the next round needs a new key. After a
-crash the marker stays `unknown`. Abandonment burns its marker and retains the
-original sanitized error in one transaction. A reservation from a crashed holder
-is durably resolved to `unknown` on readback, without another check. Claim also
+once custody closure is proven. Abandonment burns its key and retains the original
+sanitized error in one transaction. An explicit Owner `goal clear` releases
+markers with proven custody closure. If it arrives while a check is still running,
+the clear releases its key only after that exact reservation proves closure.
+After `goal set`, a released key can be used again if it still satisfies the ordinary
+idle or cadence gates. The cleared round's abandonment event does not advance the
+idle key for the rearmed Goal. The original mutation id continues to replay its
+retained error. A reservation from a crashed holder is durably resolved to
+`unknown` on readback, with its key still burned. Claim also
 preflights a bounded unknown recovery record. If the full error record exceeds
 the frame bound, abandonment retains and returns that unknown result atomically
 with the marker burn, rather than leaving a live running marker. Cancellation
@@ -1948,7 +1984,8 @@ are 1-based: slot `k` starts at `anchor + k * cadence_ms`, so the first slot
 starts one period after the set. A slot round names a due slot (its start
 passed); future slots are refused, and the last committed slot is persisted:
 any slot at or below it is refused at probe, claim and commit, and each
-burned slot still needs a newer key next time. Slot rounds are explicit; no
+burned slot stays fenced until an explicit clear and proof of custody closure.
+Slot rounds are explicit; no
 time-based driver fires them.
 
 The daemon also drives active Eliot-mode Goals automatically on idle: when a
@@ -1972,7 +2009,7 @@ the retained idle subjects. Queued waits and stale rounds are logged. Other race
 against explicit rounds resolve through the
 single-flight marker and the burn and stay silent. Shutdown cancels every
 in-flight automatic check through its custody cancellation and waits only for
-the rounds to resolve their markers (`unknown`, never rerun).
+the rounds to settle their markers.
 
 Setting or resuming an enabled idle-keyed Goal also reconciles the
 retained exact-generation idle subject: the set/resume wakes the driver,
@@ -1993,10 +2030,10 @@ generation's idle event can drive an eligible Goal. Earlier idle events and
 unresolved rounds keep their original generation binding.
 A consumed idle subject rearms only through a new Goal revision: a
 definition change clears the committed key, so the next sweep may round
-the still-current subject again. Unknown-burned keys never rerun within
-the generation, and the same revision never rerounds a consumed key —
-repeated set/retry, reads and daemon restart cannot create another
-round.
+the still-current subject again. A burned marker requires both explicit clear
+and proof of custody closure before the same subject can be used again. The
+same revision never rerounds a consumed key. Replaying a write, reading the
+Goal and restarting the daemon leave the burn in place.
 
 No-progress compares check output digests and the workspace fingerprint
 together. The fingerprint is HEAD plus the Git monitor's content `dirty_digest`
@@ -2025,10 +2062,11 @@ revision-bound rule traversal, scheduling and Goal round reservations.
 
 `goal_markers` holds one row per unresolved round: `running` while its check
 runs, `unknown` once the round ended without a commit. The final commit
-consumes its marker; an unknown marker burns its round key, which is never
-rerun. The burn ignores revision but separates key forms: a burned idle seq
-never blocks the same slot number. A `running` row whose holder is gone
-(crash) reads as `unknown`.
+consumes its marker. A burned key is fenced across revisions until an explicit
+clear and positive custody closure for that marker. Existing and crash-recovered
+markers without closure proof stay fenced. The burn separates key forms, so a
+burned idle seq never blocks the same slot number. A `running` row whose holder
+is gone reads as `unknown`.
 
 Goal definition/state retain text/check, budgets, counters, the cadence
 anchor, the last committed slot and the last workspace fingerprint alongside

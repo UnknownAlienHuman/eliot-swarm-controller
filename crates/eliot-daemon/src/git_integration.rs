@@ -531,6 +531,7 @@ async fn run_policy_check(
     configured_timeout_ms: i64,
     root: &Path,
     index: &Path,
+    base_oid: &str,
     run: GitRun<'_>,
 ) -> Result<crate::router::project_checks::CheckOutcome> {
     let remaining_ms = run
@@ -549,6 +550,7 @@ async fn run_policy_check(
         configured_timeout_ms.min(remaining_ms),
         Arc::clone(run.policy),
         run.cancellation.clone(),
+        Some(base_oid),
         Some((index, run.lease.clone())),
     )
     .await
@@ -618,7 +620,16 @@ async fn isolate_failed_branches(
                 verify_private_tree(git, root, index, &oid, deadline)
                     .await
                     .map_err(|_| "git_integrate_isolation_tree_unknown")?;
-                match run_policy_check(check_argv, check_timeout_ms, root, index, run).await {
+                match run_policy_check(
+                    check_argv,
+                    check_timeout_ms,
+                    root,
+                    index,
+                    &frozen.base_oid,
+                    run,
+                )
+                .await
+                {
                     Ok(crate::router::project_checks::CheckOutcome::Passed) => {}
                     Ok(crate::router::project_checks::CheckOutcome::Failed { .. }) => {
                         result.failed.push(pin.branch.clone());
@@ -1146,7 +1157,7 @@ async fn execute_in_scratch(
             Some("git_integrate_combined_tree_unknown"),
         );
     }
-    match run_policy_check(check.0, check.1, root, index, run).await {
+    match run_policy_check(check.0, check.1, root, index, &frozen.base_oid, run).await {
         Ok(CheckOutcome::Passed) => {}
         Ok(CheckOutcome::Failed { exit_code, output }) => {
             let (state, code, isolation) = match isolate_failed_branches(

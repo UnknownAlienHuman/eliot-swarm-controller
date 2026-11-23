@@ -1994,7 +1994,10 @@ fn stop_agent_tx(
             events,
         )?;
     }
-    if matches!(agent.state, AgentState::Stopped | AgentState::Failed) {
+    if agent.state == AgentState::Stopped {
+        return super::goals::pause_for_stop_tx(tx, agent_num, generation, now, events);
+    }
+    if agent.state == AgentState::Failed {
         return Ok(());
     }
     for dispatched_id in command_ids_in_state(tx, agent_num, generation, "dispatched")? {
@@ -2069,6 +2072,7 @@ fn stop_agent_tx(
             json!({"agent_id": agent.id, "command_id": command_id}),
         ),
     )?);
+    super::goals::pause_for_stop_tx(tx, agent_num, generation, now, events)?;
     super::native_children::end_native_children_with_parent_tx(
         tx,
         Some((agent_num, generation)),

@@ -10,7 +10,8 @@ use crate::{
     common::now_ms,
     git_monitor::GitProbe,
     scripts::process::{
-        ProcessCapture, ProcessFailure, ProcessOutcome, local_process_command, run_owned_process,
+        ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV, local_process_command,
+        run_owned_process,
     },
     workspace_git::WorkspaceGit,
 };
@@ -84,6 +85,7 @@ struct ProjectWork {
     config: crate::config::ProjectRegistrationConfig,
     check: Option<ProjectWorkCheck>,
     workspace: String,
+    task_base: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -758,6 +760,7 @@ async fn check_after_edit(
             DEFAULT_GOAL_CHECK_TIMEOUT_MS,
             Arc::clone(&policy),
             shutdown.clone(),
+            work.task_base.as_deref(),
         )
         .await
         {
@@ -809,6 +812,7 @@ async fn check_after_edit(
             check.deadline_ms,
             Arc::clone(&policy),
             shutdown,
+            work.task_base.as_deref(),
         )
         .await
         {
@@ -1084,6 +1088,7 @@ async fn load_project_work(
         config,
         check,
         workspace: canonical,
+        task_base: agent.base_oid,
     }))
 }
 
@@ -1099,8 +1104,18 @@ async fn run_argv(
     deadline_ms: i64,
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
+    task_base: Option<&str>,
 ) -> Result<CheckOutcome> {
-    run_argv_with_index(argv, workspace, deadline_ms, policy, cancellation, None).await
+    run_argv_with_index(
+        argv,
+        workspace,
+        deadline_ms,
+        policy,
+        cancellation,
+        task_base,
+        None,
+    )
+    .await
 }
 
 pub(crate) async fn run_argv_with_index(
@@ -1109,6 +1124,7 @@ pub(crate) async fn run_argv_with_index(
     deadline_ms: i64,
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
+    task_base: Option<&str>,
     private: Option<(&Path, crate::git_integration::IntegrationLease)>,
 ) -> Result<CheckOutcome> {
     let (program, args) = argv
@@ -1116,6 +1132,9 @@ pub(crate) async fn run_argv_with_index(
         .ok_or_else(|| Error::new("source_integrity", "project command argv is empty"))?;
     let mut command = local_process_command(program)?;
     command.args(args).current_dir(workspace);
+    if let Some(base) = task_base {
+        command.env(TASK_BASE_ENV, base);
+    }
     let timeout = Duration::from_millis(deadline_ms as u64);
     let outcome = if let Some((index_file, lease)) = private {
         command.env(
