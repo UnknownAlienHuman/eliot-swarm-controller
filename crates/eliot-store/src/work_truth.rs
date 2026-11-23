@@ -60,6 +60,12 @@ pub struct GitCheckpointIntent {
     pub input: GitCheckpointInput,
 }
 
+pub enum GitCheckpointReservation {
+    Reserved,
+    Deferred,
+    Skipped,
+}
+
 /// What the next checkpoint of a generation starts from.
 #[derive(Clone, Debug, Default)]
 pub struct GitCheckpointBasis {
@@ -124,6 +130,60 @@ pub(super) fn inherit_work_task_generation_tx(
     Ok(())
 }
 
+pub(super) fn require_no_checkpoint_intent_tx(tx: &Transaction<'_>, source: &Agent) -> Result<()> {
+    let pending: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM git_checkpoint_intents
+             WHERE agent = ?1 AND generation = ?2)",
+            params![parse_agent_id(&source.id)?, source.generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if pending {
+        return Err(Error::new("busy", "source checkpoint has not finished"));
+    }
+    Ok(())
+}
+
+fn checkpoint_switch_gate(
+    tx: &Transaction<'_>,
+    intent: &GitCheckpointIntent,
+    agent: i64,
+) -> Result<Option<GitCheckpointReservation>> {
+    use GitCheckpointReservation::{Deferred, Skipped};
+    let retired: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_successors WHERE agent = ?1)",
+            [agent],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if retired {
+        return Ok(Some(Skipped));
+    }
+    let switch: Option<(String, bool)> = tx
+        .query_row(
+            "SELECT p.state, EXISTS(SELECT 1 FROM commands c
+                 WHERE c.parent_command = p.id AND c.link_kind = 'switch' AND c.ordinal = 0)
+             FROM commands p INDEXED BY commands_unsettled_created
+             WHERE p.verb = 'switch' AND p.method = 'swarm.switch'
+               AND p.state IN ('accepted','queued','dispatched','unknown')
+               AND json_extract(p.args, '$.from') = ?1
+               AND json_extract(p.args, '$.from_generation') = ?2
+             LIMIT 1",
+            params![intent.agent, intent.generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(match switch {
+        Some((_, true)) => Some(Deferred),
+        Some((state, false)) if state == "dispatched" && intent.input.trigger == "handoff" => None,
+        Some(_) => Some(Deferred),
+        None => None,
+    })
+}
+
 impl Store {
     pub fn work_truth_cursor(&self) -> Result<i64> {
         self.connection
@@ -174,7 +234,8 @@ impl Store {
         &mut self,
         intent: &GitCheckpointIntent,
         removal_command: Option<&str>,
-    ) -> Result<bool> {
+    ) -> Result<GitCheckpointReservation> {
+        use GitCheckpointReservation::{Deferred, Reserved, Skipped};
         self.ensure_writer_healthy()?;
         let result = (|| {
             let agent = parse_agent_id(&intent.agent)?;
@@ -185,12 +246,18 @@ impl Store {
             if !load_agent_by_num(&tx, agent)?.is_some_and(|row| {
                 row.generation == intent.generation
                     && row.workspace.as_deref() == Some(intent.workspace.as_str())
-            }) || repo_git_write_blocked_tx(
+            }) {
+                return Ok(Skipped);
+            }
+            if let Some(outcome) = checkpoint_switch_gate(&tx, intent, agent)? {
+                return Ok(outcome);
+            }
+            if repo_git_write_blocked_tx(
                 &tx,
                 removal_command.unwrap_or_default(),
                 &intent.common_dir,
             )? {
-                return Ok(false);
+                return Ok(Deferred);
             }
             tx.execute(
                 "INSERT INTO git_checkpoint_intents(common_dir, agent, generation, workspace, input)
@@ -205,7 +272,7 @@ impl Store {
             )
             .map_err(sql_error)?;
             commit_transaction(tx, &self.write_faulted)?;
-            Ok(true)
+            Ok(Reserved)
         })();
         self.fault_on_persistence_error(&result);
         result

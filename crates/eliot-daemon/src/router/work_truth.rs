@@ -5,7 +5,8 @@ use super::*;
 use crate::work_truth::{self, CheckpointRequest, TaskRecord, TaskSource};
 use eliot_core::api::{GitCheckpointState, HandoffReason};
 use eliot_store::{
-    AutomaticHandoff, BriefFacts, GitCheckpointInput, GitCheckpointIntent, JournalTurn,
+    AutomaticHandoff, BriefFacts, GitCheckpointInput, GitCheckpointIntent,
+    GitCheckpointReservation, JournalTurn,
 };
 use std::path::{Path, PathBuf};
 use tokio::sync::broadcast;
@@ -276,15 +277,22 @@ impl Router {
             .lock()
             .await
             .session_exit_proven(agent, generation)?;
-        if proven {
-            self.checkpoint_work(agent, generation, "session_end", None)
-                .await?;
-        } else {
+        self.inner
+            .store
+            .lock()
+            .await
+            .defer_session_checkpoint(agent, generation, now_ms())?;
+        if proven
+            && self
+                .checkpoint_work(agent, generation, "session_end", None)
+                .await?
+                .is_none()
+        {
             self.inner
                 .store
                 .lock()
                 .await
-                .defer_session_checkpoint(agent, generation, now_ms())?;
+                .clear_session_checkpoint(agent, generation)?;
         }
         Ok(())
     }
@@ -400,8 +408,10 @@ impl Router {
                         .generation_bytes
                         .saturating_sub(basis.captured_bytes)
                         .min(limits.total_bytes);
-                    if store.reserve_git_checkpoint(&intent, removal_command)? {
-                        return Ok(Some(basis));
+                    match store.reserve_git_checkpoint(&intent, removal_command)? {
+                        GitCheckpointReservation::Reserved => return Ok(Some(basis)),
+                        GitCheckpointReservation::Skipped => return Ok(None),
+                        GitCheckpointReservation::Deferred => {}
                     }
                 }
                 progress.changed().await.map_err(|_| {
