@@ -789,12 +789,15 @@ pub struct InstructionFileView {
 }
 
 /// Metadata-only evidence for shared owner rules, whose text is held in settings.
-#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnerRulesDeliveryMethod {
     CodexDeveloperInstructions,
     ClaudeAppendSystemPromptFile,
     OpenCodeAgentsFile,
+    #[default]
     FirstInput,
 }
 

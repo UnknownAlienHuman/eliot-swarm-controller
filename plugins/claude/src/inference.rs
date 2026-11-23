@@ -2,9 +2,29 @@
 //! Native CLI 2.1.325 --help and https://code.claude.com/docs/en/cli-reference,
 //! inspected 2026-11-15. No upstream code is copied.
 use eliot_core::{Error, Result};
+use eliot_plugin::text_inference::TextInferenceAdapter;
+pub use eliot_plugin::text_inference::TextResult;
 use serde::Deserialize;
+use std::{ffi::OsString, path::Path};
 
 pub const MODEL: &str = "claude-haiku-5-5";
+
+pub const ADAPTER: TextInferenceAdapter = TextInferenceAdapter {
+    arguments,
+    environment,
+    result,
+};
+
+fn environment(native_home: &Path) -> Vec<(&'static str, OsString)> {
+    // The native refusal predicate has separate switches from HTTP retry.
+    vec![
+        ("CLAUDE_CODE_MAX_RETRIES", "0".into()),
+        ("CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES", "0".into()),
+        ("CLAUDE_CODE_DISABLE_REFUSAL_RETRY", "1".into()),
+        ("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK", "1".into()),
+        ("CLAUDE_CONFIG_DIR", native_home.as_os_str().to_owned()),
+    ]
+}
 
 pub fn arguments() -> Vec<String> {
     [
@@ -42,11 +62,6 @@ struct PrintResult {
     result: Option<String>,
     num_turns: u32,
     session_id: String,
-}
-
-pub struct TextResult {
-    pub text: String,
-    pub session_id: String,
 }
 
 pub fn result(bytes: &[u8], max: usize) -> Result<TextResult> {

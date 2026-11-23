@@ -1153,7 +1153,8 @@ fn persist_turn_terminal(
         .pointer("/native_error/message")
         .and_then(Value::as_str)
         .filter(|message| !message.is_empty());
-    let effective_model = (next_agent.harness == "opencode")
+    let effective_model = eliot_core::api::HarnessCapabilities::of(&next_agent.harness)
+        .turn_completed_reports_effective_model
         .then(|| {
             native_event
                 .data

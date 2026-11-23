@@ -11,6 +11,7 @@ mod source_intake;
 use crate::bus::Bus;
 use crate::command_guard::CommandGuardPolicy;
 use crate::common::{now_ms, valid_environment_name};
+use crate::harness_capabilities::HarnessCapabilities;
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
 use crate::platform::custody::{AgentCustodies, AgentSpawnError, LocalPeer};
@@ -600,11 +601,7 @@ impl PluginHost {
                 "Agent launch workspace must be an existing directory",
             ));
         }
-        if !matches!(
-            agent.harness.as_str(),
-            "codex" | "muse" | "claude" | "opencode" | "antigravity"
-        ) || agent.generation <= 0
-        {
+        if HarnessCapabilities::for_harness(&agent.harness).is_none() || agent.generation <= 0 {
             return Err(Error::new(
                 "unsupported",
                 format!("unsupported Agent harness {}", agent.harness),
@@ -643,7 +640,7 @@ impl PluginHost {
         } else {
             None
         };
-        if agent.harness == "antigravity" {
+        if HarnessCapabilities::of(&agent.harness).reader_executable_discovery {
             let cmd = agent.profile_snapshot["cmd"].as_str().unwrap_or("agy");
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             let (program, _) =
@@ -677,7 +674,9 @@ impl PluginHost {
                         "Store did not commit the generation credential before plugin start",
                     )
                 })?;
-            let receipt = if matches!(agent.harness.as_str(), "codex" | "claude" | "opencode") {
+            let receipt = if HarnessCapabilities::of(&agent.harness).owner_rules_delivery
+                != eliot_core::api::OwnerRulesDeliveryMethod::FirstInput
+            {
                 store.get_agent_owner_rules_delivery(&agent.id)?
             } else {
                 None
@@ -696,15 +695,12 @@ impl PluginHost {
             .transpose()?;
         let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
-        let mcp_environment = if agent.is_automatic_provider_probe() || agent.harness == "muse" {
+        let mcp_environment = if agent.is_automatic_provider_probe()
+            || HarnessCapabilities::of(&agent.harness).data_root_only_mcp
+        {
             Some(data_root_only_mcp_environment(&mcp_environment)?)
-        } else if matches!(
-            agent.harness.as_str(),
-            "codex" | "claude" | "opencode" | "antigravity"
-        ) {
-            Some(mcp_environment)
         } else {
-            None
+            Some(mcp_environment)
         };
         let artifact_root = self
             .state
@@ -767,7 +763,7 @@ impl PluginHost {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
-        let prepared_mcp = if agent.harness == "antigravity" {
+        let prepared_mcp = if HarnessCapabilities::of(&agent.harness).prepared_mcp_config {
             match antigravity_mcp::prepare(&agent, &target_environment, &instance_dir) {
                 Ok(config) => config,
                 Err(error) => {
@@ -3063,10 +3059,7 @@ async fn resolve_resume_config(
     actor: &AgentActorConfig,
 ) -> Result<Option<(Option<String>, Option<String>, i64)>> {
     if actor.start_command.verb != "resume"
-        || !matches!(
-            actor.agent.harness.as_str(),
-            "opencode" | "antigravity" | "claude" | "muse"
-        )
+        || !HarnessCapabilities::of(&actor.agent.harness).resume_config
     {
         return Ok(None);
     }
@@ -3084,10 +3077,10 @@ async fn resolve_resume_config(
         )
         .map(|config| {
             config.map(|config| {
-                let effort = if actor.agent.harness == "muse" {
-                    None
-                } else {
+                let effort = if HarnessCapabilities::of(&actor.agent.harness).effort {
                     config.effort
+                } else {
+                    None
                 };
                 (config.model, effort, config.revision)
             })
@@ -3131,7 +3124,10 @@ fn validate_agent_command_result(value: Value, harness: &str, command: &Command)
     let verb = command.verb.as_str();
     match value.get("state").and_then(Value::as_str) {
         Some("applied") if verb == "send" => validate_send_result(value),
-        Some("applied") if verb == "configure" && harness == "claude" => {
+        Some("applied")
+            if verb == "configure"
+                && HarnessCapabilities::of(harness).configure_reports_accepted_model =>
+        {
             let accepted = value.get("accepted_model").and_then(Value::as_str);
             if accepted.is_some() && accepted == command.args.get("model").and_then(Value::as_str) {
                 Ok(value)
@@ -3371,7 +3367,10 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
             .iter()
             .all(|required| verbs.contains(required))
         || verbs.iter().any(|verb| {
-            !implemented_verbs.contains(verb) && !(harness == "opencode" && *verb == "models")
+            !implemented_verbs.contains(verb)
+                && !HarnessCapabilities::of(harness)
+                    .manifest_extra_verbs
+                    .contains(verb)
         })
         || !manifest.child_verbs.is_empty()
         || manifest.features.start_requires_input
@@ -3381,13 +3380,10 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         return Err(unsupported_manifest());
     }
 
-    if !matches!(
-        harness,
-        "codex" | "muse" | "claude" | "opencode" | "antigravity"
-    ) {
+    if HarnessCapabilities::for_harness(harness).is_none() {
         return Err(unsupported_manifest());
     }
-    if verbs.contains("compact") && !matches!(harness, "codex" | "opencode") {
+    if verbs.contains("compact") && !HarnessCapabilities::of(harness).compact {
         return Err(unsupported_manifest());
     }
     let mandatory_families = ["message", "session", "turn"];
@@ -3602,7 +3598,10 @@ fn prepare_process_environment(
                 .ok_or_else(|| Error::new("invalid", "frozen native store inputs are malformed"))
         })
         .transpose()?;
-    if captured.is_none() && profile["harness"] == "codex" {
+    if captured.is_none()
+        && HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .requires_frozen_store_inputs
+    {
         return Err(Error::new(
             "invalid",
             "frozen native store inputs are missing",
@@ -3717,7 +3716,7 @@ fn build_target_environment(
     agent: &Agent,
     agent_token: &str,
 ) -> Result<(Value, Value)> {
-    if agent.harness == "codex"
+    if HarnessCapabilities::of(&agent.harness).requires_pass_env
         && !agent
             .profile_snapshot
             .get("pass_env")
@@ -3762,7 +3761,7 @@ fn build_target_environment(
     // Codex's app-server supplies its MCP identity from named environment
     // variables and filters those variables from its shell tools. Data-root
     // values stay in the separate MCP environment for every harness.
-    if pass_identity || agent.harness == "codex" {
+    if pass_identity || HarnessCapabilities::of(&agent.harness).agent_identity_env {
         insert_environment(&mut environment, "ELIOT_AGENT_ID", agent.id.clone());
         insert_environment(
             &mut environment,

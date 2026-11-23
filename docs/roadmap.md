@@ -485,6 +485,10 @@ qualification is incomplete; do not describe it as feature complete.
 Implement the bounded retention path first, then build/run the complete campaign against
 the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
+- [ ] Finish the adapter boundary for native catalogue and quota translation,
+      instruction-file discovery, and native diagnostics (#932). Keep native
+      translation in adapters and let the daemon own routing and settlement.
+      Remove the corresponding shared-source name exceptions as those paths move.
 - [x] Daemon update preflights a Store snapshot, fences admission, and starts the
       replacement or rolls back on the same schema. Deadline Stops use ordinary
       custody and promptless continuation in parent-first order (#836).

@@ -95,7 +95,7 @@ fn check_executable(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        if crate::adhoc::is_script_wrapper(&path.to_string_lossy()) {
+        if eliot_plugin::install::is_script_wrapper(&path.to_string_lossy()) {
             return Err(unrunnable(format!(
                 "Goal check {} is a script wrapper. Name its interpreter explicitly, for example cmd.exe /d /c npm test for a .cmd or .bat wrapper.",
                 path.display()

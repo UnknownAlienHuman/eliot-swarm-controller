@@ -2,6 +2,7 @@
 //! admission/dispatch path.
 
 use super::*;
+use crate::harness_capabilities::HarnessCapabilities;
 use eliot_store::{Admission, ProviderProbeCandidate};
 use tokio::sync::watch;
 
@@ -103,7 +104,7 @@ impl Router {
             .get("harness")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::new("invalid", "provider probe profile has no harness"))?;
-        if harness != "codex" {
+        if !HarnessCapabilities::of(harness).provider_probe {
             return Err(Error::new(
                 "unsupported",
                 "automatic minimal provider probes currently require a Codex profile",
@@ -150,7 +151,7 @@ impl Router {
                     "Codex provider probe lost its frozen profile snapshot",
                 )
             })?;
-        if snapshot.get("harness").and_then(Value::as_str) != Some("codex") {
+        if snapshot.get("harness").and_then(Value::as_str) != Some(harness) {
             return Err(Error::new(
                 "unsupported",
                 "provider probe harness changed during preparation",

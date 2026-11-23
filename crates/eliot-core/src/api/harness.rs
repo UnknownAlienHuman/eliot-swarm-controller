@@ -18,9 +18,213 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// The native harness adapters the controller supports.
 pub const SUPPORTED_HARNESSES: &[&str] = &["codex", "claude", "muse", "opencode", "antigravity"];
+
+/// How `configure` switches the live native session before Store records an overlay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfigureSessionMode {
+    /// Never switches the live native session at configure time.
+    #[default]
+    Never,
+    /// Always switches the live native session at configure time.
+    Always,
+    /// Switches the live native session only when `model` is requested.
+    WhenModelPresent,
+}
+
+/// Relationship between retained input counters and separate cache counters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputTokenAccounting {
+    #[default]
+    Uncached,
+    IncludesCacheReads,
+    ExcludesCacheWrites,
+}
+
+/// How the dedicated reader binds an archive request to the retained native store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeArchiveBinding {
+    FrozenStore,
+    Workspace,
+}
+
+/// Prelaunch capability declaration supplied by each built-in adapter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarnessCapabilities {
+    /// Accepts the `compact` verb and emits a compact hint on session growth.
+    pub compact: bool,
+    /// `harness.models` accepts a `workspace` launch-preview argument.
+    pub models_workspace_preview: bool,
+    /// Preview each configured auth integration in its own native store.
+    pub models_preview_auth_integrations: bool,
+    /// The native model refusal permits cleanup before any initial turn work.
+    pub initial_model_refusal_cleanup: bool,
+    /// Supported reasoning-effort vocabulary when `configure` restricts it.
+    pub allowed_configure_efforts: Option<&'static [&'static str]>,
+    /// How `configure` interacts with the live native session.
+    pub configure_session_mode: ConfigureSessionMode,
+    /// Live native `configure` requires an idle session with no active turn.
+    pub configure_requires_idle_turn: bool,
+    /// `configure` carries forward unrequested `model`/`effort` from the previous revision.
+    pub configure_carries_previous_overlay: bool,
+    /// `configure` applies `effort` via per-turn overlay rather than a live native setter.
+    pub configure_effort_per_turn_overlay: bool,
+    /// Unknown native `configure` commands can be resolved via live `probe_snapshot` readback.
+    pub configure_resolution_readback: bool,
+    /// `turn.completed` events may carry `effective_model`.
+    pub turn_completed_reports_effective_model: bool,
+    /// Failed turns backfill `native_error_message` / `effective_model` on readback.
+    pub backfill_failed_turn_readback: bool,
+    /// Supports `source.gap` view-projection recovery on active turns.
+    pub view_projection_gap_recovery: bool,
+    /// Stream families granted for `observe` attachment.
+    pub observed_families: &'static [&'static str],
+    /// Stream families granted for live `observe` publication.
+    pub observed_live_families: &'static [&'static str],
+    /// Observation stream families supported for registered native children.
+    pub native_child_families: &'static [&'static str],
+    /// Process executable stems owned by this harness runtime.
+    pub executable_stems: &'static [&'static str],
+    /// Product prefixes stripped when normalizing `--version` strings.
+    pub version_prefixes: &'static [&'static str],
+    /// Retained turn status can be a native print result subtype.
+    pub legacy_result_status: bool,
+    /// Interpretation of retained input counts before normalization.
+    pub input_token_accounting: InputTokenAccounting,
+    /// Native output and reasoning counts are disjoint.
+    pub output_excludes_reasoning: bool,
+    /// The cumulative session prompt includes cache reads.
+    pub session_input_includes_cache_reads: bool,
+    /// Supports automatic minimal provider probes.
+    pub provider_probe: bool,
+    /// The adapter's delivery mechanism for committed owner rules.
+    pub owner_rules_delivery: super::OwnerRulesDeliveryMethod,
+    /// MCP identity comes only from data-root values, not the full target
+    /// environment.
+    pub data_root_only_mcp: bool,
+    /// Writes a prepared MCP configuration before start.
+    pub prepared_mcp_config: bool,
+    /// Resolves the launch executable through reader discovery.
+    pub reader_executable_discovery: bool,
+    /// Resumes with a command-scoped config overlay.
+    pub resume_config: bool,
+    /// A busy session must reach a native terminal while the old daemon is writable.
+    pub restart_requires_idle: bool,
+    /// Resume preflight uses the newest retained turn across promptless generations.
+    pub resume_previous_turn: bool,
+    /// Accepts a reasoning-effort setting.
+    pub effort: bool,
+    /// Reports the accepted model on a `configure` result.
+    pub configure_reports_accepted_model: bool,
+    /// Reports separate reasoning-effort verification on a `configure` result.
+    pub configure_reports_effort_verification: bool,
+    /// Profiles must carry an explicit `pass_env` array.
+    pub requires_pass_env: bool,
+    /// Profiles that have a frozen store input must carry it.
+    pub requires_frozen_store_inputs: bool,
+    /// Supports discovering existing native sessions through a dedicated reader.
+    pub native_discovery: bool,
+    /// Native archive support and the binding required by its reader.
+    pub native_archive: Option<NativeArchiveBinding>,
+    /// Read quota evidence retained from an actual turn.
+    pub reads_retained_quota: bool,
+    /// Passes the Agent identity variables to the native process.
+    pub agent_identity_env: bool,
+    /// Resolves a default for a launch command that omits model.
+    pub launch_default_resolution: bool,
+    /// Injection point for a guard refusal on a live stream, if any.
+    pub guard_refusal_point: Option<crate::InjectPoint>,
+    /// Manifest verbs this adapter may declare without implementing.
+    pub manifest_extra_verbs: &'static [&'static str],
+    /// Hot-start manager order among harnesses that can deny native subagents;
+    /// lower is preferred.
+    pub manager_preference: Option<u8>,
+}
+
+type Declarations = Box<[(&'static str, HarnessCapabilities)]>;
+static BUILTIN_CAPABILITIES: OnceLock<Declarations> = OnceLock::new();
+
+/// Register the adapter declarations once before starting the executable.
+pub fn register_harness_capabilities(
+    declarations: impl IntoIterator<Item = (&'static str, HarnessCapabilities)>,
+) -> crate::Result<()> {
+    let declarations: Declarations = declarations.into_iter().collect();
+    if declarations.len() != SUPPORTED_HARNESSES.len()
+        || SUPPORTED_HARNESSES.iter().any(|supported| {
+            declarations
+                .iter()
+                .filter(|(name, _)| name == supported)
+                .count()
+                != 1
+        })
+    {
+        return Err(Error::new(
+            "internal",
+            "built-in adapter declarations do not match supported harnesses",
+        ));
+    }
+    BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
+        Error::new(
+            "internal",
+            "built-in adapter capabilities already registered",
+        )
+    })
+}
+
+impl HarnessCapabilities {
+    fn registered() -> Option<&'static Declarations> {
+        let entries = BUILTIN_CAPABILITIES.get();
+        debug_assert!(
+            entries.is_some(),
+            "built-in adapter capabilities must be registered"
+        );
+        entries
+    }
+
+    /// Require registration before the daemon can open its Store.
+    pub fn require_registered() -> Result<()> {
+        BUILTIN_CAPABILITIES.get().map(|_| ()).ok_or_else(|| {
+            Error::new(
+                "internal",
+                "built-in adapter capabilities were not registered",
+            )
+        })
+    }
+
+    /// Capabilities of `harness`; an unknown name has none.
+    pub fn of(harness: &str) -> Self {
+        Self::for_harness(harness).unwrap_or_default()
+    }
+
+    /// Capabilities of a supported native harness, or `None` for any other name.
+    pub fn for_harness(harness: &str) -> Option<Self> {
+        Self::registered()?
+            .iter()
+            .find_map(|(name, caps)| (*name == harness).then_some(*caps))
+    }
+
+    /// Whether `stem` (lowercased executable basename without extension) belongs
+    /// to one of the supported harness executables.
+    pub fn is_harness_executable_stem(stem: &str) -> bool {
+        Self::registered().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(_, caps)| caps.executable_stems.contains(&stem))
+        })
+    }
+
+    /// Whether `family` belongs to any supported harness's native-child grant.
+    pub fn is_native_child_family(family: &str) -> bool {
+        Self::registered().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|(_, caps)| caps.native_child_families.contains(&family))
+        })
+    }
+}
 
 /// Whether `name` is one of the supported native harnesses.
 pub fn is_supported_harness(name: &str) -> bool {
@@ -171,7 +375,7 @@ impl HarnessModelsRequest {
         validate_profile_opt(self.profile.as_deref())?;
         if let Some(workspace) = self.workspace.as_deref()
             && (self.agent.is_some()
-                || self.harness.trim() != "opencode"
+                || !HarnessCapabilities::of(self.harness.trim()).models_workspace_preview
                 || workspace.is_empty()
                 || workspace.len() > 4096
                 || workspace.chars().any(char::is_control))
@@ -384,22 +588,18 @@ impl ConfigureSupport {
     /// else has no verified mechanism. Claude effort applies only at
     /// launch (`--effort`), with no verified live switch.
     pub fn for_harness(harness: &str) -> Self {
-        let refuse = |reason: &str| Some(reason.to_owned());
-        match harness {
-            "codex" | "antigravity" | "opencode" | "muse" => Self::default(),
-            "claude" => Self {
-                model_refusal: None,
-                effort_refusal: refuse(
-                    "Claude effort applies only at launch and cannot change mid-session (launch_only)",
-                ),
-            },
-            other => {
-                let reason = format!("configure is not supported for the {other} harness");
-                Self {
-                    model_refusal: Some(reason.clone()),
-                    effort_refusal: Some(reason),
-                }
-            }
+        if !is_supported_harness(harness) {
+            let reason = format!("configure is not supported for the {harness} harness");
+            return Self {
+                model_refusal: Some(reason.clone()),
+                effort_refusal: Some(reason),
+            };
+        }
+        Self {
+            model_refusal: None,
+            effort_refusal: (harness == "claude").then(|| {
+                "Claude effort applies only at launch and cannot change mid-session (launch_only)".to_owned()
+            }),
         }
     }
 }
@@ -418,16 +618,14 @@ pub const MUSE_REASONING_EFFORT_TIERS: [&str; 8] = [
 /// harnesses without a verified mechanism never switch natively, even
 /// when a model is named.
 pub fn configure_uses_native_session(harness: &str, args: &serde_json::Value) -> bool {
-    if matches!(harness, "opencode" | "antigravity") {
-        return true;
-    }
-    if matches!(harness, "claude" | "muse") {
-        return args
+    match HarnessCapabilities::of(harness).configure_session_mode {
+        ConfigureSessionMode::Always => true,
+        ConfigureSessionMode::WhenModelPresent => args
             .get("model")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|model| !model.trim().is_empty());
+            .is_some_and(|model| !model.trim().is_empty()),
+        ConfigureSessionMode::Never => false,
     }
-    false
 }
 
 impl HarnessModelsResponse {
@@ -1060,12 +1258,12 @@ pub fn catalog_provider(harness: &str, id: &str) -> String {
             .split(['-', '_'])
             .next()
             .filter(|family| !family.trim().is_empty())
-            .unwrap_or("antigravity")
+            .unwrap_or(harness)
             .to_owned(),
         "opencode" => id
             .split_once('/')
             .map(|(provider, _)| provider.to_owned())
-            .unwrap_or_else(|| "opencode".to_owned()),
+            .unwrap_or_else(|| harness.to_owned()),
         _ => harness.to_owned(),
     }
 }

@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+pub mod capabilities;
 mod discovery;
 mod events;
 mod host;
+pub mod install;
 mod live_recovery;
 mod mcp;
 mod native;

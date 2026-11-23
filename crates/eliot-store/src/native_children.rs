@@ -3,10 +3,7 @@
 //! Agent and source rows remain authoritative for identity and publication.
 
 use super::*;
-use eliot_core::{
-    CODEX_NATIVE_CHILD_FAMILIES, ChildRegistration, ChildRegistrationAck,
-    MUSE_NATIVE_CHILD_FAMILIES, native_child_families_for_harness,
-};
+use eliot_core::{ChildRegistration, ChildRegistrationAck, native_child_families_for_harness};
 use eliot_core::{NativeChildActivity, NativeChildActivityState};
 use std::collections::BTreeMap;
 
@@ -1122,10 +1119,10 @@ pub(super) fn require_grant(
 }
 
 pub(super) fn require_families(families: &[String]) -> Result<()> {
-    if families.iter().any(|family| {
-        !CODEX_NATIVE_CHILD_FAMILIES.contains(&family.as_str())
-            && !MUSE_NATIVE_CHILD_FAMILIES.contains(&family.as_str())
-    }) {
+    if families
+        .iter()
+        .any(|family| !core::api::HarnessCapabilities::is_native_child_family(family))
+    {
         return Err(Error::new(
             "not_allowed",
             "family is outside the native child observation grant",

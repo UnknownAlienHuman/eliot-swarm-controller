@@ -591,7 +591,8 @@ impl SessionGrowth {
 
 /// Native compact or summarize operation Eliot may name in a growth warning.
 pub fn compact_hint_for_harness(harness: &str) -> Option<String> {
-    matches!(harness, "codex" | "opencode")
+    crate::api::HarnessCapabilities::of(harness)
+        .compact
         .then(|| "compact the session at an idle boundary".to_owned())
 }
 
@@ -734,14 +735,7 @@ impl HarnessDrift {
 /// pinned build.
 pub fn normalize_harness_version(harness: &str, version: &str) -> String {
     let mut text = version.trim().to_ascii_lowercase().replace(' ', "-");
-    let prefixes: &[&str] = match harness {
-        "codex" => &["codex-cli", "codex"],
-        "claude" => &["claude-code", "claude"],
-        "opencode" => &["opencode"],
-        "antigravity" => &["antigravity", "agy"],
-        "muse" => &["muse-code", "muse"],
-        _ => &[],
-    };
+    let prefixes = crate::api::HarnessCapabilities::of(harness).version_prefixes;
     for prefix in prefixes {
         if let Some(rest) = text.strip_prefix(*prefix)
             && (rest.is_empty()

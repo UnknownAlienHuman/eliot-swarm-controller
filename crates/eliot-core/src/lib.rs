@@ -573,7 +573,7 @@ impl Agent {
     pub fn is_automatic_provider_probe(&self) -> bool {
         self.chat
             && !self.observe_only
-            && self.harness == "codex"
+            && api::HarnessCapabilities::of(&self.harness).provider_probe
             && self.project.is_empty()
             && self.parent.is_none()
             && self.profile_snapshot.get(PROVIDER_PROBE_LAUNCH_ARG)
@@ -836,7 +836,7 @@ impl TurnOutcome {
     /// status and uses [`Self::classify_legacy_status`]. Anything else is
     /// unknown, never success.
     pub fn classify_legacy_status_for_harness(harness: &str, status: Option<&str>) -> Self {
-        if harness != "claude" {
+        if !api::HarnessCapabilities::of(harness).legacy_result_status {
             return Self::classify_legacy_status(status);
         }
         match status.map(str::trim) {
@@ -975,32 +975,34 @@ impl TurnUsage {
     /// Project the retained vendor counters onto uncached input, cached
     /// input, and output. Native totals can include overlapping categories.
     pub fn normalized(mut self, harness: &str) -> Self {
+        let capabilities = api::HarnessCapabilities::of(harness);
         self.first_call_input_tokens = self.first_call_input_tokens.filter(|n| *n >= 0);
         self.input_tokens = uncached_input(
-            harness,
+            capabilities.input_token_accounting,
             self.input_tokens,
             self.cache_read_tokens,
             self.cache_write_tokens,
         );
-        if harness == "opencode" {
-            // OpenCode's output is visible text only; reasoning is disjoint.
+        if capabilities.output_excludes_reasoning {
             self.output_tokens = self
                 .output_tokens
                 .zip(self.reasoning_tokens)
                 .and_then(|(visible, reasoning)| visible.checked_add(reasoning));
         }
         self.reasoning_tokens = self.reasoning_tokens.or(self.thinking_tokens);
-        self.total_tokens =
-            if matches!(harness, "claude" | "opencode") && self.cache_write_tokens.is_none() {
-                None
-            } else {
-                self.input_tokens
-                    .zip(self.cache_read_tokens)
-                    .zip(self.output_tokens)
-                    .and_then(|((input, cached), output)| {
-                        input.checked_add(cached)?.checked_add(output)
-                    })
-            };
+        self.total_tokens = if capabilities.input_token_accounting
+            == api::InputTokenAccounting::ExcludesCacheWrites
+            && self.cache_write_tokens.is_none()
+        {
+            None
+        } else {
+            self.input_tokens
+                .zip(self.cache_read_tokens)
+                .zip(self.output_tokens)
+                .and_then(|((input, cached), output)| {
+                    input.checked_add(cached)?.checked_add(output)
+                })
+        };
         self
     }
 
@@ -1075,19 +1077,19 @@ pub fn reported_token_total(
 }
 
 fn uncached_input(
-    harness: &str,
+    accounting: api::InputTokenAccounting,
     input: Option<i64>,
     cached: Option<i64>,
     written: Option<i64>,
 ) -> Option<i64> {
     let input = input?;
-    match harness {
-        // Codex includes cache hits in its input count.
-        "codex" => subtract_cached_input(input, cached),
-        // These harnesses report cache creation outside input. Creation
-        // spends fresh input tokens that can serve future cache hits.
-        "claude" | "opencode" => written.map_or(Some(input), |written| input.checked_add(written)),
-        _ => Some(input),
+    match accounting {
+        api::InputTokenAccounting::IncludesCacheReads => subtract_cached_input(input, cached),
+        // Cache creation spends fresh input tokens that can serve future cache hits.
+        api::InputTokenAccounting::ExcludesCacheWrites => {
+            written.map_or(Some(input), |written| input.checked_add(written))
+        }
+        api::InputTokenAccounting::Uncached => Some(input),
     }
 }
 
@@ -1256,14 +1258,14 @@ impl SessionUsage {
     pub fn normalized(mut self, harness: &str) -> Self {
         self.retain_valid_context();
         if let Some(tokens) = &mut self.cumulative_tokens {
-            tokens.input_tokens = if harness == "muse" {
-                // Muse supplies its counted-once prompt total for sessions.
+            let capabilities = api::HarnessCapabilities::of(harness);
+            tokens.input_tokens = if capabilities.session_input_includes_cache_reads {
                 tokens
                     .input_tokens
                     .and_then(|prompt| subtract_cached_input(prompt, tokens.cache_read_tokens))
             } else {
                 uncached_input(
-                    harness,
+                    capabilities.input_token_accounting,
                     tokens.input_tokens,
                     tokens.cache_read_tokens,
                     tokens.cache_write_tokens,

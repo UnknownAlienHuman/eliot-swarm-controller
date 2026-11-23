@@ -699,7 +699,7 @@ fn native_installed(harness: &str, snapshot: &Value) -> bool {
             .and_then(Value::as_str)
             .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd))
         {
-            return crate::adhoc::is_native_executable(std::path::Path::new(pin));
+            return eliot_plugin::install::is_native_executable(std::path::Path::new(pin));
         }
         return crate::adhoc::claude_candidate_available();
     }

@@ -1063,7 +1063,7 @@ fn resolve_configure_overlay(
         &record.command.args,
     ) {
         let proof = readback.filter(|proof| {
-            agent.harness == "muse"
+            eliot_core::api::HarnessCapabilities::of(&agent.harness).configure_resolution_readback
                 && agent.state == eliot_core::AgentState::Idle
                 && proof.agent == agent.id
                 && proof.generation == agent.generation

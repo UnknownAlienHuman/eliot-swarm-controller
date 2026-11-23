@@ -3168,7 +3168,9 @@ fn frozen_archive_profile(agent: &Agent, artifact: &ArtifactView) -> Result<(Val
             "archive identity differs from the frozen native store",
         ));
     }
-    if agent.harness == "codex" {
+    if eliot_core::api::HarnessCapabilities::of(&agent.harness).native_archive
+        == Some(eliot_core::api::harness::NativeArchiveBinding::FrozenStore)
+    {
         let binding: eliot_core::NativeStoreBinding = profile
             .get("native_store_binding")
             .cloned()
@@ -3204,7 +3206,9 @@ fn swarm_created_session_agent(agent: &Agent) -> bool {
 }
 
 fn native_archive_supported(harness: &str) -> bool {
-    matches!(harness, "codex" | "opencode")
+    eliot_core::api::HarnessCapabilities::of(harness)
+        .native_archive
+        .is_some()
 }
 
 fn cleanup_tree_root(artifact: &ArtifactView) -> Option<&str> {

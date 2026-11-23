@@ -15,7 +15,8 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Event, FailureOrigin, FrozenScriptRun,
     InjectPoint, Result, SecretPolicy, WorkspacePhase,
     api::{
-        FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
+        FrozenGitFetch, FrozenGitPublish, HarnessCapabilities, ProjectRegistrationView,
+        configure_uses_native_session,
     },
     classify_dispatched_error,
 };
@@ -900,7 +901,7 @@ impl Router {
         harness: &str,
     ) -> Result<Option<eliot_core::api::OwnerRulesDeliveryView>> {
         use eliot_core::api::{
-            OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
+            HarnessCapabilities, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
         };
         let Some((revision, text)) =
             crate::config::settings::owner_rules_snapshot(&self.inner.data_root)?
@@ -908,12 +909,7 @@ impl Router {
             return Ok(None);
         };
         crate::config::settings::validate_owner_rules_text(&text, &self.secret_policy_snapshot())?;
-        let method = match harness {
-            "codex" => OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
-            "claude" => OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
-            "opencode" => OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
-            _ => OwnerRulesDeliveryMethod::FirstInput,
-        };
+        let method = HarnessCapabilities::of(harness).owner_rules_delivery;
         Ok(Some(OwnerRulesDeliveryView {
             revision,
             digest: eliot_core::api::inference::sha256_hex(text.as_bytes()),
@@ -1117,7 +1113,8 @@ impl Router {
             return None;
         }
         let launch_binding = if let Some(agent) = launch_agent {
-            if agent.harness == "codex" {
+            if eliot_core::api::HarnessCapabilities::of(&agent.harness).requires_frozen_store_inputs
+            {
                 let workspace = match agent.workspace.as_deref() {
                     Some(workspace) => workspace,
                     None => {
@@ -1695,7 +1692,7 @@ impl Router {
                 store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
             // A promptless Codex resume opens the same thread in a new generation.
             // Its newest native turn can still belong to an earlier generation.
-            let turn_generation = if agent.harness == "codex" {
+            let turn_generation = if HarnessCapabilities::of(&agent.harness).resume_previous_turn {
                 store
                     .latest_retained_turn_generation(&agent_id, generation)?
                     .unwrap_or(generation)

@@ -12,7 +12,6 @@ workspace = true
 eliot-core.workspace = true
 eliot-store.workspace = true
 eliot-plugin.workspace = true
-eliot-plugin-claude.workspace = true
 globset.workspace = true
 toml.workspace = true
 chrono.workspace = true

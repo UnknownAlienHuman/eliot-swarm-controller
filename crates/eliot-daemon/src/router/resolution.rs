@@ -180,7 +180,8 @@ impl Router {
                 {
                     match command.target.as_deref() {
                         Some(target) => store.get_agent(target)?.filter(|agent| {
-                            agent.harness == "muse"
+                            eliot_core::api::HarnessCapabilities::of(&agent.harness)
+                                .configure_resolution_readback
                                 && Some(agent.generation) == command.generation
                                 && agent.state == eliot_core::AgentState::Idle
                                 && eliot_core::api::configure_uses_native_session(

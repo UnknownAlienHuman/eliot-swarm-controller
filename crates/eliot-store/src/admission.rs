@@ -314,9 +314,10 @@ pub(super) fn resolve_configure(
     if let Some(reason) = refusal {
         return Err(Error::new("unsupported", reason));
     }
-    if harness == "muse"
+    if let Some(allowed) =
+        eliot_core::api::HarnessCapabilities::of(harness).allowed_configure_efforts
         && let Some(effort) = effort.as_deref()
-        && !eliot_core::api::MUSE_REASONING_EFFORT_TIERS.contains(&effort)
+        && !allowed.contains(&effort)
     {
         return Err(Error::new(
             "invalid",
@@ -1759,7 +1760,9 @@ fn admit_configure_tx(
     // settles the command applied only once the values are stored.
     let _ = resolve_configure(&request.args, &agent.harness, &agent.profile_snapshot)?;
     if eliot_core::api::configure_uses_native_session(&agent.harness, &request.args) {
-        if matches!(agent.harness.as_str(), "claude" | "muse") && agent.active_turn.is_some() {
+        if eliot_core::api::HarnessCapabilities::of(&agent.harness).configure_requires_idle_turn
+            && agent.active_turn.is_some()
+        {
             return Err(Error::new(
                 "busy",
                 "Agent already has an active turn; configure the model between turns",
@@ -1793,7 +1796,7 @@ pub(super) fn require_idle_compaction(
     command_id: &str,
 ) -> Result<()> {
     observer::require_controlled(agent)?;
-    if !matches!(agent.harness.as_str(), "codex" | "opencode") {
+    if !eliot_core::api::HarnessCapabilities::of(&agent.harness).compact {
         return Err(Error::new(
             "unsupported",
             "Agent harness has no native compaction",

@@ -100,7 +100,10 @@ attempt only from a proven pre-effect failure or an idempotent operation. Safe s
 retries once with a 25–100 ms delay. A session hook bind makes at most three attempts,
 100 ms apart. Both stay within the caller's deadline. Repeated observations of the
 same outstanding hook offer pace from 250 ms up to 2 s. The first offer forwards
-immediately. A failed hook read waits 250 ms before the next read.
+immediately. A failed hook read waits 250 ms before the next read. A polled native
+readback that becomes observable asynchronously (installed MCP inventory) settles on
+the shared readiness-settle backoff: 50 ms doubling to 1 s, with the final
+observation taken at the settle cap.
 
 Read-only native CLI helpers bound stdout and process exit under the caller's deadline.
 Claude auth status can consume its JSON result on either exit status. The same shared
@@ -121,6 +124,14 @@ claim provider authentication or inference success and does not add a flag or en
 Extend verbs/families/features only when their paths exist. Version is diagnostic;
 methods/fields/capabilities establish compatibility. The host selects one owner per
 normalized native family. Hooks never mirror lifecycle already supplied by the stream.
+
+Built-in adapters own the [control capabilities](../../crates/eliot-core/src/api/harness.rs)
+and [install discovery declarations](../../crates/eliot-plugin/src/install.rs)
+that Swarm registers before daemon or plugin startup. The host uses the control
+capabilities to prepare launches and validate runtime manifests. The shared
+install engine reads the adapter's candidate search, executable identity and
+verification requirements before resolving a native executable. The profile
+parser owns the input vocabulary used for offline settings validation.
 
 ## Host requests
 
@@ -200,6 +211,19 @@ reader errors and stderr with the broader diagnostic-secret set.
 `resume_from={native_scope,native_ref}` is an `agent.start` option, not replay of the
 old input. `initial={command_id,text}` is supplied only for a harness that requires
 input to create a session. Explicit new text remains a separate linked command.
+
+Codex and Muse share the retained-turn preflight before adopting a resume. Each
+adapter translates its readback into a resumable runtime state, any active turn,
+and the newest turn's terminal status. The preflight requires a resumable runtime,
+no vendor-exposed active turn, and an exact retained terminal turn. A
+retained subject with no turn needs vendor proof that no native turn ran (an empty
+turn page, or a zero turn counter where the vendor exposes one). The preflight proves
+resumability by this new generation, not that the previous host generation is gone;
+Store admission and dispatch guarantee that.
+
+When OpenCode cannot prove consumption of a steered native input, it translates
+the cancel and readback into a removal fact. The shared settlement returns
+`unknown` and latches the session unless that fact proves removal.
 
 `eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
 preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional

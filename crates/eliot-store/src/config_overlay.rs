@@ -175,7 +175,9 @@ impl Store {
 
     pub fn fill_turn_readback(&self, agent: &Agent, turn: &mut Turn) -> Result<()> {
         turn.config = self.turn_config_view(agent, turn)?;
-        if agent.harness == "opencode" && turn.outcome == Some(TurnOutcome::Failure) {
+        if eliot_core::api::HarnessCapabilities::of(&agent.harness).backfill_failed_turn_readback
+            && turn.outcome == Some(TurnOutcome::Failure)
+        {
             // Older rows predate the retained failure fields. Recover the
             // exact terminal diagnostic while its event is still available.
             if turn.native_error_message.is_none() {
@@ -384,8 +386,9 @@ pub(super) fn apply_agent_config_tx(
         &agent.harness,
         &agent.profile_snapshot,
     )?;
+    let capabilities = eliot_core::api::HarnessCapabilities::of(&agent.harness);
     let previous_revision = current_config_revision_tx(tx, agent_num, generation)?;
-    if agent.harness == "muse" {
+    if capabilities.configure_carries_previous_overlay {
         let previous = get_agent_config_tx(tx, agent_num, generation, previous_revision)?;
         if requested["model"].is_null() {
             let model = previous
@@ -417,7 +420,7 @@ pub(super) fn apply_agent_config_tx(
                     "configure stored no proven native model for its requested model",
                 ));
             }
-            if agent.harness != "muse"
+            if !capabilities.configure_effort_per_turn_overlay
                 && requested.get("effort").and_then(Value::as_str).is_some()
                 && native_effort.is_none()
             {

@@ -146,14 +146,15 @@ pub use handoff::{
     MAX_HANDOFF_SENDS, SendTransfer,
 };
 pub use harness::{
-    CLAUDE_EXTERNAL_ROUTE_MARKERS, ConfigureSupport, HARNESS_QUOTA_SUPPORTED,
+    CLAUDE_EXTERNAL_ROUTE_MARKERS, ConfigureSessionMode, ConfigureSupport, HARNESS_QUOTA_SUPPORTED,
     HARNESS_QUOTA_UNKNOWN, HARNESS_QUOTA_UNSUPPORTED, HARNESS_READ_TTL_MS, HarnessCandidate,
-    HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry, HarnessModelsRequest,
-    HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse, MAX_HARNESS_CREDENTIAL_BYTES,
-    MAX_HARNESS_PROFILE_BYTES, MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES,
-    MUSE_REASONING_EFFORT_TIERS, ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest,
-    ModelsCatalogResponse, SUPPORTED_HARNESSES, catalog_cursor, catalog_matches, catalog_provider,
-    configure_uses_native_session, is_supported_harness,
+    HarnessCapabilities, HarnessEntry, HarnessListRequest, HarnessListResponse, HarnessModelEntry,
+    HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
+    InputTokenAccounting, MAX_HARNESS_CREDENTIAL_BYTES, MAX_HARNESS_PROFILE_BYTES,
+    MAX_HARNESS_QUOTA_NOTE_BYTES, MAX_HARNESS_SCOPE_BYTES, MUSE_REASONING_EFFORT_TIERS,
+    ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse,
+    SUPPORTED_HARNESSES, catalog_cursor, catalog_matches, catalog_provider,
+    configure_uses_native_session, is_supported_harness, register_harness_capabilities,
 };
 pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,

@@ -54,6 +54,7 @@ pub(in crate::router) mod plugin_host;
 pub(crate) use cleanup::remove_dir_all;
 pub(crate) use plugin_host::{SecretSet, build_process_environment, minimal_plugin_environment};
 
+use crate::harness_capabilities::HarnessCapabilities;
 pub(crate) use attention::run_attention;
 use auth::{authorize_command, authorize_rpc_method};
 pub(crate) use context_notes::run_context_notes;
@@ -1479,7 +1480,7 @@ impl Router {
     /// approval. Only this live receipt drives the ordinary deny and context.
     pub(crate) async fn deliver_project_guard(&self, event: &Event) -> Result<()> {
         use eliot_core::{
-            InjectArgs, InjectPoint,
+            InjectArgs,
             requests::{ApprovalArgs, ApprovalDecision, ApprovalRequest},
         };
 
@@ -1489,10 +1490,8 @@ impl Router {
         let Some(subject) = &event.subject else {
             return Ok(());
         };
-        let point = match subject.harness.as_str() {
-            "codex" | "muse" => InjectPoint::ActiveTurn,
-            "antigravity" => InjectPoint::TurnSafePoint,
-            _ => return Ok(()),
+        let Some(point) = HarnessCapabilities::of(&subject.harness).guard_refusal_point else {
+            return Ok(());
         };
         let details = &event.data["details"];
         if details.get("guard_refusal").is_none() {
@@ -3667,7 +3666,7 @@ impl Router {
         snapshot: &mut Value,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        if !matches!(harness, "codex" | "muse") {
+        if !HarnessCapabilities::of(harness).launch_default_resolution {
             return Ok(());
         }
         // Routed Codex profiles keep their own rule: the Responses route
@@ -7827,47 +7826,42 @@ fn validate_retained_resume_agent(agent: &Agent, command: &Command) -> Result<i6
             "resume has no retained native subject",
         ));
     }
-    match agent.harness.as_str() {
-        "codex" => {
-            let binding: NativeStoreBinding = agent
-                .profile_snapshot
-                .get("native_store_binding")
-                .cloned()
-                .ok_or_else(|| {
+    let capabilities = HarnessCapabilities::for_harness(&agent.harness).ok_or_else(|| {
+        Error::new(
+            "unsupported",
+            format!("resume is not supported for the {} harness", agent.harness),
+        )
+    })?;
+    if capabilities.requires_frozen_store_inputs {
+        let binding: NativeStoreBinding = agent
+            .profile_snapshot
+            .get("native_store_binding")
+            .cloned()
+            .ok_or_else(|| {
+                Error::new(
+                    "unsupported",
+                    "Codex resume requires a retained native store binding",
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|_| {
                     Error::new(
-                        "unsupported",
-                        "Codex resume requires a retained native store binding",
+                        "source_integrity",
+                        "retained native store binding is malformed",
                     )
                 })
-                .and_then(|value| {
-                    serde_json::from_value(value).map_err(|_| {
-                        Error::new(
-                            "source_integrity",
-                            "retained native store binding is malformed",
-                        )
-                    })
-                })?;
-            if native_scope != binding.native_scope {
-                return Err(Error::new(
-                    "source_integrity",
-                    "resume native scope differs from its retained store binding",
-                ));
-            }
-        }
-        "muse" | "claude" | "opencode" | "antigravity" => {
-            if agent.profile_snapshot.get("native_store_binding").is_some() {
-                return Err(Error::new(
-                    "source_integrity",
-                    "non-Codex resume cannot use a Codex native store binding",
-                ));
-            }
-        }
-        harness => {
+            })?;
+        if native_scope != binding.native_scope {
             return Err(Error::new(
-                "unsupported",
-                format!("resume is not supported for the {harness} harness"),
+                "source_integrity",
+                "resume native scope differs from its retained store binding",
             ));
         }
+    } else if agent.profile_snapshot.get("native_store_binding").is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            "non-Codex resume cannot use a Codex native store binding",
+        ));
     }
     Ok(generation)
 }

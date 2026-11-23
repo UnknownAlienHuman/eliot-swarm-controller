@@ -1077,9 +1077,20 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
 impl Store {
     pub fn latest_quota_observation(
         &self,
+        harness: &str,
         snapshot: &Value,
     ) -> Result<Option<core::api::harness::QuotaObservation>> {
-        let row: Option<String>=self.connection.query_row("SELECT e.data FROM events e JOIN agents a ON a.id=e.agent WHERE e.kind='quota.observed' AND a.harness='muse' AND a.profile_snapshot=?1 ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT 1",[encode_json(snapshot)?],|r|r.get(0)).optional().map_err(sql_error)?;
+        let row: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT e.data FROM events e JOIN agents a ON a.id=e.agent
+             WHERE e.kind='quota.observed' AND a.harness=?1 AND a.profile_snapshot=?2
+             ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT 1",
+                params![harness, encode_json(snapshot)?],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
         row.map(|data| {
             let value: Value = decode_json(&data)?;
             let observation: core::api::harness::QuotaObservation =

@@ -14,6 +14,15 @@ use cli::args::{
 use cli::support::Failure;
 
 fn main() -> ExitCode {
+    if let Err(error) = eliot_plugin::install::register_declarations([
+        eliot_plugin_codex::install::discovery(),
+        eliot_plugin_claude::install::discovery(),
+        eliot_plugin_muse::install::discovery(),
+        eliot_plugin_opencode::install::discovery(),
+        eliot_plugin_antigravity::install::discovery(),
+    ]) {
+        return report_failure(Failure::new(1, error.to_string()));
+    }
     let cli = Cli::parse();
     if let Some(path) = &cli.operator_check_store {
         return match eliot_daemon::operator::check_update_store_copy(path) {
@@ -32,6 +41,26 @@ fn main() -> ExitCode {
             })
         );
         return ExitCode::SUCCESS;
+    }
+    if let Err(error) =
+        eliot_plugin::text_inference::register(eliot_plugin_claude::inference::ADAPTER)
+    {
+        return report_failure(Failure::new(1, error.to_string()));
+    }
+    if let Err(error) = eliot_core::api::register_harness_capabilities([
+        ("codex", eliot_plugin_codex::capabilities::declaration()),
+        ("claude", eliot_plugin_claude::capabilities::declaration()),
+        (
+            "opencode",
+            eliot_plugin_opencode::capabilities::declaration(),
+        ),
+        ("muse", eliot_plugin_muse::capabilities::declaration()),
+        (
+            "antigravity",
+            eliot_plugin_antigravity::capabilities::declaration(),
+        ),
+    ]) {
+        return report_failure(Failure::new(1, error.to_string()));
     }
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));
     // One hook for both binaries: the daemon and every plugin share this

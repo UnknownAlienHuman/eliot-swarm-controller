@@ -217,18 +217,26 @@ impl Store {
     /// result. Successful probes also need their scratch and session removed.
     pub fn ended_provider_probes(&self, after: i64) -> Result<Vec<(i64, String)>> {
         self.ensure_committed_reads()?;
+        let harnesses: Vec<_> = core::api::SUPPORTED_HARNESSES
+            .iter()
+            .copied()
+            .filter(|harness| core::api::HarnessCapabilities::of(harness).provider_probe)
+            .collect();
         let mut query = self
             .connection
             .prepare(
                 "SELECT id FROM agents WHERE id > ?1 AND chat = 1 AND parent IS NULL
-               AND observe_only = 0 AND harness = 'codex' AND project = ''
+               AND observe_only = 0 AND project = ''
+               AND harness IN (SELECT value FROM json_each(?2))
                AND state IN ('stopped','failed','lost')
                AND json_extract(profile_snapshot, '$._provider_probe') = 1
              ORDER BY id LIMIT 64",
             )
             .map_err(sql_error)?;
         let rows = query
-            .query_map([after], |row| row.get::<_, i64>(0))
+            .query_map(params![after, encode_json(&json!(harnesses))?], |row| {
+                row.get::<_, i64>(0)
+            })
             .map_err(sql_error)?;
         rows.map(|row| {
             row.map(|id| (id, super::format_agent_id(id)))

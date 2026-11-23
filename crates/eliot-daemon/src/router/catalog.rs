@@ -6,9 +6,9 @@
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
-    CLAUDE_EXTERNAL_ROUTE_MARKERS, HARNESS_READ_TTL_MS, HarnessCandidate, HarnessEntry,
-    HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
-    SUPPORTED_HARNESSES,
+    CLAUDE_EXTERNAL_ROUTE_MARKERS, HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities,
+    HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry,
+    ModelsCatalogFailure, SUPPORTED_HARNESSES,
 };
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
@@ -267,7 +267,7 @@ impl Router {
         workspace: Option<String>,
         deadline: Instant,
     ) -> Result<HarnessModelsResponse> {
-        if harness == "opencode"
+        if HarnessCapabilities::of(harness).models_preview_auth_integrations
             && label == "adhoc"
             && snapshot.as_ref().is_some_and(|profile| {
                 profile.get("auth_integration").is_none()
@@ -277,7 +277,7 @@ impl Router {
             })
         {
             return self
-                .opencode_adhoc_models(snapshot, discovered, workspace, deadline)
+                .adhoc_models_by_integration(harness, snapshot, discovered, workspace, deadline)
                 .await;
         }
         let (scope, credential) = catalog::describe_snapshot(label, harness, snapshot.as_ref());
@@ -363,8 +363,9 @@ impl Router {
     /// select one integration. Preview each canonical integration in its own
     /// launch-shaped isolated store and union only the models the standalone
     /// API reports for that store.
-    async fn opencode_adhoc_models(
+    async fn adhoc_models_by_integration(
         &self,
+        harness: &str,
         snapshot: Option<Value>,
         discovered: Option<HarnessCandidate>,
         workspace: Option<String>,
@@ -407,11 +408,11 @@ impl Router {
             if Instant::now() >= deadline {
                 break;
             }
-            let integration = crate::adhoc::validate_adhoc_auth("opencode", &integration)?;
+            let integration = crate::adhoc::validate_adhoc_auth(harness, &integration)?;
             let mut selected = snapshot.clone();
             selected["auth_integration"] = json!(integration);
             let response = Box::pin(self.models_for_snapshot(
-                "opencode",
+                harness,
                 Some(selected),
                 "adhoc",
                 discovered.clone(),
@@ -438,7 +439,7 @@ impl Router {
         })?;
         response.models = models;
         response.default = None;
-        response.scope = "profile:adhoc harness:opencode auth:available".to_owned();
+        response.scope = format!("profile:adhoc harness:{harness} auth:available");
         response.credential = "auth:available".to_owned();
         response.note = Some("OpenCode launch previews from isolated stores, one integration per read. Use a named profile to see one exact auth selection.".to_owned());
         response.fetched_at_ms = now_ms();
@@ -615,14 +616,14 @@ impl Router {
             &route.environment,
         );
         let route_verified = cache_key.is_some();
-        if harness == "muse"
+        if eliot_core::api::HarnessCapabilities::of(&harness).reads_retained_quota
             && route_verified
             && let Some(observation) = self
                 .inner
                 .store
                 .lock()
                 .await
-                .latest_quota_observation(&profile)?
+                .latest_quota_observation(&harness, &profile)?
         {
             return Ok(catalog::ScopedQuota {
                 route_verified,

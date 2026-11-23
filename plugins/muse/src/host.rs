@@ -30,6 +30,7 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::stream_sources,
+    resume::ResumePreflight,
     session::{
         ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, model_catalogue_profile, native_no_write,
@@ -2577,6 +2578,14 @@ async fn read_effective_reasoning_effort(
     Ok(None)
 }
 
+/// Accepting `idle`/`notLoaded` here is NOT proof the generation-1 host is
+/// gone (muse.md: "`notLoaded` alone does not prove session closure"). Eliot
+/// guarantees the old generation is terminal before this plugin ever runs:
+/// the Store admits resume only for a Stopped/Failed/Lost generation with no
+/// active turn (`crates/eliot-store/src/admission.rs`, resume arm), rechecks
+/// that gate at dispatch (`crates/eliot-store/src/dispatch.rs`, resume arm),
+/// and refuses while a stop is still in flight. The preflight only checks the
+/// retained session is resumable by this new generation.
 async fn verify_resume_preflight(
     client: &NativeClient,
     session_id: &str,
@@ -2598,13 +2607,23 @@ async fn verify_resume_preflight(
         Some(_) => read_latest_native_turn_status(client, session_id).await?,
         None => None,
     };
-    validate_resume_preflight(
-        &session,
+    ResumePreflight {
+        vendor: "Muse",
+        subject: "session",
+        runtime_resumable: matches!(session.status.as_str(), "idle" | "notLoaded"),
         retained_turn,
-        newest_turn
-            .as_ref()
-            .map(|(id, status)| (id.as_str(), status.as_str())),
-    )?;
+        newest_turn: newest_turn.as_ref().map(|(id, status)| {
+            (
+                id.as_str(),
+                matches!(status.as_str(), "completed" | "failed" | "cancelled"),
+            )
+        }),
+        active_turn: session
+            .active_turn_id
+            .is_some_and(|turn| !turn.trim().is_empty()),
+        proves_no_turn: session.turn_count == Some(0),
+    }
+    .verify()?;
     if let Some(model) = unlisted_resume_model
         && session.model_id.as_deref() != Some(model)
     {
@@ -2614,53 +2633,6 @@ async fn verify_resume_preflight(
         ));
     }
     Ok(())
-}
-
-/// Accepting `idle`/`notLoaded` here is NOT proof the generation-1 host is
-/// gone (muse.md: "`notLoaded` alone does not prove session closure"). Eliot
-/// guarantees the old generation is terminal before this plugin ever runs:
-/// the Store admits resume only for a Stopped/Failed/Lost generation with no
-/// active turn (`crates/eliot-store/src/admission.rs`, resume arm), rechecks
-/// that gate at dispatch (`crates/eliot-store/src/dispatch.rs`, resume arm),
-/// and refuses while a stop is still in flight. The preflight only checks the
-/// retained session is resumable by this new generation.
-fn validate_resume_preflight(
-    session: &NativeSession,
-    retained_turn: Option<&str>,
-    newest_turn: Option<(&str, &str)>,
-) -> Result<()> {
-    if !matches!(session.status.as_str(), "idle" | "notLoaded") {
-        return Err(Error::new(
-            "native_readback",
-            "Muse retained session is active or has no resumable runtime status",
-        ));
-    }
-    if session
-        .active_turn_id
-        .as_deref()
-        .is_some_and(|turn| !turn.trim().is_empty())
-    {
-        return Err(Error::new(
-            "native_readback",
-            "Muse retained session still has an active turn",
-        ));
-    }
-    match (retained_turn, newest_turn) {
-        (Some(expected), Some((actual, status)))
-            if actual == expected && terminal_turn_status(status) =>
-        {
-            Ok(())
-        }
-        (None, None) if session.turn_count == Some(0) => Ok(()),
-        (None, None) => Err(Error::new(
-            "native_readback",
-            "Muse cannot prove the retained session ran no native turns",
-        )),
-        _ => Err(Error::new(
-            "native_readback",
-            "Muse newest native turn does not match the exact retained terminal turn",
-        )),
-    }
 }
 
 /// Newest native turn as `(turn_id, terminal status)` from one backward
@@ -2714,10 +2686,6 @@ async fn read_latest_native_turn_status(
         }
     }
     Ok(None)
-}
-
-fn terminal_turn_status(status: &str) -> bool {
-    matches!(status, "completed" | "failed" | "cancelled")
 }
 
 async fn read_owned_turn(
