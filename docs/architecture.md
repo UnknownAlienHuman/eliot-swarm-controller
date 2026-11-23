@@ -82,8 +82,10 @@ Completed history: L1 delivered local CLI, Store/router, a temporary fake, bus a
 result. L2 replaced that fake with a per-Agent Codex app-server and added native
 controls and readback over an existing workspace and account. Current code has no fake
 runtime: the five native adapters launch from explicit profiles, or by `--role` through
-the ordered `[routing]` candidates when `--profile` is omitted, with frozen captured
-selectors. Routing freezes before admission. The opted-in provider policy may
+the ordered `[routing]` candidates when `--profile` is omitted. A profile may omit
+`cmd`; the harness-specific executable resolver is shared with ad-hoc launches and
+freezes the selected native path in the launched generation. Routing freezes before
+admission. The opted-in provider policy may
 admit a fresh switch after an exact native pre-work refusal. Uncertain effects
 keep their original bindings and outcome.
 

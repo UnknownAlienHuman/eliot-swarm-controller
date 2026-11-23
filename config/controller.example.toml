@@ -1,6 +1,7 @@
 # Copy to <Eliot data directory>/config.toml. This does not replace Codex config.
 # The five native adapters are Codex, Claude, OpenCode, Muse and Antigravity.
-# Every profile is explicit: one harness, one native executable, one exact model.
+# Every profile explicitly selects a harness. Omit `cmd` to discover the installed
+# native executable at launch; set it only when the Owner intends to pin a path.
 # There is no builtin fake profile and no default/fallback profile. Captured
 # native-store selectors are frozen at admission and never reselected.
 # The first Codex integration uses the installed executable and existing ChatGPT login.
@@ -16,7 +17,6 @@
 
 [profiles.codex-luna]
 harness = "codex"
-cmd = "codex"
 model = "gpt-6-luna"
 effort = "medium"
 permissions = "workspace-write"
@@ -25,8 +25,8 @@ pass_env = ["CODEX_HOME"]
 # Optional native preset for planning and user questions; sandbox remains separate.
 # collaboration_mode = "plan"
 
-# Muse Code session host (per-Agent `muse serve`). Point cmd at the installed
-# binary, not the launcher, so the registered PID is the host itself. The
+# Muse Code session host (per-Agent `muse serve`). Discovery selects the native
+# binary, not a launcher wrapper, so the registered PID is the host itself. The
 # model id must exist in this account's model/list catalogue; the effort must
 # be one of the eight MSP tiers (none, minimal, low, medium, high, xhigh, max,
 # ultra) and is applied as the session default and per turn. The optional
@@ -34,30 +34,27 @@ pass_env = ["CODEX_HOME"]
 # onRequest, denyUnmatched); when omitted the server default rules.
 [profiles.muse]
 harness = "muse"
-cmd = "C:/Tools/MuseCode/muse-bin-1.4.0-R4161.1.exe"
 model = "muse-spark-1.3-contributor"
 effort = "medium"
 mcp = "inherit"
 # approval = "promptUnmatched"
 
-# Claude Code CLI (per-Agent `claude -p` stream-json). Point cmd at the
+# Claude Code CLI (per-Agent `claude -p` stream-json). Discovery selects the
 # installed native executable, not a wrapper, so stop ends the owned CLI.
 # The model id must exist in the initialize models catalogue; Eliot mints
 # the session id and each turn uuid. The optional approval is the CLI
 # permission-mode vocabulary; unset means the CLI-default posture.
 [profiles.claude]
 harness = "claude"
-cmd = "C:/Users/test/.local/bin/claude.exe"
 model = "claude-opus-4-6"
 # approval = "plan"
 
-# OpenCode (per-Agent `serve`). Point cmd at the installed native executable,
+# OpenCode (per-Agent `serve`). Discovery selects the installed native executable,
 # not a wrapper. model is the exact provider/model-id string; auth_integration
 # is the frozen nonsecret selector naming the one native integration whose
 # credential is transferred into the isolated store (no owner global auth edit).
 [profiles.opencode-openrouter]
 harness = "opencode"
-cmd = "C:/Tools/OpenCode/opencode.exe"
 model = "openrouter/stealth/crouton-alpha"
 auth_integration = "openrouter"
 
@@ -70,7 +67,6 @@ auth_integration = "openrouter"
 # qualification with a real coding turn is still required.
 [profiles.opencode-local]
 harness = "opencode"
-cmd = "C:/Tools/OpenCode/opencode.exe"
 model = "k173d-fixture/test-model"
 pass_env = ["LOCAL_LLM_KEY"]
 
@@ -81,12 +77,11 @@ base_url = "http://127.0.0.1:1234/v1"
 api_key_env = "LOCAL_LLM_KEY"
 models = [{ id = "test-model", context_limit = 32768, output_limit = 4096 }]
 
-# Antigravity. Point cmd at the installed native executable. mode is one of
+# Antigravity discovery selects the installed `agy` CLI. mode is one of
 # plan, auto or accept-edits; effort/approval/collaboration/permissions presets
 # are rejected by this adapter.
 [profiles.antigravity]
 harness = "antigravity"
-cmd = "C:/Tools/Antigravity/antigravity.exe"
 model = "antigravity-model"
 mcp = "inherit"
 # mode = "auto"

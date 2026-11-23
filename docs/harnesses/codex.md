@@ -84,7 +84,6 @@ Example Eliot config in `<data_dir>/config.toml`, using the smoke's effort and p
 ```toml
 [profiles.codex-luna]
 harness = "codex"
-cmd = "codex"
 model = "gpt-6-luna"
 effort = "medium"
 permissions = "workspace-write"
@@ -639,14 +638,17 @@ Do not make that complete campaign a prerequisite to the first useful file edit.
 
 ## Ad-hoc launch
 
-`swarm launch --harness codex [--model M] [--effort E] --workspace W "prompt"`
+`swarm launch --harness codex [--model M] [--effort E] [--cmd PATH] --workspace W "prompt"`
 is Owner-only and freezes a profile-equivalent snapshot from safe defaults
 (`workspace-write`, `never`, explicit MCP `inherit`, empty `pass_env`, default scratch,
 no child allow-list) plus flags. An omitted `--model` selects the native
 `model/list` default entry (`isDefault`); an omitted `--effort` preserves the
 native default and reports the effective readback. An unavailable requested
-model fails without substitution. `cmd` resolves via the existing `codex`
-lookup. `swarm models --harness codex` returns the live native catalogue.
+model fails without substitution. An omitted profile `cmd` and an omitted
+ad-hoc `--cmd` use the same installed `codex` lookup. Discovery freezes the
+selected executable for that launch generation; explicit `--cmd PATH` is the
+Owner's one-launch override. `swarm models --harness codex` returns the live
+native catalogue.
 ## Agent skill delivery (`eliot-swarm`)
 
 After the owned thread is live and before any input is sent, the plugin
