@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 103;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 104;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2437,6 +2437,24 @@ impl Store {
                        AND verb IN ('stop', 'interrupt')
                        AND state IN ('rejected', 'failed', 'unknown');
                  INSERT INTO schema_migrations(version) VALUES (103);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 104 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "DROP INDEX IF EXISTS commands_owner_control_failures;
+                 CREATE INDEX commands_owner_control_results
+                     ON commands(target, generation, created_at DESC)
+                     WHERE principal = 'owner'
+                       AND (parent_command IS NULL OR link_kind = 'selector')
+                       AND verb IN ('stop', 'interrupt')
+                       AND state IN ('applied', 'rejected', 'failed', 'unknown');
+                 INSERT INTO schema_migrations(version) VALUES (104);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

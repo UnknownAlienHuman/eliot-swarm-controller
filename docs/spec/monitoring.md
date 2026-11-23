@@ -112,11 +112,14 @@ termination was not observed, the applied stop records
 
 Owner interrupt has one 10-second deadline for plugin delivery and confirmation
 that the captured turn ended. A source gap or unknown turn is not confirmation.
-On expiry Swarm dispatches a linked force stop for the same controlled generation
-if a captured turn still matches, or if the interrupt was bound to the session.
-The stop uses the custody and drain
-proof above. A proven fallback records the stop on the original interrupt
-result. If custody or drain cannot be proven, the result names the uncertainty.
+A definite refusal settles immediately. If plugin enqueue finds no owned
+runtime, Swarm attempts linked stop custody immediately. Otherwise it
+escalates on expiry only for the same controlled generation and captured
+turn. The missing-runtime path also preserves an empty binding and requires
+no pending input before clearing that generation's custody.
+A proven fallback records the stop on the original interrupt result using the
+custody and drain proof above. The turn outcome still depends on its terminal
+evidence. If custody or drain cannot be proven, the result names the uncertainty.
 
 ### Unix degraded
 

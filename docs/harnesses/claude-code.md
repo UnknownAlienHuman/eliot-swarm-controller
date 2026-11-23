@@ -196,9 +196,11 @@ active turn and waits up to the core stop interrupt bound. The exact
 evidence; the control response alone does not. The terminal commit precedes
 native session teardown. Missing evidence keeps the turn unknown; force skips
 this cooperative window.
-The installed 2.1.325 interrupt capture on 2026-11-17 reports
-`terminal_reason: aborted_streaming`; this explicit native abort maps to
-`interrupted`, preserving the raw reason as `native_status`.
+Claude reports `aborted_streaming` or `aborted_tools` when a turn is aborted
+during streaming or tool execution. Both map to `interrupted` and preserve
+the raw reason as `native_status`. Swarm attributes an Owner interrupt when
+the acknowledged control and committed terminal match the
+same captured turn. Normal completion retains its native outcome.
 
 ### Send admission and uncertainty
 

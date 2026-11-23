@@ -3198,14 +3198,28 @@ impl OpenCodePlugin {
             ready_session(&mut self.session, &params)?
         };
         let command_id = params.command_id;
-        let turn_id = params.turn_id.as_deref();
+        let Some(turn_id) = params.turn_id.as_deref() else {
+            let status = session
+                .events
+                .current_status()
+                .await
+                .map_err(|error| error.with_code("native_not_dispatched"))?;
+            return eliot_plugin::session::idle_interrupt_result(
+                &command_id,
+                params.owner_control
+                    && session.phase == SessionPhase::Ready
+                    && status.ready
+                    && status.connected
+                    && !status.stopped
+                    && !status.compaction_in_flight
+                    && status.active_command_id.is_none()
+                    && status.active_turn_id.is_none()
+                    && !status.source_unknown
+                    && !status.batch_unknown
+                    && status.failure.is_none(),
+            );
+        };
         if !params.owner_control {
-            let turn_id = turn_id.ok_or_else(|| {
-                Error::new(
-                    "stale_turn",
-                    "OpenCode interrupt requires the exact turn id",
-                )
-            })?;
             let live = session.events.check_turn(turn_id).await.map_err(|_| {
                 Error::new("unknown", "OpenCode interrupt turn check is unresolved")
             })?;
@@ -3235,7 +3249,7 @@ impl OpenCodePlugin {
     async fn finish_interrupt(
         session: &mut AgentSession,
         command_id: &str,
-        turn_id: Option<&str>,
+        turn_id: &str,
         outcome: std::result::Result<bool, HttpOutcome>,
     ) -> Result<Value> {
         match outcome {
@@ -3248,12 +3262,6 @@ impl OpenCodePlugin {
                 Ok(result)
             }
             Ok(false) => {
-                let Some(turn_id) = turn_id else {
-                    return Ok(json!({
-                        "state": "applied", "command_id": command_id, "turn_id": null,
-                        "interrupt_confirmed": true,
-                    }));
-                };
                 let live = match session.events.check_turn(turn_id).await {
                     Ok(live) => live,
                     // The write went out but the gate is unresolved (the

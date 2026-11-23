@@ -1722,14 +1722,26 @@ impl MusePlugin {
             let result = rejected_control(&reason);
             return Ok(result);
         }
+        let Some(turn_id) = turn_id else {
+            return eliot_plugin::session::idle_interrupt_result(
+                &params.command_id,
+                params.owner_control
+                    && event_status.ready
+                    && !event_status.stopped
+                    && event_status.active_turn_id.is_none()
+                    && event_status.active_command_id.is_none()
+                    && !event_status.source_unknown
+                    && !event_status.batch_unknown
+                    && !event_status.needs_idle_proof
+                    && !event_status.view_unavailable
+                    && event_status.failure.is_none(),
+            );
+        };
         // The turn itself is gated authoritatively: the event task owns the
         // active turn and answers behind the terminal commit, so an interrupt
         // that arrives after the terminal batch sees `stale_turn` instead of
         // sending a second native cancel.
         if !params.owner_control {
-            let turn_id = turn_id.ok_or_else(|| {
-                Error::new("stale_turn", "turn/cancel requires a captured turn id")
-            })?;
             match session.events.check_turn(turn_id).await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1753,7 +1765,7 @@ impl MusePlugin {
         let cancel_params = NativeTurnCancelParams {
             command_id: native_command_id.clone(),
             session_id: native_session,
-            turn_id: turn_id.map(str::to_owned),
+            turn_id: Some(turn_id.to_owned()),
         };
         let encoded = match serde_json::to_value(cancel_params) {
             Ok(encoded) => encoded,
@@ -1792,8 +1804,7 @@ impl MusePlugin {
                 };
                 if cancelled.command_id != native_command_id
                     || cancelled.status != "accepted"
-                    || cancelled.turn_id.is_empty()
-                    || turn_id.is_some_and(|id| cancelled.turn_id != id)
+                    || cancelled.turn_id != turn_id
                 {
                     let result = unknown_control("Muse turn/cancel did not stop its exact turn");
                     return Ok(result);

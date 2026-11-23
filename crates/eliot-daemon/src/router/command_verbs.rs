@@ -13,6 +13,7 @@ use eliot_core::{
     Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnOutcome, TurnState,
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
+use eliot_plugin::session::native_no_write;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -795,6 +796,17 @@ impl Router {
         pending: Result<(Agent, PendingCommand)>,
     ) {
         let mut events = self.inner.bus.subscribe();
+        let runtime_unavailable = pending.is_err()
+            && command
+                .target
+                .as_deref()
+                .zip(command.generation)
+                .is_some_and(|(agent, generation)| {
+                    !self
+                        .inner
+                        .plugin_host
+                        .controls_generation(agent, generation)
+                });
         let until = pending
             .as_ref()
             .ok()
@@ -809,6 +821,37 @@ impl Router {
             }),
             Err(error) => Err(error),
         };
+        if !runtime_unavailable {
+            match &native {
+                Err(error) if native_no_write(&error.code) => {
+                    self.settle_plugin_error(
+                        &command.id,
+                        &error.clone().with_code("native_not_dispatched"),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(value) if matches!(value["state"].as_str(), Some("rejected" | "failed")) => {
+                    let state = if value["state"] == "rejected" {
+                        CommandState::Rejected
+                    } else {
+                        CommandState::Failed
+                    };
+                    let mut outcome = value.clone();
+                    if outcome["message"].as_str().is_none() {
+                        outcome["message"] = json!(
+                            value["reason"]
+                                .as_str()
+                                .unwrap_or("Harness refused the interrupt")
+                        );
+                    }
+                    self.redact_native_value(&mut outcome);
+                    let _ = self.settle(&command.id, state, Some(outcome)).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
         let ack = native.as_ref().is_ok_and(|value| {
             value["state"] == "applied"
                 && value["command_id"].as_str() == Some(command.id.as_str())
@@ -824,7 +867,7 @@ impl Router {
                 if let Some(outcome) = read_terminal().await? {
                     return Ok::<_, Error>(Some(outcome));
                 }
-                if confirmed {
+                if confirmed && command.turn_id.is_none() {
                     return Ok(None);
                 }
                 loop {
@@ -846,9 +889,13 @@ impl Router {
             }
         };
         // Read once after expiry even if the native reply used the whole budget.
-        let evidence = match timeout_at(until, wait_terminal).await {
-            Ok(result) => result,
-            Err(_) => read_terminal().await,
+        let evidence = if runtime_unavailable {
+            read_terminal().await
+        } else {
+            match timeout_at(until, wait_terminal).await {
+                Ok(result) => result,
+                Err(_) => read_terminal().await,
+            }
         };
         if let Err(error) = evidence.as_ref() {
             self.settle_plugin_error(&command.id, error).await;
@@ -859,7 +906,7 @@ impl Router {
             let reason = match terminal {
                 Some(TurnOutcome::Interrupted) if ack => "interrupted_by_owner",
                 None if command.turn_id.is_none() => "session_interrupt_confirmed",
-                None => "interrupted_by_owner",
+                None => "interrupt_confirmed",
                 _ => "turn_ended",
             };
             let _ = self
@@ -876,7 +923,7 @@ impl Router {
         let dispatched_stop = {
             let mut store = self.inner.store.lock().await;
             store
-                .dispatch_interrupt_stop(&command.id, now_ms())
+                .dispatch_interrupt_stop(&command.id, runtime_unavailable, now_ms())
                 .map(|change| {
                     change.map(|change| {
                         self.publish_locked(&change.events);
@@ -891,12 +938,14 @@ impl Router {
                 Some(id)
             }
             Ok(None) => {
-                if read_terminal()
-                    .await
-                    .is_ok_and(|terminal| terminal.is_some())
-                {
+                if let Ok(Some(outcome)) = read_terminal().await {
+                    let reason = if outcome == TurnOutcome::Interrupted && ack {
+                        "interrupted_by_owner"
+                    } else {
+                        "turn_ended"
+                    };
                     let _ = self.settle(&command.id, CommandState::Applied, Some(json!({
-                        "command_id": command.id, "turn_id": command.turn_id, "reason": "turn_ended",
+                        "command_id": command.id, "turn_id": command.turn_id, "reason": reason,
                     }))).await;
                     return;
                 }
@@ -919,6 +968,9 @@ impl Router {
             Some(_) => format!(
                 "{native_message}. Swarm could not prove that the fallback stopped the Agent."
             ),
+            None if command.turn_id.is_none() => {
+                format!("{native_message}. The interrupt has no captured turn for fallback stop.")
+            }
             None => format!(
                 "{native_message}. The captured Agent or turn changed before fallback stop."
             ),

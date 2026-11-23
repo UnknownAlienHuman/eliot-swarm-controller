@@ -54,7 +54,7 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 | Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
 | launch/send | session/start then turn/start; readiness, input association and result separate |
-| steer/interrupt | steer is turn/steer with the exact expected turn. Interrupt is turn/cancel with the captured turn when known. The [shared Owner control policy](../spec/plugin-protocol.md#host-requests) also allows a session-bound cancel. The native queue is retained |
+| steer/interrupt | steer is turn/steer with the exact expected turn. Interrupt is turn/cancel with the captured turn. An empty Owner binding allows idle confirmation only under the [shared control policy](../spec/plugin-protocol.md#host-requests). The native queue is retained |
 | inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
 | stop/resume | interrupt the captured busy turn and await native terminal evidence within the core bound, then clear/pause native Goal as necessary and close owned host; missing evidence retains an unknown turn; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |

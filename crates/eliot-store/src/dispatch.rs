@@ -924,7 +924,7 @@ fn dispatch_control_tx(
         .expected_turn_id
         .as_deref()
         .is_some_and(|expected| turn_id != Some(expected))
-        || ((!owner_interrupt || turn_id.is_some()) && current_turn.as_deref() != turn_id)
+        || current_turn.as_deref() != turn_id
     {
         return Err(Error::new(
             "stale_generation",
@@ -1008,6 +1008,7 @@ impl Store {
     pub fn dispatch_interrupt_stop(
         &mut self,
         interrupt_id: &str,
+        runtime_unavailable: bool,
         now: i64,
     ) -> Result<Option<Change<(Agent, Command)>>> {
         self.ensure_writer_healthy()?;
@@ -1030,11 +1031,14 @@ impl Store {
                 .ok_or_else(|| Error::new("not_found", "interrupt target Agent was not found"))?;
             observer::require_controlled(&agent)?;
             if !interrupt.command.is_owner_interrupt()
-                || interrupt.state != CommandState::Dispatched
+                || !(interrupt.state == CommandState::Dispatched
+                    || (runtime_unavailable && interrupt.state == CommandState::Unknown))
                 || agent.generation != generation
-                || agent.is_terminal()
-                || (interrupt.command.turn_id.is_some()
-                    && admission::owner_control_turn(&tx, &agent)? != interrupt.command.turn_id)
+                || (!runtime_unavailable && agent.is_terminal())
+                || admission::owner_control_turn(&tx, &agent)? != interrupt.command.turn_id
+                || (interrupt.command.turn_id.is_none()
+                    && (!runtime_unavailable
+                        || has_pending_send_input(&tx, agent_num, generation)?))
             {
                 return Ok(None);
             }
@@ -1044,7 +1048,8 @@ impl Store {
             request
                 .expected_turn_id
                 .clone_from(&interrupt.command.turn_id);
-            request.args = json!({"force": true});
+            request.args =
+                json!({"force": true, "interrupt_runtime_unavailable": runtime_unavailable});
             let mut events = Vec::new();
             admission::admit_stop_member(
                 &tx,
