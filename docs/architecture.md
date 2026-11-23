@@ -140,6 +140,28 @@ The detailed invariants have one owner:
 Do not duplicate these contracts in worker instructions or add another decision for each
 edge case. Repair the owning spec and its actual caller together.
 
+## Work truth lives in Git
+
+The [owner principle](vision.md#owner-statement-source-of-truth) of 2026-11-22: the
+truth about work is stored in Git, outside every harness.
+
+- **Branch.** A task's durable state is its committed Git branch in a managed worktree,
+  plus the task card naming the branch and goal. Uncommitted changes stay on disk in the
+  worktree but are not durable truth.
+- **Disposable session.** A harness session (process, model, context, native transcript)
+  is a disposable worker on that branch. Losing it loses no committed work.
+- **Checkpoints.** Agents commit progress at meaningful checkpoints on their own branch.
+- **Handoff brief.** Work moves to another model from the branch, not from a vendor
+  transcript. This is the ordinary path for every reason, not a special failover: a
+  provider limit, a model or cost choice, a failed or lost session, or an Owner request.
+- **Store's role.** Store records who works on which branch and what happened. Git holds
+  the work itself.
+
+[Coordination](spec/coordination.md#agent-switch-implemented) owns the switch and handoff
+contract, including when a handoff is admitted, what transfers and how uncertain effects
+are reported (never replayed). [Configuration](spec/configuration.md#routing-policy-s3)
+owns which models may take over. #918 brings both in line with this principle.
+
 ## Process and recovery boundary
 
 Use one process-owning plugin/app-server per Agent generation. A replacement never
