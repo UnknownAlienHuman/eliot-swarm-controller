@@ -235,16 +235,14 @@ parents only when the branch parent is exclusive; Store admission prevents anoth
 managed worktree from sharing it, and successors inherit the roots from the retained
 branch even with a different Agent ID.
 
-Explicit one-component branches receive the shared `refs/heads` and
-`logs/refs/heads` roots. Explicit `fix/<name>` and legacy
-`<project>/<agent>-<task>` branches receive their respective shared ref and reflog
-parents. These recursive roots permit writes to every loose branch ref and reflog below
+Explicit and legacy names receive their actual ref and reflog parents. One-component
+branches receive `refs/heads` and `logs/refs/heads`. These recursive roots permit
+writes to every loose branch ref and reflog below
 the granted parent, including siblings. The daemon still verifies the selected branch
 against the worktree's symbolic `HEAD` and Git's ref inventory, rejects case-only aliases
 and parent/child ref conflicts, and checks that each granted directory tree contains only
-regular files and plain directories, with no reparse points or special entries. Other
-multi-component branch names receive ref and reflog roots only when they satisfy the
-existing exclusive `<project>/<aN>/<name>` parent rule. `packed-refs`, tags, refs outside
+regular files and plain directories. Reparse points and special entries block the
+grant. `packed-refs`, tags, refs outside
 `refs/heads`, repository config and hooks remain outside these roots.
 
 The writable object root covers the repository's entire common `objects` tree, so the

@@ -107,12 +107,10 @@ permission error after a successful commit, because `packed-refs` stays outside 
 roots. Generated branches use `<project>/<agent>/work`, so their ref and reflog parents
 are dedicated to that worktree's `<project>/<aN>` branch parent. Store admission prevents
 managed worktrees from sharing the parent, and a successor keeps the roots when it inherits
-the branch under a different Agent ID. Explicit branch names are preserved, but branches
-outside that namespace do not receive shared ref or reflog roots; they can stage, write
-objects and make detached commits, but cannot advance their named ref through the sandbox.
-The shared object
-directory remains writable, so object integrity is shared across the repository. The
-commit stands when Git reports the packed-refs error after updating the loose branch ref.
+the branch under a different Agent ID. Explicit and legacy branches keep their names
+and receive their actual ref and reflog parents for native commits. Shared parents allow
+writes to sibling loose refs and reflogs below them. The common object directory lets
+an Agent create, replace, remove or corrupt loose objects or packs used by any ref.
 
 ### Eliot MCP bridge
 

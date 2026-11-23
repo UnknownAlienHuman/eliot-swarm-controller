@@ -1217,19 +1217,15 @@ admission prevents another managed worktree from sharing the `<project>/<aN>` pa
 and a successor inherits the same roots from its managed branch despite having a different
 Agent ID.
 
-Explicit one-component branch names receive the shared `refs/heads` and
-`logs/refs/heads` roots. Explicit `fix/<name>` branches receive the `fix` ref and reflog
-parents, and legacy `<project>/<agent>-<task>` branches receive their project ref and
-reflog parents, even when those parents contain sibling branches. These recursive
+Explicit and legacy branches receive their actual ref and reflog parents at any depth.
+A one-component branch receives `refs/heads` and `logs/refs/heads`. These recursive
 directory grants allow writes to every loose branch ref and reflog beneath each granted
-parent, including siblings; they do not isolate writes to the selected branch. Before
+parent, including siblings. Before
 granting them, the daemon verifies that the selected branch is the worktree's current
 HEAD branch, exists in Git's ref inventory without a case-only alias or parent/child ref
 conflict, and that each granted directory tree contains only regular files and plain
-directories, with no reparse points or special entries. Other explicit multi-component
-branch shapes receive those roots only when they match the existing exclusive
-`<project>/<aN>/<name>` parent rule. Unmanaged workspaces remain ineligible for these
-roots.
+directories. A reparse point or special entry blocks the grant. These roots require a
+managed worktree.
 
 The writable object root is the repository-wide common `objects` tree. A sandboxed Agent
 can create, replace, remove or corrupt object data visible through that tree, including

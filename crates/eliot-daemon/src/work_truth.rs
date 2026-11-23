@@ -1355,11 +1355,8 @@ pub(crate) fn needs_commit_roots(harness: &str, profile: &Value) -> bool {
 
 /// Git metadata roots needed by a sandboxed Codex Agent in a managed worktree.
 /// The worktree admin directory and shared objects remain writable. Branches
-/// in the default `<project>/<aN>/<name>` form get ref and reflog parents only
-/// when their parent is exclusive. Explicit one-component branches,
-/// `fix/<name>`, and legacy `<project>/<agent>-<task>` branches get shared ref
-/// and reflog parents;
-/// the root grant can write sibling loose refs and logs below those parents.
+/// get their actual ref and reflog parents after the path and ref checks.
+/// A shared parent makes sibling loose refs and logs writable.
 /// Successors keep the same grant when they inherit the worktree. Hooks,
 /// repository config and packed-refs stay out.
 pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<String>> {
@@ -1423,38 +1420,28 @@ pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<St
     // remains a shared integrity boundary; a broker would be needed to make
     // these writes per-Agent.
     let mut paths = vec![admin, objects];
-    let ref_parent = exclusive_agent_ref_parent(branch)
-        .map(|(parent, leaf)| (Some(parent), leaf, true))
-        .or_else(|| explicit_shared_ref_parent(branch).map(|(parent, leaf)| (parent, leaf, false)));
-    if let Some((parent, leaf, exclusive)) = ref_parent {
-        let (refs, logs) = match parent {
-            Some(parent) => (
-                common.join("refs").join("heads").join(parent),
-                common.join("logs").join("refs").join("heads").join(parent),
-            ),
-            None => (
-                common.join("refs").join("heads"),
-                common.join("logs").join("refs").join("heads"),
-            ),
+    let (parent, leaf) = branch
+        .rsplit_once('/')
+        .map_or((None, branch), |(parent, leaf)| (Some(parent), leaf));
+    let mut refs = common.join("refs").join("heads");
+    let mut logs = common.join("logs").join("refs").join("heads");
+    if let Some(parent) = parent {
+        refs.push(parent);
+        logs.push(parent);
+    }
+    if ensure_plain_directory_tree(&common, &refs) && ensure_plain_directory_tree(&common, &logs) {
+        let exclusive = if let Some((parent, _)) = exclusive_agent_ref_parent(branch) {
+            contains_only_optional_file(&refs, leaf)
+                && contains_only_optional_file(&logs, leaf)
+                && branch_ref_parent_is_exclusive(&git, &root, parent, &full_ref, deadline).await
+        } else {
+            false
         };
-        let branch_is_safe = match (exclusive, parent) {
-            (true, Some(parent)) => {
-                branch_ref_parent_is_exclusive(&git, &root, parent, &full_ref, deadline).await
-            }
-            (true, None) => false,
-            (false, parent) => {
-                branch_ref_is_unambiguous(&git, &root, parent, &full_ref, deadline).await
-            }
-        };
-        let directories_are_safe = ensure_plain_directory_tree(&common, &refs)
-            && ensure_plain_directory_tree(&common, &logs)
-            && if exclusive {
-                contains_only_optional_file(&refs, leaf) && contains_only_optional_file(&logs, leaf)
-            } else {
-                contains_only_plain_entries(&refs, Some(leaf))
-                    && contains_only_plain_entries(&logs, Some(leaf))
-            };
-        if branch_is_safe && directories_are_safe {
+        if exclusive
+            || (contains_only_plain_entries(&refs, Some(leaf))
+                && contains_only_plain_entries(&logs, Some(leaf))
+                && branch_ref_is_unambiguous(&git, &root, parent, &full_ref, deadline).await)
+        {
             paths.push(refs);
             paths.push(logs);
         }
@@ -1485,24 +1472,6 @@ fn exclusive_agent_ref_parent(branch: &str) -> Option<(&str, &str)> {
     }
     let (parent, _) = branch.rsplit_once('/')?;
     Some((parent, leaf))
-}
-
-fn explicit_shared_ref_parent(branch: &str) -> Option<(Option<&str>, &str)> {
-    let mut components = branch.split('/');
-    let first = components.next()?;
-    let Some(leaf) = components.next() else {
-        return (!first.is_empty()).then_some((None, first));
-    };
-    if first.is_empty() || leaf.is_empty() || components.next().is_some() {
-        return None;
-    }
-    (first == "fix" || is_legacy_agent_task_component(leaf)).then_some((Some(first), leaf))
-}
-
-fn is_legacy_agent_task_component(component: &str) -> bool {
-    component
-        .split_once('-')
-        .is_some_and(|(agent, task)| is_agent_id_component(agent) && !task.is_empty())
 }
 
 fn is_agent_id_component(agent: &str) -> bool {
