@@ -1573,6 +1573,7 @@ impl Store {
                         transfer,
                     )?;
                     super::work_truth::inherit_work_task_tx(&tx, &source, &destination, now)?;
+                    Store::transfer_handoff_lineage_tx(&tx, &source, &destination)?;
                     let target_root = target_checkout_root.as_deref().ok_or_else(|| {
                         Error::new("source_integrity", "switch target checkout root is missing")
                     })?;
@@ -1788,6 +1789,7 @@ impl Store {
             let outcome = serde_json::to_value(&value)
                 .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
             update_command_state(&tx, id, state, Some(&outcome), None, now)?;
+            Store::settle_automatic_handoff_attempt_tx(&tx, id, state, now)?;
             events.push(insert_daemon_command_event(
                 &tx, now, &format!("command.{}",command_state_name(state)), None, None, id,
                 json!({"launch_command":plan.launch_command,"handoff_command":plan.handoff_command,
@@ -1893,7 +1895,7 @@ impl Store {
         value.state = CommandState::Rejected;
         value.next_action.clear();
         value.routing = error.routing.clone();
-        self.settle(
+        let change = self.settle(
             id,
             CommandState::Rejected,
             Some(
@@ -1901,7 +1903,9 @@ impl Store {
                     .map_err(|_| Error::new("internal", "cannot encode switch result"))?,
             ),
             now,
-        )
+        )?;
+        self.settle_automatic_handoff_attempt(id, CommandState::Rejected, now)?;
+        Ok(change)
     }
 
     /// Latest exact provider switch fact for this attempt, including queueing.

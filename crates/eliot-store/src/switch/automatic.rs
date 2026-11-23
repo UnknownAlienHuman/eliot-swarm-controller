@@ -16,6 +16,8 @@ const LOSS_GRACE_MS: i64 = 20_000;
 const WAITING_RETRY_MS: i64 = 60_000;
 const HELD_SCAN_LIMIT: i64 = 256;
 const LOST_SCAN_LIMIT: i64 = 64;
+const MAX_AUTOMATIC_HANDOFFS_PER_TASK: i64 = 3;
+type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
 #[derive(Clone, Debug)]
 pub struct AutomaticHandoff {
@@ -23,6 +25,287 @@ pub struct AutomaticHandoff {
     pub reason: HandoffReason,
     pub kind: Option<core::ProviderRestrictionKind>,
     pub held_since: Option<i64>,
+}
+
+fn lineage_for(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<Option<(i64, Option<i64>)>> {
+    connection
+        .query_row(
+            "SELECT lineage_agent, successor_agent FROM handoff_task_lineages
+             WHERE agent = ?1 AND generation = ?2",
+            params![agent, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)
+}
+
+fn handoff_budget_available(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
+    let agent_num = parse_agent_id(&agent.id)?;
+    if lineage_for(connection, agent_num, agent.generation)?
+        .is_some_and(|(_, successor)| successor.is_some())
+    {
+        return Ok(false);
+    }
+    // Older successful same-worktree switches predate the durable lineage row.
+    let already_succeeded: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_successors
+             WHERE agent = ?1 AND generation = ?2)",
+            params![agent_num, agent.generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if already_succeeded {
+        return Ok(false);
+    }
+    let lineage_agent = lineage_for(connection, agent_num, agent.generation)?
+        .map_or(agent_num, |(lineage_agent, _)| lineage_agent);
+    let budget: Option<HandoffBudgetState> = connection
+        .query_row(
+            "SELECT automatic_attempts, last_agent, last_generation, last_state, last_updated_at
+             FROM automatic_handoff_budgets WHERE lineage_agent = ?1",
+            [lineage_agent],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((attempts, last_agent, last_generation, state, updated_at)) = budget else {
+        return Ok(true);
+    };
+    if attempts >= MAX_AUTOMATIC_HANDOFFS_PER_TASK {
+        return Ok(false);
+    }
+    if last_agent != Some(agent_num) || last_generation != Some(agent.generation) {
+        return Ok(true);
+    }
+    let updated_at = updated_at.unwrap_or(now);
+    Ok(match state.as_deref() {
+        Some("rejected") => updated_at + REJECTED_RETRY_MS <= now,
+        Some("refused") => updated_at + REFUSED_RETRY_MS <= now,
+        Some("failed") => updated_at + REFUSED_RETRY_MS <= now,
+        Some("reserved" | "unknown" | "applied") | None => false,
+        _ => false,
+    })
+}
+
+fn ensure_lineage_tx(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<i64> {
+    if let Some((lineage_agent, _)) = lineage_for(tx, agent, generation)? {
+        tx.execute(
+            "INSERT OR IGNORE INTO automatic_handoff_budgets(lineage_agent)
+             VALUES (?1)",
+            [lineage_agent],
+        )
+        .map_err(sql_error)?;
+        return Ok(lineage_agent);
+    }
+    tx.execute(
+        "INSERT INTO handoff_task_lineages(agent, generation, lineage_agent)
+         VALUES (?1, ?2, ?1)",
+        params![agent, generation],
+    )
+    .map_err(sql_error)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO automatic_handoff_budgets(lineage_agent) VALUES (?1)",
+        [agent],
+    )
+    .map_err(sql_error)?;
+    Ok(agent)
+}
+
+fn insert_lineage_generation_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    lineage_agent: i64,
+) -> Result<()> {
+    let inserted = tx
+        .execute(
+            "INSERT INTO handoff_task_lineages(agent, generation, lineage_agent)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(agent, generation) DO NOTHING",
+            params![agent, generation, lineage_agent],
+        )
+        .map_err(sql_error)?;
+    if inserted == 0
+        && lineage_for(tx, agent, generation)?.map(|(current, _)| current) != Some(lineage_agent)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "Agent generation is already bound to another task continuation",
+        ));
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO automatic_handoff_budgets(lineage_agent) VALUES (?1)",
+        [lineage_agent],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
+impl Store {
+    /// Durable read gate used before routing; reservation repeats it atomically.
+    pub fn automatic_handoff_budget_available(&self, agent: &Agent, now: i64) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        handoff_budget_available(&self.connection, agent, now)
+    }
+
+    /// Carry one task's continuation lineage across a committed switch.
+    pub(crate) fn transfer_handoff_lineage_tx(
+        tx: &Transaction<'_>,
+        source: &Agent,
+        successor: &Agent,
+    ) -> Result<()> {
+        let source_num = parse_agent_id(&source.id)?;
+        let successor_num = parse_agent_id(&successor.id)?;
+        let lineage_agent = ensure_lineage_tx(tx, source_num, source.generation)?;
+        let current =
+            lineage_for(tx, source_num, source.generation)?.and_then(|(_, successor)| successor);
+        if current.is_some_and(|current| current != successor_num) {
+            return Err(Error::new(
+                "bad_state",
+                "task continuation already has another successor",
+            ));
+        }
+        if current.is_none() {
+            let changed = tx
+                .execute(
+                    "UPDATE handoff_task_lineages SET successor_agent = ?1
+                     WHERE agent = ?2 AND generation = ?3 AND successor_agent IS NULL",
+                    params![successor_num, source_num, source.generation],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(Error::new(
+                    "stale_generation",
+                    "task continuation changed before switch completion",
+                ));
+            }
+        }
+        insert_lineage_generation_tx(tx, successor_num, successor.generation, lineage_agent)
+    }
+
+    /// Resume advances the generation but keeps the same durable task lineage.
+    pub(crate) fn inherit_handoff_lineage_tx(
+        tx: &Transaction<'_>,
+        agent: i64,
+        previous_generation: i64,
+        next_generation: i64,
+    ) -> Result<()> {
+        let lineage_agent = ensure_lineage_tx(tx, agent, previous_generation)?;
+        if lineage_for(tx, agent, previous_generation)?
+            .is_some_and(|(_, successor)| successor.is_some())
+        {
+            return Err(Error::new(
+                "bad_state",
+                "a handed-off task cannot resume from its previous Agent",
+            ));
+        }
+        insert_lineage_generation_tx(tx, agent, next_generation, lineage_agent)
+    }
+
+    /// Charge only after the automatic switch reservation is ready to commit.
+    fn charge_automatic_handoff_tx(
+        tx: &Transaction<'_>,
+        agent: &Agent,
+        switch_command: &str,
+        now: i64,
+    ) -> Result<bool> {
+        if !handoff_budget_available(tx, agent, now)? {
+            return Ok(false);
+        }
+        let agent_num = parse_agent_id(&agent.id)?;
+        let lineage_agent = ensure_lineage_tx(tx, agent_num, agent.generation)?;
+        let changed = tx
+            .execute(
+                "UPDATE automatic_handoff_budgets
+                 SET automatic_attempts = automatic_attempts + 1,
+                     last_agent = ?1, last_generation = ?2,
+                     last_switch_command = ?3, last_state = 'reserved', last_updated_at = ?4
+                 WHERE lineage_agent = ?5 AND automatic_attempts < ?6",
+                params![
+                    agent_num,
+                    agent.generation,
+                    switch_command,
+                    now,
+                    lineage_agent,
+                    MAX_AUTOMATIC_HANDOFFS_PER_TASK
+                ],
+            )
+            .map_err(sql_error)?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn settle_automatic_handoff_attempt_tx(
+        tx: &Transaction<'_>,
+        switch_command: &str,
+        state: CommandState,
+        now: i64,
+    ) -> Result<()> {
+        let state = match state {
+            CommandState::Applied => "applied",
+            CommandState::Rejected => "rejected",
+            CommandState::Failed => "failed",
+            CommandState::Unknown => "unknown",
+            _ => return Ok(()),
+        };
+        tx.execute(
+            "UPDATE automatic_handoff_budgets
+             SET last_state = ?1, last_updated_at = ?2
+             WHERE last_switch_command = ?3 AND last_state = 'reserved'",
+            params![state, now, switch_command],
+        )
+        .map_err(sql_error)?;
+        Ok(())
+    }
+
+    pub(crate) fn settle_automatic_handoff_attempt(
+        &mut self,
+        switch_command: &str,
+        state: CommandState,
+        now: i64,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            Self::settle_automatic_handoff_attempt_tx(&tx, switch_command, state, now)?;
+            commit_transaction(tx, &self.write_faulted)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn record_automatic_handoff_refusal_tx(
+        tx: &Transaction<'_>,
+        agent: &Agent,
+        now: i64,
+    ) -> Result<()> {
+        let agent_num = parse_agent_id(&agent.id)?;
+        let lineage_agent = ensure_lineage_tx(tx, agent_num, agent.generation)?;
+        tx.execute(
+            "UPDATE automatic_handoff_budgets
+             SET last_agent = ?1, last_generation = ?2, last_switch_command = NULL,
+                 last_state = 'refused', last_updated_at = ?3
+             WHERE lineage_agent = ?4",
+            params![agent_num, agent.generation, now, lineage_agent],
+        )
+        .map_err(sql_error)?;
+        Ok(())
+    }
 }
 
 struct OwedWork {
@@ -46,57 +329,9 @@ pub(super) fn hold_is_current(tx: &Connection, agent: &Agent, held_since: i64) -
     Ok(current == Some(held_since))
 }
 
-fn latest_attempt(connection: &Connection, agent: &Agent) -> Result<Option<(String, Value, i64)>> {
-    let row: Option<(String, String, i64)> = connection
-        .query_row(
-            "SELECT kind, data, ts FROM events INDEXED BY events_agent
-             WHERE agent = ?1 AND generation = ?2 AND kind IN (?3, ?4)
-             ORDER BY seq DESC LIMIT 1",
-            params![
-                parse_agent_id(&agent.id)?,
-                agent.generation,
-                HANDOFF_QUEUED,
-                HANDOFF_SETTLED
-            ],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    row.map(|(kind, data, ts)| Ok((kind, decode_json(&data)?, ts)))
-        .transpose()
-}
-
 /// Whether another automatic attempt is allowed for this generation.
 fn attempt_allowed(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
-    let moved: bool = connection
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_kind
-             WHERE kind = ?1 AND agent = ?2 AND generation = ?3)",
-            params![
-                handoff::AGENT_HANDED_OFF,
-                parse_agent_id(&agent.id)?,
-                agent.generation
-            ],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if moved {
-        return Ok(false);
-    }
-    let Some((kind, data, ts)) = latest_attempt(connection, agent)? else {
-        return Ok(true);
-    };
-    if kind == HANDOFF_SETTLED {
-        // Applied work has moved, and an unknown outcome is never retried.
-        return Ok(matches!(data["state"].as_str(), Some("refused" | "failed"))
-            && ts + REFUSED_RETRY_MS <= now);
-    }
-    let Some(id) = data["switch_command"].as_str() else {
-        return Ok(false);
-    };
-    Ok(load_command(connection, id)?.is_none_or(|command| {
-        command.state == CommandState::Rejected && command.updated_at + REJECTED_RETRY_MS <= now
-    }))
+    handoff_budget_available(connection, agent, now)
 }
 
 /// The input a successor must carry, when this generation still owes work.
@@ -222,9 +457,6 @@ impl Store {
                  WHERE h.kind IN ('quota','rate_limit')
                    AND a.state = 'idle' AND a.chat = 0 AND a.observe_only = 0
                    AND a.archived = 0 AND a.project <> ''
-                   AND NOT EXISTS(SELECT 1 FROM events x INDEXED BY events_kind
-                       WHERE x.kind = 'agent.handed_off' AND x.agent = a.id
-                         AND x.generation = a.generation)
                    AND h.scope = CASE WHEN json_type(a.profile_snapshot, '$.account') = 'text'
                        THEN 'account:' || json_extract(a.profile_snapshot, '$.account')
                        ELSE 'profile:' || a.profile END
@@ -402,6 +634,7 @@ impl Store {
                         "message": core::bound_chars(&policy.redact_text(&error.message), 512),
                     }),
                 )?;
+                Self::record_automatic_handoff_refusal_tx(&tx, &agent, now)?;
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value: None,
@@ -418,6 +651,10 @@ impl Store {
             .map_err(|_| Error::new("internal", "cannot encode handoff reason"))?;
             args[OWNER_AUTOMATION] = json!(true);
             let digest = canonical::digest(&args)?;
+            if !Self::charge_automatic_handoff_tx(&tx, &agent, &request.id, now)? {
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(none());
+            }
             let mut change = reserve_switch_tx(&tx, &request, args, &digest, now)?;
             change.events.push(insert_daemon_event(
                 &tx,

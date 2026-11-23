@@ -784,7 +784,8 @@ impl Router {
             allowed: None,
         };
         if self
-            .handoff_candidates(&candidate.agent, &route)?
+            .handoff_candidates(&candidate.agent, &route)
+            .await?
             .is_empty()
         {
             return Ok(());

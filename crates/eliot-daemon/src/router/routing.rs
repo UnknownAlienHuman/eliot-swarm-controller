@@ -393,12 +393,24 @@ impl Router {
     /// Ordered successors: the role's candidates, else the fallback list. An
     /// explicit-profile Agent with no fallback list has none. A lost session
     /// may restart on its own profile; a held or failed one may not.
-    pub(super) fn handoff_candidates(
+    pub(super) async fn handoff_candidates(
         &self,
         source: &Agent,
         route: &HandoffRoute,
     ) -> Result<Vec<String>> {
         use eliot_core::api::HandoffReason;
+        if matches!(
+            route.reason,
+            HandoffReason::ProviderHold | HandoffReason::SessionLost
+        ) && !self
+            .inner
+            .store
+            .lock()
+            .await
+            .automatic_handoff_budget_available(source, now_ms())?
+        {
+            return Ok(Vec::new());
+        }
         let routing = crate::config::load_routing_config(&self.inner.data_root)?;
         let role = route.role.as_deref().or_else(|| {
             source
@@ -446,7 +458,7 @@ impl Router {
         route: &HandoffRoute,
     ) -> Result<(String, Value)> {
         use eliot_core::api::HandoffReason;
-        let candidates = self.handoff_candidates(source, route)?;
+        let candidates = self.handoff_candidates(source, route).await?;
         let role = route
             .role
             .clone()

@@ -1285,6 +1285,13 @@ original task text after a confirmed pre-work refusal. Ordinary readiness,
 workspace, authority, claims, Goal and successor delivery rules still apply.
 Rejected means preparation/admission refused; Failed means a known launch or
 handoff refusal; Unknown retains an uncertain launch or interrupted orchestration.
+Automatic handoffs have a durable budget of three admissions per continuation lineage.
+Store maps each Agent generation to its lineage, initially the root Agent ID, and carries
+that mapping through completed switches and resume. The budget and last outcome live in
+Store independently of retained events. A reservation charges once; replaying that switch
+does not charge again. A reserved or unknown outcome is not retried, while a definite
+refusal or failure follows its existing cooldown. Manual switches and resume carry the
+lineage without spending the automatic budget.
 The result keeps the child IDs, created Agent/generation, launch state and
 handoff or disposal outcome. Refusals carry a code and a bounded reason in the
 result and daemon log. A terminal failure has an empty `next_action`.

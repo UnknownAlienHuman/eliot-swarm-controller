@@ -319,6 +319,7 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
+    Store::inherit_handoff_lineage_tx(tx, agent_num, old_generation, next_generation)?;
     let reason = if restart_resume {
         eliot_core::api::GenerationReason::RestartResume
     } else if command.command.principal == "owner" {
