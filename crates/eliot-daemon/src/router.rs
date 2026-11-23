@@ -3192,6 +3192,7 @@ impl Router {
                     &self.inner.data_root,
                     &mut request,
                 )
+                .await
                 && !self.hydrate_retained_attach(&mut request).await?
             {
                 return Err(error);
@@ -3867,14 +3868,6 @@ impl Router {
                 .route_launch_profile(principal, request, routing)
                 .await?;
             request.args["profile"] = Value::String(name.clone());
-            if harness == "claude" {
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &name,
-                    snapshot.get("cmd").and_then(Value::as_str),
-                )
-                .await?;
-                crate::adhoc::write_claude_command_snapshot(&mut snapshot, candidate)?;
-            }
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             self.resolve_launch_default(&harness, &name, &mut snapshot, deadline)
                 .await?;
@@ -3985,8 +3978,8 @@ impl Router {
         if let Some(args) = request.args.as_object_mut() {
             args.insert("profile".to_owned(), Value::String(profile_name.clone()));
         }
-        if harness == "claude" {
-            if inherited_snapshot {
+        if inherited_snapshot {
+            if harness == "claude" {
                 let cmd = snapshot
                     .get("cmd")
                     .and_then(Value::as_str)
@@ -3998,14 +3991,15 @@ impl Router {
                         )
                     })?;
                 crate::adhoc::ensure_claude_profile_command(&profile_name, cmd).await?;
-            } else {
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &profile_name,
-                    snapshot.get("cmd").and_then(Value::as_str),
-                )
-                .await?;
-                crate::adhoc::write_claude_command_snapshot(&mut snapshot, candidate)?;
             }
+        } else {
+            let candidate = crate::adhoc::resolve_profile_command(
+                &profile_name,
+                &harness,
+                snapshot.get("cmd").and_then(Value::as_str),
+            )
+            .await?;
+            crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
         }
         // Reused parent snapshots already carry their frozen default; only
         // freshly resolved child snapshots need a freeze. The label matches
@@ -4663,14 +4657,17 @@ impl Router {
             ));
         }
         let mut profile = self.resolve_profile_cached(&request.profile)?;
-        if profile.get("harness").and_then(Value::as_str) == Some("claude") {
-            let candidate = crate::adhoc::resolve_claude_profile_command(
-                &request.profile,
-                profile.get("cmd").and_then(Value::as_str),
-            )
-            .await?;
-            crate::adhoc::write_claude_command_snapshot(&mut profile, candidate)?;
-        }
+        let harness = profile
+            .get("harness")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("profile_error", "resolved profile has no harness"))?;
+        let candidate = crate::adhoc::resolve_profile_command(
+            &request.profile,
+            harness,
+            profile.get("cmd").and_then(Value::as_str),
+        )
+        .await?;
+        crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
         if request
             .harness
@@ -7217,7 +7214,7 @@ impl Router {
     }
 }
 
-fn freeze_attach_profile(
+async fn freeze_attach_profile(
     cache: &Mutex<crate::config::ProfileCache>,
     data_root: &std::path::Path,
     request: &mut SubmitCommand,
@@ -7231,6 +7228,13 @@ fn freeze_attach_profile(
             "attach harness does not match the selected profile",
         ));
     }
+    let candidate = crate::adhoc::resolve_profile_command(
+        profile_name,
+        &harness,
+        snapshot.get("cmd").and_then(Value::as_str),
+    )
+    .await?;
+    crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
     crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
     install_frozen_profile(request, &harness, snapshot, true)
 }
