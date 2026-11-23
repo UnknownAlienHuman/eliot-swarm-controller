@@ -1,5 +1,7 @@
 use super::*;
-use crate::publication::TemporaryGitIndex;
+use crate::platform::data_dir::replace_file;
+use eliot_core::api::CheckpointRestoreRequest;
+use std::io::Write;
 
 pub(crate) struct CheckpointRestoreOutcome {
     pub(crate) head: String,
@@ -17,13 +19,18 @@ struct RestoredFile {
 /// validated before importing any object into the project repository.
 pub(crate) async fn restore_checkpoint(
     data_root: &Path,
-    workspace: &str,
-    agent: &str,
-    generation: i64,
-    reference: &str,
+    request: &CheckpointRestoreRequest,
+    expected_oid: &str,
     policy: &SecretPolicy,
     limits: CheckpointLimits,
 ) -> Result<CheckpointRestoreOutcome> {
+    let CheckpointRestoreRequest {
+        workspace,
+        agent,
+        generation,
+        checkpoint_ref: reference,
+        ..
+    } = request;
     let expected_prefix = format!("refs/eliot/checkpoints/{agent}/g{generation}/");
     let Some(label) = reference.strip_prefix(&expected_prefix) else {
         return Err(Error::new(
@@ -40,7 +47,17 @@ pub(crate) async fn restore_checkpoint(
     }
     let git = GitProbe::new()?;
     let repository = crate::work_truth_repo::open(data_root, workspace).await?;
-    let manifest_path = format!("{reference}:manifest.json");
+    if checkpoint_reference(&repository, reference)
+        .await?
+        .as_deref()
+        != Some(expected_oid)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "checkpoint ref differs from Store",
+        ));
+    }
+    let manifest_path = format!("{expected_oid}:manifest.json");
     let stored = git
         .workspace_command(
             &repository,
@@ -54,8 +71,8 @@ pub(crate) async fn restore_checkpoint(
     let manifest: CheckpointManifest = serde_json::from_slice(&stored.stdout)
         .map_err(|_| Error::new("unavailable", "checkpoint manifest is unreadable"))?;
     if manifest.version != 1
-        || manifest.agent != agent
-        || manifest.generation != generation
+        || manifest.agent != *agent
+        || manifest.generation != *generation
         || manifest.staged.len().max(manifest.worktree.len()) > MAX_CHECKPOINT_FILES
     {
         return Err(Error::new(
@@ -72,18 +89,18 @@ pub(crate) async fn restore_checkpoint(
         &git,
         &repository,
         &private_overrides,
-        reference,
+        expected_oid,
         manifest.staged,
         policy,
         limits,
         &mut total_bytes,
     )
     .await?;
-    let mut worktree = load_restore_layer(
+    let worktree = load_restore_layer(
         &git,
         &repository,
         &private_overrides,
-        reference,
+        expected_oid,
         manifest.worktree,
         policy,
         limits,
@@ -173,7 +190,7 @@ pub(crate) async fn restore_checkpoint(
     let project_overrides = git
         .batch_overrides(&root, Instant::now() + GIT_TIME)
         .await?;
-    for file in staged.iter_mut().chain(worktree.iter_mut()) {
+    for file in &mut staged {
         let Some(bytes) = file.bytes.as_ref() else {
             continue;
         };
@@ -181,7 +198,7 @@ pub(crate) async fn restore_checkpoint(
         file.project_oid = Some(project_oid.clone());
     }
     let mut imported = HashSet::new();
-    for file in staged.iter().chain(&worktree) {
+    for file in &staged {
         let (Some(bytes), Some(project_oid)) = (file.bytes.as_ref(), file.project_oid.as_deref())
         else {
             continue;
@@ -211,85 +228,8 @@ pub(crate) async fn restore_checkpoint(
     for file in &staged {
         append_restore_index_info(&mut staged_info, file, &zero)?;
     }
-    let mut worktree_info = Vec::new();
-    let mut checkout_paths = Vec::new();
-    let mut deletions = Vec::new();
     for file in &worktree {
-        append_restore_index_info(&mut worktree_info, file, &zero)?;
-        if file.bytes.is_some() {
-            checkout_paths.extend_from_slice(file.snapshot.path.as_bytes());
-            checkout_paths.push(0);
-        } else {
-            deletions.push(file.snapshot.path.as_str());
-        }
-    }
-
-    let index = TemporaryGitIndex::create_with_prefix(data_root, "checkpoint-restore-index")?;
-    let base = git
-        .workspace_command_with_index(
-            &root,
-            &["read-tree", manifest.head.as_str()],
-            index.path(),
-            Instant::now() + GIT_TIME,
-        )
-        .await?;
-    if base.code != 0 {
-        return Err(Error::new(
-            "unavailable",
-            "restore base index could not be prepared",
-        ));
-    }
-    let disk_index = git
-        .workspace_input_with(
-            &root,
-            &["update-index", "-z", "--index-info"],
-            &project_overrides,
-            Some(index.path()),
-            &worktree_info,
-            Instant::now() + GIT_TIME,
-        )
-        .await?;
-    if disk_index.code != 0 {
-        return Err(Error::new(
-            "unavailable",
-            "restore worktree layer could not be prepared",
-        ));
-    }
-    if !checkout_paths.is_empty() {
-        let checked_out = git
-            .workspace_input_with(
-                &root,
-                &["checkout-index", "--force", "--stdin", "-z"],
-                &project_overrides,
-                Some(index.path()),
-                &checkout_paths,
-                Instant::now() + GIT_TIME,
-            )
-            .await?;
-        if checked_out.code != 0 {
-            return Err(Error::new(
-                "unknown",
-                "checkpoint restore file write did not settle",
-            ));
-        }
-    }
-    for path in deletions {
-        let target = validate_restore_target(&root, path)?;
-        match std::fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
-                std::fs::remove_file(&target).map_err(|_| {
-                    Error::new("unknown", "checkpoint restore deletion did not settle")
-                })?;
-            }
-            Ok(_) => return Err(Error::new("conflict", "restore target is not a file")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                return Err(Error::new(
-                    "unknown",
-                    "checkpoint restore path readback failed",
-                ));
-            }
-        }
+        apply_disk_file(&root, file)?;
     }
     if !staged_info.is_empty() {
         let staged_index = git
@@ -311,6 +251,60 @@ pub(crate) async fn restore_checkpoint(
         head: manifest.head,
         paths,
     })
+}
+
+/// Disk blobs already contain the original checkout representation.
+fn apply_disk_file(root: &Path, file: &RestoredFile) -> Result<()> {
+    let target = validate_restore_target(root, &file.snapshot.path)?;
+    let unknown = || Error::new("unknown", "checkpoint restore file write did not settle");
+    let Some(bytes) = file.bytes.as_deref() else {
+        return match std::fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(unknown()),
+        };
+    };
+    let parent = target.parent().ok_or_else(unknown)?;
+    std::fs::create_dir_all(parent).map_err(|_| unknown())?;
+    validate_restore_target(root, &file.snapshot.path)?;
+    let temporary = parent.join(format!(".eliot-restore-{}.tmp", ulid::Ulid::new()));
+    if file.snapshot.mode.as_deref() == Some("120000") {
+        let link = std::str::from_utf8(bytes).map_err(|_| unknown())?;
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(link, &temporary).map_err(|_| unknown())?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(link, &temporary).map_err(|_| unknown())?;
+    } else {
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| unknown())?;
+        let written = (|| {
+            output.write_all(bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = if file.snapshot.mode.as_deref() == Some("100755") {
+                    0o755
+                } else {
+                    0o644
+                };
+                output.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            output.sync_all()
+        })();
+        drop(output);
+        if written.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(unknown());
+        }
+    }
+    if replace_file(&temporary, &target).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(unknown());
+    }
+    Ok(())
 }
 
 async fn load_restore_layer(
@@ -343,27 +337,45 @@ async fn load_restore_layer(
                     && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
             {
                 let object_path = format!("{reference}:blobs/{oid}");
-                let output = git
-                    .workspace_command(
-                        repository,
-                        &["cat-file", "blob", &object_path],
-                        Instant::now() + GIT_TIME,
-                    )
-                    .await?;
-                if output.code != 0
-                    || output.stdout.len() as u64 > limits.file_bytes
-                    || (*total_bytes).saturating_add(output.stdout.len() as u64)
-                        > limits.total_bytes
-                    || hash_blob(git, repository, overrides, &output.stdout).await? != *oid
-                    || policy.contains_text(&String::from_utf8_lossy(&output.stdout))
+                let deadline = Instant::now() + GIT_TIME;
+                let tree_oid = read_line(
+                    git,
+                    repository,
+                    &["rev-parse", "--verify", &object_path],
+                    deadline,
+                )
+                .await?;
+                let size = read_line(git, repository, &["cat-file", "-s", &tree_oid], deadline)
+                    .await?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        Error::new("source_integrity", "checkpoint blob size is invalid")
+                    })?;
+                if tree_oid != *oid
+                    || size > limits.file_bytes
+                    || (*total_bytes).saturating_add(size) > limits.total_bytes
                 {
                     return Err(Error::new(
                         "unavailable",
                         "checkpoint restore content validation failed",
                     ));
                 }
-                *total_bytes = total_bytes.saturating_add(output.stdout.len() as u64);
-                (Some(output.stdout), None)
+                let size_bound = usize::try_from(size).map_err(|_| {
+                    Error::new("unavailable", "checkpoint blob size is out of range")
+                })?;
+                let bytes = git
+                    .workspace_blob(repository, oid, size_bound, deadline)
+                    .await?;
+                if hash_blob(git, repository, overrides, &bytes).await? != *oid
+                    || contains_checkpoint_credential(&bytes, policy)
+                {
+                    return Err(Error::new(
+                        "unavailable",
+                        "checkpoint restore content validation failed",
+                    ));
+                }
+                *total_bytes = total_bytes.saturating_add(size);
+                (Some(bytes), None)
             }
             _ => {
                 return Err(Error::new(
@@ -449,7 +461,7 @@ fn validate_restore_target(root: &Path, path: &str) -> Result<PathBuf> {
         parent.push(name);
         if components.peek().is_some() {
             match std::fs::symlink_metadata(&parent) {
-                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {}
                 Ok(_) => {
                     return Err(Error::new(
                         "conflict",

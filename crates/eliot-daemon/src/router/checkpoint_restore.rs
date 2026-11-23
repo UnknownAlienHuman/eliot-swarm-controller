@@ -1,5 +1,6 @@
 use super::*;
 use eliot_core::api::{CheckpointRestoreRequest, CheckpointRestoreResponse};
+use eliot_store::CheckpointRestoreAdmission;
 
 impl Router {
     pub(super) async fn checkpoint_restore(
@@ -8,48 +9,53 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         require_owner(principal)?;
-        let request: CheckpointRestoreRequest =
+        let mut request: CheckpointRestoreRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let workspace = crate::git_monitor::canonical_root(&request.workspace)?;
-        let workspace = workspace.to_string_lossy().into_owned();
-
-        {
-            let store = self.inner.store.lock().await;
-            let truth = store
-                .agent_work_truth(&request.agent, request.generation)?
-                .ok_or_else(|| Error::new("not_found", "checkpoint generation was not retained"))?;
-            let checkpoint_matches = truth.checkpoint.is_some_and(|checkpoint| {
-                checkpoint.state == eliot_core::api::GitCheckpointState::Snapshot
-                    && checkpoint.checkpoint_ref.as_deref() == Some(request.checkpoint_ref.as_str())
-            });
-            if !checkpoint_matches {
-                return Err(Error::new(
-                    "not_found",
-                    "checkpoint reference is not current",
-                ));
-            }
-            if store.workspace_has_active_agents(&workspace)? {
-                return Err(Error::new("busy", "restore workspace has an active Agent"));
-            }
-        }
+        let (workspace, _) = crate::workspace_git::WorkspaceGit::new()?
+            .repository_identity(&request.workspace)
+            .await?;
+        let _guard = self.workspace_check_lock(&workspace).lock_owned().await;
+        let admission = self.inner.store.lock().await.reserve_checkpoint_restore(
+            &request,
+            &workspace,
+            now_ms(),
+        )?;
+        let oid = match admission {
+            CheckpointRestoreAdmission::Replay(outcome) => return encode_outcome(outcome?),
+            CheckpointRestoreAdmission::Start { oid } => oid,
+        };
+        request.workspace = workspace;
         let limits = crate::config::load_daemon_config(&self.inner.data_root)
             .unwrap_or_default()
             .checkpoint_limits();
-        let restored = crate::work_truth::restore_checkpoint(
+        let policy = self.secret_policy_snapshot();
+        let outcome = crate::work_truth::restore_checkpoint(
             &self.inner.data_root,
-            &workspace,
-            &request.agent,
-            request.generation,
-            &request.checkpoint_ref,
-            &self.secret_policy_snapshot(),
+            &request,
+            &oid,
+            &policy,
             limits,
         )
-        .await?;
-        serde_json::to_value(CheckpointRestoreResponse {
+        .await
+        .map(|restored| CheckpointRestoreResponse {
             head: restored.head,
             paths: restored.paths,
         })
-        .map_err(|_| Error::new("internal", "checkpoint restore result cannot be encoded"))
+        .map_err(|mut error| {
+            error.message = Box::new(policy.redact_text(&error.message));
+            error
+        });
+        self.inner
+            .store
+            .lock()
+            .await
+            .settle_checkpoint_restore(&request.id, &outcome)?;
+        encode_outcome(outcome?)
     }
+}
+
+fn encode_outcome(outcome: CheckpointRestoreResponse) -> Result<Value> {
+    serde_json::to_value(outcome)
+        .map_err(|_| Error::new("internal", "checkpoint restore result cannot be encoded"))
 }
