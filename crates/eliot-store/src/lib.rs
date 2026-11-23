@@ -216,6 +216,8 @@ mod fleet;
 mod git;
 mod goals;
 mod handoff;
+mod harness_checks;
+pub use harness_checks::HarnessCheckRow;
 mod hierarchy;
 pub mod inference;
 mod lifecycle;

@@ -350,23 +350,51 @@ fn totals<'de, D: serde::Deserializer<'de>>(
         .collect()
 }
 
-/// One harness installation fact with its verified-against record.
+/// One harness installation fact with its self-check record (#932 item 3).
+/// The single fact per harness is the installed version and when that
+/// version last passed Swarm's own scenario. A new version is accepted and
+/// marked "not checked"; it is never refused.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorHarnessEntry {
     pub harness: String,
     pub installed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    pub check_outcome: HarnessCheckOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_version: Option<String>,
-    pub verified_version: String,
-    pub verified_marker: String,
-    pub drift: bool,
+    pub checked_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drift_message: Option<String>,
+    pub checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_checked_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_error: Option<String>,
     pub doc_section: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract_mismatch: Option<String>,
+}
+
+/// The self-check state of one harness's installed version.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessCheckOutcome {
+    NotChecked,
+    Passed,
+    Failed,
+}
+
+impl HarnessCheckOutcome {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotChecked => crate::OUTCOME_NOT_CHECKED,
+            Self::Passed => crate::OUTCOME_PASSED,
+            Self::Failed => crate::OUTCOME_FAILED,
+        }
+    }
 }
 
 /// An explicit profile command whose executable is absent.
@@ -427,23 +455,74 @@ impl ProfileCommandIssue {
 impl DoctorHarnessEntry {
     pub fn validate(&self) -> Result<()> {
         text(&self.harness, "doctor harness")?;
-        text(&self.verified_version, "doctor verified version")?;
-        text(&self.verified_marker, "doctor verified marker")?;
         text(&self.doc_section, "doctor doc section")?;
         if let Some(version) = &self.version {
             text(version, "doctor version")?;
         }
-        if let Some(manifest) = &self.manifest_version {
-            text(manifest, "doctor manifest version")?;
+        if let Some(checked) = &self.checked_version {
+            text(checked, "doctor checked version")?;
         }
-        match (&self.drift, &self.drift_message) {
-            (true, Some(message)) => message_text(message, "drift")?,
-            (false, None) => {}
-            _ => {
-                return Err(Error::new(
-                    "invalid",
-                    "doctor drift needs its message exactly when drifting",
-                ));
+        if let Some(at) = self.checked_at {
+            if at < 0 {
+                return Err(Error::new("invalid", "doctor check time is invalid"));
+            }
+        }
+        if let Some(profile) = &self.check_profile {
+            text(profile, "doctor check profile")?;
+        }
+        match self.check_outcome {
+            HarnessCheckOutcome::NotChecked => {
+                if self.checked_version.is_some()
+                    || self.checked_at.is_some()
+                    || self.failure_step.is_some()
+                    || self.failure_error.is_some()
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "doctor unchecked harness carries no check record",
+                    ));
+                }
+                if let Some(reason) = &self.not_checked_reason {
+                    if reason != crate::NOT_CHECKED_NEW_VERSION
+                        && reason != crate::NOT_CHECKED_QUOTA
+                    {
+                        return Err(Error::new("invalid", "doctor unchecked reason is invalid"));
+                    }
+                }
+            }
+            HarnessCheckOutcome::Passed => {
+                if self.checked_version.is_none()
+                    || self.checked_at.is_none()
+                    || self.not_checked_reason.is_some()
+                    || self.failure_step.is_some()
+                    || self.failure_error.is_some()
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "doctor passed check needs its version and time",
+                    ));
+                }
+            }
+            HarnessCheckOutcome::Failed => {
+                if self.checked_version.is_none()
+                    || self.checked_at.is_none()
+                    || self.not_checked_reason.is_some()
+                    || self.failure_step.is_none()
+                    || self.failure_error.is_none()
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "doctor failed check needs its step and vendor error",
+                    ));
+                }
+                if let Some(step) = &self.failure_step
+                    && !crate::CHECK_STEPS.contains(&step.as_str())
+                {
+                    return Err(Error::new("invalid", "doctor failure step is invalid"));
+                }
+                if let Some(error) = &self.failure_error {
+                    message_text(error, "check failure")?;
+                }
             }
         }
         if let Some(mismatch) = &self.contract_mismatch {

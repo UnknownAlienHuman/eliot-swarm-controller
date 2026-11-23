@@ -1,6 +1,7 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 111;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = HARNESS_CHECK_SCHEMA_VERSION;
+const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2589,6 +2590,41 @@ impl Store {
                        AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE};
                  INSERT INTO schema_migrations(version) VALUES (111);",
             ))
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < HARNESS_CHECK_SCHEMA_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE harness_checks (
+                     harness TEXT PRIMARY KEY CHECK(harness <> ''),
+                     installed_version TEXT NOT NULL DEFAULT '',
+                     outcome TEXT NOT NULL DEFAULT 'not_checked'
+                         CHECK(outcome IN ('not_checked', 'passed', 'failed')),
+                     not_checked_reason TEXT
+                         CHECK(not_checked_reason IS NULL
+                             OR not_checked_reason IN ('new_version', 'quota')),
+                     checked_version TEXT NOT NULL DEFAULT '',
+                     checked_at INTEGER NOT NULL DEFAULT 0 CHECK(checked_at >= 0),
+                     check_profile TEXT,
+                     failure_step TEXT
+                         CHECK(failure_step IS NULL
+                             OR failure_step IN ('launch', 'turn_with_tool_call',
+                                 'steer', 'stop', 'resume', 'select_profile')),
+                     failure_error TEXT,
+                     attempted_version TEXT,
+                     attempted_at INTEGER NOT NULL DEFAULT 0 CHECK(attempted_at >= 0),
+                     updated_at INTEGER NOT NULL DEFAULT 0 CHECK(updated_at >= 0)
+                 );",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [HARNESS_CHECK_SCHEMA_VERSION],
+            )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }

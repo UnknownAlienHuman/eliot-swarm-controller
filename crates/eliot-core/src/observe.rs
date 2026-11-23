@@ -47,8 +47,6 @@ impl AttentionStep {
             && self.turn_id.as_ref().is_none_or(|id| id.len() <= 256)
     }
 }
-/// Journal kind for an installed-vs-verified harness mismatch.
-pub const HARNESS_DRIFT_KIND: &str = "harness.drift";
 /// Detail level for the heavy-episode record.
 pub const OBSERVE_LEVEL_DEBUG: &str = "debug";
 /// Warning level for owner-actionable growth and drift flags.
@@ -646,93 +644,29 @@ pub fn evaluate_session_growth(
     None
 }
 
-/// One harness the docs verify Eliot against: the installed version (and
-/// native schema or protocol marker where one exists) plus the doc section
-/// to re-verify when the installed surface differs. The docs link this
-/// table; the code reads it. Single source: update here and in
-/// `docs/harnesses/README.md` together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VerifiedHarness {
-    pub harness: &'static str,
-    pub verified_version: &'static str,
-    pub verified_marker: &'static str,
-    pub doc_section: &'static str,
-}
-
-pub const VERIFIED_HARNESSES: &[VerifiedHarness] = &[
-    VerifiedHarness {
-        harness: "codex",
-        verified_version: "0.167.1",
-        verified_marker: "app-server schema v2 (0.167.1)",
-        doc_section: "docs/harnesses/codex.md#sources",
-    },
-    VerifiedHarness {
-        harness: "claude",
-        verified_version: "2.1.325",
-        verified_marker: "stream-json records (2.1.325)",
-        doc_section: "docs/harnesses/claude-code.md#sources-and-unresolved-facts",
-    },
-    VerifiedHarness {
-        harness: "muse",
-        verified_version: "1.4.0-R4161.1",
-        verified_marker: "MSP v1 host 1.4.0-R4161.1",
-        doc_section: "docs/harnesses/muse.md#usage-attribution",
-    },
-    VerifiedHarness {
-        harness: "opencode",
-        verified_version: "2.2.7",
-        verified_marker: "native schema (2.2.7)",
-        doc_section: "docs/harnesses/opencode.md#working-profile",
-    },
-    VerifiedHarness {
-        harness: "antigravity",
-        verified_version: "1.5.9",
-        verified_marker: "ACP v1-7ec5185c.json, AGY 1.5.2",
-        doc_section: "docs/harnesses/antigravity.md#native-identity-and-transport",
-    },
-];
-
-/// Verified record for one harness code, if the table covers it.
-pub fn verified_harness(harness: &str) -> Option<&'static VerifiedHarness> {
-    VERIFIED_HARNESSES
-        .iter()
-        .find(|entry| entry.harness == harness)
-}
-
-/// One installed-vs-verified mismatch: exactly one `harness.drift` event per
-/// harness and installed surface until the surface changes.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HarnessDrift {
-    pub harness: String,
-    pub installed: Option<String>,
-    pub verified: String,
-    pub doc_section: String,
-    pub message: String,
-}
-
-impl HarnessDrift {
-    /// Bounded journal payload for `harness.drift`.
-    pub fn payload(&self) -> Value {
-        json!({
-            "harness": self.harness,
-            "installed": self.installed,
-            "verified": self.verified,
-            "doc_section": self.doc_section,
-            "message": self.message,
-            "level": OBSERVE_LEVEL_STANDARD,
-        })
+/// The harness doc section with the native sources each adapter translates.
+/// `swarm doctor` points here when the Owner needs the harness background.
+pub fn harness_doc_section(harness: &str) -> &'static str {
+    match harness {
+        "codex" => "docs/harnesses/codex.md#sources",
+        "claude" => "docs/harnesses/claude-code.md#sources-and-unresolved-facts",
+        "muse" => "docs/harnesses/muse.md#usage-attribution",
+        "opencode" => "docs/harnesses/opencode.md#working-profile",
+        "antigravity" => "docs/harnesses/antigravity.md#native-identity-and-transport",
+        _ => "docs/harnesses/README.md",
     }
 }
 
-/// Canonical version text for drift comparison: trimmed, lowercased, with
-/// the harness product prefix stripped (`codex-cli 0.167.1`, `codex 0.167.1`
-/// and `0.167.1` all fold to `0.167.1`; a lone leading `v` folds too) and
-/// spaces folded to dashes so Muse `1.4.0 R4161.1` meets `1.4.0-R4161.1`.
+/// Canonical version text for installed-vs-checked comparison: trimmed,
+/// lowercased, with the harness product prefix stripped (`codex-cli 0.167.1`,
+/// `codex 0.167.1` and `0.167.1` all fold to `0.167.1`; a lone leading `v`
+/// folds too) and spaces folded to dashes so Muse `1.4.0 R4161.1` meets
+/// `1.4.0-R4161.1`.
 /// A trailing build parenthetical folds too: `Muse Code 1.4.20 (1.4.20-R8619.1)`
 /// carries the full version plus build, while `2.1.278 (Claude Code)` drops
 /// the product name. Build metadata still counts after folding: `1.4.20`
 /// never folds to `1.4.0-r4161.1`, and a bare `1.4.0` never folds to the
-/// pinned build.
+/// checked build.
 pub fn normalize_harness_version(harness: &str, version: &str) -> String {
     let mut text = version.trim().to_ascii_lowercase().replace(' ', "-");
     let prefixes = crate::api::HarnessCapabilities::of(harness).version_prefixes;
@@ -780,46 +714,14 @@ fn fold_build_parenthetical(text: &str) -> String {
     outer.to_owned()
 }
 
-/// Flag drift when the installed version (or, when both sides carry one, the
-/// schema fingerprint) differs from the verified record. Versions compare
+/// True when two version readings name the same installed surface, compared
 /// normalized per harness (product prefix stripped, build metadata kept), so
-/// `codex-cli 0.167.1` meets pinned `0.167.1` while `1.4.20` still drifts
-/// against `1.4.0-R4161.1`. Unknown harnesses and missing records never flag.
-pub fn check_harness_drift(
-    harness: &str,
-    installed_version: Option<&str>,
-    installed_fingerprint: Option<&str>,
-) -> Option<HarnessDrift> {
-    let verified = verified_harness(harness)?;
-    let installed = installed_version.map(str::trim).filter(|v| !v.is_empty());
-    let version_drift = installed.is_some_and(|v| {
-        normalize_harness_version(harness, v)
-            != normalize_harness_version(harness, verified.verified_version)
-    });
-    let fingerprint_drift = match (installed_fingerprint, verified.verified_marker) {
-        (Some(fingerprint), marker) if !marker.is_empty() => {
-            !fingerprint.trim().is_empty() && fingerprint.trim() != marker
-        }
-        _ => false,
-    };
-    if !version_drift && !fingerprint_drift {
-        return None;
-    }
-    let message = match installed {
-        Some(version) => format!(
-            "harness {harness} behaves as installed {version}, verified as {} ({}); re-verify {} before trusting new behavior; our bugs still read as our bugs",
-            verified.verified_version, verified.verified_marker, verified.doc_section
-        ),
-        None => format!(
-            "harness {harness} version is unknown, verified as {} ({}); re-verify {}",
-            verified.verified_version, verified.verified_marker, verified.doc_section
-        ),
-    };
-    Some(HarnessDrift {
-        harness: harness.to_owned(),
-        installed: installed.map(str::to_owned),
-        verified: verified.verified_version.to_owned(),
-        doc_section: verified.doc_section.to_owned(),
-        message,
-    })
+/// `codex-cli 0.167.1` meets `0.167.1` while `1.4.20` differs from
+/// `1.4.0-R4161.1`. Empty readings never match.
+pub fn same_harness_version(harness: &str, left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    !left.is_empty()
+        && !right.is_empty()
+        && normalize_harness_version(harness, left) == normalize_harness_version(harness, right)
 }

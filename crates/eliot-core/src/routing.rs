@@ -40,6 +40,7 @@ pub enum RouteSkipReason {
     CapacityFull,
     Unauthorized,
     InvalidProfile,
+    HarnessCheckFailed,
 }
 
 impl RouteSkipReason {
@@ -57,6 +58,7 @@ impl RouteSkipReason {
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
             Self::InvalidProfile => "profile does not resolve",
+            Self::HarnessCheckFailed => "harness self-check failed for the installed version",
         }
     }
 }

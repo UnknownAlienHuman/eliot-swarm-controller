@@ -91,9 +91,9 @@ use eliot_core::{
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
         EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
         EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
-        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessDoctorRequest,
-        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
-        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessCheckOutcome,
+        HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,
+        HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
         NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
@@ -4893,31 +4893,30 @@ impl Router {
             .map_err(|_| Error::new("internal", "heavy work could not be encoded"))
     }
 
-    /// Read-only harness installation, version and contract report per
-    /// harness: installed probe facts, the verified-against record, drift
-    /// yes or no with the doc section to re-verify, and the last
-    /// `harness_contract_mismatch` seen (absent while k68 is unmerged).
-    /// Owner only, like `harness.list`; starts no model turn and performs
-    /// no inference. Manifest versions stay unset: manifests report at
-    /// actor init and the daemon retains no central copy.
+    /// Read-only harness installation and self-check report per harness: the
+    /// installed probe facts plus the single durable self-check fact (the
+    /// installed version and when that version last passed, #932 item 3),
+    /// with the doc section and the last `harness_contract_mismatch` seen.
+    /// Recording a changed installed version marks it "not checked"; a new
+    /// version is never refused. Owner only, like `harness.list`; starts no
+    /// model turn and performs no inference.
     async fn harness_doctor(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: HarnessDoctorRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let mut probes = Vec::new();
-        for verified in eliot_core::VERIFIED_HARNESSES {
+        for harness in eliot_core::api::harness::SUPPORTED_HARNESSES {
             probes.push((
-                verified.harness,
-                crate::adhoc::harness_installation_async(verified.harness).await,
+                *harness,
+                crate::adhoc::harness_installation_async(harness).await,
             ));
         }
         let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
         let profile_command_issues = self.profile_command_issues(missing_commands, &probes);
-        let store = self.inner.store.lock().await;
+        let mut store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
-            let verified = eliot_core::verified_harness(harness).expect("table covers probes");
             let installed = entry
                 .get("installed")
                 .and_then(Value::as_bool)
@@ -4926,7 +4925,16 @@ impl Router {
                 .get("version")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let drift = eliot_core::check_harness_drift(harness, version.as_deref(), None);
+            store.note_harness_installed(harness, version.as_deref(), now_ms())?;
+            let row = store
+                .get_harness_check(harness)?
+                .ok_or_else(|| Error::new("internal", "harness check fact is missing"))?;
+            let check_outcome = match row.outcome.as_str() {
+                eliot_core::OUTCOME_PASSED => HarnessCheckOutcome::Passed,
+                eliot_core::OUTCOME_FAILED => HarnessCheckOutcome::Failed,
+                _ => HarnessCheckOutcome::NotChecked,
+            };
+            let checked = !matches!(check_outcome, HarnessCheckOutcome::NotChecked);
             let contract_mismatch = store
                 .latest_event_data("harness_contract_mismatch")?
                 .and_then(|data| doctor_mismatch_text(&data));
@@ -4934,12 +4942,17 @@ impl Router {
                 harness: (*harness).to_owned(),
                 installed,
                 version,
-                manifest_version: None,
-                verified_version: verified.verified_version.to_owned(),
-                verified_marker: verified.verified_marker.to_owned(),
-                drift: drift.is_some(),
-                drift_message: drift.map(|drift| drift.message),
-                doc_section: verified.doc_section.to_owned(),
+                check_outcome,
+                checked_version: checked.then(|| row.checked_version.clone()).flatten(),
+                checked_at: checked.then_some(row.checked_at),
+                check_profile: row
+                    .check_profile
+                    .clone()
+                    .filter(|profile| !profile.is_empty()),
+                not_checked_reason: (!checked).then(|| row.not_checked_reason.clone()).flatten(),
+                failure_step: row.failure_step.clone(),
+                failure_error: row.failure_error.clone(),
+                doc_section: eliot_core::harness_doc_section(harness).to_owned(),
                 contract_mismatch,
             });
         }

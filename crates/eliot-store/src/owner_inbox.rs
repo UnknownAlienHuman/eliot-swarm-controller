@@ -20,6 +20,7 @@ pub(crate) fn project(
     project_unknown_commands(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
     project_holds(connection, now, &mut items, &mut liveness, &[])?;
+    project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
     project_agents(connection, now, &mut items, &mut liveness, &[])?;
     project_goals(connection, now, &mut items, &mut liveness, &[])?;
     project_launch_intents(connection, now, &mut items, &mut liveness, &[])?;
@@ -54,6 +55,7 @@ pub(crate) fn project_item(
         OwnerInboxKind::UnknownCommand => (project_unknown_commands, subject),
         OwnerInboxKind::UnknownTurn => (project_unknown_turns, subject),
         OwnerInboxKind::Hold => (project_holds, subject),
+        OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
         OwnerInboxKind::Agent => (project_agents, subject),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
         OwnerInboxKind::LaunchQueue | OwnerInboxKind::Stuck => match subject.split_once(':') {
@@ -636,6 +638,91 @@ fn project_holds(
                 None,
                 vec![inspect],
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Swarm's own harness self-check results (#932 item 3): one Owner inbox
+/// item per harness whose recorded outcome belongs to its current installed
+/// version, passed or the failed step with the vendor's error. Quota-deferred
+/// versions stay "not checked" and produce no item.
+fn project_harness_checks(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT harness, installed_version, outcome, checked_version, checked_at,
+                COALESCE(check_profile, ''), failure_step, failure_error
+         FROM harness_checks
+         WHERE outcome IN ('passed', 'failed')
+           AND checked_version <> '' AND checked_version = installed_version",
+        "('harness:' || harness)=?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (harness, _installed, outcome, checked, checked_at, profile, step, error) =
+            row.map_err(sql_error)?;
+        if harness.trim().is_empty() || checked.trim().is_empty() {
+            return Err(crate::Error::new("corrupt", "invalid harness check fact"));
+        }
+        let subject = format!("harness:{harness}");
+        let subject_revision = format!(
+            "checked:{checked}:profile:{profile}:step:{}",
+            step.as_deref().unwrap_or("-")
+        );
+        if outcome == eliot_core::OUTCOME_FAILED {
+            let (Some(step), Some(error)) = (step, error) else {
+                return Err(crate::Error::new("corrupt", "invalid harness check fact"));
+            };
+            tally(
+                stats,
+                &Mover::Asked {
+                    reason: "harness_check_failed",
+                    item: OwnerInboxKind::HarnessCheck,
+                },
+            );
+            items.push(item(
+                OwnerInboxKind::HarnessCheck,
+                subject,
+                subject_revision,
+                now,
+                checked_at,
+                &format!("harness {harness} {checked} self-check failed at {step}: {error}"),
+                None,
+                Vec::new(),
+            ));
+        } else if outcome == eliot_core::OUTCOME_PASSED {
+            items.push(item(
+                OwnerInboxKind::HarnessCheck,
+                subject,
+                subject_revision,
+                now,
+                checked_at,
+                &format!("harness {harness} {checked} self-check passed"),
+                None,
+                Vec::new(),
+            ));
+        } else {
+            return Err(crate::Error::new("corrupt", "invalid harness check fact"));
         }
     }
     Ok(())

@@ -239,12 +239,11 @@ impl Store {
     }
 
     /// Commit one daemon-observed diagnostic event (`activity.heavy`,
-    /// `session.growth`, `harness.drift`) with optional Agent/generation
-    /// binding, in a single transaction. Kinds are closed: anything else
-    /// rejects as invalid so no new surface can smuggle one in. A bound
-    /// generation must equal the Agent's current generation; drifted evidence
-    /// rejects with `stale_generation` instead of committing under a dead
-    /// binding. Targetless drift carries neither agent nor generation.
+    /// `session.growth`) with optional Agent/generation binding, in a single
+    /// transaction. Kinds are closed: anything else rejects as invalid so no
+    /// new surface can smuggle one in. A bound generation must equal the
+    /// Agent's current generation; mismatched evidence rejects with
+    /// `stale_generation` instead of committing under a dead binding.
     /// Returns the committed event for bus publication.
     pub fn commit_observe_event(
         &mut self,
@@ -256,10 +255,7 @@ impl Store {
     ) -> Result<Event> {
         if !matches!(
             kind,
-            core::ACTIVITY_HEAVY_KIND
-                | core::SESSION_GROWTH_KIND
-                | core::HARNESS_DRIFT_KIND
-                | "agent.restart_resume_blocked"
+            core::ACTIVITY_HEAVY_KIND | core::SESSION_GROWTH_KIND | "agent.restart_resume_blocked"
         ) {
             return Err(Error::new("invalid", "unknown observe event kind"));
         }
