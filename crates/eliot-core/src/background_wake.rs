@@ -17,6 +17,12 @@ pub const MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES: usize = 1_024;
 pub const BACKGROUND_WAKE_AMBIGUOUS_TAIL: &str =
     "(omitted: several tool calls overlapped this process start)";
 pub const BACKGROUND_SERVER_TOPIC: &str = "background.server";
+/// `tool.started.native_wake_scope`: the harness wakes itself for the call's
+/// own task only. A process that outlives the task gets a Swarm wake.
+pub const NATIVE_WAKE_SCOPE_TOOL_PROCESS: &str = "tool_process";
+/// `tool.started.native_wake_scope`: the harness's own wake covers the call's
+/// whole process tree, so Swarm adds no wake for any process it started.
+pub const NATIVE_WAKE_SCOPE_PROCESS_TREE: &str = "process_tree";
 
 const SWARM_INFRA_SUBCOMMANDS: &[&str] = &["mcp", "hook", "plugin", "daemon"];
 

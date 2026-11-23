@@ -130,6 +130,8 @@ pub struct HarnessCapabilities {
     pub resume_previous_turn: bool,
     /// Exact Store recovery closes retained tool starts when the stream cannot.
     pub reconcile_unfinished_tools: bool,
+    /// A live commandless turn can accept and bind a newly dispatched SEND.
+    pub accepts_send_during_native_turn: bool,
     /// Accepts a reasoning-effort setting.
     pub effort: bool,
     /// Reports the accepted model on a `configure` result.

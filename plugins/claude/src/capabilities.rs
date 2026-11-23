@@ -13,6 +13,7 @@ pub fn declaration() -> HarnessCapabilities {
             eliot_core::api::OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
         resume_config: true,
         restart_requires_idle: true,
+        accepts_send_during_native_turn: true,
         configure_reports_accepted_model: true,
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,

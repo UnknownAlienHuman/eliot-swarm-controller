@@ -6280,9 +6280,8 @@ fn send_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> R
     send_outcome_gate_open(connection, agent_num, generation)
 }
 
-/// The SEND gate, plus the one busy case that accepts input: a running
-/// self-started native turn no send is bound to yet. The harness merges that
-/// input into the turn, so it never creates a second overlapping turn.
+/// Only an adapter that can prove a native input binding may accept a new
+/// SEND into an open commandless turn. Other sends wait on the idle gate.
 fn send_input_gate_open(connection: &Connection, agent_num: i64, generation: i64) -> Result<bool> {
     if send_gate_open(connection, agent_num, generation)? {
         return Ok(true);
@@ -6290,6 +6289,9 @@ fn send_input_gate_open(connection: &Connection, agent_num: i64, generation: i64
     let Some(agent) = load_agent_by_num(connection, agent_num)? else {
         return Err(Error::new("not_found", "send target Agent was not found"));
     };
+    if !core::api::HarnessCapabilities::of(&agent.harness).accepts_send_during_native_turn {
+        return Ok(false);
+    }
     let Some(turn_id) = agent
         .active_turn
         .as_deref()

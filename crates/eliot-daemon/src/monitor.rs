@@ -691,6 +691,9 @@ impl Monitoring {
         }
         let mut qualifying: Vec<QualifiedCandidate<'_>> = Vec::new();
         let mut server_ancestor_pids: HashSet<u32> = HashSet::new();
+        // Processes of a call whose declared harness wake covers its whole
+        // tree. A descendant started during a later call is covered too.
+        let mut harness_tree_pids: HashSet<u32> = HashSet::new();
 
         for sample in &snapshot.samples {
             if sample.record.role != "child" || sample.record.state != ProcessState::Running {
@@ -704,7 +707,16 @@ impl Monitoring {
             else {
                 continue;
             };
-            let Some(binding) = match_tool_window(proc_start_ms, &context.tool_windows) else {
+            let containing = containing_tool_windows(proc_start_ms, &context.tool_windows);
+            if !containing.is_empty()
+                && containing
+                    .iter()
+                    .all(|window| window.harness_wake_covers_tree)
+            {
+                harness_tree_pids.insert(sample.record.identity.pid);
+                continue;
+            }
+            let Some(binding) = tool_binding(&containing) else {
                 continue;
             };
             let Some(chain) = harness_descendant_chain(
@@ -748,6 +760,10 @@ impl Monitoring {
 
         qualifying.retain(|candidate| {
             !server_ancestor_pids.contains(&candidate.sample.record.identity.pid)
+                && !candidate
+                    .chain
+                    .iter()
+                    .any(|pid| harness_tree_pids.contains(pid))
         });
         let qualifying_pids: HashSet<u32> = qualifying
             .iter()
@@ -2765,14 +2781,12 @@ struct ToolBinding {
 /// The lower bound allows for start-time rounding, plus commit lag when a call
 /// has no native tool times. The upper bound is the call's end. A call
 /// with no recorded end covers only its own spawn, because the turn's end is
-/// when a harness starts its helpers. While the harness still runs a call as
-/// its own background task, a process bound only to that call is skipped: the
-/// harness wakes itself. Once that task ends, survivors are ordinary candidates.
-fn match_tool_window(
+/// when a harness starts its helpers.
+fn containing_tool_windows(
     proc_start_ms: i64,
     tool_windows: &[eliot_store::BackgroundWakeToolWindow],
-) -> Option<ToolBinding> {
-    let containing: Vec<_> = tool_windows
+) -> Vec<&eliot_store::BackgroundWakeToolWindow> {
+    tool_windows
         .iter()
         .filter(|window| {
             let margin = if window.native_clock {
@@ -2785,8 +2799,15 @@ fn match_tool_window(
                 .unwrap_or_else(|| window.started_at.saturating_add(OPEN_CALL_SPAWN_MS));
             proc_start_ms >= window.started_at.saturating_sub(margin) && proc_start_ms <= end
         })
-        .collect();
-    match containing.as_slice() {
+        .collect()
+}
+
+/// The binding of a process from its containing calls. While the harness
+/// still runs a call as its own background task, a process bound only to that
+/// call is skipped: the harness wakes itself. Once a `tool_process` task ends,
+/// its survivors are ordinary candidates.
+fn tool_binding(containing: &[&eliot_store::BackgroundWakeToolWindow]) -> Option<ToolBinding> {
+    match containing {
         [] => None,
         [window] if window.harness_waiting => None,
         [window] => Some(ToolBinding {
