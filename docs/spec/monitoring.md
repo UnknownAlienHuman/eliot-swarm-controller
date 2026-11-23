@@ -745,16 +745,20 @@ does not affect work already admitted.
 
 Rate-limit and quota holds permit at most one SEND probe claim per frozen provider
 scope in Store. An explicit `probe=true` SEND uses ordinary authorization and exact
-target/scope/generation fences. Daemon maintenance currently probes Codex profiles
+target/scope/generation fences. With no known reset and an eligible deadline,
+a fresh launch with input can claim its linked SEND as the probe. Routing reconsiders
+the scope at that deadline. Admission commits the claim before native spawn and
+dispatch rechecks the exact launch and SEND binding.
+
+Daemon maintenance also probes Codex profiles
 through the same SEND admission and native dispatch path, with a fixed minimal prompt
 in an isolated private chat that has no project, registered worktree, or user task.
 Its frozen profile snapshot sets `_provider_probe=true`, `permissions=read-only`,
 `approval_policy=never`, `native_subagents=deny`, `mcp=minimal`, and `mcp_allow=[]`.
 The native adapter skips the Swarm skill, shell/web/workspace instructions and Agent
 credentials for this mode. Its linked SEND claim and launch commit atomically before
-native spawn; the outer internal launch marker carries the frozen scope and cannot be
-submitted by a client. Other adapters keep their holds and record a bounded defer until
-they have a secure minimal probe path.
+native spawn. The outer internal launch marker carries the frozen scope and cannot
+be submitted by a client.
 
 A provider-supplied `retry_after` is a known reset time. Bounded maintenance removes a
 held rate-limit/quota row at or after that time and records `provider.hold_cleared`.
@@ -767,14 +771,19 @@ Each uninterrupted hold allows six automatic probe admissions. The final slot re
 A provider-supplied reset still clears the hold when due.
 Each admitted probe records `provider.hold_probe_started` and known
 completion records `provider.hold_probe_finished`. A successful exact-turn native
-completion with no restriction clears the hold. A known failure releases only its
-claim and persists the next backoff while budget remains. Startup sweeps ended
+completion with no restriction clears the hold. A known failure keeps the hold,
+records the reason, releases only its claim and persists the next backoff while
+budget remains. Startup sweeps ended
 maintenance Agents. Once the exact Agent's custody drains, an unresolved automatic
 probe releases its claim, records `provider.hold_probe_outcome_unknown` and pauses
-automation for Owner review. An uncertain probe is never replayed.
-If a minimal request cannot be prepared
-safely for the frozen profile, maintenance retains the hold, records a bounded defer
-event and backs off. A probe that exceeds the turn wait budget stops its owned Agent
+automation for Owner review. Maintenance also pauses a task-bearing launch's exact
+unresolved probe once the bound generation ends and its native custody drains, or
+after the Owner resolves the exact inactive turn. It preserves the Agent, turn and
+workspace. An uncertain probe is never replayed.
+If a minimal request cannot be prepared safely for the frozen profile, the daemon
+paces background preparation with a five-minute defer. The persisted deadline
+for a fresh launch and the admission budget stay available. A maintenance probe
+that exceeds the turn wait budget stops its owned Agent
 and retains the claim if the exact native outcome is unknown. When retention has
 pruned a probe's admission event, the terminal
 scan fails with `source_integrity` instead of clearing the hold on incomplete history;

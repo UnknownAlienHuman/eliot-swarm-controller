@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 const CLEAR_HOLD_METHOD: &str = "provider.clear_hold";
 const INTERVENING_RESTRICTION_BATCH: i64 = 64;
 const AUTOMATIC_PROBE_BACKOFF_MS: [i64; 3] = [60_000, 300_000, 1_800_000];
+const BACKGROUND_PROBE_DEFER_MS: i64 = 300_000;
 const PROVIDER_HOLD_RELEASE_BATCH: usize = 64;
 
 impl Store {
@@ -186,26 +187,78 @@ impl Store {
                     )?;
                 }
                 let scope = core::frozen_provider_scope(&agent)?;
-                let changed = tx
-                    .execute(
-                        "UPDATE provider_holds SET probe_command=NULL, state='held',
-                         probe_outcome_unknown=1, next_probe_at=NULL, updated_at=?1
-                     WHERE scope=?2 AND state='probing' AND probe_command=?3",
-                        params![now, scope, id],
+                events.extend(pause_unknown_probe_tx(
+                    &tx, &scope, &id, agent_id, generation, now,
+                )?);
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Pause only the exact linked probe after its generation has ended and
+    /// its native custody has drained, or after Owner-proven turn inactivity.
+    /// A task-bearing Agent and its commands, turn and workspace stay intact.
+    pub fn pause_unresolved_launch_probes(&mut self, now: i64) -> Result<Vec<core::Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self.connection.transaction().map_err(sql_error)?;
+            let candidates = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT h.scope, c.id, c.target, c.generation
+                     FROM provider_holds h
+                     JOIN commands c ON c.id = h.probe_command
+                     JOIN commands p ON p.id = c.parent_command AND p.target = c.target
+                     JOIN agents a ON a.id = c.target
+                     WHERE h.state = 'probing' AND c.verb = 'send' AND c.probe = 1
+                       AND c.link_kind = 'send' AND c.ordinal = 0 AND c.generation = 1
+                       AND p.verb = 'launch' AND p.generation = c.generation
+                       AND json_type(p.args, '$._provider_probe') IS NULL
+                       AND a.observe_only = 0
+                       AND c.state IN ('dispatched','unknown','applied')
+                       AND (
+                           EXISTS (SELECT 1 FROM turns t WHERE t.agent = a.id
+                             AND t.generation = c.generation AND t.turn_id = c.turn_id
+                             AND t.state = 'completed' AND t.resolution_source = 'owner')
+                           OR (
+                               (a.generation > c.generation OR
+                                (a.generation = c.generation AND a.active_turn IS NULL
+                                 AND a.state IN ('stopped','failed','lost')))
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM processes o WHERE o.state IN ('running','unknown')
+                                   AND o.owner IN ('agent:a'||a.id||'#'||c.generation,
+                                                   'workspace:a'||a.id||'#'||c.generation))
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM source_state s WHERE s.agent = a.id
+                                   AND s.generation = c.generation AND s.state = 'open'
+                                   AND s.source NOT IN ('daemon','os','git','workspace_process'))
+                           )
+                       )
+                     ORDER BY h.scope LIMIT 64",
                     )
                     .map_err(sql_error)?;
-                if changed == 1 {
-                    events.push(super::insert_daemon_event(
-                        &tx,
-                        now,
-                        "provider.hold_probe_outcome_unknown",
-                        "provider",
-                        None,
-                        None,
-                        json!({"scope":scope, "probe_command":id, "agent":agent_id,
-                               "generation":generation, "owner_attention":true}),
-                    )?);
-                }
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .map_err(sql_error)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let mut events = Vec::with_capacity(candidates.len());
+            for (scope, id, target, generation) in candidates {
+                let agent = super::format_agent_id(target);
+                events.extend(pause_unknown_probe_tx(
+                    &tx, &scope, &id, &agent, generation, now,
+                )?);
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(events)
@@ -312,12 +365,18 @@ impl Store {
                    AND next_probe_at IS NOT NULL AND next_probe_at <= ?1
                    AND probe_profile IS NOT NULL
                    AND automatic_probes < ?3 AND probe_outcome_unknown = 0
+                   AND (updated_at < next_probe_at OR updated_at <= ?4)
                  ORDER BY next_probe_at, scope LIMIT ?2",
             )
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![now, limit as i64, core::MAX_AUTOMATIC_PROVIDER_PROBES],
+                params![
+                    now,
+                    limit as i64,
+                    core::MAX_AUTOMATIC_PROVIDER_PROBES,
+                    now.saturating_sub(BACKGROUND_PROBE_DEFER_MS)
+                ],
                 |row| {
                     Ok(ProviderProbeCandidate {
                         scope: row.get(0)?,
@@ -330,8 +389,8 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Back off a due hold when profile resolution or secure probe admission
-    /// fails before a command is committed. The reason is a closed event code.
+    /// Pace background preparation failures without moving the deadline for
+    /// a caller's launch or counting the failure as a provider attempt.
     pub fn defer_provider_probe(
         &mut self,
         scope: &str,
@@ -348,46 +407,41 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let current: Option<(i64, Option<i64>)> = tx
+            let next_probe_at: Option<i64> = tx
                 .query_row(
-                    "SELECT probe_attempts, next_probe_at FROM provider_holds
-                     WHERE scope = ?1 AND state = 'held' AND probe_command IS NULL
-                       AND kind IN ('rate_limit','quota') AND retry_after IS NULL",
-                    [scope],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    "UPDATE provider_holds SET updated_at = ?1
+                     WHERE scope = ?2 AND state = 'held' AND probe_command IS NULL
+                       AND kind IN ('rate_limit','quota') AND retry_after IS NULL
+                       AND next_probe_at <= ?1
+                       AND automatic_probes < ?3 AND probe_outcome_unknown = 0
+                       AND (updated_at < next_probe_at OR updated_at <= ?4)
+                     RETURNING next_probe_at",
+                    params![
+                        now,
+                        scope,
+                        core::MAX_AUTOMATIC_PROVIDER_PROBES,
+                        now.saturating_sub(BACKGROUND_PROBE_DEFER_MS)
+                    ],
+                    |row| row.get(0),
                 )
                 .optional()
                 .map_err(sql_error)?;
             let mut events = Vec::new();
-            if let Some((attempts, Some(due_at))) = current
-                && due_at <= now
-            {
-                let attempts = attempts.saturating_add(1);
-                let next_probe_at = next_automatic_probe_at(now, attempts);
-                let changed = tx
-                    .execute(
-                        "UPDATE provider_holds SET probe_attempts = ?1,
-                             next_probe_at = ?2, updated_at = ?3
-                         WHERE scope = ?4 AND state = 'held' AND probe_command IS NULL
-                           AND retry_after IS NULL AND next_probe_at <= ?3",
-                        params![attempts, next_probe_at, now, scope],
-                    )
-                    .map_err(sql_error)?;
-                if changed == 1 {
-                    events.push(super::insert_daemon_event(
-                        &tx,
-                        now,
-                        "provider.hold_probe_deferred",
-                        "provider",
-                        None,
-                        None,
-                        json!({
-                            "scope": scope,
-                            "next_probe_at": next_probe_at,
-                            "reason": reason,
-                        }),
-                    )?);
-                }
+            if let Some(next_probe_at) = next_probe_at {
+                events.push(super::insert_daemon_event(
+                    &tx,
+                    now,
+                    "provider.hold_probe_deferred",
+                    "provider",
+                    None,
+                    None,
+                    json!({
+                        "scope": scope,
+                        "next_probe_at": next_probe_at,
+                        "background_retry_at": now.saturating_add(BACKGROUND_PROBE_DEFER_MS),
+                        "reason": reason,
+                    }),
+                )?);
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(events)
@@ -570,9 +624,9 @@ pub(super) fn require_automatic_probe_due_tx(
     now: i64,
 ) -> Result<()> {
     let scope = core::frozen_provider_scope(agent)?;
-    let Some(hold) = get(tx, &scope)? else {
+    if !get(tx, &scope)?.is_some_and(|hold| automatic_probe_due(&hold, now)) {
         return Err(provider_held());
-    };
+    }
     let probe_profile: Option<String> = tx
         .query_row(
             "SELECT probe_profile FROM provider_holds WHERE scope = ?1",
@@ -582,19 +636,39 @@ pub(super) fn require_automatic_probe_due_tx(
         .optional()
         .map_err(sql_error)?
         .flatten();
-    if !matches!(
-        hold.kind,
-        ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
-    ) || hold.state != ProviderHoldState::Held
-        || hold.probe_command.is_some()
-        || hold.retry_after.is_some()
-        || automatic_probe_paused(&hold)
-        || hold.next_probe_at.is_none_or(|due_at| due_at > now)
-        || probe_profile.as_deref() != Some(agent.profile.as_str())
-    {
+    if probe_profile.as_deref() != Some(agent.profile.as_str()) {
         return Err(provider_held());
     }
     Ok(())
+}
+
+/// Check a fresh launch against its frozen scope. A due time is supplied only
+/// when admission can atomically bind the launch's linked SEND as the probe.
+pub(super) fn launch_probe(
+    connection: &rusqlite::Connection,
+    agent: &Agent,
+    at: Option<i64>,
+) -> Result<bool> {
+    let scope = core::frozen_provider_scope(agent)?;
+    match get(connection, &scope)? {
+        None => Ok(false),
+        Some(hold) if at.is_some_and(|now| automatic_probe_due(&hold, now)) => Ok(true),
+        Some(_) => Err(Error::new(
+            "provider_held",
+            format!("provider scope {scope} is held pending owner correction or an eligible probe"),
+        )),
+    }
+}
+
+fn automatic_probe_due(hold: &ProviderHold, now: i64) -> bool {
+    matches!(
+        hold.kind,
+        ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
+    ) && hold.state == ProviderHoldState::Held
+        && hold.probe_command.is_none()
+        && hold.retry_after.is_none()
+        && !automatic_probe_paused(hold)
+        && hold.next_probe_at.is_some_and(|due_at| due_at <= now)
 }
 
 pub(super) fn profile_held(connection: &rusqlite::Connection, agent: &Agent) -> Result<bool> {
@@ -656,12 +730,7 @@ pub(super) fn admit_send_tx(
             "provider probe is not eligible before retry_after",
         ));
     }
-    if automatic
-        && (automatic_probe_paused(&hold)
-            || hold
-                .next_probe_at
-                .is_none_or(|next_probe_at| next_probe_at > now))
-    {
+    if automatic && !automatic_probe_due(&hold, now) {
         return Err(Error::new(
             "bad_state",
             "automatic provider probe is not due",
@@ -779,50 +848,20 @@ pub(super) fn require_dispatch_tx(
     command: &Command,
 ) -> Result<()> {
     let scope = core::frozen_provider_scope(agent)?;
-    if command.verb == "launch"
-        && command
-            .args
-            .get(core::PROVIDER_PROBE_LAUNCH_ARG)
-            .and_then(Value::as_str)
-            == Some(scope.as_str())
+    let background_launch =
+        command.verb == "launch" && command.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_some();
+    if background_launch
+        && (command.principal != "owner"
+            || !agent.chat
+            || command.args[core::PROVIDER_PROBE_LAUNCH_ARG].as_str() != Some(scope.as_str()))
     {
-        if command.principal != "owner" || !agent.chat {
-            return Err(Error::new(
-                "not_allowed",
-                "provider probe launch lost its daemon-owned chat binding",
-            ));
-        }
-        let linked_probe: Option<String> = tx
-            .query_row(
-                "SELECT id FROM commands WHERE parent_command = ?1 AND link_kind = 'send'
-                   AND verb = 'send' AND probe = 1 AND state IN ('accepted','queued')",
-                [&command.id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        let Some(linked_probe) = linked_probe else {
-            return Err(Error::new(
-                "source_integrity",
-                "provider probe launch has no linked native SEND",
-            ));
-        };
-        let Some(hold) = get(tx, &scope)? else {
-            return Err(provider_held());
-        };
-        if hold.state == ProviderHoldState::Probing
-            && hold.probe_command.as_deref() == Some(linked_probe.as_str())
-            && matches!(
-                hold.kind,
-                ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
-            )
-        {
-            return Ok(());
-        }
-        return Err(provider_held());
+        return Err(Error::new(
+            "not_allowed",
+            "provider probe launch lost its daemon-owned chat binding",
+        ));
     }
     let Some(hold) = get(tx, &scope)? else {
-        if command.probe {
+        if command.probe || background_launch {
             return Err(Error::new(
                 "bad_state",
                 "provider probe lost its durable hold claim",
@@ -831,15 +870,31 @@ pub(super) fn require_dispatch_tx(
         return Ok(());
     };
 
-    if command.probe
-        && hold.state == ProviderHoldState::Probing
-        && hold.probe_command.as_deref() == Some(command.id.as_str())
+    if hold.state == ProviderHoldState::Probing
         && matches!(
             hold.kind,
             ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
         )
     {
-        return Ok(());
+        if command.probe && hold.probe_command.as_deref() == Some(command.id.as_str()) {
+            return Ok(());
+        }
+        if command.verb == "launch" {
+            let owns_probe: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM commands WHERE id = ?1 AND parent_command = ?2
+                           AND link_kind = 'send' AND verb = 'send' AND probe = 1
+                           AND target = ?3 AND generation = 1 AND state IN ('accepted','queued')
+                     )",
+                    params![hold.probe_command, command.id, parse_agent_id(&agent.id)?],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if owns_probe {
+                return Ok(());
+            }
+        }
     }
     Err(provider_held())
 }
@@ -913,11 +968,11 @@ pub(super) fn terminal_tx(
         })
         .transpose()?;
 
-    let restriction_present = native_event.data.get("provider_restriction").is_some();
+    let restriction_value = native_event.data.get("provider_restriction");
+    let restriction = restriction_value.and_then(parse_restriction);
     let mut events = Vec::new();
-    if let Some(value) = native_event.data.get("provider_restriction")
-        && let Some(restriction) = parse_restriction(value)
-        && let Some(event) = record_restriction_tx(tx, agent, turn_id, &restriction, now)?
+    if let Some(restriction) = &restriction
+        && let Some(event) = record_restriction_tx(tx, agent, turn_id, restriction, now)?
     {
         let reaction = core::AttentionStep {
             incident_id: format!("provider-refusal-{}", event.seq),
@@ -948,7 +1003,7 @@ pub(super) fn terminal_tx(
 
         let successful = *state == TurnState::Completed
             && status.as_deref() == Some("completed")
-            && !restriction_present
+            && restriction_value.is_none()
             && matches!(
                 hold.kind,
                 ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
@@ -1016,8 +1071,8 @@ pub(super) fn terminal_tx(
                         "scope": scope,
                         "probe_command": command_id,
                         "state": ProviderHoldState::Held.as_str(),
-                        "reason": "probe_terminal",
-                          "next_probe_at": next_probe_at,
+                        "reason": restriction.as_ref().map_or("probe_terminal", |r| r.kind.as_str()),
+                        "next_probe_at": next_probe_at,
                     }),
                 )?);
                 events.push(super::insert_daemon_event(
@@ -1222,6 +1277,38 @@ fn release_probe_claim_tx(tx: &Transaction<'_>, command_id: &str, now: i64) -> R
         )
         .map_err(sql_error)?;
     Ok(changed == 1)
+}
+
+fn pause_unknown_probe_tx(
+    tx: &Transaction<'_>,
+    scope: &str,
+    command_id: &str,
+    agent_id: &str,
+    generation: i64,
+    now: i64,
+) -> Result<Option<core::Event>> {
+    let changed = tx
+        .execute(
+            "UPDATE provider_holds SET probe_command=NULL, state='held',
+             probe_outcome_unknown=1, next_probe_at=NULL, updated_at=?1
+             WHERE scope=?2 AND state='probing' AND probe_command=?3",
+            params![now, scope, command_id],
+        )
+        .map_err(sql_error)?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    super::insert_daemon_event(
+        tx,
+        now,
+        "provider.hold_probe_outcome_unknown",
+        "provider",
+        None,
+        None,
+        json!({"scope":scope, "probe_command":command_id, "agent":agent_id,
+               "generation":generation, "owner_attention":true}),
+    )
+    .map(Some)
 }
 
 fn reschedule_failed_probe_tx(tx: &Transaction<'_>, scope: &str, now: i64) -> Result<Option<i64>> {

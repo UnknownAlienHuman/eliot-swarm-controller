@@ -1986,6 +1986,9 @@ source marker.
 Optional `after` and `limit` select the page; the response provides `holds` and
 `next`. The canonical Core `ProviderHoldsRequest`/`ProviderHoldsResponse` DTOs own
 the wire shape.
+`swarm status` shows the first page of held scopes, each hold's age,
+and any scheduled retry or probe. JSON adds the age in milliseconds and a
+continuation cursor for `swarm provider holds` when the status page is full.
 `provider.clear_hold` is an owner-only idempotent write using
 `ProviderClearHoldRequest`/`ProviderClearHoldResponse`. The corrective evidence is a
 closed enum: `credentials_updated`, `configuration_updated`, or `owner_verified`;
@@ -1996,8 +1999,8 @@ their field list.
 
 A provider scope comes from the frozen explicitly selected account, otherwise the
 exact profile; a shared adopted proxy is only a capacity scope, never a provider
-hold scope. Eliot never guesses a vendor account. A held scope rejects new launch/send before
-native I/O and is rechecked when queued work dispatches. Bounded maintenance removes a
+hold scope. Eliot never guesses a vendor account. A held scope gates launch/send
+before native I/O and is rechecked when queued work dispatches. Bounded maintenance removes a
 rate-limit/quota hold at or after its known `retry_after` and publishes the automatic
 lift. Launch with linked input and
 resume with new text are gated as sends. Plain resume, reads, request replies, interrupt
@@ -2007,27 +2010,32 @@ An already queued command that becomes held is rejected at dispatch under its ex
 binding, before native I/O.
 
 An explicit `send --probe` can claim an eligible rate-limit/quota hold through ordinary
-SEND authorization and exact target/scope/generation checks. Daemon maintenance
-currently probes Codex profiles through the ordinary launch/SEND path for one fixed
+SEND authorization and exact target/scope/generation checks. Once an unknown-reset
+hold reaches `next_probe_at`, routing can select its profile for a fresh launch
+with input. Store commits the launch and claims its linked SEND as the sole probe
+in the same transaction. A launch without input still requires an unheld scope.
+Routing preview reports eligibility for a launch with input.
+
+Daemon maintenance also probes Codex profiles through the ordinary launch/SEND path for one fixed
 minimal request in a private chat with no project, registered worktree, or user task.
 Its frozen profile snapshot restricts permissions to read-only, disables approval and
 native subagents, selects minimal MCP with an empty allow list, and marks the internal
 probe mode. The Codex adapter skips the Swarm skill, shell/web/workspace instructions,
 and Agent credentials for that mode. Store atomically binds that linked SEND as the sole
 probe for its frozen provider scope before native spawn. The daemon-only outer launch
-marker carries the exact scope and is rejected on public submissions. Other adapters
-keep their holds and defer until they have a secure minimal probe path. The probe flag
-stays Store metadata; native input contains only the fixed minimal SEND text.
+marker carries the exact scope and is rejected on public submissions. The probe flag
+stays Store metadata. Native input is the launch's supplied text or the fixed
+maintenance prompt.
 
 A provider-supplied `retry_after` is a known reset: maintenance clears a held
 rate-limit/quota row at or after that timestamp and records the lift event. A hold with
 no reset persists `next_probe_at` and a completed-probe count, beginning at one minute
 and backing off to five and then thirty minutes. Each admitted probe and known terminal
 result is a provider event. A successful exact-turn native completion with no new
-restriction clears the hold; a known failure releases only the exact probe claim and
-schedules its next bounded attempt. Unknown command or turn outcomes keep the claim
-across restart and are never replayed. If a profile cannot be prepared for a safe
-minimal request, maintenance keeps the hold and backs off with a bounded defer event.
+restriction clears the hold. A known failure releases only the exact probe claim,
+retains the hold and schedules its next bounded attempt. Unknown command or turn
+outcomes are never replayed and prevent further automatic probes. When background
+preparation is deferred, a fresh launch remains eligible at the persisted deadline.
 Deleting an Agent whose explicit probe command is settled releases that probe binding
 back to the conservative held restriction instead of dropping it. Auth and
 ModelRemoved holds require owner correction and are not probe-eligible. Provider

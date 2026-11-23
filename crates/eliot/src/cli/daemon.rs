@@ -10,8 +10,9 @@ use eliot_core::api::{
     AutomaticCleanupPolicy, DaemonShutdownRequest, DaemonShutdownResponse, DaemonStatusRequest,
     DaemonStatusResponse, MaintenancePurgeLegacyAttentionRequest,
     MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
-    ShutdownMode, StatusBlocker,
+    ProviderHoldsRequest, ProviderHoldsResponse, ShutdownMode, StatusBlocker,
 };
+use eliot_core::{ProviderHold, ProviderHoldState};
 use serde_json::Value;
 use serde_json::json;
 #[cfg(not(windows))]
@@ -24,7 +25,7 @@ use std::process::Command as ProcessCommand;
 use std::process::Stdio;
 use std::{
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::time::{Instant, sleep};
 
@@ -205,6 +206,19 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
+    let hold_request = ProviderHoldsRequest::default();
+    let hold_page: ProviderHoldsResponse =
+        eliot_daemon::client_call_typed(&data_dir, "provider.holds", &hold_request)
+            .await
+            .map_err(Failure::for_read)?;
+    hold_request
+        .validate_response(&hold_page)
+        .map_err(Failure::invalid_response)?;
+    let more_holds = hold_page
+        .next
+        .as_deref()
+        .filter(|_| hold_page.holds.len() == hold_request.effective_limit());
+    let status_time_ms = status_now_ms();
     #[cfg(windows)]
     if acl_repair_was_pending {
         eprintln!("data directory ACL repaired");
@@ -254,9 +268,17 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         let mut value = serde_json::to_value(&response)
             .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
         value["data_dir"] = Value::String(data_dir.to_string_lossy().into_owned());
+        value["provider_holds"] = provider_hold_values(&hold_page.holds, status_time_ms)?;
+        value["provider_holds_next"] = json!(more_holds);
         print_value(&value, true);
     } else {
         print_status_summary(&response, &data_dir);
+        print_provider_holds(&hold_page.holds, status_time_ms);
+        if let Some(after) = more_holds {
+            println!(
+                "More provider holds may be available with swarm provider holds --after {after}"
+            );
+        }
         if let Some(line) = build_line {
             println!("{line}");
         }
@@ -265,6 +287,84 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
         }
     }
     Ok(0)
+}
+
+fn provider_hold_values(holds: &[ProviderHold], now_ms: i64) -> Result<Value, Failure> {
+    let mut values = serde_json::to_value(holds)
+        .map_err(|_| Failure::new(4, "provider.holds response is invalid"))?;
+    let Some(rows) = values.as_array_mut() else {
+        return Err(Failure::new(4, "provider.holds response is invalid"));
+    };
+    for (row, hold) in rows.iter_mut().zip(holds) {
+        row["age_ms"] = if hold.held_since > 0 {
+            json!(now_ms.saturating_sub(hold.held_since).max(0))
+        } else {
+            Value::Null
+        };
+    }
+    Ok(values)
+}
+
+fn print_provider_holds(holds: &[ProviderHold], now_ms: i64) {
+    if holds.is_empty() {
+        println!("Provider holds: none");
+        return;
+    }
+    println!("Provider holds ({}):", holds.len());
+    for hold in holds {
+        let age = if hold.held_since > 0 {
+            let age_ms = now_ms.saturating_sub(hold.held_since).max(0);
+            let age_ms = u64::try_from(age_ms).unwrap_or(u64::MAX);
+            humantime::format_duration(Duration::from_millis(age_ms)).to_string()
+        } else {
+            "unknown".to_owned()
+        };
+        println!(
+            "  {} · {} {} · held {} · {}",
+            hold.scope,
+            hold.kind.as_str(),
+            hold.state.as_str(),
+            age,
+            provider_hold_schedule(hold, now_ms),
+        );
+    }
+}
+
+fn provider_hold_schedule(hold: &ProviderHold, now_ms: i64) -> String {
+    if hold.state == ProviderHoldState::Probing {
+        return "probe settling".to_owned();
+    }
+    let (action, at) = match (hold.retry_after, hold.next_probe_at) {
+        (Some(at), _) => ("retry", Some(at)),
+        (None, Some(at)) => ("probe", Some(at)),
+        (None, None) => ("retry/probe", None),
+    };
+    let Some(at) = at else {
+        return "no retry/probe scheduled".to_owned();
+    };
+    let timestamp = provider_timestamp(at);
+    if at <= now_ms {
+        format!("{action} due since {timestamp}")
+    } else {
+        format!("next {action} {timestamp}")
+    }
+}
+
+fn provider_timestamp(millis: i64) -> String {
+    // RFC 3339 uses a four-digit year.
+    const LAST_RFC3339_MILLISECOND: i64 = 253_402_300_799_999;
+    u64::try_from(millis)
+        .ok()
+        .filter(|_| millis <= LAST_RFC3339_MILLISECOND)
+        .and_then(|millis| UNIX_EPOCH.checked_add(Duration::from_millis(millis)))
+        .map_or_else(
+            || format!("{millis} ms since Unix epoch"),
+            |time| humantime::format_rfc3339_millis(time).to_string(),
+        )
+}
+
+fn status_now_ms() -> i64 {
+    i64::try_from(daemon_now_ms()).unwrap_or(i64::MAX)
 }
 
 fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
