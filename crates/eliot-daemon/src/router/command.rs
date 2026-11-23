@@ -1690,7 +1690,7 @@ impl Router {
             let generation = validate_retained_resume_agent(&agent, &command)?;
             let source =
                 store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
-            // A promptless Codex resume opens the same thread in a new generation.
+            // A promptless resume can open the same native subject in a new generation.
             // Its newest native turn can still belong to an earlier generation.
             let turn_generation = if HarnessCapabilities::of(&agent.harness).resume_previous_turn {
                 store

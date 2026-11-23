@@ -7,6 +7,7 @@ pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         data_root_only_mcp: true,
         resume_config: true,
+        resume_previous_turn: true,
         launch_default_resolution: true,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),

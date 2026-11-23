@@ -662,7 +662,7 @@ impl MusePlugin {
         // command id; the resume is never dispatched a second time.
         let mut snapshot_pull: Option<bool> = None;
         let mut resume_pointers = Vec::new();
-        let native_session = if resume_subject.is_some() {
+        let (native_session, view_cursor) = if resume_subject.is_some() {
             let mut resumed = match serde_json::from_value::<NativeSessionResumeResult>(
                 response_value.clone(),
             ) {
@@ -720,7 +720,7 @@ impl MusePlugin {
                     "Muse session/resume did not prove the resumed session idle; no input was sent",
                 ));
             }
-            resumed.session
+            (resumed.session, resumed.view_cursor)
         } else {
             let started = match serde_json::from_value::<NativeSessionStartResult>(
                 response_value.clone(),
@@ -751,16 +751,22 @@ impl MusePlugin {
                     "Muse session/start did not prove the new session idle; no input was sent",
                 ));
             }
-            started.session
+            (started.session, started.view_cursor)
         };
         session.session_id = Some(native_session.session_id.clone());
-        let effort_verified = self
+        let effective_effort = self
             .apply_start_effort(
                 &mut session,
                 &native_session,
+                &view_cursor,
                 initialized_native.effort.as_deref(),
             )
             .await?;
+        // The exact setter acknowledgement proves durable admission. A view
+        // page may omit the change, but a fresh conflicting report still fails.
+        let effort_matches =
+            effective_effort.is_none() || effective_effort == initialized_native.effort;
+        let effort_verified = initialized_native.effort.is_some() && effort_matches;
         // Model and approval alignment on resume: the frozen profile is the
         // source of truth, so a retained session running another model or
         // approval mode is realigned via the setters (launch already passes
@@ -862,21 +868,48 @@ impl MusePlugin {
         );
         // The effective settings are checked BEFORE readiness: on any
         // mismatch no `session.ready` is published and no session is kept.
-        let effort_match = initialized_native.effort.is_none() || effort_verified;
-        let approval_match = requested_approval.is_none() || approval_verified;
-        let settings_match = effort_match
-            && approval_match
-            && model_verified
-            && native_session
-                .workspace_root
-                .as_deref()
-                .is_some_and(|root| paths_equal(Path::new(root), &workspace));
-        if !settings_match {
+        let workspace_text = workspace.to_string_lossy();
+        let reported_root = native_session.workspace_root.as_deref();
+        let checks = [
+            (
+                model_verified,
+                "model",
+                requested_model.as_deref(),
+                effective_model.as_deref(),
+            ),
+            (
+                reported_root.is_some_and(|root| paths_equal(Path::new(root), &workspace)),
+                "workspace root",
+                Some(workspace_text.as_ref()),
+                reported_root,
+            ),
+            (
+                effort_matches,
+                "reasoning effort",
+                initialized_native.effort.as_deref(),
+                effective_effort.as_deref(),
+            ),
+            (
+                requested_approval.is_none() || approval_verified,
+                "approval mode",
+                requested_approval.as_deref(),
+                effective_approval.as_deref(),
+            ),
+        ];
+        if let Some((_, field, requested, reported)) = checks.into_iter().find(|check| !check.0) {
+            let describe = |value: Option<&str>| match value {
+                Some(value) => format!("{:?}", policy.redact_bounded(value, 512)),
+                None => "<absent>".to_owned(),
+            };
             let error = discard_failed_start(
                 &mut session,
                 Error::new(
                     "profile_error",
-                    "Muse effective model, workspace root, reasoning effort, or approval mode did not match the frozen profile",
+                    format!(
+                        "Muse {field} did not match the frozen profile (expected {}, reported {})",
+                        describe(requested),
+                        describe(reported)
+                    ),
                 ),
             )
             .await;
@@ -2503,19 +2536,25 @@ async fn read_owned_session(
     read_owned_session_at(client, session_id, Instant::now() + RPC_TIMEOUT).await
 }
 
-/// One backward `view/page` fetch, newest records first. Every durable-view
-/// scan in this file pages through this helper; callers fold their own
-/// records from the page and loop on `next_cursor` when one page cannot
-/// prove enough.
+/// One backward `view/page` fetch. The page itself is in ascending order.
 async fn read_backward_page(
     client: &NativeClient,
     session_id: &str,
     cursor: Option<String>,
 ) -> Result<NativeViewPageResult> {
+    read_view_page(client, session_id, "backward", cursor).await
+}
+
+async fn read_view_page(
+    client: &NativeClient,
+    session_id: &str,
+    direction: &str,
+    cursor: Option<String>,
+) -> Result<NativeViewPageResult> {
     let params = NativeViewPageParams {
         session_id: session_id.to_owned(),
         limit: VIEW_PAGE_SIZE,
-        direction: Some("backward".to_owned()),
+        direction: Some(direction.to_owned()),
         cursor,
     };
     serde_json::from_value(
@@ -2548,17 +2587,15 @@ fn check_configure_model_ack(response: Value, command_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read back the standing session-default reasoning effort: the newest
-/// `session/reasoningEffortChanged` view event for the exact session. The set
-/// call's ack proves admission only, so the start path compares this readback
-/// against the requested tier before readiness.
+/// Read the newest effort report after the start or resume reply's view head.
+/// An older setting in the retained history cannot contradict the new setter.
 async fn read_effective_reasoning_effort(
     client: &NativeClient,
     session_id: &str,
+    start_cursor: &str,
 ) -> Result<Option<String>> {
-    // The set just landed at the view head, so one backward page from the
-    // head holds it; anything else writing here would be a foreign host.
-    let response = read_backward_page(client, session_id, None).await?;
+    let response =
+        read_view_page(client, session_id, "forward", Some(start_cursor.to_owned())).await?;
     for event in response.events.iter().rev() {
         if event.method.as_str() != "session/reasoningEffortChanged" {
             continue;

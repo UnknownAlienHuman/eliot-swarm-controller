@@ -390,13 +390,11 @@ impl MusePlugin {
         &mut self,
         session: &mut AgentSession,
         native_session: &NativeSession,
+        view_cursor: &str,
         requested_effort: Option<&str>,
-    ) -> Result<bool> {
-        // Apply the frozen profile effort as the session default before
-        // readiness. The ack proves admission only (it echoes the command id,
-        // not the tier), so the standing default is read back from the durable
-        // view and compared; `effort_verified` holds only on an exact match.
-        let mut effort_verified = false;
+    ) -> Result<Option<String>> {
+        // MSP makes the default durable at the exact setter ack. Read the
+        // fresh view suffix to detect a conflicting report before readiness.
         if let Some(effort) = requested_effort {
             let effort_command = new_command_id();
             let effort_params = NativeSessionSetReasoningEffortParams {
@@ -478,22 +476,22 @@ impl MusePlugin {
                 .await;
                 return Err(self.retain_failed_start(error));
             }
-            let effective_effort = match read_effective_reasoning_effort(
+            return match read_effective_reasoning_effort(
                 &session.native_client,
                 &native_session.session_id,
+                view_cursor,
             )
             .await
             {
-                Ok(effort) => effort,
+                Ok(effort) => Ok(effort),
                 Err(error) => {
                     let error = discard_failed_start(session, error).await;
-                    return Err(self.retain_failed_start(error));
+                    Err(self.retain_failed_start(error))
                 }
             };
-            effort_verified = effective_effort.as_deref() == Some(effort);
         }
 
-        Ok(effort_verified)
+        Ok(None)
     }
 
     pub(super) async fn align_resume_model(
