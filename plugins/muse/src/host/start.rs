@@ -4,7 +4,7 @@
 use super::{
     AgentSession, Initialized, InitializedNative, MusePlugin, RPC_TIMEOUT, SessionPhase,
     catalogue::CatalogueHost, contextual_error, discard_failed_start, muse_scope, muse_serve_args,
-    new_command_id, read_effective_reasoning_effort, select_launch_model,
+    new_command_id, read_effective_reasoning_effort,
 };
 use crate::{
     events::{self, EventConfig},
@@ -20,6 +20,7 @@ use crate::{
     },
 };
 use eliot_core::{Error, Result};
+use eliot_plugin::session::ModelSelection;
 use eliot_plugin::{
     AgentStartParams, PeerClient,
     session::{
@@ -282,7 +283,6 @@ impl MusePlugin {
         mut session: AgentSession,
         session_method: &str,
         params_value: Value,
-        resuming: bool,
     ) -> Result<DispatchedStart> {
         match session
             .native_client
@@ -291,18 +291,12 @@ impl MusePlugin {
         {
             Ok(response) => Ok(DispatchedStart { session, response }),
             Err(error) if error.code == "native_rejected" => {
-                let (code, message) = if resuming {
-                    (
-                        "not_found",
-                        "Muse rejected resume of the exact retained session",
-                    )
-                } else {
-                    (
-                        "profile_error",
-                        "Muse rejected session/start for the selected profile",
-                    )
-                };
-                let error = contextual_error(error, code, message);
+                let error = error
+                    .with_where(format!("plugin.muse.start.{session_method}"))
+                    .with_origin(
+                        eliot_core::FailureOrigin::Harness,
+                        "Muse returned a native session error",
+                    );
                 let error = discard_failed_start(&mut session, error).await;
                 Err(self.retain_failed_start(error))
             }
@@ -350,11 +344,28 @@ impl MusePlugin {
                 "Muse session host initialize omitted runtime identity fields",
             ));
         }
-        let model = select_launch_model(&host.catalogue, requested_model)
-            .map_err(|error| host.catalogue_error(error))?;
-        if let (Some(effort), Some(selected)) = (requested_effort, model.as_ref())
-            && let Some(NativeModelEffortVariants::Known(variants)) = selected.variants.as_ref()
-            && !variants.iter().any(|variant| variant == effort)
+        if requested_model.is_none() && host.catalogue.models.is_empty() {
+            return Err(host.catalogue_error(Error::new(
+                "native_model_unavailable",
+                "Muse model/list reported no usable default; use an explicit model",
+            )));
+        }
+        let selection = requested_model.map(|id| {
+            ModelSelection::new(
+                id,
+                host.catalogue
+                    .models
+                    .iter()
+                    .find(|model| model.model_id == id),
+            )
+        });
+        if let (Some(effort), Some(selection)) = (requested_effort, &selection)
+            && !selection.allows_effort(|entry| match entry.variants.as_ref() {
+                Some(NativeModelEffortVariants::Known(variants)) => {
+                    variants.iter().any(|variant| variant == effort)
+                }
+                _ => true,
+            })
         {
             return Err(Error::new(
                 "profile_error",
@@ -365,6 +376,7 @@ impl MusePlugin {
             effort: requested_effort.map(str::to_owned),
             scope: muse_scope(&initialized.muse_home),
             fingerprint: initialized.schema.fingerprint.clone(),
+            catalogue_omits_model: selection.is_some_and(|model| model.catalogue_omits_model()),
         })
     }
 
@@ -518,10 +530,9 @@ impl MusePlugin {
                 Err(error) if error.code == "native_rejected" => {
                     let error = discard_failed_start(
                         session,
-                        contextual_error(
-                            error,
-                            "profile_error",
-                            "Muse session/setModel did not admit the profile model",
+                        error.with_where("plugin.muse.start.set_model").with_origin(
+                            eliot_core::FailureOrigin::Harness,
+                            "Muse session/setModel returned a native error",
                         ),
                     )
                     .await;

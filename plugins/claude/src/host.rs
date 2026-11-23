@@ -944,22 +944,17 @@ impl ClaudePlugin {
                     .await);
             }
         };
-        // An omitted request accepts the CLI default: availability is
-        // proven by the idle session itself, and the effective model is
-        // read back below. An explicit request must name a catalogue member.
-        let model_available = plan.requested_model.as_deref().is_none_or(|requested| {
-            readback.models.iter().any(|model| {
-                model.value.as_deref() == Some(requested)
-                    || model.resolved_model.as_deref() == Some(requested)
-            })
-        });
-        if !model_available || readback.session_state.as_deref() != Some("idle") {
+        let catalogue_omits_model = plan
+            .requested_model
+            .as_deref()
+            .is_some_and(|model| claude_model_selection(&readback, model).catalogue_omits_model());
+        if readback.session_state.as_deref() != Some("idle") {
             return Err(self
                 .reject_start(
                     session,
                     Error::new(
                         "profile_error",
-                        "Claude effective model or session state did not match the frozen profile",
+                        "Claude initialize did not report an idle session",
                     ),
                 )
                 .await);
@@ -996,11 +991,8 @@ impl ClaudePlugin {
                 )
                 .await);
         }
-        // The CLI never reads the active model back in initialize (note 47):
-        // membership in `models[]` above is the only proof, so
-        // `effective.model` stays null at readiness and the requested id
-        // travels under `requested`. It is populated later only by a model
-        // reported on an actual native assistant record (message.completed).
+        // The CLI does not report the serving model at initialize. Only an
+        // actual native assistant record supplies the effective model.
         // Requested vs effective permission mode is reported, never forced:
         // launching with `manual` reads back `default` on the installed CLI.
         // initialize itself exposes no MCP inventory record, so the
@@ -1013,7 +1005,10 @@ impl ClaudePlugin {
         // An absent or malformed init inventory stays unknown.
         let effective =
             start_effective_settings(&readback, effective_mode, plan.requested_mcp_policy);
-        Ok((session, effective))
+        Ok((
+            session,
+            session::with_model_catalogue_diagnostic(effective, catalogue_omits_model),
+        ))
     }
 
     /// Commit `session.ready` and retain the ready session. If readiness is
@@ -1281,7 +1276,8 @@ impl ClaudePlugin {
                 }));
             }
         };
-        if let Err(error) = check_configure_preflight(&before, &model) {
+        let selection = claude_model_selection(&before, &model);
+        if let Err(error) = check_configure_preflight(&before, &selection) {
             return Ok(json!({"state": "rejected", "reason": error.message}));
         }
         if let Some(reason) = configure_input_refusal(
@@ -1308,16 +1304,27 @@ impl ClaudePlugin {
                     )
                 })?;
                 verify_configure_permission_mode(&before, &after)?;
-                Ok(json!({
-                    "state": "applied",
-                    "accepted_model": model,
-                    "model_verified": false,
-                }))
+                Ok(session::with_model_catalogue_diagnostic(
+                    json!({
+                        "state": "applied",
+                        "accepted_model": model,
+                        "model_verified": false,
+                    }),
+                    selection.catalogue_omits_model(),
+                ))
             }
-            Err(error) if error.code == "native_rejected" => Ok(json!({
-                "state": "rejected",
-                "reason": format!("Claude refused the model switch ({})", error.message),
-            })),
+            Err(error) if error.code == "native_rejected" => {
+                Ok(session::with_model_catalogue_diagnostic(
+                    json!({
+                        "state": "rejected",
+                        "reason": error.message,
+                        "origin": eliot_core::FailureOrigin::Harness,
+                        "origin_evidence": "Claude set_model returned a native error",
+                        "where": "plugin.claude.configure.set_model",
+                    }),
+                    selection.catalogue_omits_model(),
+                ))
+            }
             Err(error) if native_no_write(&error.code) => Ok(json!({
                 "state": "rejected",
                 "reason": "Claude set_model was not dispatched",
@@ -2144,7 +2151,26 @@ async fn read_configure_state(client: &ClaudeClient) -> Result<InitializeReadbac
     })
 }
 
-fn check_configure_preflight(readback: &InitializeReadback, model: &str) -> Result<()> {
+fn claude_model_selection<'a>(
+    readback: &'a InitializeReadback,
+    id: &'a str,
+) -> session::ModelSelection<'a, crate::native::types::InitializeModel> {
+    session::ModelSelection::new(
+        id,
+        readback
+            .models
+            .iter()
+            .filter(|entry| {
+                entry.value.as_deref() == Some(id) || entry.resolved_model.as_deref() == Some(id)
+            })
+            .max_by_key(|entry| entry.supports_auto_mode == Some(true)),
+    )
+}
+
+fn check_configure_preflight(
+    readback: &InitializeReadback,
+    selection: &session::ModelSelection<'_, crate::native::types::InitializeModel>,
+) -> Result<()> {
     if readback.session_state.as_deref() != Some("idle") {
         return Err(Error::new(
             "busy",
@@ -2153,11 +2179,9 @@ fn check_configure_preflight(readback: &InitializeReadback, model: &str) -> Resu
     }
     match readback.current_permission_mode.as_deref() {
         Some("auto")
-            if !readback.models.iter().any(|entry| {
-                entry.supports_auto_mode == Some(true)
-                    && (entry.value.as_deref() == Some(model)
-                        || entry.resolved_model.as_deref() == Some(model))
-            }) =>
+            if selection
+                .catalogue_entry
+                .is_some_and(|entry| entry.supports_auto_mode != Some(true)) =>
         {
             Err(Error::new(
                 "unsupported",
@@ -2197,7 +2221,14 @@ fn native_resume_permission_mode(profile_mode: &str) -> &str {
 fn setter_error(error: Error, subtype: &str) -> Error {
     // Definite local non-admission: the control write provably never
     // reached the CLI, so the start is rejected, never a profile verdict.
-    if native_no_write(&error.code) {
+    if subtype == "set_model" && error.code == "native_rejected" {
+        error
+            .with_where("plugin.claude.start.set_model")
+            .with_origin(
+                eliot_core::FailureOrigin::Harness,
+                "Claude set_model returned a native error",
+            )
+    } else if native_no_write(&error.code) {
         contextual_error(
             error,
             "rejected",

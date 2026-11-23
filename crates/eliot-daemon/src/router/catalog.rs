@@ -1148,8 +1148,7 @@ pub(crate) fn external_quota_route(
 /// daemon's own cached `harness.models` entry. Codex launches the native
 /// `isDefault` id; Muse defers to the server default (the marker is
 /// display-only), so an omitted Muse model resolves to no frozen value and
-/// only an empty catalogue refuses. Explicit models stay with the plugins,
-/// which validate them against their native entries at launch.
+/// only an empty catalogue refuses. Explicit models pass to the plugins.
 pub(crate) fn launch_model_default(
     harness: &str,
     response: &HarnessModelsResponse,

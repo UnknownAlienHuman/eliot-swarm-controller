@@ -9,34 +9,34 @@ use crate::{
         types::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
-            NativeItemCompletedNotification, NativeModelCatalogEntry, NativeModelEffortVariants,
-            NativeModelListParams, NativeModelListResult, NativeModelSelection, NativeSession,
-            NativeSessionReadParams, NativeSessionReadResult,
-            NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
-            NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
-            NativeSessionStartParams, NativeSessionStartResult, NativeTurnCancelParams,
-            NativeTurnCancelResult, NativeTurnCompletedNotification, NativeTurnInputPart,
-            NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
-            NativeTurnSteerParams, NativeTurnSteerResult, NativeTurnTerminal,
-            NativeUnframedViewEvent, NativeViewPageParams, NativeViewPageResult,
-            is_reasoning_effort_tier,
+            NativeItemCompletedNotification, NativeModelEffortVariants, NativeModelListParams,
+            NativeModelListResult, NativeModelSelection, NativeSession, NativeSessionReadParams,
+            NativeSessionReadResult, NativeSessionReasoningEffortChangedNotification,
+            NativeSessionResumeParams, NativeSessionResumeResult, NativeSessionSetModelParams,
+            NativeSessionSetModelResult, NativeSessionStartParams, NativeSessionStartResult,
+            NativeTurnCancelParams, NativeTurnCancelResult, NativeTurnCompletedNotification,
+            NativeTurnInputPart, NativeTurnStartParams, NativeTurnStartResult,
+            NativeTurnStartedNotification, NativeTurnSteerParams, NativeTurnSteerResult,
+            NativeTurnTerminal, NativeUnframedViewEvent, NativeViewPageParams,
+            NativeViewPageResult, is_reasoning_effort_tier,
         },
     },
 };
 use eliot_core::{
-    ContextOutcome, Error, InjectArgs, InjectPoint, Result, SecretPolicy, StderrSnapshot,
+    ContextOutcome, Error, FailureOrigin, InjectArgs, InjectPoint, Result, SecretPolicy,
+    StderrSnapshot,
 };
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::stream_sources,
     session::{
-        attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
+        ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, model_catalogue_profile, native_no_write,
         not_initialized, paths_equal, register_native_process, rejected_control, request_reply_ids,
         required_native_cmd, shutdown_session, stop_owned_session, target_environment,
         unknown_control, unknown_snapshot, validate_binding, validate_identity,
-        with_claimed_context, with_context_points,
+        with_claimed_context, with_context_points, with_model_catalogue_diagnostic,
     },
 };
 use serde_json::{Value, json};
@@ -223,6 +223,7 @@ struct InitializedNative {
     effort: Option<String>,
     scope: String,
     fingerprint: String,
+    catalogue_omits_model: bool,
 }
 
 pub(crate) async fn run() -> Result<()> {
@@ -485,7 +486,6 @@ impl MusePlugin {
             &launch,
             Path::new(&initialized.instance_dir),
             &policy,
-            requested_model.as_deref(),
         )
         .await
         {
@@ -643,12 +643,7 @@ impl MusePlugin {
             }
         };
         let dispatched = self
-            .dispatch_session_start(
-                session,
-                session_method,
-                params_value,
-                resume_subject.is_some(),
-            )
+            .dispatch_session_start(session, session_method, params_value)
             .await?;
         let start::DispatchedStart {
             mut session,
@@ -850,6 +845,8 @@ impl MusePlugin {
             "permissions_verified": false,
             "schema_fingerprint": initialized_native.fingerprint.clone(),
         });
+        let effective =
+            with_model_catalogue_diagnostic(effective, initialized_native.catalogue_omits_model);
         let effective = with_context_points(
             effective,
             &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
@@ -974,8 +971,7 @@ impl MusePlugin {
     /// standing reasoning effort through `session/setReasoningEffort` when
     /// requested), between turns only. The switch runs only when no turn
     /// is active, so a mid-turn configure refuses before any write with
-    /// proof of no effect. The session catalogue gates the model: a miss
-    /// refuses honestly with nothing written. Each setter ack is verified
+    /// proof of no effect. Each setter ack is verified
     /// against its readback (`session/read` for the model, the durable
     /// `session/reasoningEffortChanged` view event for the effort); a
     /// refusal or a provably-undispatched write refuses with its reason,
@@ -1044,8 +1040,7 @@ impl MusePlugin {
             }));
         }
         let deadline = Instant::now() + RPC_TIMEOUT;
-        // The session catalogue gates the write: a miss proves nothing
-        // was written and refuses honestly.
+        // The exact catalogue row supplies effort variants when available.
         let catalog: NativeModelListResult = match session
             .native_client
             .call(
@@ -1076,35 +1071,28 @@ impl MusePlugin {
                 }));
             }
         };
-        if !catalog
-            .models
-            .iter()
-            .any(|model| model.model_id == requested_model)
+        let selection = ModelSelection::new(
+            &requested_model,
+            catalog
+                .models
+                .iter()
+                .find(|model| model.model_id == requested_model),
+        );
+        if let Some(effort) = requested.effort.as_deref()
+            && !selection.allows_effort(|entry| {
+                is_reasoning_effort_tier(effort)
+                    && match entry.variants.as_ref() {
+                        Some(NativeModelEffortVariants::Known(variants)) => {
+                            variants.iter().any(|variant| variant == effort)
+                        }
+                        _ => true,
+                    }
+            })
         {
             return Ok(json!({
                 "state": "rejected",
-                "reason": format!("Muse model {requested_model} is not in the native catalogue"),
+                "reason": format!("Muse effort {effort} is not a variant of model {requested_model}"),
             }));
-        }
-        if let Some(effort) = requested.effort.as_deref() {
-            if !is_reasoning_effort_tier(effort) {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": format!("Muse effort {effort} is not a supported reasoning tier"),
-                }));
-            }
-            if let Some(entry) = catalog
-                .models
-                .iter()
-                .find(|model| model.model_id == requested_model)
-                && let Some(NativeModelEffortVariants::Known(variants)) = entry.variants.as_ref()
-                && !variants.iter().any(|variant| variant == effort)
-            {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": format!("Muse effort {effort} is not a variant of model {requested_model}"),
-                }));
-            }
         }
         let model_command = new_command_id();
         let model_response = match session
@@ -1115,7 +1103,7 @@ impl MusePlugin {
                     command_id: model_command.clone(),
                     session_id: session_id.clone(),
                     model: NativeModelSelection {
-                        model_id: requested_model.clone(),
+                        model_id: selection.id.to_owned(),
                     },
                 })
                 .map_err(|_| {
@@ -1130,13 +1118,16 @@ impl MusePlugin {
         {
             Ok(value) => value,
             Err(error) if error.code == "native_rejected" => {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": format!(
-                        "Muse session/setModel did not admit the model switch ({})",
-                        error.message
-                    ),
-                }));
+                return Ok(with_model_catalogue_diagnostic(
+                    json!({
+                        "state": "rejected",
+                        "reason": error.message,
+                        "origin": FailureOrigin::Harness,
+                        "origin_evidence": "Muse session/setModel returned a native error",
+                        "where": "plugin.muse.configure.set_model",
+                    }),
+                    selection.catalogue_omits_model(),
+                ));
             }
             Err(error) if native_no_write(&error.code) => {
                 return Ok(json!({
@@ -1174,11 +1165,14 @@ impl MusePlugin {
             ));
         }
         session.selected_model = Some(requested_model.clone());
-        Ok(json!({
-            "state": "applied",
-            "model": requested_model,
-            "model_verified": true,
-        }))
+        Ok(with_model_catalogue_diagnostic(
+            json!({
+                "state": "applied",
+                "model": requested_model,
+                "model_verified": true,
+            }),
+            selection.catalogue_omits_model(),
+        ))
     }
 
     /// Re-prove an idle send gate with a fresh exact `session/read` (k167b):
@@ -2115,55 +2109,6 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
     Ok(ConfigureRequest { model, effort })
 }
 
-/// Pure catalogue selection: an explicit request matches exactly or fails
-/// honestly with no substitution; an omitted request proves the catalogue
-/// reachable and non-empty (e.g. a cold daemon cache left the freeze without
-/// its resolved default) and otherwise defers to the server default, whose
-/// effective id is read back from the session.
-fn select_launch_model(
-    catalog: &NativeModelListResult,
-    requested_model: Option<&str>,
-) -> Result<Option<NativeModelCatalogEntry>> {
-    use eliot_plugin::session::{LaunchModelMissing, LaunchModelRequest, choose_launch_model};
-
-    let source = catalog
-        .source
-        .clone()
-        .unwrap_or_else(|| "unknown".to_owned());
-    let count = catalog.models.len();
-    let request = requested_model.map_or(
-        LaunchModelRequest::VendorDefault,
-        LaunchModelRequest::Explicit,
-    );
-    let selected = choose_launch_model(
-        &catalog.models,
-        request,
-        |model| model.model_id.as_str(),
-        |_, _| true,
-        |model| model.is_default == Some(true),
-    )
-    .map_err(|reason| match reason {
-        LaunchModelMissing::Explicit | LaunchModelMissing::Frozen => Error::new(
-            "profile_error",
-            format!(
-                "Muse model catalogue (source {source}, {count} models) does not contain the exact requested model"
-            ),
-        )
-        .with_where("plugin.muse.start.model_list")
-        .with_origin(
-            eliot_core::FailureOrigin::Harness,
-            "native model catalogue omits the exact requested model",
-        ),
-        LaunchModelMissing::Default => Error::new(
-            "profile_error",
-            format!(
-                "Muse model catalogue (source {source}, {count} models) names no default model; use an explicit model"
-            ),
-        ),
-    })?;
-    Ok(selected.cloned())
-}
-
 impl MusePlugin {
     /// Read-only native model catalogue for `harness.models`. A dedicated
     /// reader instance queries `model/list` on a transient `muse serve`
@@ -2199,13 +2144,9 @@ impl MusePlugin {
             environment: environment.variables,
         };
         let policy = SecretPolicy::new(environment.secrets.iter().chain([&initialized.credential]));
-        let mut host = catalogue::CatalogueHost::open(
-            &launch,
-            Path::new(&initialized.instance_dir),
-            &policy,
-            None,
-        )
-        .await?;
+        let mut host =
+            catalogue::CatalogueHost::open(&launch, Path::new(&initialized.instance_dir), &policy)
+                .await?;
         host.close().await?;
         if host.catalogue.models.is_empty() && host.refresh_failed() {
             return Err(host.catalogue_error(Error::new(

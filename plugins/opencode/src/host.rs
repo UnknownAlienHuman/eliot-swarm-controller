@@ -17,7 +17,6 @@ use crate::{
 };
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
-use eliot_plugin::retry::{Retry, RetryFact, RetryOperation};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
@@ -25,12 +24,12 @@ use eliot_plugin::{
         AgentModelsParams, ModelListParams, ModelListPart, NativeArchiveParams, stream_sources,
     },
     session::{
-        ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop, decode,
-        ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid, native_no_write,
-        not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
+        ModelSelection, ResumeSubject, TargetEnvironment, attach_reply_diagnostics, begin_stop,
+        decode, ensure_dedicated_reader, ensure_reader_harness, initialize_fields_valid,
+        native_no_write, not_initialized, optional_profile_text, parse_resume_subject, paths_equal,
         register_native_process, required_native_cmd, split_provider_model, target_environment,
         unknown_snapshot, validate_binding, validate_identity, validate_source_plan,
-        with_claimed_context, with_context_points,
+        with_claimed_context, with_context_points, with_model_catalogue_diagnostic,
     },
 };
 use serde_json::{Value, json};
@@ -1358,17 +1357,9 @@ impl OpenCodePlugin {
     /// failure settles only after proving deletion of the created session;
     /// otherwise the exact session and server remain available as unknown.
     ///
-    /// Fragment path: the native provider and catalogue verification runs
-    /// BEFORE `POST /api/session` creates any native session — right here at
-    /// the top, after the owned server is up but before the first native
-    /// write. Nothing has been dispatched at that point, so every
-    /// verification failure (mismatch or unreadable readback) settles as a
-    /// definite failed start (`ProvenFailed`, retained for a corrected
-    /// retry), never as an unknown that would pin the Agent, keep the plugin
-    /// alive, and hold capacity. Unknown is reserved for failures after a
-    /// session or prompt may have been admitted. An unreachable custom
-    /// endpoint is not a start failure: the catalogue still lists the model,
-    /// the start succeeds, and the native turn surfaces the refusal.
+    /// The catalogue contributes model limits and effort variants before
+    /// native session creation. The session readback proves the selected
+    /// identity. Inference can still report a native refusal on the turn.
     async fn create_start_session(
         &mut self,
         parsed: &ParsedStart,
@@ -1377,30 +1368,15 @@ impl OpenCodePlugin {
     ) -> Result<CreateOutcome> {
         let _timing = crate::native::startup::Step::new("session_create_verify");
         session.native_scope = opencode_scope(session.server.data_dir());
-        // An explicit model must prove membership in the live catalogue
-        // before the create below: `Session.create` publishes its input
-        // model unchanged and only resolves availability lazily at
-        // inference, so the create echo alone never proves the
-        // provider/model exists. A requested effort additionally selects
-        // the documented `Model.Ref.variant` on the create, so the
-        // catalogue must also prove the variant belongs to that exact
-        // model row. A miss or an unreadable catalogue is a definite
-        // failed start, never unknown.
-        let mut ready_limits: Option<(Option<i64>, Option<i64>)> = None;
+        let mut model_catalogue = ModelCatalogueReadback::default();
         if let Some(requested) = parsed.requested_model.as_deref() {
             let requested_variant = parsed
                 .model_ref
                 .as_ref()
                 .and_then(|model_ref| model_ref.variant.as_deref());
             let _timing = crate::native::startup::Step::new("model_catalogue");
-            let catalogue = match wait_for_start_catalogue(
-                &session.http,
-                requested,
-                requested_variant,
-                envelope,
-            )
-            .await
-            {
+            let deadline = phase_deadline(create_cutoff(envelope), START_CATALOGUE_READY_BUDGET);
+            let catalogue = match session.http.list_native_models(deadline).await {
                 Ok(catalogue) => catalogue,
                 Err(error) => {
                     let failure = Error::new(
@@ -1420,40 +1396,14 @@ impl OpenCodePlugin {
                     ));
                 }
             };
-            if !catalogue_contains(&catalogue, requested) {
-                let failure = Error::new(
-                    "profile_error",
-                    format!("OpenCode model {requested} is not in the native catalogue"),
-                );
+            let selection = ModelSelection::new(requested, catalogue_entry(&catalogue, requested));
+            if let Err(failure) = validate_catalogue_effort(&selection, requested_variant) {
                 discard_failed_start(&mut session, failure.clone(), envelope).await;
                 return Ok(CreateOutcome::ProvenFailed(
                     self.retain_proven_no_effect_start(&parsed.params, StartPhase::Verify, failure),
                 ));
             }
-            if let Some(variant) = requested_variant {
-                let known = catalogue_variants(&catalogue, requested)
-                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
-                if !known {
-                    let failure = Error::new(
-                        "profile_error",
-                        format!("OpenCode effort {variant} is not a variant of model {requested}"),
-                    );
-                    discard_failed_start(&mut session, failure.clone(), envelope).await;
-                    return Ok(CreateOutcome::ProvenFailed(
-                        self.retain_proven_no_effect_start(
-                            &parsed.params,
-                            StartPhase::Verify,
-                            failure,
-                        ),
-                    ));
-                }
-            }
-            ready_limits = Some(
-                catalogue_entry(&catalogue, requested)
-                    .and_then(|entry| entry.limit.as_ref())
-                    .map(|limit| (limit.context, limit.output))
-                    .unwrap_or((None, None)),
-            );
+            model_catalogue = ModelCatalogueReadback::from_selection(&selection);
         }
         // Workspace-inherited project MCP layers: the owned serve already
         // merged them, so an owner-identity entry there must refuse the start
@@ -1608,18 +1558,7 @@ impl OpenCodePlugin {
             "effort_verified": effort_verified,
             "cwd": created.location.as_ref().map(|location| location.directory.clone()),
         });
-        // Carry the matching catalogue row's context and output limits into
-        // the ready result; omitted values stay unknown (null), never zero.
-        match ready_limits {
-            Some((context, output)) => {
-                effective["context_limit"] = context.map_or(Value::Null, Value::from);
-                effective["output_limit"] = output.map_or(Value::Null, Value::from);
-            }
-            None => {
-                effective["context_limit"] = Value::Null;
-                effective["output_limit"] = Value::Null;
-            }
-        }
+        effective = model_catalogue.attach(effective);
         if created.model.is_none()
             && let Some(default) = native_default_model
         {
@@ -1868,11 +1807,8 @@ impl OpenCodePlugin {
                 Err(error) => return Err(self.fail_resume(session, error, envelope).await),
             };
         session.session_id = Some(retained.id.clone());
-        // Catalogue membership proves before any native interrupt or
-        // setter: the quiesce below aborts a running retained execution,
-        // so a catalogue miss must fail here with proven no effect
-        // instead of aborting that turn and then failing.
-        let resume_limits =
+        // Read model metadata before the quiesce can interrupt a retained turn.
+        let model_catalogue =
             match Self::resume_validate_catalogue(&parsed, &session, &retained, deadline).await {
                 Ok(limits) => limits,
                 Err(error) => {
@@ -1908,7 +1844,7 @@ impl OpenCodePlugin {
                 }
             };
         if let Err(error) = Self::resume_verify_idle(&session, &retained.id, deadline).await {
-            return Err(self.stash_resume_unknown(session, *error.message).await);
+            return Err(self.stash_resume_unknown(session, error).await);
         }
         let effective = match Self::resume_configure(
             &parsed,
@@ -1916,14 +1852,14 @@ impl OpenCodePlugin {
             &retained.id,
             mcp_servers,
             mcp_servers_verified,
-            resume_limits,
+            model_catalogue,
             deadline,
         )
         .await
         {
             Ok(effective) => effective,
             Err(error) if error.code == "unknown" => {
-                return Err(self.stash_resume_unknown(session, *error.message).await);
+                return Err(self.stash_resume_unknown(session, error).await);
             }
             Err(error) => return Err(self.fail_resume(session, error, envelope).await),
         };
@@ -1945,7 +1881,7 @@ impl OpenCodePlugin {
             )
             .await
         {
-            return Err(self.stash_resume_unknown(session, *error.message).await);
+            return Err(self.stash_resume_unknown(session, error).await);
         }
         session.phase = SessionPhase::Ready;
         let result = json!({
@@ -2095,23 +2031,15 @@ impl OpenCodePlugin {
         Ok((inbox.len(), permissions.len(), forms.len()))
     }
 
-    /// Resume catalogue gate: an explicit realignment target proves live
-    /// catalogue membership BEFORE the retained session is touched. The
-    /// quiesce interrupt below aborts a running retained execution, so a
-    /// catalogue miss must fail here with proven no effect instead of
-    /// aborting that turn and then failing. No native interrupt, model
-    /// switch or agent switch has been dispatched at this point, so a
-    /// miss is a profile error with proven no effect; an unreadable
-    /// catalogue is a pre-write readback failure, also with proven no
-    /// effect (the create path settles an unreadable catalogue the same
-    /// way). The `resume_configure` setters later only realign to the
-    /// target proven here.
+    /// Read metadata for the resume target before any interrupt or setter.
+    /// An unreadable catalogue or an unsupported listed variant settles with
+    /// proven no effect. An omitted model row only contributes a diagnostic.
     async fn resume_validate_catalogue(
         parsed: &ParsedStart,
         session: &AgentSession,
         retained: &SessionInfo,
         deadline: Instant,
-    ) -> Result<Option<(Option<i64>, Option<i64>)>> {
+    ) -> Result<ModelCatalogueReadback> {
         // The realignment target is the inherited overlay's effective
         // model and effort when a resume carries them (the retained
         // session already runs them), else the frozen request. An omitted
@@ -2130,7 +2058,7 @@ impl OpenCodePlugin {
                 .or(parsed.requested_effort.as_deref())
         };
         // The fragment membership rule matches the create path before any
-        // write: a catalog-listed model outside the fragment refuses here,
+        // write: a model outside the fragment refuses here,
         // before the quiesce interrupt aborts a running retained turn. No
         // workspace file scan runs here either: the resumed serve regenerates
         // under the same native project-config disable switch, so workspace
@@ -2144,7 +2072,7 @@ impl OpenCodePlugin {
             ));
         }
         if target_model.is_none() && target_variant.is_none() {
-            return Ok(None);
+            return Ok(ModelCatalogueReadback::default());
         }
         let catalogue = session
             .http
@@ -2159,89 +2087,32 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        // The membership lookup uses the native fields, never the joined
-        // display string: see `catalogue_entry_for`.
         let target_ref = parsed
             .override_model_ref
             .as_ref()
             .or(parsed.model_ref.as_ref());
-        if let Some(target) = target_model {
-            let Some(target_ref) = target_ref else {
-                return Err(Error::new(
+        let validation_ref = if target_model.is_some() {
+            target_ref.ok_or_else(|| {
+                Error::new(
                     "source_integrity",
                     "OpenCode resume model is missing its native ref",
-                ));
-            };
-            if !catalogue_contains_for(&catalogue, &target_ref.provider_id, &target_ref.id) {
-                return Err(Error::new(
+                )
+            })?
+        } else {
+            target_ref.or(retained.model.as_ref()).ok_or_else(|| {
+                Error::new(
                     "profile_error",
-                    format!("OpenCode model {target} is not in the native catalogue"),
-                ));
-            }
-        }
-        if let Some(variant) = target_variant {
-            // The native fields stay apart end to end: the validation ref
-            // is the overlay/frozen ref when a model is carried, else the
-            // retained native ref verbatim. Joining provider "a/b" plus
-            // model "c" into "a/b/c" and re-splitting would look up
-            // provider "a", model "b/c" instead.
-            let validation_ref = parsed
-                .override_model_ref
-                .as_ref()
-                .or(parsed.model_ref.as_ref())
-                .or(retained.model.as_ref())
-                .ok_or_else(|| {
-                    Error::new(
-                        "profile_error",
-                        "OpenCode resume configure effort needs a session model",
-                    )
-                })?;
-            let known =
-                catalogue_variants_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
-                    .is_some_and(|variants| variants.iter().any(|known| known == variant));
-            if !known {
-                // Display form only for the message; the lookup above uses
-                // the native fields, never this string.
-                let validation_model =
-                    format!("{}/{}", validation_ref.provider_id, validation_ref.id);
-                return Err(Error::new(
-                    "profile_error",
-                    format!(
-                        "OpenCode effort {variant} is not a variant of model {validation_model}"
-                    ),
-                ));
-            }
-        }
-        // Carry the matching catalogue row's limits for the ready result;
-        // omitted values stay unknown (None), never zero.
-        if let Some(target) = target_model
-            && let Some(target_ref) = target_ref
-        {
-            let _ = target;
-            if let Some(entry) =
-                catalogue_entry_for(&catalogue, &target_ref.provider_id, &target_ref.id)
-                && let Some(limit) = entry.limit.as_ref()
-            {
-                return Ok(Some((limit.context, limit.output)));
-            }
-            return Ok(Some((None, None)));
-        }
-        if let Some(variant) = target_variant {
-            let _ = variant;
-            if let Some(validation_ref) = parsed
-                .override_model_ref
-                .as_ref()
-                .or(parsed.model_ref.as_ref())
-                .or(retained.model.as_ref())
-                && let Some(entry) =
-                    catalogue_entry_for(&catalogue, &validation_ref.provider_id, &validation_ref.id)
-                && let Some(limit) = entry.limit.as_ref()
-            {
-                return Ok(Some((limit.context, limit.output)));
-            }
-            return Ok(Some((None, None)));
-        }
-        Ok(None)
+                    "OpenCode resume configure effort needs a session model",
+                )
+            })?
+        };
+        let id = format!("{}/{}", validation_ref.provider_id, validation_ref.id);
+        let selection = ModelSelection::new(
+            &id,
+            catalogue_entry_for(&catalogue, &validation_ref.provider_id, &validation_ref.id),
+        );
+        validate_catalogue_effort(&selection, target_variant)?;
+        Ok(ModelCatalogueReadback::from_selection(&selection))
     }
 
     /// Resume MCP proof: gate the settled inventory and prove the winning
@@ -2304,19 +2175,15 @@ impl OpenCodePlugin {
     /// Resume configure: realign the retained session's model and agent
     /// to the frozen profile, then prove the effective values with a fresh
     /// `session.get`. The location must be the workspace; the requested
-    /// agent must be installed (the switch validates nothing itself). Live
-    /// catalogue membership was already proven by the pre-quiesce
-    /// `resume_validate_catalogue` gate, and the effective MCP proof by
-    /// the pre-quiesce `resume_prove_mcp` gate, so no catalogue, inventory
-    /// or effective-config read happens here after the interrupt: the
-    /// caller threads that proof through as the `mcp_servers` pair.
+    /// agent must be installed (the switch validates nothing itself).
+    /// Catalogue metadata and MCP proof come from the pre-quiesce reads.
     async fn resume_configure(
         parsed: &ParsedStart,
         session: &AgentSession,
         session_id: &str,
         mcp_servers: Value,
         mcp_servers_verified: bool,
-        resume_limits: Option<(Option<i64>, Option<i64>)>,
+        model_catalogue: ModelCatalogueReadback,
         deadline: Instant,
     ) -> Result<Value> {
         let current = session
@@ -2408,12 +2275,6 @@ impl OpenCodePlugin {
             .override_model_ref
             .as_ref()
             .or(parsed.model_ref.as_ref());
-        // Membership was proven by the pre-quiesce catalogue gate
-        // (`resume_validate_catalogue` runs before any interrupt or
-        // setter): the create echo is not membership proof, so neither is
-        // the resume echo, and re-checking here would run after the
-        // interrupt. The setters below plus the `session.get` effective
-        // readback only realign to that already-proven target.
         let model_needed = target_model.is_some_and(|target| {
             current
                 .model
@@ -2508,7 +2369,7 @@ impl OpenCodePlugin {
                     )
                 })?,
         };
-        let model_verified = true;
+        let model_verified = effective.model.is_some();
         let agent_verified = parsed
             .requested_agent
             .as_ref()
@@ -2560,16 +2421,7 @@ impl OpenCodePlugin {
             "agent_verified": agent_verified,
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
         });
-        match resume_limits {
-            Some((context, output)) => {
-                effective_value["context_limit"] = context.map_or(Value::Null, Value::from);
-                effective_value["output_limit"] = output.map_or(Value::Null, Value::from);
-            }
-            None => {
-                effective_value["context_limit"] = Value::Null;
-                effective_value["output_limit"] = Value::Null;
-            }
-        }
+        effective_value = model_catalogue.attach(effective_value);
         effective_value["native_subagents"] = json!(
             parsed
                 .native_subagents
@@ -2577,9 +2429,7 @@ impl OpenCodePlugin {
                 .unwrap_or_else(|| "allow".to_owned())
         );
         effective_value["native_subagents_verified"] = json!(subagents_verified);
-        // Fragment path: the regenerated server config must still carry the
-        // frozen provider. The live catalogue proves the retained pair; a
-        // miss fails the resume for a corrected retry.
+        // The regenerated provider fragment still bounds the retained model.
         if let Some(provider) = parsed.local_provider.as_ref()
             && let Some(model) = effective.model.as_ref()
             && !provider.contains_model(&model.provider_id, &model.id)
@@ -2730,6 +2580,14 @@ impl OpenCodePlugin {
     fn resume_switch(outcome: std::result::Result<(), HttpOutcome>, what: &str) -> Result<()> {
         match outcome {
             Ok(()) => Ok(()),
+            Err(HttpOutcome::Rejected { reason, .. }) if what == "model" => {
+                Err(Error::new("unknown", reason)
+                    .with_where("plugin.opencode.start.resume_model")
+                    .with_origin(
+                        FailureOrigin::Harness,
+                        "OpenCode resume model switch returned a native error",
+                    ))
+            }
             Err(HttpOutcome::Rejected { reason, .. })
             | Err(HttpOutcome::Unknown { reason })
             | Err(HttpOutcome::NotDispatched { reason }) => Err(Error::new(
@@ -2763,8 +2621,12 @@ impl OpenCodePlugin {
 
     /// Stash a resume-ambiguous session as unknown: the server and stream
     /// stay for the snapshot, and the resume is never repeated.
-    async fn stash_resume_unknown(&mut self, session: AgentSession, message: String) -> Error {
+    async fn stash_resume_unknown(&mut self, session: AgentSession, error: Error) -> Error {
         self.session = Some(session);
+        if error.origin.is_some() {
+            return error;
+        }
+        let message = error.message;
         Error::new(
             "unknown",
             format!("OpenCode resume is unresolved ({message})"),
@@ -3022,10 +2884,7 @@ impl OpenCodePlugin {
             .clone()
             .ok_or_else(|| Error::new("unknown", "OpenCode session identity is unresolved"))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
-        // The installed server validates nothing (a bogus model 204s and
-        // echoes back), so the live catalogue gates the write: a miss
-        // proves nothing was written and rejects honestly. A catalogue
-        // read failure is a readback, never an uncertain write.
+        // The exact catalogue row supplies effort variants when available.
         let catalogue = session
             .http
             .list_native_models(deadline)
@@ -3039,19 +2898,8 @@ impl OpenCodePlugin {
                     ),
                 )
             })?;
-        if let Some(model) = requested.model.as_deref()
-            && !catalogue_contains(&catalogue, model)
-        {
-            return Ok(json!({
-                "state": "rejected",
-                "reason": format!("OpenCode model {model} is not in the native catalogue"),
-                "origin": FailureOrigin::Harness,
-                "origin_evidence": "the native model catalogue omitted the requested model",
-                "where": "plugin.opencode.configure.catalogue",
-            }));
-        }
         // The same membership rule as the start and resume paths, before
-        // either one writes: a catalog-listed model outside the frozen
+        // either one writes: a model outside the frozen
         // fragment refuses here, never after quiescing or switching.
         if let (Some(provider), Some(model)) =
             (session.local_provider.as_ref(), requested.model.as_deref())
@@ -3080,7 +2928,7 @@ impl OpenCodePlugin {
             .as_ref()
             .and_then(|model| model.variant.clone());
         // The switch target keeps the native fields apart end to end: an
-        // explicit request re-splits its already catalogue-proven pair,
+        // explicit request supplies its provider/model pair,
         // while an effort-only configure reuses the retained native ref
         // verbatim. Routing the retained model through a joined
         // `provider/model` string and back would re-split at the first
@@ -3100,17 +2948,12 @@ impl OpenCodePlugin {
         // provider "a/b" plus model "c" into "a/b/c" and re-splitting
         // would look up provider "a", model "b/c" instead.
         let target_model = format!("{}/{}", target_ref.provider_id, target_ref.id);
-        if let Some(effort) = requested.effort.as_deref() {
-            let known = catalogue_variants_for(&catalogue, &target_ref.provider_id, &target_ref.id)
-                .is_some_and(|variants| variants.iter().any(|known| known == effort));
-            if !known {
-                return Ok(json!({
-                    "state": "rejected",
-                    "reason": format!(
-                        "OpenCode effort {effort} is not a variant of model {target_model}"
-                    ),
-                }));
-            }
+        let selection = ModelSelection::new(
+            &target_model,
+            catalogue_entry_for(&catalogue, &target_ref.provider_id, &target_ref.id),
+        );
+        if let Err(error) = validate_catalogue_effort(&selection, requested.effort.as_deref()) {
+            return Ok(json!({"state": "rejected", "reason": error.message}));
         }
         // A model switch without an effort runs the server default
         // variant; otherwise the retained variant carries over.
@@ -3132,10 +2975,16 @@ impl OpenCodePlugin {
             {
                 Ok(()) => {}
                 Err(HttpOutcome::Rejected { reason, .. }) => {
-                    return Ok(json!({
-                        "state": "rejected",
-                        "reason": format!("OpenCode refused the model switch ({reason})"),
-                    }));
+                    return Ok(with_model_catalogue_diagnostic(
+                        json!({
+                            "state": "rejected",
+                            "reason": reason,
+                            "origin": FailureOrigin::Harness,
+                            "origin_evidence": "OpenCode model switch returned a native error",
+                            "where": "plugin.opencode.configure.switch_model",
+                        }),
+                        selection.catalogue_omits_model(),
+                    ));
                 }
                 Err(HttpOutcome::NotDispatched { reason }) => {
                     return Ok(json!({
@@ -3164,14 +3013,17 @@ impl OpenCodePlugin {
         .await?;
         let mut response = json!({
             "state": "applied",
-            "model": target_model,
+            "model": selection.id,
             "model_verified": true,
         });
         if let Some(effort) = requested.effort {
             response["effort"] = Value::String(effort);
             response["effort_verified"] = Value::Bool(true);
         }
-        Ok(response)
+        Ok(with_model_catalogue_diagnostic(
+            response,
+            selection.catalogue_omits_model(),
+        ))
     }
 
     async fn send_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -4561,7 +4413,7 @@ fn session_model_is(target: &ModelRef, model: &ModelRef) -> bool {
 }
 
 /// The configure switch target: an explicit request re-splits its
-/// already catalogue-proven pair, while an effort-only configure reuses
+/// requested pair, while an effort-only configure reuses
 /// the retained native ref verbatim (`None` when the session reports no
 /// model). The retained ref never routes through a joined
 /// `provider/model` string: re-splitting would change the selected model
@@ -4581,61 +4433,51 @@ fn configure_switch_ref(
     }
 }
 
-/// Whether the live native catalogue carries the exact native
-/// provider/model pair. See [`catalogue_entry_for`].
-fn catalogue_contains_for(catalogue: &[NativeModelEntry], provider_id: &str, id: &str) -> bool {
-    catalogue_entry_for(catalogue, provider_id, id).is_some()
+#[derive(Default)]
+struct ModelCatalogueReadback {
+    context: Option<i64>,
+    output: Option<i64>,
+    omits_model: bool,
 }
 
-/// Whether the live native catalogue carries the exact requested
-/// `provider/model` id. See [`catalogue_entry`].
-fn catalogue_contains(catalogue: &[NativeModelEntry], requested: &str) -> bool {
-    catalogue_entry(catalogue, requested).is_some()
-}
-
-/// An exact model and variant match on the first read is enough. On a
-/// cold catalogue miss, wait within the start budget for the missing entry.
-async fn wait_for_start_catalogue(
-    http: &OpenCodeHttp,
-    requested: &str,
-    requested_variant: Option<&str>,
-    envelope: Instant,
-) -> Result<Vec<NativeModelEntry>> {
-    let deadline = phase_deadline(create_cutoff(envelope), START_CATALOGUE_READY_BUDGET);
-    let ready = |entries: &[NativeModelEntry]| {
-        catalogue_entry(entries, requested).is_some_and(|entry| {
-            requested_variant.is_none_or(|variant| {
-                catalogue_entry_variants(entry)
-                    .is_some_and(|variants| variants.iter().any(|known| known == variant))
-            })
-        })
-    };
-    let mut entries = http.list_native_models(deadline).await?;
-    let mut retry = Retry::new(RetryOperation::ReadinessPoll);
-    while !ready(&entries) && retry.wait(RetryFact::Idempotent, Some(deadline)).await {
-        entries = http.list_native_models(deadline).await?;
+impl ModelCatalogueReadback {
+    fn from_selection(selection: &ModelSelection<'_, NativeModelEntry>) -> Self {
+        let limits = selection
+            .catalogue_entry
+            .and_then(|entry| entry.limit.as_ref());
+        Self {
+            context: limits.and_then(|limit| limit.context),
+            output: limits.and_then(|limit| limit.output),
+            omits_model: selection.catalogue_omits_model(),
+        }
     }
-    Ok(entries)
+
+    fn attach(self, mut effective: Value) -> Value {
+        effective["context_limit"] = json!(self.context);
+        effective["output_limit"] = json!(self.output);
+        with_model_catalogue_diagnostic(effective, self.omits_model)
+    }
 }
 
-/// The live native catalogue's selectable variant ids for one exact native
-/// provider/model pair (`Model.Variant` ids in wire order). `None` when
-/// the entry is absent or reports no variants member: unknown, never an
-/// empty wardrobe. See [`catalogue_entry_for`].
-fn catalogue_variants_for(
-    catalogue: &[NativeModelEntry],
-    provider_id: &str,
-    id: &str,
-) -> Option<Vec<String>> {
-    catalogue_entry_for(catalogue, provider_id, id).and_then(catalogue_entry_variants)
-}
-
-/// The live native catalogue's selectable variant ids for one exact
-/// `provider/model` id (`Model.Variant` ids in wire order). `None` when
-/// the entry is absent or reports no variants member: unknown, never an
-/// empty wardrobe.
-fn catalogue_variants(catalogue: &[NativeModelEntry], requested: &str) -> Option<Vec<String>> {
-    catalogue_entry(catalogue, requested).and_then(catalogue_entry_variants)
+fn validate_catalogue_effort(
+    selection: &ModelSelection<'_, NativeModelEntry>,
+    effort: Option<&str>,
+) -> Result<()> {
+    if let Some(effort) = effort
+        && !selection.allows_effort(|entry| {
+            catalogue_entry_variants(entry)
+                .is_some_and(|variants| variants.iter().any(|variant| variant == effort))
+        })
+    {
+        return Err(Error::new(
+            "profile_error",
+            format!(
+                "OpenCode effort {effort} is not a variant of model {}",
+                selection.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn catalogue_entry_variants(entry: &NativeModelEntry) -> Option<Vec<String>> {
@@ -4656,8 +4498,7 @@ fn valid_catalogue_variant(id: &str) -> bool {
 }
 
 /// A frozen effort value: the trimmed string, non-empty, at most 128
-/// bytes, no controls. The live catalogue gate proves membership; this
-/// only rejects unusable shapes before any native I/O.
+/// bytes, no controls. This checks the shape before any native I/O.
 fn checked_effort(raw: Option<&str>, code: &'static str) -> Result<Option<String>> {
     let Some(value) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);

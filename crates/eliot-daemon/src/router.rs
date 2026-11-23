@@ -3607,8 +3607,7 @@ impl Router {
     /// snapshot untouched for the plugin's native read, so passive freeze
     /// work can never fail a launch its readers could serve. Explicit
     /// models, routed Codex profiles (the Responses route requires an
-    /// explicit model id) and other harnesses pass through untouched; the
-    /// plugins keep validating those against their native entries.
+    /// explicit model id) and other harnesses pass through untouched.
     async fn resolve_launch_default(
         &self,
         harness: &str,

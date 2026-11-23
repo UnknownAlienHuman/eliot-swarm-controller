@@ -29,18 +29,9 @@ impl CatalogueHost {
         launch: &NativeLaunch,
         instance_dir: &Path,
         policy: &SecretPolicy,
-        requested_model: Option<&str>,
     ) -> Result<Self> {
         let mut host = Self::read(launch, policy).await?;
-        let missing = host.catalogue.models.is_empty()
-            || requested_model.is_some_and(|id| {
-                !host
-                    .catalogue
-                    .models
-                    .iter()
-                    .any(|model| model.model_id == id)
-            });
-        if !missing {
+        if !host.catalogue.models.is_empty() {
             return Ok(host);
         }
 

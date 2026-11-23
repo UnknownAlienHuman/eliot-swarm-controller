@@ -1556,50 +1556,36 @@ pub fn model_catalogue_profile<'a>(
     Ok(profile)
 }
 
-pub enum LaunchModelRequest<'a> {
-    Explicit(&'a str),
-    Frozen(&'a str),
-    CatalogueDefault,
-    VendorDefault,
+/// An explicit or frozen selector is authoritative. The exact catalogue row,
+/// when present, provides metadata for that selector.
+pub struct ModelSelection<'a, T> {
+    pub id: &'a str,
+    pub catalogue_entry: Option<&'a T>,
 }
 
-pub enum LaunchModelMissing {
-    Explicit,
-    Frozen,
-    Default,
-}
-
-/// Select the exact explicit or frozen model. An omitted selection can
-/// delegate to a vendor that reports its default at session creation.
-pub fn choose_launch_model<'a, T>(
-    entries: &'a [T],
-    request: LaunchModelRequest<'_>,
-    id: impl Fn(&T) -> &str,
-    exact: impl Fn(&T, &str) -> bool,
-    is_default: impl Fn(&T) -> bool,
-) -> std::result::Result<Option<&'a T>, LaunchModelMissing> {
-    let selected = match request {
-        LaunchModelRequest::Explicit(requested) => entries
-            .iter()
-            .find(|entry| id(entry) == requested && exact(entry, requested))
-            .ok_or(LaunchModelMissing::Explicit)?,
-        LaunchModelRequest::Frozen(frozen) => entries
-            .iter()
-            .find(|entry| id(entry) == frozen)
-            .ok_or(LaunchModelMissing::Frozen)?,
-        LaunchModelRequest::CatalogueDefault => entries
-            .iter()
-            .find(|entry| is_default(entry))
-            .ok_or(LaunchModelMissing::Default)?,
-        LaunchModelRequest::VendorDefault => {
-            return if entries.is_empty() {
-                Err(LaunchModelMissing::Default)
-            } else {
-                Ok(None)
-            };
+impl<'a, T> ModelSelection<'a, T> {
+    pub fn new(id: &'a str, catalogue_entry: Option<&'a T>) -> Self {
+        Self {
+            id,
+            catalogue_entry,
         }
-    };
-    Ok(Some(selected))
+    }
+
+    pub fn allows_effort(&self, supports: impl FnOnce(&T) -> bool) -> bool {
+        self.catalogue_entry.is_none_or(supports)
+    }
+
+    pub fn catalogue_omits_model(&self) -> bool {
+        self.catalogue_entry.is_none()
+    }
+}
+
+/// A catalogue omission is advisory on readiness and configure results.
+pub fn with_model_catalogue_diagnostic(mut value: Value, catalogue_omits_model: bool) -> Value {
+    if catalogue_omits_model {
+        value["catalogue_omits_model"] = Value::Bool(true);
+    }
+    value
 }
 
 /// Close the owned event task after stop. Teardown after a transport loss

@@ -444,28 +444,6 @@ impl Plan {
                 ));
             }
         }
-        // Every required write value must be an advertised option value:
-        // an unadvertised id is rejected here instead of sent and guessed.
-        for (config_id, value) in self.config_writes() {
-            let advertised = options
-                .iter()
-                .find(|option| option.id == config_id)
-                .is_some_and(|option| {
-                    option
-                        .option_values()
-                        .iter()
-                        .any(|(advertised, _)| advertised == &value)
-                });
-            if !advertised {
-                return Err(
-                    eliot_plugin::start_classification::harness_unavailable_model(
-                        "antigravity",
-                        "session",
-                        "Antigravity ACP session did not advertise a required config value",
-                    ),
-                );
-            }
-        }
         // The reported effective selectors are the realignment target
         // (overlay or frozen); `requested_model` stays the frozen profile
         // id so the original request is never rewritten.
