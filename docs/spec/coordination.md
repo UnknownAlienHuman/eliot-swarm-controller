@@ -1297,13 +1297,15 @@ A fence that still needs Owner review appears in `swarm inbox` as Stuck with
 transaction releases only that switch's fence, rejects known live writers or active
 workspace operations, and records the Owner's reason.
 
-Automatic handoffs have a durable budget of three admissions per continuation lineage.
-Store maps each Agent generation to its lineage, initially the root Agent ID, and carries
-that mapping through completed switches and resume. The budget and last outcome live in
-Store independently of retained events. A reservation charges once; replaying that switch
-does not charge again. A reserved or unknown outcome is not retried, while a definite
-refusal or failure follows its existing cooldown. Manual switches and resume carry the
-lineage without spending the automatic budget.
+Switch reservations outside an explicit Owner switch have a durable budget of three per
+continuation lineage. This includes automatic held/lost/provider, rule and session-growth
+switches and manager-routed switches. Store maps each Agent generation to its lineage,
+initially the root Agent ID, and carries that mapping through completed switches and resume.
+The budget and last outcome live in Store independently of retained events. Store charges
+in the same transaction that admits the parent switch command; replaying the same switch,
+later routing, and settlement do not charge again. A reserved or unknown outcome is not
+retried, while a definite refusal or failure follows its existing cooldown. Explicit Owner
+switches and resume carry the lineage without spending the budget.
 The result keeps the child IDs, created Agent/generation, launch state and
 handoff or disposal outcome. Refusals carry a code and a bounded reason in the
 result and daemon log. A terminal failure has an empty `next_action`.
@@ -1314,9 +1316,9 @@ the current receipt.
 Same-ID identical-payload retry is readback before live/config/model/auth checks;
 it never schedules another worker, creates another Agent or repeats launch/transfer.
 A crash before the parent worker is claimed may recover that unattempted parent.
-A claimed orchestration becomes Unknown on restart with its reserved IDs intact;
-it is not automatically resumed. Its exact Accepted, unattempted launch child is
-recoverable through ordinary launch/workspace recovery; no new child ID is minted.
+A claimed orchestration becomes Unknown on restart with its reserved IDs intact.
+Workspace recovery can read back Git preparation for its launch. Native launch
+dispatch requires an active Dispatched parent.
 An exact Accepted, unattempted successor stop is recoverable through ordinary
 command recovery. Dispatched or unknown children retain the normal no-replay
 rules. A ready B from an interrupted orchestration can receive an explicit

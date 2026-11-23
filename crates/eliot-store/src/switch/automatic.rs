@@ -16,7 +16,7 @@ const LOSS_GRACE_MS: i64 = 20_000;
 const WAITING_RETRY_MS: i64 = 60_000;
 const HELD_SCAN_LIMIT: i64 = 256;
 const LOST_SCAN_LIMIT: i64 = 64;
-const MAX_AUTOMATIC_HANDOFFS_PER_TASK: i64 = 3;
+const MAX_SWITCHES_PER_TASK: i64 = 3;
 type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
 #[derive(Clone, Debug)]
@@ -43,7 +43,7 @@ fn lineage_for(
         .map_err(sql_error)
 }
 
-fn handoff_budget_available(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
+fn switch_budget_available(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
     let agent_num = parse_agent_id(&agent.id)?;
     if lineage_for(connection, agent_num, agent.generation)?
         .is_some_and(|(_, successor)| successor.is_some())
@@ -81,10 +81,10 @@ fn handoff_budget_available(connection: &Connection, agent: &Agent, now: i64) ->
         )
         .optional()
         .map_err(sql_error)?;
-    let Some((attempts, last_agent, last_generation, state, updated_at)) = budget else {
+    let Some((charged_switches, last_agent, last_generation, state, updated_at)) = budget else {
         return Ok(true);
     };
-    if attempts >= MAX_AUTOMATIC_HANDOFFS_PER_TASK {
+    if charged_switches >= MAX_SWITCHES_PER_TASK {
         return Ok(false);
     }
     if last_agent != Some(agent_num) || last_generation != Some(agent.generation) {
@@ -209,14 +209,14 @@ impl Store {
         insert_lineage_generation_tx(tx, agent, next_generation, lineage_agent)
     }
 
-    /// Charge only after the automatic switch reservation is ready to commit.
-    fn charge_automatic_handoff_tx(
+    /// Charge a non-Owner switch in the same transaction as its reservation.
+    pub(super) fn charge_switch_reservation_tx(
         tx: &Transaction<'_>,
         agent: &Agent,
         switch_command: &str,
         now: i64,
     ) -> Result<bool> {
-        if !handoff_budget_available(tx, agent, now)? {
+        if !switch_budget_available(tx, agent, now)? {
             return Ok(false);
         }
         let agent_num = parse_agent_id(&agent.id)?;
@@ -234,7 +234,7 @@ impl Store {
                     switch_command,
                     now,
                     lineage_agent,
-                    MAX_AUTOMATIC_HANDOFFS_PER_TASK
+                    MAX_SWITCHES_PER_TASK
                 ],
             )
             .map_err(sql_error)?;
@@ -325,7 +325,7 @@ pub(super) fn hold_is_current(tx: &Connection, agent: &Agent, held_since: i64) -
 
 /// Whether another automatic attempt is allowed for this generation.
 fn attempt_allowed(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
-    handoff_budget_available(connection, agent, now)
+    switch_budget_available(connection, agent, now)
 }
 
 /// The input a successor must carry, when this generation still owes work.
@@ -646,11 +646,15 @@ impl Store {
             .map_err(|_| Error::new("internal", "cannot encode handoff reason"))?;
             args[OWNER_AUTOMATION] = json!(true);
             let digest = canonical::digest(&args)?;
-            if !Self::charge_automatic_handoff_tx(&tx, &agent, &request.id, now)? {
-                commit_transaction(tx, &self.write_faulted)?;
-                return Ok(none());
-            }
-            let mut change = reserve_switch_tx(&tx, &request, args, &digest, now, None)?;
+            let mut change = match reserve_switch_tx(&tx, &request, args, &digest, now, None, true)
+            {
+                Ok(change) => change,
+                Err(error) if error.code == "switch_budget_unavailable" => {
+                    commit_transaction(tx, &self.write_faulted)?;
+                    return Ok(none());
+                }
+                Err(error) => return Err(error),
+            };
             change.events.push(insert_daemon_event(
                 &tx,
                 now,

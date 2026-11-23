@@ -743,7 +743,7 @@ pub(super) fn reserve_rule_switch_tx(
             Err(error)
         };
     }
-    reserve_switch_tx(tx, request, args, &digest, now, None)
+    reserve_switch_tx(tx, request, args, &digest, now, None, true)
 }
 
 fn reserve_switch_tx(
@@ -753,6 +753,7 @@ fn reserve_switch_tx(
     digest: &[u8],
     now: i64,
     live_checkout_snapshot: Option<&[(String, i64, String, String)]>,
+    charge_switch: bool,
 ) -> Result<Change<SwitchResponse>> {
     let source = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
         .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
@@ -778,6 +779,14 @@ fn reserve_switch_tx(
     args[SOURCE_CHECKOUT_KEY] = json!(source_checkout_key);
     if let Some(error) = switch_blocker(tx, request, source_checkout_key.as_deref())? {
         return Err(error);
+    }
+    if charge_switch
+        && !Store::charge_switch_reservation_tx(tx, &source, &request.id, now)?
+    {
+        return Err(Error::new(
+            "switch_budget_unavailable",
+            "the task continuation switch budget is exhausted or its previous reservation is unresolved",
+        ));
     }
     if let (Some(checkout_key), Some(checkout_root)) = (
         source_checkout_key.as_deref(),
@@ -909,7 +918,27 @@ pub(super) fn reserve_provider_switch_tx(
         args[OWNER_AUTOMATION] = json!(true);
     }
     let digest = canonical::digest(&args)?;
-    events.extend(reserve_switch_tx(tx, &request, args, &digest, now, None)?.events);
+    let change = match reserve_switch_tx(tx, &request, args, &digest, now, None, true) {
+        Ok(change) => change,
+        Err(error) if error.code == "switch_budget_unavailable" => {
+            events.push(insert_daemon_event(
+                tx,
+                now,
+                PROVIDER_SWITCH_SETTLED,
+                "provider",
+                Some(agent_num),
+                Some(agent.generation),
+                json!({
+                    "task_command": task,
+                    "kind": restriction.kind,
+                    "state": "budget_unavailable",
+                }),
+            )?);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    events.extend(change.events);
     events.push(insert_daemon_event(
         tx,
         now,
@@ -1010,6 +1039,7 @@ impl Store {
             source_checkout,
             live_checkouts,
         } = reservation;
+        let charge_switch = principal != "owner" || profile_authority.is_some();
         if let Some(value) = self.replay_switch(principal, request)? {
             return Ok(Change {
                 value,
@@ -1052,8 +1082,15 @@ impl Store {
             }
             require_switch_caller(&tx, principal, request)?;
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
-            let mut change =
-                reserve_switch_tx(&tx, request, args, &digest, now, Some(live_checkouts))?;
+            let mut change = reserve_switch_tx(
+                &tx,
+                request,
+                args,
+                &digest,
+                now,
+                Some(live_checkouts),
+                charge_switch,
+            )?;
             annotate_owner_events(&tx, &mut change.events, owner_process)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(change)

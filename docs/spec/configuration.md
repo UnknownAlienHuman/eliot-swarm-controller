@@ -1666,10 +1666,14 @@ repeats. A refused admission is tried again after five minutes and a failed laun
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
 
-Automatic handoff admits at most three switches for one continuation lineage. The count
-survives successor Agents and resumed generations, and does not depend on retained events.
-Manual switches carry the lineage without spending this budget. When it is exhausted, the
-work stays with its current Agent for an Owner or manager to move manually.
+Each continuation lineage admits at most three switch reservations initiated outside an
+explicit Owner switch. This includes automatic held/lost/provider, rule and session-growth
+switches, as well as manager-routed switches. The count survives successor Agents and
+resumed generations and does not depend on retained events. An explicit Owner switch and
+resume carry the lineage without spending this budget. A reservation charges once in the
+same Store transaction as the switch command; retry/readback and later routing or settlement
+do not charge again. When the budget is exhausted, the work stays with its current Agent
+until the Owner moves it explicitly.
 
 ### CLI editing
 
