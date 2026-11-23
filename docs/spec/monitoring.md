@@ -491,6 +491,10 @@ absence settles `removed` without dispatching Git writes. The outcome records
 available retained Git observation, which can show that the checkout had
 changes before it vanished. The daemon's missing-worktree reconciliation
 admits one removal at a time and advances after the command settles.
+A `worktree.remove` that a previous daemon left `queued` behind the
+repository write lane is re-admitted by restart recovery, so it is
+dispatched in order and never strands later launches in the same
+repository.
 
 The Owner can settle a legacy `worktree.remove` that is still unknown with
 `source_integrity: removed workspace branch was not retained` using
