@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 109;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 111;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2559,6 +2559,36 @@ impl Store {
                      END;
                  INSERT INTO schema_migrations(version) VALUES (109);",
             )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 110 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN wake INTEGER NOT NULL DEFAULT 1 CHECK (wake IN (0, 1));
+                 ALTER TABLE messages ADD COLUMN inline_ack_pending INTEGER NOT NULL DEFAULT 0
+                     CHECK (inline_ack_pending IN (0, 1));
+                 ALTER TABLE messages ADD COLUMN inline_wake_retries INTEGER NOT NULL DEFAULT 0
+                     CHECK (inline_wake_retries BETWEEN 0 AND 2);
+                 INSERT INTO schema_migrations(version) VALUES (110);",
+            ).map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 111 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(&format!(
+                "CREATE INDEX messages_prune_legacy_advisory_unread
+                     ON messages(admitted_at, id)
+                     WHERE read_at IS NULL
+                       AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE};
+                 INSERT INTO schema_migrations(version) VALUES (111);",
+            ))
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }

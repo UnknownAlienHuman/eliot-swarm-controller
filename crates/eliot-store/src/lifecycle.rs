@@ -1817,6 +1817,7 @@ fn mark_lost_turn_unknown_tx(
                 },
             )?;
         }
+        super::native_events::rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
         let cause = command_cause_for_turn_tx(tx, agent_num, generation, turn_id)?;
         let mut data = json!({"turn_id": turn_id, "reason": reason});
         if let Some((origin, location)) = failure {
@@ -2167,6 +2168,7 @@ fn settle_stopped_turn_unknown_tx(
     if changed != 1 {
         return Ok(());
     }
+    super::native_events::rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
     events.push(insert_daemon_event_for_command(
         tx,
         command_id,

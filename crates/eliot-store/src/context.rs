@@ -36,7 +36,14 @@ type ContextPage = (Vec<KeyedCommand>, Option<ContextCursor>);
 #[derive(Clone, Debug, PartialEq)]
 pub struct ContextDispatch {
     pub command: Command,
+    pub input: SendInput,
+}
+
+/// Native-only additions to a send. Keep the retained command args unchanged.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SendInput {
     pub context_items: Vec<ContextItem>,
+    pub text_with_mail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,16 +730,15 @@ pub(super) fn claim_next_input_tx(
     send: &Command,
     now: i64,
     events: &mut Vec<Event>,
-) -> Result<Vec<ContextItem>> {
+) -> Result<SendInput> {
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
     let mut selected_outcomes: Vec<ContextOutcome> = Vec::new();
-    let mut payload_bytes = send
+    let original_text = send
         .args
         .get("text")
         .and_then(Value::as_str)
-        .ok_or_else(|| Error::new("source_integrity", "send command has no text"))?
-        .len();
+        .ok_or_else(|| Error::new("source_integrity", "send command has no text"))?;
     let mut cursor = None;
     // The mandatory `turn.started` receipt, budgeted in the exact shape the
     // adapters persist (one outcome per claimed item). Fields fixed only at
@@ -792,6 +798,23 @@ pub(super) fn claim_next_input_tx(
         params["config_revision"] = json!(i64::MAX);
         Ok(params)
     };
+    let append_mail = |mail: &str| format!("{original_text}\n\n---\n\n{mail}");
+    let mut native_args = send.args.clone();
+    let mail = coordination::claim_deferred_inline_mail_tx(tx, agent, agent_num, send, |mail| {
+        let text = append_mail(mail);
+        if text.len() > MAX_TEXT_BYTES {
+            return Ok(false);
+        }
+        native_args["text"] = Value::String(text);
+        match check_rpc_frame("agent.command", &plugin_frame(&native_args, &[])?) {
+            Ok(()) => Ok(true),
+            Err(error) if error.code == "frame_too_large" => Ok(false),
+            Err(error) => Err(error),
+        }
+    })?;
+    let text_with_mail = mail.as_deref().map(append_mail);
+    let mut payload_bytes = text_with_mail.as_deref().unwrap_or(original_text).len();
+    native_args["text"] = json!(text_with_mail.as_deref().unwrap_or(original_text));
     'scan: loop {
         let (records, next_cursor) = pending_context_batch_page(
             tx,
@@ -871,7 +894,7 @@ pub(super) fn claim_next_input_tx(
             if candidate_bytes > MAX_TEXT_BYTES {
                 break 'scan;
             }
-            let frame = plugin_frame(&send.args, &candidate)?;
+            let frame = plugin_frame(&native_args, &candidate)?;
             match check_rpc_frame("agent.command", &frame) {
                 Ok(()) => {
                     let mut candidate_outcomes = selected_outcomes.clone();
@@ -909,7 +932,10 @@ pub(super) fn claim_next_input_tx(
             events,
         )?;
     }
-    Ok(selected)
+    Ok(SendInput {
+        context_items: selected,
+        text_with_mail,
+    })
 }
 
 impl Store {

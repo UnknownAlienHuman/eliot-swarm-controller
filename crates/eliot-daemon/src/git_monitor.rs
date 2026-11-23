@@ -103,6 +103,8 @@ pub(crate) struct PatchRead {
     pub root: PathBuf,
     pub base: Option<String>,
     pub head: Option<String>,
+    /// The worktree fingerprint from the same status/content snapshot, when requested.
+    pub fingerprint: Option<String>,
     pub diff: String,
     pub untracked: Vec<String>,
     /// False when the diff exceeded the read bound and was left out.
@@ -1030,15 +1032,46 @@ impl GitProbe {
         workspace: &str,
         base: Option<&str>,
     ) -> Result<PatchRead> {
+        self.patch_read_inner(workspace, base, false).await
+    }
+
+    /// The same bounded patch read, with its status snapshot bound to the
+    /// worktree fingerprint used by completion events.
+    pub(crate) async fn patch_read_with_fingerprint(
+        &self,
+        workspace: &str,
+        base: Option<&str>,
+    ) -> Result<PatchRead> {
+        self.patch_read_inner(workspace, base, true).await
+    }
+
+    async fn patch_read_inner(
+        &self,
+        workspace: &str,
+        base: Option<&str>,
+        include_fingerprint: bool,
+    ) -> Result<PatchRead> {
         let root = canonical_root(workspace)?;
         let deadline = Instant::now() + PROBE_TIME;
         let overrides = self.safe_overrides(&root, deadline).await?;
         self.require_exact_root(&root, &overrides, deadline).await?;
-        let status = parse_status(
-            &self
-                .checked(&root, SCOPE_STATUS_ARGS, &overrides, &[], deadline)
-                .await?,
-        )?;
+        let fingerprint_status = status_args("--untracked-files=all");
+        let args = if include_fingerprint {
+            &fingerprint_status[..]
+        } else {
+            SCOPE_STATUS_ARGS
+        };
+        let status = parse_status(&self.checked(&root, args, &overrides, &[], deadline).await?)?;
+        let fingerprint = if include_fingerprint {
+            let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
+                .map_err(|reason| unavailable(&format!("workspace fingerprint: {reason}")))?;
+            Some(work_fingerprint_from_parts(
+                status.head.as_deref(),
+                &dirty_digest,
+            ))
+        } else {
+            None
+        };
         let untracked = status
             .dirty
             .iter()
@@ -1103,6 +1136,7 @@ impl GitProbe {
             root,
             base,
             head: status.head,
+            fingerprint,
             diff,
             untracked,
             complete,

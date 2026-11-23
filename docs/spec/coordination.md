@@ -425,7 +425,7 @@ namespace. Both forms retain the timestamp needed to classify pruned deliveries
 for reads and idempotent acknowledgements. Each creates atomic concrete recipient
 rows from the frozen recipient list in one bounded transaction.
 The frozen list is not reevaluated later. One admission names 1–100
-concrete recipients. Same id with different identity/mode/body rejects; unknown
+concrete recipients. Same id with different identity, mode, body or wake policy rejects; unknown
 recipient never creates an Agent. Text is at most 32 KiB, known secrets rejected.
 Only `queue` mode is connected; `send`, `steer` and `inject` presentation
 return `unsupported`.
@@ -444,6 +444,14 @@ conversation. Native turn success is separate from message delivery/read state.
 
 `queue` stores text only. `send`, `steer`, and `inject` use ordinary generation/turn-bound
 commands and report their actual application point. Presented is not read or understood.
+
+Senders can set `wake: false` on `mail.send` (`swarm msg send --no-wake`).
+Deferred deliveries stay unread until a SEND to their generation
+claims them for its native input or the recipient acknowledges them explicitly.
+They do not trigger a wake or qualify for the reply cooldown bypass. The next
+Swarm-supplied input, including a linked launch or resume SEND, an automation
+SEND, or an existing mail wake, can carry the oldest eligible deferred
+deliveries that fit. The remainder stays queued for later input or an inbox read.
 
 With `wake_on_mail=true` (read from the recipient's frozen profile snapshot,
 default true), a routed recipient may receive one coalesced notice per minute,
@@ -470,21 +478,27 @@ service message matches the digest registration, the current recipient
 requester (`agent:<recipient>:<generation>`), and that registration's digest
 thread. Other registered digest rows are not treated as ordinary mail.
 
-Store binds every inline delivery to the exact notice command in the same
-claim transaction. The exact wake's first committed model output or
-successful terminal stamps `presented_at` and `read_at` on those rows in the
-same transaction. A definite terminal without either releases the
-presentation binding so unread deliveries can be included in the next eligible
-wake. Unknown outcomes keep their binding. If no
+Store binds every inline delivery to the exact notice or ordinary send command
+in the same claim transaction. Committing `turn.started` for that send stamps
+`presented_at` and `read_at` on those rows in the same transaction.
+For a send merged into a harness-started turn, `turn.input_bound` is the exact
+receipt. Model output, a successful terminal, or an explicit mailbox
+acknowledgement confirms delivery. A failed, interrupted, unknown or lost turn
+with no such evidence returns its provisional acknowledgements to unread.
+Wake mail is eligible for one automatic re-offer under the usual cooldown.
+A rejected, failed or cancelled SEND without a start leaves its rows unread
+and eligible for a later claim. Unknown SENDs without a start keep their binding. If no
 current-generation delivery qualifies, or the serialized
 `send` request including the complete rendered content and any unread
 remainder line exceeds `MAX_EVENT_BYTES`, the notice falls back to the
 count-only text and binds no rows; overflow never partially presents a batch.
-A prior presentation binding is reusable only when its command is missing or
-settled as `rejected`, `failed`, or `cancelled`, and the delivery remains
-unpresented. Active and `unknown` commands are never rebound. Command readback
-redacts inline notice text, and the Router strips its internal notice metadata
-before plugin dispatch. Unknown
+A prior presentation binding can be claimed again when its command is missing
+or settled as `rejected`, `failed`, or `cancelled`, or its accepted turn ended
+and its acknowledgement was rolled back. The delivery must remain unread and
+unpresented. The active and unknown gates still apply. Command readback
+redacts inline notice text. Deferred mail text is attached only to the native
+input and stays out of retained send arguments. The Router strips internal
+notice metadata before plugin dispatch. Unknown
 notice is not blindly retried;
 provider hold, pending request, current unknown gate and drain suppress new wake.
 A busy, waiting or input-pending mail recipient suppresses a new mail wake:
@@ -531,12 +545,12 @@ advisory self-copy is generated. Notices carry a short bounded diagnosis and poi
 the `x.user.agent.attention` event for details; they contain no native transcript or
 replay of the Agent's prompt or job.
 
-The 206 owner-sent advisory-attention messages retained by older versions can be
-previewed and purged by the owner-only `maintenance.purge_legacy_attention_advisories`
-operation. The default call reports an exact count across read and unread rows;
-applying requires that count and rechecks it atomically before deletion. The operation
-matches only `attention-*-advisory` threads sent by the owner, preserving regular mail
-and non-advisory attention escalations. See the [maintenance API](api.md) contract.
+The legacy advisory-attention messages retained by older versions can be previewed and
+purged by the owner-only `maintenance.purge_legacy_attention_advisories` operation. The
+default call reports an exact count across read and unread rows; applying requires that
+count and rechecks it atomically before deletion. Scheduled retention also removes
+expired unread advisories for terminal recipients using the same
+[legacy advisory provenance](core.md#retention). See the [maintenance API](api.md) contract.
 
 A completion digest (`swarm.digest`, see [api](api.md#waiting)) reuses the same
 ordinary queued mail and wake policy for a different purpose: exactly one coalesced

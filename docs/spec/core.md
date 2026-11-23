@@ -1117,14 +1117,18 @@ IS NULL`), however old: an undelivered digest is still live coordination.
 A re-registration of a pruned id reads `id_expired` through the write-id age
 rule, never a new row. An unset `commands_days` disables digest pruning.
 
-Prune acknowledged mail only: one bounded batch per pass of rows with
-`read_at` older than the `mail_days` window, oldest acknowledgement first.
-Never prune unread mail, however old. Mail rows always outlive the retry
-window plus twice the allowed clock-skew margin regardless of `mail_days`,
-so a removed delivery admitted with a skew-bounded write id reads
-`history_gap` through the shared absent-id age rule on its own mailbox's
-read paths; a retried ack over it succeeds as already acked. An unset
-`mail_days` disables mail pruning.
+Prune mail in bounded batches: acknowledged rows with `read_at` older than the
+`mail_days` window, oldest acknowledgement first, and legacy unread attention
+advisories whose `admitted_at` is older than that same cutoff and whose
+recipient Agent is terminal (`stopped`, `failed`, or `lost`). The unread
+advisories must match the explicit legacy purge provenance. The sender is
+`owner` or `swarm`, the thread matches `attention-*-advisory`, and the body
+matches the daemon's legacy report or recovery envelope for the recipient.
+Other unread mail is retained. Mail rows always outlive the retry window plus twice
+the allowed clock-skew margin regardless of `mail_days`, so a removed delivery
+admitted with a skew-bounded write id reads `history_gap` through the shared
+absent-id age rule on its own mailbox's read paths; a retried ack over it
+succeeds as already acked. An unset `mail_days` disables all mail pruning.
 
 Prune exited child process rows when the independent `processes_seconds` window
 is configured. The Store counts retained child observations and previously

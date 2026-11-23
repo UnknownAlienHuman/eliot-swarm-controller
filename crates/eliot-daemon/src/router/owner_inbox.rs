@@ -291,6 +291,7 @@ impl Router {
                 command.verb,
             ));
             let request = MailSendRequest {
+                wake: true,
                 id: ulid::Ulid::new().to_string(),
                 to: vec![issuer.to_owned()],
                 mode: MailMode::Queue,

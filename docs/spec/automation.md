@@ -622,6 +622,14 @@ and fingerprint before live admission and dispatch. This launch form requires li
 event processing. The binding is to the observed tree
 at those points. A reviewer reads the author's worktree, which can change during review.
 
+The recipe sets `include_patch_digest = true`. The daemon builds the existing
+`agent.patch_digest` summary under the rule's Owner or project authority, using the
+trigger's exact Agent generation, workspace, base and worktree fingerprint. If that
+snapshot is no longer current or cannot be bound, the rule does not launch. A digest
+whose own Git read is incomplete keeps its `complete` and `truncated` markers. The bounded
+summary is appended to the reviewer launch text (at most 12 KiB, within the ordinary
+64 KiB launch-text limit). The launch rechecks the fingerprint at dispatch.
+
 A second rule uses `inject` with `from_launch` set to the initiating rule ID.
 Swarm follows the linked initial SEND in that rule's namespace. It submits the
 complete retained final text and the original author turn via `soonest`, using
@@ -767,6 +775,11 @@ role. Neither accepts templates. Both may be omitted to use the routing default.
 `text` is optional; for event rules,
 its value is rendered once from the captured event context and frozen into the launch
 command. Timer launch uses the same action shape, but its optional text must be literal.
+An event launch with `require_worktree = true` and review text can set
+`include_patch_digest = true` on `turn.completed` or `project.worktree.check.passed`.
+Project rules can attach a digest for an author from their registered project.
+The digest uses the triggering worktree fingerprint, and the launch follows the
+existing live-only worktree guard.
 Optional `goal` is a partial Goal object and `no_policy` is a nonblank, one-line reason
 of at most 256 bytes with no control characters. Both are literal and map to the
 ordinary launch's `args.goal` and `args.no_policy`; `goal` fields override policy

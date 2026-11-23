@@ -524,6 +524,12 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
     if let Some(error) = response.workspace_recovery_error.as_deref() {
         println!("Workspace recovery: {error}");
     }
+    for issue in &response.profile_command_issues {
+        super::reads::print_profile_command_issue(issue);
+    }
+    if !response.profile_command_issues.is_empty() {
+        println!("Run swarm doctor for installed executables and profile repairs.");
+    }
     if let Some(crash) = response.previous_crash.as_ref() {
         println!("Previous crash: {}", crash.summary());
     }

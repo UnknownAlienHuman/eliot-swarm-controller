@@ -279,6 +279,7 @@ pub(crate) async fn run_msg(
             thread,
             reply_to,
             mode,
+            no_wake,
         }) => {
             let mode: MailMode = serde_json::from_value(Value::String(mode))
                 .map_err(|_| Failure::new(2, "mail mode must be queue, send, steer or inject"))?;
@@ -286,6 +287,7 @@ pub(crate) async fn run_msg(
                 id: mutation_id(id)?,
                 to,
                 mode,
+                wake: !no_wake,
                 text,
                 thread,
                 reply_to_delivery: reply_to,

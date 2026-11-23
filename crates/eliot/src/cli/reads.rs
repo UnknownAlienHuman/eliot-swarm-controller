@@ -15,7 +15,8 @@ use eliot_core::api::{
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
     EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessDoctorRequest,
     HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage, ObserveHeavyRequest,
-    ObserveHeavyResponse, TurnCounterMissing, UsageSummaryRequest, UsageSummaryResponse,
+    ObserveHeavyResponse, ProfileCommandIssue, TurnCounterMissing, UsageSummaryRequest,
+    UsageSummaryResponse,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
 use eliot_core::{AgentState, Error as CoreError};
@@ -580,6 +581,13 @@ fn inherited_identity_context() -> bool {
     .any(|name| std::env::var_os(name).is_some())
 }
 
+pub(crate) fn print_profile_command_issue(issue: &ProfileCommandIssue) {
+    println!(
+        "Profile {} ({}) is missing its configured executable {} (profiles.{}.cmd)",
+        issue.profile, issue.harness, issue.configured_cmd, issue.profile
+    );
+}
+
 pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
     println!(
         "{:<12} {:<9} {:<14} {:<16} {:<5} DOC",
@@ -603,17 +611,32 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
         }
     }
     for issue in &response.profile_command_issues {
-        println!(
-            "Profile {} ({}): configured executable is missing: {}",
-            issue.profile, issue.harness, issue.configured_cmd
-        );
-        if let Some(replacement) = &issue.replacement {
-            let version = replacement.version.as_deref().unwrap_or("version unknown");
-            println!("  installed replacement: {} ({version})", replacement.cmd);
-        } else {
-            println!("  no installed replacement was discovered");
+        print_profile_command_issue(issue);
+        let harness = response
+            .harnesses
+            .iter()
+            .find(|row| row.harness == issue.harness);
+        if let Some(harness) = harness {
+            println!("  adapter verified with {}", harness.verified_version);
         }
-        println!("  repair: omit cmd from this profile to follow the vendor installation");
+        match (&issue.replacement, harness) {
+            (Some(replacement), _) => {
+                let version = replacement.version.as_deref().unwrap_or("version unknown");
+                println!("  installed replacement {} ({version})", replacement.cmd);
+            }
+            (None, Some(harness)) if harness.installed => {
+                let version = harness.version.as_deref().unwrap_or("version unknown");
+                println!("  installed version {version}, replacement path unavailable");
+            }
+            (None, _) => println!(
+                "  no installed replacement found. Install or repair {} first.",
+                issue.harness
+            ),
+        }
+        println!(
+            "  repair: remove `cmd` from `[profiles.{}]` and save Profiles to follow the vendor installation.",
+            issue.profile
+        );
     }
     if response.owner_rules_check_unavailable {
         println!("Owner rules comparison unavailable");

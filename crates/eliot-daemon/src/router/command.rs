@@ -12,8 +12,8 @@ use super::{
 use crate::common::now_ms;
 use crate::router::plugin_host::PendingCommand;
 use eliot_core::{
-    Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
-    FrozenScriptRun, InjectPoint, Result, SecretPolicy, WorkspacePhase,
+    Agent, AgentState, Command, CommandState, Error, Event, FailureOrigin, FrozenScriptRun,
+    InjectPoint, Result, SecretPolicy, WorkspacePhase,
     api::{
         FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
     },
@@ -1185,7 +1185,13 @@ impl Router {
                             &binding.binding,
                             binding.startup.as_ref(),
                         )
-                        .map(|change| (change.value, Vec::new(), change.events)),
+                        .map(|change| {
+                            (
+                                change.value,
+                                eliot_store::SendInput::default(),
+                                change.events,
+                            )
+                        }),
                     None if command.verb == "run"
                         && self.inner.mode.load(Ordering::SeqCst) == MODE_FORCE =>
                     {
@@ -1236,21 +1242,19 @@ impl Router {
                             "force shutdown prevents coordination dispatch",
                         ))
                     }
-                    None if command.verb == "send" => {
-                        store.dispatch_with_context(id, now_ms()).map(|change| {
-                            (
-                                change.value.command,
-                                change.value.context_items,
-                                change.events,
-                            )
-                        })
-                    }
-                    None => store
-                        .dispatch(id, now_ms())
-                        .map(|change| (change.value, Vec::new(), change.events)),
+                    None if command.verb == "send" => store
+                        .dispatch_with_context(id, now_ms())
+                        .map(|change| (change.value.command, change.value.input, change.events)),
+                    None => store.dispatch(id, now_ms()).map(|change| {
+                        (
+                            change.value,
+                            eliot_store::SendInput::default(),
+                            change.events,
+                        )
+                    }),
                 };
                 let result = match dispatched {
-                    Ok((command, context, events)) => {
+                    Ok((command, input, events)) => {
                         // A retained Dispatched row carries no new commit event.
                         // Only the worker that made this transition may enqueue.
                         let fresh = command.state == CommandState::Dispatched
@@ -1258,7 +1262,7 @@ impl Router {
                         self.publish_locked(&events);
                         self.note_command_rejection(&command, &events);
                         let plugin = if fresh {
-                            self.enqueue_plugin_command(&store, &command, context)
+                            self.enqueue_plugin_command(&store, &command, input)
                         } else {
                             None
                         };
@@ -1296,7 +1300,7 @@ impl Router {
         &self,
         store: &eliot_store::Store,
         command: &Command,
-        context: Vec<ContextItem>,
+        input: eliot_store::SendInput,
     ) -> Option<Result<(Agent, PendingCommand)>> {
         if !matches!(
             command.verb.as_str(),
@@ -1331,6 +1335,9 @@ impl Router {
             return None;
         }
         let mut command = command.clone();
+        if let Some(text) = input.text_with_mail {
+            command.args["text"] = Value::String(text);
+        }
         if command.verb == "inject" {
             let Some(text) = command.args.get("text").and_then(Value::as_str) else {
                 return Some(Err(Error::new("invalid", "context delivery requires text")));
@@ -1350,7 +1357,7 @@ impl Router {
         let pending = self
             .inner
             .plugin_host
-            .enqueue_command(&agent, command, context);
+            .enqueue_command(&agent, command, input.context_items);
         Some(pending.map(|pending| (agent, pending)))
     }
 

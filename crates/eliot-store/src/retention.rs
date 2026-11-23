@@ -1,6 +1,6 @@
 //! Bounded physical retention: expired event-prefix pruning, atomic
-//! command/child-set cleanup, exited child process pruning, and
-//! acknowledged-mail pruning through the one Store writer.
+//! command/child-set cleanup, exited child process pruning, and mail pruning
+//! through the one Store writer.
 //!
 //! Owning contract: docs/spec/core.md#retention. Deletion is silent (no events
 //! are emitted) and never replays an effect: event pruning stays below every
@@ -8,8 +8,8 @@
 //! `rule_history_coverage.pruned_through` in
 //! the same transaction, while command/write pruning keeps open work, the
 //! retry window, and every row a live projection still references. Mail
-//! pruning deletes only acknowledged rows older than the mail window; unread
-//! mail is never pruned.
+//! pruning keeps ordinary unread mail; it also removes only expired legacy
+//! advisory rows for terminal Agents.
 
 use super::*;
 
@@ -184,7 +184,8 @@ impl Store {
     /// expired contiguous prefix below every live cursor; exited child rows
     /// use their own shorter cutoff and remain protected while live or while
     /// their generation holds capacity. Command pruning removes whole closed
-    /// child-sets leaf-first; mail pruning never removes unread rows. Event
+    /// child-sets leaf-first; mail pruning preserves ordinary unread rows and
+    /// removes only expired legacy advisory rows for terminal Agents. Event
     /// identities, projections, source recovery state, timers, and the event
     /// allocator are preserved.
     pub fn prune_retention(
@@ -619,12 +620,12 @@ impl Store {
         Ok((deleted as i64, examined, more))
     }
 
-    /// Delete one bounded batch of acknowledged messages whose acknowledgement
-    /// is older than the mail cutoff, oldest ack first. Unread rows
-    /// (`read_at IS NULL`) never match, however old. Deletion is silent: no
-    /// events are emitted. Later reads of a removed delivery return
-    /// `history_gap` through the shared absent-id age rule, and a retried ack
-    /// treats it as already acked.
+    /// Delete one bounded mail batch: acknowledged messages whose read time is
+    /// older than the mail cutoff, followed by legacy unread advisory messages
+    /// admitted before that cutoff for terminal Agents. Other unread rows never
+    /// match. Deletion is silent: no events are emitted. Later reads of a
+    /// removed delivery return `history_gap` through the shared absent-id age
+    /// rule, and a retried ack treats it as already acked.
     fn prune_mail(&mut self, cutoff: i64) -> Result<i64> {
         let tx = self
             .connection
@@ -634,6 +635,55 @@ impl Store {
             &format!("DELETE FROM messages WHERE delivery_id IN ({PRUNE_MAIL_SELECT})"),
             params![cutoff, MAX_PAGE_ENTRIES as i64],
         ));
+        let advisory_limit = MAX_PAGE_ENTRIES.saturating_sub(deleted);
+        let mut advisory_cursor = self.retention_attention_advisory_cursor;
+        let mut advisory_deleted = 0;
+        if advisory_limit > 0 {
+            let (after_time, after_id) = advisory_cursor.unwrap_or((i64::MIN, i64::MIN));
+            let candidates: Vec<(i64, i64)> = {
+                let mut statement = tx
+                    .prepare(&format!(
+                        "SELECT admitted_at, id FROM messages
+                         INDEXED BY messages_prune_legacy_advisory_unread
+                         WHERE read_at IS NULL
+                           AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
+                           AND admitted_at <= ?1
+                           AND (admitted_at, id) > (?2, ?3)
+                         ORDER BY admitted_at, id LIMIT ?4"
+                    ))
+                    .map_err(sql_error)?;
+                statement
+                    .query_map(
+                        params![cutoff, after_time, after_id, advisory_limit as i64],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(sql_error)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let candidate_ids: Vec<i64> = candidates.iter().map(|&(_, id)| id).collect();
+            if !candidate_ids.is_empty() {
+                advisory_deleted = db!(tx.execute(
+                    &format!(
+                        "DELETE FROM messages
+                         WHERE id IN (SELECT CAST(value AS INTEGER) FROM json_each(?1))
+                           AND read_at IS NULL
+                           AND {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}
+                           AND admitted_at <= ?2
+                           AND EXISTS (
+                               SELECT 1 FROM agents a
+                               WHERE a.id = messages.recipient
+                                 AND a.state IN ('stopped', 'failed', 'lost')
+                           )"
+                    ),
+                    params![encode_json(&candidate_ids)?, cutoff],
+                ));
+            }
+            advisory_cursor = candidates
+                .last()
+                .filter(|_| candidates.len() == advisory_limit)
+                .copied();
+        }
         // A spent attention wake lives only as long as mail on its thread:
         // once every message on the thread is gone, the bound can go. A new
         // mail on the same thread (same incident re-mailed) then wakes again.
@@ -646,7 +696,8 @@ impl Store {
             [],
         ));
         commit_transaction(tx, &self.write_faulted)?;
-        Ok(deleted as i64)
+        self.retention_attention_advisory_cursor = advisory_cursor;
+        Ok((deleted + advisory_deleted) as i64)
     }
 }
 
@@ -667,7 +718,7 @@ fn read_passive_checkpoint(connection: &Connection) -> Result<(i64, i64, bool)> 
 /// first. Shared with the plan test so the asserted plan cannot drift from
 /// the executed query.
 const PRUNE_MAIL_SELECT: &str = "SELECT delivery_id FROM messages
-             WHERE read_at IS NOT NULL AND read_at <= ?1
+             WHERE read_at IS NOT NULL AND read_at <= ?1 AND inline_ack_pending = 0
              ORDER BY read_at, delivery_id LIMIT ?2";
 
 impl SubtreeMember {

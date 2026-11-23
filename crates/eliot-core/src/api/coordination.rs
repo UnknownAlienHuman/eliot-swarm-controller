@@ -127,6 +127,11 @@ pub struct MailSendRequest {
         description = "Defaults to queue. Only queue is implemented; send/steer/inject parse but return unsupported."
     )]
     pub mode: MailMode,
+    #[serde(default = "default_mail_wake")]
+    #[schemars(
+        description = "Defaults to true. False defers inline delivery to an ordinary recipient turn and cannot wake the recipient."
+    )]
+    pub wake: bool,
     #[schemars(extend("x-maxBytes" = MAX_MAIL_TEXT_BYTES), description = "Mail body, at most 32768 UTF-8 bytes, no NUL; empty text is allowed.")]
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,6 +142,10 @@ pub struct MailSendRequest {
         description = "Exact <write-id>/<recipient-agent> delivery id, at most 512 bytes, no NUL."
     )]
     pub reply_to_delivery: Option<String>,
+}
+
+const fn default_mail_wake() -> bool {
+    true
 }
 
 impl MailSendRequest {
