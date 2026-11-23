@@ -548,7 +548,7 @@ struct EventProcessor {
     uncertain_native_starts: HashSet<String>,
     uncertain_native_turns: HashSet<String>,
     active_native_command_id: Option<String>,
-    latest_turn_usage: Option<(String, eliot_core::TurnUsage)>,
+    turn_completion_usage: Option<(String, eliot_core::TurnUsage)>,
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -885,7 +885,7 @@ impl EventProcessor {
             uncertain_native_starts: HashSet::new(),
             uncertain_native_turns: HashSet::new(),
             active_native_command_id: None,
-            latest_turn_usage: None,
+            turn_completion_usage: None,
             gap_number: 0,
             accept_frames: true,
             planned_stop: false,
@@ -980,7 +980,14 @@ impl EventProcessor {
                 reply,
             } => {
                 let result = self
-                    .associate_turn(command_id, native_command_id, turn_id, context, effort, model)
+                    .associate_turn(
+                        command_id,
+                        native_command_id,
+                        turn_id,
+                        context,
+                        effort,
+                        model,
+                    )
                     .await;
                 let _ = reply.send(result);
                 true
@@ -1144,7 +1151,7 @@ impl EventProcessor {
         let had_turn = self.status.active_turn_id.take().is_some();
         self.status.active_command_id = None;
         self.active_native_command_id = None;
-        self.latest_turn_usage = None;
+        self.turn_completion_usage = None;
         if had_turn {
             self.pending_requests.clear();
             self.observe();
@@ -1341,8 +1348,10 @@ impl EventProcessor {
             if let Some(turn_id) = turn_id {
                 self.uncertain_native_turns.insert(turn_id);
             }
-            self.record_gap("Muse emitted the exact turn/start after proving it was not dispatched")
-                .await?;
+            self.record_gap(
+                "Muse emitted the exact turn/start after proving it was not dispatched",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1353,7 +1362,10 @@ impl EventProcessor {
         {
             return Ok(());
         }
-        let expected = self.pending_native_starts.remove(native_command_id).is_some();
+        let expected = self
+            .pending_native_starts
+            .remove(native_command_id)
+            .is_some();
         if !expected && !self.uncertain_native_starts.contains(native_command_id) {
             return Err(Error::new(
                 "source_integrity",
@@ -1367,8 +1379,10 @@ impl EventProcessor {
             if let Some(turn_id) = turn_id {
                 self.uncertain_native_turns.insert(turn_id);
             }
-            self.record_gap("Muse turn/start result is unknown; buffered native facts were discarded")
-                .await?;
+            self.record_gap(
+                "Muse turn/start result is unknown; buffered native facts were discarded",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1379,9 +1393,13 @@ impl EventProcessor {
                 return None;
             };
             (method == "turn/started"
-                && params.get("commandId").and_then(Value::as_str)
-                    == Some(native_command_id))
-            .then(|| params.get("turnId").and_then(Value::as_str).map(str::to_owned))
+                && params.get("commandId").and_then(Value::as_str) == Some(native_command_id))
+            .then(|| {
+                params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
             .flatten()
         });
         let found_start = self.buffer.iter().any(|buffered| {
@@ -1402,9 +1420,9 @@ impl EventProcessor {
                     if method == "turn/started"
                         && params.get("commandId").and_then(Value::as_str)
                             == Some(native_command_id));
-            let turn_matches = turn_id.as_deref().is_some_and(|turn_id| {
-                buffered_frame_turn_id(&buffered.frame) == Some(turn_id)
-            });
+            let turn_matches = turn_id
+                .as_deref()
+                .is_some_and(|turn_id| buffered_frame_turn_id(&buffered.frame) == Some(turn_id));
             if !start_matches && !turn_matches {
                 retained_bytes = retained_bytes.saturating_add(buffered.size);
                 retained.push_back(buffered);
@@ -1557,11 +1575,11 @@ impl EventProcessor {
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = Some(native_command_id.clone());
         if self
-            .latest_turn_usage
+            .turn_completion_usage
             .as_ref()
             .is_none_or(|(sample_turn_id, _)| sample_turn_id != &turn_id)
         {
-            self.latest_turn_usage = None;
+            self.turn_completion_usage = None;
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(session_id, &turn_id, &turn_id, "turn.started")?;
@@ -1589,7 +1607,10 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn start_native_turn(&mut self, notification: NativeTurnStartedNotification) -> Result<()> {
+    async fn start_native_turn(
+        &mut self,
+        notification: NativeTurnStartedNotification,
+    ) -> Result<()> {
         if !self.status.ready
             || self.status.active_turn_id.is_some()
             || notification.command_id.trim().is_empty()
@@ -1604,7 +1625,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = Some(notification.command_id);
-        self.latest_turn_usage = None;
+        self.turn_completion_usage = None;
         let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
         self.commit_event(
             "turn.started",
@@ -3140,9 +3161,8 @@ impl EventProcessor {
     }
 
     /// Fold session cumulative counters and estimated cost from one
-    /// `session/tokenUsage` event into the session snapshot. Retain only its
-    /// latest exact-turn raw sample separately for a terminal fallback; never
-    /// sum per-completion samples into turn usage.
+    /// `session/tokenUsage` event into the session snapshot. Separately
+    /// aggregate deduplicated model completions that identify this exact turn.
     async fn observe_session_token_usage(&mut self, params: Value) -> Result<()> {
         let notification: NativeSessionTokenUsageNotification = serde_json::from_value(params)
             .map_err(|_| {
@@ -3155,12 +3175,29 @@ impl EventProcessor {
         if let Some(turn_id) = notification.turn_id.as_deref()
             && (self.status.active_turn_id.as_deref() == Some(turn_id)
                 || self.pending_native_starts.contains_key(turn_id))
+            && notification
+                .view_cursor
+                .as_deref()
+                .is_some_and(|cursor| !cursor.trim().is_empty())
         {
-            self.latest_turn_usage = notification
-                .usage
-                .as_ref()
-                .and_then(turn_usage_from_native)
-                .map(|usage| (turn_id.to_owned(), usage));
+            if let Some(sample) = notification.usage.as_ref().and_then(turn_usage_from_native) {
+                match self.turn_completion_usage.as_mut() {
+                    Some((id, total)) if id == turn_id => {
+                        let add = |previous: Option<i64>, next: Option<i64>| {
+                            previous.zip(next).and_then(|(a, b)| a.checked_add(b))
+                        };
+                        total.input_tokens = add(total.input_tokens, sample.input_tokens);
+                        total.output_tokens = add(total.output_tokens, sample.output_tokens);
+                        total.reasoning_tokens =
+                            add(total.reasoning_tokens, sample.reasoning_tokens);
+                        total.cache_read_tokens =
+                            add(total.cache_read_tokens, sample.cache_read_tokens);
+                        total.cache_write_tokens =
+                            add(total.cache_write_tokens, sample.cache_write_tokens);
+                    }
+                    _ => self.turn_completion_usage = Some((turn_id.to_owned(), sample)),
+                }
+            }
         }
         let Some(merged) =
             session_usage_from_token_usage(&notification, self.session_usage.as_ref())
@@ -3584,7 +3621,7 @@ impl EventProcessor {
         // usage bytes. Absent/malformed usage never blocks or gaps this
         // terminal; it simply leaves `data.usage` unset.
         let usage = if notification.usage.is_none() {
-            self.latest_turn_usage
+            self.turn_completion_usage
                 .as_ref()
                 .filter(|(turn_id, _)| turn_id == &notification.turn_id)
                 .map(|(_, usage)| usage.clone())
@@ -3640,7 +3677,7 @@ impl EventProcessor {
             self.status.model_stop_at = None;
         }
         self.active_native_command_id = None;
-        self.latest_turn_usage = None;
+        self.turn_completion_usage = None;
         self.messages = TurnMessages::default();
         self.status.clear_stale_idle_latch();
         // A definite Store rejection leaves degraded coverage and requires a
@@ -4051,7 +4088,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
         self.active_native_command_id = None;
-        self.latest_turn_usage = None;
+        self.turn_completion_usage = None;
         self.messages = TurnMessages::default();
         Ok(())
     }

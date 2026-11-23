@@ -207,11 +207,10 @@ cache reads from the cumulative prompt total. The server-computed
 estimated `cost.usd` maps with unit `usd_estimate`, and each context
 notification replaces both context counters (absent members become null,
 never keeping the previous window). Missing counters stay null. When
-`turn/completed.usage` is absent, the latest valid `session/tokenUsage.usage`
-sample is a turn-usage fallback only when its `turnId` exactly matches that
-active turn. It remains one model-completion sample; samples and session
-cumulative totals are never summed into turn usage. If the exact-turn sample
-is unavailable, turn usage stays null.
+`turn/completed.usage` is absent, observed `session/tokenUsage.usage` model
+completions with the exact turn id and a replay-deduplicated view identity supply
+the turn's fallback counters. A counter missing on an observed completion stays
+unavailable in the aggregate. Session cumulative totals remain session-scoped.
 
 ## Observation and recovery
 
