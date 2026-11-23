@@ -689,7 +689,7 @@ fn reserve_switch_tx(
         .or_else(|| {
             source_checkout_root
                 .as_deref()
-                .map(core::workspace_path_key)
+                .map(|root| core::workspace_path_key(root).into_owned())
         });
     args[SOURCE_CHECKOUT] = json!(source.workspace);
     args[SOURCE_CHECKOUT_ROOT] = json!(source_checkout_root);
@@ -1224,7 +1224,7 @@ impl Store {
                 continuation,
                 requested_by,
                 ..
-            } = decode_switch(parent.args)?;
+            } = decode_switch(parent.args.clone())?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
             if agent.workspace != source_checkout {
                 return Err(Error::new(

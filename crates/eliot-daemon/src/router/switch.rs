@@ -8,7 +8,7 @@ use eliot_core::api::{
 async fn canonical_checkout_identity(workspace: &str) -> Result<(String, String)> {
     let git = crate::workspace_git::WorkspaceGit::new()?;
     let (root, _, _) = git.discover_repository_identity(workspace).await?;
-    let key = eliot_core::workspace_path_key(&root);
+    let key = eliot_core::workspace_path_key(&root).into_owned();
     Ok((root, key))
 }
 
@@ -57,7 +57,7 @@ impl Router {
                 agent,
                 generation,
                 workspace,
-                eliot_core::workspace_path_key(&checkout),
+                eliot_core::workspace_path_key(&checkout).into_owned(),
             ));
         }
         Ok(snapshot)
@@ -461,7 +461,7 @@ impl Router {
             let (target_checkout_root, target_checkout_key) = match prepared.workspace.as_ref() {
                 Some(workspace) => {
                     let root = workspace.worktree_path.clone();
-                    let key = eliot_core::workspace_path_key(&root);
+                    let key = eliot_core::workspace_path_key(&root).into_owned();
                     (root, key)
                 }
                 None => {

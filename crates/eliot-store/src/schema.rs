@@ -1,9 +1,11 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = WORK_TRUTH_INTENT_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = HANDOFF_BUDGET_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
+const SWITCH_CHECKOUT_VERSION: i64 = 115;
+const HANDOFF_BUDGET_VERSION: i64 = 116;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2730,6 +2732,30 @@ impl Store {
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
+        }
+        for (version, sql) in [
+            (
+                SWITCH_CHECKOUT_VERSION,
+                include_str!("../migrations/switch_checkout_owners.sql"),
+            ),
+            (
+                HANDOFF_BUDGET_VERSION,
+                include_str!("../migrations/automatic_handoff_budget.sql"),
+            ),
+        ] {
+            if current < version {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql_error)?;
+                tx.execute_batch(sql).map_err(sql_error)?;
+                tx.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?1)",
+                    [version],
+                )
+                .map_err(sql_error)?;
+                tx.commit().map_err(sql_error)?;
+            }
         }
         Ok(())
     }

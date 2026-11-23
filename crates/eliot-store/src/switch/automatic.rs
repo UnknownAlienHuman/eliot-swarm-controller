@@ -155,12 +155,6 @@ fn insert_lineage_generation_tx(
 }
 
 impl Store {
-    /// Durable read gate used before routing; reservation repeats it atomically.
-    pub fn automatic_handoff_budget_available(&self, agent: &Agent, now: i64) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        handoff_budget_available(&self.connection, agent, now)
-    }
-
     /// Carry one task's continuation lineage across a committed switch.
     pub(crate) fn transfer_handoff_lineage_tx(
         tx: &Transaction<'_>,
@@ -602,7 +596,8 @@ impl Store {
                 commands: owed.commands,
                 launch: SwitchLaunch::default(),
             };
-            if switch_blocker(&tx, &request)?.is_some() {
+            let checkout_key = agent.workspace.as_deref().map(core::workspace_path_key);
+            if switch_blocker(&tx, &request, checkout_key.as_deref())?.is_some() {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(none());
             }
@@ -655,7 +650,7 @@ impl Store {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(none());
             }
-            let mut change = reserve_switch_tx(&tx, &request, args, &digest, now)?;
+            let mut change = reserve_switch_tx(&tx, &request, args, &digest, now, None)?;
             change.events.push(insert_daemon_event(
                 &tx,
                 now,

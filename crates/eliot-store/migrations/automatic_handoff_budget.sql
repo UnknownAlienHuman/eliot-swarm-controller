@@ -28,5 +28,3 @@ CREATE TABLE automatic_handoff_budgets (
             AND last_generation IS NOT NULL AND last_updated_at IS NOT NULL)
     )
 );
-
-INSERT INTO schema_migrations(version) VALUES (109);
