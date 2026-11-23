@@ -117,9 +117,15 @@ impl Checkpoints {
         if !metadata.is_file() {
             return Vec::new();
         }
-        if self.needs_seed || self.was_rewritten(&mut file, &metadata) {
+        if self.needs_seed {
             self.seed_file(&mut file, &metadata);
             return Vec::new();
+        }
+        if self.was_rewritten(&mut file, &metadata) {
+            // The native writer can replace a transcript snapshot. Rescan
+            // from byte zero while keeping the highest observed step so
+            // rewritten history cannot replay a card or hide a later row.
+            self.reset_cursor();
         }
 
         let checkpoints = self.scan_to(&mut file, metadata.len(), true);
@@ -147,17 +153,21 @@ impl Checkpoints {
     /// Establish a no-replay baseline. If a trailing row is incomplete, keep
     /// its bytes and suppress that row if it is completed after the seed.
     fn seed_file(&mut self, file: &mut File, metadata: &Metadata) {
-        self.offset = 0;
+        self.reset_cursor();
         self.last_step = None;
+        self.scan_to(file, metadata.len(), false);
+        self.skip_partial_row = !self.line.is_empty() || self.discard_line;
+        self.needs_seed = self.offset < metadata.len();
+        self.remember_file(file, metadata);
+    }
+
+    fn reset_cursor(&mut self) {
+        self.offset = 0;
         self.line.clear();
         self.discard_line = false;
         self.skip_partial_row = false;
         self.prefix_anchor = None;
         self.cursor_anchor.clear();
-        self.scan_to(file, metadata.len(), false);
-        self.skip_partial_row = !self.line.is_empty() || self.discard_line;
-        self.needs_seed = false;
-        self.remember_file(file, metadata);
     }
 
     fn was_rewritten(&self, file: &mut File, metadata: &Metadata) -> bool {

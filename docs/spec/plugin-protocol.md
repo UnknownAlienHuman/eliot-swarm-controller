@@ -619,9 +619,11 @@ affected source history incomplete. An unresolved gap elsewhere fences the strea
 Antigravity reports completed system checkpoints from the exact owned native
 conversation transcript. The isolated root supplies the path for private
 profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
-callback for the live conversation. ACP prompt settlement triggers the bounded
-readback. The fact carries the native checkpoint index, and the task card waits
-for the next input. The transcript summary stays in the native store.
+callback that names the exact conversation transcript under the profile root.
+ACP prompt settlement reads complete rows forward from the retained byte offset.
+Resume establishes a baseline before reporting new checkpoints. The fact carries
+the native checkpoint index, and the task card waits for the next input.
+The transcript summary stays in the native store.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a

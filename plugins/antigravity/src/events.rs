@@ -2337,15 +2337,14 @@ async fn handle_hook_callback(
         if origin_is_live && state.hook_binding_is_live(&binding) {
             if state.checkpoints.is_none()
                 && let Some(path) = callback.input().transcript_path.as_deref()
+                && let Some(root) = state.checkpoint_root.as_deref()
             {
-                if let Some(root) = state.checkpoint_root.clone() {
-                    state.checkpoints = checkpoints::Checkpoints::from_hook(
-                        std::path::Path::new(path),
-                        &root,
-                        &state.conversation,
-                        state.checkpoint_resume,
-                    );
-                }
+                state.checkpoints = checkpoints::Checkpoints::from_hook(
+                    std::path::Path::new(path),
+                    root,
+                    &state.conversation,
+                    state.checkpoint_resume,
+                );
             }
             Some((
                 state.take_pending_steer(&binding.turn),
