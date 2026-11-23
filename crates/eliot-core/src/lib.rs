@@ -266,6 +266,8 @@ pub enum WorkspaceRemovalOutcome {
         branch_retained: bool,
         #[serde(default, skip_serializing_if = "is_false")]
         directory_absent_before_remove: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        branch_absent_before_remove: bool,
     },
     /// Proven no destructive effect: the registered checkout remains intact.
     Failed {

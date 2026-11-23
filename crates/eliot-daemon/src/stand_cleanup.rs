@@ -8,7 +8,7 @@ use crate::operator::{
 };
 use crate::platform::script_file::directory_identity;
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
-use crate::workspace_git::{WorkspaceGit, containment::branch_rev_parse};
+use crate::workspace_git::{RemovalBranch, WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
 use eliot_core::{
     Error, Result, WorkspacePreparation, WorkspaceRemovalOutcome, workspace_path_key,
@@ -2272,7 +2272,12 @@ async fn remove_guarded_stand_worktree(
         };
     }
 
-    match timeout_at(deadline, Box::pin(git.inspect_removal(&rec.preparation))).await {
+    match timeout_at(
+        deadline,
+        Box::pin(git.inspect_removal(&rec.preparation, RemovalBranch::At(&tip))),
+    )
+    .await
+    {
         Ok(WorkspaceRemovalOutcome::Removed { .. }) => GuardedOutcome::Removed,
         Ok(WorkspaceRemovalOutcome::Unknown { code, .. }) => GuardedOutcome::Unknown {
             code,

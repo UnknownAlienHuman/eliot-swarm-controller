@@ -1730,21 +1730,25 @@ impl Router {
     pub(crate) async fn reconcile_missing_worktrees(
         &self,
         after: &mut Option<String>,
+        in_flight: &mut Option<String>,
     ) -> Result<()> {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
-        let (workspaces, _, more) = self
-            .inner
-            .store
-            .lock()
-            .await
-            .list_managed_workspaces(after.as_deref(), 64)?;
-        *after = workspaces
-            .last()
-            .filter(|_| more)
-            .map(|row| row.agent.clone());
+        let (workspaces, _, more) = {
+            let store = self.inner.store.lock().await;
+            if let Some(id) = in_flight.as_deref()
+                && store.get_command(id)?.is_some_and(|command| {
+                    !command.state.is_terminal() && command.state != CommandState::Unknown
+                })
+            {
+                return Ok(());
+            }
+            *in_flight = None;
+            store.list_managed_workspaces(after.as_deref(), 64)?
+        };
         for workspace in workspaces {
+            *after = Some(workspace.agent.clone());
             if workspace.phase != WorkspacePhase::Ready
                 || !matches!(
                     crate::workspace_git::observe_worktree_absence(Path::new(
@@ -1785,8 +1789,13 @@ impl Router {
                     Err(error) => return Err(error),
                 }
             };
+            *in_flight = Some(admission.command.id.clone());
             self.schedule_admission(&admission);
             self.signal_progress();
+            return Ok(());
+        }
+        if !more {
+            *after = None;
         }
         Ok(())
     }

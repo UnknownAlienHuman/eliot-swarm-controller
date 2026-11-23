@@ -35,7 +35,7 @@ use eliot_core::{
     parse_agent_id,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const RESOLVE_COMMAND_METHOD: &str = "command.resolve";
 const RESOLVE_TURN_METHOD: &str = "turn.resolve";
@@ -63,6 +63,10 @@ pub struct ConfigureReadback {
 enum CommandReadback<'a> {
     Configure(&'a ConfigureReadback),
     WorkspaceAbsent(&'a WorkspacePreparation),
+    RemovalAbsent(
+        &'a WorkspacePreparation,
+        &'a eliot_core::WorkspaceRemovalOutcome,
+    ),
 }
 
 impl Store {
@@ -139,6 +143,7 @@ impl Store {
                 &record,
                 &command,
                 CommandState::Applied,
+                None,
                 now,
             )?);
             if let Some(turn_id) = &stop.interrupted_turn {
@@ -215,6 +220,21 @@ impl Store {
             principal,
             request,
             Some(CommandReadback::WorkspaceAbsent(preparation)),
+            now,
+        )
+    }
+
+    pub fn resolve_command_with_absent_removal(
+        &mut self,
+        request: &CommandResolveRequest,
+        preparation: &WorkspacePreparation,
+        outcome: &eliot_core::WorkspaceRemovalOutcome,
+        now: i64,
+    ) -> Result<Change<CommandResolveResponse>> {
+        self.resolve_command_with_proof(
+            "owner",
+            request,
+            Some(CommandReadback::RemovalAbsent(preparation, outcome)),
             now,
         )
     }
@@ -390,7 +410,34 @@ impl Store {
                 }
             }
         }
-        let mut events = vec![resolve_command_tx(&tx, &record, request, state, now)?];
+        let mut events = Vec::new();
+        let removal_outcome =
+            if state == CommandState::Applied && record.command.verb == "worktree.remove" {
+                let Some(CommandReadback::RemovalAbsent(preparation, outcome)) = readback else {
+                    return Err(Error::new(
+                        "bad_state",
+                        "removal completion requires verified legacy no-write absence",
+                    ));
+                };
+                Some(super::workspace::resolve_legacy_removal_tx(
+                    &tx,
+                    &record,
+                    preparation,
+                    outcome,
+                    now,
+                    &mut events,
+                )?)
+            } else {
+                None
+            };
+        events.push(resolve_command_tx(
+            &tx,
+            &record,
+            request,
+            state,
+            removal_outcome,
+            now,
+        )?);
         if workspace_launch && let Some(agent_num) = record.target {
             super::capacity::release_unstarted_tx(&tx, agent_num, 1, &request.command_id)?;
             super::lifecycle::apply_settle_agent_transition(
@@ -830,13 +877,13 @@ fn resolve_command_tx(
     record: &CommandRecord,
     request: &CommandResolveRequest,
     state: CommandState,
+    outcome: Option<Value>,
     now: i64,
 ) -> Result<eliot_core::Event> {
     let command_id = record.command.id.as_str();
-    let outcome = json!({
-        "resolution_source": OWNER_ASSERTION,
-        "reason": request.reason,
-    });
+    let mut outcome = outcome.unwrap_or_else(|| json!({}));
+    outcome["resolution_source"] = json!(OWNER_ASSERTION);
+    outcome["reason"] = json!(request.reason);
     if encode_json(&outcome)?.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
             "frame_too_large",

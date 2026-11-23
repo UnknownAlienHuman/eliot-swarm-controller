@@ -69,10 +69,11 @@ async fn run_missing_worktree_reconciliation(
     let mut ticker = tokio::time::interval(Duration::from_secs(15));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut after = None;
+    let mut in_flight = None;
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                if let Err(error) = router.reconcile_missing_worktrees(&mut after).await {
+                if let Err(error) = router.reconcile_missing_worktrees(&mut after, &mut in_flight).await {
                     logging::record(&policy, "daemon.missing_worktree_reconciliation_failed", &[], Some(&error));
                 }
             }

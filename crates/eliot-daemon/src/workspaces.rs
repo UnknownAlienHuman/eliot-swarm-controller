@@ -9,7 +9,7 @@ use crate::{
     platform::{CustodyObserver, OwnedChild, worktree_guard::WorktreeWriteGuard},
     router::SecretSet,
     setup,
-    workspace_git::{MissingWorktreeRemoval, WorkspaceGit},
+    workspace_git::{MissingWorktreeRemoval, RemovalBranch, WorkspaceGit},
 };
 use eliot_core::api::{CommandResolveRequest, CommandResolveResponse};
 use eliot_core::is_start_verb;
@@ -286,7 +286,7 @@ impl WorkspaceManager {
         result
     }
 
-    pub(crate) async fn resolve_failed_launch(
+    pub(crate) async fn resolve_absent_workspace(
         &self,
         request: &CommandResolveRequest,
         preparation: &WorkspacePreparation,
@@ -307,26 +307,54 @@ impl WorkspaceManager {
             if preparation.phase != WorkspacePhase::Unknown {
                 return Err(problem("bad_state", "workspace preparation is not unknown"));
             }
-            if !workspace_git_effect_quiescent(&slot) {
+            let removal = request.resolution == eliot_core::api::CommandResolution::Applied;
+            let quiescent = if removal {
+                // An exact no-dispatch marker proves custody for this removal
+                // even when the host cannot establish prior process exit.
+                slot.active.lock_recover().is_none()
+                    && preparation.outcome.as_ref().is_some_and(|outcome| {
+                        eliot_store::Store::is_legacy_missing_branch_removal(
+                            outcome,
+                            &request.command_id,
+                        )
+                    })
+            } else {
+                workspace_git_effect_quiescent(&slot)
+            };
+            if !quiescent {
                 return Err(problem(
                     "bad_state",
                     "workspace process custody has not drained",
                 ));
             }
-            if !WorkspaceGit::new()?.creation_is_absent(preparation).await? {
-                return Err(problem(
-                    "bad_state",
-                    "workspace path, Git registration, or branch still exists",
-                ));
-            }
+            let git = WorkspaceGit::new()?;
+            let removal = if removal {
+                Some(git.verify_absent_removal(preparation).await?)
+            } else {
+                if !git.creation_is_absent(preparation).await? {
+                    return Err(problem(
+                        "bad_state",
+                        "workspace path, Git registration, or branch still exists",
+                    ));
+                }
+                None
+            };
             let mut store = self.inner.store.lock().await;
             crate::router::owner_inbox::check_binding(&store)?;
-            let change = store.resolve_command_with_absent_workspace(
-                "owner",
-                request,
-                preparation,
-                now_ms(),
-            )?;
+            let change = match removal.as_ref() {
+                Some(outcome) => store.resolve_command_with_absent_removal(
+                    request,
+                    preparation,
+                    outcome,
+                    now_ms(),
+                )?,
+                None => store.resolve_command_with_absent_workspace(
+                    "owner",
+                    request,
+                    preparation,
+                    now_ms(),
+                )?,
+            };
             self.publish(&change.events);
             Ok(change.value)
         }
@@ -402,6 +430,7 @@ impl WorkspaceManager {
                                     store.begin_workspace_git_effect(
                                         command_id,
                                         &current,
+                                        None,
                                         now_ms(),
                                     )?
                                 };
@@ -855,13 +884,27 @@ impl WorkspaceManager {
             }
             Ok(Some(MissingWorktreeRemoval {
                 parent,
+                branch_tip,
                 command: mutator,
             })) => {
+                let branch = branch_tip
+                    .as_deref()
+                    .map_or(RemovalBranch::Absent, RemovalBranch::At);
                 let outcome = if let Some(mutator) = mutator {
-                    self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
-                        .await
+                    let Some(tip) = branch_tip.as_deref() else {
+                        return removal_unknown("workspace_remove_branch_unconfirmed");
+                    };
+                    self.run_removal_mutator(
+                        command,
+                        preparation,
+                        slot,
+                        git,
+                        (mutator, tip),
+                        deadline,
+                    )
+                    .await
                 } else {
-                    git.inspect_removal(preparation).await
+                    git.inspect_removal(preparation, branch).await
                 };
                 drop(parent);
                 outcome
@@ -1011,8 +1054,15 @@ impl WorkspaceManager {
             Ok(Err(error)) => return removal_preflight_error(&error, "git_prepare"),
             Err(_) => return removal_unknown("workspace_remove_deadline"),
         };
-        self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
-            .await
+        self.run_removal_mutator(
+            command,
+            preparation,
+            slot,
+            git,
+            (mutator, &preflight.tip),
+            deadline,
+        )
+        .await
     }
 
     #[expect(
@@ -1025,7 +1075,7 @@ impl WorkspaceManager {
         preparation: &WorkspacePreparation,
         slot: &Arc<Slot>,
         git: &WorkspaceGit,
-        mutator: Command,
+        (mutator, expected_tip): (Command, &str),
         deadline: Instant,
     ) -> WorkspaceRemovalOutcome {
         let gate = slot.gate.clone().lock_owned().await;
@@ -1038,6 +1088,7 @@ impl WorkspaceManager {
         let reservation = self.inner.store.lock().await.begin_workspace_git_effect(
             &command.id,
             preparation,
+            Some(expected_tip),
             now_ms(),
         );
         match reservation {
@@ -1079,9 +1130,12 @@ impl WorkspaceManager {
         }
         // A nonzero Git exit never proves no destructive effect. Only exact
         // absence and retained-branch readback can establish successful removal.
-        timeout_at(deadline, git.inspect_removal(preparation))
-            .await
-            .unwrap_or_else(|_| removal_unknown("workspace_removal_unconfirmed"))
+        timeout_at(
+            deadline,
+            git.inspect_removal(preparation, RemovalBranch::At(expected_tip)),
+        )
+        .await
+        .unwrap_or_else(|_| removal_unknown("workspace_removal_unconfirmed"))
     }
 
     async fn remove_scratch_files(
@@ -1365,6 +1419,12 @@ impl WorkspaceManager {
                         .ok_or_else(|| {
                             problem("source_integrity", "unknown removal has no command id")
                         })?;
+                    if preparation.outcome.as_ref().is_some_and(|outcome| {
+                        outcome["result"]["code"] == "identity_changed"
+                            || eliot_store::Store::is_legacy_missing_branch_removal(outcome, id)
+                    }) {
+                        return Ok(None);
+                    }
                     if let Some(journal) = preparation
                         .outcome
                         .as_ref()
@@ -1384,8 +1444,13 @@ impl WorkspaceManager {
                             .await
                             .set_workspace_removal_write_guard(preparation, id, None)?;
                     }
+                    let branch = preparation
+                        .outcome
+                        .as_ref()
+                        .and_then(|marker| marker["branch_tip_before_remove"].as_str())
+                        .map_or(RemovalBranch::Retained, RemovalBranch::At);
                     if let outcome @ WorkspaceRemovalOutcome::Removed { .. } =
-                        git.inspect_removal(preparation).await
+                        git.inspect_removal(preparation, branch).await
                     {
                         let _gate = slot.gate.clone().lock_owned().await;
                         let mut store = self.inner.store.lock().await;
