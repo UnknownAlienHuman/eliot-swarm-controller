@@ -22,6 +22,7 @@ use crate::{
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::{
     AgentStartParams, PeerClient,
+    native_cli::{BoundedReadLabels, run_bounded},
     session::{
         ResumeSubject, TargetEnvironment, native_no_write, optional_profile_text,
         parse_resume_subject, target_environment, validate_source_plan,
@@ -30,6 +31,11 @@ use eliot_plugin::{
 };
 use serde_json::Value;
 use std::{ffi::OsString, path::PathBuf};
+#[expect(
+    clippy::disallowed_types,
+    reason = "Muse catalogue refresh uses an owned native CLI command."
+)]
+use tokio::process::Command;
 use tokio::time::Instant;
 
 pub(super) struct PreparedStart {
@@ -188,6 +194,36 @@ pub(super) fn prepare_profile(
         launch,
         secrets,
     })
+}
+
+/// Populate Muse's provider cache before `serve` takes its catalogue snapshot.
+pub(super) async fn refresh_catalogue(launch: &NativeLaunch, deadline: Instant) -> Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs an owned Muse catalogue process."
+    )]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This command runs Muse's read-only model listing."
+    )]
+    let mut command = Command::new(&launch.program);
+    command
+        .args(["exec", "--list-models"])
+        .current_dir(&launch.cwd)
+        .envs(launch.environment.iter().map(|(name, value)| (name, value)));
+    run_bounded(
+        command,
+        64 * 1024,
+        deadline,
+        &BoundedReadLabels {
+            start: "Muse exec --list-models could not start",
+            deadline: "Muse exec --list-models did not finish before its deadline",
+            unreadable: "Muse exec --list-models output was unreadable",
+            status: "Muse exec --list-models failed to refresh the provider catalogue",
+        },
+    )
+    .await?;
+    Ok(())
 }
 
 pub(super) async fn spawn_owned_session(

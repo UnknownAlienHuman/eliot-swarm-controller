@@ -33,9 +33,9 @@ use eliot_plugin::{
         attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, model_catalogue_profile, native_no_write,
         not_initialized, paths_equal, register_native_process, rejected_control, request_reply_ids,
-        required_native_cmd, shutdown_session, stop_owned_session, unknown_control,
-        unknown_snapshot, validate_binding, validate_identity, with_claimed_context,
-        with_context_points,
+        required_native_cmd, shutdown_session, stop_owned_session, target_environment,
+        unknown_control, unknown_snapshot, validate_binding, validate_identity,
+        with_claimed_context, with_context_points,
     },
 };
 use serde_json::{Value, json};
@@ -475,6 +475,9 @@ impl MusePlugin {
                 return Ok(self.retain_proven_no_effect_start(&params, error));
             }
         };
+        if let Err(error) = start::refresh_catalogue(&launch, Instant::now() + RPC_TIMEOUT).await {
+            return Ok(self.retain_proven_no_effect_start(&params, error));
+        }
         // A spawn failure leaves no child behind: still proven-no-effect.
         // The OS message is not reused as the reason (it may quote paths);
         // the reason names the check and carries only the safe error code.
@@ -2165,8 +2168,8 @@ fn select_launch_model(
 
 impl MusePlugin {
     /// Read-only native model catalogue for `harness.models`. A dedicated
-    /// reader instance spawns a transient `muse serve`, runs initialize
-    /// plus `model/list`, then terminates. No session, no turn, no input
+    /// reader instance refreshes the vendor catalogue, then queries
+    /// `model/list` on a transient `muse serve`. No session, no turn, no input
     /// and no inference. The native `isDefault` marker (when the installed
     /// host supplies it) projects as the catalogue default; absent or
     /// all-false stays unknown and is never invented by list order.
@@ -2183,16 +2186,20 @@ impl MusePlugin {
         let cwd = std::env::current_dir()
             .map_err(|_| Error::new("internal", "Muse model.list could not read its cwd"))?;
         let deadline = Instant::now() + RPC_TIMEOUT;
-        let mut native = NativeProcess::spawn(
-            NativeLaunch {
-                program: OsString::from(program),
-                args: vec![OsString::from("serve")],
-                cwd,
-                environment: Vec::new(),
-            },
-            SecretPolicy::new(std::iter::empty::<String>()),
-        )
-        .await?;
+        let environment = target_environment(
+            raw.get("target_environment"),
+            snapshot.get("pass_env"),
+            "Muse",
+        )?;
+        let launch = NativeLaunch {
+            program: OsString::from(program),
+            args: vec![OsString::from("serve")],
+            cwd,
+            environment: environment.variables,
+        };
+        start::refresh_catalogue(&launch, deadline).await?;
+        let mut native =
+            NativeProcess::spawn(launch, SecretPolicy::new(environment.secrets)).await?;
         let client = native.client();
         let result: Result<Value> = async {
             use crate::native::types::NativeInitializeResult;

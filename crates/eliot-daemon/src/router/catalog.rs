@@ -1545,19 +1545,10 @@ fn native_models_response(
         .filter(|default| !default.trim().is_empty())
         .map(str::to_owned);
     let (catalogue, note) = if harness == "muse" && entries.is_empty() {
-        // The launcher-marked Muse binary answered `model/list`
-        // with an empty catalogue (observed on Muse 1.4.20's
-        // empty `bundledCatalog`): no server default exists to
-        // apply, so the read reports `empty` honestly instead of
-        // the default-marker note. Discovery stays deterministic
-        // on the launcher mark (no extra native launch beyond
-        // this read); pass `--cmd` (or a profile pinning `cmd`)
-        // naming a binary with a live catalogue, e.g. the
-        // pinned 1.4.0 binary.
         (
             "empty".to_owned(),
             Some(format!(
-                "Muse model/list from {cmd} returned an empty catalogue; ad-hoc launch needs an explicit model, or --cmd naming a binary with a live catalogue"
+                "Muse model/list from {cmd} returned an empty catalogue after provider discovery"
             )),
         )
     } else if harness == "muse" {
