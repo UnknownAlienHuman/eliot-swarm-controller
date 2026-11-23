@@ -1197,10 +1197,19 @@ A held account is never replaced by another account of the same harness.
 
 A source generation has at most one open switch. The Store records the canonical source
 checkout at reservation and rechecks its current owner at reservation and launch
-admission. For generated workspaces, launch admission checks the Store-finalized checkout
-path after allocation, before native dispatch. The durable
-`switch_checkout_owners` row stores the canonical checkout key, current Agent and any
-in-flight switch; a successful handoff moves ownership to B in the H2 transaction.
+admission. Plain Owner launches, including `owner_override`, and resumes compare the
+canonical workspace identity with settled owner rows, matching the canonical checkout
+root and its subdirectories. A launch or resume by a different Agent, including a child
+borrowing that checkout, is refused while the owner is nonterminal or process-custody
+exit is unproven; the refusal names the current owner. A settled row no longer fences
+when its Agent is terminal and Store proves its process custody exited. For generated
+workspaces, launch admission checks the Store-finalized checkout path after allocation,
+before native dispatch. Unsettled switch rows retain their path fences. A switch-reserved
+launch is rejected at native dispatch if its parent is no longer Dispatched, even after
+its fence row is cleared; while the parent is Dispatched, the linked launch bypasses the
+ordinary owner check and its matching switch fence. The durable `switch_checkout_owners`
+row stores the canonical checkout key, current Agent and any in-flight switch; a
+successful handoff moves ownership to B in the H2 transaction.
 `agent_successors` retains the same-checkout transfer after event retention. A same-checkout
 transfer records the successor even when the caller explicitly repeats the workspace path.
 A second switch from a retired owner is refused and names the current Agent to switch instead. From then on the source

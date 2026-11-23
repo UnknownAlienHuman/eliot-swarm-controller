@@ -53,24 +53,96 @@ pub(super) fn require_no_active_checkout_switch(connection: &Connection, agent: 
     Ok(())
 }
 
-pub(super) fn require_checkout_launch_tx(
-    tx: &Transaction<'_>,
-    id: &str,
+/// Refuse a new start while another live Agent owns this checkout. `None` is a
+/// new launch; a resume supplies its existing Agent id.
+pub(super) fn require_checkout_owner_tx(
+    connection: &Connection,
     workspace: Option<&str>,
+    agent: Option<i64>,
 ) -> Result<()> {
     let Some(workspace) = workspace else {
         return Ok(());
     };
-    let key = core::workspace_path_key(workspace);
-    let parent: Option<String> = tx
+    let workspace_key = core::workspace_path_key(workspace);
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT checkout_key, agent FROM switch_checkout_owners
+             WHERE switch_command IS NULL",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    for (checkout_key, owner) in rows {
+        if Some(owner) == agent || !checkout_contains_workspace(&checkout_key, &workspace_key) {
+            continue;
+        }
+        let Some(owner_agent) = load_agent_by_num(connection, owner)? else {
+            continue;
+        };
+        let owner_is_live = !owner_agent.is_terminal()
+            || !capacity::owned_exit_proof_tx(connection, owner, owner_agent.generation)?
+                .process_custody_exited;
+        if owner_is_live {
+            return Err(Error::new(
+                "bad_state",
+                format!(
+                    "canonical checkout is owned by Agent {}#{}",
+                    owner_agent.id, owner_agent.generation
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn checkout_contains_workspace(checkout_key: &str, workspace_key: &str) -> bool {
+    if checkout_key == workspace_key {
+        return true;
+    }
+    let checkout_root = checkout_key.trim_end_matches('/');
+    if checkout_root.is_empty() {
+        return workspace_key.starts_with('/');
+    }
+    workspace_key
+        .strip_prefix(checkout_root)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+pub(super) fn require_checkout_launch_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+    agent: i64,
+    workspace: Option<&str>,
+) -> Result<()> {
+    let switch_parent: Option<(String, String)> = tx
         .query_row(
-            "SELECT parent_command FROM commands
-         WHERE id = ?1 AND link_kind = 'switch' AND ordinal = 0",
+            "SELECT p.id, p.state FROM commands c
+             JOIN commands p ON p.id = c.parent_command
+             WHERE c.id = ?1 AND c.link_kind = 'switch' AND c.ordinal = 0",
             [id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sql_error)?;
+    if let Some((parent, state)) = &switch_parent
+        && state != "dispatched"
+    {
+        return Err(Error::new(
+            "bad_state",
+            format!("switch launch parent {parent} is {state}, not dispatched"),
+        ));
+    }
+    let parent = switch_parent.map(|(parent, _)| parent);
+    let Some(workspace) = workspace else {
+        return Ok(());
+    };
+    let key = core::workspace_path_key(workspace);
     let mut statement = tx
         .prepare_cached(
             "SELECT checkout_key, switch_command FROM switch_checkout_owners
@@ -84,17 +156,15 @@ pub(super) fn require_checkout_launch_tx(
         .map_err(sql_error)?;
     for row in rows {
         let (checkout, switch) = row.map_err(sql_error)?;
-        if parent.as_deref() != Some(&switch)
-            && (checkout == key
-                || key
-                    .strip_prefix(checkout.as_str())
-                    .is_some_and(|suffix| suffix.starts_with('/')))
-        {
+        if parent.as_deref() != Some(&switch) && checkout_contains_workspace(&checkout, &key) {
             return Err(Error::new(
                 "busy",
                 "checkout is fenced by an unsettled switch",
             ));
         }
+    }
+    if parent.is_none() {
+        require_checkout_owner_tx(tx, Some(workspace), Some(agent))?;
     }
     Ok(())
 }
@@ -1536,7 +1606,7 @@ impl Store {
                 ));
             }
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
-            let admission = admission::submit_tx(
+            let admission = admission::submit_switch_launch_tx(
                 &tx,
                 "owner",
                 request,

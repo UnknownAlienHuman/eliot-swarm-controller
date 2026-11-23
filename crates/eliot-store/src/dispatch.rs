@@ -44,9 +44,15 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     }
     if command.command.verb == "resume" {
         switch::require_no_active_checkout_switch(tx, agent_num)?;
+        switch::require_checkout_owner_tx(tx, agent.workspace.as_deref(), Some(agent_num))?;
     }
     if command.command.verb == "launch" {
-        switch::require_checkout_launch_tx(tx, &command.command.id, agent.workspace.as_deref())?;
+        switch::require_checkout_launch_tx(
+            tx,
+            &command.command.id,
+            agent_num,
+            agent.workspace.as_deref(),
+        )?;
     }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;
