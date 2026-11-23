@@ -803,27 +803,24 @@ impl Router {
             role: None,
             allowed: None,
         };
-        if self
-            .handoff_candidates(&candidate.agent, &route)?
-            .is_empty()
-        {
-            return Ok(());
-        }
         let mut probe = SubmitCommand::new(String::new(), "launch");
         if let Err(error) = self
             .route_handoff(&mut probe, &candidate.agent, &route)
             .await
         {
-            let Some(decision) = error.routing.as_deref() else {
+            let message = if let Some(decision) = error.routing.as_deref() {
+                let skipped = decision
+                    .skipped
+                    .iter()
+                    .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("No eligible successor in routing.handoff_fallback. {skipped}")
+            } else if error.code == "handoff_unavailable" {
+                error.message
+            } else {
                 return Err(error);
             };
-            let skipped = decision
-                .skipped
-                .iter()
-                .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let message = format!("No eligible successor yet: {skipped}");
             let mut store = self.inner.store.lock().await;
             let events = store.record_handoff_waiting(candidate, &message, now_ms())?;
             self.publish_locked(&events);

@@ -404,8 +404,7 @@ pub(crate) struct RoutingConfig {
     /// Move owed work off a held or lost session. Absent means on.
     #[serde(default)]
     auto_handoff: Option<bool>,
-    /// Ordered successors for Agents launched with an explicit profile, and
-    /// for a role with no other candidate.
+    /// Ordered profiles authorized for automatic handoff.
     #[serde(default)]
     pub(crate) handoff_fallback: Vec<String>,
     /// Additional extensible roles share the same ordered candidate syntax.

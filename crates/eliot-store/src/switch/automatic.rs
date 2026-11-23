@@ -491,7 +491,7 @@ impl Store {
                    AND a.state = 'idle' AND a.chat = 0 AND a.observe_only = 0
                    AND a.archived = 0 AND a.project <> ''
                    AND h.scope = CASE WHEN json_type(a.profile_snapshot, '$.account') = 'text'
-                       THEN 'account:' || json_extract(a.profile_snapshot, '$.account')
+                       THEN 'account:' || json_extract(a.profile_snapshot, '$.account') || '.' || a.harness
                        ELSE 'profile:' || a.profile END
                  ORDER BY a.id LIMIT ?1",
             )

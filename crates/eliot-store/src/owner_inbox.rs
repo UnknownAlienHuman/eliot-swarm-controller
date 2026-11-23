@@ -622,6 +622,54 @@ fn project_handoffs(
             vec![action("inspect", "agent.get", json!({"id": successor}))],
         ));
     }
+    let mut stmt = projection_query(
+        db,
+        "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message')
+         FROM events e INDEXED BY events_kind
+         JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+         WHERE e.kind = 'handoff.waiting' AND a.archived = 0
+           AND NOT EXISTS(SELECT 1 FROM agent_successors s WHERE s.agent = a.id)
+           AND ((json_extract(e.data,'$.reason') = 'session_lost' AND a.state IN ('lost','failed'))
+                OR (json_extract(e.data,'$.reason') = 'provider_hold' AND a.state = 'idle'
+                    AND EXISTS(SELECT 1 FROM provider_holds h
+                        WHERE h.kind IN ('quota','rate_limit')
+                          AND h.scope = CASE WHEN json_type(a.profile_snapshot,'$.account') = 'text'
+                              THEN 'account:' || json_extract(a.profile_snapshot,'$.account') || '.' || a.harness
+                              ELSE 'profile:' || a.profile END)))
+           AND NOT EXISTS(SELECT 1 FROM events newer INDEXED BY events_agent
+               WHERE newer.agent = a.id AND newer.generation = a.generation AND newer.seq > e.seq
+                 AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))",
+        "'waiting:a' || a.id || ':g' || a.generation = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (seq, since, agent, generation, message) = row.map_err(sql_error)?;
+        items.push(item(
+            OwnerInboxKind::Handoff,
+            format!("waiting:a{agent}:g{generation}"),
+            format!("event:{seq}"),
+            now,
+            since,
+            &message,
+            None,
+            vec![action(
+                "inspect",
+                "agent.get",
+                json!({"id":format!("a{agent}")}),
+            )],
+        ));
+    }
     Ok(())
 }
 

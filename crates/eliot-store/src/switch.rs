@@ -1487,7 +1487,7 @@ impl Store {
                 {
                     return Err(Error::new(
                         "bad_state",
-                        "provider switch selection is outside the frozen role",
+                        "provider switch selection is outside the frozen continuation list",
                     ));
                 }
             }

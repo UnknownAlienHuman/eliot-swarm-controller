@@ -1621,7 +1621,7 @@ its configured candidates again on each attempt. A waiting explicit profile
 launch keeps its original route binding.
 
 `on_provider_failure` defaults to `stop`. With `next`, an Owner's role-routed
-launch in a project freezes the remaining candidate order. The daemon may continue
+launch in a project freezes the configured `handoff_fallback` names. The daemon may continue
 the original launch input after a structured quota, rate-limit or access refusal
 when the adapter proves that no native work began for that exact turn. A stream
 gap, uncertain delivery, tool or output activity, an explicit profile or a later
@@ -1630,8 +1630,9 @@ the harness, access, permissions, approval, account and credential selectors.
 An original launch with explicit overrides does not enter automatic failover.
 The Codex adapter supplies this evidence for structured upstream refusals.
 The daemon reuses the [switch and handoff](coordination.md#agent-switch-implemented)
-transaction with fresh command IDs, the retained workspace and the next eligible
-candidate. Each switch consumes part of the frozen order. `swarm why` reports
+transaction with fresh command IDs and the retained workspace. It chooses the first
+eligible profile that is both in the current `handoff_fallback` order and still in the
+frozen list. Each switch removes its selected profile from that list. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
 An automated launch's provider successor applies the same quota admission policy.
 
@@ -1655,14 +1656,14 @@ The daemon evaluates this every five seconds for root and child Agents outside c
 - a lost or failed session of this daemon's lifetime with the same kinds of owed work,
   20 seconds after the loss so native process-loss recovery can reopen it first.
 
-Candidates are the role that launched the Agent, then `handoff_fallback` when the role
-has no other profile. An Agent launched with an explicit profile uses
-`handoff_fallback` alone and stays put when it is empty. A lost session may restart on
-its own profile first; a held or failed one may not. Profiles this task already left are
-skipped. Each candidate passes installation, hold, capacity, quota reserve and the
+Automatic handoff uses `handoff_fallback` in configured order for every Agent. Role
+lists choose initial launches. A lost session can reuse its profile if the fallback
+list names it. Profiles this task already left and held profiles are skipped.
+Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
-eligible candidate the Agent keeps its work, `swarm why` names each skip, and the check
-repeats. A refused admission is tried again after five minutes and a failed launch or
+eligible candidate the Agent keeps its work. The Owner inbox and `swarm why` report
+an empty list or why candidates were skipped. A refused admission is tried again
+after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
 
