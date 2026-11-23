@@ -619,7 +619,7 @@ impl Router {
                 .map(|agent| agent.generation);
             if let Some(generation) = generation
                 && let Err(error) = self
-                    .checkpoint_work(target, generation, "worktree_remove", None)
+                    .checkpoint_work_in_lane(target, generation, "worktree_remove", None, Some(id))
                     .await
             {
                 crate::logging::record(

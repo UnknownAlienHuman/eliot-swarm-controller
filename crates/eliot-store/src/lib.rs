@@ -253,7 +253,9 @@ pub use switch::{
 };
 mod swarm_usage;
 mod work_truth;
-pub use work_truth::{GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput, JournalTurn};
+pub use work_truth::{
+    GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput, GitCheckpointIntent, JournalTurn,
+};
 mod turn_recovery;
 pub(crate) mod usage;
 mod wakes;
@@ -4636,16 +4638,23 @@ fn repo_git_write_blocked_tx(
     command_id: &str,
     common_dir: &str,
 ) -> Result<bool> {
-    let current_rowid: i64 = tx
-        .query_row(
+    let current_rowid: i64 = if command_id.is_empty() {
+        // An event-driven writer may wait for in-flight Git commands but
+        // cannot make a queued command wait for something it cannot see.
+        0
+    } else {
+        tx.query_row(
             "SELECT rowid FROM commands WHERE id = ?1",
             [command_id],
             |row| row.get(0),
         )
-        .map_err(sql_error)?;
+        .map_err(sql_error)?
+    };
     let git_action_pending = tx
         .query_row(
             "SELECT EXISTS(
+                 SELECT 1 FROM git_checkpoint_intents WHERE common_dir = ?2
+             ) OR EXISTS(
                  SELECT 1 FROM git_integration_custody
                  WHERE common_dir = ?2 AND cleaned = 0 AND command_id <> ?1
              ) OR EXISTS(

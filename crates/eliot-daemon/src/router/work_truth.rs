@@ -4,7 +4,9 @@ use super::routing::HandoffRoute;
 use super::*;
 use crate::work_truth::{self, CheckpointRequest, TaskRecord, TaskSource};
 use eliot_core::api::{GitCheckpointState, HandoffReason};
-use eliot_store::{AutomaticHandoff, BriefFacts, GitCheckpointInput, JournalTurn};
+use eliot_store::{
+    AutomaticHandoff, BriefFacts, GitCheckpointInput, GitCheckpointIntent, JournalTurn,
+};
 use std::path::{Path, PathBuf};
 use tokio::sync::broadcast;
 
@@ -201,7 +203,9 @@ impl Router {
             return Ok(());
         };
         match (event.kind.as_str(), event.source.as_str()) {
-            ("session.ready", "stream") => self.ensure_work_task(agent, generation, None).await,
+            ("session.ready" | "turn.started", "stream") => {
+                self.ensure_work_task(agent, generation, None).await
+            }
             ("turn.completed", "stream") => {
                 let turn = event.data["turn_id"].as_str().map(str::to_owned);
                 let checkpoint = self
@@ -342,13 +346,19 @@ impl Router {
         trigger: &'static str,
         turn_id: Option<String>,
     ) -> Result<Option<GitCheckpointInput>> {
-        let (row, basis) = {
-            let store = self.inner.store.lock().await;
-            (
-                store.get_agent(agent)?,
-                store.git_checkpoint_basis(agent, generation)?,
-            )
-        };
+        self.checkpoint_work_in_lane(agent, generation, trigger, turn_id, None)
+            .await
+    }
+
+    pub(super) async fn checkpoint_work_in_lane(
+        &self,
+        agent: &str,
+        generation: i64,
+        trigger: &'static str,
+        turn_id: Option<String>,
+        removal_command: Option<&str>,
+    ) -> Result<Option<GitCheckpointInput>> {
+        let row = self.inner.store.lock().await.get_agent(agent)?;
         let Some(row) = row.filter(|row| row.generation == generation && records_work(row)) else {
             return Ok(None);
         };
@@ -356,10 +366,60 @@ impl Router {
         if row.branch.is_none() && work_truth::current_branch(&workspace).await.is_none() {
             return Ok(None);
         }
-        let first = basis.fingerprint.is_none();
+        let (_, common_dir) = crate::workspace_git::WorkspaceGit::new()?
+            .repository_identity(&workspace)
+            .await?;
         let limits = crate::config::load_daemon_config(&self.inner.data_root)
             .unwrap_or_default()
             .checkpoint_limits();
+        let mut intent = GitCheckpointIntent {
+            common_dir,
+            agent: agent.to_owned(),
+            generation,
+            workspace: workspace.clone(),
+            input: GitCheckpointInput::failed(
+                trigger,
+                turn_id.clone(),
+                "checkpoint capture was interrupted before the exact byte count was recorded"
+                    .to_owned(),
+            ),
+        };
+        let mut progress = self.inner.progress.subscribe();
+        let basis = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                {
+                    let mut store = self.inner.store.lock().await;
+                    if store.get_agent(agent)?.is_none_or(|current| {
+                        current.generation != generation
+                            || current.workspace.as_deref() != Some(workspace.as_str())
+                    }) {
+                        return Ok::<_, Error>(None);
+                    }
+                    let basis = store.git_checkpoint_basis(agent, generation)?;
+                    intent.input.captured_bytes = limits
+                        .generation_bytes
+                        .saturating_sub(basis.captured_bytes)
+                        .min(limits.total_bytes);
+                    if store.reserve_git_checkpoint(&intent, removal_command)? {
+                        return Ok(Some(basis));
+                    }
+                }
+                progress.changed().await.map_err(|_| {
+                    Error::new("unavailable", "checkpoint repository write lane closed")
+                })?;
+            }
+        })
+        .await
+        .map_err(|_| {
+            Error::new(
+                "repository_busy",
+                "checkpoint repository write lane is busy",
+            )
+        })??;
+        let Some(basis) = basis else {
+            return Ok(None);
+        };
+        let first = basis.fingerprint.is_none();
         let mut input = work_truth::checkpoint(CheckpointRequest {
             data_root: &self.inner.data_root,
             workspace: &workspace,
@@ -375,6 +435,19 @@ impl Router {
             policy: self.secret_policy_snapshot(),
         })
         .await;
+        self.inner
+            .store
+            .lock()
+            .await
+            .stage_git_checkpoint(agent, generation, &input)?;
+        if let (Some(reference), Some(oid)) = (&input.checkpoint_ref, &input.oid) {
+            let root = crate::git_monitor::canonical_root(&workspace)?;
+            if let Err(error) = work_truth::publish_checkpoint(&root, reference, oid).await {
+                self.log_work_truth_error("daemon.checkpoint_publication_failed", &error);
+            }
+            self.reconcile_checkpoint_ref(&workspace, &mut input)
+                .await?;
+        }
         // A turn that changed nothing adds nothing to Git. Its report joins
         // the journal with the next change or when the session ends.
         let changed = match input.state {
@@ -404,11 +477,76 @@ impl Router {
         let mut store = self.inner.store.lock().await;
         let events = store.record_git_checkpoint(agent, generation, &input, now_ms())?;
         self.publish_locked(&events);
+        self.signal_progress();
         Ok(Some(input))
     }
 
-    /// Write the task record once per branch. `task_command` names the input
-    /// of a successor, whose own launch carries no prompt.
+    async fn reconcile_checkpoint_ref(
+        &self,
+        workspace: &str,
+        input: &mut GitCheckpointInput,
+    ) -> Result<()> {
+        if input.state != GitCheckpointState::Snapshot {
+            return Ok(());
+        }
+        let (Some(reference), Some(expected)) = (&input.checkpoint_ref, &input.oid) else {
+            return Err(Error::new(
+                "source_integrity",
+                "checkpoint intent has no ref or OID",
+            ));
+        };
+        let root = crate::git_monitor::canonical_root(workspace)?;
+        match work_truth::checkpoint_reference(&root, reference).await? {
+            Some(actual) if &actual == expected => {
+                if let Err(error) = work_truth::prune_checkpoints(&root, reference).await {
+                    self.log_work_truth_error("daemon.checkpoint_prune_failed", &error);
+                }
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "checkpoint ref differs from its intent",
+                ));
+            }
+            None => {
+                input.state = GitCheckpointState::Failed;
+                input.fingerprint = None;
+                input.error = Some("checkpoint ref was not published".to_owned());
+                input.checkpoint_ref = None;
+                input.oid = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run before accepting work. Reconcile the exact local ref, without
+    /// repeating a capture or ref publication from a previous daemon.
+    pub(crate) async fn recover_git_checkpoints(&self) -> Result<()> {
+        let intents = self.inner.store.lock().await.git_checkpoint_intents()?;
+        for GitCheckpointIntent {
+            agent,
+            generation,
+            workspace,
+            mut input,
+            ..
+        } in intents
+        {
+            if let Err(error) = self.reconcile_checkpoint_ref(&workspace, &mut input).await {
+                self.log_work_truth_error("daemon.checkpoint_recovery_failed", &error);
+                continue;
+            }
+            let events = self.inner.store.lock().await.record_git_checkpoint(
+                &agent,
+                generation,
+                &input,
+                now_ms(),
+            )?;
+            self.publish_locked(&events);
+        }
+        Ok(())
+    }
+
+    /// Bind this generation to the exact original input's Git record.
     pub(super) async fn ensure_work_task(
         &self,
         agent: &str,
@@ -419,19 +557,10 @@ impl Router {
             let store = self.inner.store.lock().await;
             let row = store.get_agent(agent)?;
             let known = store.work_task_ref(agent, generation)?;
-            let named = match task_command.filter(|id| !id.is_empty()) {
-                Some(id) => store.get_command(id)?.filter(|command| {
-                    command.verb == "send" && command.target.as_deref() == Some(agent)
-                }),
+            let command = match task_command.filter(|id| !id.is_empty()) {
+                Some(id) => store.work_task_send(agent, id)?,
+                None if known.is_none() => store.first_work_task_send(agent)?,
                 None => None,
-            };
-            let command = match named {
-                Some(command) => Some(command),
-                None => match store.generation_start_command(agent, 1)? {
-                    Some(launch) if launch.args.get("text").is_some() => Some(launch),
-                    Some(launch) => store.get_linked_send(&launch.id)?,
-                    None => None,
-                },
             };
             let goal = match store
                 .goal_get(agent, "eliot")?
@@ -445,7 +574,11 @@ impl Router {
         let Some(row) = row.filter(|row| row.generation == generation && records_work(row)) else {
             return Ok(());
         };
-        if known.is_some() {
+        let Some(command) = command else {
+            return Ok(());
+        };
+        let task_ref = work_truth::task_ref(&command.id);
+        if known.as_deref() == Some(task_ref.as_str()) {
             return Ok(());
         }
         let workspace = row.workspace.clone().unwrap_or_default();
@@ -464,17 +597,6 @@ impl Router {
             None => work_truth::current_branch(&workspace).await,
         };
         let Some(branch) = branch else {
-            return Ok(());
-        };
-        let task_ref = work_truth::task_ref(&branch);
-        let Some(command) = command else {
-            // A successor without retained input still shares its branch's record.
-            self.inner.store.lock().await.record_work_task(
-                agent,
-                generation,
-                &task_ref,
-                now_ms(),
-            )?;
             return Ok(());
         };
         let policy = self.secret_policy_snapshot();
@@ -499,6 +621,7 @@ impl Router {
             (Vec::new(), Vec::new())
         };
         let mut card = json!({
+            "task_command": command.id,
             "branch": branch,
             "base": base,
             "agent": row.id,

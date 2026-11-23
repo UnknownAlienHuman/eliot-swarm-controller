@@ -5,13 +5,14 @@ use eliot_core::api::{
     AgentHandoffView, AgentWorkTruthView, GitCheckpointState, GitCheckpointView,
     GitCheckpointWithheld, HandoffReason,
 };
+use serde::{Deserialize, Serialize};
 
 pub const GIT_CHECKPOINT: &str = "git.checkpoint";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GitCheckpointInput {
     pub state: GitCheckpointState,
-    pub trigger: &'static str,
+    pub trigger: String,
     pub turn_id: Option<String>,
     pub head: Option<String>,
     pub checkpoint_ref: Option<String>,
@@ -25,6 +26,38 @@ pub struct GitCheckpointInput {
     pub captured_bytes: u64,
     pub error: Option<String>,
     pub journaled_through: Option<i64>,
+}
+
+impl GitCheckpointInput {
+    pub fn failed(trigger: &str, turn_id: Option<String>, error: String) -> Self {
+        Self {
+            state: GitCheckpointState::Failed,
+            trigger: trigger.to_owned(),
+            turn_id,
+            head: None,
+            checkpoint_ref: None,
+            oid: None,
+            fingerprint: None,
+            paths: Vec::new(),
+            paths_truncated: false,
+            withheld: Vec::new(),
+            withheld_truncated: false,
+            captured_bytes: 0,
+            error: Some(error),
+            journaled_through: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GitCheckpointIntent {
+    pub common_dir: String,
+    pub agent: String,
+    pub generation: i64,
+    pub workspace: String,
+    /// Initially the conservative charge for an interrupted capture, then
+    /// the exact candidate that must be reconciled after ref publication.
+    pub input: GitCheckpointInput,
 }
 
 /// What the next checkpoint of a generation starts from.
@@ -55,6 +88,39 @@ fn state_name(state: GitCheckpointState) -> &'static str {
         GitCheckpointState::Unchanged => "unchanged",
         GitCheckpointState::Failed => "failed",
     }
+}
+
+/// Copy the already-bound Git task through a lifecycle change in the same
+/// transaction. Command and event retention cannot change this binding.
+pub(super) fn inherit_work_task_tx(
+    tx: &Transaction<'_>,
+    from: &Agent,
+    to: &Agent,
+    now: i64,
+) -> Result<()> {
+    inherit_work_task_generation_tx(
+        tx,
+        (parse_agent_id(&from.id)?, from.generation),
+        (parse_agent_id(&to.id)?, to.generation),
+        now,
+    )
+}
+
+pub(super) fn inherit_work_task_generation_tx(
+    tx: &Transaction<'_>,
+    from: (i64, i64),
+    to: (i64, i64),
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO git_checkpoints(agent, generation, state, task_ref, updated_at)
+         SELECT ?3, ?4, 'none', task_ref, ?5
+         FROM git_checkpoints WHERE agent = ?1 AND generation = ?2 AND task_ref IS NOT NULL
+         ON CONFLICT(agent, generation) DO UPDATE SET task_ref = excluded.task_ref",
+        params![from.0, from.1, to.0, to.1, now],
+    )
+    .map_err(sql_error)?;
+    Ok(())
 }
 
 impl Store {
@@ -101,6 +167,107 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         Ok(basis.unwrap_or_default())
+    }
+
+    pub fn reserve_git_checkpoint(
+        &mut self,
+        intent: &GitCheckpointIntent,
+        removal_command: Option<&str>,
+    ) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let agent = parse_agent_id(&intent.agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if !load_agent_by_num(&tx, agent)?.is_some_and(|row| {
+                row.generation == intent.generation
+                    && row.workspace.as_deref() == Some(intent.workspace.as_str())
+            }) || repo_git_write_blocked_tx(
+                &tx,
+                removal_command.unwrap_or_default(),
+                &intent.common_dir,
+            )? {
+                return Ok(false);
+            }
+            tx.execute(
+                "INSERT INTO git_checkpoint_intents(common_dir, agent, generation, workspace, input)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                params![
+                    intent.common_dir,
+                    agent,
+                    intent.generation,
+                    intent.workspace,
+                    encode_json(&intent.input)?,
+                ],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(true)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn stage_git_checkpoint(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        input: &GitCheckpointInput,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let changed = self
+                .connection
+                .execute(
+                    "UPDATE git_checkpoint_intents SET input = ?1
+                 WHERE agent = ?2 AND generation = ?3",
+                    params![encode_json(input)?, parse_agent_id(agent)?, generation],
+                )
+                .map_err(sql_error)?;
+            if changed != 1 {
+                return Err(Error::new("source_integrity", "checkpoint intent was lost"));
+            }
+            Ok(())
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn git_checkpoint_intents(&self) -> Result<Vec<GitCheckpointIntent>> {
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT common_dir, agent, generation, workspace, input
+             FROM git_checkpoint_intents ORDER BY common_dir",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        rows.map(|row| {
+            let (common_dir, agent, generation, workspace, input) = row.map_err(sql_error)?;
+            Ok(GitCheckpointIntent {
+                common_dir,
+                agent: format_agent_id(agent),
+                generation,
+                workspace,
+                input: serde_json::from_str(&input).map_err(|_| {
+                    Error::new("source_integrity", "invalid stored checkpoint intent")
+                })?,
+            })
+        })
+        .collect()
     }
 
     /// Whether this ended generation's whole process tree is proven gone.
@@ -185,6 +352,49 @@ impl Store {
             .optional()
             .map_err(sql_error)?;
         Ok(value.flatten())
+    }
+
+    /// Find an original SEND for an Agent launched without a prompt. A
+    /// queued input is eligible for transfer as its own command.
+    pub fn first_work_task_send(&self, agent: &str) -> Result<Option<Command>> {
+        self.ensure_committed_reads()?;
+        let id = self
+            .connection
+            .query_row(
+                "SELECT id FROM commands INDEXED BY commands_target
+                 WHERE target = ?1 AND verb = 'send'
+                   AND state IN ('dispatched','applied','unknown')
+                   AND link_kind IS NOT 'handoff'
+                   AND principal NOT LIKE 'swarm_note:%'
+                   AND json_type(args, '$.text') = 'text'
+                 ORDER BY created_at, rowid LIMIT 1",
+                [parse_agent_id(agent)?],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        match id {
+            Some(id) => load_command(&self.connection, &id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn work_task_send(&self, agent: &str, id: &str) -> Result<Option<Command>> {
+        self.ensure_committed_reads()?;
+        let Some(command) = load_command(&self.connection, id)? else {
+            return Ok(None);
+        };
+        if command.verb != "send"
+            || command.target.as_deref() != Some(agent)
+            || handoff::is_brief_tx(&self.connection, id)?
+            || !matches!(
+                command.state,
+                CommandState::Dispatched | CommandState::Applied | CommandState::Unknown
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(command))
     }
 
     pub fn record_work_task(
@@ -312,7 +522,17 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
+            let removed = tx
+                .execute(
+                    "DELETE FROM git_checkpoint_intents WHERE agent = ?1 AND generation = ?2",
+                    params![num, generation],
+                )
+                .map_err(sql_error)?;
+            if removed != 1 {
+                return Err(Error::new("source_integrity", "checkpoint intent was lost"));
+            }
             if load_agent_by_num(&tx, num)?.is_none() {
+                commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Vec::new());
             }
             let journaled = input.journaled_through.unwrap_or(0);

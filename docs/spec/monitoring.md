@@ -771,7 +771,7 @@ harness child could still be writing. A lost or failed source qualifies for a su
 in its worktree under the same proof. On Windows the Job proves the whole family. Unix
 custody is degraded and proves what its process-group drain can.
 
-**Task record.** `refs/eliot/tasks/<branch>` holds `task.md` (the full task),
+**Task record.** `refs/eliot/tasks/<input digest>` holds `task.md` (the full task),
 `card.json` (branch, base, Agent, profile, Goal and check) and `journal.md`. Known
 secrets and text shaped like a credential are redacted in all three. For a task the
 Owner wrote directly, the card lists the path, size and SHA-256 of up to eight absolute
@@ -782,8 +782,10 @@ names it next to the original task. A file holding a known secret is neither has
 saved. Other files stay out of Git, because every Agent with access to the repository
 can read its refs. To keep such a file with the task, deliver it with `--source`. The
 journal gains each finished turn's report when work changes or
-the session ends, and keeps its newest 128 KiB. A successor on the branch reuses the
-record. These refs are local: an ordinary branch push does not carry them.
+the session ends, and keeps its newest 128 KiB. The digest identifies the exact
+original SEND. Switch and Resume carry its binding through their Store transactions
+so a successor can find the record after command retention. Agents sharing a branch
+can hold different task records.
 
 **Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
 Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.
@@ -794,6 +796,14 @@ checkpoint or Git observation held uncommitted work. That item carries the exact
 that restore it: `git worktree prune`, `git worktree add <dir> <branch>` and
 `git restore --source=<checkpoint> --worktree -- .`.
 A failed capture keeps the reference to the last good checkpoint.
+
+Checkpoint capture and accounting share the repository write lane with managed Git
+operations. Store reserves the lane and a bounded byte allowance before capture,
+then records the candidate ref, OID and exact byte charge before ref publication.
+On restart, exact Git readback determines whether the ref was published. Swarm
+settles the Store projection and releases the lane together. An interrupted capture
+with no exact byte count charges the reserved allowance. An unreadable or mismatched
+ref keeps the intent unresolved.
 
 ## Provider holds
 

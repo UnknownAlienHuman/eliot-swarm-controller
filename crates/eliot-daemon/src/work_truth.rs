@@ -93,8 +93,9 @@ pub(crate) fn redact_record_value(value: &mut Value, policy: &SecretPolicy) {
     }
 }
 
-pub(crate) fn task_ref(branch: &str) -> String {
-    format!("refs/eliot/tasks/{branch}")
+pub(crate) fn task_ref(command: &str) -> String {
+    let digest = eliot_core::api::inference::sha256_hex(command.as_bytes());
+    format!("refs/eliot/tasks/{digest}")
 }
 
 /// Capture the worktree. A failure is a reported fact, never a blocked turn.
@@ -104,25 +105,14 @@ pub(crate) async fn checkpoint(request: CheckpointRequest<'_>) -> GitCheckpointI
     let policy = Arc::clone(&request.policy);
     match capture(request).await {
         Ok(input) => input,
-        Err(error) => GitCheckpointInput {
-            state: GitCheckpointState::Failed,
+        Err(error) => GitCheckpointInput::failed(
             trigger,
             turn_id,
-            head: None,
-            checkpoint_ref: None,
-            oid: None,
-            fingerprint: None,
-            paths: Vec::new(),
-            paths_truncated: false,
-            withheld: Vec::new(),
-            withheld_truncated: false,
-            captured_bytes: 0,
-            error: Some(bound_chars(
+            bound_chars(
                 &policy.redact_text(&format!("{}: {}", error.code, error.message)),
                 240,
-            )),
-            journaled_through: None,
-        },
+            ),
+        ),
     }
 }
 
@@ -168,7 +158,7 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
     } = scan;
     let mut input = GitCheckpointInput {
         state: GitCheckpointState::Unchanged,
-        trigger: request.trigger,
+        trigger: request.trigger.to_owned(),
         turn_id: request.turn_id.clone(),
         head: None,
         checkpoint_ref: None,
@@ -279,7 +269,7 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
     } else if index_info.is_empty() {
         Some("no changed file could be captured".to_owned())
     } else {
-        match publish_snapshot(&request, &git, &root, &overrides, &head, &index_info).await {
+        match prepare_snapshot(&request, &git, &root, &overrides, &head, &index_info).await {
             Ok((reference, oid)) => {
                 input.state = GitCheckpointState::Snapshot;
                 input.checkpoint_ref = Some(reference);
@@ -304,8 +294,8 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
     Ok(input)
 }
 
-/// Build the snapshot commit from a private index and publish its ref.
-async fn publish_snapshot(
+/// Build the snapshot commit. The caller must retain its intent before publication.
+async fn prepare_snapshot(
     request: &CheckpointRequest<'_>,
     git: &GitProbe,
     root: &Path,
@@ -361,10 +351,47 @@ async fn publish_snapshot(
     );
     // The time prefix orders retention; the suffix keeps equal times distinct.
     let reference = format!("{prefix}{:016}-{}", request.label, ulid::Ulid::new());
-    run.output(&["update-ref", &reference, &oid]).await?;
-    // Retention is best effort: the new checkpoint already exists.
-    let _ = prune(git, root, &prefix, &run).await;
     Ok((reference, oid))
+}
+
+pub(crate) async fn publish_checkpoint(root: &Path, reference: &str, oid: &str) -> Result<()> {
+    let git = GitProbe::new()?;
+    let zero = "0".repeat(oid.len());
+    let result = git
+        .workspace_input_command(
+            root,
+            &["update-ref", reference, oid, &zero],
+            &[],
+            Instant::now() + GIT_TIME,
+        )
+        .await?;
+    if result.code != 0 {
+        return Err(Error::new(
+            "unavailable",
+            "checkpoint ref publication failed",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn checkpoint_reference(root: &Path, reference: &str) -> Result<Option<String>> {
+    let git = GitProbe::new()?;
+    let deadline = Instant::now() + GIT_TIME;
+    let result = git
+        .workspace_command(root, &["show-ref", "--exists", reference], deadline)
+        .await?;
+    match result.code {
+        0 => read_line(
+            &git,
+            root,
+            &["show-ref", "--verify", "--hash", reference],
+            deadline,
+        )
+        .await
+        .map(Some),
+        2 => Ok(None),
+        _ => Err(Error::new("unavailable", "checkpoint ref readback failed")),
+    }
 }
 
 fn set_withheld(input: &mut GitCheckpointInput, mut withheld: Vec<GitCheckpointWithheld>) {
@@ -463,7 +490,14 @@ impl Effect<'_> {
     }
 }
 
-async fn prune(git: &GitProbe, root: &Path, prefix: &str, run: &Effect<'_>) -> Result<()> {
+pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> {
+    let git = GitProbe::new()?;
+    let Some((prefix, _)) = current.rsplit_once('/') else {
+        return Err(Error::new(
+            "source_integrity",
+            "checkpoint ref has no parent",
+        ));
+    };
     let deadline = Instant::now() + GIT_TIME;
     let listed = git
         .workspace_command(
@@ -476,11 +510,19 @@ async fn prune(git: &GitProbe, root: &Path, prefix: &str, run: &Effect<'_>) -> R
         return Ok(());
     }
     let text = String::from_utf8_lossy(&listed.stdout);
-    let mut references: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    let mut references: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.is_empty() && *line != current)
+        .collect();
     references.sort_unstable();
-    let excess = references.len().saturating_sub(KEEP_CHECKPOINTS);
+    let excess = references.len().saturating_sub(KEEP_CHECKPOINTS - 1);
     for reference in &references[..excess] {
-        run.output(&["update-ref", "-d", reference]).await?;
+        let result = git
+            .workspace_input_command(root, &["update-ref", "-d", reference], &[], deadline)
+            .await?;
+        if result.code != 0 {
+            return Err(Error::new("unavailable", "checkpoint ref pruning failed"));
+        }
     }
     Ok(())
 }

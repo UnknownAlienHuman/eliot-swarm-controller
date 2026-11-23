@@ -1,7 +1,8 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 113;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = WORK_TRUTH_INTENT_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
+const WORK_TRUTH_INTENT_VERSION: i64 = 114;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2692,6 +2693,29 @@ impl Store {
                  );
                  CREATE INDEX agent_successors_successor ON agent_successors(successor);
                  INSERT INTO schema_migrations(version) VALUES (113);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < WORK_TRUTH_INTENT_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE git_checkpoint_intents (
+                     common_dir TEXT PRIMARY KEY,
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     workspace TEXT NOT NULL,
+                     input TEXT NOT NULL,
+                     UNIQUE(agent, generation)
+                 );",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [WORK_TRUTH_INTENT_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

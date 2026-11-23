@@ -363,6 +363,12 @@ fn dispatch_resume_tx(
         ));
     }
     project_assignment::advance_resume(tx, agent, agent_num, next_generation, id)?;
+    super::work_truth::inherit_work_task_generation_tx(
+        tx,
+        (agent_num, old_generation),
+        (agent_num, next_generation),
+        now,
+    )?;
     super::goals::advance_resume_tx(
         tx,
         agent_num,

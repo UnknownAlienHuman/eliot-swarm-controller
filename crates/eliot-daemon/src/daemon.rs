@@ -547,6 +547,7 @@ async fn initialize_runtime(
     };
     router.note_events(&recovered);
     router.reconcile_git_integrations(None).await?;
+    router.recover_git_checkpoints().await?;
     logging::record(&policy, "daemon.recovered", &[], None);
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
