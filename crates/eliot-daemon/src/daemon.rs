@@ -242,6 +242,7 @@ async fn run_with_update(path: PathBuf, attempt: Option<&str>) -> Result<()> {
     let mut removed = repair_startup_data_root(&path)?;
     let data_dir = DataDir::open(&path)?;
     let daemon_lock = data_dir.acquire_daemon_lock()?;
+    data_dir.initialize_retention_config(&daemon_lock)?;
     if let Some(attempt) = attempt {
         let backup = crate::update_backup::update_backup_path(data_dir.path(), attempt)?;
         crate::platform::data_dir::validate_private_file(&backup)?;

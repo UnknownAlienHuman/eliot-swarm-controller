@@ -20,14 +20,15 @@ use eliot_core::api::{
     ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CleanupPlan,
     CleanupPlanRequest, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
     CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
-    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DiagnoseRequest,
-    DiagnoseResponse, EventsBoundsRequest, EventsBoundsResponse, EventsFilter, EventsReadRequest,
-    EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, GenerationBoundary,
-    HandoffRequest, HandoffResponse, HarnessModelsRequest, HarnessModelsResponse,
-    LaunchIntentGetRequest, LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest,
-    LaunchQueueView, ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange,
-    OrganizationChangedEvent, ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse,
-    UsageSummaryRequest, UsageSummaryResponse,
+    CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DaemonStatusRequest,
+    DaemonStatusResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
+    EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
+    EventsSubscribeRequest, EventsSubscribeResponse, GenerationBoundary, HandoffRequest,
+    HandoffResponse, HarnessModelsRequest, HarnessModelsResponse, LaunchIntentGetRequest,
+    LaunchIntentView, LaunchQueueListRequest, LaunchQueueRequest, LaunchQueueView,
+    ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange, OrganizationChangedEvent,
+    ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest,
+    UsageSummaryResponse,
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -177,6 +178,15 @@ pub async fn cleanup_plan_page(
         }
         request.continuation = Some(next.clone());
     }
+}
+
+/// A validated daemon status snapshot for the Worktrees cleanup surface.
+pub async fn daemon_status(data_dir: &Path) -> Result<DaemonStatusResponse> {
+    let request = DaemonStatusRequest::default();
+    request.validate()?;
+    let response = eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+    request.validate_response(&response)?;
+    Ok(response)
 }
 
 async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(

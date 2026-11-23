@@ -1,7 +1,7 @@
 use crate::protocol::{
     DecodeErrorKind, EncodeErrorKind, MAX_EVENT_BYTES, MAX_FRAME_BYTES,
-    PrivateIncoming as Incoming, RpcError, RpcRequest, RpcResponse, decode_private_frame,
-    encode_private_frame,
+    PrivateIncoming as Incoming, RpcError, RpcRequest, RpcResponse, SessionUsageSampleAck,
+    SessionUsageSampleRequest, decode_private_frame, encode_private_frame,
 };
 use crate::sync::LockExt;
 use eliot_core::{
@@ -334,6 +334,28 @@ impl CommitSink {
             client,
             credential: credential.into(),
         }
+    }
+
+    /// Send a live sample independently of native event receipts.
+    pub async fn update_session_usage(
+        &self,
+        request: SessionUsageSampleRequest,
+        deadline: Instant,
+    ) -> Result<()> {
+        request.validate()?;
+        let mut params = serde_json::to_value(request)
+            .map_err(|_| Error::new("invalid", "session usage sample could not be encoded"))?;
+        params["credential"] = Value::String(self.credential.clone());
+        let response = self.client.call("usage.sample", params, deadline).await?;
+        let ack: SessionUsageSampleAck = serde_json::from_value(response)
+            .map_err(|_| Error::new("invalid_response", "invalid session usage acknowledgement"))?;
+        if !ack.accepted {
+            return Err(Error::new(
+                "rejected",
+                "session usage sample was not accepted",
+            ));
+        }
+        Ok(())
     }
 
     /// Commit one complete event batch and validate its acknowledgement.

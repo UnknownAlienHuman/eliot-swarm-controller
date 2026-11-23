@@ -781,17 +781,18 @@ Backlog and automatic cleanup are root-level automation options.
 ```toml
 [automation]
 max_event_backlog = 100000
-# auto_cleanup = true # Opt in to apply after the first preview.
+auto_cleanup = true
 auto_cleanup_after = "7d"
 ```
 
 `max_event_backlog` is a positive signed 64-bit integer. It defaults to `100000`; zero,
-negative, wrong-type and unknown automation values are invalid. Omitted `auto_cleanup`
-means plan-only: the guarded paged planner runs and reports its completed sweep, but no
-plan is retained for apply. Explicit `true` enables automatic apply only after the first
-complete plan-only sweep of that daemon startup. Explicit `false` disables automatic
-planning and apply. `auto_cleanup_after`
-is a positive duration and defaults to seven days. Every automatic apply uses the
+negative, wrong-type and unknown automation values are invalid. Automatic cleanup
+is written as enabled when Swarm creates a new configuration. An existing
+configuration that omits the key runs plan-only sweeps. Explicit `true` applies
+eligible cleanup after the first complete plan-only sweep of each daemon startup.
+Set `auto_cleanup = false` to disable automatic planning and apply.
+`auto_cleanup_after` defaults to seven days and accepts a positive duration
+such as `"14d"`. Every automatic apply uses the
 [cleanup retention policy](coordination.md#registered-artifacts-and-cleanup-k69) through
 the same guarded plan and apply path as the cleanup UI and CLI.
 
@@ -801,11 +802,16 @@ Store retention uses the `[daemon.retention]` table.
 [daemon.retention]
 events_days = 30
 processes_seconds = 86400
+commands_days = 90
+mail_days = 90
 interval_seconds = 300
 compact_on_start = false
 ```
 
-Omitted settings use the defaults shown. `events_seconds` can specify the event
+Swarm writes the four history windows shown into the config it creates for a
+new Store. Existing configs and existing Stores without a config keep their
+settings. An omitted history window disables deletion for that class.
+`interval_seconds` defaults to 300. `events_seconds` can specify the event
 window in seconds instead of `events_days`. Set at most one of the two. The event
 and exited-child process windows are positive integers. `interval_seconds` allows
 1 through 86,400 seconds. Optional positive `commands_days` and `mail_days` windows
@@ -819,11 +825,13 @@ that margin regardless of `mail_days`, so a removed delivery admitted with a
 skew-bounded write id reads `history_gap` on its own mailbox's read paths;
 a retried ack over it succeeds as already acked.
 
+`swarm status` and desktop show retention off when all four windows are unset.
 `daemon.status` reports the main and WAL file sizes, retention windows, and
 the retained-event watermark `pruned_through`. New Stores reclaim free pages
 incrementally. Older Stores reuse freed pages while the daemon runs, so a
 retention pass can leave `eliot.db` at its prior high-water size. To reclaim
-space from an older Store, run `swarm store compact` with the daemon stopped.
+space from an older Store, run `swarm maintenance compact` with the daemon
+stopped. `swarm store compact` calls the same operation.
 This owner-only local command takes the private DataDir lock, refuses to
 operate while a daemon holds it, and does not start a daemon. Before SQLite
 runs `VACUUM`, it reports the estimated required and available bytes and
@@ -920,7 +928,8 @@ required. The HTTP MCP executable is the running daemon executable (`current_exe
 it is not a separate setting. The hostname is a bare DNS host; Eliot constructs
 `https://<hostname>/mcp`. Tunnel and credential values are metadata only: Eliot
 does not read the credential file contents. Cloudflared reads that file when it
-starts.
+starts. Swarm clears stale tunnel configuration files from its private data
+directory after taking the daemon lock and before launching the next tunnel.
 
 Manual `swarm mcp --http` also requires these configured Access settings; it
 never exposes an unauthenticated local Owner bridge. The HTTP origin verifies

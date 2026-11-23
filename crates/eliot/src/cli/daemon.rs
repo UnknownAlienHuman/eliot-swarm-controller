@@ -156,6 +156,13 @@ pub(crate) async fn run_maintenance(
     json_output: bool,
 ) -> Result<u8, Failure> {
     match command {
+        MaintenanceCommand::Compact => super::store::run_store(
+            super::args::StoreArgs {
+                command: super::args::StoreCommand::Compact,
+            },
+            data_dir,
+            json_output,
+        ),
         MaintenanceCommand::Run => {
             read_and_print!(
                 &data_dir,
@@ -256,6 +263,7 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
             None => format!("Automatic cleanup {policy}"),
         }
     });
+    let disk_usage_line = response.disk_usage.as_ref().map(disk_usage_line);
     if json_output {
         let mut value = serde_json::to_value(&response)
             .map_err(|_| Failure::new(4, "daemon.status response is invalid"))?;
@@ -275,6 +283,9 @@ pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u
             println!("{line}");
         }
         if let Some(line) = cleanup_line {
+            println!("{line}");
+        }
+        if let Some(line) = disk_usage_line {
             println!("{line}");
         }
     }
@@ -419,6 +430,27 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
             );
         }
     }
+    if let Some(retention) = &response.retention {
+        if let Some(error) = &retention.config_error {
+            println!("Store retention unavailable ({error})");
+        } else if retention.unbounded {
+            println!("Store retention off");
+        } else {
+            let window = |value: Option<i64>, unit: &str| {
+                value.map_or_else(|| "off".to_owned(), |value| format!("{value}{unit}"))
+            };
+            let events = retention.events_days.map_or_else(
+                || window(retention.events_seconds, "s"),
+                |days| window(Some(days), "d"),
+            );
+            println!(
+                "Store retention | events {events} | child processes {} | commands {} | mail {}",
+                window(retention.processes_seconds, "s"),
+                window(retention.commands_days, "d"),
+                window(retention.mail_days, "d"),
+            );
+        }
+    }
     println!(
         "Commands: {} unknown · {} unsettled",
         response.unknown_commands_count, response.unsettled_commands_count
@@ -507,6 +539,30 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         }
     }
     println!("Data directory: {}", data_dir.display());
+}
+
+fn disk_usage_line(usage: &eliot_core::api::DiskUsageView) -> String {
+    fn bucket(name: &str, directory: &eliot_core::api::DiskUsageDirectory) -> String {
+        match (directory.bytes, &directory.error_code) {
+            (Some(bytes), None) => format!("{name} {bytes} bytes"),
+            (None, Some(code)) => format!("{name} unavailable ({code})"),
+            _ => format!("{name} unavailable (invalid status)"),
+        }
+    }
+    let owner_decision = match (
+        usage.owner_decision_worktrees,
+        &usage.owner_decision_error_code,
+    ) {
+        (Some(count), None) => format!("{count} worktrees awaiting Owner decision"),
+        (None, Some(code)) => format!("Owner-decision worktrees unavailable ({code})"),
+        _ => "Owner-decision worktrees unavailable (invalid status)".to_owned(),
+    };
+    format!(
+        "Disk use: {} · {} · {} · {owner_decision}",
+        bucket("artifacts", &usage.artifacts),
+        bucket("worktrees", &usage.worktrees),
+        bucket("plugins", &usage.plugins),
+    )
 }
 
 pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {

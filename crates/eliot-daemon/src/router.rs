@@ -5283,6 +5283,13 @@ impl Router {
     }
 
     async fn session_usage(&self, agent: &Agent) -> Result<Option<SessionUsage>> {
+        if let Some(usage) = self
+            .inner
+            .monitoring
+            .live_session_usage(&agent.id, agent.generation)
+        {
+            return Ok(Some(usage));
+        }
         let store = self.inner.store.lock().await;
         store.get_session_usage(&agent.id, agent.generation)
     }
@@ -5348,7 +5355,7 @@ impl Router {
         let scope = request.effective_scope();
         let after = request.cursor()?;
         let limit = request.limit;
-        let (generation, mut processes) = {
+        let (generation, mut processes, child_counts) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, generation)?;
             let agent = store
@@ -5392,6 +5399,7 @@ impl Router {
                     after.as_ref().map(|cursor| &cursor.identity),
                     limit,
                 )?,
+                store.child_process_counts(&owner)?,
             )
         };
         self.inner
@@ -5415,6 +5423,7 @@ impl Router {
             processes,
             next,
             scope: (scope == "workspace").then(|| scope.to_owned()),
+            child_counts: Some(child_counts),
         })
         .map_err(|_| Error::new("internal", "process page could not be encoded"))
     }

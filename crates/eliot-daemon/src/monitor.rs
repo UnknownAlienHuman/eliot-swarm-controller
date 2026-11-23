@@ -11,7 +11,7 @@ use crate::{
 };
 use eliot_core::{
     Agent, Error, FileChangeHint, GitBaseline, GitHintPage, GitSnapshot, ProcessIdentity,
-    ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result, SourceGap,
+    ProcessRecord, ProcessSample, ProcessSnapshot, ProcessState, Result, SessionUsage, SourceGap,
     WorkspacePreparation,
     api::{
         ChildRunLineCounts, FilesystemInvalidationState, FilesystemInvalidationView,
@@ -118,6 +118,7 @@ struct ObserveTracker {
     warned_growth: HashSet<&'static str>,
     emitted_heavy: HashSet<String>,
     harness: Option<String>,
+    session_usage: Option<SessionUsage>,
     ancestry: HashMap<u32, (u64, Option<u32>)>,
 }
 
@@ -295,6 +296,34 @@ impl Monitoring {
     /// them from memory; the daemon never re-reads the config file per sweep.
     pub(crate) fn set_observe_thresholds(&self, thresholds: ObserveThresholds) {
         *self.inner.observe.lock_recover() = thresholds;
+    }
+
+    /// Keep the latest accepted native session snapshot in the live monitor.
+    /// Store remains the readback authority; this cache avoids waiting for a
+    /// journal event to refresh session-growth observation.
+    pub(crate) fn record_session_usage(&self, agent: &str, generation: i64, usage: SessionUsage) {
+        let Some(target) = self.target(agent, generation) else {
+            return;
+        };
+        let mut tracker = target.observe.lock_recover();
+        let newer = tracker.session_usage.as_ref().is_none_or(|current| {
+            match (current.observed_at, usage.observed_at) {
+                (Some(current), Some(incoming)) => incoming > current,
+                (Some(_), None) => false,
+                (None, Some(_)) | (None, None) => true,
+            }
+        });
+        if newer {
+            tracker.session_usage = Some(usage);
+        }
+    }
+
+    pub(crate) fn live_session_usage(&self, agent: &str, generation: i64) -> Option<SessionUsage> {
+        self.target(agent, generation)?
+            .observe
+            .lock_recover()
+            .session_usage
+            .clone()
     }
 
     /// An owned observer reader has OS custody but no native control token or
@@ -2255,6 +2284,7 @@ impl Monitoring {
         // of whether the native adapter reports its window capacity.
         let mut growth_events = Vec::new();
         {
+            let cached_usage = target.observe.lock_recover().session_usage.clone();
             let (harness, usage) = {
                 let store = self.inner.store.lock().await;
                 let harness = match target.observe.lock_recover().harness.clone() {
@@ -2264,12 +2294,17 @@ impl Monitoring {
                         None => return,
                     },
                 };
-                let usage = store
-                    .get_session_usage(&target.agent, target.generation)
-                    .unwrap_or(None);
+                let usage = cached_usage.or_else(|| {
+                    store
+                        .get_session_usage(&target.agent, target.generation)
+                        .unwrap_or(None)
+                });
                 (harness, usage)
             };
             target.observe.lock_recover().harness = Some(harness.clone());
+            if let Some(usage) = usage.as_ref() {
+                self.record_session_usage(&target.agent, target.generation, usage.clone());
+            }
             let mut tracker = target.observe.lock_recover();
             // The retained session snapshot carries the native session file
             // size where the harness exposes a documented size source

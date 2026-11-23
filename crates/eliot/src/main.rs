@@ -8,7 +8,9 @@ use std::{
 mod cli;
 mod mcp;
 
-use cli::args::{Cli, CliCommand, McpArgs, PluginArgs, PluginCommand};
+use cli::args::{
+    Cli, CliCommand, MaintenanceArgs, MaintenanceCommand, McpArgs, PluginArgs, PluginCommand,
+};
 use cli::support::Failure;
 
 fn main() -> ExitCode {
@@ -145,6 +147,9 @@ async fn run_inner(cli: Cli) -> ExitCode {
                     | CliCommand::Autonomy(_)
                     | CliCommand::Mcp(_)
                     | CliCommand::Store(_)
+                    | CliCommand::Maintenance(MaintenanceArgs {
+                        command: MaintenanceCommand::Compact,
+                    })
             ) {
                 let executable = match env::current_exe() {
                     Ok(path) => path,

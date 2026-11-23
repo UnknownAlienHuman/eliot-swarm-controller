@@ -983,10 +983,13 @@ message in the exact user-to-idle slice. Missing counters, including OpenCode's
 cache-write input, leave the first-call value unavailable.
 Session snapshots and whole-turn usage supply their own counters.
 
-`session_usage` retains only the latest serialized `SessionUsage` snapshot
-per Agent generation, committed from `session.usage` `data.usage` (`source`
-names the adapter and native signal, `observed_at` is native epoch
-milliseconds defaulted at the owning boundary). A strictly newer snapshot
+`session_usage` retains the latest serialized `SessionUsage` snapshot per
+Agent generation. Intermediate samples from an active turn update live
+Monitor state in memory. A completed turn with an accepted sample journals
+one `session.usage` observation. A session-only sample can refresh the
+projection without a journal row. `source` names the adapter and native
+signal. `observed_at` is native epoch milliseconds, defaulted at the owning
+boundary. A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens` carries an actual
@@ -1123,7 +1126,10 @@ so a removed delivery admitted with a skew-bounded write id reads
 read paths; a retried ack over it succeeds as already acked. An unset
 `mail_days` disables mail pruning.
 
-Prune exited child process rows using the independent `processes_seconds` window.
+Prune exited child process rows when the independent `processes_seconds` window
+is configured. The Store counts retained child observations and previously
+removed rows per process owner. A recorded child remains in those counts when
+its role is promoted, including after that process exits.
 Each pass deletes a bounded batch of `processes` rows with `state = 'exited'`,
 `role = 'child'` and `updated_at` older than the cutoff. Plugin and harness rows,
 running or unknown rows, and rows needed by retained generation custody stay available

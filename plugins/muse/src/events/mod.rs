@@ -511,16 +511,10 @@ struct EventProcessor {
     /// Advance only after successful processing/commit on this actor.
     /// Latest merged session-scoped snapshot from `session/tokenUsage`
     /// (cumulative counted-once totals plus estimated cost) and
-    /// `session/contextUsage` (occupancy triple). Never turn expenditure;
-    /// committed as `session.usage` when accepted and replaced wholesale on
-    /// newer updates.
+    /// `session/contextUsage` (occupancy triple). Never turn expenditure.
     session_usage: Option<SessionUsage>,
-    /// Last committed session snapshot content. Each accepted update commits
-    /// only when it differs, so repeats commit no extra session fact.
-    session_usage_committed: Option<SessionUsage>,
-    /// Monotonic counter for `session.usage` native ids so each accepted
-    /// update commits under a unique identity.
-    session_usage_seq: u64,
+    /// Exact active turn that supplied the latest sample, if any.
+    session_usage_turn: Option<String>,
     /// Cursors already normalized on this actor. A replayed copy skips
     /// normalization; the first application did the binding and conflict
     /// checks. Remembered only on success, never on gaps or failures.
@@ -793,8 +787,7 @@ impl EventProcessor {
             transport_loss: false,
             view_stale_reported: false,
             session_usage: None,
-            session_usage_committed: None,
-            session_usage_seq: 0,
+            session_usage_turn: None,
             applied_view_cursors: AppliedViewCursors::default(),
             messages: TurnMessages::default(),
             pending_requests: HashMap::new(),
@@ -2672,8 +2665,7 @@ impl EventProcessor {
         messages.complete(&mut source, native_id, text, data).await
     }
 
-    /// Fold one `session/tokenUsage` event into the retained session snapshot
-    /// and commit it as `session.usage` when accepted: the cumulative
+    /// Fold one `session/tokenUsage` event into the session snapshot: cumulative
     /// counted-once session totals plus the estimated session cost, with
     /// `observed_at` captured at acceptance. Session-scoped facts, never turn
     /// expenditure, so repeated completions can never inflate the terminal
@@ -2692,12 +2684,12 @@ impl EventProcessor {
         else {
             return Ok(());
         };
-        self.session_usage = Some(merged.clone());
-        self.commit_session_usage_now(merged).await
+        self.sample_session_usage(merged).await;
+        Ok(())
     }
 
     /// Fold one `session/contextUsage` event into the retained session
-    /// snapshot and commit it as `session.usage` when accepted: counted-once
+    /// snapshot: counted-once
     /// context occupancy and the effective window size, with `observed_at`
     /// captured at acceptance. Each notification replaces both context
     /// fields. Unchanged merges commit nothing, so identical adoptions never
@@ -2716,8 +2708,8 @@ impl EventProcessor {
         else {
             return Ok(());
         };
-        self.session_usage = Some(merged.clone());
-        self.commit_session_usage_now(merged).await
+        self.sample_session_usage(merged).await;
+        Ok(())
     }
 
     /// The notification names the owned native session; anything else is a
@@ -2732,32 +2724,31 @@ impl EventProcessor {
         Ok(())
     }
 
-    /// Commit one accepted session snapshot as its own `session.usage` fact,
-    /// so session scope and turn scope can never be confused and stream loss
-    /// before the terminal cannot lose an accepted fact. Commits only when
-    /// the snapshot differs from the last committed fact; `observed_at` is
-    /// defaulted at the owning boundary to the commit time.
-    async fn commit_session_usage_now(&mut self, usage: SessionUsage) -> Result<()> {
-        if self.session_usage_committed.as_ref() == Some(&usage) {
+    async fn sample_session_usage(&mut self, usage: SessionUsage) {
+        let turn = self.status.active_turn_id.clone();
+        if self.session_usage.as_ref() == Some(&usage) && self.session_usage_turn == turn {
+            return;
+        }
+        self.session_usage = Some(usage.clone());
+        self.session_usage_turn = turn.clone();
+        let _ = self
+            .stream_source()
+            .report_session_usage_sample(usage, turn.as_deref())
+            .await;
+    }
+
+    async fn commit_turn_session_usage(&mut self, turn: &str) -> Result<()> {
+        if self.session_usage_turn.as_deref() != Some(turn) {
             return Ok(());
         }
-        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
+        self.session_usage_turn = None;
+        let Some(usage) = self.session_usage.clone() else {
+            return Ok(());
+        };
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
-        let turn = self
-            .status
-            .active_turn_id
-            .clone()
-            .unwrap_or_else(|| "session".to_owned());
-        let native_id = event_id(
-            session_id,
-            &turn,
-            &format!("session-{}", self.session_usage_seq),
-            "session.usage",
-        )?;
+        let native_id = event_id(session_id, turn, "terminal", "session.usage")?;
         self.commit_event("session.usage", native_id, json!({"usage": usage}))
-            .await?;
-        self.session_usage_committed = Some(usage);
-        Ok(())
+            .await
     }
 
     /// Commit `tool.started` for a turn-bound tool item, mirroring the Codex
@@ -3105,10 +3096,6 @@ impl EventProcessor {
             Err(error) if error.failure_where.as_deref() == Some("plugin.events.put") => false,
             Err(error) => return Err(error),
         };
-        // Session facts already committed when each notification was
-        // accepted, so the terminal carries turn scope only. A terminal
-        // whose native turn carries no usage leaves `data.usage` unset: for
-        // this harness the session notifications are the only usage signal.
         let dead_turn_id = notification.turn_id.clone();
         self.status.last_turn = Some(TurnFacts {
             command_id,
@@ -3159,7 +3146,11 @@ impl EventProcessor {
         self.expected_requests.clear();
         // Parent completion keeps child tracking: workflow children outlive
         // the parent turn and settle on their own terminal revisions.
-        Ok(())
+        if committed {
+            self.commit_turn_session_usage(&dead_turn_id).await
+        } else {
+            Ok(())
+        }
     }
 
     fn remember_resolved(&mut self, native_id: String) {

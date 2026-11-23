@@ -669,9 +669,10 @@ interval when the folder has no new brief (`not_found`), eligible briefs are set
 (`brief_settling`), or only older names await explicit inclusion (`brief_requires_include`).
 Each skipped or rejected slot commits its code as the timer's `last_outcome`
 with the slot, and an admitted slot clears it, so timer reads show why the last check
-started nothing. A scheduled skip emits `rule.skipped` when its reason changes or
-the slot carries a capacity diagnostic. Repeated skips with the same bare reason
-still advance the timer cursor. A manual run changes neither `last_outcome` nor `last_key`.
+started nothing. An idle folder check advances the timer without a `rule.skipped`
+event. Other scheduled skips emit that event when their reason changes or when
+the slot carries a capacity diagnostic. A manual run changes neither
+`last_outcome` nor `last_key`.
 A capacity, provider, workspace or transfer wait keeps the due slot. Timer and
 rule-list readback report the current wait code in `last_outcome` while the
 slot remains due.

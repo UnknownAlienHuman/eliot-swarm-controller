@@ -1006,6 +1006,7 @@ fn prepare_delete_tree_tx(tx: &Transaction<'_>, members: &[i64]) -> Result<Vec<S
 fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()> {
     let ids = prepare_delete_tree_tx(tx, members)?;
     delete_db!(tx.execute("DELETE FROM processes WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE processes.owner GLOB 'agent:a'||d.id||'#*' OR processes.owner GLOB 'workspace:a'||d.id||'#*')",[]));
+    delete_db!(tx.execute("DELETE FROM child_process_counts WHERE EXISTS(SELECT 1 FROM deleted_agents d WHERE child_process_counts.owner GLOB 'agent:a'||d.id||'#*' OR child_process_counts.owner GLOB 'workspace:a'||d.id||'#*')",[]));
     // Preserve existing mutation receipts. Create retry tombstones only
     // for commands whose identities would otherwise disappear.
     delete_db!(tx.execute(

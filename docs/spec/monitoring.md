@@ -212,7 +212,15 @@ plugin registration upsert one identity. Plugin, harness and workspace-runner ro
 append one `process.started` event and, on departure, one `process.exited` or
 `process.unknown` event. An enumerated descendant (`child`) is a registry row only:
 `processes AGENT` and stats show it, and a heavy one surfaces as `activity.heavy`. A
-child promoted to harness gets its start event at promotion.
+child promoted to harness gets its start event at promotion. Process pages also
+report the cumulative number observed and exited as children for that Agent
+generation and scope. These counts survive child-row retention. An upgraded
+Store seeds them from the child rows it still holds.
+
+After terminal settlement and custody drain, the plugin host removes its
+registered instance directory if it is empty and records the removal in the
+artifact ledger. Nonempty generation instance directories follow the configured
+[cleanup age](configuration.md#daemon-and-automation-settings).
 
 Process exit does **not** immediately imply session/turn loss. It races buffered stdout
 and final native events:
@@ -510,9 +518,11 @@ Before dispatching Git removal, Swarm records the branch tip and requires the
 same tip in the final readback, including after restart.
 For an already missing checkout, Swarm requires two absence observations at
 least 15 seconds apart from the same readable parent before removing the
-stale Git registration or settling the row. An unavailable parent keeps the
-row unsettled. When the registration and branch are already absent, verified
-absence settles `removed` without dispatching Git writes. The outcome records
+stale Git registration or settling the row. For a matching unlocked, prunable
+registration, the bounded runner invokes non-force `git worktree remove` for
+the exact missing path, then re-reads the registration and branch. An unavailable
+parent keeps the row unsettled. When the registration and branch are already
+absent, verified absence settles `removed` without dispatching Git writes. The outcome records
 `directory_absent_before_remove`, `branch_absent_before_remove` and
 `branch_retained: false`. A confirmed disappearance also includes the last
 available retained Git observation, which can show that the checkout had
@@ -1218,7 +1228,14 @@ duration and Store lock wait and hold times for retention and native event batch
 The
 retention view reports the `eliot.db` main and WAL sizes, the configured
 windows and `pruned_through`, along with the SQLite auto-vacuum mode,
-total pages and reusable pages. The drain
+total pages and reusable pages. The disk usage view reports logical bytes under
+`artifacts/`, `worktrees/` and `plugins/` and skips link targets. Before #729,
+Swarm's managed launch assigned each worktree a flat `worktrees/<ULID>/` path.
+Those paths share the same size accounting as project-named worktrees. A flat
+path qualifies for age cleanup through its retained Agent and Git registration.
+An unbound directory contributes to the byte total. The Owner-decision worktree
+count comes from the latest complete cleanup sweep. Failed measurements and
+sweeps report their error codes. The drain
 report lists stored unknowns with no live process, turn or reader as
 retained-unresolved — with resolvability and owner action — instead of
 blocking on them; the stored outcome stays `unknown`.

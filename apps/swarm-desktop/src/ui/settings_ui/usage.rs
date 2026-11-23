@@ -252,9 +252,7 @@ pub(super) fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> 
         };
         return (
             size,
-            format!(
-                "All history is kept: no retention window is set (daemon.retention).{advisory}"
-            ),
+            format!("Retention off. All history is kept.{advisory}"),
         );
     }
     let window = |days: Option<i64>| {
@@ -266,8 +264,15 @@ pub(super) fn retention_lines(view: Option<&eliot_core::api::RetentionView>) -> 
     (
         size,
         format!(
-            "History kept: events {}, commands {}, mail {}.",
-            window(view.events_days),
+            "History kept: events {}, child processes {}, commands {}, mail {}.",
+            view.events_days.map_or_else(
+                || view
+                    .events_seconds
+                    .map_or_else(|| "kept".to_owned(), |seconds| format!("{seconds}s")),
+                |days| window(Some(days)),
+            ),
+            view.processes_seconds
+                .map_or_else(|| "kept".to_owned(), |seconds| format!("{seconds}s")),
             window(view.commands_days),
             window(view.mail_days)
         ),

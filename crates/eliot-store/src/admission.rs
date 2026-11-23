@@ -1466,6 +1466,7 @@ fn admit_worktree_remove_tx(
     let expected_tip = args.get("expected_tip");
     let observe_missing = args.get("observe_missing");
     let refused_launch = args.get("refused_launch_command");
+    let cleanup_mode = args.get("cleanup_mode");
     if request.request_id.is_some()
         || request.expected_turn_id.is_some()
         || request
@@ -1474,7 +1475,7 @@ fn admit_worktree_remove_tx(
         || args.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "expected_tip" | "observe_missing" | "refused_launch_command"
+                "expected_tip" | "observe_missing" | "refused_launch_command" | "cleanup_mode"
             )
         })
         || observe_missing.is_some_and(|value| value != &Value::Bool(true) || principal != "owner")
@@ -1482,6 +1483,14 @@ fn admit_worktree_remove_tx(
             !value.is_string() || principal != "owner" || observe_missing.is_some()
         })
         || expected_tip.is_some_and(|tip| !tip.as_str().is_some_and(eliot_core::api::is_git_oid))
+        || cleanup_mode.is_some_and(|mode| {
+            mode.as_str() != Some("automatic")
+                || principal != "owner"
+                || request.expected_generation != Some(agent.generation)
+                || expected_tip.is_none()
+                || observe_missing.is_some()
+                || refused_launch.is_some()
+        })
     {
         return Err(Error::new(
             "invalid",
@@ -1525,6 +1534,9 @@ fn admit_worktree_remove_tx(
     }
     if let Some(command_id) = refused_launch {
         args["refused_launch_command"] = command_id.clone();
+    }
+    if let Some(mode) = cleanup_mode {
+        args["cleanup_mode"] = mode.clone();
     }
     events.push(admit_command(
         tx,

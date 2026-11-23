@@ -16,6 +16,7 @@ use std::{
 const MAX_BRIEF_ENTRIES: usize = 500;
 const READY_DIRECTORY: &str = ".ready";
 const STABILITY_WINDOW: Duration = Duration::from_secs(3);
+pub(super) const EMPTY_FOLDER: &str = "assignment.folder.empty";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BriefVersion {
@@ -165,7 +166,8 @@ pub(crate) async fn prepare(
                 "brief_requires_include",
                 "an older brief requires explicit Owner inclusion",
             ),
-            (false, false) => Error::new("not_found", "assignment folder has no new brief"),
+            (false, false) => Error::new("not_found", "assignment folder has no new brief")
+                .with_where(EMPTY_FOLDER),
         })?;
 
     // Goal-owned work freezes the brief's Goal into the launch, so Store

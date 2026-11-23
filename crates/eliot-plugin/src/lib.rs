@@ -31,7 +31,7 @@ pub use protocol::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, DiscoverParams,
     InitializeParams, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES, ObserverAttachParams,
     ObserverDetachParams, ObserverSnapshotParams, PluginManifest, RpcError, RpcRequest,
-    RpcResponse,
+    RpcResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
 };
 pub use stderr::{
     StderrCapture, StderrSnapshot, StderrView, harness_diagnostic, spawn_plugin_stderr,

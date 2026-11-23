@@ -738,15 +738,21 @@ struct CloudMcpSettings {
 /// reports `size_advisory` and maintenance logs a line while all retention
 /// windows are unset. Documented in docs/spec/configuration.md (daemon retention).
 pub(crate) const RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES: u64 = 100 * 1024 * 1024;
-const DEFAULT_EVENTS_RETENTION_DAYS: i64 = 30;
-const DEFAULT_PROCESSES_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+pub(crate) const NEW_STORE_RETENTION_CONFIG: &str = "
+[daemon.retention]
+events_days = 30
+processes_seconds = 86400
+commands_days = 90
+mail_days = 90
+
+[automation]
+auto_cleanup = true
+";
 const DEFAULT_RETENTION_INTERVAL_SECONDS: i64 = 5 * 60;
 const MAX_RETENTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 
-/// Physical retention policy and SQLite space maintenance. Event retention
-/// defaults to 30 days; legacy `events_days` remains supported, while
-/// `events_seconds` permits short private qualification windows. Exited child
-/// rows default to one day. See docs/spec/configuration.md (daemon retention).
+/// Physical retention policy and SQLite space maintenance. Only explicitly
+/// configured windows delete history.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RetentionConfig {
@@ -767,23 +773,18 @@ pub(crate) struct RetentionConfig {
 }
 
 impl RetentionConfig {
-    pub(crate) fn events_retention_days(&self) -> Option<i64> {
-        self.events_seconds
-            .is_none()
-            .then_some(self.events_days.unwrap_or(DEFAULT_EVENTS_RETENTION_DAYS))
-    }
-
-    pub(crate) fn events_retention_seconds(&self) -> i64 {
-        self.events_seconds.unwrap_or_else(|| {
+    pub(crate) fn events_retention_seconds(&self) -> Option<i64> {
+        self.events_seconds.or_else(|| {
             self.events_days
-                .unwrap_or(DEFAULT_EVENTS_RETENTION_DAYS)
-                .saturating_mul(24 * 60 * 60)
+                .map(|days| days.saturating_mul(24 * 60 * 60))
         })
     }
 
-    pub(crate) fn processes_retention_seconds(&self) -> i64 {
-        self.processes_seconds
-            .unwrap_or(DEFAULT_PROCESSES_RETENTION_SECONDS)
+    pub(crate) fn is_unbounded(&self) -> bool {
+        self.events_retention_seconds().is_none()
+            && self.processes_seconds.is_none()
+            && self.commands_days.is_none()
+            && self.mail_days.is_none()
     }
 
     pub(crate) fn maintenance_interval_seconds(&self) -> u64 {

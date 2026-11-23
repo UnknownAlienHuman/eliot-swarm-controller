@@ -12,6 +12,7 @@ const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 /// Ledger rows inspected by one cleanup inventory page, including rows that
 /// are settled or filtered out.
 const CLEANUP_INVENTORY_SCAN: usize = 256;
+const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
@@ -56,6 +57,84 @@ impl Store {
             serde_json::from_str(&s).map_err(|_| Error::new("source_integrity", "invalid artifact"))
         })
         .transpose()
+    }
+
+    /// Whether a dispatched or unresolved stop still targets this exact
+    /// generation. The actor epilogue waits for progress only while this fence
+    /// remains open.
+    pub fn generation_has_open_stop(&mut self, agent: &str, generation: i64) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(sql_error)?;
+        let (dispatched, unknown) = super::open_stops_tx(&tx, agent_num, generation)?;
+        tx.commit().map_err(sql_error)?;
+        Ok(dispatched || unknown)
+    }
+
+    /// Retire exactly one empty plugin instance after the daemon has removed
+    /// its directory. This leaves the normal artifact tombstone without
+    /// creating a synthetic cleanup plan or receipt.
+    pub fn settle_empty_plugin_instance_removal(&mut self, expected: &ArtifactView) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        if expected.kind != ArtifactKind::Other
+            || expected.purpose != SWARM_PLUGIN_INSTANCE_PURPOSE
+            || expected.state != "registered"
+        {
+            return Err(Error::new(
+                "not_allowed",
+                "artifact is not a registered plugin instance directory",
+            ));
+        }
+        if !self.cleanup_agent_quiescent(expected)? {
+            return Err(Error::new(
+                "agent_not_quiescent",
+                "plugin instance generation is not terminal and quiescent",
+            ));
+        }
+
+        let agent_num = parse_agent_id(&expected.agent)?;
+        let mut retired = expected.clone();
+        retired.state = "removed".to_owned();
+        retired.path = format!("retired:{}", retired.id);
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let changed = tx
+            .execute(
+                "UPDATE artifacts SET body=?1,path=?2
+                 WHERE id=?3 AND agent=?4 AND generation=?5 AND path=?6
+                   AND json_extract(body,'$.id')=?3
+                   AND json_extract(body,'$.agent')=?7
+                   AND json_extract(body,'$.generation')=?5
+                   AND json_extract(body,'$.path')=?6
+                   AND json_extract(body,'$.identity')=?8
+                   AND json_extract(body,'$.kind')='other'
+                   AND json_extract(body,'$.purpose')=?9
+                   AND json_extract(body,'$.state')='registered'",
+                params![
+                    encode_json(&retired)?,
+                    retired.path,
+                    expected.id,
+                    agent_num,
+                    expected.generation,
+                    expected.path,
+                    expected.agent,
+                    expected.identity,
+                    SWARM_PLUGIN_INSTANCE_PURPOSE
+                ],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "plugin instance artifact registration changed before settlement",
+            ));
+        }
+        commit_transaction(tx, &self.write_faulted)
     }
 
     pub fn known_native_session_artifact(

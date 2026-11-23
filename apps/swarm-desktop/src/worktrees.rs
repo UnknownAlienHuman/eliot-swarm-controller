@@ -6,7 +6,8 @@
 //! (`docs/spec/coordination.md`, Registered artifacts and cleanup).
 
 use eliot_core::api::{
-    ArtifactKind, CleanupApplyResponse, CleanupCandidate, CleanupPlan, ManagedWorkspaceView,
+    ArtifactKind, CleanupApplyResponse, CleanupCandidate, CleanupPlan, DiskUsageDirectory,
+    DiskUsageView, ManagedWorkspaceView,
 };
 
 use crate::nav;
@@ -199,6 +200,31 @@ pub fn size_words(bytes: u64) -> String {
     } else {
         format!("{:.1} GB", value / (KB * KB * KB))
     }
+}
+
+/// Disk totals and the worktree decisions shown with the cleanup review.
+pub fn disk_usage_line(usage: &DiskUsageView) -> String {
+    fn size(label: &str, directory: &DiskUsageDirectory) -> String {
+        match (directory.bytes, &directory.error_code) {
+            (Some(bytes), None) => format!("{label} {} ({bytes} bytes)", size_words(bytes)),
+            (None, Some(code)) => format!("{label} unavailable ({code})"),
+            _ => format!("{label} unavailable"),
+        }
+    }
+    let decisions = match (
+        usage.owner_decision_worktrees,
+        &usage.owner_decision_error_code,
+    ) {
+        (Some(count), None) => format!("{count} worktrees awaiting Owner decision"),
+        (None, Some(code)) => format!("Owner-decision worktrees unavailable ({code})"),
+        _ => "Owner-decision worktrees unavailable".to_owned(),
+    };
+    format!(
+        "Disk use: {} · {} · {} · {decisions}",
+        size("artifacts", &usage.artifacts),
+        size("worktrees", &usage.worktrees),
+        size("plugins", &usage.plugins),
+    )
 }
 
 /// A plan or apply reason code in words.

@@ -972,6 +972,97 @@ impl WorkspaceGit {
             .await
     }
 
+    /// Prove against an independent branch ref in the frozen source, without
+    /// fetching or changing any refs. Recheck both object IDs after ancestry.
+    pub(crate) async fn require_automatic_removal_merge(
+        &self,
+        preparation: &WorkspacePreparation,
+        expected_tip: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let source = self.source(preparation, deadline).await?;
+        let candidate = branch_ref(&preparation.requested_branch);
+        let unproven = || {
+            problem(
+                "merge_proof_unavailable",
+                "local merge proof is unavailable",
+            )
+        };
+        if !is_git_oid(expected_tip)
+            || source
+                .common_dir
+                .join("info/grafts")
+                .try_exists()
+                .map_err(|_| unproven())?
+        {
+            return Err(unproven());
+        }
+
+        let base_name = if let Some(base) = preparation
+            .base_ref
+            .as_deref()
+            .filter(|base| *base != "HEAD" && !is_git_oid(base))
+        {
+            self.read_line(
+                &source.root,
+                &[
+                    "rev-parse",
+                    "--symbolic-full-name",
+                    "--verify",
+                    "--end-of-options",
+                    base,
+                ],
+                deadline,
+            )
+            .await
+        } else {
+            self.read_line(&source.root, &["symbolic-ref", "--quiet", "HEAD"], deadline)
+                .await
+        }
+        .map_err(|_| unproven())?;
+        if base_name == candidate
+            || !["refs/heads/", "refs/remotes/"]
+                .iter()
+                .any(|prefix| base_name.starts_with(prefix))
+        {
+            return Err(unproven());
+        }
+        let read_oid = async |reference: &str| {
+            self.read_line(
+                &source.root,
+                &["rev-parse", "--verify", "--end-of-options", reference],
+                deadline,
+            )
+            .await
+        };
+        let base = read_oid(&base_name).await?;
+        if !is_git_oid(&base) {
+            return Err(unproven());
+        }
+        let result = self
+            .git
+            .workspace_command(
+                &source.root,
+                &["merge-base", "--is-ancestor", expected_tip, &base],
+                deadline,
+            )
+            .await?;
+        if read_oid(&candidate).await? != expected_tip || read_oid(&base_name).await? != base {
+            return Err(problem(
+                "identity_changed",
+                "worktree or base ref moved during merge proof",
+            ));
+        }
+        match result.code {
+            0 => Ok(()),
+            1 => Err(problem(
+                "unmerged",
+                "managed branch has commits outside its local base",
+            )),
+            _ => Err(unproven()),
+        }
+    }
+
     /// A hand-deleted directory has no contents left to guard. Only a unique,
     /// unlocked, prunable registration of the frozen path and branch may be
     /// passed to Git's non-force removal. Never prune unrelated worktrees.

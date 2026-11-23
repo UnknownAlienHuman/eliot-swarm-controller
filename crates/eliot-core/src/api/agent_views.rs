@@ -1197,6 +1197,12 @@ pub struct AgentListResponse {
     pub truncated: bool,
 }
 
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildProcessCounts {
+    pub observed: i64,
+    pub exited: i64,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentProcessesResponse {
     pub agent: String,
@@ -1207,6 +1213,9 @@ pub struct AgentProcessesResponse {
     pub next: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Cumulative for this process owner, including rows pruned by retention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_counts: Option<ChildProcessCounts>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2304,6 +2313,56 @@ impl CommandWithoutDispatcherStatus {
     }
 }
 
+/// Logical bytes below one private daemon data-directory bucket. The walk
+/// includes every entry and never follows symbolic links or reparse points.
+/// `bytes` is absent with a typed `error_code` when an exact total was not
+/// available; missing bucket directories report zero bytes.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskUsageDirectory {
+    pub bytes: Option<u64>,
+    pub error_code: Option<String>,
+}
+
+impl DiskUsageDirectory {
+    pub fn validate(&self) -> Result<()> {
+        match (&self.bytes, &self.error_code) {
+            (Some(_), None) => Ok(()),
+            (None, Some(code)) if !code.trim().is_empty() && code.len() <= 64 => Ok(()),
+            _ => Err(invalid_response()),
+        }
+    }
+}
+
+/// Recursive logical-size inventory for the daemon's managed disk buckets.
+/// The decision count is unknown until a complete automatic cleanup sweep
+/// has supplied evidence or the latest sweep failed.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiskUsageView {
+    pub artifacts: DiskUsageDirectory,
+    pub worktrees: DiskUsageDirectory,
+    pub plugins: DiskUsageDirectory,
+    pub owner_decision_worktrees: Option<usize>,
+    pub owner_decision_error_code: Option<String>,
+}
+
+impl DiskUsageView {
+    pub fn validate(&self) -> Result<()> {
+        self.artifacts.validate()?;
+        self.worktrees.validate()?;
+        self.plugins.validate()?;
+        match (
+            self.owner_decision_worktrees,
+            &self.owner_decision_error_code,
+        ) {
+            (Some(_), None) => Ok(()),
+            (None, Some(code)) if !code.trim().is_empty() && code.len() <= 64 => Ok(()),
+            _ => Err(invalid_response()),
+        }
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonHealthSummary {
@@ -2346,6 +2405,8 @@ pub struct DaemonStatusResponse {
     pub automation_tasks: Vec<WorkerTaskStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automatic_cleanup: Option<AutomaticCleanupView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_usage: Option<DiskUsageView>,
     pub unknown_commands_count: usize,
     pub unknown_commands: Vec<String>,
     pub unknown_commands_truncated: bool,

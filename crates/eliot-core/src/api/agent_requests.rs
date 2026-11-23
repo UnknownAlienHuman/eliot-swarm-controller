@@ -588,6 +588,10 @@ impl AgentProcessesRequest {
         if self.validate().is_err()
             || !binding(&self.id, self.generation, &reply.agent, reply.generation)
             || reply.processes.len() > self.limit
+            || reply
+                .child_counts
+                .as_ref()
+                .is_some_and(|counts| counts.exited < 0 || counts.exited > counts.observed)
             || match self.effective_scope() {
                 "workspace" => reply.scope.as_deref() != Some("workspace"),
                 _ => reply.scope.is_some(),
@@ -897,6 +901,10 @@ impl DaemonStatusRequest {
                                 .copied()
                                 .unwrap_or_default()
                 })
+            || reply
+                .disk_usage
+                .as_ref()
+                .is_some_and(|usage| usage.validate().is_err())
             || reply.workspace_custody.scope != "current_host"
             || reply
                 .cloud_mcp

@@ -1190,32 +1190,46 @@ impl WorkspaceManager {
         } else {
             profile
         };
-        let preflight = match timeout_at(
-            deadline,
-            self.removal_candidates(git, preparation, profile, expected_tip, deadline),
-        )
-        .await
-        {
-            Ok(Ok(candidates)) => candidates,
-            Ok(Err(error)) => return removal_preflight_error(&error, "cleanliness"),
-            Err(_) => return removal_unknown("workspace_scratch_deadline"),
-        };
-        if let Err(outcome) = self
-            .remove_scratch_files(
-                command,
-                preparation,
-                slot,
-                &preflight.scratch,
-                preflight.files,
+        let automatic =
+            command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic");
+        let verified_tip = if automatic {
+            let Some(tip) = expected_tip else {
+                return removal_refused(
+                    "source_integrity",
+                    "automatic worktree plan has no tip",
+                    "git_prepare",
+                );
+            };
+            tip.to_owned()
+        } else {
+            let preflight = match timeout_at(
                 deadline,
+                self.removal_candidates(git, preparation, profile, expected_tip, deadline),
             )
             .await
-        {
-            return outcome;
-        }
+            {
+                Ok(Ok(candidates)) => candidates,
+                Ok(Err(error)) => return removal_preflight_error(&error, "cleanliness"),
+                Err(_) => return removal_unknown("workspace_scratch_deadline"),
+            };
+            if let Err(outcome) = self
+                .remove_scratch_files(
+                    command,
+                    preparation,
+                    slot,
+                    &preflight.scratch,
+                    preflight.files,
+                    deadline,
+                )
+                .await
+            {
+                return outcome;
+            }
+            preflight.tip
+        };
         let mutator = match timeout_at(
             deadline,
-            git.prepare_remove(preparation, &preflight.tip, deadline),
+            git.prepare_remove(preparation, &verified_tip, deadline),
         )
         .await
         {
@@ -1228,7 +1242,7 @@ impl WorkspaceManager {
             preparation,
             slot,
             git,
-            (mutator, &preflight.tip),
+            (mutator, &verified_tip),
             deadline,
         )
         .await
@@ -1253,6 +1267,13 @@ impl WorkspaceManager {
         }
         if Instant::now() >= deadline {
             return removal_unknown("workspace_remove_deadline");
+        }
+        if command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic")
+            && let Err(error) = git
+                .require_automatic_removal_merge(preparation, expected_tip, deadline)
+                .await
+        {
+            return removal_preflight_error(&error, "merge_proof");
         }
         let reservation = self.inner.store.lock().await.begin_workspace_git_effect(
             &command.id,

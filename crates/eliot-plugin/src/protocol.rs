@@ -2,11 +2,47 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-use eliot_core::ContextItem;
 pub use eliot_core::limits::{
     MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
 };
 pub use eliot_core::{AgentStartParams, NativeStoreBinding};
+use eliot_core::{ContextItem, Error, SessionUsage};
+
+/// Live session usage sample sent to the bound daemon source without adding a
+/// native event row. `turn_id` is an optional source authority check only;
+/// the usage snapshot remains session scoped.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SessionUsageSampleRequest {
+    pub agent_id: String,
+    pub generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    pub usage: SessionUsage,
+}
+
+impl SessionUsageSampleRequest {
+    pub fn validate(&self) -> eliot_core::Result<()> {
+        if self.agent_id.trim().is_empty()
+            || self.generation < 1
+            || self
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| turn_id.trim().is_empty() || turn_id.len() > 256)
+        {
+            return Err(Error::new(
+                "invalid",
+                "session usage sample binding is invalid",
+            ));
+        }
+        self.usage.validate()
+    }
+}
+
+/// Positive response after the host accepts the sample.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionUsageSampleAck {
+    pub accepted: bool,
+}
 
 pub(crate) fn empty_object() -> Value {
     Value::Object(Map::new())

@@ -253,7 +253,13 @@ fn search_settings(query: &str) -> Vec<(Page, &'static str)> {
 pub(super) enum SettingsMsg {
     /// Clean up finished work: read a plan (nothing is removed).
     CleanupPlan(Option<String>),
-    CleanupPlanned(Fallible<(eliot_core::api::CleanupPlan, HashMap<String, String>)>),
+    CleanupPlanned(
+        Fallible<(
+            eliot_core::api::CleanupPlan,
+            HashMap<String, String>,
+            Option<eliot_core::api::DiskUsageView>,
+        )>,
+    ),
     /// Check (true) or uncheck one group of the plan.
     CleanupGroupToggled(crate::worktrees::CleanupGroup, bool),
     /// Check every group that has something safe to remove (opt-in
@@ -266,7 +272,12 @@ pub(super) enum SettingsMsg {
     CleanupApply,
     /// The confirmation's answer: true removes the selected items.
     CleanupConfirmed(bool),
-    CleanupApplied(MutationResult<eliot_core::api::CleanupApplyResponse>),
+    CleanupApplied(
+        MutationResult<(
+            eliot_core::api::CleanupApplyResponse,
+            Option<eliot_core::api::DiskUsageView>,
+        )>,
+    ),
     PageSelected(Page),
     Loaded(Fallible<SettingsReadResponse>),
     Reload,
@@ -452,6 +463,8 @@ impl Note {
 pub(super) struct SettingsState {
     /// The plan under review (nothing removed yet).
     cleanup_plan: Option<eliot_core::api::CleanupPlan>,
+    /// Current disk totals shown alongside the cleanup plan.
+    cleanup_disk_usage: Option<eliot_core::api::DiskUsageView>,
     cleanup_busy: bool,
     cleanup_titles: HashMap<String, String>,
     /// Why the last plan or apply read failed.
@@ -822,6 +835,7 @@ impl DesktopApp {
                 if continuation.is_none() {
                     s.cleanup_plan = None;
                     s.cleanup_result = None;
+                    s.cleanup_disk_usage = None;
                 }
                 s.cleanup_error = None;
                 s.cleanup_confirm = false;
@@ -879,7 +893,11 @@ impl DesktopApp {
                                 break;
                             }
                         }
-                        Ok::<_, eliot_core::Error>((plan, titles))
+                        let disk_usage = client::daemon_status(&data)
+                            .await
+                            .ok()
+                            .and_then(|status| status.disk_usage);
+                        Ok::<_, eliot_core::Error>((plan, titles, disk_usage))
                     })
                     .map_err(|error| error.to_string());
                     Message::Settings(SettingsMsg::CleanupPlanned(result))
@@ -888,9 +906,10 @@ impl DesktopApp {
             SettingsMsg::CleanupPlanned(result) => {
                 s.cleanup_busy = false;
                 match result {
-                    Ok((plan, titles)) => {
+                    Ok((plan, titles, disk_usage)) => {
                         s.cleanup_result = None;
                         s.cleanup_titles = titles;
+                        s.cleanup_disk_usage = disk_usage;
                         s.cleanup_unchecked =
                             crate::worktrees::CleanupGroup::unchecked_by_default();
                         s.cleanup_kept_open.clear();
@@ -959,6 +978,7 @@ impl DesktopApp {
                 s.cleanup_key = Some(key);
                 s.cleanup_busy = true;
                 s.cleanup_error = None;
+                s.cleanup_disk_usage = None;
                 let _task = context.spawn_background(move |_| {
                     let request = eliot_core::api::CleanupApplyRequest {
                         id,
@@ -968,9 +988,16 @@ impl DesktopApp {
                         delete_remote: false,
                         artifacts: Some(selected),
                     };
-                    Message::Settings(SettingsMsg::CleanupApplied(client::block_on(
-                        eliot_daemon::client_call_typed(&data, "cleanup.apply", &request),
-                    )))
+                    Message::Settings(SettingsMsg::CleanupApplied(client::block_on(async {
+                        let reply =
+                            eliot_daemon::client_call_typed(&data, "cleanup.apply", &request)
+                                .await?;
+                        let disk_usage = client::daemon_status(&data)
+                            .await
+                            .ok()
+                            .and_then(|status| status.disk_usage);
+                        Ok::<_, eliot_core::Error>((reply, disk_usage))
+                    })))
                 });
             }
             SettingsMsg::CleanupApplied(result) => {
@@ -978,7 +1005,8 @@ impl DesktopApp {
                 let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 let key = s.cleanup_key.take();
                 match result {
-                    Ok(reply) => {
+                    Ok((reply, disk_usage)) => {
+                        s.cleanup_disk_usage = disk_usage;
                         if let Some(plan) = s.cleanup_plan.take() {
                             s.cleanup_result = Some((plan, reply));
                         }

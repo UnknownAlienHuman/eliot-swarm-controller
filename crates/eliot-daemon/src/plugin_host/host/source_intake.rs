@@ -16,9 +16,12 @@ use super::{native_children, observation, source_handoff};
 use crate::command_guard::{CommandGuardPolicy, CommandGuardRequest, REQUEST_FIELD};
 use crate::common::{now_ms, secure_eq};
 use crate::git_monitor::GitProbe;
+use crate::monitor::Monitoring;
 
 use eliot_core::{Error, PermissionRefusal, Result, SecretPolicy, SourceBatch, SourceGap};
-use eliot_plugin::protocol::{HookEvent, HookResponse};
+use eliot_plugin::protocol::{
+    HookEvent, HookResponse, SessionUsageSampleAck, SessionUsageSampleRequest,
+};
 use eliot_plugin::sync::LockExt;
 use eliot_store::family_for_kind;
 use serde_json::{Value, json};
@@ -28,6 +31,7 @@ use ulid::Ulid;
 
 struct BatchIntake<'a> {
     host: &'a std::sync::Weak<HostState>,
+    monitoring: &'a Monitoring,
     policy: &'a CommandGuardPolicy,
     credentials: &'a [String],
 }
@@ -57,15 +61,16 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         let method = request.method.clone();
         let reply_deadline = deadline();
         // A Store lock timeout must leave time to transmit the proven rejection.
-        let request_deadline = if method == "events.put" {
-            reply_deadline - RPC_GRACE
-        } else {
-            reply_deadline
+        let request_deadline = match method.as_str() {
+            "events.put" => reply_deadline - RPC_GRACE,
+            "usage.sample" => Instant::now() + std::time::Duration::from_millis(150),
+            _ => reply_deadline,
         };
         let mut rejected_batch = None;
         let result = if !matches!(
             method.as_str(),
             "events.put"
+                | "usage.sample"
                 | "source.gap"
                 | "source.handoff"
                 | "source.health"
@@ -76,7 +81,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
         ) {
             Err(Error::new(
                 "unsupported",
-                "plugin host only accepts events.put, source.gap, source.handoff, source.health, source.state, process.put, child, and hook.event",
+                "plugin host only accepts events.put, usage.sample, source.gap, source.handoff, source.health, source.state, process.put, child, and hook.event",
             ))
         } else {
             let mut params = request.params;
@@ -150,6 +155,33 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                             }
                         }
                     }
+                    "usage.sample" => {
+                        let current = state
+                            .upgrade()
+                            .is_some_and(|state| state.running.lock_recover().contains_key(&key));
+                        if observation.is_some()
+                            || !current
+                            || params.get("agent_id").and_then(Value::as_str)
+                                != Some(agent_id.as_str())
+                            || params.get("generation").and_then(Value::as_i64) != Some(generation)
+                        {
+                            Err(Error::new(
+                                "stale_generation",
+                                "usage.sample does not match the current plugin generation",
+                            ))
+                        } else {
+                            put_usage_sample(
+                                &store,
+                                &monitoring,
+                                params,
+                                &agent_id,
+                                generation,
+                                &source_credentials,
+                                request_deadline,
+                            )
+                            .await
+                        }
+                    }
                     "events.put" => {
                         let result = put_events(
                             &store,
@@ -158,6 +190,7 @@ pub(super) async fn serve_plugin_requests(mut connection: PluginConnection, sour
                             binding,
                             BatchIntake {
                                 host: &state,
+                                monitoring: &monitoring,
                                 credentials: &source_credentials,
                                 policy: &command_guard_policy,
                             },
@@ -528,6 +561,53 @@ fn completion_fields_for(
     }
     fields
 }
+async fn put_usage_sample(
+    store: &StoreHandle,
+    monitoring: &Monitoring,
+    params: Value,
+    bound_agent: &str,
+    bound_generation: i64,
+    credentials: &[String],
+    until: Instant,
+) -> Result<Value> {
+    let mut request: SessionUsageSampleRequest = serde_json::from_value(params)
+        .map_err(|_| Error::new("invalid", "usage.sample params are malformed"))?;
+    request.validate()?;
+    if request.agent_id != bound_agent || request.generation != bound_generation {
+        return Err(Error::new(
+            "stale_generation",
+            "usage.sample binding does not match the current plugin generation",
+        ));
+    }
+    let mut usage = serde_json::to_value(&request.usage)
+        .map_err(|_| Error::new("invalid", "usage.sample payload could not be encoded"))?;
+    SecretPolicy::new(credentials.iter()).redact_values(&mut usage);
+    request.usage = serde_json::from_value(usage)
+        .map_err(|_| Error::new("invalid", "usage.sample payload is invalid after redaction"))?;
+    request.validate()?;
+
+    let latest = match timeout_at(until, store.lock()).await {
+        Ok(mut store) => store.put_session_usage_sample(
+            bound_agent,
+            bound_generation,
+            request.turn_id.as_deref(),
+            request.usage,
+            now_ms(),
+        ),
+        Err(_) => Err(Error::new(
+            "busy",
+            "Store lock deadline elapsed for usage.sample",
+        )),
+    }?;
+    monitoring.record_session_usage(bound_agent, bound_generation, latest);
+    serde_json::to_value(SessionUsageSampleAck { accepted: true }).map_err(|_| {
+        Error::new(
+            "internal",
+            "usage.sample acknowledgement could not be encoded",
+        )
+    })
+}
+
 async fn put_events(
     store: &StoreHandle,
     bus: &Bus,
@@ -539,6 +619,7 @@ async fn put_events(
 ) -> Result<Value> {
     let invalid_batch = || Error::new("invalid", "events.put params are malformed");
     let credentials = intake.credentials;
+    let monitoring = intake.monitoring;
     let guard_policy = intake.policy;
     let gap = batch_gap(&params).ok_or_else(invalid_batch)?;
     let is_child = gap.agent_id != binding.agent_id || gap.generation != binding.generation;
@@ -577,6 +658,10 @@ async fn put_events(
         .map(|event| event.kind.chars().take(48).collect::<String>())
         .collect::<Vec<_>>()
         .join(",");
+    let contains_session_usage = batch
+        .events
+        .iter()
+        .any(|event| event.kind == "session.usage");
     let queued = Instant::now();
     let result = match timeout_at(until, store.lock()).await {
         Ok(mut store) => {
@@ -597,8 +682,18 @@ async fn put_events(
             if let Ok(commit) = &result {
                 bus.publish(&commit.events);
             }
+            let latest_usage = if result.is_ok() && contains_session_usage {
+                store
+                    .get_session_usage(&gap.agent_id, gap.generation)
+                    .unwrap_or(None)
+            } else {
+                None
+            };
             let held = acquired.elapsed();
             drop(store);
+            if let Some(usage) = latest_usage {
+                monitoring.record_session_usage(&gap.agent_id, gap.generation, usage);
+            }
             if crate::logging::is_debug()
                 && let Ok(commit) = &result
             {
