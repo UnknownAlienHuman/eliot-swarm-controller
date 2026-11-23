@@ -13,6 +13,7 @@ pub fn declaration() -> HarnessCapabilities {
         requires_frozen_store_inputs: true,
         native_discovery: true,
         resume_previous_turn: true,
+        reconcile_unfinished_tools: true,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::FrozenStore),
         agent_identity_env: true,
         launch_default_resolution: true,

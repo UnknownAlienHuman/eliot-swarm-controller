@@ -649,6 +649,11 @@ Unknown command and file-change statuses also decode as `Other` and are diagnose
 they do not produce a guessed `tool.completed`. Unknown message phases do not mark a
 final answer, and unknown patch-change kinds do not add an inferred move path.
 
+If the Codex stream could not commit its final tool records, exact turn
+settlement or generation loss closes retained tool starts as `unknown`.
+These daemon events carry the original turn and item and record the absence
+of a native tool terminal.
+
 OpenCodex is added as a named provider route in L3, initially attached to an owner-run
 service. Do not edit owner global Codex config. Keep client/admin credentials separate
 and report only routing facts that native/readback or a real request demonstrates.

@@ -66,6 +66,10 @@ impl Store {
             return Ok(Vec::new());
         }
 
+        let native_ended = matches!(
+            &outcome,
+            RecoveredTurn::Terminal(_) | RecoveredTurn::NativeExited
+        );
         let (kind, mut data) = match outcome {
             RecoveredTurn::Terminal(mut terminal) => {
                 if binding.view_projection_gap {
@@ -122,7 +126,18 @@ impl Store {
             native.data.clone(),
         );
         event.cause = cause.clone();
-        let mut events = vec![insert_daemon_event_input(&tx, event)?];
+        let mut events = Vec::new();
+        if native_ended {
+            super::native_events::settle_unfinished_tools_tx(
+                &tx,
+                &agent,
+                agent_num,
+                &binding.turn_id,
+                now,
+                &mut events,
+            )?;
+        }
+        events.push(insert_daemon_event_input(&tx, event)?);
         let (commands, provider_events) = persist_effects(
             &tx,
             &effects,
