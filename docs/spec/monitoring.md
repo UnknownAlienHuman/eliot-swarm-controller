@@ -174,14 +174,14 @@ margin is missed, and a helper spawned after the tool ended but before
 `tool_time_basis` (`native` or `commit`). A call with no recorded end covers one
 second after its start, because a harness starts its own helpers at turn end.
 
-While a harness still runs a call as its own background task (`native_background`
-on `tool.started`), a process bound only to that call is not a candidate, because
-the harness wakes itself when the task ends. When `tool.background_ended` commits,
-the window closes at that time and a process that outlived the task becomes a
-candidate. When Swarm cannot track the task it does not suppress: a call past the
-plugin's bound of 64 tracked tasks carries no `native_background`, so it can get a
-duplicate wake but not lose one. A daemon restart ends every live generation, so
-tracking never outlives the plugin that holds it.
+A `tool.started` fact with `native_background` declares a harness-owned background
+task. A start with `native_auto_background` declares the same when the call has
+no `tool.completed` in its originating turn. A process bound only to an open
+native background task waits for the harness's own wake. For `native_background`
+tasks, `tool.background_ended` closes the task window and makes surviving processes
+eligible again. An auto-backgrounded call with `native_wake_scope: "process_tree"`
+also covers descendants of processes bound exclusively to that call. The harness's
+wake still covers that tree after the task ends (#916).
 
 On Windows custody is the Agent's Job, so every member descends from the session
 and a parent chain may break at an exited launcher, as a detached job's does. On

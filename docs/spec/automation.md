@@ -964,11 +964,10 @@ started inside a native tool call of that completing turn: the first process sti
 running from the newest such call. A process started
 outside every tool call, such as a harness notify helper at turn end, never arms.
 A process from an earlier turn does not arm either. While the harness still runs a
-call as its own background task (`native_background` on `tool.started`, Claude
-`run_in_background`), a process bound only to that call does not arm, because the
-harness wakes itself when that task ends. When `tool.background_ended` commits for
-a completed turn, Swarm inspects custody again and arms for a process that outlived
-the task. Swarm retains one `waiting`
+call as its own background task, Swarm leaves the wake to the harness. The
+[candidate rules](monitoring.md#background-process-wake-candidates) use the
+adapter's task and wake-scope facts to determine whether a survivor can arm when
+`tool.background_ended` commits. Swarm retains one `waiting`
 row in `background_process_wakes`. Nothing arms when the turn ended with a stop or
 interrupt, when it ran no native tool (including a turn started by a wake), or
 when the Agent has an open or same-turn
