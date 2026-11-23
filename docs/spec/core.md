@@ -787,9 +787,8 @@ diagnostics come from that exact retained turn event; missing retained links are
 left missing, never inferred by timestamps.
 Admission preflight can refuse before command admission with a typed location
 and origin: a reserved capacity bound (`swarm` at `store.admission.capacity`) or
-an unavailable profile executable (a missing explicit pin or no discovered
-default; `environment` at `router.admission.profile_cmd`). Only the router's
-`command.submit` preflight
+a missing explicit profile executable (`environment` at
+`router.admission.profile_cmd`). Only the router's `command.submit` preflight
 call site sets the private in-process refusal marker, and only after the Store
 proves no command was admitted under that request ID; a later-stage error with
 the same code, location and origin is never recorded. `diagnose` can explain that exact request ID

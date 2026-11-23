@@ -243,10 +243,9 @@ the first default when it is the only installed harness). This makes Swarm deleg
 profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
-Bootstrap does not select or persist a native executable. Muse catalogue reads
-are previews; an empty catalogue from the launch-selected binary is reported to
-the Owner, who can pin another installed binary explicitly. The same Muse
-discovery and empty-catalogue behavior applies to named and ad-hoc launches.
+Bootstrap detects the installed harnesses and writes profiles with `cmd` omitted.
+Muse follows the launcher-current binary at launch. An empty catalogue can
+prevent model selection and is reported by the Muse launch path.
 Before admission, an omitted profile selects the first available ordered role candidate.
 The [routing policy](#routing-policy-s3) governs continuation after a confirmed provider
 refusal. Uncertain outcomes retain their original command bindings.
@@ -412,13 +411,13 @@ fields default to the safe posture (Codex `workspace-write` + `never`,
 Claude CLI-default permission mode, Muse current conservative
 defaults); broader authority stays profile-only, owner-written choice. A missing
 `--cmd` uses the same harness-specific discovery as a profile with omitted `cmd`.
-Discovery runs when the launch is dispatched, after admission, and freezes the
+Launch preparation resolves and freezes the
 absolute selected path and available `cmd_version` in that generation's snapshot.
 It does not rewrite the profile. `swarm models`, `swarm harnesses`, and `swarm
 doctor` may inspect installed candidates but do not freeze a launch selection.
 An explicit `--cmd PATH` overrides discovery for this Owner launch; an explicit
-profile `cmd` is the saved-profile equivalent. These are exact native executable
-pins, not shell commands or version selectors. A missing pin refuses launch and
+profile `cmd` is the saved-profile equivalent. Claude also accepts `latest` for
+automatic selection. A missing pin refuses launch and
 never falls back silently. A new launch from an omitted-`cmd` profile discovers
 again; an existing generation keeps its captured executable.
 
@@ -430,12 +429,9 @@ selection (or the native Unix payload); Antigravity selects the `agy` CLI and
 never substitutes its IDE executable. Each harness page owns the candidate
 paths and native identity checks. An absent or ambiguous automatic candidate
 returns a typed `unsupported`/`profile_error` naming what was searched. An
-explicit path that no longer exists returns a profile command issue; discovery
-does not replace it. `swarm doctor` and `swarm status` report every affected
-profile, its configured path, and the discovered replacement path/version when
-available, with an Owner repair command. Use
-`swarm settings harness-cmd PROFILE (--cmd PATH|--auto)` to pin that replacement
-or clear the pin and return to automatic discovery. Ad-hoc Claude uses
+explicit path that no longer exists returns a profile command issue. The refusal
+and `swarm doctor` give the discovered replacement path when available and ask
+the Owner to omit `cmd` to restore automatic discovery. Ad-hoc Claude uses
 `mcp = "minimal"`. See
 [Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
 
@@ -917,9 +913,8 @@ latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 the diagnostic `VERIFIED_HARNESSES` baseline without blocking launch; those versions
 do not pin executable selection. It also reports every profile whose explicitly
 pinned executable is missing, with the configured path, current replacement
-path/version when available, and a one-command Owner repair. A missing pin still
-refuses that profile's launch until the Owner repairs or clears it. `swarm status`
-includes the same profile issues when present.
+path/version when available, and instructions to omit `cmd`. `swarm status`
+retains its Claude-specific preflight report.
 
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);
@@ -1623,13 +1618,10 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 Each named section is a complete replacement; leave unmodified sections out of the
 request. The desktop Settings screen uses the same read/save contract and follows the
 stale-revision rule of [unified settings](#unified-settings).
-`swarm settings harness-cmd PROFILE --cmd PATH` replaces one profile's
-executable through the revision-checked settings writer. Use
-`swarm settings harness-cmd PROFILE --auto` to clear the pin and restore the
-harness's default discovery. These forms are mutually exclusive. The command
-uses revision compare-and-swap and refuses a profile section containing
-redacted values rather than overwriting hidden settings. Repair suggestions
-are shell-quoted for PowerShell on Windows and POSIX shells elsewhere.
+Desktop profile creation and duplication omit `cmd`. The Owner can add or remove
+an executable override in the profile source. `swarm settings claude-cmd PROFILE
+--cmd PATH` sets an explicit Claude override and `swarm settings claude-cmd PROFILE
+--latest` restores automatic discovery through the revision-checked writer.
 
 The desktop adds a project by choosing its checkout with the native folder picker;
 it derives a valid, collision-free ID from the folder name and immediately saves

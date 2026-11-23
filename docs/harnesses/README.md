@@ -47,8 +47,7 @@ without blocking launch:
 A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
 `harness.drift` event and the launch flag. Every profile with an explicitly pinned
 executable path that has disappeared is reported with the configured path, an
-installed replacement and repair command when available; `swarm status` exposes
-the same profile warnings. A missing pin never falls back silently. `cmd` may be
+installed replacement when available, and instructions to omit `cmd`. `cmd` may be
 omitted from any of the five harness profiles; the profile and ad-hoc launch use the
 same harness-specific discovery, and only the launched generation freezes its
 selected executable. Historical source-check dates on adapter pages are not fresh
