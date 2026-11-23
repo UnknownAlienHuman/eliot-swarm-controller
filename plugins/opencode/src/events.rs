@@ -1854,9 +1854,21 @@ impl EventProcessor {
                 // A duplicate replay of an already-seen record: ignore.
                 Ok(())
             }
-            _ => {
-                self.record_gap("OpenCode event stream skipped durable sequence numbers")
-                    .await?;
+            Some(expected) => {
+                let kind = envelope.event_type.as_str();
+                let kind = if kind.len() <= 96
+                    && kind.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    }) {
+                    kind
+                } else {
+                    "unknown"
+                };
+                self.record_gap(&format!(
+                    "OpenCode event stream skipped durable sequence numbers: expected {expected}, saw {} ({kind})",
+                    durable.seq
+                ))
+                .await?;
                 Err(Error::new(
                     "unknown",
                     "OpenCode native facts were lost in transport",
