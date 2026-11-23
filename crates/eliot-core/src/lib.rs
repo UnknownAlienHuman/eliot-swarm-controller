@@ -709,6 +709,12 @@ pub struct Command {
     pub config: Option<AgentConfigView>,
 }
 
+impl Command {
+    pub fn is_owner_interrupt(&self) -> bool {
+        self.principal == "owner" && self.verb == "interrupt"
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventCause {

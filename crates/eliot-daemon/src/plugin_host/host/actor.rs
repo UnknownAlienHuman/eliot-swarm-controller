@@ -612,8 +612,16 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                     RuntimeMessage::Command {
                         command,
                         context,
+                        interrupt_deadline,
                         reply,
                     } => {
+                        if interrupt_deadline.is_some_and(|until| Instant::now() >= until) {
+                            let _ = reply.send(Err(Error::new(
+                                "native_not_dispatched",
+                                "Owner interrupt reached the plugin queue after its deadline",
+                            )));
+                            continue;
+                        }
                         let config = match resolve_send_config(state, &command).await {
                             Ok(config) => config,
                             Err(error) => {
@@ -696,7 +704,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                 }
                             }
                             Ok(params) => {
-                                let command_deadline = if command.verb == "compact" { Instant::now() + COMPACT_RPC_DEADLINE } else { deadline() };
+                                let command_deadline = if command.verb == "compact" { Instant::now() + COMPACT_RPC_DEADLINE } else { interrupt_deadline.unwrap_or_else(deadline) };
                                 let result = client.call("agent.command", params, command_deadline).await;
                                 complete_plugin_command(
                                     PluginCommandCompletion {

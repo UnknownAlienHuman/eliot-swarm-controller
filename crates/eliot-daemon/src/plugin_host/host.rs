@@ -53,6 +53,7 @@ use tokio::{
 use ulid::Ulid;
 
 const RPC_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const OWNER_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMPACT_RPC_DEADLINE: Duration = Duration::from_secs(180);
 /// Bound for one `agent.start` round trip and its outer absolute wait.
 /// Cold native startup is sequential inside that single RPC: credential
@@ -306,6 +307,7 @@ enum RuntimeMessage {
     Command {
         command: Command,
         context: Vec<ContextItem>,
+        interrupt_deadline: Option<Instant>,
         reply: oneshot::Sender<Result<Value>>,
     },
     Snapshot {
@@ -332,6 +334,7 @@ pub(crate) struct PendingCommand {
     stderr: StderrView,
     credentials: Arc<[String]>,
     response_timeout: Option<Duration>,
+    pub(crate) interrupt_deadline: Option<Instant>,
 }
 
 impl PendingCommand {
@@ -1053,7 +1056,7 @@ impl PluginHost {
             ));
         }
         match command.verb.as_str() {
-            "steer" | "interrupt" if command.turn_id.is_none() => {
+            "steer" | "interrupt" if command.turn_id.is_none() && !command.is_owner_interrupt() => {
                 return Err(Error::new(
                     "native_not_dispatched",
                     "turn control requires the captured active turn",
@@ -1076,10 +1079,14 @@ impl PluginHost {
             _ => Some(RPC_DEADLINE),
         };
         let (reply, response) = oneshot::channel();
+        let interrupt_deadline = command
+            .is_owner_interrupt()
+            .then(|| Instant::now() + OWNER_INTERRUPT_TIMEOUT);
         sender
             .try_send(RuntimeMessage::Command {
                 command,
                 context,
+                interrupt_deadline,
                 reply,
             })
             .map_err(|error| {
@@ -1094,6 +1101,7 @@ impl PluginHost {
             stderr,
             credentials,
             response_timeout,
+            interrupt_deadline,
         })
     }
 
@@ -2901,6 +2909,7 @@ fn agent_command_params(
         generation: agent.generation,
         command_id: command.id.clone(),
         verb: command.verb.clone(),
+        owner_control: command.is_owner_interrupt(),
         turn_id: command.turn_id.clone(),
         request_id: command.request_id.clone(),
         args,

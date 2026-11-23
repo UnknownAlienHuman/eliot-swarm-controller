@@ -581,10 +581,15 @@ fn dispatch_stop_tx(
         ));
     }
     super::switch::require_unused_switch_successor(tx, id, agent)?;
+    let turn = if command.command.principal == "owner" {
+        admission::owner_control_turn(tx, agent)?
+    } else {
+        agent.active_turn.clone()
+    };
     if command
         .expected_turn_id
         .as_deref()
-        .is_some_and(|expected| agent.active_turn.as_deref() != Some(expected))
+        .is_some_and(|expected| turn.as_deref() != Some(expected))
     {
         return Err(Error::new(
             "stale_generation",
@@ -596,7 +601,7 @@ fn dispatch_stop_tx(
     // the stop effect commits; this binding lets a proven Owner stop classify
     // only the turn it actually interrupted.
     if command.expected_turn_id.is_none()
-        && let Some(turn_id) = agent.active_turn.as_deref()
+        && let Some(turn_id) = turn.as_deref()
     {
         db!(tx.execute(
             "UPDATE commands SET expected_turn_id = ?1
@@ -783,7 +788,8 @@ fn dispatch_inject_tx(
         ));
     }
     require_no_in_flight_stop(tx, agent_num, agent.generation)?;
-    if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+    let owner_interrupt = command.command.is_owner_interrupt();
+    if !owner_interrupt && !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",
             "active_turn inject requires a busy or waiting Agent",
@@ -896,22 +902,38 @@ fn dispatch_control_tx(
             "control command requires a busy or waiting Agent",
         ));
     }
-    let turn_id =
-        command.command.turn_id.as_deref().ok_or_else(|| {
-            Error::new("source_integrity", "control command has no captured turn")
-        })?;
+    let turn_id = command.command.turn_id.as_deref();
+    let current_turn = if owner_interrupt {
+        if agent.native_ref.is_none() || agent.is_terminal() {
+            return Err(Error::new(
+                "bad_state",
+                "interrupt requires a live controlled native session",
+            ));
+        }
+        admission::owner_control_turn(tx, agent)?
+    } else {
+        if turn_id.is_none() {
+            return Err(Error::new(
+                "source_integrity",
+                "control command has no captured turn",
+            ));
+        }
+        agent.active_turn.clone()
+    };
     if command
         .expected_turn_id
         .as_deref()
-        .is_some_and(|expected| expected != turn_id)
-        || agent.active_turn.as_deref() != Some(turn_id)
+        .is_some_and(|expected| turn_id != Some(expected))
+        || current_turn.as_deref() != turn_id
     {
         return Err(Error::new(
             "stale_generation",
             "control command no longer targets the exact active turn",
         ));
     }
-    if command.command.verb == "interrupt" {
+    if command.command.verb == "interrupt"
+        && let Some(turn_id) = turn_id
+    {
         attention_lookup::guard_attention_interrupt(tx, agent_num, agent.generation, turn_id, id)?;
     }
     if is_request_reply_verb(command.command.verb.as_str()) {
@@ -930,7 +952,7 @@ fn dispatch_control_tx(
             ));
         };
         if state != "pending"
-            || pending.turn_id.as_str() != turn_id
+            || Some(pending.turn_id.as_str()) != turn_id
             || !agent.pending.contains(&pending)
         {
             return Err(Error::new(
@@ -981,14 +1003,89 @@ fn dispatch_control_tx(
 }
 
 impl Store {
+    /// Fence the exact unresolved Owner interrupt's generation before the
+    /// daemon escalates to the existing force-stop custody path.
+    pub fn dispatch_interrupt_stop(
+        &mut self,
+        interrupt_id: &str,
+        now: i64,
+    ) -> Result<Option<Change<(Agent, Command)>>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let interrupt = load_command_record(&tx, interrupt_id)?
+                .ok_or_else(|| Error::new("not_found", "interrupt command was not found"))?;
+            let (Some(agent_num), Some(generation)) =
+                (interrupt.target, interrupt.command.generation)
+            else {
+                return Err(Error::new(
+                    "bad_state",
+                    "interrupt has no generation binding",
+                ));
+            };
+            let agent = load_agent_by_num(&tx, agent_num)?
+                .ok_or_else(|| Error::new("not_found", "interrupt target Agent was not found"))?;
+            observer::require_controlled(&agent)?;
+            if !interrupt.command.is_owner_interrupt()
+                || interrupt.state != CommandState::Dispatched
+                || agent.generation != generation
+                || agent.is_terminal()
+                || admission::owner_control_turn(&tx, &agent)? != interrupt.command.turn_id
+            {
+                return Ok(None);
+            }
+            let mut request = SubmitCommand::new(Ulid::new().to_string(), "stop");
+            request.target = Some(agent.id.clone());
+            request.expected_generation = Some(generation);
+            request
+                .expected_turn_id
+                .clone_from(&interrupt.command.turn_id);
+            request.args = json!({"force": true});
+            let mut events = Vec::new();
+            admission::admit_stop_member(
+                &tx,
+                "owner",
+                &request,
+                &admission::command_payload_digest(&request)?,
+                &agent,
+                now,
+                &mut events,
+            )?;
+            db!(tx.execute(
+                "UPDATE commands SET parent_command = ?1, link_kind = 'interrupt_stop', ordinal = 0
+                 WHERE id = ?2",
+                params![interrupt_id, request.id],
+            ));
+            let stop = load_dispatchable_tx(&tx, &request.id)?;
+            dispatch_stop_tx(
+                &tx,
+                &request.id,
+                &stop,
+                &agent,
+                agent_num,
+                generation,
+                now,
+                &mut events,
+            )?;
+            let value = load_command(&tx, &request.id)?.ok_or_else(|| {
+                Error::new("source_integrity", "interrupt fallback stop disappeared")
+            })?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(Some(Change {
+                value: (agent, value),
+                events,
+            }))
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Admit and dispatch the one interrupt authorized by an already-dispatched
     /// graceful stop. Public command submission cannot create this child.
-    pub fn dispatch_stop_interrupt(
-        &mut self,
-        stop_id: &str,
-        turn_id: &str,
-        now: i64,
-    ) -> Result<Change<Command>> {
+    pub fn dispatch_stop_interrupt(&mut self, stop_id: &str, now: i64) -> Result<Change<Command>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -1009,16 +1106,6 @@ impl Store {
                     "interrupt requires a dispatched graceful stop",
                 ));
             }
-            if stop
-                .expected_turn_id
-                .as_deref()
-                .is_some_and(|expected| expected != turn_id)
-            {
-                return Err(Error::new(
-                    "stale_generation",
-                    "stop interrupt targets a different turn",
-                ));
-            }
             let already_attempted: bool = tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM commands
@@ -1036,10 +1123,21 @@ impl Store {
             let agent = load_agent_by_num(&tx, agent_num)?
                 .ok_or_else(|| Error::new("not_found", "stop target Agent was not found"))?;
             observer::require_controlled(&agent)?;
+            let current_turn = if stop.command.principal == "owner" {
+                admission::owner_control_turn(&tx, &agent)?
+            } else {
+                agent.active_turn.clone()
+            };
+            if current_turn.is_none() || current_turn != stop.expected_turn_id {
+                return Err(Error::new(
+                    "stale_generation",
+                    "stop interrupt no longer targets the captured turn",
+                ));
+            }
             let mut request = SubmitCommand::new(Ulid::new().to_string(), "interrupt");
             request.target = Some(agent.id.clone());
             request.expected_generation = Some(generation);
-            request.expected_turn_id = Some(turn_id.to_owned());
+            request.expected_turn_id = current_turn;
             let mut events = Vec::new();
             admission::admit_control_tx(
                 &tx,

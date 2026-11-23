@@ -286,6 +286,9 @@ pub struct AgentCommandParams {
     pub generation: i64,
     pub command_id: String,
     pub verb: String,
+    /// Daemon-authorized Owner interrupt of this controlled native session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub owner_control: bool,
     #[serde(default = "empty_object")]
     pub args: Value,
     #[serde(default)]
