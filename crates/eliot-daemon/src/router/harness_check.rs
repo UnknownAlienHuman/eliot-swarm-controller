@@ -78,13 +78,17 @@ impl Router {
                     .map(str::to_owned);
                 store.note_harness_installed(harness, version.as_deref(), now)?;
             }
-            let due = store
-                .due_harness_checks(now, available.min(eliot_core::HARNESS_CHECK_BATCH_LIMIT))?;
+            // Fetch every due harness: ones without a configured profile are
+            // skipped below, and must not consume the run batch.
+            let due = store.due_harness_checks(now, usize::MAX)?;
             let orphans = self.orphaned_harness_check_agents(&store)?;
             (due, orphans)
         };
         let mut started = Vec::with_capacity(due.len());
         for (harness, version) in due {
+            if started.len() >= available.min(eliot_core::HARNESS_CHECK_BATCH_LIMIT) {
+                break;
+            }
             let Some(profile) = self.cheapest_harness_profile(&harness) else {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
