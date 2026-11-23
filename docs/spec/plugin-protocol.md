@@ -139,11 +139,19 @@ normalized native family. Hooks never mirror lifecycle already supplied by the s
 | `profile.store` (L3) | shared [`ProfileStoreParams`](../../crates/eliot-plugin/src/protocol.rs) | Return [`ProfileStoreResult`](../../crates/eliot-plugin/src/protocol.rs): the effective `NativeStoreBinding` and optional plugin-owned startup projection, using the caller's actual prepared workspace and one bounded, owned metadata reader. Store freezes both with the exact launch dispatch; success requires confirmed reader cleanup. It creates no model or thread, performs no native control and publishes no Agent events. This is outside the L1/L2 first-harness subset. |
 | `shutdown` | none | close owned paths, drain, exit; never kill an adopted service |
 
-For an ordinary stop with an active turn, the router attempts `agent.command`
-with `interrupt` under the stop's authority. It then sends `agent.stop` following
-the [generation and turn rules](core.md#states-and-reducer). The daemon alone
-terminates owned custody when needed, using the generation's Windows Job or the
-weaker Unix process custody. Explicit force bypasses plugin stop.
+An ordinary stop attempts `agent.command` with `interrupt` for the captured
+active or uncertain turn under the stop's authority, then sends `agent.stop` to
+close the controlled session. For an Owner interrupt, the daemon sets
+`owner_control` in [AgentCommandParams](../../crates/eliot-plugin/src/protocol.rs).
+The adapter translates the cancellation for its bound process and session even
+when the source is unhealthy or the turn projection is uncertain. It retains
+the exact native turn binding when the protocol requires it, and echoes the
+command and daemon-captured turn in its result. An adapter may report
+`interrupt_confirmed` only when native evidence establishes that the captured
+work ended or that there is no active work in the bound session.
+
+The daemon owns the [interrupt deadline and stop custody](monitoring.md#process-identity-and-custody).
+Explicit force uses that custody directly.
 
 Stop is applied only after independent, bounded process-custody exit and native
 source-drain proofs are committed for that generation. A missing native stop
@@ -586,8 +594,10 @@ A fanout guard never hides an already-created native child.
 ## Translation and normalization
 
 Unsupported semantics reject; never quietly map steer to send, resume to fresh launch,
-answer to a default choice or force-stop to shared-service termination. Steer/interrupt
-carry exact turn and replies exact request. Report delayed application points.
+answer to a default choice or force-stop to shared-service termination. Steer,
+ordinary interrupt and replies carry the exact turn, and replies carry the
+exact request. Owner interrupt uses the controlled-session binding above.
+Report delayed application points.
 
 Native inbox/HTTP acceptance is intermediate; send applies at exact input-to-turn
 association. A correlated terminal response can establish that association even

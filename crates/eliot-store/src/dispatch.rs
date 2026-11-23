@@ -788,8 +788,7 @@ fn dispatch_inject_tx(
         ));
     }
     require_no_in_flight_stop(tx, agent_num, agent.generation)?;
-    let owner_interrupt = command.command.is_owner_interrupt();
-    if !owner_interrupt && !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+    if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",
             "active_turn inject requires a busy or waiting Agent",
@@ -896,7 +895,8 @@ fn dispatch_control_tx(
     }
     // Control-verb support is owned by the PluginHost manifest
     // check; only generation, state, turn and request are rechecked.
-    if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+    let owner_interrupt = command.command.is_owner_interrupt();
+    if !owner_interrupt && !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
         return Err(Error::new(
             "bad_state",
             "control command requires a busy or waiting Agent",

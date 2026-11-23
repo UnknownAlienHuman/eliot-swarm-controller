@@ -3179,7 +3179,7 @@ on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that 
 line into an error record when merged with `2>&1`, so callers must read the raw process
 exit code (`$LASTEXITCODE` / `%ERRORLEVEL%`) rather than `$?`.
 
-`steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
+`steer` does not require `--generation`/`--turn`. When either flag
 is omitted the CLI reads the Agent's current generation and active turn, prints
 the exact target it captured (`<verb> target: agent=A generation=N turn=T` on
 stderr), and submits exactly that binding; an explicit flag always wins over the
@@ -3188,6 +3188,14 @@ with no extra read. A missing active turn fails clearly (exit 3) before any
 submit. A captured submit that the Store rejects as `stale_generation` is
 reported as a race (exit 3, `race:` message naming the submitted binding) and is
 never retried against the new turn.
+
+`interrupt` submits explicit generation and turn constraints unchanged.
+When either is omitted the daemon captures the current binding during admission.
+For the Owner, a controlled live native session is sufficient even when its turn
+is uncertain. The result of a proven fallback stop carries
+`outcome.reason=interrupt_unconfirmed_agent_stopped` and
+`outcome.fallback_stop_id`. A confirmed Owner interruption is visible on the
+bound turn as `outcome=interrupted` with `resolution_source=owner`.
 
 Prompted waits (`send --wait`, and `launch --wait` / `resume --wait` with a
 prompt) return 0 only for a positively recognized `success` outcome. Lifecycle

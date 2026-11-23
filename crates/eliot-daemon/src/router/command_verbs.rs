@@ -906,14 +906,13 @@ impl Router {
                 return;
             }
         };
-        let native_message = match native {
-            Err(error) => error.message,
+        let native_message = match &native {
+            Err(error) => error.message.as_str(),
             Ok(value) if !ack => value["message"]
                 .as_str()
                 .or(value["reason"].as_str())
-                .unwrap_or("Harness declined to confirm the interrupt")
-                .to_owned(),
-            Ok(_) => "Harness did not confirm that the turn ended within 10 seconds".to_owned(),
+                .unwrap_or("Harness declined to confirm the interrupt"),
+            Ok(_) => "Harness did not confirm that the turn ended within 10 seconds",
         };
         let message = match fallback.as_deref() {
             Some(_) => format!(
