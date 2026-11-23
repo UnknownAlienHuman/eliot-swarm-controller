@@ -143,6 +143,20 @@ pub(super) fn inherit_work_task_generation_tx(
         params![from.0, from.1, to.0, to.1, now],
     )
     .map_err(sql_error)?;
+    if from.0 == to.0 {
+        tx.execute(
+            "INSERT INTO git_work_tasks(agent, generation, task_command, task_ref, principal, updated_at)
+             SELECT ?3, ?4, task_command, task_ref, principal, ?5
+             FROM git_work_tasks
+             WHERE agent = ?1 AND generation = ?2
+             ON CONFLICT(agent, generation, task_command) DO UPDATE SET
+                 task_ref = excluded.task_ref,
+                 principal = COALESCE(excluded.principal, git_work_tasks.principal),
+                 updated_at = excluded.updated_at",
+            params![from.0, from.1, to.0, to.1, now],
+        )
+        .map_err(sql_error)?;
+    }
     tx.execute(
         "INSERT INTO git_checkpoints(agent, generation, state, task_ref, task_command, updated_at)
          SELECT ?3, ?4, 'none', task_ref, task_command, ?5

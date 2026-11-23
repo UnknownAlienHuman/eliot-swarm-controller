@@ -369,16 +369,16 @@ fn source_task(
 ) -> Result<Option<Command>> {
     let binding =
         crate::Store::work_task_binding(connection, &from.id, from.generation, task_command)?;
-    let Some(task) = load_command(connection, task_command)? else {
-        if let Some((_, issuer)) = binding {
-            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
-                return Err(Error::new(
-                    "not_allowed",
-                    "handoff transfers only SENDs issued by the caller",
-                ));
-            }
-            return Ok(None);
+    if let Some((_, issuer)) = binding {
+        if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+            return Err(Error::new(
+                "not_allowed",
+                "handoff transfers only SENDs issued by the caller",
+            ));
         }
+        return Ok(None);
+    }
+    let Some(task) = load_command(connection, task_command)? else {
         return Err(Error::new(
             "not_found",
             format!("original task SEND {task_command} is not retained"),
@@ -386,7 +386,7 @@ fn source_task(
     };
     if task.verb != "send"
         || task.target.as_deref() != Some(&from.id)
-        || (task.generation != Some(from.generation) && binding.is_none())
+        || task.generation != Some(from.generation)
     {
         return Err(Error::new(
             "invalid",
@@ -418,6 +418,17 @@ fn continuation_task(
         Some(task_command.to_owned())
     };
     if let Some(id) = selected.filter(|id| !id.is_empty()) {
+        if let Some((_, issuer)) =
+            crate::Store::work_task_binding(connection, &from.id, from.generation, &id)?
+        {
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
+        }
         if let Some(task) = load_command(connection, &id)? {
             if task.target.as_deref() != Some(&from.id)
                 || !matches!(task.verb.as_str(), "send" | "launch")
@@ -435,17 +446,6 @@ fn continuation_task(
                 ));
             }
             return Ok(Some(task));
-        }
-        if let Some((_, issuer)) =
-            crate::Store::work_task_binding(connection, &from.id, from.generation, &id)?
-        {
-            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
-                return Err(Error::new(
-                    "not_allowed",
-                    "handoff transfers only SENDs issued by the caller",
-                ));
-            }
-            return Ok(None);
         }
     }
     let id: Option<String> = connection
