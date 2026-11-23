@@ -836,15 +836,13 @@ async fn resume_stopped(
             "the stopped generation changed before resume",
         ));
     }
-    let args = if HarnessCapabilities::of(&agent.harness).restart_requires_idle {
-        let body = format!(
-            "The daemon update stopped {} while turn {} of generation {} was active. +             Read its retained outcome and reconcile the worktree (git status and git log on +             the task branch, plus the task card), then continue the task from the files as they are.",
-            agent.id, candidate.turn, agent.generation,
-        );
-        json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
-    } else {
-        json!({})
-    };
+    let body = format!(
+        "The daemon update stopped {} while turn {} of generation {} was active. \
+         Read its retained outcome and reconcile the worktree (git status and git log on \
+         the task branch, plus the task card), then continue the task from the files as they are.",
+        agent.id, candidate.turn, agent.generation,
+    );
+    let args = json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)});
     let mut resume = submit_request(None, Some(agent.id.clone()), "resume", args)?;
     resume.expected_generation = Some(agent.generation);
     match submit_command(path, &resume).await {

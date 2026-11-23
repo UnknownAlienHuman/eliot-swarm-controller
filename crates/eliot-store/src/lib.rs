@@ -2437,9 +2437,10 @@ impl Store {
         Ok(turns)
     }
 
-    /// Latest terminal agent events (`agent.lost`, `agent.failed`) for one
-    /// generation, newest first. Powers `diagnose` process/exit steps: the
-    /// exit code, NTSTATUS and redacted stderr tail ride on these events.
+    /// Latest terminal process events (`agent.lost`, `agent.failed`, and an
+    /// idle `agent.stopped` recorded before restart) for one generation,
+    /// newest first. Powers `diagnose` process/exit steps: the exit code,
+    /// NTSTATUS and redacted stderr tail ride on these events.
     /// Bounded like every other page; at most `limit` rows.
     pub fn latest_agent_terminal_events(
         &self,
@@ -2454,7 +2455,10 @@ impl Store {
             .prepare(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
                  FROM events
-                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.lost', 'agent.failed')
+                 WHERE agent = ?1 AND generation = ?2
+                   AND (kind IN ('agent.lost', 'agent.failed')
+                        OR (kind = 'agent.stopped'
+                            AND json_extract(data, '$.reason') = 'owned_exit_before_restart'))
                  ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;

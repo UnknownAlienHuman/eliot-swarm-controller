@@ -772,7 +772,7 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .and_then(Value::as_str)
             .map(|value| bound_chars(value, limit))
     };
-    let message = if reason == Some("daemon_restart") {
+    let message = if matches!(reason, Some("daemon_restart" | "owned_exit_before_restart")) {
         let agent = event
             .data
             .get("agent_id")
@@ -780,7 +780,7 @@ fn loss_step(event: &Event, at: Option<i64>) -> DiagnoseStep {
             .unwrap_or("<agent>");
         Some(bound_chars(
             &format!(
-                "Swarm restarted and disconnected the session. To reopen a retained session, run `swarm resume {agent}` when ready."
+                "Swarm restarted. Automatic continuation requires interrupted work or undelivered input at restart. An idle Agent without either stays closed until a send. Archived and Owner-stopped Agents stay closed on restart. Once the retained-work gates are clear, run `swarm send {agent} \"<text>\"` for new input."
             ),
             1024,
         ))

@@ -1978,24 +1978,29 @@ streams disconnected.
 ### Agent restart policy
 
 `[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
-at daemon startup. Continue reopens eligible retained idle sessions without
-input and resumes eligible retained generations that were live, in batches
-of up to four resume commands within configured capacity. Roots resume
-before their children. Descendants wait for restart-affected ancestors to resume.
-A resumed live session opens with a framed Swarm note
-naming the interrupted turn. Resume uses the Agent's frozen profile and
-any inherited effective configuration from the retained generation. Goals
-and project assignments follow the Agent to its new generation. A Goal with
-unresolved prior work remains paused until that work is settled. Hold leaves
-those sessions for explicit resume. Previously
-admitted commands still follow durable command recovery. Interrupted turns
-and uncertain effects stay `unknown` under either policy: they are named,
-never replayed.
+at daemon startup. Continue has one automatic continuation rule: resume a
+retained generation only when work was interrupted or input was still waiting
+at restart. The restart event captures undelivered direct sends and unread
+wake-enabled mail. Mail arriving later does not reopen an idle Agent.
+An idle Agent without interrupted work or waiting input stays closed until a direct `send`,
+which uses normal resume admission and links that new input. Archived Agents
+are excluded, and an Owner-applied Stop remains a fence. Eligible generations
+resume in batches of up to four commands within configured capacity. Roots
+resume before their children. Descendants wait for ancestors with interrupted
+work or undelivered input. A resumed generation with interrupted work opens with a
+framed Swarm note naming the interrupted turn; no prior input is replayed.
+Resume uses the Agent's frozen profile and any inherited effective
+configuration from the retained generation. Goals and project assignments
+follow the Agent to its new generation. A Goal with unresolved prior work
+remains paused until that work is settled. Hold leaves those sessions for
+explicit resume. Previously admitted commands still follow durable command
+recovery. Interrupted turns and uncertain effects stay `unknown` under either
+policy: they are named, never replayed.
 
 `swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an
-applied Stop with proven process exit and native source drain allows promptless
-resume after replacement or rollback, with interrupted parents resumed before
+applied Stop with proven process exit and native source drain allows resume with
+the framed Swarm note after replacement or rollback, with interrupted parents before
 their children. The old turn retains its observed outcome. `hold` keeps those
 generations stopped for the Owner.
 

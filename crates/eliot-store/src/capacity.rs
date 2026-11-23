@@ -21,10 +21,19 @@ const RESTART_RESUME_EVENT: &str = r#"
     )
 "#;
 
-const RESTART_RESUME_ELIGIBILITY: &str = r#"
+const RESTART_INTERRUPTED_WORK: &str = "restart.kind = 'agent.lost'
+    AND (json_type(restart.data, '$.turn_id') IS 'text'
+         OR COALESCE(json_extract(restart.data, '$.previous_state') IN ('busy', 'waiting'), 0))";
+const RESTART_UNDELIVERED_INPUT: &str = "json_extract(restart.data, '$.undelivered_input') IS 1";
+
+// Both facts must come from the retained restart event, not a later Store read.
+fn restart_resume_eligibility() -> String {
+    format!(
+        r#"
     a.observe_only = 0 AND a.archived = 0
     AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
     AND a.state IN ('lost', 'stopped')
+    AND (({interrupted_work}) OR ({undelivered_input}))
     AND a.capacity_generation IS NULL
     AND a.harness IN (SELECT value FROM json_each(?3))
     AND TRIM(COALESCE(a.native_scope, '')) <> ''
@@ -70,7 +79,11 @@ const RESTART_RESUME_ELIGIBILITY: &str = r#"
         SELECT 1 FROM goal_markers g
         WHERE g.agent = a.id AND g.state IN ('running', 'unknown')
     )
-"#;
+"#,
+        interrupted_work = RESTART_INTERRUPTED_WORK,
+        undelivered_input = RESTART_UNDELIVERED_INPUT,
+    )
+}
 
 pub(super) fn owner_stop_fences_restart_resume_tx(
     tx: &Transaction<'_>,
@@ -104,12 +117,14 @@ pub(super) fn restart_ancestor_fences_resume_tx(
          SELECT EXISTS (
              SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
              {RESTART_RESUME_EVENT}
-             WHERE a.state IN ('lost', 'stopped')
+             WHERE a.state IN ('lost', 'stopped') AND a.archived = 0
+                 AND (({RESTART_INTERRUPTED_WORK}) OR ({RESTART_UNDELIVERED_INPUT}))
              UNION ALL
              SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
              JOIN commands c ON c.target = a.id AND c.generation = a.generation
              JOIN restart_resume_intents r ON r.command_id = c.id
-             WHERE c.state IN ('accepted', 'queued', 'dispatched', 'unknown', 'failed', 'rejected')
+             WHERE a.archived = 0
+                 AND c.state IN ('accepted', 'queued', 'dispatched', 'unknown', 'failed', 'rejected')
          )"
     );
     connection
@@ -123,9 +138,10 @@ pub(super) fn restart_resume_candidate_tx(
     generation: i64,
 ) -> Result<bool> {
     let agent_num = parse_agent_id(agent)?;
+    let eligibility = restart_resume_eligibility();
     let query = format!(
         "SELECT EXISTS(SELECT 1 FROM agents a {RESTART_RESUME_EVENT}
-         WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_RESUME_ELIGIBILITY})"
+         WHERE a.id = ?1 AND a.generation = ?2 AND {eligibility})"
     );
     let candidate: bool = connection
         .query_row(
@@ -467,13 +483,14 @@ impl Store {
             Some(candidate) => (candidate.depth, parse_agent_id(&candidate.agent)?),
             None => (0, 0),
         };
+        let interrupted_work = RESTART_INTERRUPTED_WORK;
+        let eligibility = restart_resume_eligibility();
         let query = format!(
             "SELECT a.id, a.generation, a.depth,
-                    restart.kind = 'agent.lost'
-                      AND json_extract(restart.data, '$.previous_state') IS NOT 'idle',
+                    ({interrupted_work}),
                     json_extract(restart.data, '$.turn_id')
              FROM agents a {RESTART_RESUME_EVENT}
-             WHERE (a.depth, a.id) > (?1, ?2) AND {RESTART_RESUME_ELIGIBILITY}
+             WHERE (a.depth, a.id) > (?1, ?2) AND {eligibility}
              ORDER BY a.depth, a.id LIMIT ?4"
         );
         let mut statement = self.connection.prepare(&query).map_err(sql_error)?;

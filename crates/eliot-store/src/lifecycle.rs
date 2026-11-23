@@ -1604,6 +1604,8 @@ pub(super) fn stop_exited_idle_on_restart_tx(
     if !capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)? {
         return Ok(false);
     }
+    // Snapshot mail eligibility so arrivals after restart cannot reopen this idle Agent.
+    let undelivered_input = super::coordination::notice_pending_count_tx(tx, agent)?.is_some();
     let stopped = db!(tx.execute(
         "UPDATE agents AS a SET state = 'stopped', updated_at = ?1
          WHERE a.id = ?2 AND a.generation = ?3 AND a.state = 'idle' AND a.observe_only = 0
@@ -1627,7 +1629,11 @@ pub(super) fn stop_exited_idle_on_restart_tx(
         "agent",
         Some(agent),
         Some(generation),
-        json!({"agent_id": format_agent_id(agent), "reason": "owned_exit_before_restart"}),
+        json!({
+            "agent_id": format_agent_id(agent),
+            "reason": "owned_exit_before_restart",
+            "undelivered_input": undelivered_input,
+        }),
     )?);
     super::goals::pause_for_restart_tx(tx, agent, generation, "daemon_restart", now, events)?;
     Ok(true)
@@ -1655,6 +1661,19 @@ pub(super) fn transition_lost_tx(
     if agent.is_terminal() {
         return Ok(());
     }
+
+    // Persist this before loss settlement changes commands and turn state.
+    let restart_undelivered_input = reason == core::DAEMON_RESTART_REASON
+        && (super::coordination::notice_pending_count_tx(tx, agent_num)?.is_some()
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commands
+                     WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+                       AND parent_command IS NULL AND state IN ('accepted', 'queued'))",
+                    params![agent_num, generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?);
 
     let dispatched = command_ids_in_state(tx, agent_num, generation, "dispatched")?;
     for command_id in dispatched {
@@ -1725,6 +1744,9 @@ pub(super) fn transition_lost_tx(
         core::DAEMON_RESTART_REASON | core::PLUGIN_ROOT_EXITED_REASON
     ) {
         data["previous_state"] = json!(agent.state);
+    }
+    if reason == core::DAEMON_RESTART_REASON {
+        data["undelivered_input"] = json!(restart_undelivered_input);
     }
     if let Some(turn_id) = &agent.active_turn {
         data["turn_id"] = json!(turn_id);

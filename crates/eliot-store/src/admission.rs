@@ -352,6 +352,12 @@ pub(super) fn admit_send_member(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
+    if agent.archived {
+        return Err(Error::new(
+            "bad_state",
+            "archived Agents cannot receive input; unarchive the Agent first",
+        ));
+    }
     super::switch::require_switch_successor_accepting_input(tx, agent_num, agent.generation)?;
     super::launch_refusal::require_no_refused_launch_stop_in_flight(
         tx,
@@ -1573,6 +1579,12 @@ fn admit_resume_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+    if agent.archived {
+        return Err(Error::new(
+            "bad_state",
+            "archived Agents cannot be resumed; unarchive the Agent first",
+        ));
+    }
     cleanup::require_no_cleanup_attempt(tx, &agent)?;
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;

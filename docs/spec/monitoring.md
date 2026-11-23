@@ -1108,11 +1108,16 @@ recorded exited processes, a closed OS source and closed native sources, backed
 by the Host's owned-exit record or exact restart reconciliation. Recovery records
 `agent.stopped` with reason `owned_exit_before_restart` and preserves the turn and
 command history as recorded. A process still recorded as running at restart becomes
-unknown. The daemon checks retained custody and the
-[restart policy](configuration.md#agent-restart-policy) before reopening an
-eligible idle session through normal resume admission. The new generation starts
-without input.
-Missing custody proof and unresolved effects leave the old generation fenced.
+unknown. The restart event also captures accepted or queued direct sends and
+unread wake-enabled mail awaiting delivery. Under the
+[restart policy](configuration.md#agent-restart-policy),
+automatic continuation requires either interrupted work or that captured input;
+truly idle sessions remain stopped/lost until a direct send. Archived Agents and
+Agents fenced by an Owner Stop are never admitted. Recovery checks the retained
+custody proof again at admission. An interrupted generation opens with a framed
+Swarm note naming the turn, while old prompt and uncertain effects are never
+replayed. Missing custody proof and unresolved effects leave the old generation
+fenced.
 
 ### Retained transcript generations
 

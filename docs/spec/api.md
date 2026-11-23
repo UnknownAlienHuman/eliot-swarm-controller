@@ -2960,7 +2960,8 @@ connection has been sealed. Confirmed cancellation discards its backup.
 
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
-both honor `on_restart` and continue eligible idle and interrupted Agents.
+both honor `on_restart` and continue eligible Agents with interrupted work or
+undelivered input at restart.
 An independent watchdog bounds exit after restart commit at 110 seconds.
 It closes Windows Job custody through process exit and signals the captured
 Agent process groups on Linux, subject to the platform's custody limits.
@@ -2968,8 +2969,8 @@ If a committed restart outlives its exit deadline on Windows, the operator
 verifies the previous daemon's process identity and retires it before opening
 the Store in a replacement. An unconfirmed exit reports restarting admission.
 Under `continue` the CLI resumes its confirmed Stops with proven custody
-exit and source drain. A stopped Claude Agent starts with a fresh framed
-Swarm note naming the old turn. Other deadline Stops resume without input.
+exit and source drain. The resumed Agent starts with a fresh framed Swarm
+note naming the old turn.
 The CLI waits
 for each interrupted parent's resume before its children. Under `hold` it
 leaves them stopped. An unknown turn outcome remains unknown. The

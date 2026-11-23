@@ -2177,7 +2177,7 @@ fn bind_inline_mail_tx(
 
 /// Count unread rows that can wake this recipient. Legacy advisory copies
 /// stay in the inbox until read or explicitly purged.
-fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<Option<i64>> {
+pub(super) fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<Option<i64>> {
     let unread: i64 = tx
         .query_row(
             &format!(
