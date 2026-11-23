@@ -853,12 +853,18 @@ impl WorkspaceManager {
                     .remove_present(command, preparation, slot, git, deadline)
                     .await;
             }
-            Ok(MissingWorktreeRemoval::AlreadyUnregistered) => {
-                git.inspect_removal(preparation).await
-            }
-            Ok(MissingWorktreeRemoval::Registered(mutator)) => {
-                self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
-                    .await
+            Ok(MissingWorktreeRemoval::Absent {
+                parent,
+                command: mutator,
+            }) => {
+                let outcome = if let Some(mutator) = mutator {
+                    self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
+                        .await
+                } else {
+                    git.inspect_removal(preparation).await
+                };
+                drop(parent);
+                outcome
             }
             Err(error) => return removal_preflight_error(&error, "missing_path"),
         };

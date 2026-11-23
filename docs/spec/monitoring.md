@@ -478,9 +478,11 @@ configuration of the source checkout and the target. A host that cannot establis
 the write guard keeps the checkout. On Windows the existing removal row retains
 the original directory permissions before the guard changes them. Recovery
 restores those permissions for remaining directories using their retained identities.
-Exact path and registration absence plus the retained branch settle `removed`. A
-fresh reconciliation that finds the exact registered managed path absent also
-settles its durable row as `removed` and commits `workspace.removed` with
+Exact path and registration absence plus the retained branch settle `removed`.
+For an already missing checkout, Swarm requires two absence observations at
+least 15 seconds apart from the same readable parent before removing the
+stale Git registration or settling the row. An unavailable parent keeps the
+row unsettled. A confirmed disappearance commits `workspace.removed` with
 `directory_absent_before_remove` and the last available retained Git observation.
 That observation can show that the checkout had changes before it vanished.
 Keep the row so a later resume cannot treat the deleted checkout as an

@@ -2,6 +2,7 @@
 //! mutations, under its durable cancellation/spawn gate and ordinary custody.
 
 use crate::git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links};
+use crate::platform::script_file::Directory;
 use eliot_core::api::{is_git_oid, validate_integration_branch};
 use eliot_core::{
     Error, Result, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
@@ -19,7 +20,7 @@ use std::{
     reason = "Workspace Git prepares native commands for authorized worktree effects."
 )]
 use tokio::process::Command;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 pub(crate) mod containment;
 mod readback;
@@ -28,6 +29,7 @@ const READ_TIME: Duration = Duration::from_secs(15);
 /// Shared Git command budget for a project readback.
 const ORIGIN_READ_TIME: Duration = Duration::from_secs(3);
 const METADATA_BYTES: u64 = 64 * 1024;
+const ABSENCE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrozenWorkspaceGit {
@@ -76,12 +78,14 @@ struct WorktreeEntry {
 
 pub(crate) enum MissingWorktreeRemoval {
     Present,
-    AlreadyUnregistered,
-    #[expect(
-        clippy::disallowed_types,
-        reason = "The worktree owner dispatches the prepared exact Git removal command."
-    )]
-    Registered(Command),
+    Absent {
+        parent: Directory,
+        #[expect(
+            clippy::disallowed_types,
+            reason = "The worktree owner dispatches the prepared exact Git removal command."
+        )]
+        command: Option<Command>,
+    },
 }
 
 struct Subject {
@@ -951,16 +955,35 @@ impl WorkspaceGit {
         expected_tip: Option<&str>,
         deadline: Instant,
     ) -> Result<MissingWorktreeRemoval> {
-        let target = destination_path(&preparation.worktree_path)?;
-        if !absent(&target)? {
+        let path = Path::new(&preparation.worktree_path);
+        let Some(parent) = observe_worktree_absence(path)? else {
             return Ok(MissingWorktreeRemoval::Present);
+        };
+        timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
+            .await
+            .map_err(|_| {
+                problem(
+                    "unavailable",
+                    "worktree absence observation deadline elapsed",
+                )
+            })?;
+        confirm_worktree_absence(path, &parent)?;
+        let target = destination_path(&preparation.worktree_path)?;
+        if !git_path_matches(path, &target) {
+            return Err(problem(
+                "identity_changed",
+                "missing worktree path changed during observation",
+            ));
         }
         let source = self.source(preparation, deadline).await?;
         separate_target(&source, &target)?;
         let entries = self.entries(&source.root, deadline).await?;
         let mut matches = entries.iter().filter(|entry| entry.path == target);
         let Some(entry) = matches.next() else {
-            return Ok(MissingWorktreeRemoval::AlreadyUnregistered);
+            return Ok(MissingWorktreeRemoval::Absent {
+                parent,
+                command: None,
+            });
         };
         if entry.locked {
             return Err(problem(
@@ -1009,13 +1032,11 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        if !absent(&destination_path(&preparation.worktree_path)?)? {
-            return Err(problem(
-                "identity_changed",
-                "missing worktree path reappeared before Git removal",
-            ));
-        }
-        Ok(MissingWorktreeRemoval::Registered(command))
+        confirm_worktree_absence(path, &parent)?;
+        Ok(MissingWorktreeRemoval::Absent {
+            parent,
+            command: Some(command),
+        })
     }
 
     /// Non-force worktree removal command for an offline private stand whose
@@ -1092,12 +1113,17 @@ impl WorkspaceGit {
         let source = self.source(preparation, deadline).await?;
         let target = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target)?;
-        if !absent(&target)?
-            || self
-                .entries(&source.root, deadline)
-                .await?
-                .iter()
-                .any(|entry| entry.path == target)
+        let Some(parent) = observe_worktree_absence(&target)? else {
+            return Err(problem(
+                "unknown",
+                "worktree path still exists after removal",
+            ));
+        };
+        if self
+            .entries(&source.root, deadline)
+            .await?
+            .iter()
+            .any(|entry| entry.path == target)
         {
             return Err(problem(
                 "unknown",
@@ -1114,9 +1140,7 @@ impl WorkspaceGit {
                 "removed workspace branch was not retained",
             ));
         }
-        if !absent(&target)? {
-            return Err(problem("unknown", "removed workspace path reappeared"));
-        }
+        confirm_worktree_absence(&target, &parent)?;
         Ok(WorkspaceRemovalOutcome::Removed {
             repo_common_dir: path_text(&source.common_dir)?,
             worktree_path: path_text(&target)?,
@@ -1552,6 +1576,44 @@ fn absent(path: &Path) -> Result<bool> {
             "workspace path presence cannot be read",
         )),
     }
+}
+
+/// Observe a missing leaf from a readable parent. Windows keeps that parent
+/// and its ancestors pinned while the caller retains the returned guard.
+pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>> {
+    if !absent(path)? {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| problem("invalid", "worktree has no parent directory"))?;
+    let unreadable = |_| {
+        problem(
+            "unavailable",
+            "worktree parent directory is unavailable or unreadable",
+        )
+    };
+    let guard = Directory::open(parent).map_err(unreadable)?;
+    fs::read_dir(parent)
+        .and_then(|mut entries| entries.next().transpose())
+        .map_err(|_| problem("unavailable", "worktree parent directory cannot be listed"))?;
+    Ok(absent(path)?.then_some(guard))
+}
+
+fn confirm_worktree_absence(path: &Path, previous: &Directory) -> Result<()> {
+    let Some(current) = observe_worktree_absence(path)? else {
+        return Err(problem(
+            "worktree_present",
+            "worktree reappeared during absence verification",
+        ));
+    };
+    if current.identity()? != previous.identity()? {
+        return Err(problem(
+            "identity_changed",
+            "worktree parent changed during absence verification",
+        ));
+    }
+    Ok(())
 }
 
 fn separate_target(source: &Repository, target: &Path) -> Result<()> {

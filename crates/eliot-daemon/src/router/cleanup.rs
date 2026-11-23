@@ -1746,8 +1746,12 @@ impl Router {
             .map(|row| row.agent.clone());
         for workspace in workspaces {
             if workspace.phase != WorkspacePhase::Ready
-                || !std::fs::symlink_metadata(&workspace.worktree_path)
-                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                || !matches!(
+                    crate::workspace_git::observe_worktree_absence(Path::new(
+                        &workspace.worktree_path
+                    )),
+                    Ok(Some(_))
+                )
             {
                 continue;
             }
