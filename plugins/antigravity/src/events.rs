@@ -981,7 +981,7 @@ impl State {
         publication?;
         if !self.tools.contains_key(&ask.tool_call_id) {
             if self.tools.len() < MAX_LIVE_TOOLS {
-                self.merge_tool(&ask.tool_call_id, &ask.title, "pending");
+                self.merge_tool(&ask.tool_call_id, &ask.title, "pending", None, None, &[]);
             } else {
                 self.record_unattributed_tool().await?;
             }
