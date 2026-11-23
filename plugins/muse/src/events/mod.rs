@@ -1637,7 +1637,6 @@ impl EventProcessor {
         )
         .await?;
         self.messages = TurnMessages::default();
-        self.flush_buffer().await?;
         self.apply_stashed_entries().await?;
         Ok(())
     }
