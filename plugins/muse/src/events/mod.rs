@@ -47,9 +47,10 @@ use crate::native::{
         NativeSessionContextUsageNotification, NativeSessionReadResult,
         NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
         NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
-        NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
-        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
-        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
+        NativeTurnModelAttemptStartedNotification, NativeTurnStartedNotification,
+        NativeTurnTerminal, NativeUserInputAnswerResult, NativeUserInputCancelResult,
+        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
+        NativeWorkflowItemNotification, session_usage_from_context_usage,
         session_usage_from_token_usage, turn_usage, turn_usage_from_native,
     },
 };
@@ -1293,14 +1294,15 @@ impl EventProcessor {
         if method == "session/viewHealthChanged" {
             return self.status.session_id.is_none();
         }
-        if method == "turn/started" {
+        if matches!(method, "turn/started" | "turn/modelAttemptStarted") {
             if !self.status.ready {
                 return true;
             }
-            let Some(command_id) = params.get("commandId").and_then(Value::as_str) else {
-                return false;
-            };
-            return self.pending_native_starts.contains_key(command_id);
+            return params
+                .get("commandId")
+                .and_then(Value::as_str)
+                .or_else(|| native_notification_turn_id(params))
+                .is_some_and(|id| self.pending_native_starts.contains_key(id));
         }
         if native_notification_turn_id(params)
             .is_some_and(|turn_id| self.uncertain_native_turns.contains(turn_id))
@@ -1317,7 +1319,9 @@ impl EventProcessor {
                 | "approval/resolved"
                 | "approval/updated"
                 | "userInput/settled"
-        ) && (!self.status.ready || self.status.active_turn_id.is_none())
+        ) && (!self.status.ready
+            || native_notification_turn_id(params)
+                .is_some_and(|id| self.pending_native_starts.contains_key(id)))
     }
 
     fn expect_turn_start(&mut self, command_id: String, native_command_id: String) -> Result<()> {
@@ -1609,22 +1613,25 @@ impl EventProcessor {
 
     async fn start_native_turn(
         &mut self,
-        notification: NativeTurnStartedNotification,
+        session_id: String,
+        turn_id: String,
+        native_command_id: Option<String>,
+        trigger: &'static str,
     ) -> Result<()> {
         if !self.status.ready
             || self.status.active_turn_id.is_some()
-            || notification.command_id.trim().is_empty()
-            || notification.turn_id.trim().is_empty()
+            || native_command_id
+                .as_deref()
+                .is_some_and(|id| id.trim().is_empty())
+            || turn_id.trim().is_empty()
         {
             return self
                 .record_gap("Muse native turn/start did not prove one exact idle-session turn")
                 .await;
         }
-        let session_id = notification.session_id;
-        let turn_id = notification.turn_id;
         self.status.active_command_id = None;
         self.status.active_turn_id = Some(turn_id.clone());
-        self.active_native_command_id = Some(notification.command_id);
+        self.active_native_command_id = native_command_id;
         self.turn_completion_usage = None;
         let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
         self.commit_event(
@@ -1632,7 +1639,7 @@ impl EventProcessor {
             native_id,
             json!({
                 "turn_id": turn_id,
-                "native_trigger": MUSE_NATIVE_TURN_TRIGGER,
+                "native_trigger": trigger,
             }),
         )
         .await?;
@@ -2715,6 +2722,20 @@ impl EventProcessor {
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
+        if matches!(
+            method.as_str(),
+            "item/started" | "item/updated" | "item/completed"
+        ) && (params.pointer("/item/kind").and_then(Value::as_str)
+            == Some("backgroundTerminalCompletion")
+            || self.status.active_turn_id.is_none()
+            || self.status.last_turn.as_ref().is_some_and(|last| {
+                native_notification_turn_id(&params) == Some(last.turn_id.as_str())
+            }))
+        {
+            // Background receipts and idle view items can outlive their
+            // foreground turn. They carry no new active-turn binding.
+            return Ok(());
+        }
         match method.as_str() {
             "log/record" => self.observe_provider_model(&params).await?,
             "log/gap"
@@ -2809,9 +2830,12 @@ impl EventProcessor {
                 match self.status.active_turn_id.as_deref() {
                     Some(active_turn)
                         if active_turn == notification.turn_id
-                            && self.active_native_command_id.as_deref()
-                                == Some(notification.command_id.as_str()) =>
+                            && self
+                                .active_native_command_id
+                                .as_deref()
+                                .is_none_or(|command| command == notification.command_id) =>
                     {
+                        self.active_native_command_id = Some(notification.command_id);
                         return Ok(());
                     }
                     Some(_) => {
@@ -2819,7 +2843,46 @@ impl EventProcessor {
                             .record_gap("Muse turn/started did not match the exact active turn")
                             .await;
                     }
-                    None => self.start_native_turn(notification).await?,
+                    None => {
+                        self.start_native_turn(
+                            notification.session_id,
+                            notification.turn_id,
+                            Some(notification.command_id),
+                            MUSE_NATIVE_TURN_TRIGGER,
+                        )
+                        .await?
+                    }
+                }
+            }
+            "turn/modelAttemptStarted" => {
+                let notification: NativeTurnModelAttemptStartedNotification =
+                    serde_json::from_value(params).map_err(|_| {
+                        Error::new(
+                            "native_protocol",
+                            "Muse model attempt had no exact turn binding",
+                        )
+                    })?;
+                validate_session_and_turn(
+                    &self.status,
+                    &notification.session_id,
+                    &notification.turn_id,
+                )?;
+                if self.status.active_turn_id.is_none()
+                    && self.pending_native_starts.is_empty()
+                    && !self.uncertain_native_starts.contains(&notification.turn_id)
+                    && !self
+                        .status
+                        .last_turn
+                        .as_ref()
+                        .is_some_and(|turn| turn.turn_id == notification.turn_id)
+                {
+                    self.start_native_turn(
+                        notification.session_id,
+                        notification.turn_id,
+                        None,
+                        "muse.turn/modelAttemptStarted",
+                    )
+                    .await?;
                 }
             }
             "item/started" => {

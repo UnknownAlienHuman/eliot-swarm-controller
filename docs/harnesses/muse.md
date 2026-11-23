@@ -75,9 +75,10 @@ bound to that exact send and must match its acknowledgement and turn. An
 otherwise unbound start on the owned session is a native trigger: Eliot emits
 `turn.started` with `native_trigger: "muse.turn/started"` and the exact
 `turn_id`, omitting Eliot `command_id`. The Muse command id remains private
-matching evidence. Pre-ack events retain the existing bounded early-event
-buffer and view-cursor replay fence; item facts bind by exact `turnId` and
-`itemId`, without accumulating item updates.
+matching evidence. An exact `turn/modelAttemptStarted` also proves that an
+otherwise unbound turn is running. Only pre-readiness events and facts of an
+identified pending Eliot input use the early-event buffer. Idle view items
+and background completion receipts do not accumulate there.
 
 The installed `turn/steer` result must echo the submitted `commandId`, the exact
 `expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported

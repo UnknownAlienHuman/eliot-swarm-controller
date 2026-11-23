@@ -601,6 +601,14 @@ pub struct NativeTurnStartedNotification {
     pub view_cursor: String,
 }
 
+/// Durable MSP model task opening for an exact running turn.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTurnModelAttemptStartedNotification {
+    pub session_id: String,
+    pub turn_id: String,
+}
+
 /// Turn terminal vocabulary (SS4.5.1): completed | failed | cancelled.
 /// Wire-open: unknown values must not settle a turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

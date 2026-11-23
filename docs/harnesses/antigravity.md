@@ -356,6 +356,8 @@ An open call at a turn end is declared with
 `native_auto_background: true` and `native_wake_scope: "process_tree"` on
 `tool.started`. Its later native completion commits `tool.background_ended` for
 the original turn. Swarm does not add a second wake for its process tree.
+A successful terminal with a tracked background call reports
+`native_followup_pending`, so an Eliot Goal waits for the native follow-up.
 
 A send received while this native turn is open stays in the shared daemon queue;
 the plugin does not merge it into the native turn or emit `turn.input_bound`.

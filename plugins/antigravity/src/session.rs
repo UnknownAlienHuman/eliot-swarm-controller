@@ -1163,7 +1163,11 @@ impl Session {
                 active_turn = None;
             }
             Some(TurnEvidence::NativeTerminal) => {
-                status = if state.stopped || process_exited { "terminal" } else { "idle" };
+                status = if state.stopped || process_exited {
+                    "terminal"
+                } else {
+                    "idle"
+                };
                 active_turn = None;
             }
             Some(TurnEvidence::Terminal) => {
@@ -1402,7 +1406,7 @@ pub(crate) fn exact_turn_evidence(
         && !state.stopped
         && (state.pending_is(command_id, turn_id)
             || (session_selector && state.native_run_is(turn_id))))
-        .then_some(TurnEvidence::Exited)
+    .then_some(TurnEvidence::Exited)
 }
 
 pub(crate) fn unknown_steer(command_id: &str, turn_id: &str, reason: &str) -> Value {

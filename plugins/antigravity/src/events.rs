@@ -572,9 +572,9 @@ impl State {
     }
 
     pub fn native_run_is(&self, turn_id: &str) -> bool {
-        self.pending.as_ref().is_some_and(|pending| {
-            pending.command.is_none() && pending.turn == turn_id
-        })
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.command.is_none() && pending.turn == turn_id)
     }
 
     pub fn native_unknown_turn_is(&self, turn_id: &str) -> bool {
@@ -623,11 +623,9 @@ impl State {
 
     /// True while `turn_id` is the exact prepared turn of `command_id`.
     pub fn pending_is(&self, command_id: &str, turn_id: &str) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| {
-                pending.command.as_deref() == Some(command_id) && pending.turn == turn_id
-            })
+        self.pending.as_ref().is_some_and(|pending| {
+            pending.command.as_deref() == Some(command_id) && pending.turn == turn_id
+        })
     }
 
     /// True while the exact turn's fenced `session/prompt` call awaits its
@@ -786,9 +784,7 @@ impl State {
             return Ok(());
         }
         let (turn_id, readback) = match self.pending.as_ref() {
-            Some(pending)
-                if pending.command.is_none() && origin.start_time > pending.opened_at =>
-            {
+            Some(pending) if pending.command.is_none() && origin.start_time > pending.opened_at => {
                 (pending.turn.clone(), false)
             }
             _ => match self.unknown_native_turn.as_ref() {
@@ -841,11 +837,7 @@ impl State {
         Ok(())
     }
 
-    async fn stop_barrier_passed(
-        &mut self,
-        request_id: &str,
-        result: Result<Value>,
-    ) -> Result<()> {
+    async fn stop_barrier_passed(&mut self, request_id: &str, result: Result<Value>) -> Result<()> {
         if self.stop_barrier_request.as_deref() != Some(request_id) {
             return Err(Error::new(
                 "source_integrity",
@@ -914,7 +906,11 @@ impl State {
             }
             restriction
         });
-        let status = if restriction.is_some() { "failed" } else { stop.status };
+        let status = if restriction.is_some() {
+            "failed"
+        } else {
+            stop.status
+        };
         self.last_turn = Some(TurnFacts {
             command_id: None,
             turn_id: stop.turn_id.clone(),
@@ -944,6 +940,9 @@ impl State {
             "outcome": outcome,
             "native_status": stop.native_status.clone(),
         });
+        if status == "completed" && !self.background_tools.is_empty() {
+            data["native_followup_pending"] = json!(true);
+        }
         if let Some(error) = stop.error.clone() {
             data["native_error"] = error;
         }
@@ -955,7 +954,8 @@ impl State {
                 "captured Antigravity native quota warning",
                 &self.policy,
             );
-            data["native_error"] = json!({"code":"quota_exhausted", "message":"provider quota exhausted"});
+            data["native_error"] =
+                json!({"code":"quota_exhausted", "message":"provider quota exhausted"});
             eliot_plugin::session::attach_provider_restriction(
                 &mut data,
                 restriction,
@@ -1100,7 +1100,10 @@ impl State {
             return Err(Error::new("unknown", "Antigravity stream is unresolved"));
         }
         if self.native_stop.is_some() || self.unknown_native_turn.is_some() {
-            return Err(Error::new("unknown", "Antigravity native turn is unresolved"));
+            return Err(Error::new(
+                "unknown",
+                "Antigravity native turn is unresolved",
+            ));
         }
         if self.stopping || self.stopped {
             return Err(Error::new("bad_state", "Antigravity session is stopping"));
@@ -1139,9 +1142,7 @@ impl State {
     /// attached late or faked.
     pub fn attach_context(&mut self, command: &str, context: Vec<ContextItem>) -> Result<()> {
         match self.pending.as_mut() {
-            Some(pending)
-                if pending.command.as_deref() == Some(command) && !pending.associated =>
-            {
+            Some(pending) if pending.command.as_deref() == Some(command) && !pending.associated => {
                 pending.context = context;
                 Ok(())
             }
@@ -1209,8 +1210,7 @@ impl State {
         if !pending.context.is_empty()
             && let Some(command) = pending.command.as_deref()
         {
-            data["context_outcomes"] =
-                json!(next_input_outcomes(&pending.context, command));
+            data["context_outcomes"] = json!(next_input_outcomes(&pending.context, command));
         }
         let result = self.commit("turn.started", &turn, "started", data).await;
         if let Some(pending) = self.pending.as_mut() {
@@ -1429,8 +1429,7 @@ impl State {
         if self.pending.as_ref().is_none_or(|pending| {
             pending.turn != entry.turn_id
                 || data["turn_id"] != pending.turn
-                || data.get("command_id").and_then(Value::as_str)
-                    != pending.command.as_deref()
+                || data.get("command_id").and_then(Value::as_str) != pending.command.as_deref()
         }) {
             return Err(Error::new(
                 "source_integrity",
@@ -2457,8 +2456,7 @@ impl State {
         }
         if kind == "tool.started" {
             data["native_auto_background"] = json!(true);
-            data["native_wake_scope"] =
-                json!(eliot_core::NATIVE_WAKE_SCOPE_PROCESS_TREE);
+            data["native_wake_scope"] = json!(eliot_core::NATIVE_WAKE_SCOPE_PROCESS_TREE);
         }
         self.policy.redact_values(&mut data);
         self.commit(kind, &turn, &item, data).await?;
@@ -2648,6 +2646,9 @@ impl State {
         let missing_text = self.text_unavailable;
         let mut data = json!({"turn_id": turn,
             "status": status, "outcome": outcome, "native_status": native_status});
+        if status == "completed" && !self.background_tools.is_empty() {
+            data["native_followup_pending"] = json!(true);
+        }
         if let Some(command) = command.as_deref() {
             data["command_id"] = json!(command);
         }
@@ -2987,13 +2988,9 @@ pub(crate) fn spawn(
                         }
                         continue;
                     }
-                    if let Err(error) = handle_hook_callback(
-                        callback.callback,
-                        callback.binding,
-                        &state,
-                        &client,
-                    )
-                    .await
+                    if let Err(error) =
+                        handle_hook_callback(callback.callback, callback.binding, &state, &client)
+                            .await
                     {
                         state.lock().await.lose_observation(&error).await;
                     }
