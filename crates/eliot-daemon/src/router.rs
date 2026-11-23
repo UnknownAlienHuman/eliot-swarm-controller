@@ -8147,7 +8147,8 @@ async fn project_logical_name(
 
 /// Naming parts for a standard worktree directory: the project's logical
 /// name (display name, else origin, else main checkout folder) and the
-/// prompt text the Store slugs into `<project>/<agent>-<task-slug>`.
+/// prompt text the Store slugs into the worktree path leaf
+/// `<agent>-<task-slug>`.
 /// A daemon-set `auto_worktree` hint (manager launches) wins when present.
 async fn generated_naming(
     data_root: &std::path::Path,

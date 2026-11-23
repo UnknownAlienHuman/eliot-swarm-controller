@@ -385,7 +385,9 @@ It also freezes each note/setup file as bounded bytes or canonical allowed
 `path+size+digest`; dispatch verifies the digest before executing.
 The current opt-in creates a new branch; an existing branch is rejected rather than
 reset or renamed, as is a branch that collides with the branch namespace (an
-existing `atlas` blocks `atlas/a1-task`, and vice versa). An explicit `--base`
+existing `atlas/a1` blocks `atlas/a1/work`, and vice versa). Managed worktrees also
+reserve each `<project>/<agent>` ref parent to one worktree, so an explicit sibling
+branch under that parent is refused. An explicit `--base`
 wins; an omitted `--base` means local `HEAD`. Repository common-directory
 identity is frozen alongside the source checkout.
 
@@ -396,9 +398,12 @@ Store with the admitted Agent ID:
   display_names` entry, else the repository name of its `origin` remote,
   else the folder of the repository's main checkout); registration IDs name
   nothing a person reads and are never used;
-- `branch`: `<project>/<agent>-<task-slug>`, where the task slug is an ASCII,
-  bounded slug of the launch prompt's first line (`task` when empty);
+- `branch`: `<project>/<agent>/work`; the project and Agent ID are slugs, and
+  the Agent ID is unique;
 - `worktree path`: `<data_dir>/worktrees/<project>/<agent>-<task-slug>`.
+  The task slug remains an ASCII, bounded slug of the launch prompt's first line
+  (`task` when empty), and is used only for the worktree path. Explicit branch
+  names continue to win without renaming.
 
 A requested branch name still wins, but even an explicit branch lands in the
 standard directory. Generated names are readable, unique per

@@ -1200,14 +1200,27 @@ that now holds the worktree, and automatic resume skips it. `stop` still works. 
 transfer closes any lost or failed `owner.inbox` item for the source. A busy source is
 refused with the remedy: run `swarm interrupt <agent>`, then retry.
 
-A Codex `workspace-write` Agent in a managed worktree whose branch has a `/` gets the
-worktree's Git admin directory, the object store, and the branch's parent ref and log
-directories as extra writable roots, so it can commit. Sibling branches under that same
-parent are writable too: Git creates `<branch>.lock` beside the ref, and Windows grants file
-creation per directory, so a grant on the ref file alone cannot commit. Hooks, repository
-config, top-level branches such as `main`, tags and other ref directories stay denied. Routing skips such
-a candidate as `cannot_commit` for an unmanaged workspace or a top-level branch, unless
-it is the source's own profile.
+A Codex `workspace-write` Agent in a managed worktree gets its worktree admin directory
+and the repository's common object directory as extra writable roots. Branch ref and
+reflog parent directories are added only when the managed branch parent is
+`<project>/<aN>`, and Git's full ref inventory and the on-disk directories show no sibling
+refs or logs. Generated branches use
+`<project>/<agent>/work`, giving each worktree its own parent; Store admission prevents
+another managed worktree from sharing that parent. A successor inherits the same roots
+from its managed worktree branch even though it has a different Agent ID.
+Explicit branch names remain unchanged. A legacy branch such as
+`<project>/<agent>-<task>` has a shared project parent and receives no ref or reflog
+roots. Such an Agent can stage files and write objects; it can also make detached commits
+in its worktree admin directory, but it cannot advance the named branch through the
+sandbox roots. Unmanaged
+workspaces and top-level branches remain ineligible for a successor that needs to commit,
+unless it is the source's own profile.
+
+The common object directory remains writable and is shared by every worktree. A sandboxed
+Agent can create objects and can corrupt or remove repository objects used by other refs.
+Per-Agent object brokering would need to mediate Git object writes and is outside this
+increment; writable ref and reflog parents do not isolate object integrity. Hooks,
+repository config, `packed-refs`, tags and other agents' ref directories stay denied.
 
 A may be idle, or lost, failed or stopped with its process tree proven gone, in any
 generation. The task comes from the named command of any of A's generations, else A's

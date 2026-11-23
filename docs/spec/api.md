@@ -556,7 +556,10 @@ The request and readback use [ProjectTransferRequest and ProjectTransferResult](
 A managed manager launch always runs in a project worktree. Without an explicit
 `adopt_worktree` the daemon prepares a fresh opaque worktree on a unique
 branch from the frozen base OID and runs the existing preparation and setup chain
-before native dispatch. Workers inherit that worktree through the parent link by default.
+before native dispatch. Generated branches use `<project>/<agent>/work`; an explicit
+`--worktree BRANCH` keeps the caller's branch name. Managed worktrees reserve each
+`<project>/<agent>` ref parent to one worktree. Workers inherit that worktree through the
+parent link by default.
 `adopt_worktree` names an existing checkout of the same repository explicitly;
 adoption verifies Git identity and live workspace overlap, and freezes the profile
 without running its setup. Cleanup and worktree removal keep bound or borrowed

@@ -229,7 +229,18 @@ the cancel and readback into a removal fact. The shared settlement returns
 
 `commit_roots` lists the Git directories the daemon computed for a sandboxed Agent on a
 managed worktree. The adapter only maps them to native writable roots and verifies them
-in the readback.
+in the readback. Roots include the worktree's admin directory and the repository's shared
+object directory. The daemon adds branch-ref and reflog parent directories only after
+confirming that the managed branch parent is `<project>/<aN>` and contains no sibling
+ref or log; otherwise those directories are withheld. Store
+admission prevents another managed worktree from sharing that parent, and successors
+inherit the roots from the retained branch even with a different Agent ID. Explicit and
+legacy branch names remain unchanged, but a shared legacy parent gets no ref or reflog
+roots. A requested branch under a reserved parent is refused rather than allowed to add
+a future sibling. The common object directory remains a repository-wide integrity
+exposure: the sandbox can create,
+remove, or corrupt objects used by other refs. A per-Agent object broker would need to
+mediate all Git object writes and is outside this increment.
 
 `eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
 preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional

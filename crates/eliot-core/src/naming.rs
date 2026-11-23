@@ -1,12 +1,13 @@
 //! One naming standard for managed worktrees (k178).
 //!
-//! A prepared worktree is named `<project>/<agent>-<task-slug>` and lives at
+//! A prepared worktree uses branch `<project>/<agent>/work` and lives at
 //! `<data_dir>/worktrees/<project>/<agent>-<task-slug>`:
 //!
 //! * `project` is the registration's logical name as a slug (a folder slug
 //!   for unregistered checkouts);
 //! * `agent` is the admitted Agent ID (`aN`), unique per launch;
-//! * `task` is an ASCII slug of the launch prompt's first line, bounded.
+//! * `task` is an ASCII slug of the launch prompt's first line, bounded; it
+//!   keeps worktree paths readable but does not name the branch.
 //!
 //! An explicitly requested branch name always wins over the standard. The
 //! standard is never derived from caller command-id syntax: uniqueness comes
@@ -85,13 +86,12 @@ pub fn task_slug(prompt: &str) -> String {
     slug_with_len(first.trim(), MAX_TASK_SLUG_LEN)
 }
 
-/// The standard branch: `<project>/<agent>-<task>`.
-pub fn standard_branch(project: &str, agent: &str, task: &str) -> String {
+/// The standard branch: `<project>/<agent>/work`.
+pub fn standard_branch(project: &str, agent: &str) -> String {
     format!(
-        "{}/{agent}-{task}",
+        "{}/{}/work",
         project_slug(project),
-        agent = slug_with_len(agent, MAX_PROJECT_SLUG_LEN),
-        task = slug_with_len(task, MAX_TASK_SLUG_LEN),
+        slug_with_len(agent, MAX_PROJECT_SLUG_LEN),
     )
 }
 

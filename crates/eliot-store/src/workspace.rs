@@ -237,7 +237,8 @@ pub(super) fn validate_setup_file(file: &FrozenSetupFile) -> Result<()> {
 const MAX_FINAL_PATH_LEN: usize = 260;
 
 /// Finalize a daemon-prepared standard directory with the admitted Agent
-/// ID: `<project>/<agent>-<task-slug>` under the frozen worktrees parent.
+/// ID: branch `<project>/<agent>/work`, with path leaf
+/// `<agent>-<task-slug>` under the frozen worktrees parent.
 /// The Store is the only place that knows both the worktrees root (from the
 /// frozen placeholder's parent) and the admitted Agent ID, so the standard
 /// is implemented once here and never derives from caller command-id syntax.
@@ -261,7 +262,7 @@ fn finalize_generated_naming(
             }
             explicit.to_owned()
         }
-        None => core::standard_branch(&naming.project_slug, agent_id, &naming.task_slug),
+        None => core::standard_branch(&naming.project_slug, agent_id),
     };
     if branch.starts_with('-') || branch.contains('\0') {
         return Err(Error::new("invalid", "invalid generated workspace branch"));
@@ -314,10 +315,11 @@ fn finalize_generated_naming(
 }
 
 /// The finalized branch must not collide with the managed branch namespace:
-/// an existing managed `atlas` blocks a new `atlas/a1-task`, and an existing
-/// managed `atlas/a1-task` blocks a new `atlas`. Git-level collisions were
-/// already refused at freeze time for the placeholder prefix; this guards
-/// the finalized leaf admitted here.
+/// an existing managed `atlas/a1` blocks a new `atlas/a1/work`, and an
+/// existing managed `atlas/a1/work` blocks a new `atlas/a1`. Git-level
+/// collisions were already refused at freeze time for the placeholder
+/// prefix. A `<project>/aN` ref parent is reserved to one managed worktree so
+/// a later explicit sibling cannot enter a sandbox's writable ref directory.
 fn require_branch_namespace_free(
     connection: &Connection,
     repo_common_dir: &str,
@@ -330,6 +332,18 @@ fn require_branch_namespace_free(
     let mut existing: Vec<String> = Vec::new();
     while let Some(row) = rows.next().map_err(sql_error)? {
         existing.push(row.get(0).map_err(sql_error)?);
+    }
+    if let Some(namespace) = agent_ref_namespace(branch)
+        && existing.iter().any(|other| {
+            agent_ref_namespace(other).is_some_and(|other_namespace| {
+                core::workspace_path_key(other_namespace) == core::workspace_path_key(namespace)
+            })
+        })
+    {
+        return Err(Error::new(
+            "already_exists",
+            "managed worktrees cannot share an Agent branch namespace",
+        ));
     }
     let mut prefix = String::new();
     for component in branch.split('/') {
@@ -355,6 +369,21 @@ fn require_branch_namespace_free(
         ));
     }
     Ok(())
+}
+
+fn agent_ref_namespace(branch: &str) -> Option<&str> {
+    let (project, rest) = branch.split_once('/')?;
+    let (agent, _) = rest.split_once('/')?;
+    if project.is_empty() || !is_agent_id_component(agent) {
+        return None;
+    }
+    Some(&branch[..project.len() + 1 + agent.len()])
+}
+
+fn is_agent_id_component(agent: &str) -> bool {
+    agent.strip_prefix('a').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 pub(super) fn validate_workspace_input(input: &WorkspacePreparationInput) -> Result<()> {

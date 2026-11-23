@@ -383,9 +383,9 @@ impl WorkspaceGit {
     }
 
     /// A requested branch must not collide with the branch namespace: an
-    /// existing branch `atlas` blocks `atlas/a1-task` (Git cannot create a
-    /// ref under an existing ref), and an existing `atlas/a1-task` blocks a
-    /// new `atlas`. The conflict is refused before admission.
+    /// existing branch `atlas/a1` blocks `atlas/a1/work` (Git cannot create
+    /// a ref under an existing ref), and an existing `atlas/a1/work` blocks
+    /// a new `atlas/a1`. The conflict is refused before admission.
     async fn require_branch_namespace_free(
         &self,
         root: &Path,

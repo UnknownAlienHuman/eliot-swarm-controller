@@ -13,13 +13,14 @@ use crate::{
 use eliot_core::{
     Error, Result, SecretPolicy,
     api::{GitCheckpointState, GitCheckpointView, GitCheckpointWithheld},
-    bound_chars,
+    bound_chars, workspace_path_key,
 };
 use eliot_store::GitCheckpointInput;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -903,6 +904,7 @@ pub(crate) async fn ensure_task(workspace: &str, record: &TaskRecord) -> Result<
 }
 
 /// Whether this profile runs in a sandbox that needs Git roots to commit.
+/// This profile gate is separate from the worktree and branch checks below.
 pub(crate) fn needs_commit_roots(harness: &str, profile: &Value) -> bool {
     harness == "codex"
         && profile
@@ -912,15 +914,24 @@ pub(crate) fn needs_commit_roots(harness: &str, profile: &Value) -> bool {
             == "workspace-write"
 }
 
-/// The narrowest directories that let a sandboxed harness commit on a linked
-/// worktree's own branch: its admin directory, the object store, and the
-/// branch's ref and log directories. Hooks and repository config stay out. A
-/// top-level branch gets none, because its ref directory also holds `main`.
+/// Git metadata roots needed by a sandboxed Codex Agent in a managed worktree.
+/// The worktree admin directory and shared objects remain writable. A branch
+/// ref and reflog parent is added only for the managed branch's `<project>/<aN>`
+/// parent, after confirming that both contain no sibling refs/logs. Successors
+/// keep that grant when they inherit the worktree. Hooks, repository config
+/// and packed-refs stay out.
 pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<String>> {
-    let (parent, _) = branch.rsplit_once('/')?;
     let git = GitProbe::new().ok()?;
     let root = canonical_root(workspace).ok()?;
     let deadline = Instant::now() + GIT_TIME;
+    let full_ref = format!("refs/heads/{branch}");
+    let valid = git
+        .workspace_command(&root, &["check-ref-format", &full_ref], deadline)
+        .await
+        .ok()?;
+    if valid.code != 0 {
+        return None;
+    }
     let head = git
         .workspace_command(&root, &["symbolic-ref", "-q", "HEAD"], deadline)
         .await
@@ -950,15 +961,42 @@ pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<St
     let mut lines = text.lines();
     let admin = PathBuf::from(lines.next()?);
     let common = PathBuf::from(lines.next()?);
-    if admin == common {
+    let canonical_admin = fs::canonicalize(&admin).ok()?;
+    let canonical_common = fs::canonicalize(&common).ok()?;
+    if lines.next().is_some()
+        || !same_workspace_path(&canonical_admin, &admin)
+        || !same_workspace_path(&canonical_common, &common)
+        || same_workspace_path(&canonical_admin, &canonical_common)
+        || !plain_directory(&admin)
+        || !plain_directory(&common)
+    {
         return None;
     }
-    let refs = common.join("refs").join("heads").join(parent);
-    let logs = common.join("logs").join("refs").join("heads").join(parent);
-    std::fs::create_dir_all(&refs).ok()?;
-    std::fs::create_dir_all(&logs).ok()?;
+    let objects = common.join("objects");
+    if !plain_directory(&objects) {
+        return None;
+    }
+
+    // The common object store is required for staging and object creation. It
+    // remains a shared integrity boundary; a broker would be needed to make
+    // these writes per-Agent.
+    let mut paths = vec![admin, objects];
+    if let Some((parent, leaf)) = exclusive_agent_ref_parent(branch) {
+        let refs = common.join("refs").join("heads").join(parent);
+        let logs = common.join("logs").join("refs").join("heads").join(parent);
+        if branch_ref_parent_is_exclusive(&git, &root, parent, &full_ref, deadline).await
+            && ensure_plain_directory_tree(&common, &refs)
+            && ensure_plain_directory_tree(&common, &logs)
+            && contains_only_optional_file(&refs, leaf)
+            && contains_only_optional_file(&logs, leaf)
+        {
+            paths.push(refs);
+            paths.push(logs);
+        }
+    }
+
     Some(
-        [admin, common.join("objects"), refs, logs]
+        paths
             .iter()
             .map(|path| {
                 path.components()
@@ -968,6 +1006,147 @@ pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<St
             })
             .collect(),
     )
+}
+
+fn exclusive_agent_ref_parent(branch: &str) -> Option<(&str, &str)> {
+    let mut components = branch.split('/');
+    components.next()?;
+    if !is_agent_id_component(components.next()?) {
+        return None;
+    }
+    let leaf = components.next()?;
+    if components.next().is_some() {
+        return None;
+    }
+    let (parent, _) = branch.rsplit_once('/')?;
+    Some((parent, leaf))
+}
+
+fn is_agent_id_component(agent: &str) -> bool {
+    agent.strip_prefix('a').is_some_and(|digits| {
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+async fn branch_ref_parent_is_exclusive(
+    git: &GitProbe,
+    root: &Path,
+    parent: &str,
+    full_ref: &str,
+    deadline: Instant,
+) -> bool {
+    let Ok(refs) = git
+        .workspace_command(root, &["for-each-ref", "--format=%(refname)"], deadline)
+        .await
+    else {
+        return false;
+    };
+    if refs.code != 0 {
+        return false;
+    }
+    let Ok(refs) = String::from_utf8(refs.stdout) else {
+        return false;
+    };
+    let parent_ref = format!("refs/heads/{parent}");
+    let nested_prefix = format!("{parent_ref}/");
+    let full_ref_key = workspace_path_key(full_ref);
+    let parent_ref_key = workspace_path_key(&parent_ref);
+    let nested_prefix_key = workspace_path_key(&nested_prefix);
+    let mut current_found = false;
+    for name in refs.lines() {
+        if name == full_ref {
+            current_found = true;
+            continue;
+        }
+        let name_key = workspace_path_key(name);
+        if name_key == full_ref_key
+            || name_key == parent_ref_key
+            || name_key.starts_with(&nested_prefix_key)
+        {
+            // This also catches packed sibling refs, which are absent from
+            // the loose refs directory but would share the granted parent.
+            // Windows path comparison also catches case-only ref collisions.
+            return false;
+        }
+    }
+    current_found
+}
+
+fn ensure_plain_directory_tree(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = fs::create_dir(&current);
+                let Ok(metadata) = fs::symlink_metadata(&current) else {
+                    return false;
+                };
+                metadata
+            }
+            Err(_) => return false,
+        };
+        if !plain_directory_metadata(&metadata) {
+            return false;
+        }
+    }
+    fs::canonicalize(path)
+        .ok()
+        .is_some_and(|canonical| same_workspace_path(&canonical, path))
+}
+
+fn contains_only_optional_file(directory: &Path, expected: &str) -> bool {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return false;
+    };
+    let mut found = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        if name.to_str() != Some(expected) || found {
+            return false;
+        }
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if !metadata.is_file() || is_reparse_point(&metadata) {
+            return false;
+        }
+        found = true;
+    }
+    true
+}
+
+fn plain_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| plain_directory_metadata(&metadata))
+}
+
+fn plain_directory_metadata(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !is_reparse_point(metadata)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn same_workspace_path(left: &Path, right: &Path) -> bool {
+    left.to_str()
+        .zip(right.to_str())
+        .is_some_and(|(left, right)| workspace_path_key(left) == workspace_path_key(right))
 }
 
 /// The task text kept in the record, for when the Store no longer has it.

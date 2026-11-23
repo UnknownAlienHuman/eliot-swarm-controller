@@ -486,7 +486,7 @@ pub(crate) struct LaunchArgs {
     pub(crate) chat: bool,
     /// Prepare a managed worktree on a new branch. A value names the branch
     /// explicitly; a bare `--worktree` generates the standard
-    /// `<project>/<agent>-<task-slug>` branch (use `--` before the prompt so
+    /// `<project>/<agent>/work` branch (use `--` before the prompt so
     /// the prompt is not consumed as the value).
     #[arg(long, value_name = "BRANCH", num_args(0..=1), default_missing_value = "")]
     pub(crate) worktree: Option<String>,
