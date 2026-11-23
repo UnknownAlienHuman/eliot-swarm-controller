@@ -142,6 +142,8 @@ pub struct OwnerDecideResponse {
 pub struct SwarmLiveness {
     pub moving: usize,
     pub asked: usize,
+    #[serde(default)]
+    pub parked: usize,
     pub stuck: usize,
     pub long: usize,
     pub reasons: BTreeMap<String, usize>,
