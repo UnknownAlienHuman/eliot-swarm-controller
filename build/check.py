@@ -29,6 +29,8 @@ def run(args: list[str], cwd: Path, *, capture: bool = False) -> bytes:
         cwd=cwd,
         check=False,
         capture_output=capture,
+        # On Windows, implicit inheritance drops the empty RUSTC_WRAPPER override.
+        env=os.environ.copy(),
     )
     if result.returncode != 0:
         if capture and result.stderr:
@@ -114,6 +116,14 @@ def select_packages(root: Path, changed: list[str], packages: list[dict]) -> lis
     return sorted(selected)
 
 
+def set_cargo_isolation(root: Path) -> None:
+    """Keep Cargo outputs private to the Agent artifact root or this worktree."""
+    artifact_root = os.environ.get("ELIOT_ARTIFACT_ROOT")
+    target = root / Path(artifact_root) / "target" if artifact_root else root / "target" / "project-check"
+    os.environ["CARGO_TARGET_DIR"] = os.path.abspath(target)
+    os.environ["RUSTC_WRAPPER"] = ""
+
+
 def main(argv: list[str]) -> int:
     if len(argv) > 2:
         print("usage: python build/check.py [base-commit]", file=sys.stderr)
@@ -124,6 +134,7 @@ def main(argv: list[str]) -> int:
         return 2
 
     root = repo_root()
+    set_cargo_isolation(root)
     base = resolve_base(root, requested)
     print(f"== base: {base}", flush=True)
     run(["cargo", "fmt", "--check"], root)

@@ -1812,7 +1812,14 @@ interpreter such as `cmd.exe /d /c npm test`. The same lookup runs immediately
 before the check, so a changed or removed program can still block a round.
 Goal and project checks receive the managed worktree's frozen base commit as
 `ELIOT_TASK_BASE` when available. The integration check receives its frozen
-integration base. The variable is supplied to the check process only.
+integration base. The variable is supplied to the check process only. Goal and fast
+project checks also receive `ELIOT_ARTIFACT_ROOT` from the exact Agent generation's
+Store-owned artifact root when present. The integration check runs in its own private
+checkout and receives no Agent artifact root.
+The build check script places Cargo output under that root and clears `RUSTC_WRAPPER`,
+so parent Cargo configuration cannot select a shared target or wrapper. With no artifact
+root (including a direct manual run), it uses the check worktree's ignored
+`target/project-check/`.
 An explicit check deadline
 of 1–600 seconds in the Goal or its project policy takes precedence. With at
 least three successful runs with the same argv and working-directory

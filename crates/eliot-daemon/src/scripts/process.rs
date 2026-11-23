@@ -18,6 +18,7 @@ use tokio::{
 
 const CLEANUP_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const TASK_BASE_ENV: &str = "ELIOT_TASK_BASE";
+pub(crate) const ARTIFACT_ROOT_ENV: &str = "ELIOT_ARTIFACT_ROOT";
 
 #[cfg(windows)]
 const LOCAL_BASE_ENVIRONMENT: &[&str] = &[

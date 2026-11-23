@@ -550,7 +550,10 @@ async fn run_policy_check(
         configured_timeout_ms.min(remaining_ms),
         Arc::clone(run.policy),
         run.cancellation.clone(),
-        Some(base_oid),
+        crate::router::project_checks::CheckEnvironment {
+            task_base: Some(base_oid),
+            artifact_root: None,
+        },
         Some((index, run.lease.clone())),
     )
     .await

@@ -10,8 +10,8 @@ use crate::{
     common::now_ms,
     git_monitor::GitProbe,
     scripts::process::{
-        ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV, local_process_command,
-        run_owned_process,
+        ARTIFACT_ROOT_ENV, ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV,
+        local_process_command, run_owned_process,
     },
     workspace_git::WorkspaceGit,
 };
@@ -86,6 +86,7 @@ struct ProjectWork {
     check: Option<ProjectWorkCheck>,
     workspace: String,
     task_base: Option<String>,
+    artifact_root: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -761,6 +762,7 @@ async fn check_after_edit(
             Arc::clone(&policy),
             shutdown.clone(),
             work.task_base.as_deref(),
+            None,
         )
         .await
         {
@@ -813,6 +815,7 @@ async fn check_after_edit(
             Arc::clone(&policy),
             shutdown,
             work.task_base.as_deref(),
+            work.artifact_root.as_deref(),
         )
         .await
         {
@@ -993,7 +996,7 @@ async fn load_project_work(
     expected_workspace: &str,
     review: Option<&Event>,
 ) -> Result<Option<ProjectWork>> {
-    let (agent, registration, opted_out, launch_goal) = {
+    let (agent, registration, opted_out, launch_goal, artifact_root) = {
         let store = router.inner.store.lock().await;
         let Some(agent) = store.get_agent(&key.agent)? else {
             return Ok(None);
@@ -1012,7 +1015,10 @@ async fn load_project_work(
         };
         let opted_out = agent.policy_opt_out_reason.is_some();
         let launch_goal = store.launch_goal_definition(&agent.id, key.generation)?;
-        (agent, registration, opted_out, launch_goal)
+        let artifact_root = store
+            .agent_artifact_root(&agent.id, key.generation)?
+            .map(|root| root.path);
+        (agent, registration, opted_out, launch_goal, artifact_root)
     };
     let config = crate::config::load_project_registration_config(&router.inner.data_root)?
         .into_iter()
@@ -1089,6 +1095,7 @@ async fn load_project_work(
         check,
         workspace: canonical,
         task_base: agent.base_oid,
+        artifact_root,
     }))
 }
 
@@ -1098,6 +1105,11 @@ pub(crate) enum CheckOutcome {
     Unknown(String),
 }
 
+pub(crate) struct CheckEnvironment<'a> {
+    pub(crate) task_base: Option<&'a str>,
+    pub(crate) artifact_root: Option<&'a str>,
+}
+
 async fn run_argv(
     argv: &[String],
     workspace: &str,
@@ -1105,6 +1117,7 @@ async fn run_argv(
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
     task_base: Option<&str>,
+    artifact_root: Option<&str>,
 ) -> Result<CheckOutcome> {
     run_argv_with_index(
         argv,
@@ -1112,7 +1125,10 @@ async fn run_argv(
         deadline_ms,
         policy,
         cancellation,
-        task_base,
+        CheckEnvironment {
+            task_base,
+            artifact_root,
+        },
         None,
     )
     .await
@@ -1124,7 +1140,7 @@ pub(crate) async fn run_argv_with_index(
     deadline_ms: i64,
     policy: Arc<SecretPolicy>,
     cancellation: watch::Receiver<bool>,
-    task_base: Option<&str>,
+    environment: CheckEnvironment<'_>,
     private: Option<(&Path, crate::git_integration::IntegrationLease)>,
 ) -> Result<CheckOutcome> {
     let (program, args) = argv
@@ -1132,8 +1148,11 @@ pub(crate) async fn run_argv_with_index(
         .ok_or_else(|| Error::new("source_integrity", "project command argv is empty"))?;
     let mut command = local_process_command(program)?;
     command.args(args).current_dir(workspace);
-    if let Some(base) = task_base {
+    if let Some(base) = environment.task_base {
         command.env(TASK_BASE_ENV, base);
+    }
+    if let Some(root) = environment.artifact_root {
+        command.env(ARTIFACT_ROOT_ENV, root);
     }
     let timeout = Duration::from_millis(deadline_ms as u64);
     let outcome = if let Some((index_file, lease)) = private {
