@@ -89,6 +89,32 @@ pub(super) struct HandoffRoute {
     pub(super) allowed: Option<Vec<String>>,
 }
 
+pub(super) fn handoff_waiting_message(error: &Error) -> Option<String> {
+    if let Some(decision) = error.routing.as_deref() {
+        let skipped = decision
+            .skipped
+            .iter()
+            .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "No eligible successor in routing.handoff_fallback. {skipped}"
+        ));
+    }
+    (error.code == "handoff_unavailable").then(|| (*error.message).clone())
+}
+
+fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<String>> {
+    let reason = if !routing.auto_handoff() {
+        "Automatic handoff is disabled"
+    } else if routing.handoff_fallback.is_empty() {
+        "routing.handoff_fallback is empty"
+    } else {
+        return Ok(routing.handoff_fallback);
+    };
+    Err(Error::new("handoff_unavailable", reason))
+}
+
 #[derive(Default)]
 struct RoutePreflight {
     arbitrated: bool,
@@ -357,6 +383,7 @@ impl Router {
             )
         })?;
         decision.profile = None;
+        decision.source = "settings.routing.handoff_fallback".to_owned();
         decision.reason = format!("{} refused the task ({})", source.profile, kind.as_str());
         decision.skipped.push(RouteSkip {
             profile: source.profile.clone(),
@@ -365,11 +392,9 @@ impl Router {
         });
         decision.quota_status = RouteQuotaStatus::Unknown;
         let routing = crate::config::load_routing_config(&self.inner.data_root)?;
-        let enabled = routing.auto_handoff();
-        let candidates: Vec<_> = routing
-            .handoff_fallback
+        let candidates: Vec<_> = automatic_fallback(routing)?
             .into_iter()
-            .filter(|name| enabled && frozen.contains(name))
+            .filter(|name| frozen.contains(name))
             .collect();
         decision.provider_failover = Some(candidates.clone());
         decision.owner_automation |= owner_automation;
@@ -408,19 +433,7 @@ impl Router {
         let mut list = if let Some(role) = route.role.as_deref() {
             routing.candidates(role).unwrap_or_default().to_vec()
         } else {
-            if !routing.auto_handoff() {
-                return Err(Error::new(
-                    "handoff_unavailable",
-                    "Automatic handoff is disabled",
-                ));
-            }
-            if routing.handoff_fallback.is_empty() {
-                return Err(Error::new(
-                    "handoff_unavailable",
-                    "routing.handoff_fallback is empty",
-                ));
-            }
-            routing.handoff_fallback
+            automatic_fallback(routing)?
         };
         let keep_source =
             route.reason == HandoffReason::SessionLost && source.state == AgentState::Lost;

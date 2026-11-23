@@ -281,6 +281,88 @@ impl Router {
             self.signal_launch_arbitration();
             return;
         };
+        // Resolve automatic or manager-routed targets before issuing the
+        // source stop. An unavailable route must leave its source running.
+        let routed = async {
+            let mut launch = SubmitCommand::new(&plan.launch_command, "launch");
+            let mut owner_automation = owner_automation;
+            let handoff_route = if let Some(value) = continuation {
+                Some(HandoffRoute {
+                    reason: value.reason,
+                    kind: value.kind,
+                    role: None,
+                    allowed: None,
+                })
+            } else if let (Some(manager), Some(role)) =
+                (requested_by.as_deref(), request.launch.role.as_deref())
+            {
+                Some(HandoffRoute {
+                    reason: HandoffReason::Routing,
+                    kind: None,
+                    role: Some(role.to_owned()),
+                    allowed: Some(self.manager_successors(manager, &source).await?),
+                })
+            } else {
+                None
+            };
+            let provider_route = if let Some(route) = &handoff_route {
+                let (name, identity) = self.route_handoff(&mut launch, &source, route).await?;
+                Some((name, launch.args["profile_choice"].take(), identity))
+            } else if let Some(failure) = provider_failure {
+                let authority = failure.require_authority(&source.profile_snapshot)?;
+                owner_automation |= source
+                    .profile_choice
+                    .as_ref()
+                    .is_some_and(|choice| choice.owner_automation);
+                let (name, identity) = self
+                    .route_provider_switch(
+                        &mut launch,
+                        &source,
+                        failure.kind,
+                        authority,
+                        owner_automation,
+                    )
+                    .await?;
+                Some((name, launch.args["profile_choice"].take(), identity))
+            } else {
+                None
+            };
+            Ok::<_, Error>((provider_route, owner_automation))
+        }
+        .await;
+        let (provider_route, owner_automation) = match routed {
+            Ok(result) => result,
+            Err(error) => {
+                let reason_kind = continuation
+                    .map(|value| (value.reason, value.kind))
+                    .or_else(|| {
+                        provider_failure
+                            .map(|value| (HandoffReason::ProviderHold, Some(value.kind)))
+                    });
+                let policy = self.secret_policy_snapshot();
+                let mut store = self.inner.store.lock().await;
+                if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                    self.publish_locked(&change.events);
+                }
+                if let Some((reason, kind)) = reason_kind
+                    && let Some(message) = routing::handoff_waiting_message(&error)
+                {
+                    let candidate = eliot_store::AutomaticHandoff {
+                        agent: source,
+                        reason,
+                        kind,
+                        held_since: None,
+                    };
+                    if let Ok(events) = store.record_handoff_waiting(&candidate, &message, now_ms())
+                    {
+                        self.publish_locked(&events);
+                    }
+                }
+                self.signal_progress();
+                self.signal_launch_arbitration();
+                return;
+            }
+        };
         self.clone()
             .process_command(source_stop_command, None)
             .await;
@@ -375,59 +457,11 @@ impl Router {
                     .to_owned(),
             };
             launch.args = request.launch.args(&workspace)?;
-            let mut owner_automation = owner_automation;
-            let handoff_route = if let Some(value) = continuation {
-                Some(HandoffRoute {
-                    reason: value.reason,
-                    kind: value.kind,
-                    role: None,
-                    allowed: None,
-                })
-            } else if let (Some(manager), Some(role)) =
-                (requested_by.as_deref(), request.launch.role.as_deref())
-            {
-                Some(HandoffRoute {
-                    reason: HandoffReason::Routing,
-                    kind: None,
-                    role: Some(role.to_owned()),
-                    allowed: Some(self.manager_successors(manager, &source).await?),
-                })
-            } else {
-                None
-            };
-            let provider_route = if let Some(route) = &handoff_route {
+            if let Some((name, _, _)) = &provider_route {
                 if let Some(args) = launch.args.as_object_mut() {
                     args.remove("role");
                 }
-                let (name, identity) = self.route_handoff(&mut launch, &source, route).await?;
                 launch.args["profile"] = json!(name);
-                Some((launch.args["profile_choice"].take(), identity))
-            } else if let Some(failure) = provider_failure {
-                let authority = failure.require_authority(&source.profile_snapshot)?;
-                owner_automation |= source
-                    .profile_choice
-                    .as_ref()
-                    .is_some_and(|choice| choice.owner_automation);
-                let (name, identity) = self
-                    .route_provider_switch(
-                        &mut launch,
-                        &source,
-                        failure.kind,
-                        authority,
-                        owner_automation,
-                    )
-                    .await?;
-                launch.args["profile"] = json!(name);
-                Some((launch.args["profile_choice"].take(), identity))
-            } else {
-                None
-            };
-            if provider_route.is_some() {
-                launch
-                    .args
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("profile_choice");
             }
             // A targeted continuation explicitly requests standard worktree
             // preparation, even in a `shared` project: B never starts in the
@@ -479,7 +513,7 @@ impl Router {
                     "session growth switch authority differs from the source generation",
                 ));
             }
-            if let Some((choice, identity)) = provider_route {
+            if let Some((_, choice, identity)) = provider_route {
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity
                 {

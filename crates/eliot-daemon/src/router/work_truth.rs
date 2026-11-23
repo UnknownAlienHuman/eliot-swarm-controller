@@ -808,17 +808,7 @@ impl Router {
             .route_handoff(&mut probe, &candidate.agent, &route)
             .await
         {
-            let message = if let Some(decision) = error.routing.as_deref() {
-                let skipped = decision
-                    .skipped
-                    .iter()
-                    .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("No eligible successor in routing.handoff_fallback. {skipped}")
-            } else if error.code == "handoff_unavailable" {
-                *error.message
-            } else {
+            let Some(message) = super::routing::handoff_waiting_message(&error) else {
                 return Err(error);
             };
             let mut store = self.inner.store.lock().await;

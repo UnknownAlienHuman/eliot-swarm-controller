@@ -1662,7 +1662,8 @@ list names it. Profiles this task already left and held profiles are skipped.
 Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
 eligible candidate the Agent keeps its work. The Owner inbox and `swarm why` report
-an empty list or why candidates were skipped. A refused admission is tried again
+an empty list or why candidates were skipped. Routing must succeed before the daemon
+dispatches a stop to the source. A refused admission is tried again
 after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.

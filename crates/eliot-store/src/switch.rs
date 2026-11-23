@@ -2064,6 +2064,7 @@ impl Store {
         let parent = switch_parent(&self.connection, id)?;
         let retained = decode_switch(parent.args)?;
         let source = load_agent_by_num(&self.connection, parse_agent_id(&retained.request.from)?)?;
+        let mut events = Vec::new();
         if let Some(source) = source {
             let stop = retained
                 .source_stop_command
@@ -2071,6 +2072,12 @@ impl Store {
                 .map(|stop_id| load_command(&self.connection, stop_id))
                 .transpose()?
                 .flatten();
+            let pending = stop.as_ref().filter(|stop| {
+                stop.state == CommandState::Accepted
+                    && stop.verb == "stop"
+                    && stop.target.as_deref() == Some(source.id.as_str())
+                    && stop.generation == Some(source.generation)
+            });
             let stop_settled = stop.as_ref().is_none_or(|stop| {
                 matches!(
                     stop.state,
@@ -2085,11 +2092,22 @@ impl Store {
                     || handoff::session_exit_blocker(&self.connection, &source)
                         .is_ok_and(|blocker| blocker.is_none())
             });
-            if stop_settled && exit_proven {
+            if pending.is_some() || (stop_settled && exit_proven) {
                 let tx = self
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(sql_error)?;
+                if let Some(stop) = pending {
+                    cancel_pending_command_tx(
+                        &tx,
+                        parse_agent_id(&source.id)?,
+                        source.generation,
+                        &stop.id,
+                        "switch_preparation_refused",
+                        now,
+                        &mut events,
+                    )?;
+                }
                 release_switch_checkout_fences(
                     &tx,
                     id,
@@ -2106,7 +2124,7 @@ impl Store {
         value.state = CommandState::Rejected;
         value.next_action.clear();
         value.routing = error.routing.clone();
-        let change = self.settle(
+        let mut change = self.settle(
             id,
             CommandState::Rejected,
             Some(
@@ -2115,6 +2133,8 @@ impl Store {
             ),
             now,
         )?;
+        events.append(&mut change.events);
+        change.events = events;
         self.settle_automatic_handoff_attempt(id, CommandState::Rejected, now)?;
         Ok(change)
     }
