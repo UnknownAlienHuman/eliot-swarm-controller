@@ -29,17 +29,10 @@ impl CatalogueHost {
         launch: &NativeLaunch,
         instance_dir: &Path,
         policy: &SecretPolicy,
-        requested_model: Option<&str>,
+        observe_models: bool,
     ) -> Result<Self> {
-        let mut host = Self::read(launch, policy).await?;
-        let requested_model_missing = requested_model.is_some_and(|requested| {
-            !host
-                .catalogue
-                .models
-                .iter()
-                .any(|model| model.model_id == requested)
-        });
-        if !host.catalogue.models.is_empty() && !requested_model_missing {
+        let mut host = Self::read(launch, policy, observe_models).await?;
+        if !host.catalogue.models.is_empty() {
             return Ok(host);
         }
 
@@ -47,14 +40,18 @@ impl CatalogueHost {
         // exit before refreshing the cache and opening a fresh host.
         host.close().await?;
         let refresh_error = refresh(launch, instance_dir, policy).await.err();
-        let mut host = Self::read(launch, policy)
+        let mut host = Self::read(launch, policy, observe_models)
             .await
             .map_err(|error| with_refresh_failure(error, refresh_error.as_ref()))?;
         host.refresh_error = refresh_error;
         Ok(host)
     }
 
-    async fn read(launch: &NativeLaunch, policy: &SecretPolicy) -> Result<Self> {
+    async fn read(
+        launch: &NativeLaunch,
+        policy: &SecretPolicy,
+        observe_models: bool,
+    ) -> Result<Self> {
         let deadline = Instant::now() + QUERY_BUDGET;
         let mut native = NativeProcess::spawn(launch.clone(), policy.clone())
             .await
@@ -62,7 +59,7 @@ impl CatalogueHost {
                 let message = format!("Muse session host could not be spawned ({})", error.code);
                 error.with_message(message)
             })?;
-        match read_snapshot(&native.client(), deadline).await {
+        match read_snapshot(&native.client(), deadline, observe_models).await {
             Ok((identity, catalogue)) => Ok(Self {
                 native,
                 identity,
@@ -99,8 +96,9 @@ async fn close(native: &mut NativeProcess) -> Result<()> {
 async fn read_snapshot(
     client: &NativeClient,
     deadline: Instant,
+    observe_models: bool,
 ) -> Result<(NativeInitializeResult, NativeModelListResult)> {
-    let init = serde_json::to_value(native_initialize_params())
+    let init = serde_json::to_value(native_initialize_params(observe_models))
         .map_err(|_| Error::new("internal", "Muse initialize params could not be encoded"))?;
     let identity = client
         .call("initialize", init, deadline)

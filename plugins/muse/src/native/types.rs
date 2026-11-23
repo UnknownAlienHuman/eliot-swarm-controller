@@ -73,6 +73,10 @@ pub struct NativeClientInfo {
 pub struct NativeClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_dialogs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_api: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,8 +125,6 @@ pub struct NativeInitializeResult {
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionStartParams {
     pub command_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
     /// Starting approval mode; the server default rules when omitted.
@@ -193,6 +195,8 @@ pub struct NativeSessionSetModelParams {
 #[serde(rename_all = "camelCase")]
 pub struct NativeModelSelection {
     pub model_id: String,
+    pub provider_id: String,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,13 +248,28 @@ pub struct NativeModelListResult {
     #[serde(default)]
     pub models: Vec<NativeModelCatalogEntry>,
     pub provider_id: String,
+    pub profile_id: Option<String>,
     /// Where the catalogue came from (`providerCatalog`, `bundledCatalog`,
-    /// ...; open enum). Only the source is modelled: the accompanying
-    /// `profileId` is account data and stays ignored, never persisted.
+    /// ...; open enum). Provider profile IDs stay on the native command plane.
     /// An empty `bundledCatalog` means the host has no visible rows in its
     /// snapshot. The exact-model check still applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+impl NativeModelListResult {
+    /// Hidden IDs are absent from the picker. An explicit ID can still be
+    /// routed through the provider and profile of this catalogue.
+    pub fn selection(&self, model_id: &str) -> NativeModelSelection {
+        let row = self.models.iter().find(|row| row.model_id == model_id);
+        NativeModelSelection {
+            model_id: model_id.to_owned(),
+            provider_id: row
+                .map_or(&self.provider_id, |row| &row.provider_id)
+                .clone(),
+            profile_id: row.map_or(&self.profile_id, |row| &row.profile_id).clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +277,7 @@ pub struct NativeModelListResult {
 pub struct NativeModelCatalogEntry {
     pub model_id: String,
     pub provider_id: String,
+    pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
     #[serde(default)]
@@ -359,6 +379,8 @@ pub struct NativeSessionReadResult {
 pub struct NativeSessionResumeParams {
     pub command_id: String,
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_items: Option<bool>,
 }

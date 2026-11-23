@@ -1029,7 +1029,10 @@ harness proves what its native turn request carried (Codex reports the
 carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
 `effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
-record on the bound turn. Values no turn
+record on the bound turn. Muse clears model verification on each turn and
+sets it only on a matching provider response. A mismatch exposes the reported
+model with `model_verified: false` and names both IDs in the Owner inbox and
+`diagnose` (`swarm why`). Values no turn
 re-proves stay at their admission readback; no value is ever presented as
 verified without that admission.
 
@@ -1411,11 +1414,11 @@ with its echoed current value. On the natively-switching harnesses the
 Router switches the live native session through the owned plugin first and
 stores the overlay only after native proof, then settles `applied` with the
 requested values, the monotonically increasing `config_revision` for the
-generation and `application:"next_turn"`. Claude retains `accepted_model`
+generation and `application:"next_turn"`. Claude and Muse retain `accepted_model`
 as the next-turn selector, with `effective.model` null and `model_verified`
-false in the configure outcome. The next bound assistant record updates
-the Agent's last observed serving model. Muse proves the session model at
-configure and reports carried effort at the next turn association.
+false in the configure outcome. The next bound Claude assistant record or
+Muse provider response updates the Agent's observed serving model. Muse
+reports carried effort at the next turn association.
 OpenCode and Antigravity report verified native values from their readback
 or echo. A proven validation refusal settles `rejected`. An ambiguous
 native effect or a Store commit failure after the effect settles

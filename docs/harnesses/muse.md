@@ -59,10 +59,9 @@ establishes terminal lifecycle even when the terminal value is `Other`. Its outc
 is `unknown`. An unavailable view still requires command-plane proof. A workflow-child
 status or readback value of `Other` carries no terminal or healthy-view evidence.
 
-The adapter has no exact runtime-version equality gate. Its manifest declares the
-`1.4.0` harness baseline, while startup requires only a non-empty reported
-`serverInfo.version`; neither that value nor `schema.version` is compared to an exact
-supported version. This metadata does not qualify a newer runtime.
+The adapter has no exact runtime-version equality gate. Its manifest declares
+the `1.4.0` harness baseline. Owned sessions require a non-empty
+`serverInfo.version` and the `rawLog` capability for model observation.
 
 ## Native mapping
 
@@ -74,14 +73,34 @@ native refusal alone does not prove a contract mismatch or an upstream failure.
 
 | Eliot verb | Installed MSP mechanism to verify |
 | --- | --- |
-| launch/send | session/start then turn/start; readiness, input association and result separate |
+| launch/send | Explicit models use `serve --model <id>`, then `session/start` inherits that route. `turn/start` sends input after readiness. |
 | steer/interrupt | steer is turn/steer with the exact expected turn. Interrupt is turn/cancel with the captured turn. An empty Owner binding allows idle confirmation only under the [shared control policy](../spec/plugin-protocol.md#host-requests). The native queue is retained |
 | inject | exact supported steer or explicit next-send prepend, mechanism reported; active_turn uses the actual turn/steer mechanism with the exact expected turn (`muse.turn/steer`), other points unsupported here |
 | stop/resume | interrupt the captured busy turn and await native terminal evidence within the core bound, then clear/pause native Goal as necessary and close owned host; missing evidence retains an unknown turn; resume exact session without old input |
 | approve/deny/answer | exact session/child request id and offered choice/requirement; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |
-| configure | The model switches through `session/setModel` between turns. The exact setter acknowledgment and `session/read` prove the requested model before the overlay commits. Effort is carried through per-turn `reasoningEffort` in `turn/start`, including mixed requests and after resume. An effort-only revision keeps the last session model. |
+| configure | `session/setModel` carries the catalogue's provider and profile between turns. Its exact acknowledgment and `session/read` prove selector admission before the overlay commits. Effort travels in per-turn `reasoningEffort` in `turn/start`. An effort-only revision keeps the last selector. |
 | goal | native set/edit/pause/resume/clear where installed schema supports them |
 | compact/fork/background | native-only, advertised after implementation |
+
+The Muse 1.4.25 MSP schema documents that an omitted `session/setModel`
+`profileId` means no profile. In #949, the retained Contributor selector
+lost its `tbh` route and the provider answered with the ordinary model.
+Startup lets Muse resolve the profile for the exact `--model`. Resume uses
+`session/resume.modelId` and rebinds an already-selected Contributor model
+to its provider profile for sessions retained from earlier versions.
+The Contributor model can be hidden from the public picker, so its absence
+does not prevent attempting the exact selector on the native catalogue route.
+Swarm disables auto-update in its owned host process and leaves Contributor
+mode and disclosure consent under the Owner's native configuration.
+
+Model proof comes from the exact session's MSP `log/subscribe` live stream
+(`rawLog`). The adapter binds each provider success record to the active
+run and its foreground task. Only the model recorded in the provider's
+response facet can verify the selector. `session/tokenUsage.modelId`
+can still echo the configured selector. On a mismatch the adapter sends
+`turn/cancel` for that exact turn, suppresses its unverified output, and
+blocks further input on the affected session. The Owner inbox and
+`swarm why` show both model IDs.
 
 Before `turn/steer` (including `inject active_turn`), the adapter makes a bounded,
 read-only `session/read` with `excludeItems: true`. It requires a readable
@@ -189,18 +208,16 @@ With a fresh data root, `serve` returned an empty `bundledCatalog` even
 after `session/start`. The installed `muse exec --help` documents
 `exec --list-models`, which fetches models and populates Muse's cache under
 `XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
-The adapter first reads the host's `model/list` snapshot. An empty snapshot,
-or a missing exact retained model on resume, triggers one refresh with the
-resolved executable and environment from the private plugin directory. The
+The adapter first reads the host's `model/list` snapshot. An empty snapshot
+triggers one refresh with the resolved executable and environment from the
+private plugin directory. The
 refresh and each host query have separate deadlines. A fresh `serve` reads the
-resulting cache even if the refresh fails. A resume can reopen a session
-already on its retained model when the catalogue omits that model. If the
-session needs realignment to an omitted model, preflight asks the Owner to
-restore access before sending `session/resume`. Launch still sends an omitted
-model unchanged and reports `catalogue_omits_model: true`. An exact row
+resulting cache even if the refresh fails. An exact selector missing from the
+public catalogue is passed unchanged and reported with
+`catalogue_omits_model: true`. An exact row
 supplies effort variants when known, so a known model/effort mismatch fails
-before a native start or resume. The effective session `modelId` must match
-the request to set `model_verified`.
+before a native start or resume. The session `modelId` confirms admission
+before Swarm dispatches input.
 
 Muse makes a profile's standing reasoning effort durable when
 `session/setReasoningEffort` acknowledges the exact command. The adapter

@@ -10,15 +10,15 @@ use crate::{
             NativeApprovalListPendingParams, NativeApprovalListPendingResult,
             NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
             NativeItemCompletedNotification, NativeModelEffortVariants, NativeModelListParams,
-            NativeModelListResult, NativeModelSelection, NativeSession, NativeSessionReadParams,
-            NativeSessionReadResult, NativeSessionReasoningEffortChangedNotification,
-            NativeSessionResumeParams, NativeSessionResumeResult, NativeSessionSetModelParams,
-            NativeSessionSetModelResult, NativeSessionStartParams, NativeSessionStartResult,
-            NativeTurnCancelParams, NativeTurnCancelResult, NativeTurnCompletedNotification,
-            NativeTurnInputPart, NativeTurnStartParams, NativeTurnStartResult,
-            NativeTurnStartedNotification, NativeTurnSteerParams, NativeTurnSteerResult,
-            NativeTurnTerminal, NativeUnframedViewEvent, NativeViewPageParams,
-            NativeViewPageResult, is_reasoning_effort_tier,
+            NativeModelListResult, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
+            NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
+            NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
+            NativeSessionStartParams, NativeSessionStartResult, NativeTurnCancelParams,
+            NativeTurnCancelResult, NativeTurnCompletedNotification, NativeTurnInputPart,
+            NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
+            NativeTurnSteerParams, NativeTurnSteerResult, NativeTurnTerminal,
+            NativeUnframedViewEvent, NativeViewPageParams, NativeViewPageResult,
+            is_reasoning_effort_tier,
         },
     },
 };
@@ -136,7 +136,7 @@ pub(super) const NATIVE_CLIENT_INFO_NAME: &str = "eliot";
 
 /// Shared native `initialize` params for the launch path and the read-only
 /// model.list reader: identical client identity on both paths.
-pub(super) fn native_initialize_params() -> NativeInitializeParams {
+pub(super) fn native_initialize_params(observe_models: bool) -> NativeInitializeParams {
     NativeInitializeParams {
         client_info: NativeClientInfo {
             name: NATIVE_CLIENT_INFO_NAME.to_owned(),
@@ -148,6 +148,8 @@ pub(super) fn native_initialize_params() -> NativeInitializeParams {
         // toward this client.
         capabilities: Some(NativeClientCapabilities {
             user_input_dialogs: Some(true),
+            experimental_api: observe_models.then_some(true),
+            requested_capabilities: observe_models.then(|| vec!["rawLog".to_owned()]),
         }),
     }
 }
@@ -201,11 +203,8 @@ struct AgentSession {
     session_id: Option<String>,
     native_scope: String,
     selected_effort: Option<String>,
-    /// Session-verified model the owned native session currently runs:
-    /// the start/resume readback, refreshed by `configure` after its
-    /// `session/read` proof. Reported on turn association so the readback
-    /// follows a live switch; omitted when never verified.
-    selected_model: Option<String>,
+    /// Selector that the first and subsequent provider responses must match.
+    expected_model: Option<String>,
     secrets: Vec<String>,
     native: NativeProcess,
     native_client: NativeClient,
@@ -483,12 +482,11 @@ impl MusePlugin {
             Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
         };
         let policy = SecretPolicy::new(secrets.iter());
-        let resume_model = resume_subject.as_ref().and(requested_model.as_deref());
         let mut host = match catalogue::CatalogueHost::open(
             &launch,
             Path::new(&initialized.instance_dir),
             &policy,
-            resume_model,
+            true,
         )
         .await
         {
@@ -509,6 +507,10 @@ impl MusePlugin {
                 };
             }
         };
+        let resume_route = requested_model
+            .as_deref()
+            .filter(|model| resume_subject.is_some() && model.ends_with("-contributor"))
+            .map(|model| host.catalogue.selection(model));
         let mut session = match start::bind_owned_session(
             &params,
             initialized,
@@ -583,7 +585,6 @@ impl MusePlugin {
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
-                resume_model.filter(|_| initialized_native.catalogue_omits_model),
             )
             .await
             {
@@ -618,6 +619,7 @@ impl MusePlugin {
             let native_params = NativeSessionResumeParams {
                 command_id: new_command_id(),
                 session_id: subject.native_ref.clone(),
+                model_id: requested_model.clone(),
                 exclude_items: Some(true),
             };
             let encoded = serde_json::to_value(native_params).map_err(|_| {
@@ -635,9 +637,6 @@ impl MusePlugin {
         } else {
             let native_params = NativeSessionStartParams {
                 command_id: new_command_id(),
-                // Omitted model defers to the server default; the effective
-                // id is read back from the session below.
-                model_id: requested_model.clone(),
                 workspace_root: Some(workspace.to_string_lossy().into_owned()),
                 approval_mode: requested_approval.clone(),
             };
@@ -767,19 +766,16 @@ impl MusePlugin {
         let effort_matches =
             effective_effort.is_none() || effective_effort == initialized_native.effort;
         let effort_verified = initialized_native.effort.is_some() && effort_matches;
-        // Model and approval alignment on resume: the frozen profile is the
-        // source of truth, so a retained session running another model or
-        // approval mode is realigned via the setters (launch already passes
-        // both to `session/start`). Either setter runs idle — the resume
-        // preflight proved it — so admission applies immediately and one
-        // `session/read` confirms both.
+        // Repair an already-selected contributor route retained by an older
+        // generation. A refused resume override still fails the selector
+        // check below without sending input.
+        let resume_route = resume_route.filter(|route| {
+            route.profile_id.is_some()
+                && native_session.model_id.as_deref() == Some(route.model_id.as_str())
+                && native_session.provider_id.as_deref() == Some(route.provider_id.as_str())
+        });
         let model_set = self
-            .align_resume_model(
-                &mut session,
-                &native_session,
-                resume_subject.is_some(),
-                requested_model.as_deref(),
-            )
+            .align_resume_model(&mut session, &native_session, resume_route)
             .await?;
         let approval_set = self
             .align_resume_approval(
@@ -832,13 +828,10 @@ impl MusePlugin {
                         .map(|state| state.mode.clone()),
                 )
             };
-        // An omitted request accepts the server-selected model as
-        // effective, but only when the server actually names one; an empty
-        // or missing `modelId` never verifies. An explicit request must
-        // match exactly. Retain it as the session-verified model so later
-        // turn associations report the switch instead of the launch value.
-        session.selected_model = effective_model.clone();
-        let model_verified = match requested_model.as_deref() {
+        // This proves selector admission. Only the response observer can
+        // verify the serving model.
+        session.expected_model = effective_model.clone();
+        let model_selected = match requested_model.as_deref() {
             None => effective_model
                 .as_deref()
                 .is_some_and(|model| !model.trim().is_empty()),
@@ -848,9 +841,9 @@ impl MusePlugin {
             .as_deref()
             .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
         let effective = json!({
-            "model": effective_model.clone(),
+            "model": Value::Null,
             "model_provider": native_session.provider_id.clone(),
-            "model_verified": model_verified,
+            "model_verified": false,
             "cwd": native_session.workspace_root.clone(),
             "effort": initialized_native.effort.clone(),
             "effort_verified": effort_verified,
@@ -872,7 +865,7 @@ impl MusePlugin {
         let reported_root = native_session.workspace_root.as_deref();
         let checks = [
             (
-                model_verified,
+                model_selected,
                 "model",
                 requested_model.as_deref(),
                 effective_model.as_deref(),
@@ -1133,6 +1126,12 @@ impl MusePlugin {
                 "reason": format!("Muse effort {effort} is not a variant of model {requested_model}"),
             }));
         }
+        let native_selection = catalog.selection(selection.id);
+        if selection.id.ends_with("-contributor") && native_selection.profile_id.is_none() {
+            return Ok(rejected_control(
+                "Muse catalogue did not identify the provider profile for the Contributor selector",
+            ));
+        }
         let model_command = new_command_id();
         let model_response = match session
             .native_client
@@ -1141,9 +1140,7 @@ impl MusePlugin {
                 serde_json::to_value(NativeSessionSetModelParams {
                     command_id: model_command.clone(),
                     session_id: session_id.clone(),
-                    model: NativeModelSelection {
-                        model_id: selection.id.to_owned(),
-                    },
+                    model: native_selection,
                 })
                 .map_err(|_| {
                     Error::new(
@@ -1203,12 +1200,12 @@ impl MusePlugin {
                 format!("Muse session/read did not prove the model switch to {requested_model}"),
             ));
         }
-        session.selected_model = Some(requested_model.clone());
+        session.expected_model = Some(requested_model.clone());
         Ok(with_model_catalogue_diagnostic(
             json!({
                 "state": "applied",
-                "model": requested_model,
-                "model_verified": true,
+                "accepted_model": requested_model,
+                "model_verified": false,
             }),
             selection.catalogue_omits_model(),
         ))
@@ -1379,11 +1376,13 @@ impl MusePlugin {
         let native_command_id = new_command_id();
         // A retained `configure` effort overlay rides the per-turn field
         // the installed schema accepts; without one the frozen session
-        // value applies unchanged. A model override never reaches this
-        // path: the model switch runs live through `session/setModel` at
-        // configure time, so the session already carries the retained
-        // revision's model. The association reports that session-verified
-        // model alongside the carried effort.
+        // value applies unchanged. The retained selector is the expected
+        // provider model, including after Store settles an ambiguous
+        // configure through exact native readback.
+        let expected_model = params
+            .model_override
+            .clone()
+            .or_else(|| session.expected_model.clone());
         let effort = params
             .effort_override
             .clone()
@@ -1482,7 +1481,7 @@ impl MusePlugin {
                 turn_id.clone(),
                 params.context.clone(),
                 sent_effort.clone(),
-                session.selected_model.clone(),
+                expected_model,
             )
             .await
             .is_err()
@@ -1598,6 +1597,9 @@ impl MusePlugin {
                 return Ok(result);
             }
         };
+        if let Some((_, reason)) = session.events.status().model_mismatch {
+            return Ok(rejected_control(&reason));
+        }
         if !live {
             return Ok(rejected_control(
                 "Muse turn/steer does not match the exact active turn",
@@ -2209,7 +2211,7 @@ impl MusePlugin {
             &launch,
             Path::new(&initialized.instance_dir),
             &policy,
-            None,
+            false,
         )
         .await?;
         host.close().await?;
@@ -2273,19 +2275,11 @@ impl MusePlugin {
         let client = native.client();
         let result: Result<Value> = async {
             use crate::native::types::{
-                NativeClientCapabilities, NativeClientInfo, NativeInitializeParams,
                 NativeInitializeResult, NativeUsageReadParams, NativeUsageReadResult,
             };
-            let init = NativeInitializeParams {
-                client_info: NativeClientInfo {
-                    name: "eliot_quota".to_owned(),
-                    version: env!("CARGO_PKG_VERSION").to_owned(),
-                    title: Some("Eliot quota".to_owned()),
-                },
-                capabilities: Some(NativeClientCapabilities {
-                    user_input_dialogs: Some(true),
-                }),
-            };
+            let mut init = native_initialize_params(false);
+            init.client_info.name = "eliot_quota".to_owned();
+            init.client_info.title = Some("Eliot quota".to_owned());
             let init_value = serde_json::to_value(init).map_err(|_| {
                 Error::new(
                     "internal",
@@ -2399,7 +2393,7 @@ async fn read_live_snapshot(
     let explicit_idle = raw.pointer("/session/activeTurnId") == Some(&Value::Null);
     let readback: NativeSessionReadResult = serde_json::from_value(raw)
         .map_err(|_| Error::new("native_readback", "Muse session/read response was invalid"))?;
-    let last_turn = if let Some(turn_id) = turn_id {
+    let mut last_turn = if let Some(turn_id) = turn_id {
         let exact_running = readback.session.status == "running"
             && readback.session.active_turn_id.as_deref() == Some(turn_id);
         if !(exact_running || (readback.session.status == "idle" && explicit_idle)) {
@@ -2432,6 +2426,27 @@ async fn read_live_snapshot(
         None
     };
     let event_status = session.events.status();
+    if let Some(facts) = &mut last_turn {
+        if event_status.provider_model_turn.as_deref() != Some(facts.turn_id.as_str()) {
+            facts.final_text = None;
+        }
+        if let Some((_, reason)) = event_status
+            .model_mismatch
+            .as_ref()
+            .filter(|(turn, _)| turn == &facts.turn_id)
+        {
+            facts.native_error = Some(reason.clone());
+            if facts.terminal {
+                facts.status = Some("failed".to_owned());
+            }
+        } else if facts.terminal
+            && facts.status.as_deref() == Some("completed")
+            && event_status.provider_model_turn.as_deref() != Some(facts.turn_id.as_str())
+        {
+            facts.status = Some("failed".to_owned());
+            facts.native_error = Some("Muse completed without provider model evidence".to_owned());
+        }
+    }
     let result_known = last_turn
         .as_ref()
         .is_some_and(|turn| turn.final_text.is_some());
@@ -2627,7 +2642,6 @@ async fn verify_resume_preflight(
     client: &NativeClient,
     session_id: &str,
     retained_turn: Option<&str>,
-    unlisted_resume_model: Option<&str>,
 ) -> Result<()> {
     let readback = read_owned_session(client, session_id).await?;
     if let Some(reason) = readback.history.unavailable_reason() {
@@ -2661,14 +2675,6 @@ async fn verify_resume_preflight(
         proves_no_turn: session.turn_count == Some(0),
     }
     .verify()?;
-    if let Some(model) = unlisted_resume_model
-        && session.model_id.as_deref() != Some(model)
-    {
-        return Err(Error::new(
-            "profile_error",
-            "Muse cannot verify the retained profile model for realignment; restore access to that model and retry Resume",
-        ));
-    }
     Ok(())
 }
 
@@ -3016,8 +3022,11 @@ fn muse_manifest() -> PluginManifest {
 
 /// Native arguments for `muse serve`. Full access passes `--disable-sandbox`
 /// at host startup; default/workspace-write retains host-default sandboxing.
-fn muse_serve_args(permissions: &str) -> Vec<OsString> {
+fn muse_serve_args(permissions: &str, model: Option<&str>) -> Vec<OsString> {
     let mut args = vec![OsString::from("serve")];
+    if let Some(model) = model {
+        args.extend([OsString::from("--model"), OsString::from(model)]);
+    }
     if permissions == "danger-full-access" {
         args.push(OsString::from("--disable-sandbox"));
     }

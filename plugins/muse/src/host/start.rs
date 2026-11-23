@@ -167,20 +167,22 @@ pub(super) fn prepare_profile(
             )
         })?;
     let TargetEnvironment {
-        variables: environment,
+        variables: mut environment,
         mut secrets,
     } = target_environment(
         params.target_environment.as_ref(),
         profile.get("pass_env"),
         "Muse",
     )?;
+    environment.retain(|(name, _)| !name.eq_ignore_ascii_case("MUSE_NO_AUTO_UPDATE"));
+    environment.push((OsString::from("MUSE_NO_AUTO_UPDATE"), OsString::from("1")));
     secrets.push(initialized.credential.clone());
     // Sandbox posture is fixed at host birth (`muse serve` flags):
     // canonical danger-full-access passes --disable-sandbox, while
     // workspace-write preserves the host-default sandbox posture.
     let launch = NativeLaunch {
         program,
-        args: muse_serve_args(&requested_permissions),
+        args: muse_serve_args(&requested_permissions, requested_model.as_deref()),
         cwd: workspace.clone(),
         environment,
     };
@@ -260,7 +262,7 @@ pub(super) fn bind_owned_session(
         session_id: None,
         native_scope: String::new(),
         selected_effort: None,
-        selected_model: None,
+        expected_model: None,
         secrets,
         native,
         native_client,
@@ -334,6 +336,16 @@ impl MusePlugin {
         requested_effort: Option<&str>,
     ) -> Result<InitializedNative> {
         let initialized = &host.identity;
+        if !initialized
+            .granted_capabilities
+            .iter()
+            .any(|cap| cap == "rawLog")
+        {
+            return Err(Error::new(
+                "unsupported",
+                "Muse host does not expose rawLog for provider model verification",
+            ));
+        }
         if initialized.muse_home.trim().is_empty() {
             return Err(Error::new(
                 "profile_error",
@@ -498,22 +510,18 @@ impl MusePlugin {
         &mut self,
         session: &mut AgentSession,
         native_session: &NativeSession,
-        resuming: bool,
-        requested_model: Option<&str>,
+        selection: Option<NativeModelSelection>,
     ) -> Result<bool> {
-        let mut setters_ran = false;
-        // An omitted request accepts the retained server-selected model.
-        if let Some(requested) = requested_model
-            && resuming
-            && native_session.model_id.as_deref() != Some(requested)
-        {
+        // Resume's model override resolves a change of model through the
+        // retained provider. When the label already matches, resume leaves
+        // its stored route alone. Repair the contributor route for sessions
+        // created before #949, which can retain the ID with no profile.
+        if let Some(model) = selection {
             let model_command = new_command_id();
             let model_params = NativeSessionSetModelParams {
                 command_id: model_command.clone(),
                 session_id: native_session.session_id.clone(),
-                model: NativeModelSelection {
-                    model_id: requested.to_owned(),
-                },
+                model,
             };
             let model_value = serde_json::to_value(model_params).map_err(|_| {
                 Error::new(
@@ -588,10 +596,10 @@ impl MusePlugin {
                 .await;
                 return Err(self.retain_failed_start(error));
             }
-            setters_ran = true;
+            return Ok(true);
         }
 
-        Ok(setters_ran)
+        Ok(false)
     }
 
     pub(super) async fn align_resume_approval(

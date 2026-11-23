@@ -1045,7 +1045,8 @@ fn project_agents(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
-                json_extract(aw.condition,'$.seconds')
+                json_extract(aw.condition,'$.seconds'),
+                json_extract(a.effective,'$.model_mismatch')
          FROM agents a
          LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
             AND aw.state='waiting' AND EXISTS(
@@ -1091,6 +1092,7 @@ fn project_agents(
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
                 r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(23)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1119,6 +1121,7 @@ fn project_agents(
             wake_created_at,
             wake_kind,
             wake_seconds,
+            model_mismatch,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "created" => eliot_core::AgentState::Created,
@@ -1166,7 +1169,9 @@ fn project_agents(
                     "verb":"resume","target":format!("a{id}"),"expected_generation":generation,"args":{}
                 })))
             };
-            let reason = if unknown_start.is_some() {
+            let reason = if let Some(reason) = model_mismatch.as_deref() {
+                reason
+            } else if unknown_start.is_some() {
                 if state == eliot_core::AgentState::Lost {
                     "lost_agent_resolve_unknown_start_first"
                 } else {
@@ -1200,11 +1205,25 @@ fn project_agents(
                 choice.into_iter().collect(),
             ));
         } else {
+            if let Some(reason) = model_mismatch.as_deref() {
+                let target = format!("a{id}");
+                let inspect = action("inspect", "diagnose", json!({"target":target}));
+                items.push(item(
+                    OwnerInboxKind::Agent,
+                    target,
+                    format!("g{generation}:updated:{since}:event:{event_seq}"),
+                    now,
+                    since,
+                    reason,
+                    None,
+                    vec![inspect],
+                ));
+            }
             let result = liveness::mover(
                 &LivenessObject::Agent {
                     state,
                     since,
-                    owner_item: has_request,
+                    owner_item: has_request || model_mismatch.is_some(),
                     launch_queued: launch_queued
                         || (state == eliot_core::AgentState::Starting && process_running),
                     active_turn: observed_turn && (source_open || process_running),

@@ -565,14 +565,15 @@ no mapping and are rejected. The effective permission mode and effective model c
 from native init facts; init does not establish the served model. See the
 [Antigravity page](../harnesses/antigravity.md).
 
-A Muse profile selects `harness = "muse"` with optional `cmd` and an optional
-exact `model`,
-optional `effort`, optional `approval`, and `permissions` (`workspace-write`, the default,
+A Muse profile selects `harness = "muse"` with optional `cmd`, exact
+`model`, `effort`, `approval`, and `permissions` (`workspace-write`, the default,
 or `danger-full-access`; `read-only` remains unsupported). Sandbox posture is fixed at
 host birth (`--disable-sandbox` for `danger-full-access`); the MSP session wire has no
 sandbox or permissions readback field and is not negotiable per session, so effective
 permissions stay unknown (`null` / unverified) until a real native tool probe confirms
-posture. `collaboration_mode` and `approval_policy`
+posture. An explicit model is selected at host startup so Muse can resolve
+the provider profile, and resume also sends the exact selector to the retained
+session. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
 An OpenCode custom-provider profile points one profile at a local
@@ -1358,7 +1359,8 @@ submit it.
 Codex carries both values as per-turn `turn/start` overrides
 (`TurnStartParams.model`/`effort`); Muse carries effort through per-turn
 `reasoningEffort` and switches the live session model at configure time
-(`session/setModel` with `session/read` proof, between turns only). Muse
+(`session/setModel` with the provider/profile binding and `session/read`
+confirmation of selector admission, between turns only). Muse
 keeps the last configured value for omitted fields, with initial values
 from the native session and frozen profile. The frozen profile supplies
 the native resume effort. Claude commits the accepted selector through

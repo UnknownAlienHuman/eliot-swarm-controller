@@ -74,8 +74,14 @@ A successful catalogue read that omits the model adds
 `catalogue_omits_model: true` to effective start settings or the configure
 outcome. The harness receives the requested model and effort and decides whether
 to accept them. A native refusal carries the harness origin and its error
-message. Effective readback establishes `model_verified`; a request or a
-catalogue row alone cannot verify the serving model.
+message. Each adapter defines the evidence for `model_verified`. For Muse,
+each main turn begins unverified. The owned session's raw provider response
+must name the model on that exact turn before it becomes verified. A
+selection acknowledgement, catalogue row, session label or token-usage
+model cannot supply that evidence. On the first observed mismatch the
+adapter cancels the exact turn, withholds its unverified response and
+retains both IDs for the Owner inbox and diagnosis. The native terminal
+or the ordinary loss recovery still determines whether the turn ended.
 
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below

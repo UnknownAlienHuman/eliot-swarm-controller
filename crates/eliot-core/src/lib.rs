@@ -2348,6 +2348,12 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 return Err(bad_state(event, "turn.started requires an idle Agent"));
             }
             let turn_id = required_text(event, "turn_id")?;
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+                && let Some(Value::Object(effective)) = next.effective.as_mut()
+            {
+                effective.insert("model".to_owned(), Value::Null);
+                effective.insert("model_verified".to_owned(), Value::Bool(false));
+            }
             if let Some(trigger) = optional_native_trigger(event)? {
                 if event.data.get("command_id").is_some() {
                     return Err(Error::new(
@@ -2369,9 +2375,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             // Refresh the admitted native settings when the harness reports
             // what the native turn runs under (Codex reports the model and
             // effort its turn request carried, only under a `configure`
-            // overlay; Muse reports its session-verified model on every
-            // association once verified, plus the carried effort under an
-            // overlay): the
+            // overlay; Muse reports the carried effort under an overlay): the
             // exact-turn association acknowledges native admission of those
             // values, so they read back verified as carried. Absent fields
             // invent nothing and a missing `effective` object is never
@@ -2405,6 +2409,13 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         "turn.model_observed" => {
             require_live_turn(agent, event)?;
             record_serving_model(&mut next, required_text(event, "model")?);
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+                && let Some(reason) = optional_text(event, "model_mismatch")?
+                && let Some(Value::Object(effective)) = next.effective.as_mut()
+            {
+                effective.insert("model_verified".to_owned(), Value::Bool(false));
+                effective.insert("model_mismatch".to_owned(), Value::String(reason));
+            }
         }
         "turn.notice" => {
             require_live_turn(agent, event)?;

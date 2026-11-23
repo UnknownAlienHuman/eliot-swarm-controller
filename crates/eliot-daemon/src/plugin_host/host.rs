@@ -3134,7 +3134,7 @@ fn validate_agent_command_result(value: Value, harness: &str, command: &Command)
             } else {
                 Err(Error::new(
                     "unknown",
-                    "Claude configure reply did not prove acceptance of the requested selector",
+                    "Native configure reply did not prove acceptance of the requested selector",
                 ))
             }
         }
