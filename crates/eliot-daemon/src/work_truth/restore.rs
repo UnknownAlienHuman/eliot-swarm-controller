@@ -409,12 +409,9 @@ fn append_restore_index_info(output: &mut Vec<u8>, file: &RestoredFile, zero: &s
 }
 
 async fn tracked_paths(git: &GitProbe, root: &Path, paths: &[String]) -> Result<HashSet<String>> {
-    let specs: Vec<String> = paths
-        .iter()
-        .map(|path| format!(":(literal){path}"))
-        .collect();
     let mut args = vec!["ls-files", "--stage", "-z", "--"];
-    args.extend(specs.iter().map(String::as_str));
+    // GitProbe already treats these arguments as literal pathnames.
+    args.extend(paths.iter().map(String::as_str));
     let output = git
         .workspace_command(root, &args, Instant::now() + GIT_TIME)
         .await?;
