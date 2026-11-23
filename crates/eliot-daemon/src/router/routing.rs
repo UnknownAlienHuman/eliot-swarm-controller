@@ -87,6 +87,7 @@ struct RoutePreflight {
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
     provider_refusal: Option<Error>,
+    profile_command_refusal: Option<Error>,
     quota_policies: HashMap<String, QuotaPolicy>,
     discovery_deadline: Option<std::time::Instant>,
 }
@@ -453,7 +454,9 @@ impl Router {
             serde_json::to_string(&decision)
                 .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
         );
-        let mut error = wait.unwrap_or(routing_error);
+        let mut error = wait
+            .or(preflight.profile_command_refusal)
+            .unwrap_or(routing_error);
         error.routing = Some(Box::new(decision));
         Err(error)
     }
@@ -558,10 +561,14 @@ impl Router {
                 return Ok(Err(preflight.record(error, harness, account)));
             }
         }
-        if configured_pin
+        if command_bound
+            && configured_pin
             && let Some(cmd) = crate::adhoc::explicit_profile_command(&snapshot, &harness)
             && !crate::adhoc::profile_command_exists(cmd)
         {
+            preflight.profile_command_refusal.get_or_insert_with(|| {
+                crate::adhoc::missing_profile_command_refusal(name, &harness, cmd, None)
+            });
             return Ok(Err(RouteSkipReason::MissingProfileCommand));
         }
         let deadline = preflight
@@ -583,13 +590,11 @@ impl Router {
                         error.failure_where.as_deref(),
                         error.origin,
                     );
-                    return Ok(Err(
-                        if refusal == Some(eliot_core::AdmissionRefusal::ProfileCommand) {
-                            RouteSkipReason::MissingProfileCommand
-                        } else {
-                            RouteSkipReason::NotInstalled
-                        },
-                    ));
+                    if refusal == Some(eliot_core::AdmissionRefusal::ProfileCommand) {
+                        preflight.profile_command_refusal.get_or_insert(error);
+                        return Ok(Err(RouteSkipReason::MissingProfileCommand));
+                    }
+                    return Ok(Err(RouteSkipReason::NotInstalled));
                 }
             }
         }
