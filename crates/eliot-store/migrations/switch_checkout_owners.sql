@@ -1,4 +1,4 @@
--- Canonical checkout owner and in-flight switch fence.
+-- Durable canonical checkout owner and in-flight switch fence.
 CREATE TABLE switch_checkout_owners (
     checkout_key TEXT PRIMARY KEY NOT NULL,
     checkout_root TEXT NOT NULL,

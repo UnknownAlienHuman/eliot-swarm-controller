@@ -1191,10 +1191,14 @@ impl Store {
         target_checkout_root: &str,
         target_checkout_key: &str,
         live_checkout_snapshot: &[(String, i64, String, String)],
+        source_checkout_clean: Option<bool>,
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
+        let generated_target = preparation
+            .as_ref()
+            .is_some_and(|input| input.generated.is_some());
         let result = (|| {
             let tx = self
                 .connection
@@ -1214,6 +1218,7 @@ impl Store {
                     "switch launch binding or phase differs",
                 ));
             }
+            let mut retained_args = parent.args.clone();
             let RetainedSwitch {
                 request: source,
                 source_stop_command,
@@ -1267,20 +1272,6 @@ impl Store {
                 )
             })?;
             require_switch_source_exit(&tx, id, source_stop, &source)?;
-            require_live_checkout_snapshot(
-                &tx,
-                live_checkout_snapshot,
-                target_checkout_key,
-                &agent.id,
-            )?;
-            claim_source_checkout(
-                &tx,
-                target_checkout_key,
-                target_checkout_root,
-                &agent,
-                id,
-                now,
-            )?;
             if continuation.is_some() || requested_by.is_some() {
                 require_handoff_bounds(
                     &tx,
@@ -1430,14 +1421,6 @@ impl Store {
                     "reserved launch id occupied by another command",
                 ));
             }
-            let mut retained_args = parent.args.clone();
-            retained_args[TARGET_CHECKOUT_ROOT] = json!(target_checkout_root);
-            retained_args[TARGET_CHECKOUT_KEY] = json!(target_checkout_key);
-            tx.execute(
-                "UPDATE commands SET args=?1 WHERE id=?2",
-                params![encode_json(&retained_args)?, id],
-            )
-            .map_err(sql_error)?;
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
             let admission = admission::submit_tx(
                 &tx,
@@ -1449,6 +1432,52 @@ impl Store {
                 self.hierarchy_limits,
                 self.capacity_policy.as_deref(),
             )?;
+            let target_num =
+                parse_agent_id(admission.command.target.as_deref().ok_or_else(|| {
+                    Error::new("source_integrity", "switch launch Agent is missing")
+                })?)?;
+            let target_agent = load_agent_by_num(&tx, target_num)?
+                .ok_or_else(|| Error::new("source_integrity", "switch launch Agent is missing"))?;
+            let (actual_checkout_root, actual_checkout_key) = if generated_target {
+                let root = target_agent.workspace.clone().ok_or_else(|| {
+                    Error::new("source_integrity", "generated switch checkout is missing")
+                })?;
+                let key = core::workspace_path_key(&root);
+                (root, key)
+            } else {
+                (
+                    target_checkout_root.to_owned(),
+                    target_checkout_key.to_owned(),
+                )
+            };
+            let same_checkout = source_checkout_key == actual_checkout_key.as_str();
+            if !same_checkout && source_checkout_clean != Some(true) {
+                return Err(Error::new(
+                    "dirty",
+                    "switch to a different checkout requires a fully verified clean source worktree",
+                ));
+            }
+            require_live_checkout_snapshot(
+                &tx,
+                live_checkout_snapshot,
+                &actual_checkout_key,
+                &agent.id,
+            )?;
+            claim_source_checkout(
+                &tx,
+                &actual_checkout_key,
+                &actual_checkout_root,
+                &agent,
+                id,
+                now,
+            )?;
+            retained_args[TARGET_CHECKOUT_ROOT] = json!(actual_checkout_root);
+            retained_args[TARGET_CHECKOUT_KEY] = json!(actual_checkout_key);
+            tx.execute(
+                "UPDATE commands SET args=?1 WHERE id=?2",
+                params![encode_json(&retained_args)?, id],
+            )
+            .map_err(sql_error)?;
             tx.execute(
                 "UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=0 WHERE id=?2",
                 params![id, plan.launch_command],

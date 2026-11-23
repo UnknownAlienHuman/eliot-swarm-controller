@@ -1197,11 +1197,13 @@ A held account is never replaced by another account of the same harness.
 
 A source generation has at most one open switch. The Store records the canonical source
 checkout at reservation and rechecks its current owner at reservation and launch
-admission. The actual target checkout is checked again before native launch. The durable
-`agents.workspace` identity and `agent_successors` relation establish checkout ownership;
-event retention does not release it. A same-checkout transfer records the successor even
-when the caller explicitly repeats the workspace path. A second switch from a retired
-owner is refused and names the current Agent to switch instead. From then on the source
+admission. For generated workspaces, launch admission checks the Store-finalized checkout
+path after allocation, before native dispatch. The durable
+`switch_checkout_owners` row stores the canonical checkout key, current Agent and any
+in-flight switch; a successful handoff moves ownership to B in the H2 transaction.
+`agent_successors` retains the same-checkout transfer after event retention. A same-checkout
+transfer records the successor even when the caller explicitly repeats the workspace path.
+A second switch from a retired owner is refused and names the current Agent to switch instead. From then on the source
 refuses `send`, `steer`, `inject` and `resume` with `handed_off`, naming the Agent that
 now holds the worktree, and automatic resume skips it. `stop` still works. The
 transfer closes any lost or failed `owner.inbox` item for the source. A busy source is

@@ -6,10 +6,21 @@ use eliot_core::api::{
 };
 
 async fn canonical_checkout_identity(workspace: &str) -> Result<(String, String)> {
-    let git = crate::workspace_git::WorkspaceGit::new()?;
-    let (root, _, _) = git.discover_repository_identity(workspace).await?;
+    let root = match crate::workspace_git::WorkspaceGit::new() {
+        Ok(git) => match git.discover_repository_identity(workspace).await {
+            Ok((root, _, _)) => root,
+            Err(_) => canonical_directory_or_input(workspace),
+        },
+        Err(_) => canonical_directory_or_input(workspace),
+    };
     let key = eliot_core::workspace_path_key(&root).into_owned();
     Ok((root, key))
+}
+
+fn canonical_directory_or_input(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_owned())
 }
 
 fn log_refusal(policy: &eliot_core::SecretPolicy, id: &str, code: &str, reason: &str) {
@@ -49,16 +60,10 @@ impl Router {
             let store = self.inner.store.lock().await;
             store.switch_live_workspace_inputs()?
         };
-        let git = crate::workspace_git::WorkspaceGit::new()?;
         let mut snapshot = Vec::with_capacity(inputs.len());
         for (agent, generation, workspace) in inputs {
-            let (checkout, _, _) = git.discover_repository_identity(&workspace).await?;
-            snapshot.push((
-                agent,
-                generation,
-                workspace,
-                eliot_core::workspace_path_key(&checkout).into_owned(),
-            ));
+            let (_, key) = canonical_checkout_identity(&workspace).await?;
+            snapshot.push((agent, generation, workspace, key));
         }
         Ok(snapshot)
     }
@@ -272,16 +277,6 @@ impl Router {
             self.signal_launch_arbitration();
             return;
         };
-        if let Err(error) = self.check_command_admission_mode("launch") {
-            let policy = self.secret_policy_snapshot();
-            let mut store = self.inner.store.lock().await;
-            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
-                self.publish_locked(&change.events);
-            }
-            self.signal_progress();
-            self.signal_launch_arbitration();
-            return;
-        }
         self.clone()
             .process_command(source_stop_command, None)
             .await;
@@ -298,6 +293,16 @@ impl Router {
             Err(error) => Some(error),
         };
         if let Some(error) = source_exit_error {
+            let policy = self.secret_policy_snapshot();
+            let mut store = self.inner.store.lock().await;
+            if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
+                self.publish_locked(&change.events);
+            }
+            self.signal_progress();
+            self.signal_launch_arbitration();
+            return;
+        }
+        if let Err(error) = self.check_command_admission_mode("launch") {
             let policy = self.secret_policy_snapshot();
             let mut store = self.inner.store.lock().await;
             if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
@@ -460,31 +465,6 @@ impl Router {
                     true,
                 )
                 .await?;
-            let (target_checkout_root, target_checkout_key) = match prepared.workspace.as_ref() {
-                Some(workspace) => {
-                    let root = workspace.worktree_path.clone();
-                    let key = eliot_core::workspace_path_key(&root).into_owned();
-                    (root, key)
-                }
-                None => {
-                    let workspace = prepared
-                        .request
-                        .args
-                        .get("workspace")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| Error::new("invalid", "switch launch has no checkout"))?;
-                    canonical_checkout_identity(workspace).await?
-                }
-            };
-            let same_checkout = source_checkout_key
-                .as_deref()
-                .is_some_and(|key| key == target_checkout_key);
-            if !same_checkout && source_clean != Some(true) {
-                return Err(Error::new(
-                    "dirty",
-                    "switch to a different checkout requires a fully verified clean source worktree",
-                ));
-            }
             if let Some(authority) = profile_authority
                 && eliot_core::provider_switch_authority(
                     &prepared.request.args["profile_snapshot"],
@@ -513,6 +493,31 @@ impl Router {
                 if let Some(args) = prepared.request.args.as_object_mut() {
                     args.remove("workspace_preparation");
                 }
+            }
+            let (target_checkout_root, target_checkout_key) = match prepared.workspace.as_ref() {
+                Some(workspace) => {
+                    let root = workspace.worktree_path.clone();
+                    let key = eliot_core::workspace_path_key(&root).into_owned();
+                    (root, key)
+                }
+                None => {
+                    let workspace = prepared
+                        .request
+                        .args
+                        .get("workspace")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| Error::new("invalid", "switch launch has no checkout"))?;
+                    canonical_checkout_identity(workspace).await?
+                }
+            };
+            let same_checkout = source_checkout_key
+                .as_deref()
+                .is_some_and(|key| key == target_checkout_key);
+            if !same_checkout && source_clean != Some(true) {
+                return Err(Error::new(
+                    "dirty",
+                    "switch to a different checkout requires a fully verified clean source worktree",
+                ));
             }
             // The replacement retains the source's authorization namespace for handoff.
             prepared.request.args["project"] = json!(scope);
@@ -611,6 +616,7 @@ impl Router {
                 &target_checkout_root,
                 &target_checkout_key,
                 &live_checkout_snapshot,
+                source_clean,
                 &policy,
                 now_ms(),
             )?;
