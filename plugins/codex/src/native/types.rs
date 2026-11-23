@@ -524,13 +524,16 @@ impl NativeTurnError {
     /// extra details, unrelated statuses and unknown future variants stay inert.
     pub(crate) fn provider_restriction(&self) -> Option<ProviderRestriction> {
         let error_info = self.codex_error_info.as_ref()?;
-        let kind = match error_info {
-            serde_json::Value::String(code) => match code.as_str() {
-                "rateLimitExceeded" => ProviderRestrictionKind::RateLimit,
-                "usageLimitExceeded" => ProviderRestrictionKind::Quota,
-                "unauthorized" => ProviderRestrictionKind::Auth,
-                _ => return None,
-            },
+        let (kind, code, http_status) = match error_info {
+            serde_json::Value::String(code) => {
+                let kind = match code.as_str() {
+                    "rateLimitExceeded" => ProviderRestrictionKind::RateLimit,
+                    "usageLimitExceeded" => ProviderRestrictionKind::Quota,
+                    "unauthorized" => ProviderRestrictionKind::Auth,
+                    _ => return None,
+                };
+                (kind, code.clone(), None)
+            }
             serde_json::Value::Object(variants) if variants.len() == 1 => {
                 let (variant, details) = variants.iter().next()?;
                 if !matches!(
@@ -542,17 +545,21 @@ impl NativeTurnError {
                 ) {
                     return None;
                 }
-                match details.as_object()?.get("httpStatusCode")?.as_u64()? {
-                    403 => ProviderRestrictionKind::Auth,
-                    429 => ProviderRestrictionKind::RateLimit,
+                let http_status = details.as_object()?.get("httpStatusCode")?.as_u64()?;
+                let (kind, http_status) = match http_status {
+                    403 => (ProviderRestrictionKind::Auth, Some(403)),
+                    429 => (ProviderRestrictionKind::RateLimit, Some(429)),
                     _ => return None,
-                }
+                };
+                (kind, variant.clone(), http_status)
             }
             _ => return None,
         };
         Some(ProviderRestriction {
             kind,
             retry_after: None,
+            code: Some(code),
+            http_status,
         })
     }
 

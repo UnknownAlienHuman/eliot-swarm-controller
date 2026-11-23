@@ -428,6 +428,9 @@ async fn initialize_runtime(
             logging::record(&policy, "daemon.store_migrated", &[], None);
         }
     })?;
+    let provider_scopes = crate::config::configured_provider_account_scopes(data_dir.path())
+        .map_err(startup_config_failure)?;
+    store.attribute_legacy_provider_holds(&provider_scopes)?;
     // Startup compaction is opt-in because converting an existing DB needs a
     // full VACUUM and temporary disk space. It shares the same preflight as
     // the offline owner command and runs before workers or IPC bind.

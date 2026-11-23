@@ -309,7 +309,44 @@ impl ProviderRestrictionKind {
 #[serde(deny_unknown_fields)]
 pub struct ProviderRestriction {
     pub kind: ProviderRestrictionKind,
+    /// Vendor-supplied reset time in Unix milliseconds.
     pub retry_after: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+impl ProviderRestriction {
+    pub fn validate(&self) -> Result<()> {
+        if self.retry_after.is_some_and(|at| at < 0)
+            || !valid_refusal_metadata(self.code.as_deref(), self.http_status)
+        {
+            return Err(Error::new("invalid", "invalid provider restriction"));
+        }
+        Ok(())
+    }
+}
+
+fn valid_refusal_metadata(code: Option<&str>, http_status: Option<u16>) -> bool {
+    code.is_none_or(|code| {
+        !code.is_empty()
+            && code.len() <= 128
+            && code
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+    }) && http_status.is_none_or(|status| (100..=599).contains(&status))
+}
+
+/// Origin of the latest refusal recorded for a hold.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderHoldSource {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -336,8 +373,11 @@ impl ProviderHoldState {
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderHold {
+    /// Frozen account-and-harness key or exact-profile key.
     pub scope: String,
     pub kind: ProviderRestrictionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<ProviderHoldSource>,
     pub retry_after: Option<i64>,
     pub probe_command: Option<String>,
     pub state: ProviderHoldState,
@@ -355,15 +395,24 @@ pub struct ProviderHold {
 }
 
 pub const MAX_AUTOMATIC_PROVIDER_PROBES: u32 = 6;
+pub const UNATTRIBUTED_PROVIDER_HOLD_REASON: &str =
+    "legacy account hold has no attributable harness";
+/// Allows weekly quota windows while bounding untrusted vendor deadlines.
+pub const MAX_PROVIDER_RESET_HORIZON_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
 
 impl ProviderHold {
     pub fn validate(&self) -> Result<()> {
-        CapacityScope {
-            scope: self.scope.clone(),
-            max_live: None,
-        }
-        .validate()?;
-        if self.retry_after.is_some_and(|at| at < 0)
+        validate_provider_scope(&self.scope)?;
+        let latest_reset = self
+            .updated_at
+            .saturating_add(MAX_PROVIDER_RESET_HORIZON_MS);
+        if self.source.as_ref().is_some_and(|source| {
+            source.harness.trim().is_empty()
+                || source.harness.chars().any(char::is_control)
+                || !valid_refusal_metadata(source.code.as_deref(), source.http_status)
+        }) || self
+            .retry_after
+            .is_some_and(|at| at < 0 || at > latest_reset)
             || self.next_probe_at.is_some_and(|at| at < 0)
             || self.automatic_probes > MAX_AUTOMATIC_PROVIDER_PROBES
             || self.held_since < 0
@@ -387,36 +436,63 @@ impl ProviderHold {
     }
 }
 
-/// Resolve the hold scope from the Agent's frozen account or profile only.
+pub fn is_unattributed_provider_hold(scope: &str) -> bool {
+    scope
+        .strip_prefix("account:")
+        .is_some_and(|name| !name.contains('.'))
+}
+
+/// Resolve the hold scope from the Agent's frozen account and harness, or profile only.
 /// A shared adopted proxy (`route_binding`/`proxy`) is a capacity scope, never
 /// a provider-hold scope: a per-turn restriction proves only the admitted
 /// account/profile restriction, not that the whole proxy service is held.
 pub fn frozen_provider_scope(agent: &Agent) -> Result<String> {
-    frozen_provider_scope_for(&agent.profile, &agent.profile_snapshot)
+    frozen_provider_scope_for(&agent.profile, &agent.harness, &agent.profile_snapshot)
 }
 
 /// Resolve the same frozen provider scope while projecting a compact Agent
-/// row from the stored profile snapshot.
-pub fn frozen_provider_scope_for(profile: &str, profile_snapshot: &Value) -> Result<String> {
+/// row from the stored profile snapshot. Account scopes include its harness so
+/// identically named accounts in different harnesses remain independent. The
+/// canonical account key is `account:<name>.<harness>`.
+pub fn frozen_provider_scope_for(
+    profile: &str,
+    harness: &str,
+    profile_snapshot: &Value,
+) -> Result<String> {
     let snapshot = profile_snapshot
         .as_object()
         .ok_or_else(invalid_provider_scope)?;
 
     let scope = match snapshot.get("account") {
-        Some(account) => format!(
-            "account:{}",
-            account.as_str().ok_or_else(invalid_provider_scope)?
-        ),
+        Some(account) => {
+            let account = account.as_str().ok_or_else(invalid_provider_scope)?;
+            format!("account:{account}.{harness}")
+        }
         None => format!("profile:{profile}"),
     };
 
+    validate_provider_scope(&scope).map_err(|_| invalid_provider_scope())?;
+    Ok(scope)
+}
+
+pub(crate) fn validate_provider_scope(scope: &str) -> Result<()> {
+    if let Some(account) = scope.strip_prefix("account:")
+        && let Some((name, harness)) = account.split_once('.')
+    {
+        // Profile/account names cannot contain '.', so this delimiter keeps
+        // the harness-qualified key disjoint from legacy `account:<name>` keys.
+        return if valid_name(name) && crate::api::is_supported_harness(harness) {
+            Ok(())
+        } else {
+            Err(invalid_provider_scope())
+        };
+    }
+
     CapacityScope {
-        scope: scope.clone(),
+        scope: scope.to_owned(),
         max_live: None,
     }
     .validate()
-    .map_err(|_| invalid_provider_scope())?;
-    Ok(scope)
 }
 
 fn invalid_provider_scope() -> Error {

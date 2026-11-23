@@ -695,8 +695,7 @@ selector for an unbound turn, and the returned turn facts omit `command_id`.
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its
 encoded JSON to 4 KiB and the remaining event-data budget; omit it if it cannot fit.
 Never invent unavailable text or alter terminal settlement, bindings, status, final
-text or input acknowledgement for diagnostics. Raw vendor detail maps stay private;
-message text never determines error classification.
+text or input acknowledgement for diagnostics. Raw vendor detail maps stay private.
 
 `turn.notice` is a non-progress event in the existing `turn` family. Its Core
 [`NativeNotice`](../../crates/eliot-core/src/api/agent_views.rs) data binds `turn_id`
@@ -715,9 +714,19 @@ Transient notices never carry `provider_restriction`: only the existing exact-bo
 terminal rule below may create or clear a hold.
 
 An optional `turn.completed.data.provider_restriction` is the shared Core
-[`ProviderRestriction` DTO](../../crates/eliot-core/src/routing.rs) and is actionable only for that exact controlled Agent,
-generation, command and turn binding. A separate provider event, generic failure,
-native-error message, or HTTP status alone does not create or clear a hold.
+[`ProviderRestriction` DTO](../../crates/eliot-core/src/routing.rs) and is actionable
+only for that exact controlled Agent, generation, turn and any bound SEND. For each
+harness (#941), the adapter translates a confirmed vendor refusal using the native
+terminal response and any native observations bound to that same turn. It supplies
+the restriction kind and, when available, a bounded vendor code token, HTTP status
+and vendor reset as absolute Unix milliseconds.
+Muse uses its typed `turn/completed.error.quota` when available. When the typed
+quota detail or reset is unavailable, it decodes the exact vendor format from
+`turn/completed.error.message`. An adapter may also use a documented native
+provider signal such as
+[Antigravity's ACP quota warning](../harnesses/antigravity.md#facts-and-recovery).
+Free-text terminal reasons, model output, transient notices, and standalone provider events
+cannot create a hold. The Store applies the shared [hold policy](monitoring.md#provider-holds).
 
 `failed` means a known unsuccessful completed operation, which may have partial side
 effects; it does not mean rollback. `rejected` proves no native I/O. Missing authoritative

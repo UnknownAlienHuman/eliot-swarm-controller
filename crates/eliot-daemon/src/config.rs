@@ -1954,6 +1954,32 @@ pub(crate) fn load_routing_config(data_root: &Path) -> core::Result<RoutingConfi
         .unwrap_or_default())
 }
 
+pub(crate) fn configured_provider_account_scopes(
+    data_root: &Path,
+) -> core::Result<BTreeMap<String, String>> {
+    let Some((config, _)) = read_config(data_root)? else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(config
+        .profiles
+        .iter()
+        .filter_map(|(name, entry)| {
+            let entry = entry.get_ref();
+            let account = entry.account.as_ref()?;
+            if !config.accounts.contains_key(account) {
+                return None;
+            }
+            let scope = core::frozen_provider_scope_for(
+                name,
+                &entry.harness,
+                &serde_json::json!({"account": account}),
+            )
+            .ok()?;
+            Some((name.clone(), scope))
+        })
+        .collect())
+}
+
 pub(crate) fn missing_profile_commands(data_root: &Path) -> Vec<(String, String, String)> {
     let Ok(Some(source)) = read_config_source(data_root) else {
         return Vec::new();

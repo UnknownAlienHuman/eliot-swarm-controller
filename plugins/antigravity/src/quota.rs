@@ -26,6 +26,8 @@ pub(crate) fn turn_restriction(text: &str, observed_at: i64) -> Option<ProviderR
     Some(ProviderRestriction {
         kind: ProviderRestrictionKind::Quota,
         retry_after,
+        code: None,
+        http_status: None,
     })
 }
 

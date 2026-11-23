@@ -573,7 +573,9 @@ fn project_holds(
             }
         };
         let reset_at = next_probe.or(retry);
-        let needs_owner = unknown
+        let unattributed = eliot_core::is_unattributed_provider_hold(&scope);
+        let needs_owner = unattributed
+            || unknown
             || (state == eliot_core::ProviderHoldState::Held
                 && (reset_at.is_none()
                     || attempts >= i64::from(eliot_core::MAX_AUTOMATIC_PROVIDER_PROBES)));
@@ -603,7 +605,9 @@ fn project_holds(
             } else {
                 vec![action("inspect", "provider.holds", json!({}))]
             };
-            let reason = if unknown {
+            let reason = if unattributed {
+                "legacy_account_hold_needs_owner_clear_harness_unattributed"
+            } else if unknown {
                 "provider_probe_outcome_unknown"
             } else if retry.is_none() && next_probe.is_none() {
                 "provider_hold_needs_owner_release"

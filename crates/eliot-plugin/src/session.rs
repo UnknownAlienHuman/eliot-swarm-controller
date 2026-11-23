@@ -1094,6 +1094,9 @@ pub fn attach_provider_restriction(
     restriction: ProviderRestriction,
     policy: &SecretPolicy,
 ) -> bool {
+    if restriction.validate().is_err() {
+        return false;
+    }
     let Ok(value) = serde_json::to_value(restriction) else {
         return false;
     };

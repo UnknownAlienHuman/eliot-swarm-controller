@@ -17,13 +17,14 @@ type RawHold = (
     i64,
     u32,
     bool,
+    Option<String>,
 );
 
 pub(super) fn get(connection: &Connection, scope: &str) -> Result<Option<ProviderHold>> {
     let raw = connection
         .query_row(
             "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
-                    held_since, automatic_probes, probe_outcome_unknown
+                    held_since, automatic_probes, probe_outcome_unknown, source
              FROM provider_holds WHERE scope = ?1",
             [scope],
             raw_hold_from_row,
@@ -44,7 +45,8 @@ pub(super) fn get_many(
     let mut statement = connection
         .prepare(
             "SELECT h.scope, h.kind, h.retry_after, h.next_probe_at, h.probe_command,
-                    h.state, h.updated_at, h.held_since, h.automatic_probes, h.probe_outcome_unknown
+                    h.state, h.updated_at, h.held_since, h.automatic_probes, h.probe_outcome_unknown,
+                    h.source
              FROM json_each(?1) AS requested
              CROSS JOIN provider_holds AS h
              WHERE h.scope = requested.value",
@@ -77,7 +79,7 @@ pub(super) fn list_page(
     let mut statement = connection
         .prepare(
             "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
-                    held_since, automatic_probes, probe_outcome_unknown
+                    held_since, automatic_probes, probe_outcome_unknown, source
              FROM provider_holds
              WHERE (?1 IS NULL OR scope > ?1)
              ORDER BY scope
@@ -104,9 +106,10 @@ pub(super) fn attention(connection: &Connection, limit: usize) -> Result<Vec<Pro
     let mut statement = connection
         .prepare(
             "SELECT scope, kind, retry_after, next_probe_at, probe_command, state, updated_at,
-                held_since, automatic_probes, probe_outcome_unknown
+                held_since, automatic_probes, probe_outcome_unknown, source
          FROM provider_holds
          WHERE probe_outcome_unknown = 1 OR (automatic_probes >= ?1 AND retry_after IS NULL)
+            OR (scope LIKE 'account:%' AND instr(substr(scope, 9), '.') = 0)
          ORDER BY scope LIMIT ?2",
         )
         .map_err(sql_error)?;
@@ -168,6 +171,7 @@ fn raw_hold_from_row(row: &Row<'_>) -> rusqlite::Result<RawHold> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 
@@ -183,6 +187,7 @@ fn hold_from_raw(raw: RawHold) -> Result<ProviderHold> {
         held_since,
         automatic_probes,
         probe_outcome_unknown,
+        source,
     ) = raw;
     let kind = match kind.as_str() {
         "rate_limit" => ProviderRestrictionKind::RateLimit,
@@ -199,6 +204,11 @@ fn hold_from_raw(raw: RawHold) -> Result<ProviderHold> {
     let hold = ProviderHold {
         scope,
         kind,
+        source: source
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| Error::new("internal", "invalid stored provider hold source"))?,
         retry_after,
         next_probe_at,
         probe_command,

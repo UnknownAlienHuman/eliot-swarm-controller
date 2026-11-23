@@ -12,11 +12,14 @@
 //! message readback. Its latest complete per-call context count is also
 //! committed as the generation's latest `session.usage` fact.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use eliot_core::{
-    ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestrictionKind, Result, SecretPolicy,
-    SessionUsage, TurnUsage,
+    ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestriction, ProviderRestrictionKind,
+    Result, SecretPolicy, SessionUsage, TurnUsage,
     api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
     limits::{MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
 };
@@ -2748,6 +2751,7 @@ impl EventProcessor {
                 &input,
                 &terminal,
                 &envelope.event_type,
+                envelope.created,
                 (status, outcome),
                 readback.as_ref(),
             )
@@ -2783,6 +2787,7 @@ impl EventProcessor {
         input: &TurnInput,
         terminal: &ExecutionEventData,
         event_type: &str,
+        terminal_event_created_ms: Option<i64>,
         (status, outcome): (&str, &str),
         readback: Option<&TerminalReadback>,
     ) -> Result<()> {
@@ -2809,8 +2814,15 @@ impl EventProcessor {
             // obtained from readback; terminal_turn_data bounds final_text.
             let _message_commit = self.stream_source().commit_message(native_id, data).await?;
         }
-        let mut data =
-            terminal_turn_data(command_id, turn_id, status, terminal, readback, &secrets);
+        let mut data = terminal_turn_data(
+            command_id,
+            turn_id,
+            status,
+            terminal,
+            readback,
+            terminal_event_created_ms,
+            &secrets,
+        );
         if let Some(model) = self.active_model.take() {
             data["effective_model"] =
                 json!(secrets.redact_text(&format!("{}/{}", model.provider_id, model.id)));
@@ -3647,6 +3659,7 @@ fn terminal_turn_data(
     status: &str,
     terminal: &ExecutionEventData,
     readback: Option<&TerminalReadback>,
+    terminal_event_created_ms: Option<i64>,
     secrets: &SecretPolicy,
 ) -> Value {
     let mut data = json!({
@@ -3670,12 +3683,21 @@ fn terminal_turn_data(
         let origin = native_error
             .map(|error| error.failure_origin())
             .unwrap_or(eliot_core::FailureOrigin::Unknown);
+        if let Some(restriction) = native_error
+            .and_then(|error| terminal_provider_restriction(error, terminal_event_created_ms))
+        {
+            eliot_plugin::session::attach_provider_restriction(&mut data, restriction, secrets);
+        }
         eliot_plugin::session::attach_failure_origin(
             &mut data,
             "opencode",
             origin,
-            if origin == eliot_core::FailureOrigin::Provider {
+            if origin == eliot_core::FailureOrigin::Provider
+                && native_error.is_some_and(|error| error.status.is_some())
+            {
                 "Session.StructuredError provider type with upstream HTTP error status"
+            } else if origin == eliot_core::FailureOrigin::Provider {
+                "Session.StructuredError exact provider error type"
             } else {
                 "native terminal lacks a structured upstream failure status"
             },
@@ -3686,6 +3708,41 @@ fn terminal_turn_data(
         attach_final_text(&mut data, &secrets.redact_text(text));
     }
     data
+}
+
+fn terminal_provider_restriction(
+    error: &crate::native::types::StructuredError,
+    terminal_event_created_ms: Option<i64>,
+) -> Option<ProviderRestriction> {
+    let kind = match error.error_type.as_str() {
+        "provider.rate-limit" => ProviderRestrictionKind::RateLimit,
+        "provider.quota"
+        | "provider.free-limit"
+        | "provider.chatgpt-limit"
+        | "provider.go-limit"
+        | "provider.budget-limit"
+        | "provider.model-budget-limit" => ProviderRestrictionKind::Quota,
+        _ => return None,
+    };
+    let retry_after = error.retry_after_ms.and_then(|delay_ms| {
+        let reset_base_ms = terminal_event_created_ms
+            .filter(|created_ms| *created_ms >= 0)
+            .or_else(current_unix_time_ms)?;
+        Some(reset_base_ms.saturating_add(delay_ms))
+    });
+    Some(ProviderRestriction {
+        kind,
+        retry_after,
+        code: Some(error.error_type.clone()),
+        http_status: error.status,
+    })
+}
+
+fn current_unix_time_ms() -> Option<i64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
 }
 
 /// Terminal readback: page the newest-first message list (bounded) and
