@@ -294,6 +294,12 @@ struct CompactWatch {
     terminal: oneshot::Sender<(String, bool)>,
 }
 
+struct CompactionStart {
+    seq: u64,
+    reason: &'static str,
+    activity: Option<eliot_core::CompactionActivity>,
+}
+
 /// Verdict for one steered input watched against its exact turn.
 /// Delivered-while-active proves native joined the input to that turn;
 /// anything else leaves consumption unproven.
@@ -361,6 +367,7 @@ struct EventProcessor {
     gap_reported: bool,
     pending: Option<PendingInbox>,
     compaction: Option<CompactWatch>,
+    compaction_start: Option<CompactionStart>,
     last_compaction_terminal: Option<String>,
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
@@ -709,6 +716,7 @@ impl EventProcessor {
             gap_reported: false,
             pending: None,
             compaction: None,
+            compaction_start: None,
             last_compaction_terminal: None,
             active_model: None,
             tool_parts: HashMap::new(),
@@ -1797,6 +1805,20 @@ impl EventProcessor {
             }
         }
 
+        match envelope.event_type.as_str() {
+            "session.compaction.started" => {
+                self.compaction_start = envelope.durable.as_ref().map(|durable| CompactionStart {
+                    seq: durable.seq,
+                    reason,
+                    activity: self.compaction_activity(),
+                });
+            }
+            "session.compaction.ended" | "session.compaction.failed" => {
+                self.compaction_start = None;
+            }
+            _ => {}
+        }
+
         if envelope.event_type == "session.compaction.ended" {
             let native_id = event_id(
                 &session_id,
@@ -1816,6 +1838,20 @@ impl EventProcessor {
                 .await?;
         }
         Ok(())
+    }
+
+    fn compaction_activity(&self) -> Option<eliot_core::CompactionActivity> {
+        if let Some(turn_id) = &self.status.active_turn_id {
+            return Some(eliot_core::CompactionActivity::Turn {
+                turn_id: turn_id.clone(),
+            });
+        }
+        let watch = self.compaction.as_ref()?;
+        (self.stashed_started.is_some() && watch.input.is_some()).then(|| {
+            eliot_core::CompactionActivity::Command {
+                command_id: watch.command_id.clone(),
+            }
+        })
     }
 
     async fn observe_retry_scheduled(&mut self, envelope: &SseEnvelope) -> Result<()> {
@@ -1909,25 +1945,26 @@ impl EventProcessor {
                 if matches!(
                     kind,
                     "session.compaction.ended" | "session.compaction.failed"
-                ) && envelope.data["reason"] == "manual"
-                    && envelope.data["sessionID"].as_str() == Some(session_id.as_str())
-                    && self.status.active_turn_id.is_none()
-                    && self.stashed_started.is_some()
-                    && let Some(watch) = self
-                        .compaction
-                        .as_ref()
-                        .filter(|watch| watch.input.is_some())
+                ) && envelope.data["sessionID"].as_str() == Some(session_id.as_str())
                 {
-                    let command = watch.command_id.clone();
+                    let activity = self.compaction_activity();
+                    let start_seq = self
+                        .compaction_start
+                        .as_ref()
+                        .filter(|start| {
+                            envelope.data["reason"].as_str() == Some(start.reason)
+                                && start.activity == activity
+                        })
+                        .map(|start| start.seq);
+                    let boundary = eliot_core::CompactionGapBoundary {
+                        native_ref: session_id,
+                        start_seq,
+                        activity,
+                        usage: compaction_usage_echo(&envelope.data),
+                    };
                     if self
                         .stream_source()
-                        .record_compaction_gap(
-                            &reason,
-                            expected,
-                            durable.seq,
-                            &command,
-                            &session_id,
-                        )
+                        .record_compaction_gap(&reason, expected, durable.seq, boundary)
                         .await?
                     {
                         self.expected_seq = Some(durable.seq.saturating_add(1));
@@ -3318,6 +3355,18 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
+}
+
+fn compaction_usage_echo(data: &Value) -> Option<eliot_core::CompactionUsageEcho> {
+    let tokens = &data["tokens"];
+    Some(eliot_core::CompactionUsageEcho {
+        cost: data["cost"].as_f64()?,
+        input_tokens: tokens["input"].as_f64()?,
+        output_tokens: tokens["output"].as_f64()?,
+        reasoning_tokens: tokens["reasoning"].as_f64()?,
+        cache_read_tokens: tokens["cache"]["read"].as_f64()?,
+        cache_write_tokens: tokens["cache"]["write"].as_f64()?,
+    })
 }
 
 fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {

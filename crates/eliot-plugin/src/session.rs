@@ -1319,13 +1319,8 @@ impl StreamSource<'_> {
         reason: &str,
         expected: u64,
         observed: u64,
-        command_id: &str,
-        native_ref: &str,
+        boundary: eliot_core::CompactionGapBoundary,
     ) -> Result<bool> {
-        let boundary = eliot_core::CompactionGapBoundary {
-            command_id: command_id.to_owned(),
-            native_ref: native_ref.to_owned(),
-        };
         self.record_gap_inner_until(
             reason,
             self.families,

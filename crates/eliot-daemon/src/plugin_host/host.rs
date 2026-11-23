@@ -2558,26 +2558,51 @@ fn allow_compaction_gap(
         .to
         .as_deref()
         .and_then(|value| value.parse::<u64>().ok());
-    if gap.source != "stream" || to.is_none() || from.and_then(|seq| seq.checked_add(1)) != to {
+    if gap.source != "stream"
+        || to.is_none()
+        || from.and_then(|seq| seq.checked_add(1)) != to
+        || !boundary
+            .start_seq
+            .zip(from)
+            .is_some_and(|(start, missing)| start < missing)
+        || !boundary.usage.as_ref().is_some_and(|usage| {
+            [
+                usage.cost,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+        })
+    {
         return Ok(false);
     }
-    if !store.get_agent(&gap.agent_id)?.is_some_and(|agent| {
+    let Some(agent) = store.get_agent(&gap.agent_id)?.filter(|agent| {
         agent.harness == "opencode"
             && agent.generation == gap.generation
             && agent.native_ref.as_deref() == Some(boundary.native_ref.as_str())
-            && agent.state == eliot_core::AgentState::Idle
-            && agent.active_turn.is_none()
-    }) {
+    }) else {
         return Ok(false);
+    };
+    match &boundary.activity {
+        Some(eliot_core::CompactionActivity::Turn { turn_id }) => {
+            Ok(agent.active_turn.as_deref() == Some(turn_id.as_str()))
+        }
+        Some(eliot_core::CompactionActivity::Command { command_id })
+            if agent.state == eliot_core::AgentState::Idle && agent.active_turn.is_none() =>
+        {
+            Ok(store.get_command(command_id)?.is_some_and(|command| {
+                command.verb == "compact"
+                    && command.target.as_deref() == Some(gap.agent_id.as_str())
+                    && command.generation == Some(gap.generation)
+                    && command.state == eliot_core::CommandState::Dispatched
+            }))
+        }
+        _ => Ok(false),
     }
-    Ok(store
-        .get_command(&boundary.command_id)?
-        .is_some_and(|command| {
-            command.verb == "compact"
-                && command.target.as_deref() == Some(gap.agent_id.as_str())
-                && command.generation == Some(gap.generation)
-                && command.state == eliot_core::CommandState::Dispatched
-        }))
 }
 
 fn redact_source_gap(gap: &mut SourceGap, credentials: &[String]) -> Result<()> {

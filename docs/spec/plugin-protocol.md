@@ -612,10 +612,12 @@ OpenCode uses the durable `session.compaction.ended` fact for the exact native
 session. The adapter includes `turn_id` when a Swarm turn is active. An idle
 compaction leaves the task card for the next input through the shared note path.
 The OpenCode public feed can omit durable records. The adapter reports a forward
-sequence gap with its native bounds. After recording the gap, the daemon can
-authorize continuation across a single missing cursor at the terminal of an exact
-dispatched manual compaction on the same idle session. The gap still marks the
-affected source history incomplete. An unresolved gap elsewhere fences the stream.
+sequence gap with its native bounds. Before authorizing continuation, the daemon
+records the gap and checks that one cursor is missing after a matching native
+compaction start. The terminal must echo the provider's usage figures and bind
+to the current turn or an exact dispatched idle compaction command. This applies
+to both automatic and manual compaction. The source history stays incomplete
+at the recorded gap. Other unverified gaps fence the stream.
 Antigravity reports completed system checkpoints from the exact owned native
 conversation transcript. The isolated root supplies the path for private
 profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
