@@ -537,7 +537,7 @@ impl Router {
                 }
             }
         }
-        if let Some(parent) = parent {
+        if parent.is_some() {
             let mut candidate = request.clone();
             candidate.args["profile"] = Value::String(name.to_owned());
             install_frozen_profile(&mut candidate, &harness, snapshot.clone(), true)?;

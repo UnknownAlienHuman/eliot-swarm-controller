@@ -524,10 +524,6 @@ pub fn field_error(message: &str) -> Option<(String, String, String)> {
         (_, "native_subagents deny has no mapping on this harness") => {
             "This app cannot turn its own subagents off.".to_owned()
         }
-        ("cmd", "required explicit cmd is missing") => {
-            "Swarm does not know where this app is installed: add its path as cmd with Edit as TOML."
-                .to_owned()
-        }
         ("child_profiles", reason) if reason.starts_with("unknown child profile ") => format!(
             "There is no preset named {}.",
             reason.trim_start_matches("unknown child profile ")
