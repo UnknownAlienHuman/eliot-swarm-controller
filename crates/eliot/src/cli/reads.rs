@@ -16,8 +16,7 @@ use eliot_core::api::{
     EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessCheckOutcome,
     HarnessDoctorRequest, HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage,
     ObserveHeavyRequest, ObserveHeavyResponse, ProfileCommandIssue, TurnCounterMissing,
-    UsageSummaryRequest,
-    UsageSummaryResponse,
+    UsageSummaryRequest, UsageSummaryResponse,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
 use eliot_core::{AgentState, Error as CoreError};
