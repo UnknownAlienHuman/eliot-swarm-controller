@@ -2783,9 +2783,12 @@ fn plugin_command_args(command: &Command) -> Result<Value> {
             }
         }
         "steer" | "interrupt" => {
-            command.turn_id.as_ref().ok_or_else(|| {
-                Error::new("stale_generation", "turn control has no captured turn id")
-            })?;
+            if !command.is_owner_interrupt() && command.turn_id.is_none() {
+                return Err(Error::new(
+                    "stale_generation",
+                    "turn control has no captured turn id",
+                ));
+            }
         }
         "inject" => {
             args.remove("_trusted_review_labels");
