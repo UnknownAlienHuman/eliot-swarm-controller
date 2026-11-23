@@ -296,6 +296,20 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         "Liveness: {} moving · {} asked · {} parked · {} stuck · {} long",
         liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
     );
+    match response.command_without_dispatcher.as_ref() {
+        Some(status) => {
+            let oldest = status
+                .oldest_id
+                .as_deref()
+                .zip(status.oldest_age_ms)
+                .map(|(id, age_ms)| {
+                    format!("oldest {id} ({})", super::reads::age_cell(Some(age_ms)))
+                })
+                .unwrap_or_else(|| "oldest none".to_owned());
+            println!("Commands without dispatcher: {} · {oldest}", status.count);
+        }
+        None => println!("Commands without dispatcher: unavailable"),
+    }
     if response.blockers.is_empty() {
         println!("Blocking work: none");
     } else {

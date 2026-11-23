@@ -277,10 +277,19 @@ fn project_unknown_commands(
                 COALESCE((SELECT MAX(e.seq) FROM events e
                   WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0),
-                json_extract(c.outcome,'$.stage'),c.args,
+                json_extract(c.outcome,'$.stage'),
+                EXISTS(SELECT 1 FROM workspaces w JOIN agents a ON a.id=w.agent
+                  WHERE w.agent=c.target AND w.start_command_id=c.id AND w.phase='creating'
+                    AND c.verb='launch' AND a.state='created' AND a.generation=0
+                    AND c.generation=a.generation AND w.target_generation=a.generation+1
+                    AND json_type(w.outcome,'$.native_git_write_dispatched')='false'
+                    AND COALESCE(json_type(w.outcome,'$.cancel_requested'),'false')='false'),
                 (EXISTS(SELECT 1 FROM processes p WHERE p.owner='agent:a'||c.target||'#'||c.generation AND p.state IN ('running','unknown'))),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=c.target AND s.generation=c.generation
-                  AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open')
+                  AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state='open'),
+                EXISTS(SELECT 1 FROM commands parent
+                  WHERE parent.id=c.parent_command AND c.link_kind='handoff'
+                    AND parent.method='swarm.handoff')
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')", "c.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -296,9 +305,10 @@ fn project_unknown_commands(
                 r.get::<_, i64>(8)?,
                 r.get::<_, i64>(9)?,
                 r.get::<_, Option<String>>(10)?,
-                r.get::<_, String>(11)?,
+                r.get::<_, bool>(11)?,
                 r.get::<_, bool>(12)?,
                 r.get::<_, bool>(13)?,
+                r.get::<_, bool>(14)?,
             ))
         })
         .map_err(sql_error)?;
@@ -315,9 +325,10 @@ fn project_unknown_commands(
             since,
             seq,
             stage,
-            _raw_args,
+            unstarted_workspace,
             process_active,
             source_open,
+            owner_handoff_send,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -343,6 +354,29 @@ fn project_unknown_commands(
         if !unknown {
             if let Mover::Stuck { reason } = result {
                 let inspect = action("inspect", "command.get", json!({"id":id}));
+                let recommended = match (reason, unstarted_workspace, target) {
+                    ("command_without_dispatcher", true, Some(agent)) => Some(action(
+                        "stop",
+                        "command.submit",
+                        json!({"verb":"stop", "target":format!("a{agent}"),
+                               "expected_generation":generation, "args":{"force":false}}),
+                    )),
+                    _ => None,
+                };
+                let mut choices = recommended
+                    .iter()
+                    .cloned()
+                    .chain([inspect])
+                    .collect::<Vec<_>>();
+                if owner_handoff_send
+                    && verb == "send"
+                    && matches!(
+                        state,
+                        eliot_core::CommandState::Accepted | eliot_core::CommandState::Queued
+                    )
+                {
+                    choices.push(action("cancel", "command.cancel", json!({"command_id":id})));
+                }
                 items.push(item(
                     OwnerInboxKind::Stuck,
                     format!("command:{id}"),
@@ -350,8 +384,8 @@ fn project_unknown_commands(
                     now,
                     since,
                     reason,
-                    None,
-                    vec![inspect],
+                    recommended,
+                    choices,
                 ));
             }
             continue;

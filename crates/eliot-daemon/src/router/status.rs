@@ -36,7 +36,7 @@ impl Router {
     }
 
     pub(super) async fn status(&self) -> Result<Value> {
-        let (inbox, liveness) = self.read_owner_projection().await?;
+        let (inbox, liveness, command_without_dispatcher) = self.read_owner_projection().await?;
         let mut owner_inbox = OwnerInboxKind::ALL
             .into_iter()
             .map(|kind| (kind, 0))
@@ -104,6 +104,7 @@ impl Router {
         serde_json::to_value(DaemonStatusResponse {
             owner_inbox,
             liveness,
+            command_without_dispatcher: Some(command_without_dispatcher),
             build_identity: Some(crate::build_identity::current().clone()),
             provider_probe_attention,
             state: if mode == "open" { "running" } else { mode }.to_owned(),

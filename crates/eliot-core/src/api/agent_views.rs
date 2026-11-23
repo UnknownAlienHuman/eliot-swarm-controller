@@ -2181,6 +2181,33 @@ pub struct AutomaticCleanupSweep {
     pub error_code: Option<String>,
 }
 
+/// Confirmed commands classified by current Store facts as lacking a
+/// dispatcher. The count shares the `daemon.status` liveness confirmation
+/// gate; the oldest age is measured from the same projection timestamp.
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandWithoutDispatcherStatus {
+    pub count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_ms: Option<i64>,
+}
+
+impl CommandWithoutDispatcherStatus {
+    pub fn validate(&self) -> Result<()> {
+        let oldest_valid = match (&self.oldest_id, self.oldest_age_ms) {
+            (None, None) => self.count == 0,
+            (Some(id), Some(age_ms)) => self.count > 0 && text(id).is_ok() && age_ms >= 0,
+            _ => false,
+        };
+        if !oldest_valid {
+            return Err(invalid_response());
+        }
+        Ok(())
+    }
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonStatusResponse {
@@ -2188,6 +2215,9 @@ pub struct DaemonStatusResponse {
     pub owner_inbox: std::collections::BTreeMap<super::OwnerInboxKind, usize>,
     #[serde(default)]
     pub liveness: super::SwarmLiveness,
+    /// `None` means the daemon predates this status projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_without_dispatcher: Option<CommandWithoutDispatcherStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_identity: Option<DaemonBuildIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

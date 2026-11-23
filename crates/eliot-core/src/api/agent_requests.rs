@@ -881,6 +881,19 @@ impl DaemonStatusRequest {
                 .retention
                 .as_ref()
                 .is_some_and(|retention| retention.validate().is_err())
+            || reply
+                .command_without_dispatcher
+                .as_ref()
+                .is_some_and(|status| {
+                    status.validate().is_err()
+                        || status.count
+                            != reply
+                                .liveness
+                                .reasons
+                                .get("command_without_dispatcher")
+                                .copied()
+                                .unwrap_or_default()
+                })
             || reply.workspace_custody.scope != "current_host"
             || reply
                 .cloud_mcp

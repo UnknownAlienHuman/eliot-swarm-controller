@@ -1777,14 +1777,13 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Whether any message (read or unread) on this thread was mailed to this
-    /// recipient. Reconciling a retained incident resends only missing mail.
-    pub fn attention_thread_mailed_to(&self, thread: &str, recipient: &str) -> Result<bool> {
+    /// Whether Swarm already mailed this retained fact to the recipient.
+    pub fn swarm_mail_thread_exists(&self, thread: &str, recipient: &str) -> Result<bool> {
         let num = parse_agent_id(recipient)?;
         self.connection
             .query_row(
                 "SELECT EXISTS(
-                     SELECT 1 FROM messages WHERE thread = ?1 AND recipient = ?2
+                     SELECT 1 FROM messages WHERE thread = ?1 AND recipient = ?2 AND sender = 'swarm'
                  )",
                 params![thread, num],
                 |row| row.get(0),

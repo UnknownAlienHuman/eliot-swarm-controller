@@ -553,7 +553,13 @@ pub(crate) async fn run_attention(
                     "internal", "owner inbox sweep ended without a sample",
                 )));
                 match result {
-                    Ok(current) => router.publish_liveness(current, &mut previous_stuck),
+                    Ok(current) => {
+                        let confirmed = router.publish_liveness(current, &mut previous_stuck);
+                        let router = router.clone();
+                        tasks.spawn(async move {
+                            router.notify_stuck_command_issuers(&confirmed).await;
+                        });
+                    }
                     Err(error) => {
                         previous_stuck.clear();
                     crate::logging::record(

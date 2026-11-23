@@ -1991,7 +1991,10 @@ fn inline_mail_wake_tx(
         }
 
         let topic = topic.as_deref().unwrap_or("(no topic)");
-        let mail = if sender == SWARM_MAIL_SENDER && digest_id.is_some() {
+        let mail = if sender == SWARM_MAIL_SENDER
+            && (digest_id.is_some()
+                || topic.starts_with(eliot_core::api::LIVENESS_MAIL_THREAD_PREFIX))
+        {
             format!("Mail from swarm (service) | topic {topic:?} | delivery {delivery_id}\n{text}")
         } else if sender == SWARM_MAIL_SENDER || (sender == "owner" && digest_id.is_some()) {
             format!(

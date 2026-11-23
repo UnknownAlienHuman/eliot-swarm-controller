@@ -1178,9 +1178,20 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 | Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
 | Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |
 
-The attention worker samples liveness on startup and every three minutes.
-An unchanged Stuck candidate becomes reportable after two consecutive sweeps
-and produces one `daemon.liveness_stuck` log line for the episode.
+The attention worker samples liveness on startup and every three minutes (#871).
+An unchanged Stuck candidate becomes reportable after two consecutive sweeps.
+Swarm logs `daemon.liveness_stuck` once per episode and exposes the current
+subject in the Owner inbox. Each command has at most one current command item.
+The `swarm status` liveness summary includes the number of confirmed commands
+without a dispatcher and the oldest command's ID and age, including snoozed
+items (#929, #883).
+
+For a command issued by an Agent, Swarm rechecks the stuck reason before
+queuing a `#888` framed Swarm note to that issuer through addressed service
+mail. The note identifies the command and reason and points to command
+inspection and the Owner inbox. A retained delivery suppresses another note
+for that command and reason. Existing mail presentation and wake rules apply.
+
 `daemon.status` and `owner.inbox` project current Store facts on read. Parked is
 separate from Moving and Long: only a current idle or waiting Agent with an
 unexpired `agent_wakes` row bound to its exact generation and turn is Parked.
@@ -1193,9 +1204,16 @@ waiting turn without an active wake keep their existing Moving/Long/Stuck
 classification.
 
 Stuck inbox rows keep `recommended` absent when Store facts do not prove a safe
-correction; available inspection choices remain executable. For a Stuck busy or
-waiting Agent, the Owner-only `stop` recommendation is present only when its
-current generation has no active-turn pointer, pending request, running or
+correction; available inspection choices remain executable. A stuck managed
+launch offers Stop when the exact generation is still Created and its workspace
+is Creating with explicit proof that Git creation has yet to dispatch. Stop
+uses the normal workspace-cancellation path and exact generation fence. The
+same item offers command inspection. A Stuck undispatched `send` from
+`swarm.handoff` offers an explicit `command.cancel` choice. The ordinary
+cancel mutation rechecks its dispatch state and handoff binding.
+
+For a Stuck busy or waiting Agent, the Owner-only `stop` recommendation is
+present only when its current generation has no active-turn pointer, pending request, running or
 unknown turn, or unsettled command, and Store has both an open native source and
 a running owned plugin. The action carries that exact generation, and normal
 command admission rechecks the inbox subject revision before admitting Stop;
@@ -1212,6 +1230,10 @@ action is available. The selected action is bound into the item's revision;
 `owner.decide` reprojects that exact subject and revision before admitting it.
 Snooze hides the current inbox revision until its subject changes. The sweep
 prunes snoozes for subjects that no longer project.
+
+Release qualification must include launching a real Agent in a newly managed
+worktree and observing its first native turn. This checks the repository write
+lane and dispatch path after the release starts (#929).
 
 Shell matching counts one check per matching command segment and at most one wait
 per captured shell-tool start. It uses the executable basename, ignoring case and
