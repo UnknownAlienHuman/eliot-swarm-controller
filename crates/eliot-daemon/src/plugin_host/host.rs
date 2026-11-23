@@ -713,8 +713,9 @@ impl PluginHost {
             .transpose()?;
         let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
+        // A harness self-check Agent runs real tool turns, so unlike a
+        // provider probe it keeps the ordinary MCP identity environment.
         let mcp_environment = if agent.is_automatic_provider_probe()
-            || agent.is_harness_check()
             || HarnessCapabilities::of(&agent.harness).data_root_only_mcp
         {
             Some(data_root_only_mcp_environment(&mcp_environment)?)

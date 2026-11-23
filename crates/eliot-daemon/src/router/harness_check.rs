@@ -517,33 +517,13 @@ impl Router {
         work: &HarnessCheckWork,
         shutdown: &mut watch::Receiver<bool>,
     ) -> CheckResult<()> {
-        // Steer needs a live turn: wait for the scenario turn to start, then
-        // steer it while it runs.
-        if self
-            .wait_for_check_turn_start(
-                &work.agent_id,
-                &work.send_command_id,
-                shutdown,
-                work.deadline,
-            )
-            .await?
-            .is_none()
-        {
-            return Err(CheckEnd::Shutdown);
-        }
-        let agent = self.check_agent(&work.agent_id).await?;
-        let mut generation = agent.generation;
+        // Steer needs a live turn: submit the steer as soon as the scenario
+        // turn starts, while the Agent is still busy or waiting.
         let steer_id = self
-            .submit_check_control(
-                "steer",
-                &work.agent_id,
-                generation,
-                Some(eliot_core::HARNESS_CHECK_STEER_TEXT),
-                shutdown,
-                work.deadline,
-            )
+            .submit_check_steer(work, shutdown)
             .await?
             .ok_or(CheckEnd::Shutdown)?;
+        let mut generation: i64;
         // The scenario turn must succeed and actually use a tool.
         let (_, turn) = self
             .wait_for_check_command(
@@ -719,69 +699,94 @@ impl Router {
         Ok(Some(admission.command.id))
     }
 
-    /// Wait until the scenario SEND binds a live turn, so the steer has a
-    /// turn to take. Returns `None` on shutdown.
-    async fn wait_for_check_turn_start(
+    /// Submit the scenario steer as soon as the SEND binds a live turn.
+    /// Native turn events do not always wake the daemon promptly, so the arm
+    /// polls on a short interval instead of waiting for progress. A `bad_state`
+    /// rejection re-reads the Agent rather than matching message text: a turn
+    /// that ended in the gap reads as terminal SEND and fails the step, while
+    /// a still-live turn retries inside the arm window. Returns `None` on
+    /// shutdown.
+    async fn submit_check_steer(
         &self,
-        agent_id: &str,
-        send_command_id: &str,
+        work: &HarnessCheckWork,
         shutdown: &mut watch::Receiver<bool>,
-        deadline: Instant,
-    ) -> CheckResult<Option<()>> {
+    ) -> CheckResult<Option<String>> {
         let arm_by = Instant::now() + CHECK_STEER_ARM_WAIT;
-        let mut progress = self.inner.progress.subscribe();
         loop {
             if *shutdown.borrow() {
                 return Ok(None);
             }
-            let started = {
-                let store = self.inner.store.lock().await;
-                let agent = store.get_agent(agent_id).map_err(|error| {
-                    CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
-                })?;
-                let send = store.get_command(send_command_id).map_err(|error| {
-                    CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
-                })?;
-                match (agent, send) {
-                    (Some(agent), Some(_)) if agent.active_turn.is_some() => true,
-                    (Some(_), Some(send)) if send.state.is_terminal() => true,
-                    (None, _) | (_, None) => {
-                        return Err(CheckEnd::fail(
-                            "turn_with_tool_call",
-                            "unknown",
-                            "harness check Agent or SEND disappeared",
-                        ));
-                    }
-                    _ => false,
-                }
-            };
-            if started {
-                return Ok(Some(()));
-            }
-            if Instant::now() >= arm_by {
+            if Instant::now() >= arm_by.min(work.deadline) {
                 return Err(CheckEnd::fail(
                     "steer",
                     "harness_vendor",
                     "the harness started no live turn to steer",
                 ));
             }
-            tokio::select! {
-                _ = tokio::time::sleep_until(arm_by.min(deadline)) => {}
-                changed = progress.changed() => {
-                    if changed.is_err() {
-                        return Err(CheckEnd::fail(
+            let live = {
+                let store = self.inner.store.lock().await;
+                let agent = store
+                    .get_agent(&work.agent_id)
+                    .map_err(|error| {
+                        CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
+                    })?
+                    .ok_or_else(|| {
+                        CheckEnd::fail(
                             "turn_with_tool_call",
-                            "unavailable",
-                            "harness check progress closed",
-                        ));
-                    }
+                            "unknown",
+                            "harness check Agent disappeared",
+                        )
+                    })?;
+                let send = store
+                    .get_command(&work.send_command_id)
+                    .map_err(|error| {
+                        CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
+                    })?
+                    .ok_or_else(|| {
+                        CheckEnd::fail(
+                            "turn_with_tool_call",
+                            "unknown",
+                            "harness check SEND disappeared",
+                        )
+                    })?;
+                if agent.active_turn.is_some() {
+                    true
+                } else if send.state.is_terminal() {
+                    return Err(CheckEnd::fail(
+                        "steer",
+                        "harness_vendor",
+                        "the scenario turn ended before the steer was accepted",
+                    ));
+                } else {
+                    false
                 }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(None);
-                    }
+            };
+            if live {
+                match self
+                    .submit_check_control(
+                        "steer",
+                        &work.agent_id,
+                        self.check_agent(&work.agent_id).await?.generation,
+                        Some(eliot_core::HARNESS_CHECK_STEER_TEXT),
+                        shutdown,
+                        work.deadline,
+                    )
+                    .await
+                {
+                    Ok(Some(id)) => return Ok(Some(id)),
+                    // Shutdown, or the turn ended between the sighting and
+                    // admission: re-read on the next pass instead of matching
+                    // message text.
+                    Ok(None) => continue,
+                    Err(CheckEnd::Step { error, .. }) if error.code == "bad_state" => continue,
+                    Err(other) => return Err(other),
                 }
             }
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "This bounded arm poll is owned by the surrounding check run."
+            )]
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 

@@ -351,6 +351,8 @@ impl Store {
             // A quota refusal consumes no run: the checked version stays empty
             // and the claim is released, so the version runs again after the
             // hold ends. Terminal outcomes bind their version and never rerun.
+            // Every record releases the claim: a served claim must never read
+            // as a live run.
             let checked_version = if outcome.outcome == OUTCOME_NOT_CHECKED {
                 String::new()
             } else {
@@ -361,11 +363,9 @@ impl Store {
                     "UPDATE harness_checks SET outcome = ?2, not_checked_reason = ?3,
                          checked_version = ?4, checked_at = ?5, check_profile = ?6,
                          failure_step = ?7, failure_error = ?8,
-                         attempted_version = CASE WHEN ?2 = ?9 THEN NULL ELSE attempted_version END,
-                         attempted_at = CASE WHEN ?2 = ?9 THEN 0 ELSE attempted_at END,
-                         updated_at = ?5
+                         attempted_version = NULL, attempted_at = 0, updated_at = ?5
                      WHERE harness = ?1 AND attempted_version IS NOT NULL
-                       AND attempted_version = ?10",
+                       AND attempted_version = ?9",
                     params![
                         harness,
                         outcome.outcome,
@@ -375,7 +375,6 @@ impl Store {
                         profile,
                         outcome.step,
                         error,
-                        OUTCOME_NOT_CHECKED,
                         version,
                     ],
                 )
