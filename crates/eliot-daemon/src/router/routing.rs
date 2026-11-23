@@ -510,17 +510,17 @@ impl Router {
             }
         };
         let harness = required_text(&snapshot, "harness")?.to_owned();
-        if let Some(parent) = parent {
-            if hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err() {
-                return Ok(Err(RouteSkipReason::Unauthorized));
-            }
+        if let Some(parent) = parent
+            && hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err()
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
         }
         if !inherited_snapshot {
             let configured_cmd = snapshot
                 .get("cmd")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            match crate::adhoc::resolve_profile_command(&name, &harness, configured_cmd.as_deref())
+            match crate::adhoc::resolve_profile_command(name, &harness, configured_cmd.as_deref())
                 .await
             {
                 Ok(candidate) => {
