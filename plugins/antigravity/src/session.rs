@@ -230,6 +230,7 @@ impl Session {
             params.generation,
             plan.policy.clone(),
             String::new(),
+            plan.launch.cwd.to_string_lossy().into_owned(),
         )));
         // Tracked selectors start at the effective start target (frozen
         // profile or inherited overlay); the advertised sets fill in once

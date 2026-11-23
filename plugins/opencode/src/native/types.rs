@@ -670,35 +670,6 @@ pub struct DurableBlock {
     pub version: u64,
 }
 
-/// Durable OpenCode compaction lifecycle data from `session-event.ts`.
-/// `inputID` identifies an explicit `/compact` inbox item when present;
-/// automatic compactions have no input id. `session.compaction.ended` is
-/// the native success signal for either reason.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CompactionEventData {
-    #[serde(rename = "sessionID")]
-    pub session_id: String,
-    pub reason: CompactionReason,
-    #[serde(default, rename = "inputID")]
-    pub input_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompactionReason {
-    Auto,
-    Manual,
-}
-
-impl CompactionReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Manual => "manual",
-        }
-    }
-}
-
 /// `session.inbox.enqueued` / `session.inbox.delivered` data:
 /// `{sessionID, inboxID, item?}`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -369,6 +369,12 @@ fn tool_diff_paths(update: &Value) -> Vec<String> {
         let Some(path) = block.get("path").and_then(Value::as_str) else {
             continue;
         };
+        // AGY's Windows ACP diff location can use the file-URI path spelling.
+        #[cfg(windows)]
+        let path = match path.as_bytes() {
+            [b'/', drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic() => &path[1..],
+            _ => path,
+        };
         if path.trim().is_empty()
             || path.len() > MAX_TOOL_DIFF_PATH_BYTES
             || path.contains('\0')

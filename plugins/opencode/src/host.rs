@@ -2890,7 +2890,7 @@ impl OpenCodePlugin {
             .session_id
             .as_deref()
             .ok_or_else(|| Error::new("native_not_dispatched", "OpenCode session is not bound"))?;
-        let terminal = session.events.begin_compaction().await?;
+        let terminal = session.events.begin_compaction(&params.command_id).await?;
         let deadline = Instant::now() + RPC_TIMEOUT;
         let receipt = match session.http.compact(session_id, deadline).await {
             Ok(receipt) => receipt,

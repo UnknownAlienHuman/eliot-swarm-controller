@@ -215,6 +215,7 @@ enum Control {
         reply: oneshot::Sender<InboxRecord>,
     },
     BeginCompact {
+        command_id: String,
         terminal: oneshot::Sender<(String, bool)>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -287,6 +288,7 @@ struct PendingInbox {
 }
 
 struct CompactWatch {
+    command_id: String,
     input: Option<String>,
     result: Option<bool>,
     terminal: oneshot::Sender<(String, bool)>,
@@ -445,10 +447,17 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
-    pub async fn begin_compaction(&self) -> Result<oneshot::Receiver<(String, bool)>> {
+    pub async fn begin_compaction(
+        &self,
+        command_id: &str,
+    ) -> Result<oneshot::Receiver<(String, bool)>> {
         let (terminal, result) = oneshot::channel();
         self.actor
-            .call(|reply| Control::BeginCompact { terminal, reply })
+            .call(|reply| Control::BeginCompact {
+                command_id: command_id.to_owned(),
+                terminal,
+                reply,
+            })
             .await??;
         Ok(result)
     }
@@ -808,7 +817,11 @@ impl EventProcessor {
                 });
                 true
             }
-            Control::BeginCompact { terminal, reply } => {
+            Control::BeginCompact {
+                command_id,
+                terminal,
+                reply,
+            } => {
                 let result = if self.status.active_turn_id.is_some()
                     || self.pending.is_some()
                     || self.stashed_started.is_some()
@@ -826,6 +839,7 @@ impl EventProcessor {
                 } else {
                     self.status.compaction_in_flight = true;
                     self.compaction = Some(CompactWatch {
+                        command_id,
                         input: None,
                         result: None,
                         terminal,
@@ -1744,14 +1758,6 @@ impl EventProcessor {
             .await?;
             return Ok(());
         }
-        if envelope.durable.is_none() {
-            let reason = if envelope.id.trim().is_empty() {
-                "OpenCode compaction event omitted its durable sequence and native identity"
-            } else {
-                "OpenCode compaction event omitted its durable sequence"
-            };
-            self.record_source_gap_once(reason).await?;
-        }
         if envelope.id.trim().is_empty() {
             self.record_source_gap_once("OpenCode compaction event omitted its native identity")
                 .await?;
@@ -1768,7 +1774,8 @@ impl EventProcessor {
             .filter(|input| !input.trim().is_empty());
 
         if self.stashed_started.is_some()
-            && reason != "auto"
+            && reason == "manual"
+            && envelope.durable.is_some()
             && let Some(watch) = self.compaction.as_mut()
         {
             match envelope.event_type.as_str() {
@@ -1776,7 +1783,8 @@ impl EventProcessor {
                     watch.input = input_id.map(str::to_owned);
                 }
                 "session.compaction.ended"
-                    if watch.input.as_deref().is_some() && watch.input.as_deref() == input_id =>
+                    if watch.input.is_some()
+                        && (input_id.is_none() || watch.input.as_deref() == input_id) =>
                 {
                     watch.result = Some(true);
                 }
@@ -1799,7 +1807,9 @@ impl EventProcessor {
                 "OpenCode",
             )?;
             let mut data = json!({"reason": reason});
-            if let Some(turn_id) = self.status.active_turn_id.as_deref() {
+            if envelope.durable.is_none() {
+                data["durability"] = json!("unknown");
+            } else if let Some(turn_id) = self.status.active_turn_id.as_deref() {
                 data["turn_id"] = json!(turn_id);
             }
             self.commit_event("session.context.compacted", native_id, data)
@@ -1886,31 +1896,57 @@ impl EventProcessor {
                 } else {
                     "unknown"
                 };
-                self.record_source_gap_once(&format!(
+                let reason = format!(
                     "OpenCode event stream skipped durable sequence numbers: expected {expected}, saw {} ({kind})",
                     durable.seq
-                ))
-                .await?;
-                // Repeated cost/tokens on a compaction event do not identify the
-                // missing sequence; this remains an acknowledged source gap.
-                let compaction_event = matches!(
-                    envelope.event_type.as_str(),
-                    "session.compaction.started"
-                        | "session.compaction.ended"
-                        | "session.compaction.failed"
-                ) && envelope.data["sessionID"].as_str()
-                    == Some(session_id.as_str());
-                if compaction_event {
-                    // The gap remains unknown; retain this independently attributable
-                    // lifecycle record and continue from its real durable cursor.
-                    self.expected_seq = Some(durable.seq.saturating_add(1));
-                    Ok(())
-                } else {
-                    Err(Error::new(
+                );
+                if self.gap_reported {
+                    return Err(Error::new(
                         "unknown",
-                        "OpenCode native facts were lost in transport",
-                    ))
+                        "OpenCode native source already has a gap",
+                    ));
                 }
+                if matches!(
+                    kind,
+                    "session.compaction.ended" | "session.compaction.failed"
+                ) && envelope.data["reason"] == "manual"
+                    && envelope.data["sessionID"].as_str() == Some(session_id.as_str())
+                    && self.status.active_turn_id.is_none()
+                    && self.stashed_started.is_some()
+                    && let Some(watch) = self
+                        .compaction
+                        .as_ref()
+                        .filter(|watch| watch.input.is_some())
+                {
+                    let command = watch.command_id.clone();
+                    if self
+                        .stream_source()
+                        .record_compaction_gap(
+                            &reason,
+                            expected,
+                            durable.seq,
+                            &command,
+                            &session_id,
+                        )
+                        .await?
+                    {
+                        self.expected_seq = Some(durable.seq.saturating_add(1));
+                        return Ok(());
+                    }
+                } else {
+                    self.stream_source()
+                        .record_gap_range_until(
+                            &reason,
+                            Some(expected.to_string()),
+                            Some(durable.seq.to_string()),
+                            Instant::now() + REPLY_DEADLINE,
+                        )
+                        .await?;
+                }
+                Err(Error::new(
+                    "unknown",
+                    "OpenCode native facts were lost in transport",
+                ))
             }
         }
     }
