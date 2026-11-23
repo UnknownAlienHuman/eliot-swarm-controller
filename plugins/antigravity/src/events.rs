@@ -284,6 +284,7 @@ pub(crate) struct State {
     stop_barrier_request: Option<String>,
     stop_barrier_guard: Option<FencedGuard>,
     unknown_native_turn: Option<UnknownNativeTurn>,
+    native_terminal_deadline: Option<Instant>,
     session_ready: bool,
     pending_steer: Option<PendingSteer>,
     /// Lifecycle transitions already emitted per tool call, keyed
@@ -403,6 +404,7 @@ impl State {
             stop_barrier_request: None,
             stop_barrier_guard: None,
             unknown_native_turn: None,
+            native_terminal_deadline: None,
             session_ready: false,
             pending_steer: None,
             tool_emitted: HashSet::new(),
@@ -584,6 +586,14 @@ impl State {
     }
 
     pub(crate) async fn settle_unanswered_cancel(&mut self, turn_id: &str) -> Result<()> {
+        self.settle_unconfirmed_native_turn(
+            turn_id,
+            "Antigravity reported no terminal after session/cancel",
+        )
+        .await
+    }
+
+    async fn settle_unconfirmed_native_turn(&mut self, turn_id: &str, detail: &str) -> Result<()> {
         if !self.native_run_is(turn_id) || self.failure.is_some() {
             return Ok(());
         }
@@ -601,23 +611,49 @@ impl State {
             stop.readback = true;
         }
         self.close_pending_requests(Some(turn_id)).await?;
+        self.close_open_tools_at_terminal(false).await?;
         self.commit(
             "turn.unknown",
             turn_id,
             "unknown",
             json!({
                 "turn_id": turn_id,
-                "reason": "Antigravity reported no terminal after session/cancel",
+                "reason": eliot_core::limits::NATIVE_TERMINAL_UNCONFIRMED_REASON,
+                "detail": detail,
             }),
         )
         .await?;
-        self.reject_pending_steer("Antigravity run has no native terminal after its cancel");
-        self.close_open_tools_at_terminal().await?;
+        self.reject_pending_steer("Antigravity native turn has no terminal");
+        self.native_terminal_deadline = None;
         self.unknown_native_turn = Some(UnknownNativeTurn {
             turn_id: turn_id.to_owned(),
             opened_at,
         });
         self.pending = None;
+        Ok(())
+    }
+
+    fn refresh_native_terminal_deadline(&mut self) {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.command.is_none())
+            && self.native_stop.is_none()
+        {
+            self.native_terminal_deadline =
+                Some(Instant::now() + eliot_plugin::session::native_terminal_inactivity());
+        }
+    }
+
+    async fn expire_native_terminal_deadline(&mut self) -> Result<()> {
+        self.native_terminal_deadline = None;
+        if let Some(turn_id) = self.active_turn().map(str::to_owned) {
+            self.settle_unconfirmed_native_turn(
+                &turn_id,
+                "Antigravity did not deliver an ordered terminal before the inactivity deadline",
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -756,6 +792,7 @@ impl State {
             self.pending = None;
             return Err(error);
         }
+        self.refresh_native_terminal_deadline();
         Ok(Some(HookTurnBinding {
             conversation: self.conversation.clone(),
             turn,
@@ -829,6 +866,9 @@ impl State {
             error,
             readback,
         });
+        if !readback {
+            self.native_terminal_deadline = Some(Instant::now() + EVENT_DEADLINE);
+        }
         self.stop_barrier_request = Some(request_id);
         self.stop_barrier_guard = Some(guard);
         client
@@ -854,27 +894,53 @@ impl State {
             .take()
             .ok_or_else(|| Error::new("source_integrity", "Antigravity Stop fact disappeared"))?;
         if stop.readback {
+            if !self.native_unknown_turn_is(&stop.turn_id) {
+                return Err(Error::new(
+                    "stale_turn",
+                    "Antigravity Stop did not match the unsettled native turn",
+                ));
+            }
             self.finish_assistant_text();
             let final_text = if self.text_unavailable.is_none() {
                 self.policy.redact_text(&self.text_accum)
             } else {
                 String::new()
             };
+            let mut data = json!({
+                "turn_id": stop.turn_id,
+                "status": stop.status,
+                "outcome": match stop.status {
+                    "completed" => "success",
+                    "failed" => "failure",
+                    _ => "unknown",
+                },
+                "native_status": stop.native_status,
+            });
+            let missing_text = reply_unavailable(self.text_unavailable, stop.status, &final_text);
+            if let Some(marker) = missing_text {
+                data["final_text_unavailable"] = json!(marker);
+            }
+            if let Some(error) = &stop.error {
+                data["native_error"] = error.clone();
+            }
+            if missing_text.is_none() {
+                attach_final_text(&mut data, &final_text);
+            }
+            self.commit("turn.completed", &stop.turn_id, "completed", data.clone())
+                .await?;
             self.last_turn = Some(TurnFacts {
                 command_id: None,
-                turn_id: stop.turn_id,
+                turn_id: stop.turn_id.clone(),
                 status: stop.status.to_owned(),
                 native_status: stop.native_status,
-                final_text_unavailable: reply_unavailable(
-                    self.text_unavailable,
-                    stop.status,
-                    &final_text,
-                ),
-                final_text,
+                final_text_unavailable: missing_text,
+                final_text: data["final_text"].as_str().unwrap_or_default().to_owned(),
                 native_error: stop.error,
                 terminal: true,
             });
-            return Ok(());
+            self.unknown_native_turn = None;
+            self.record_settlement(stop.turn_id.clone(), false);
+            return self.commit_turn_session_usage(&stop.turn_id).await;
         }
         self.settle_native_stop(stop).await
     }
@@ -926,7 +992,8 @@ impl State {
             terminal: true,
         });
         self.close_pending_requests(Some(&stop.turn_id)).await?;
-        self.close_open_tools_at_terminal().await?;
+        self.close_open_tools_at_terminal(status == "completed")
+            .await?;
         let text = self.policy.redact_text(&self.text_accum);
         let missing_text = self.text_unavailable;
         let outcome = match status {
@@ -994,6 +1061,7 @@ impl State {
         self.record_settlement(stop.turn_id, false);
         self.pending = None;
         self.unknown_native_turn = None;
+        self.native_terminal_deadline = None;
         session_usage
     }
 
@@ -1987,6 +2055,13 @@ impl State {
         if self.load_request_id.is_some() {
             return Ok(());
         }
+        if matches!(
+            &update,
+            AcpUpdate::MessageChunk { .. } | AcpUpdate::ThoughtChunk | AcpUpdate::ToolCall { .. }
+        ) || matches!(&update, AcpUpdate::ToolCallUpdate { tool_call_id, .. } if self.tools.contains_key(tool_call_id))
+        {
+            self.refresh_native_terminal_deadline();
+        }
         let unknown_tool_status = match &update {
             AcpUpdate::ToolCall { status, .. } => Some(status.as_deref().unwrap_or("missing")),
             AcpUpdate::ToolCallUpdate {
@@ -2099,7 +2174,8 @@ impl State {
                             "tool.background_ended",
                             &turn,
                             &item,
-                            json!({"turn_id": turn, "item_id": item}),
+                            json!({"turn_id": turn, "item_id": item,
+                                "native_followup_pending": !self.background_tools.is_empty()}),
                         )
                         .await?;
                     }
@@ -2181,7 +2257,7 @@ impl State {
 
     /// Keep calls that Antigravity moved to native background tasks open;
     /// their exact later completion is `tool.background_ended`.
-    async fn close_open_tools_at_terminal(&mut self) -> Result<()> {
+    async fn close_open_tools_at_terminal(&mut self, completed: bool) -> Result<()> {
         let turn = self
             .pending
             .as_ref()
@@ -2200,6 +2276,11 @@ impl State {
             .cloned()
             .collect();
         for tool_call_id in open_tool_ids {
+            if !completed {
+                self.tool_event(&tool_call_id, "tool.completed", "unknown")
+                    .await?;
+                continue;
+            }
             if self.background_tools.len() < MAX_BACKGROUND_TOOLS {
                 self.tools.remove(&tool_call_id);
                 self.background_tools.insert(tool_call_id, turn.clone());
@@ -2641,7 +2722,8 @@ impl State {
         // This is the exact fenced `session/prompt` terminal for the bound
         // conversation. Close only this State's still-open tool lifecycles;
         // a terminal response cannot establish their native outcome.
-        self.close_open_tools_at_terminal().await?;
+        self.close_open_tools_at_terminal(status == "completed")
+            .await?;
         let text = self.policy.redact_text(&self.text_accum);
         let missing_text = self.text_unavailable;
         let mut data = json!({"turn_id": turn,
@@ -2822,7 +2904,7 @@ impl State {
         {
             // Reconcile the still-bound tool lifecycle before publishing loss
             // and allowing Store to settle the prompt unknown.
-            let _ = self.close_open_tools_at_terminal().await;
+            let _ = self.close_open_tools_at_terminal(false).await;
             // A cancel notification can be followed by stream loss without a
             // prompt terminal. Keep the observed usage without inferring a turn outcome.
             if self.cancellation_for_pending().is_some()
@@ -2936,10 +3018,8 @@ pub(crate) fn spawn(
         // Observe watch faults while active, including with no incoming
         // frames: a record-local Malformed keeps the reader open, so an
         // EOF-only check would let it vanish while later facts commit.
-        // No model-turn timer lives here: stream silence is not staleness
-        // and a wait timeout never cancels admitted work; the fenced
-        // terminal reply, an error, a stream fault, stop, or drop are the
-        // only settlements.
+        // Only commandless turns use the inactivity deadline. A fenced
+        // prompt still settles on its ordered reply or loss.
         let mut stream_open = true;
         let mut hooks_open = true;
         let mut deferred: Option<AcceptedHook> = None;
@@ -2948,7 +3028,9 @@ pub(crate) fn spawn(
                 Frame(Option<AgyFrame>),
                 StreamClosed(bool),
                 Hook(Option<AcceptedHook>),
+                NativeDeadline,
             }
+            let native_terminal_deadline = state.lock().await.native_terminal_deadline;
             let next = tokio::select! {
                 biased;
                 frame = frames.recv() => Next::Frame(frame),
@@ -2956,8 +3038,21 @@ pub(crate) fn spawn(
                     Next::StreamClosed(changed.is_err())
                 }
                 callback = hook_rx.recv(), if hooks_open => Next::Hook(callback),
+                _ = async {
+                    if let Some(deadline) = native_terminal_deadline {
+                        tokio::time::sleep_until(deadline).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => Next::NativeDeadline,
             };
             match next {
+                Next::NativeDeadline => {
+                    let mut state = state.lock().await;
+                    if let Err(error) = state.expire_native_terminal_deadline().await {
+                        state.lose_observation(&error).await;
+                    }
+                }
                 Next::StreamClosed(closed) => {
                     if closed {
                         stream_open = false;
@@ -3114,6 +3209,7 @@ async fn handle_hook_callback(
     let live_binding = {
         let mut state = state.lock().await;
         if origin_is_live && state.hook_binding_is_live(&binding) {
+            state.refresh_native_terminal_deadline();
             if state.checkpoints.is_none()
                 && let Some(path) = callback.input().transcript_path.as_deref()
                 && let Some(root) = state.checkpoint_root.as_deref()

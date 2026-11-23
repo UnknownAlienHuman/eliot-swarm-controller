@@ -352,19 +352,21 @@ only after that exact reply is consumed behind earlier ACP updates.
 or a non-empty `error` fails; an unfamiliar reason remains `unknown`.
 `fullyIdle` and `continuationActive` do not predict another wake or terminal.
 
-An open call at a turn end is declared with
+An open call can become a background task after a successful terminal. It is declared with
 `native_auto_background: true` and `native_wake_scope: "process_tree"` on
 `tool.started`. Its later native completion commits `tool.background_ended` for
 the original turn. Swarm does not add a second wake for its process tree.
 A successful terminal with a tracked background call reports
 `native_followup_pending`, so an Eliot Goal waits for the native follow-up.
+Each background completion reports whether tracked tasks remain. Failed,
+cancelled and unconfirmed turns close their open calls with unknown tool outcomes.
 
 A send received while this native turn is open stays in the shared daemon queue;
 the plugin does not merge it into the native turn or emit `turn.input_bound`.
-Interrupt sends `session/cancel` and waits for a native terminal. If no terminal
-arrives by the bounded deadline, the adapter commits `turn.unknown`; it never
-infers interruption or completion from silence. A later `Stop` is retained as
-readback evidence and does not rewrite that unknown outcome.
+Interrupt sends `session/cancel` and waits for a native terminal. An unanswered
+cancel or the shared native inactivity deadline commits `turn.unknown`. A
+later exact `Stop` that passes the read fence settles the retained turn and
+releases the send gate.
 
 ## Facts and recovery
 

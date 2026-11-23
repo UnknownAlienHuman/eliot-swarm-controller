@@ -2,7 +2,7 @@ mod catalogue;
 mod start;
 
 use crate::{
-    events::{EventHandle, EventStatus, TurnFacts, turn_native_error},
+    events::{EventHandle, EventStatus, SendAssociation, TurnFacts, turn_native_error},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -1026,6 +1026,7 @@ impl MusePlugin {
             command_id,
             session_id,
             input,
+            if_busy: "queue".to_owned(),
             reasoning_effort,
         }
     }
@@ -1379,7 +1380,7 @@ impl MusePlugin {
                 }
             }
         }
-        if event_status.active_turn_id.is_some()
+        if event_status.active_command_id.is_some()
             && Self::reprove_idle_send_gate(session, proof_deadline)
                 .await
                 .is_none()
@@ -1544,38 +1545,42 @@ impl MusePlugin {
                     ));
                 }
             };
+        let native_queued = started.disposition == "queued";
         let turn_id = started.turn_id;
         session.current_turn = Some((command_id.clone(), turn_id.clone()));
-        if session
+        let associated = match session
             .events
             .associate_turn(
-                command_id.clone(),
-                native_command_id.clone(),
-                turn_id.clone(),
-                params.context.clone(),
-                sent_effort.clone(),
-                expected_model,
+                SendAssociation {
+                    command_id,
+                    native_command_id: native_command_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: params.context,
+                    effort: sent_effort,
+                    model: expected_model,
+                },
+                native_queued,
             )
             .await
-            .is_err()
         {
-            let _ = session
-                .events
-                .unknown_turn_start(native_command_id.clone())
-                .await;
-            session.phase = SessionPhase::Unknown;
-            return Err(Error::new(
-                "unknown",
-                "Muse turn was accepted but turn.started was not acknowledged",
-            ));
-        }
+            Ok(associated) => associated,
+            Err(_) => {
+                let _ = session.events.unknown_turn_start(native_command_id).await;
+                session.phase = SessionPhase::Unknown;
+                return Err(Error::new(
+                    "unknown",
+                    "Muse turn was accepted but its exact turn association was not retained",
+                ));
+            }
+        };
         // The first turn carrying the skill text is now accepted and
         // acknowledged: later turns send plain input.
         session.skill_pointer = None;
         // Echo what the native request carried when a `configure` overlay
         // applied, so the settled outcome reads back the effective values
         // alongside the native turn association. Unchanged without one.
-        let mut result = json!({"state": "applied", "turn_id": turn_id});
+        let state = if associated { "applied" } else { "queued" };
+        let mut result = json!({"state": state, "turn_id": turn_id});
         if let Some(revision) = params.config_revision {
             result["config_revision"] = json!(revision);
             result["effort"] = json!(effort);

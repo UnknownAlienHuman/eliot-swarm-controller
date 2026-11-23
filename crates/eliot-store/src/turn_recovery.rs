@@ -202,7 +202,9 @@ pub(super) fn resolves_recovered_turn_tx(
         .query_row(
             "SELECT json_extract(data, '$.command_id') IS ?4 AND (
                     (NOT ?6 AND source = 'daemon' AND json_type(data, '$.source_event_seq') IS 'integer')
-                    OR (source = 'stream' AND json_extract(data, '$.reason') IS ?5))
+                    OR (source = 'stream' AND json_extract(data, '$.reason') IS ?5)
+                    OR (?7 AND ?4 IS NULL AND source = 'stream'
+                        AND json_extract(data, '$.reason') IS ?8))
              FROM events INDEXED BY events_agent
              WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.unknown'
                AND json_extract(data, '$.turn_id') = ?3
@@ -213,7 +215,9 @@ pub(super) fn resolves_recovered_turn_tx(
                 turn_id,
                 command_id,
                 core::limits::NATIVE_TERMINAL_DEADLINE_REASON,
-                agent.active_turn.as_deref() == Some(turn_id)
+                agent.active_turn.as_deref() == Some(turn_id),
+                agent.state == AgentState::Idle && agent.active_turn.is_none(),
+                core::limits::NATIVE_TERMINAL_UNCONFIRMED_REASON,
             ],
             |row| row.get(0),
         )

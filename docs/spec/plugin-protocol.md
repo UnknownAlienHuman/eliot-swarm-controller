@@ -765,10 +765,15 @@ and the applied response names the turn it joined. Exact-turn `agent.snapshot`
 uses the session's start command as the session selector for an unbound turn, and
 the returned turn facts omit `command_id`.
 
+A send already admitted by the harness into its native queue replies
+`state: "queued"` with the exact native turn id. The host keeps it dispatched
+until the matching `turn.started` commits its input association.
+
 When a terminal supplies positive evidence that the harness still has work that
 will drive a follow-up, the adapter sets `turn.completed.data.native_followup_pending`
-to `true`. The Goal's idle gate holds across that turn boundary. The next native
-lifecycle takes precedence and each terminal reports its own pending work.
+to `true`. `tool.background_ended` may carry the same field with the remaining
+session state. An explicit false clears the hold. The Goal's idle gate bounds
+each hold from the committed terminal and reevaluates at the next native lifecycle.
 
 `turn.completed.data.native_error` optionally summarizes an available native error as
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its

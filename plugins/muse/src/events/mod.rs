@@ -299,13 +299,9 @@ enum Control {
         reply: oneshot::Sender<Result<()>>,
     },
     AssociateTurn {
-        command_id: String,
-        native_command_id: String,
-        turn_id: String,
-        context: Vec<ContextItem>,
-        effort: Option<String>,
-        model: Option<String>,
-        reply: oneshot::Sender<Result<()>>,
+        send: SendAssociation,
+        queued: bool,
+        reply: oneshot::Sender<Result<bool>>,
     },
     ExpectTurnStart {
         command_id: String,
@@ -531,6 +527,15 @@ impl TurnMessages {
     }
 }
 
+pub(crate) struct SendAssociation {
+    pub command_id: String,
+    pub native_command_id: String,
+    pub turn_id: String,
+    pub context: Vec<ContextItem>,
+    pub effort: Option<String>,
+    pub model: Option<String>,
+}
+
 struct EventProcessor {
     native: NativeClient,
     host: PeerClient,
@@ -546,10 +551,12 @@ struct EventProcessor {
     buffer: VecDeque<BufferedFrame>,
     buffer_bytes: usize,
     pending_native_starts: HashMap<String, String>,
+    queued_send: Option<SendAssociation>,
     uncertain_native_starts: HashSet<String>,
     uncertain_native_turns: HashSet<String>,
     active_native_command_id: Option<String>,
     turn_completion_usage: Option<(String, eliot_core::TurnUsage)>,
+    pending_completion_usage: Option<(String, eliot_core::TurnUsage)>,
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -716,22 +723,10 @@ impl EventHandle {
         .await
     }
 
-    pub async fn associate_turn(
-        &self,
-        command_id: String,
-        native_command_id: String,
-        turn_id: String,
-        context: Vec<ContextItem>,
-        effort: Option<String>,
-        model: Option<String>,
-    ) -> Result<()> {
+    pub async fn associate_turn(&self, send: SendAssociation, queued: bool) -> Result<bool> {
         self.send(|reply| Control::AssociateTurn {
-            command_id,
-            native_command_id,
-            turn_id,
-            context,
-            effort,
-            model,
+            send,
+            queued,
             reply,
         })
         .await
@@ -883,10 +878,12 @@ impl EventProcessor {
             buffer: VecDeque::new(),
             buffer_bytes: 0,
             pending_native_starts: HashMap::new(),
+            queued_send: None,
             uncertain_native_starts: HashSet::new(),
             uncertain_native_turns: HashSet::new(),
             active_native_command_id: None,
             turn_completion_usage: None,
+            pending_completion_usage: None,
             gap_number: 0,
             accept_frames: true,
             planned_stop: false,
@@ -972,24 +969,11 @@ impl EventProcessor {
                 true
             }
             Control::AssociateTurn {
-                command_id,
-                native_command_id,
-                turn_id,
-                context,
-                effort,
-                model,
+                send,
+                queued,
                 reply,
             } => {
-                let result = self
-                    .associate_turn(
-                        command_id,
-                        native_command_id,
-                        turn_id,
-                        context,
-                        effort,
-                        model,
-                    )
-                    .await;
+                let result = self.accept_send_association(send, queued).await;
                 let _ = reply.send(result);
                 true
             }
@@ -1298,11 +1282,11 @@ impl EventProcessor {
             if !self.status.ready {
                 return true;
             }
-            return params
-                .get("commandId")
-                .and_then(Value::as_str)
-                .or_else(|| native_notification_turn_id(params))
-                .is_some_and(|id| self.pending_native_starts.contains_key(id));
+            return params["commandId"]
+                .as_str()
+                .is_some_and(|id| self.pending_native_starts.contains_key(id))
+                || native_notification_turn_id(params)
+                    .is_some_and(|id| self.pending_native_turn_matches(id));
         }
         if native_notification_turn_id(params)
             .is_some_and(|turn_id| self.uncertain_native_turns.contains(turn_id))
@@ -1321,13 +1305,22 @@ impl EventProcessor {
                 | "userInput/settled"
         ) && (!self.status.ready
             || native_notification_turn_id(params)
-                .is_some_and(|id| self.pending_native_starts.contains_key(id)))
+                .is_some_and(|id| self.pending_native_turn_matches(id)))
+    }
+
+    fn pending_native_turn_matches(&self, turn_id: &str) -> bool {
+        // Before the acknowledgement a fresh MSP turn derives its id from
+        // the caller's UUID. The exact acknowledged id supersedes that.
+        self.queued_send.as_ref().map_or_else(
+            || self.pending_native_starts.contains_key(turn_id),
+            |send| send.turn_id == turn_id,
+        )
     }
 
     fn expect_turn_start(&mut self, command_id: String, native_command_id: String) -> Result<()> {
         if !self.status.ready
             || self.status.session_id.is_none()
-            || self.status.active_turn_id.is_some()
+            || self.status.active_command_id.is_some()
             || command_id.trim().is_empty()
             || native_command_id.trim().is_empty()
             || self.pending_native_starts.len() >= MAX_PENDING_NATIVE_TURN_STARTS
@@ -1345,6 +1338,7 @@ impl EventProcessor {
 
     async fn reject_turn_start(&mut self, native_command_id: &str) -> Result<()> {
         self.pending_native_starts.remove(native_command_id);
+        self.pending_completion_usage = None;
         let (found, turn_id) = self.discard_buffered_native_start(native_command_id);
         if found {
             self.uncertain_native_starts
@@ -1378,6 +1372,7 @@ impl EventProcessor {
         }
         self.uncertain_native_starts
             .insert(native_command_id.to_owned());
+        self.pending_completion_usage = None;
         let (found, turn_id) = self.discard_buffered_native_start(native_command_id);
         if found {
             if let Some(turn_id) = turn_id {
@@ -1537,15 +1532,61 @@ impl EventProcessor {
         Ok(())
     }
 
-    async fn associate_turn(
+    async fn accept_send_association(
         &mut self,
-        command_id: String,
-        native_command_id: String,
-        turn_id: String,
-        context: Vec<ContextItem>,
-        effort: Option<String>,
-        model: Option<String>,
-    ) -> Result<()> {
+        send: SendAssociation,
+        queued: bool,
+    ) -> Result<bool> {
+        if queued || self.status.active_turn_id.is_some() {
+            if self.queued_send.is_some()
+                || self.pending_native_starts.get(&send.native_command_id) != Some(&send.command_id)
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "Muse queue acknowledgement did not match the pending send",
+                ));
+            }
+            self.queued_send = Some(send);
+            return self.associate_queued_turn().await;
+        }
+        self.associate_turn(send).await?;
+        Ok(true)
+    }
+
+    async fn associate_queued_turn(&mut self) -> Result<bool> {
+        if self.status.active_turn_id.is_some() || self.writes_blocked {
+            return Ok(false);
+        }
+        let Some(send) = self.queued_send.as_ref() else {
+            return Ok(false);
+        };
+        let started = self.buffer.iter().any(|frame| {
+            matches!(&frame.frame, BufferedNativeFrame::Notification { method, params }
+                if method == "turn/started"
+                    && params["commandId"].as_str() == Some(send.native_command_id.as_str())
+                    && params["turnId"].as_str() == Some(send.turn_id.as_str())
+                    && params["sessionId"].as_str() == self.status.session_id.as_deref())
+        });
+        if !started {
+            return Ok(false);
+        }
+        let send = self
+            .queued_send
+            .take()
+            .ok_or_else(|| Error::new("internal", "Muse queued send association disappeared"))?;
+        self.associate_turn(send).await?;
+        Ok(true)
+    }
+
+    async fn associate_turn(&mut self, send: SendAssociation) -> Result<()> {
+        let SendAssociation {
+            command_id,
+            native_command_id,
+            turn_id,
+            context,
+            effort,
+            model,
+        } = send;
         if !self.status.ready
             || self.status.session_id.is_none()
             || command_id.trim().is_empty()
@@ -1578,13 +1619,10 @@ impl EventProcessor {
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = Some(native_command_id.clone());
-        if self
-            .turn_completion_usage
-            .as_ref()
-            .is_none_or(|(sample_turn_id, _)| sample_turn_id != &turn_id)
-        {
-            self.turn_completion_usage = None;
-        }
+        self.turn_completion_usage = self
+            .pending_completion_usage
+            .take()
+            .filter(|(sample_turn_id, _)| sample_turn_id == &turn_id);
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(session_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
@@ -2871,7 +2909,7 @@ impl EventProcessor {
                     &notification.turn_id,
                 )?;
                 if self.status.active_turn_id.is_none()
-                    && self.pending_native_starts.is_empty()
+                    && !self.pending_native_turn_matches(&notification.turn_id)
                     && !self.uncertain_native_starts.contains(&notification.turn_id)
                     && !self
                         .status
@@ -3238,15 +3276,27 @@ impl EventProcessor {
             })?;
         self.check_session_signal(&notification.session_id)?;
         if let Some(turn_id) = notification.turn_id.as_deref()
-            && (self.status.active_turn_id.as_deref() == Some(turn_id)
-                || self.pending_native_starts.contains_key(turn_id))
             && notification
                 .view_cursor
                 .as_deref()
                 .is_some_and(|cursor| !cursor.trim().is_empty())
             && let Some(sample) = notification.usage.as_ref().and_then(turn_usage_from_native)
+            && let Some(usage) = if self.status.active_turn_id.as_deref() == Some(turn_id) {
+                Some(&mut self.turn_completion_usage)
+            } else if !self.pending_native_starts.is_empty()
+                && self
+                    .queued_send
+                    .as_ref()
+                    .is_none_or(|send| send.turn_id == turn_id)
+            {
+                // A pre-ack sample carries only turnId. Hold its native
+                // identity until the acknowledgement can prove the join.
+                Some(&mut self.pending_completion_usage)
+            } else {
+                None
+            }
         {
-            match self.turn_completion_usage.as_mut() {
+            match usage.as_mut() {
                 Some((id, total)) if id == turn_id => {
                     let add = |previous: Option<i64>, next: Option<i64>| {
                         previous.zip(next).and_then(|(a, b)| a.checked_add(b))
@@ -3259,7 +3309,7 @@ impl EventProcessor {
                     total.cache_write_tokens =
                         add(total.cache_write_tokens, sample.cache_write_tokens);
                 }
-                _ => self.turn_completion_usage = Some((turn_id.to_owned(), sample)),
+                _ => *usage = Some((turn_id.to_owned(), sample)),
             }
         }
         let Some(merged) =
@@ -4759,6 +4809,10 @@ async fn run(
                 }
                 if !processor.handle_frame(frame).await {
                     break;
+                }
+                if let Err(error) = processor.associate_queued_turn().await {
+                    processor.status.source_unknown = true;
+                    processor.defer_gap(*error.message);
                 }
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }

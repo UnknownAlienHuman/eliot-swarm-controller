@@ -524,6 +524,7 @@ pub struct NativeTurnStartParams {
     pub command_id: String,
     pub session_id: String,
     pub input: Vec<NativeTurnInputPart>,
+    pub if_busy: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }
