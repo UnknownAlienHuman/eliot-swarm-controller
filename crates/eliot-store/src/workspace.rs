@@ -381,9 +381,12 @@ fn agent_ref_namespace(branch: &str) -> Option<&str> {
 }
 
 fn is_agent_id_component(agent: &str) -> bool {
-    agent.strip_prefix('a').is_some_and(|digits| {
-        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
-    })
+    let Some((&prefix, digits)) = agent.as_bytes().split_first() else {
+        return false;
+    };
+    (prefix == b'a' || (cfg!(windows) && prefix == b'A'))
+        && !digits.is_empty()
+        && digits.iter().all(u8::is_ascii_digit)
 }
 
 pub(super) fn validate_workspace_input(input: &WorkspacePreparationInput) -> Result<()> {
