@@ -85,6 +85,8 @@ pub struct HookInput {
     pub conversation_id: String,
     pub invocation_num: u64,
     pub initial_num_steps: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 /// Helper origin identity alias carried through IPC queries.
@@ -144,6 +146,8 @@ pub struct IpcQuery {
     pub conversation_id: String,
     pub invocation_num: u64,
     pub initial_num_steps: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub origin: HelperOrigin,
 }
 
@@ -262,6 +266,7 @@ impl HookServer {
                 conversation_id: query.conversation_id,
                 invocation_num: query.invocation_num,
                 initial_num_steps: query.initial_num_steps,
+                transcript_path: query.transcript_path,
             };
 
             return Ok(HookCallback {
@@ -416,6 +421,7 @@ pub async fn run_helper() -> Result<()> {
         conversation_id: input.conversation_id,
         invocation_num: input.invocation_num,
         initial_num_steps: input.initial_num_steps,
+        transcript_path: input.transcript_path,
         origin,
     };
 

@@ -38,6 +38,8 @@ use crate::{
         permission_option_grants, prompt_turn_usage, session_usage_from_update,
     },
 };
+
+mod checkpoints;
 use ulid::Ulid;
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool", "request"];
@@ -290,6 +292,8 @@ pub(crate) struct State {
     /// Monotonic counter for `session.usage` native ids so each accepted
     /// update commits under a unique identity.
     session_usage_seq: u64,
+    checkpoints: Option<checkpoints::Checkpoints>,
+    checkpoint_resume: bool,
 }
 
 impl State {
@@ -364,6 +368,8 @@ impl State {
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
+            checkpoints: None,
+            checkpoint_resume: false,
         }
     }
 
@@ -410,6 +416,12 @@ impl State {
             self.apply_update(queued.session_id, queued.update).await?;
         }
         Ok(())
+    }
+
+    pub fn bind_checkpoint_transcript(&mut self, root: Option<&std::path::Path>, resumed: bool) {
+        self.checkpoint_resume = resumed;
+        self.checkpoints =
+            root.and_then(|root| checkpoints::Checkpoints::bind(root, &self.conversation, resumed));
     }
 
     /// Bind the retained session and arm both the exact load filter and
@@ -1904,6 +1916,19 @@ impl State {
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
+        if let Some(checkpoints) = &mut self.checkpoints {
+            for step_index in checkpoints.read_new() {
+                // The transcript proves a session checkpoint, even if its
+                // write reached disk after an earlier prompt settled.
+                self.commit(
+                    "session.context.compacted",
+                    "session",
+                    &format!("checkpoint-{step_index}"),
+                    json!({"step_index": step_index}),
+                )
+                .await?;
+            }
+        }
         let failed = status == "failed";
         // Canonical outcome decided here at the plugin boundary from the
         // Antigravity terminal vocabulary (`completed` | `failed` |
@@ -2302,6 +2327,15 @@ async fn handle_hook_callback(
     let live_binding = {
         let mut state = state.lock().await;
         if origin_is_live && state.hook_binding_is_live(&binding) {
+            if state.checkpoints.is_none()
+                && let Some(path) = callback.input().transcript_path.as_deref()
+            {
+                state.checkpoints = checkpoints::Checkpoints::from_hook(
+                    std::path::Path::new(path),
+                    &state.conversation,
+                    state.checkpoint_resume,
+                );
+            }
             Some((
                 state.take_pending_steer(&binding.turn),
                 state.host.clone(),
