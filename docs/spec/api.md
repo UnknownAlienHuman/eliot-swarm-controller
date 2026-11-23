@@ -1665,6 +1665,10 @@ NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 any raw panic marker lines. The process step can carry the startup panic marker
 summary in `origin_evidence`. Diagnosis also includes the previous-run crash
 marker when the terminal failure is unclassified.
+For a refused `worktree.remove`, `swarm why COMMAND_ID` shows the retained
+code, cause and failure location when available. `swarm why AGENT` includes
+that refusal while it is the current managed worktree outcome for the terminal
+Agent's generation. A later successful removal replaces it in Agent diagnosis.
 When a failure exists, the one-line `summary` starts with its origin
 (`provider origin: <target> <code> at <where>: <message>`). A healthy idle, busy,
 waiting or stopped Agent with no failure in the bounded recent generation read

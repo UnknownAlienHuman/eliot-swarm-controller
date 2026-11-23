@@ -102,6 +102,11 @@ impl Error {
 
 impl crate::api::DiagnoseStep {
     pub fn user_message(&self) -> String {
+        if self.kind == "worktree.remove"
+            && let (Some(code), Some(message)) = (self.code.as_deref(), self.message.as_deref())
+        {
+            return format!("{code}: {message}");
+        }
         if self.kind == "process" {
             let words = reason_words(self.code.as_deref().unwrap_or("unknown"));
             return match self

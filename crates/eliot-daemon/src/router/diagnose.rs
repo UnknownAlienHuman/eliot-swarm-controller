@@ -406,6 +406,14 @@ impl Router {
             }
         }
         steps.extend(loss_steps(&store, agent, generation)?);
+        if row.is_terminal()
+            && let Some(workspace) = store.get_workspace(agent)?
+            && workspace.target_generation == generation
+            && let Some(step) =
+                worktree_removal_refusal(workspace.outcome.as_ref(), workspace.updated_at)
+        {
+            steps.push(step);
+        }
         let attention_steps = store.recent_attention_steps(agent, None)?;
         drop(store);
         let origin = chain_origin(&steps);
@@ -578,15 +586,34 @@ fn chain_origin(steps: &[DiagnoseStep]) -> String {
 }
 
 fn command_step(command: &Command) -> DiagnoseStep {
-    let outcome = command.outcome.as_ref();
+    if command.verb == "worktree.remove"
+        && let Some(step) = worktree_removal_refusal(command.outcome.as_ref(), command.updated_at)
+    {
+        return step;
+    }
+    let mut step = command_outcome_step(command.outcome.as_ref(), command.updated_at);
+    if step.code.is_none() {
+        step.code = Some(format!("{:?}", command.state).to_lowercase());
+    }
+    step
+}
+
+fn worktree_removal_refusal(outcome: Option<&Value>, at: i64) -> Option<DiagnoseStep> {
+    let outcome = outcome?;
+    let result = outcome.get("result")?;
+    if outcome["stage"].as_str() != Some("removal") || result["state"].as_str() != Some("failed") {
+        return None;
+    }
+    let mut step = command_outcome_step(Some(result), at);
+    step.kind = "worktree.remove".to_owned();
+    step.origin = Some("swarm".to_owned());
+    Some(step)
+}
+
+fn command_outcome_step(outcome: Option<&Value>, at: i64) -> DiagnoseStep {
     DiagnoseStep {
         kind: "command".to_owned(),
-        code: outcome.and_then(outcome_code).or_else(|| {
-            Some(bound_chars(
-                &format!("{:?}", command.state).to_lowercase(),
-                128,
-            ))
-        }),
+        code: outcome.and_then(outcome_code),
         message: outcome.and_then(|outcome| {
             outcome
                 .get("message")
@@ -620,7 +647,7 @@ fn command_step(command: &Command) -> DiagnoseStep {
                 .and_then(Value::as_str)
                 .map(|ntstatus| bound_chars(ntstatus, 16))
         }),
-        at: (command.updated_at >= 0).then_some(command.updated_at),
+        at: (at >= 0).then_some(at),
     }
 }
 
