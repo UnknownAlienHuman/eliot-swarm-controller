@@ -1061,7 +1061,7 @@ async fn branch_ref_parent_is_exclusive(
         let name_key = workspace_path_key(name);
         if name_key == full_ref_key
             || name_key == parent_ref_key
-            || name_key.starts_with(&nested_prefix_key)
+            || name_key.starts_with(nested_prefix_key.as_ref())
         {
             // This also catches packed sibling refs, which are absent from
             // the loose refs directory but would share the granted parent.
