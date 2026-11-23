@@ -5,6 +5,43 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Native subagent policy for one built-in harness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeSubagentsPolicy {
+    /// Whether omitted `native_subagents` resolves to `allow`.
+    pub default_allowed: bool,
+    /// Whether the harness can disable native subagents for one session.
+    pub can_deny: bool,
+}
+
+impl NativeSubagentsPolicy {
+    /// Build a capability that denies native subagents by default.
+    pub const fn deny_by_default() -> Self {
+        Self {
+            default_allowed: false,
+            can_deny: true,
+        }
+    }
+
+    /// Build a capability that preserves native subagents by default when
+    /// the harness cannot disable them for one session.
+    pub const fn allow_by_default() -> Self {
+        Self {
+            default_allowed: true,
+            can_deny: false,
+        }
+    }
+
+    /// The serialized value for this harness's omitted profile setting.
+    pub const fn default_value(self) -> &'static str {
+        if self.default_allowed {
+            "allow"
+        } else {
+            "deny"
+        }
+    }
+}
+
 /// Codex CLI's documented default for project instructions.
 pub const CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES: u64 = 32 * 1024;
 

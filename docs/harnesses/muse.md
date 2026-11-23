@@ -726,16 +726,16 @@ Turn usage: session input 45,444 + output 209. A follow-up turn ran
 state, proving Agent-scoped access. `muse serve --help` exposes no MCP
 isolation or tool-deferral surface, so both stay unsupported.
 
-## Native subagents (`native_subagents` deny): unsupported
+## Native subagents (`native_subagents` allow; deny unsupported)
 
 Checked against the installed Muse 1.4.20 binary (`muse --help`,
 `muse serve --help`, and the exported MSP schema
 `muse schema generate-json-schema`, which names native subagent provenance
 `subagentOrigin` / `subagentId` but no disable switch): there is no verified
-per-session switch to turn off native subagents. A Muse profile freezes
-`native_subagents = "deny"` when omitted or explicitly set to deny. The launch
-and resume preflight refuses this policy before native effects. Set
-`native_subagents = "allow"` explicitly to use Muse with its native subagents.
+per-session switch to turn off native subagents. An omitted setting freezes
+`native_subagents = "allow"` to preserve Muse's native behavior. An explicit
+`deny` remains unsupported and the launch/resume preflight refuses it before
+native effects. Previously frozen snapshots retain their original value.
 
 ## Access levels (`--access ask|auto|full`)
 

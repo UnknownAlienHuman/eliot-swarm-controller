@@ -75,6 +75,8 @@ pub struct SubagentsForm {
     pub children: Option<Vec<(String, bool)>>,
     /// The harness's own subagents are allowed (`native_subagents`).
     pub native_allowed: bool,
+    /// Whether the harness can enforce a `native_subagents = "deny"` setting.
+    pub native_can_deny: Option<bool>,
     /// The `control` scope as written (`self` when absent); `None` when the
     /// value is source-only.
     pub control: Option<String>,
@@ -168,12 +170,14 @@ fn subagents_card(
             .keyed_children(start),
     ));
 
-    let native_note = if form.native_allowed {
-        format!("Allowed: {harness} may start its own subagents too.")
-    } else if matches!(harness, "muse" | "antigravity") {
+    let native_note = if form.native_can_deny == Some(false) && form.native_allowed {
+        format!("Allowed: {harness} has no per-session way to turn off its own native subagents.")
+    } else if form.native_can_deny == Some(false) {
         format!(
-            "Off: {harness} cannot disable native subagents, so this profile will not launch until you opt in."
+            "Off: {harness} cannot disable native subagents, so launch will be refused. Turn this on to allow them."
         )
+    } else if form.native_allowed {
+        format!("Allowed: {harness} may start its own subagents too.")
     } else {
         "Off: it delegates only through Swarm subagents.".to_owned()
     };
@@ -185,7 +189,7 @@ fn subagents_card(
             switch(
                 "native",
                 form.native_allowed,
-                !busy,
+                !busy && (!form.native_allowed || form.native_can_deny == Some(true)),
                 "The agent app's own subagents".to_owned(),
                 actions.native_toggled.clone(),
             ),

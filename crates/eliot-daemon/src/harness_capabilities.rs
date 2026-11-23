@@ -1,6 +1,7 @@
 //! Built-in profile parser rules, also used by offline desktop settings repair.
 
 pub(crate) use eliot_core::api::HarnessCapabilities;
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProfileCapabilities {
@@ -20,8 +21,8 @@ pub(crate) struct ProfileCapabilities {
     pub local_provider: bool,
     /// Accepts `project_doc_max_bytes` in a profile entry.
     pub project_doc_max_bytes: bool,
-    /// Default `native_subagents` policy when a profile omits it.
-    pub native_subagents_default: Option<&'static str>,
+    /// Native-subagent default and denial support.
+    pub native_subagents_policy: Option<NativeSubagentsPolicy>,
 }
 
 impl ProfileCapabilities {
@@ -34,11 +35,11 @@ impl ProfileCapabilities {
             "codex" => Self {
                 script_wrapper_cmd: true,
                 project_doc_max_bytes: true,
-                native_subagents_default: Some("deny"),
+                native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
                 ..Self::default()
             },
             "claude" => Self {
-                native_subagents_default: Some("deny"),
+                native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
                 model_pin_selectors: true,
                 route_selectors_resolved: true,
                 route_scope_secret_names: &["CLAUDE_CODE_OAUTH_TOKEN"],
@@ -47,20 +48,21 @@ impl ProfileCapabilities {
                 ..Self::default()
             },
             "opencode" => Self {
-                native_subagents_default: Some("deny"),
+                native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
                 route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
                 local_provider: true,
                 ..Self::default()
             },
-            "muse" => Self {
-                native_subagents_default: Some("deny"),
-                ..Self::default()
-            },
-            "antigravity" => Self {
-                native_subagents_default: Some("deny"),
+            "muse" | "antigravity" => Self {
+                native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
                 ..Self::default()
             },
             _ => return None,
         })
     }
+}
+
+/// Native-subagent policy shared with the offline settings editor.
+pub fn native_subagents_policy(harness: &str) -> Option<NativeSubagentsPolicy> {
+    ProfileCapabilities::for_harness(harness)?.native_subagents_policy
 }

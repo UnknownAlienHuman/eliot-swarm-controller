@@ -257,9 +257,17 @@ fn ensure_bootstrap_settings(
             let Some(profile) = profiles.get_mut(&manager) else {
                 continue;
             };
-            // Bootstrap records the safe policy explicitly for every native
-            // manager; adapters without an enforcement mapping fail closed.
-            profile["native_subagents"] = json!("deny");
+            // Record an explicit denial only when this harness can enforce it.
+            // A Muse or Antigravity fallback keeps the field omitted, whose
+            // capability default accurately preserves its native behavior.
+            let can_deny_native_subagents = profile
+                .get("harness")
+                .and_then(Value::as_str)
+                .and_then(crate::harness_capabilities::native_subagents_policy)
+                .is_some_and(|policy| policy.can_deny);
+            if can_deny_native_subagents {
+                profile["native_subagents"] = json!("deny");
+            }
             profile["child_profiles"] = json!(workers);
             profile["control"] = json!("tree");
         }

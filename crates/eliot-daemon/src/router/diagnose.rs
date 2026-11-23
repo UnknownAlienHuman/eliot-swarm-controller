@@ -228,6 +228,23 @@ impl Router {
             ntstatus: None,
             at: (row.updated_at >= 0).then_some(row.updated_at),
         }];
+        if let Some(policy @ ("allow" | "deny")) = row
+            .profile_snapshot
+            .get("native_subagents")
+            .and_then(Value::as_str)
+        {
+            steps.push(DiagnoseStep {
+                kind: "native_subagents".to_owned(),
+                code: Some(policy.to_owned()),
+                message: Some(format!("Frozen profile sets native_subagents = {policy}")),
+                failure_where: None,
+                origin: None,
+                origin_evidence: None,
+                exit_code: None,
+                ntstatus: None,
+                at: None,
+            });
+        }
         if let Some(gap) = store.latest_stream_gap(agent, generation)?
             && let Some(message) = gap.data.get("reason").and_then(Value::as_str)
             && [
@@ -846,9 +863,10 @@ fn summary_for(target: &str, steps: &[DiagnoseStep], fallback_what: &str) -> Str
 
 fn healthy_agent(steps: &[DiagnoseStep]) -> bool {
     steps.first().is_some_and(|step| step.kind == "agent")
-        && steps[1..]
-            .iter()
-            .all(|step| step.kind == "goal" && step.code.as_deref() != Some("blocked"))
+        && steps[1..].iter().all(|step| {
+            step.kind == "native_subagents"
+                || (step.kind == "goal" && step.code.as_deref() != Some("blocked"))
+        })
         && matches!(
             steps[0].code.as_deref(),
             Some("idle" | "busy" | "waiting" | "stopped")

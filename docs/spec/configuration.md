@@ -232,8 +232,9 @@ the managers are the installed ones of `codex`, `claude` and `opencode` in that
 order (the harnesses that can disable native subagents per session), otherwise the
 first installed profile in name order. Each manager has `control = "tree"` and
 `child_profiles` listing the other installed bootstrap profiles. Bootstrap writes
-`native_subagents = "deny"` for every manager. A Muse or Antigravity
-fallback requires the Owner to opt in before its first launch. The `default`
+`native_subagents = "deny"` for managers whose harness can enforce it. If
+Muse or Antigravity is the fallback manager, bootstrap leaves the field
+omitted and its effective value is `allow`. The `default`
 routing role lists the managers followed by the other installed profiles in name
 order, so routing passes over one whose quota is used up or whose provider is on
 hold and starts the task on the next. The `worker` routing role and each manager's
@@ -520,18 +521,20 @@ A profile selects its harness-native subagent surface in `native_subagents`:
 `deny` asks the harness plugin to disable its native subagent tool for the
 session so delegation goes through Swarm (`launch` with `role` or an allowed
 profile, claims, mail, `wait`/`digest`). When omitted, it defaults to `deny`
-on every supported harness, independent of `child_profiles`. An
+for Codex, Claude and OpenCode, and to `allow` for Muse and Antigravity,
+independent of `child_profiles`. An
 explicit `native_subagents = "allow"` opts that profile into native subagents
 and remains valid for audit or other profiles that rely on them. The frozen
 value is captured in the profile snapshot and reported truthfully in effective
-settings. Ad-hoc Owner launches use the same default. Resume uses the
-retained snapshot, so adapters require explicit `allow` even for snapshots
-saved before the setting was frozen.
+settings, the desktop Profiles view and `swarm why`. Ad-hoc Owner launches use the same
+default. Resume uses the retained snapshot unchanged; the new default applies
+when a new launch snapshot is frozen, not when an existing Agent resumes.
 
 Muse and Antigravity have no verified per-session switch. A launch with
 `deny` on either harness returns `unsupported` before native process start,
-with a message showing how to opt in on a named profile. Codex, Claude, and
-OpenCode enforce `deny` on the session.
+with a reason surfaced by `swarm why`. Their desktop switch shows the effective
+`allow` default and cannot be switched off; an explicit deny from TOML still
+fails. Codex, Claude, and OpenCode enforce `deny` on the session.
 On OpenCode the denial is a per-session `subagent` wildcard deny stored as
 the final entry in the session's entire ruleset and verified by readback of that
 exact session on create and resume: the server merges session rules after

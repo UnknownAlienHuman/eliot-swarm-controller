@@ -11,8 +11,9 @@
 
 use eliot_core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, COMMON_EFFORTS,
-    CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
+    CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS, NativeSubagentsPolicy,
 };
+use eliot_daemon::operator::native_subagents_policy;
 
 /// The first choice of an enumerated field: the key is left out, so the
 /// harness default applies.
@@ -490,13 +491,27 @@ pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> 
     Ok(out)
 }
 
-/// The effective `native_subagents` of a profile: its own value, else
-/// `deny` (the daemon's default for every supported harness).
+fn native_subagents_policy_for_profile(draft: &str, name: &str) -> Option<NativeSubagentsPolicy> {
+    match field(draft, name, "harness") {
+        Field::Simple(harness) => native_subagents_policy(&harness),
+        Field::Absent | Field::Complex => None,
+    }
+}
+
+/// The effective `native_subagents` value shown for a profile: its explicit
+/// value, else the capability default shared with the daemon.
 pub fn native_subagents_allowed(draft: &str, name: &str) -> bool {
     match field(draft, name, "native_subagents") {
-        Field::Simple(value) => value.trim() == "allow",
-        _ => false,
+        Field::Simple(value) if !value.trim().is_empty() => value.trim() == "allow",
+        Field::Absent | Field::Simple(_) => native_subagents_policy_for_profile(draft, name)
+            .is_some_and(|policy| policy.default_allowed),
+        Field::Complex => false,
     }
+}
+
+/// Whether the profile's harness can enforce an explicit native-subagent deny.
+pub fn native_subagents_can_deny(draft: &str, name: &str) -> Option<bool> {
+    native_subagents_policy_for_profile(draft, name).map(|policy| policy.can_deny)
 }
 
 /// A daemon refusal of one profile field
