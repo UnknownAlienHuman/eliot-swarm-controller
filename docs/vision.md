@@ -39,13 +39,14 @@ On 2026-11-22 the owner stated a principle that every layer must follow:
 
 > «Истина хранится вне harness!!! Она хранится в Git!!!! Это ещё в первой архитектуре должно было быть написано и повторяться!!!»
 
-The truth about work lives in Git, outside any harness. A harness session, its model,
-its context window and its transcript are disposable. The task's state is its committed
-branch and the task card that names it. Any model on any harness can continue a task
-from that branch, for any reason: a provider limit, a cheaper or stronger model, a
-failure, or the Owner's choice. Moving work between models is the ordinary path, not a
-special recovery feature. See
-[Work truth lives in Git](architecture.md#work-truth-lives-in-git).
+The owner then specified: «В Git, в файловой системе». The truth about work lives in Git
+and in the file system, outside any harness. A harness session, its model, its context
+window and its transcript are disposable. The task's state is its worktree (the branch,
+its commits and the files on disk) and the task card that names it. Any model on any
+harness can continue a task from there, for any reason: a provider limit, a cheaper or
+stronger model, a failure, or the Owner's choice. Moving work between models is the
+ordinary path, not a special recovery feature. See
+[Work truth lives in Git and the file system](architecture.md#work-truth-lives-in-git-and-the-file-system).
 
 ## What Eliot is
 

@@ -140,22 +140,25 @@ The detailed invariants have one owner:
 Do not duplicate these contracts in worker instructions or add another decision for each
 edge case. Repair the owning spec and its actual caller together.
 
-## Work truth lives in Git
+## Work truth lives in Git and the file system
 
 The [owner principle](vision.md#owner-statement-source-of-truth) of 2026-11-22: the
-truth about work is stored in Git, outside every harness.
+truth about work is stored in Git and in the file system, outside every harness.
 
-- **Branch.** A task's durable state is its committed Git branch in a managed worktree,
-  plus the task card naming the branch and goal. Uncommitted changes stay on disk in the
-  worktree but are not durable truth.
+- **Worktree.** A task's state is its managed worktree: the Git branch with its commits,
+  the files on disk including uncommitted changes, and the task card naming the branch
+  and goal.
 - **Disposable session.** A harness session (process, model, context, native transcript)
-  is a disposable worker on that branch. Losing it loses no committed work.
+  is a disposable worker on that worktree. Losing it loses none of the work on disk.
 - **Checkpoints.** Agents commit progress at meaningful checkpoints on their own branch.
-- **Handoff brief.** Work moves to another model from the branch, not from a vendor
-  transcript. This is the ordinary path for every reason, not a special failover: a
-  provider limit, a model or cost choice, a failed or lost session, or an Owner request.
-- **Store's role.** Store records who works on which branch and what happened. Git holds
-  the work itself.
+  Commits carry the work beyond the worktree: review, merge, or a successor in another
+  worktree.
+- **Handoff brief.** Work moves to another model from the worktree and branch, not from a
+  vendor transcript. A successor in the same worktree continues from the files as they
+  are. This is the ordinary path for every reason, not a special failover: a provider
+  limit, a model or cost choice, a failed or lost session, or an Owner request.
+- **Store's role.** Store records who works in which worktree and what happened. Git and
+  the file system hold the work itself.
 
 [Coordination](spec/coordination.md#agent-switch-implemented) owns the switch and handoff
 contract, including when a handoff is admitted, what transfers and how uncertain effects
