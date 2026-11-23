@@ -43,6 +43,27 @@ Obtain the native command id before writing: use caller-selected `commandId` or 
 operation exposing its generated id before send. Text/time/list position is not identity.
 Use supported typed APIs, not an inferred method list from a different host version.
 
+## Additive native event decoding
+
+Muse DTOs ignore unfamiliar fields. An unhandled notification for the owned session
+commits `session.native_unclassified` with only a static site and the sanitized native
+method tag; it does not persist the vendor payload, infer a lifecycle fact, or stop the
+stream. Notifications explicitly naming another session are ignored.
+
+On live events, unknown `health`, `noneReason`, `turn/completed.terminal`, and
+workflow-child terminal values decode as `Other` and produce the same neutral diagnostic
+with the native schema tag. An unknown health value does not change source health.
+`health="unavailable"` still marks the exact session unavailable, including when its
+reason is `Other`. A healthy live `turn/completed` bound to the exact active turn
+establishes terminal lifecycle even when the terminal value is `Other`. Its outcome
+is `unknown`. An unavailable view still requires command-plane proof. A workflow-child
+status or readback value of `Other` carries no terminal or healthy-view evidence.
+
+The adapter has no exact runtime-version equality gate. Its manifest declares the
+`1.4.0` harness baseline, while startup requires only a non-empty reported
+`serverInfo.version`; neither that value nor `schema.version` is compared to an exact
+supported version. This metadata does not qualify a newer runtime.
+
 ## Native mapping
 
 The installed `turn/steer` result must echo the submitted `commandId`, the exact

@@ -397,15 +397,15 @@ impl Plan {
     }
 
     /// Verify the ACP `initialize` + `session/new|load` facts against the
-    /// frozen plan: protocol 1, a non-empty session id (the exact retained
-    /// id on resume), and the model/thought-level selectors the translation
-    /// below depends on. Permissions and cwd are launch facts (the ACP
+    /// frozen plan: a non-empty session id (the exact retained id on resume),
+    /// and the model/thought-level selectors the translation below depends
+    /// on. The reported protocol version is metadata, not an equality gate.
+    /// Permissions and cwd are launch facts (the ACP
     /// server is spawned in the workspace with the profile environment);
     /// the session object itself echoes neither, so cwd is proven by the
     /// launch, not by a response field.
     pub fn check_session(&self, init: &InitializeResult, session: &SessionResult) -> Result<Value> {
-        if init.protocol_version != 1
-            || session.session_id.trim().is_empty()
+        if session.session_id.trim().is_empty()
             || self
                 .resume
                 .as_ref()
@@ -486,6 +486,7 @@ impl Plan {
         // requested entry. Proof that the Agent can reach swarm is
         // behavioral: its tool calls through the session.
         Ok(json!({
+            "protocol_version": init.protocol_version,
             "model": base_model,
             "requested_model": self.model,
             "thought_level": thought_level,

@@ -6,6 +6,7 @@
 //! `assistant` text, `system` lines and the terminal `result` record. Records
 //! stay open: unknown fields are ignored, required fields are checked by the
 //! caller that consumes them.
+//! The cited CLI version is evidence provenance, not an exact-version gate.
 
 use eliot_core::{
     MAX_MCP_SERVER_NAME_LEN, SessionCost, SessionTokenTotals, SessionUsage, TurnUsage,
@@ -41,6 +42,23 @@ pub(crate) struct OutboundControlResponseBody<T> {
     pub response: T,
 }
 
+/// Protocol-level refusal for an inbound control request whose subtype is
+/// unsupported. The exact native request id is echoed; no subtype-specific
+/// response payload is guessed.
+#[derive(Serialize)]
+pub(crate) struct OutboundControlError {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub response: OutboundControlErrorBody,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OutboundControlErrorBody {
+    pub subtype: &'static str,
+    pub request_id: String,
+    pub error: String,
+}
+
 /// Documented SDK permission decision (camelCase wire names). Allow must
 /// echo the asked `input` back as `updatedInput`; deny carries a bounded
 /// message. Live verification is pending the owner login (note 47).
@@ -61,8 +79,6 @@ pub(crate) enum PermissionResult {
 /// and reasons stay out of the persisted details.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct CanUseToolBody {
-    #[serde(default)]
-    pub subtype: String,
     #[serde(default)]
     pub tool_name: String,
     #[serde(default)]
@@ -191,6 +207,30 @@ pub(crate) struct CommandLifecycle {
     pub command_uuid: String,
     #[serde(default)]
     pub state: String,
+}
+
+/// The lifecycle states interpreted by the adapter. The original wire value
+/// remains on `CommandLifecycle` so `Other` can be diagnosed without
+/// assigning it a turn outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommandLifecycleState {
+    Queued,
+    Started,
+    Completed,
+    Cancelled,
+    Other,
+}
+
+impl CommandLifecycleState {
+    pub(crate) fn from_native(value: &str) -> Self {
+        match value {
+            "queued" => Self::Queued,
+            "started" => Self::Started,
+            "completed" => Self::Completed,
+            "cancelled" => Self::Cancelled,
+            _ => Self::Other,
+        }
+    }
 }
 
 /// One `assistant` content block; `text` blocks carry reply text,

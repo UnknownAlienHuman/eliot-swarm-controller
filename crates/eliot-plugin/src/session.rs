@@ -1745,3 +1745,16 @@ pub async fn stop_retained_session(
         Err(unknown("end_ack"))
     }
 }
+/// In debug qualification builds the private stand can shorten the window.
+pub fn native_terminal_inactivity() -> std::time::Duration {
+    use eliot_core::limits::NATIVE_TERMINAL_DEADLINE;
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(eliot_core::limits::DEBUG_NATIVE_INACTIVITY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| *ms > 0 && u128::from(*ms) <= NATIVE_TERMINAL_DEADLINE.as_millis())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    NATIVE_TERMINAL_DEADLINE
+}

@@ -1,8 +1,11 @@
 # OpenCode
 
-L6 adapter for the installed OpenCode 2.2.7. Select one installed HTTP/SSE API
-generation from its OpenAPI document (`GET /openapi.json` on installed 2.2.7); do not mix
-generations after a 404. Source:
+The HTTP/SSE shapes below were verified against OpenCode v2.2.7 on 2026-11-23.
+The plugin has no exact vendor-version comparison gate; its manifest's `2.2.7`
+is reference metadata, not proof of the installed version. A newer CLI is
+attempted through the same API contract, with compatibility unverified until
+live qualification. Select one installed HTTP/SSE API generation from its
+OpenAPI document (`GET /openapi.json`); do not mix generations after a 404. Source:
 [anomalyco/opencode](https://github.com/anomalyco/opencode).
 
 Waku's [service](https://github.com/egoist/waku/blob/main/crates/waku-core/src/opencode_service.rs)
@@ -113,6 +116,24 @@ The native `x-opencode-directory` header is URI component encoded, including lit
 percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
 decodes it once; raw UTF-8 headers turn non-ASCII directory names into mojibake and
 fail readiness with location-not-found (observed in the Linux Docker image).
+
+SSE framing and exact session/durable cursor checks remain authoritative. Unknown
+event tags are committed as `session.native_unclassified` only when the event's
+`sessionID` or durable `aggregateID` matches the bound session; conflicting or
+missing identity is not inferred. The record contains the sanitized event tag
+and static site only, then processing continues. Known text/reasoning deltas,
+tool input details, steps, usage and `session.idle` remain intentionally unmapped.
+`session.status.status.type` recognizes `idle`, `retry` and `busy`; an unknown
+tag is `Other` with a diagnostic. Compaction reasons recognize `auto` and
+`manual`; an unknown reason projects only as `unknown` with a diagnostic.
+Unknown interruption reasons are diagnosed without changing the terminal
+status established by the exact `session.execution.*` event type. Malformed
+JSON and oversized SSE frames still end the stream.
+
+The 30-minute inactivity deadline starts at turn association and resets on
+bound execution activity. At expiry, an absent terminal settles the outcome as
+`unknown` with `native_terminal_deadline`. Later bound facts still commit and
+the exact native terminal can resolve the outcome.
 
 ## Native mapping
 

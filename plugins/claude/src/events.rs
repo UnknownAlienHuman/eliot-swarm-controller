@@ -7,7 +7,7 @@ use self::hooks::{
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, Result, SecretPolicy, TurnUsage,
-    limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES},
+    limits::{MAX_COMMAND_ID_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
     requests::{ApprovalChoice, ApprovalDecision, ApprovalRequest},
 };
 use eliot_plugin::{
@@ -17,8 +17,9 @@ use eliot_plugin::{
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, approval_reply_args, attach_final_text, attach_native_error,
-        is_blank_native_text, native_no_write, next_input_outcomes, rejected_control,
-        request_event_id, request_reply_applied, unknown_control, with_claimed_context,
+        is_blank_native_text, native_no_write, native_terminal_inactivity, next_input_outcomes,
+        rejected_control, request_event_id, request_reply_applied, unknown_control,
+        with_claimed_context,
     },
     usage::FirstCallUsage,
 };
@@ -102,6 +103,7 @@ pub(crate) struct EventConfig {
     pub agent_id: String,
     pub generation: i64,
     pub secrets: Vec<String>,
+    pub native: ClaudeClient,
     /// Owned session workspace: hook tool paths are normalized against it.
     pub workspace: PathBuf,
 }
@@ -197,18 +199,41 @@ struct PendingNativeRequest {
     reply_state: NativeReplyState,
 }
 
-/// Canonical outcome for one Claude terminal reason, decided here at the
-/// plugin boundary; the verbatim reason is preserved as `native_status`
-/// next to it. `success` (2.1.278) and `completed` (live 2.1.321 terminal
-/// frame) are the recognized successes. Cancellation and native abort
-/// reasons are interrupts. Supported native failures (`error`, `failed`, `failure`
-/// and the `api_error...` family) fail. Anything else is unknown: an
-/// unrecognized reason never defaults to success.
-fn claude_outcome(reason: &str) -> &'static str {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeTerminalReason {
+    Success,
+    Interrupted,
+    Failure,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeControlRequestSubtype {
+    CanUseTool,
+    HookCallback,
+    Other,
+}
+
+impl NativeControlRequestSubtype {
+    fn from_native(value: &str) -> Self {
+        match value {
+            "can_use_tool" => Self::CanUseTool,
+            "hook_callback" => Self::HookCallback,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Classify one Claude terminal reason without assigning an outcome to a new
+/// native value. The raw reason remains available for the neutral diagnostic
+/// and `native_status` readback.
+fn native_terminal_reason(reason: &str) -> NativeTerminalReason {
     match reason.trim() {
-        "success" | "completed" => "success",
-        "cancelled" | "interrupted" | "aborted_streaming" | "aborted_tools" => "interrupted",
-        "error" | "failed" | "failure" => "failure",
+        "success" | "completed" => NativeTerminalReason::Success,
+        "cancelled" | "interrupted" | "aborted_streaming" | "aborted_tools" => {
+            NativeTerminalReason::Interrupted
+        }
+        "error" | "failed" | "failure" => NativeTerminalReason::Failure,
         reason => {
             let lower = reason.to_lowercase();
             if lower.starts_with("api_error")
@@ -216,11 +241,22 @@ fn claude_outcome(reason: &str) -> &'static str {
                 || lower.starts_with("failed")
                 || lower.starts_with("failure")
             {
-                "failure"
+                NativeTerminalReason::Failure
             } else {
-                "unknown"
+                NativeTerminalReason::Other
             }
         }
+    }
+}
+
+/// Canonical outcome for one Claude terminal reason, decided here at the
+/// plugin boundary; unrecognized reasons remain explicitly unknown.
+fn claude_outcome(reason: &str) -> &'static str {
+    match native_terminal_reason(reason) {
+        NativeTerminalReason::Success => "success",
+        NativeTerminalReason::Interrupted => "interrupted",
+        NativeTerminalReason::Failure => "failure",
+        NativeTerminalReason::Other => "unknown",
     }
 }
 
@@ -235,20 +271,26 @@ fn universal_status(outcome: &str) -> Option<String> {
     .map(str::to_owned)
 }
 
-/// Classify the original terminal reason first, then redact for persistence:
-/// a configured secret inside the reason must not change its outcome (a
-/// secret `error` redacts `api_error` into `api_[REDACTED]`, i.e. unknown).
-/// Returns the canonical outcome and the sanitized reason.
+/// Classify the original terminal reason first, then redact recognized values
+/// for persistence: a configured secret must not change its outcome. An
+/// unrecognized value is persisted only as `other`; its bounded diagnostic is
+/// emitted separately.
 fn terminal_outcome_and_status(
     reason: &str,
     secrets: &SecretPolicy,
     failure: Option<&Error>,
 ) -> (&'static str, String) {
+    let terminal_reason = native_terminal_reason(reason);
     let mut outcome = claude_outcome(reason);
     if outcome == "success" && failure.is_some_and(|error| error.code == "quota_exhausted") {
         outcome = "failure";
     }
-    (outcome, secrets.redact_text(reason))
+    let status = if terminal_reason == NativeTerminalReason::Other {
+        "other".to_owned()
+    } else {
+        secrets.redact_text(reason)
+    };
+    (outcome, status)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -423,12 +465,15 @@ struct EventProcessor {
     deny_uncertain: HashSet<String>,
     permission_admission_fenced: bool,
     message_seq: u64,
+    unclassified_sequence: u64,
     accept_frames: bool,
     planned_stop: bool,
     frames_drained: bool,
     pending_end_stop: Option<oneshot::Sender<Result<()>>>,
     writes_blocked: bool,
     gap_reported: bool,
+    terminal_deadline: Option<Instant>,
+    terminal_inactivity: std::time::Duration,
     /// Sticky first record-local fault awaiting its gap (planned-stop drain
     /// must not erase it if the immediate record was blocked).
     pending_fault_gap: Option<String>,
@@ -666,6 +711,7 @@ async fn run(
     let mut frames_open = true;
     let mut stream_open = true;
     loop {
+        let terminal_deadline = processor.terminal_deadline;
         // Frames win over controls: a queued terminal settles before any
         // `CheckTurn` behind it is answered.
         tokio::select! {
@@ -697,6 +743,17 @@ async fn run(
                 }
                 let state: StreamState = *stream.borrow();
                 processor.note_stream_state(state).await;
+            }
+            _ = async {
+                match terminal_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Err(error) = processor.expire_terminal_deadline().await {
+                    processor.status.source_unknown = true;
+                    processor.status.failure.get_or_insert(*error.message);
+                }
             }
             request = control.recv() => {
                 let Some(request) = request else { break };
@@ -864,6 +921,7 @@ impl EventProcessor {
             agent_id: config.agent_id,
             generation: config.generation,
             hook_callback_id,
+            native: Some(config.native),
             secrets: config.secrets,
             workspace: config.workspace,
             status: EventStatus::default(),
@@ -890,12 +948,15 @@ impl EventProcessor {
             deny_uncertain: HashSet::new(),
             permission_admission_fenced: false,
             message_seq: 0,
+            unclassified_sequence: 0,
             accept_frames: true,
             planned_stop: false,
             frames_drained: false,
             pending_end_stop: None,
             writes_blocked: false,
             gap_reported: false,
+            terminal_deadline: None,
+            terminal_inactivity: native_terminal_inactivity(),
             pending_fault_gap: None,
             final_text: None,
             native_failure: None,
@@ -904,7 +965,6 @@ impl EventProcessor {
             latest_context_sample: None,
             first_call_usage: FirstCallUsage::default(),
             closed: false,
-            native: None,
             status_tx,
             control_actor,
             pending_hooks: HashMap::new(),
@@ -1155,7 +1215,8 @@ impl EventProcessor {
         let kind = record
             .get("type")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .filter(|kind| !kind.trim().is_empty())
+            .ok_or_else(|| Error::new("native_protocol", "Claude record omitted its type"))?;
         // Sidechains can outlive the parent's turn. Filter before session,
         // association and tool-table checks, never against a later active turn.
         if matches!(kind, "assistant" | "user") && !is_main_thread(&record) {
@@ -1172,7 +1233,24 @@ impl EventProcessor {
                 self.cancel_hook_callback(&record);
                 Ok(())
             }
-            _ => Ok(()),
+            _ => {
+                if record
+                    .get("session_id")
+                    .is_some_and(|id| id.as_str() != self.status.session_id.as_deref())
+                {
+                    return Ok(());
+                }
+                if self.status.active_turn_id.is_some()
+                    && is_main_thread(&record)
+                    && record.get("session_id").and_then(Value::as_str).is_some()
+                    && record.get("turn_id").map_or(kind == "stream_event", |id| {
+                        id.as_str() == self.status.active_turn_id.as_deref()
+                    })
+                {
+                    self.refresh_terminal_deadline();
+                }
+                self.record_unclassified("claude.record.type", kind).await
+            }
         }
     }
 
@@ -1365,18 +1443,48 @@ impl EventProcessor {
                 "Claude command_lifecycle omitted its turn association",
             ));
         }
+        let matches_observed_turn = self
+            .pending_turn
+            .as_ref()
+            .is_some_and(|pending| pending.turn_id == parsed.command_uuid)
+            || self.status.active_turn_id.as_deref() == Some(parsed.command_uuid.as_str())
+            || self.active_input.as_deref() == Some(parsed.command_uuid.as_str())
+            || self.last_input.as_deref() == Some(parsed.command_uuid.as_str())
+            || self
+                .status
+                .last_turn
+                .as_ref()
+                .is_some_and(|last| last.turn_id == parsed.command_uuid);
+        if !matches_observed_turn {
+            return self
+                .record_gap("Claude lifecycle did not match the exact submitted turn")
+                .await;
+        }
+        if self.status.active_turn_id.as_deref() == Some(parsed.command_uuid.as_str())
+            || self.active_input.as_deref() == Some(parsed.command_uuid.as_str())
+        {
+            self.refresh_terminal_deadline();
+        }
+        let state = crate::native::types::CommandLifecycleState::from_native(&parsed.state);
+        if state == crate::native::types::CommandLifecycleState::Other {
+            self.record_unclassified("claude.command_lifecycle.state", &parsed.state)
+                .await?;
+        }
         if let Some(pending) = self.pending_turn.as_ref()
             && pending.turn_id == parsed.command_uuid
         {
             // A queued frame can follow the native result. Queue admission
             // alone cannot start a new turn after that result.
-            if parsed.state == "queued" && pending.overlaps_native && !self.status.native_unbound {
+            if state == crate::native::types::CommandLifecycleState::Queued
+                && pending.overlaps_native
+                && !self.status.native_unbound
+            {
                 return Ok(());
             }
-            return self.settle_pending_lifecycle(&parsed.state).await;
+            return self.settle_pending_lifecycle(state).await;
         }
         if self.status.active_turn_id.as_deref() == Some(parsed.command_uuid.as_str()) {
-            if parsed.state == "cancelled" {
+            if state == crate::native::types::CommandLifecycleState::Cancelled {
                 return self.complete_cancelled_turn().await;
             }
             return Ok(());
@@ -1384,7 +1492,7 @@ impl EventProcessor {
         if self.active_input.as_deref() == Some(parsed.command_uuid.as_str()) {
             // A merged input Claude dropped: the running native turn still
             // ends with its own result, unless that result already arrived.
-            if parsed.state == "cancelled" {
+            if state == crate::native::types::CommandLifecycleState::Cancelled {
                 self.active_input = None;
                 if self.native_prefix_ended {
                     return self.complete_cancelled_turn().await;
@@ -1405,7 +1513,10 @@ impl EventProcessor {
             .await
     }
 
-    async fn settle_pending_lifecycle(&mut self, state: &str) -> Result<()> {
+    async fn settle_pending_lifecycle(
+        &mut self,
+        state: crate::native::types::CommandLifecycleState,
+    ) -> Result<()> {
         let Some(pending) = self.pending_turn.take() else {
             return Ok(());
         };
@@ -1422,7 +1533,8 @@ impl EventProcessor {
             }
         };
         match state {
-            "queued" | "started" => {
+            crate::native::types::CommandLifecycleState::Queued
+            | crate::native::types::CommandLifecycleState::Started => {
                 if self.writes_blocked {
                     settle(
                         outcome,
@@ -1475,7 +1587,7 @@ impl EventProcessor {
                 // flush, not here, keeping the commit path non-recursive.
                 Ok(())
             }
-            "cancelled" => {
+            crate::native::types::CommandLifecycleState::Cancelled => {
                 self.cancelled_hook_requests.clear();
                 settle(
                     outcome,
@@ -1483,7 +1595,8 @@ impl EventProcessor {
                 );
                 Ok(())
             }
-            _ => {
+            crate::native::types::CommandLifecycleState::Completed
+            | crate::native::types::CommandLifecycleState::Other => {
                 self.cancelled_hook_requests.clear();
                 settle(
                     outcome,
@@ -1593,6 +1706,7 @@ impl EventProcessor {
                 )
                 .await;
         };
+        self.refresh_terminal_deadline();
         let main_thread = is_main_thread_assistant(record);
         let model = assistant_model(record);
         let model_output = main_thread
@@ -2577,15 +2691,68 @@ impl EventProcessor {
     /// One CLI `control_request`: only the `can_use_tool` permission ask is
     /// connected. It binds to the exact active turn and opens a retained
     /// request under the CLI's exact native `request_id`; any other subtype
-    /// is an explicit gap, as before.
+    /// is retained as an unclassified observation without inventing a reply.
     async fn observe_control_request(&mut self, record: &Value) -> Result<()> {
-        if record
+        if let Some(session_id) = record.get("session_id").and_then(Value::as_str)
+            && self.status.session_id.is_some()
+        {
+            self.check_session(session_id)?;
+        }
+        let subtype = record
             .get("request")
             .and_then(|request| request.get("subtype"))
             .and_then(Value::as_str)
-            == Some("hook_callback")
-        {
+            .unwrap_or_default();
+        if subtype.trim().is_empty() {
+            return Err(Error::new(
+                "native_protocol",
+                "Claude control_request omitted its subtype",
+            ));
+        }
+        let subtype_kind = NativeControlRequestSubtype::from_native(subtype);
+        if subtype_kind == NativeControlRequestSubtype::HookCallback {
             return self.observe_hook_callback(record).await;
+        }
+        let request_id = record
+            .get("request_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| {
+                Error::new(
+                    "native_protocol",
+                    "Claude control_request omitted its exact native request id",
+                )
+            })?;
+        if subtype_kind == NativeControlRequestSubtype::Other {
+            if !self.deny_uncertain.contains(request_id)
+                && self.retain_uncertain_id(request_id).await
+            {
+                let Some(native) = self.native.clone() else {
+                    return Err(Error::new(
+                        "unknown",
+                        "Claude could not refuse an unsupported control request",
+                    ));
+                };
+                if let Err(error) = native
+                    .refuse_control(
+                        request_id,
+                        "Unsupported Claude control request subtype",
+                        Instant::now() + EVENT_DEADLINE,
+                    )
+                    .await
+                {
+                    if matches!(
+                        error.code.as_str(),
+                        "native_not_dispatched" | "frame_too_large" | "native_encode"
+                    ) {
+                        self.deny_uncertain.remove(request_id);
+                    }
+                    return Err(error);
+                }
+            }
+            return self
+                .record_unclassified("claude.control_request.subtype", subtype)
+                .await;
         }
         let body = record
             .get("request")
@@ -2601,21 +2768,6 @@ impl EventProcessor {
                 Error::new(
                     "native_protocol",
                     "Claude control_request did not match its envelope",
-                )
-            })?;
-        if body.subtype != "can_use_tool" {
-            return self
-                .record_gap("Claude native request type is unconnected in this slice")
-                .await;
-        }
-        let request_id = record
-            .get("request_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new(
-                    "native_protocol",
-                    "Claude can_use_tool omitted its exact native request id",
                 )
             })?;
         if body.tool_name.trim().is_empty() || body.input.is_none() {
@@ -2650,6 +2802,7 @@ impl EventProcessor {
                 .record_gap("Claude permission ask arrived outside the exact active turn")
                 .await;
         };
+        self.refresh_terminal_deadline();
         let command_id = self.status.active_command_id.clone();
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         // The public approval fact carries only a neutral summary (the
@@ -3055,7 +3208,8 @@ impl EventProcessor {
                 .as_ref()
                 .is_some_and(|pending| parsed.names_input(&pending.turn_id))
         {
-            self.settle_pending_lifecycle("started").await?;
+            self.settle_pending_lifecycle(crate::native::types::CommandLifecycleState::Started)
+                .await?;
         }
         // Only a result naming other inputs accounts for the prefix. A
         // result without input UUIDs can finish an already-associated turn.
@@ -3114,6 +3268,10 @@ impl EventProcessor {
             .is_some_and(|last| last.turn_id == turn_id && last.terminal)
         {
             return Ok(());
+        }
+        if native_terminal_reason(&parsed.terminal_reason) == NativeTerminalReason::Other {
+            self.record_unclassified("claude.result.terminal_reason", &parsed.terminal_reason)
+                .await?;
         }
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let (outcome, terminal_reason) = terminal_outcome_and_status(
@@ -3443,9 +3601,62 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
+        let current = data["turn_id"]
+            .as_str()
+            .is_some_and(|turn| self.status.active_turn_id.as_deref() == Some(turn));
+        if matches!(kind, "turn.completed" | "session.ended") {
+            self.terminal_deadline = None;
+        }
         self.stream_source()
             .commit_event(kind, native_id, data)
-            .await
+            .await?;
+        if kind == "turn.started" {
+            self.terminal_deadline = Some(Instant::now() + self.terminal_inactivity);
+        } else if current && kind != "turn.unknown" {
+            self.refresh_terminal_deadline();
+        }
+        Ok(())
+    }
+
+    fn refresh_terminal_deadline(&mut self) {
+        if let Some(deadline) = &mut self.terminal_deadline {
+            *deadline = Instant::now() + self.terminal_inactivity;
+        }
+    }
+
+    async fn expire_terminal_deadline(&mut self) -> Result<()> {
+        self.terminal_deadline = None;
+        let Some(turn_id) = self.status.active_turn_id.clone() else {
+            return Ok(());
+        };
+        let session_id = self.status.session_id.as_deref().unwrap_or_default();
+        let native_id = format!("claude:{session_id}:{turn_id}:turn.unknown");
+        let mut data = json!({
+            "command_id": self.status.active_command_id,
+            "turn_id": turn_id,
+            "reason": NATIVE_TERMINAL_DEADLINE_REASON,
+        });
+        self.scope_turn_command(&mut data);
+        self.commit_event("turn.unknown", native_id, data).await
+    }
+
+    async fn record_unclassified(&mut self, site: &'static str, native_tag: &str) -> Result<()> {
+        // An observed session-start record is only a candidate until Ready
+        // compares it with the exact id minted for this native session.
+        if !self.status.ready {
+            return Ok(());
+        }
+        let sequence = self.unclassified_sequence;
+        self.unclassified_sequence = sequence.checked_add(1).ok_or_else(|| {
+            Error::new("internal", "Claude unclassified observation id exhausted")
+        })?;
+        let native_id = format!("claude:g{}:native_unclassified:{sequence}", self.generation);
+        self.commit_event(
+            eliot_plugin::native_data::UNCLASSIFIED_NATIVE_EVENT,
+            native_id,
+            eliot_plugin::native_data::unclassified(site, native_tag),
+        )
+        .await
     }
 
     async fn record_gap(&mut self, reason: &str) -> Result<()> {

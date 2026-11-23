@@ -4082,6 +4082,7 @@ struct SourceStateRecord {
     last_batch_digest: Option<Vec<u8>>,
     last_batch_first_seq: Option<i64>,
     last_batch_last_seq: Option<i64>,
+    last_batch_dropped: i64,
     state: String,
     health: String,
     gap_id: Option<String>,
@@ -6065,7 +6066,8 @@ fn load_source_state(
         .query_row(
             "SELECT cursor, last_store_seq, last_batch_id, last_batch_digest,
                     last_batch_first_seq, last_batch_last_seq, state, health,
-                    gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff
+                    gap_id, gap_digest, gap_from, gap_to, gap_seq, last_handoff_digest, last_handoff,
+                    last_batch_dropped
              FROM source_state WHERE agent = ?1 AND generation = ?2 AND source = ?3",
             params![agent, generation, source],
             |row| {
@@ -6085,6 +6087,7 @@ fn load_source_state(
                     gap_seq: row.get(12)?,
                     last_handoff_digest: row.get(13)?,
                     last_handoff: row.get(14)?,
+                    last_batch_dropped: row.get(15)?,
                 })
             },
         )
@@ -6139,6 +6142,7 @@ pub fn family_for_kind(kind: &str) -> Result<&'static str> {
         | "session.ended"
         | "session.usage"
         | "session.context.compacted"
+        | eliot_core::UNCLASSIFIED_NATIVE_EVENT
         | "quota.observed" => Ok("session"),
         "turn.started"
         | "turn.completed"

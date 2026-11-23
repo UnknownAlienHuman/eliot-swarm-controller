@@ -1886,6 +1886,17 @@ impl PluginHost {
         if let Some(value) = std::env::var_os("ELIOT_DEBUG_PLUGIN_PANIC") {
             command.env("ELIOT_DEBUG_PLUGIN_PANIC", value);
         }
+        #[cfg(debug_assertions)]
+        if crash_nonce_stdin
+            && self
+                .state
+                .data_root
+                .join(crate::stand_cleanup::STAND_MARKER)
+                .is_file()
+            && let Some(value) = std::env::var_os(eliot_core::limits::DEBUG_NATIVE_INACTIVITY_ENV)
+        {
+            command.env(eliot_core::limits::DEBUG_NATIVE_INACTIVITY_ENV, value);
+        }
         Ok(command)
     }
 

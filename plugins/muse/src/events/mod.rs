@@ -9,6 +9,7 @@ use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
     native_child::{ChildAction, binding_from_ack, is_admission_rejection, register_child},
+    native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text, attach_native_error,
@@ -2388,6 +2389,14 @@ impl EventProcessor {
         }
         match method.as_str() {
             "session/viewHealthChanged" => {
+                let health_tag = params
+                    .get("health")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let none_reason_tag = params
+                    .get("noneReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let notification: NativeSessionViewHealthChangedNotification =
                     serde_json::from_value(params).map_err(|_| {
                         Error::new(
@@ -2395,16 +2404,34 @@ impl EventProcessor {
                             "Muse view-health notification did not match its schema",
                         )
                     })?;
-                if self.status.session_id.as_deref() == Some(notification.session_id.as_str())
-                    && notification.health == NativeViewHealth::Unavailable
-                {
-                    self.view_unavailable(
-                        &notification.session_id,
-                        notification
-                            .none_reason
-                            .unwrap_or(NativeHistoryNoneReason::Unknown),
-                    )
-                    .await?;
+                if self.status.session_id.as_deref() == Some(notification.session_id.as_str()) {
+                    if notification.health == NativeViewHealth::Unavailable {
+                        self.view_unavailable(
+                            &notification.session_id,
+                            notification
+                                .none_reason
+                                .unwrap_or(NativeHistoryNoneReason::Other),
+                        )
+                        .await?;
+                    }
+                    if notification.health == NativeViewHealth::Other
+                        && let Some(native_tag) = health_tag.as_deref()
+                    {
+                        self.record_unclassified_native(
+                            "muse.session.viewHealthChanged.health",
+                            native_tag,
+                        )
+                        .await?;
+                    }
+                    if notification.none_reason == Some(NativeHistoryNoneReason::Other)
+                        && let Some(native_tag) = none_reason_tag.as_deref()
+                    {
+                        self.record_unclassified_native(
+                            "muse.session.viewHealthChanged.noneReason",
+                            native_tag,
+                        )
+                        .await?;
+                    }
                 }
             }
             "turn/started" => {
@@ -2582,7 +2609,16 @@ impl EventProcessor {
                         .await;
                 }
             }
-            _ => {}
+            _ => {
+                let belongs_to_owned_session = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|session_id| self.status.session_id.as_deref() == Some(session_id));
+                if belongs_to_owned_session {
+                    self.record_unclassified_native("muse.notification", &method)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -2964,6 +3000,10 @@ impl EventProcessor {
 
     /// Commit one natively observed turn terminal.
     async fn complete_turn(&mut self, params: Value) -> Result<()> {
+        let terminal_tag = params
+            .get("terminal")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
                 Error::new(
@@ -2981,12 +3021,18 @@ impl EventProcessor {
                 .record_gap("Muse terminal notification did not match the exact active turn")
                 .await;
         }
+        if notification.terminal == NativeTurnTerminal::Other
+            && let Some(native_tag) = terminal_tag.as_deref()
+        {
+            self.record_unclassified_native("muse.turn.completed.terminal", native_tag)
+                .await?;
+        }
         if self.status.view_unavailable
             || (notification.terminal == NativeTurnTerminal::Failed && notification.error.is_none())
         {
             self.status.needs_idle_proof = true;
             if !self.status.view_unavailable {
-                self.view_unavailable(&notification.session_id, NativeHistoryNoneReason::Unknown)
+                self.view_unavailable(&notification.session_id, NativeHistoryNoneReason::Other)
                     .await?;
             }
             // Leave the cursor and active turn in place until the daemon has
@@ -2996,11 +3042,7 @@ impl EventProcessor {
                 "Muse native view is unavailable; terminal requires command-plane confirmation",
             ));
         }
-        let Some(status_text) = turn_status(&notification.terminal) else {
-            return self
-                .record_gap("Muse turn/completed carried an unknown terminal")
-                .await;
-        };
+        let status_text = turn_status(&notification.terminal).unwrap_or("other");
         let command_id = self
             .status
             .active_command_id
@@ -3012,8 +3054,8 @@ impl EventProcessor {
             "command_id": command_id.clone(),
             "turn_id": notification.turn_id,
             "status": status_text,
-            "outcome": turn_outcome(&notification.terminal),
-            "native_status": native_terminal(&notification.terminal),
+            "outcome": turn_outcome(&notification.terminal).unwrap_or("unknown"),
+            "native_status": native_terminal(&notification.terminal).unwrap_or("other"),
         });
         // The semantic hold signal gets first claim on the bounded terminal data.
         if notification.terminal == NativeTurnTerminal::Failed {
@@ -3597,6 +3639,13 @@ impl EventProcessor {
                     return Ok(());
                 }
                 ChildAction::UnknownTerminal => {
+                    if let Some(native_tag) = child.terminal.as_deref()
+                        && NativeTurnTerminal::parse_workflow_terminal(native_tag)
+                            == NativeTurnTerminal::Other
+                    {
+                        self.record_unclassified_native("muse.workflow.child.terminal", native_tag)
+                            .await?;
+                    }
                     let host = self.host.clone();
                     let credential = self.credential.clone();
                     let sink = &mut self.sink;
@@ -3934,6 +3983,20 @@ impl EventProcessor {
                 }
             }
         }
+    }
+
+    async fn record_unclassified_native(
+        &mut self,
+        site: &'static str,
+        native_tag: &str,
+    ) -> Result<()> {
+        let native_id = format!("muse-unclassified:{}", ulid::Ulid::new());
+        self.commit_event(
+            UNCLASSIFIED_NATIVE_EVENT,
+            native_id,
+            unclassified(site, native_tag),
+        )
+        .await
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
@@ -4517,7 +4580,7 @@ pub(crate) fn turn_status(terminal: &NativeTurnTerminal) -> Option<&'static str>
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),
         NativeTurnTerminal::Cancelled => Some("interrupted"),
-        NativeTurnTerminal::Unknown => None,
+        NativeTurnTerminal::Other => None,
     }
 }
 
@@ -4529,7 +4592,7 @@ pub(crate) fn turn_outcome(terminal: &NativeTurnTerminal) -> Option<&'static str
         NativeTurnTerminal::Completed => Some("success"),
         NativeTurnTerminal::Failed => Some("failure"),
         NativeTurnTerminal::Cancelled => Some("interrupted"),
-        NativeTurnTerminal::Unknown => None,
+        NativeTurnTerminal::Other => None,
     }
 }
 
@@ -4540,7 +4603,7 @@ pub(crate) fn native_terminal(terminal: &NativeTurnTerminal) -> Option<&'static 
         NativeTurnTerminal::Completed => Some("completed"),
         NativeTurnTerminal::Failed => Some("failed"),
         NativeTurnTerminal::Cancelled => Some("cancelled"),
-        NativeTurnTerminal::Unknown => None,
+        NativeTurnTerminal::Other => None,
     }
 }
 

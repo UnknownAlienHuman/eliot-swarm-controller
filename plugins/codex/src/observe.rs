@@ -9,7 +9,7 @@ use crate::{
         StoreContext, fingerprint, finish_reader, milliseconds, open_pinned_reader, probe_store,
         project_subject,
     },
-    live_recovery::RecoveryPublisher,
+    live_recovery::{LiveCommitOutcome, RecoveryPublisher},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         types::{NativeHistoryItemsResponse, NativeObservedThreadReadResponse},
@@ -78,7 +78,6 @@ struct HistoryTurn {
 struct SubjectRead {
     projection: Value,
     rollout_path: Option<PathBuf>,
-    cli_version: String,
 }
 
 enum LiveIntent {
@@ -97,7 +96,6 @@ pub(crate) struct ObserverSession {
     params: ObserverAttachParams,
     store: StoreContext,
     rollout_path: Option<PathBuf>,
-    rollout_cli_version: String,
     secrets: Vec<String>,
     metadata_secrets: Vec<String>,
     reader: Option<NativeProcess>,
@@ -174,7 +172,6 @@ impl ObserverSession {
         let SubjectRead {
             projection: subject,
             rollout_path,
-            cli_version,
         } = subject_read;
 
         let metadata = match native_store_identity(&store).map(|identity| {
@@ -215,7 +212,6 @@ impl ObserverSession {
             params,
             store,
             rollout_path,
-            rollout_cli_version: cli_version,
             secrets,
             metadata_secrets,
             reader: Some(reader),
@@ -323,7 +319,6 @@ impl ObserverSession {
             let path = self.rollout_path.clone().ok_or_else(rollout_unavailable)?;
             let home = self.store.home().to_path_buf();
             let native_ref = self.params.native_ref.clone();
-            let cli_version = self.rollout_cli_version.clone();
             let binding = binding.clone();
             let secrets = self.secrets.clone();
             let std_deadline = deadline.into_std();
@@ -331,7 +326,6 @@ impl ObserverSession {
                 path,
                 codex_home: home,
                 native_ref,
-                cli_version,
                 query: (*query).clone(),
                 binding,
                 secrets,
@@ -501,12 +495,21 @@ impl ObserverSession {
                     .commit(record.events, record.cursor, deadline)
                     .await;
                 self.live_publication_failed = result.is_err();
-                self.live_cursor = Some(result?);
-                // A verified native record restores live coverage. The
-                // durable source gap remains in Store as historical evidence;
-                // this local marker only controls current health reporting.
-                self.live_gap_recorded = false;
-                self.live_problem = None;
+                match result? {
+                    LiveCommitOutcome::Acknowledged(cursor) => {
+                        self.live_cursor = Some(cursor);
+                        // A verified native record restores live coverage. The
+                        // durable source gap remains in Store as historical evidence;
+                        // this local marker only controls current health reporting.
+                        self.live_gap_recorded = false;
+                        self.live_problem = None;
+                    }
+                    LiveCommitOutcome::Suppressed(cursor) => {
+                        // Store advanced the checkpoint without a native
+                        // fact. That alone cannot restore source health.
+                        self.live_cursor = Some(cursor);
+                    }
+                }
             } else {
                 if page.cursor == from && !page.at_end && !page.partial_tail {
                     return Err(integrity());
@@ -601,10 +604,6 @@ impl ObserverSession {
         if self.live_rollout.is_some() {
             return Ok(());
         }
-        if validate_live_codec(&self.rollout_cli_version).is_err() {
-            self.live_problem = Some("observer rollout live edge is unavailable");
-            return Err(rollout_unavailable());
-        }
         if self.live_opening.is_none() {
             if self.rollout_path.is_none() {
                 let client = self.reader.as_ref().ok_or_else(live_unknown)?.client();
@@ -615,10 +614,6 @@ impl ObserverSession {
                         return Err(error);
                     }
                 };
-                if subject.cli_version != self.rollout_cli_version {
-                    self.live_problem = Some("observer rollout codec version changed");
-                    return Err(integrity());
-                }
                 self.rollout_path = subject.rollout_path;
             }
             let Some(path) = self.rollout_path.clone() else {
@@ -627,7 +622,6 @@ impl ObserverSession {
             };
             let home = self.store.home().to_path_buf();
             let native_ref = self.params.native_ref.clone();
-            let version = self.rollout_cli_version.clone();
             let binding = self.live_binding()?;
             let policy = self.live_policy.clone();
             self.live_opening = Some(tokio::task::spawn_blocking(move || {
@@ -635,7 +629,6 @@ impl ObserverSession {
                     path,
                     home,
                     native_ref,
-                    version,
                     binding,
                     policy,
                     deadline.into_std(),
@@ -672,7 +665,7 @@ impl ObserverSession {
             "generation":self.params.generation, "native_scope":self.store.scope(),
             "native_ref":self.params.native_ref, "profile":self.params.profile,
             "target_environment":self.params.target_environment, "store_binding":self.store.binding(),
-            "cli_version":self.rollout_cli_version, "source":"transcript", "mechanism":"rollout_tail",
+            "source":"transcript", "mechanism":"rollout_tail",
         }))
     }
 
@@ -809,11 +802,10 @@ impl ObserverSession {
             "direction": direction,
             "items_view": "notLoaded",
         });
-        if query.source == "rollout" {
-            if let Some(object) = context.as_object_mut() {
-                object.remove("items_view");
-            }
-            context["rollout_cli_version"] = json!(self.rollout_cli_version);
+        if query.source == "rollout"
+            && let Some(object) = context.as_object_mut()
+        {
+            object.remove("items_view");
         }
         fingerprint(context)
     }
@@ -1071,7 +1063,6 @@ async fn read_subject(
     Ok(SubjectRead {
         projection: subject,
         rollout_path,
-        cli_version,
     })
 }
 
@@ -1330,16 +1321,6 @@ fn acknowledge_live_outage(
         }
         LiveIntent::Health { .. } => {}
     }
-}
-
-fn validate_live_codec(version: &str) -> Result<()> {
-    if version != "0.161.0" {
-        return Err(Error::new(
-            "profile_error",
-            "Codex live observation requires the supported stable 0.161.0 codec",
-        ));
-    }
-    Ok(())
 }
 
 fn secret_in_payload() -> Error {

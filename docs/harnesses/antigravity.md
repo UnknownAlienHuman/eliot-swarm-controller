@@ -3,8 +3,10 @@
 Optional L6 adapter. One warm `agy acp` process belongs to one Eliot Agent
 generation and custody unit. Source: [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli).
 The manifest's native version (`1.5.2`) is diagnostic metadata, not a
-startup version gate. Startup validates the ACP protocol version and the
-advertised session selectors.
+startup version gate. The ACP `protocolVersion` returned at initialization is
+retained as metadata, not checked for equality with a pinned value. Startup
+still validates the exact session binding, advertised selectors and config
+readbacks needed by this adapter.
 
 ## Native identity and transport
 
@@ -27,10 +29,12 @@ option. The install directory ships no bundled docs or settings schema, so
 hook discovery truly requires a directory root. Inventory, model and quota reads,
 and launch check one resolved CLI. The daemon verifies the vendor CLI module in
 the executable before running bounded `agy acp --help` and `agy --version`.
-The ACP help must advertise stdio and the permission option used at launch.
-The manifest version stays diagnostic metadata.
+The bounded `agy acp --help` command must exit successfully; its help prose
+and option spelling do not gate discovery. Launch continues to pass explicit
+stdio and permission arguments and the private config root when isolation is selected.
 
-The adapter speaks Agent Client Protocol v1 (pinned schema
+The adapter uses the Agent Client Protocol v1 schema as its known wire shape
+(pinned schema
 `v1-7ec5185c.json`, AGY 1.5.2; permission and usage shapes re-verified
 against installed agy 1.5.9) over bounded NDJSON JSON-RPC stdio through
 the shared `native_stdio` transport: one process, correlated pending
@@ -45,8 +49,25 @@ system-context and steer paths below use the separate native CLI
 `PreInvocation` hook; they are not ACP operations. `active_turn`
 injection remains unsupported.
 
+After draining a lost stream, the adapter closes still-open tools from the exact
+bound prompt as `unknown` before reporting loss, while the Store remains writable.
+
+The adapter ignores additional JSON fields. Unknown live `sessionUpdate` tags,
+valid unknown JSON-RPC notification methods and unfamiliar tool status, prompt
+stop reason and permission option kind values are committed as
+`session.native_unclassified` observations with unique event ids. Unknown
+notifications are recorded after session binding and require a valid envelope;
+a supplied `sessionId` must match the bound session. These observations do not terminate the event stream or imply a
+success, failure, interruption or approval. An unknown prompt stop reason
+settles that prompt with `status` and `outcome` set to `unknown` and canonical
+`native_status: "other"`; its raw tag is retained only in the bounded
+diagnostic. Empty and missing native discriminator values use the valid tags
+`empty` and `missing`. Broken framing and bound session/turn/request mismatches
+retain their existing fatal handling.
+
 The adapter uses `start_requires_input = false`: spawn, `initialize`
-(protocol 1), then `session/new` — or `session/load` with the exact
+(retaining the reported protocol version), then `session/new` — or
+`session/load` with the exact
 retained session id on resume, which sends no input by itself. The
 load reply is fenced in wire order behind the history replay: validated
 matching-session updates before the reply are discarded (never
@@ -93,7 +114,7 @@ public details: a redacted plain-text summary (title plus tool
 name/kind and compact raw input, never the native record) and one
 choice per usable offered option, `approve` for `allow_once`/
 `allow_always` and `deny` for `reject_once`/`reject_always`
-(`feedback_allowed: false`; unknown kinds are never offered).
+(`feedback_allowed: false`; unknown kinds are diagnosed and never offered).
 `swarm approve`/`deny` map to the ACP outcome using those kinds: an
 explicit `choice_id` must name an option whose kind matches the verb,
 otherwise the verb takes the least-privilege default (`allow_once`
@@ -138,9 +159,10 @@ The terminal `stopReason` settles the turn through
 the event state, never from the send ack alone. The fenced registration
 is held until that actual in-band terminal reply, an error, a stream
 fault, stop, or drop — stream silence is not staleness and no
-model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests` complete the
-turn, `cancelled` settles an interrupt, `refusal` fails it, and any other
-stop reason is a native protocol gap. Text chunks within an assistant message
+model-turn timer expires admitted work. `end_turn`/`max_tokens`/`max_turn_requests`
+complete the turn, `cancelled` settles an interrupt and `refusal` fails it. Any
+other stop reason is classified as `Other`, diagnosed, and settled with an
+unknown outcome rather than guessed. Text chunks within an assistant message
 are joined in ACP order. A tool invocation closes the preceding message and
 clears the final reply candidate. Bounded earlier messages are retained as
 `message.completed` events. An oversized message opens a `message` coverage
@@ -164,6 +186,14 @@ Tool calls map from `tool_call` and `tool_call_update` using the native
 validated permission ask in the current prompt. Omitted title and status
 inherit the last value for that call. AGY can finish an asynchronous tool
 after its prompt has completed and emit unsolicited assistant or tool output.
+An unfamiliar tool status is retained as `Other`, diagnosed, and produces no
+guessed tool lifecycle event. A later unfamiliar or missing status does not
+erase an already emitted `tool.started`. When the exact fenced terminal for
+that session's prompt arrives, each started tool without a `tool.completed`
+is closed once with `status: "unknown"`; the terminal does not prove tool
+success or failure. Updates from another `sessionId` are rejected before they
+can affect that session's tool lifecycles. An unknown-status tool that never
+emitted `tool.started` receives no fabricated lifecycle event.
 Once session identity is verified, assistant chunks and tool notifications
 received without a pending prompt record a `source.gap` scoped to `message` or
 `tool`. This applies before the first turn and after a fenced terminal reply.

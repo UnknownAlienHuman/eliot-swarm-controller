@@ -584,10 +584,9 @@ process loss ends that controlled generation after buffered output is drained.
 Observe-only live reading is separate from private `agent.history` pages. It opens only
 the exact rollout path returned for the attached `native_ref`, verifies its held-file
 identity and `session_meta` header under the selected Codex home's `sessions` or
-`archived_sessions` root. Metadata attachment and native `agent.history` pages do not
-depend on the live rollout codec gate; opening the live tail remains pinned to Codex
-0.161.0 and rejects other versions before reading records or establishing a live cursor.
-It captures a bounded live-edge baseline. Only after private `source.state` proves
+`archived_sessions` root. The reported CLI version is metadata; rollout records are
+selected by their data shape, and an unverified version does not gate observation. It
+captures a bounded live-edge baseline. Only after private `source.state` proves
 settled `observer_ready` does it commit a gap-backed `observe` to `transcript` handoff
 (`rollout_tail`). Store
 rechecks readiness, subject and ownership before accepting each observed batch. History
@@ -596,22 +595,31 @@ pages never publish events or settle commands.
 The live cursor binds the exact Agent generation, native scope/ref and held file identity
 to an exclusive byte offset. It advances only past complete newline-terminated records;
 a partial tail does not advance and is not a complete/EOF page. Replacement, truncation,
-header mismatch or unsupported normalization yields an explicit gap/unavailable result,
-not an empty-complete page or a newly selected path. Each page requests at most one
-normalized record, with bounded byte scanning and the observation page/cursor limits; it
-does not scan the whole file in one call.
+native-ref mismatch, broken framing or a known record with an invalid binding yields an
+explicit gap/unavailable result, not an empty-complete page or a newly selected path.
+Unknown record and event tags emit `session.native_unclassified` with a bounded
+discriminator and continue without changing turn or tool binding. Each page requests at
+most one normalized record, with bounded byte scanning and the observation page/cursor
+limits; it does not scan the whole file in one call.
 
-For the pinned Codex 0.161.0 rollout format at upstream commit
+For the Codex rollout writer at upstream commit
 `979011409de0a60b52f179721948e65531d26144`, task/turn lifecycle uses canonical
 `task_started`/`turn_started`, `task_complete`/`turn_complete` and
 `task_aborted`/`turn_aborted` records. Persisted usage/thread metadata
 (`token_count`, `thread_settings_applied`, `thread_goal_updated`,
-`thread_rolled_back`, `item_completed`) and the upstream 0.167.1 persisted dynamic-tool catalog (`dynamic_tools_updated`, rollout `policy.rs`), legacy message/tool echoes and
-legacy-mode records are ignorable without clearing binding; only
-lifecycle records mutate binding. An aborted turn emits an interrupted
-(`reason: interrupted`) or failed terminal turn with its native reason; the abort row itself still resolves to the aborted turn (a schema-valid abort carries no `turn_id` upstream), then it
-clears the active binding and releases the aborted turn id, so a following
-start is not an anomaly and later items cannot attach to the aborted turn.
+`thread_rolled_back`, `item_completed`) and the upstream 0.167.1 persisted
+dynamic-tool catalog (`dynamic_tools_updated`, rollout `policy.rs`), legacy
+message/tool echoes and legacy-mode records are ignorable without clearing binding; only
+lifecycle records mutate binding. A new event or item type emits an unclassified
+diagnostic and leaves binding unchanged. An abort settles the bound turn as
+interrupted for `reason: interrupted` or failed for another recognized reason.
+An unfamiliar abort reason produces a diagnostic and an unknown outcome. An abort
+without a `turn_id` is unclassified in the live tail and supplies no turn fact in
+history. A subsequent exact start binds its own turn without settling the older
+one. An exactly bound abort releases its turn binding. The app-server stream
+closes any still-open tools as `unknown` before settling their turn, ending the
+session or reporting drained stream loss. A new turn cannot inherit open tools
+from the previous binding.
 Only legacy message/tool echoes are otherwise suppressed; `FinalAnswer` and EOF are not terminal evidence.
 The outer JSONL record timestamp is retained as epoch milliseconds in `NativeEvent.ts`.
 Optional lifecycle `data.started_at` and `data.completed_at` are integer epoch seconds
@@ -622,6 +630,19 @@ turn `final_text`; a present error or explicit abort is nonsuccess. Only a
 `message.completed` with phase `final_answer` may fill turn `final_text`; commentary or
 missing phase leaves it unknown. Observation never calls resume, fork, Goal or send to
 obtain visibility. Parent idle does not prove children completed.
+
+For native JSON-RPC, unknown notification methods publish a compact
+`session.native_unclassified` fact and the stream continues. The known high-volume
+0.167.1 delta notifications (`item/agentMessage/delta`,
+`item/commandExecution/outputDelta`, `item/fileChange/outputDelta`, `item/plan/delta`,
+`item/reasoning/summaryPartAdded`, `item/reasoning/summaryTextDelta`, and
+`item/reasoning/textDelta`) are skipped before the bounded lossy queue. An unfamiliar
+turn status decodes as `Other`, records its bounded native tag, and a `turn/completed`
+record yields an explicit `unknown` outcome without inferring success, failure or
+interruption. Exact thread/turn binding mismatches and malformed frames remain fatal.
+Unknown command and file-change statuses also decode as `Other` and are diagnosed;
+they do not produce a guessed `tool.completed`. Unknown message phases do not mark a
+final answer, and unknown patch-change kinds do not add an inferred move path.
 
 OpenCodex is added as a named provider route in L3, initially attached to an owner-run
 service. Do not edit owner global Codex config. Keep client/admin credentials separate

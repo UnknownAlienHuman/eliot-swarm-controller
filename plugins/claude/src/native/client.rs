@@ -26,8 +26,9 @@ use eliot_plugin::{
 };
 
 use crate::native::types::{
-    ControlResponse, HookCallbackResponse, OutboundControlRequest, OutboundControlResponse,
-    OutboundControlResponseBody, OutboundUserInput, PermissionResult,
+    ControlResponse, HookCallbackResponse, OutboundControlError, OutboundControlErrorBody,
+    OutboundControlRequest, OutboundControlResponse, OutboundControlResponseBody,
+    OutboundUserInput, PermissionResult,
 };
 
 const LABELS: NativeLabels = NativeLabels {
@@ -172,6 +173,35 @@ impl ClaudeClient {
                     subtype: "success",
                     request_id: request_id.to_owned(),
                     response: result,
+                },
+            },
+        )?;
+        self.write_encoded(encoded, deadline).await
+    }
+
+    /// Refuse one inbound control request at the protocol level. The native
+    /// request id is exact and the `error` subtype avoids inventing a response
+    /// shape for an unsupported request kind.
+    pub async fn refuse_control(
+        &self,
+        request_id: &str,
+        message: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        if request_id.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "Claude control refusal requires the exact native request id",
+            ));
+        }
+        let encoded = encode_frame(
+            LABELS.server,
+            &OutboundControlError {
+                kind: "control_response",
+                response: OutboundControlErrorBody {
+                    subtype: "error",
+                    request_id: request_id.to_owned(),
+                    error: message.to_owned(),
                 },
             },
         )?;

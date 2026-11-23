@@ -170,12 +170,33 @@ The SDK's structured `assistant.error:"billing_error"` on the main assistant
 marks a provider billing/quota refusal. If that remains the last main assistant
 error at a normal terminal, the turn settles as `failure`, origin `provider`,
 with `native_error.code:"quota_exhausted"` and a typed quota restriction (no
-reset is invented). The original terminal reason stays in `native_status`.
+reset is invented). A recognized terminal reason stays in `native_status`; an
+unrecognized one persists as `other`, with its bounded tag in the diagnostic.
 A later normal main-assistant record clears an earlier refusal, so recovered
-turns can succeed. Sidechain records do not change this state; cancelled and
-unknown terminal reasons keep their outcomes. This uses the
+turns can succeed. Sidechain records do not change this state. Cancelled
+reasons map to interruption; unknown terminal reasons keep outcome `unknown`
+and are never guessed as success, failure, or interruption. This uses the
 [vendor SDKAssistantMessage error field](https://code.claude.com/docs/en/agent-sdk/typescript#sdkassistantmessage),
 not error prose.
+
+The stream decoder ignores additive fields. Unknown top-level record types,
+unconnected `control_request` subtypes, unknown `command_lifecycle.state`
+values, and unrecognized terminal reasons are recorded as neutral
+`session.native_unclassified` observations with only the site and bounded native
+tag, after readiness has matched the observed session id to the exact id minted
+for this CLI. Earlier unknown records are discarded. An unrecognized
+`control_request` with an exact `request_id` receives a protocol `control_response`
+with `subtype: "error"` and a bounded refusal string; no subtype-specific response
+payload is guessed. Unknown lifecycle states do not create a turn start or
+terminal; an unknown terminal reason preserves outcome `unknown` and persists
+terminal status `other`.
+Malformed NDJSON and exact session/turn/request binding failures retain their
+existing error handling. Version numbers in the capture notes above are
+historical evidence snapshots, not exact-version launch gates.
+
+After 30 minutes without bound native activity, a turn with no result settles
+as `unknown` with reason `native_terminal_deadline`. Later bound output is
+retained, and an exact native result can resolve the outcome.
 
 | Eliot verb | Mechanism / limitation |
 | --- | --- |

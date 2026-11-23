@@ -3,8 +3,9 @@
 //! The event task owns the controlled `stream` source: it routes every SSE
 //! envelope by exact session, commits one native record per batch
 //! (`session.ready`, `turn.started`, `tool.started`, `tool.completed`,
-//! `message.completed`, `turn.completed`, `session.ended`), and records an
-//! explicit gap on any loss or unmodelled native behavior. Tool lifecycle
+//! `message.completed`, `turn.completed`, `session.ended`), records an
+//! explicit gap on loss, and retains unfamiliar bound tags as neutral native
+//! diagnostics. Tool lifecycle
 //! facts map from the installed `session.tool.*` events; the remaining
 //! streaming detail (`text`/`reasoning` deltas, tool input deltas and
 //! progress, steps, usage, ephemeral status) is folded into the terminal
@@ -17,17 +18,18 @@ use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestrictionKind, Result, SecretPolicy,
     SessionUsage, TurnUsage,
     api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
-    limits::MAX_TOOL_COMMAND_BYTES,
+    limits::{MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
         EVENT_DEADLINE, StreamSource, attach_final_text, attach_native_error, event_id,
-        is_blank_native_text, next_input_outcomes, redact_request_details_for_commit,
-        with_claimed_context,
+        is_blank_native_text, native_terminal_inactivity, next_input_outcomes,
+        redact_request_details_for_commit, with_claimed_context,
     },
 };
 
@@ -65,6 +67,65 @@ const MAX_STEER_WATCHES: usize = 128;
 const MAX_TOOL_PARTS: usize = 128;
 const MAX_TOOL_FAILURE_CONTENT_BLOCKS: usize = 32;
 const MAX_TOOL_FAILURE_OUTPUT_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy)]
+enum NativeSessionStatus<'a> {
+    Idle,
+    Retry,
+    Busy,
+    Other(&'a str),
+}
+
+impl<'a> NativeSessionStatus<'a> {
+    fn from_tag(tag: &'a str) -> Self {
+        match tag {
+            "idle" => Self::Idle,
+            "retry" => Self::Retry,
+            "busy" => Self::Busy,
+            other => Self::Other(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NativeCompactionReason<'a> {
+    Auto,
+    Manual,
+    Other(&'a str),
+    Missing,
+}
+
+impl NativeCompactionReason<'_> {
+    fn projection(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Other(_) | Self::Missing => "unknown",
+        }
+    }
+}
+
+fn is_known_streaming_detail(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "session.compaction.delta"
+            | "session.idle"
+            | "session.reasoning.delta"
+            | "session.reasoning.ended"
+            | "session.reasoning.started"
+            | "session.step.ended"
+            | "session.step.failed"
+            | "session.step.streamed"
+            | "session.text.delta"
+            | "session.text.ended"
+            | "session.text.started"
+            | "session.tool.input.delta"
+            | "session.tool.input.ended"
+            | "session.tool.progress"
+            | "session.usage.recorded"
+            | "session.usage.updated"
+    )
+}
 
 fn native_tool_failure_output(data: &Value) -> (Option<String>, bool) {
     let mut truncated = data
@@ -365,6 +426,8 @@ struct EventProcessor {
     close_frames: bool,
     writes_blocked: bool,
     gap_reported: bool,
+    terminal_deadline: Option<Instant>,
+    terminal_inactivity: std::time::Duration,
     pending: Option<PendingInbox>,
     compaction: Option<CompactWatch>,
     compaction_start: Option<CompactionStart>,
@@ -714,6 +777,8 @@ impl EventProcessor {
             close_frames: false,
             writes_blocked: false,
             gap_reported: false,
+            terminal_deadline: None,
+            terminal_inactivity: native_terminal_inactivity(),
             pending: None,
             compaction: None,
             compaction_start: None,
@@ -1394,7 +1459,34 @@ impl EventProcessor {
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
-        self.commit_event("turn.started", native_id, data).await
+        self.commit_event("turn.started", native_id, data).await?;
+        self.terminal_deadline = Some(Instant::now() + self.terminal_inactivity);
+        Ok(())
+    }
+
+    async fn expire_terminal_deadline(&mut self) -> Result<()> {
+        self.terminal_deadline = None;
+        let Some(input) =
+            self.status.turn_input.clone().filter(|input| {
+                self.status.active_turn_id.as_deref() == Some(input.turn_id.as_str())
+            })
+        else {
+            return Ok(());
+        };
+        let native_id = event_id(
+            self.status.session_id.as_deref().unwrap_or_default(),
+            &input.turn_id,
+            &input.turn_id,
+            "turn.unknown",
+            "opencode",
+            "OpenCode",
+        )?;
+        let data = json!({
+            "command_id": input.command_id,
+            "turn_id": input.turn_id,
+            "reason": NATIVE_TERMINAL_DEADLINE_REASON,
+        });
+        self.commit_event("turn.unknown", native_id, data).await
     }
 
     /// Start the owned-generation context poll once readiness proved the
@@ -1689,7 +1781,11 @@ impl EventProcessor {
                 self.expected_seq == Some(durable.seq)
                     && self.status.session_id.as_deref() == Some(durable.aggregate_id.as_str())
             });
+        let active_progress = self.is_active_turn_progress(&envelope);
         self.check_sequence(&envelope).await?;
+        if active_progress {
+            self.refresh_terminal_deadline();
+        }
         match envelope.event_type.as_str() {
             "server.connected" => {
                 self.status.connected = true;
@@ -1730,12 +1826,74 @@ impl EventProcessor {
             "session.model.selected" | "session.agent.selected" => {
                 self.observe_selected(&envelope).await
             }
-            // Streaming detail (text/reasoning deltas, tool input deltas and
-            // progress, steps, usage), ephemeral status, and any future type
-            // fold into the terminal readback or stay unconnected; they are
-            // never gaps.
-            _ => Ok(()),
+            "session.status" => self.observe_session_status(&envelope).await,
+            // Known streaming details are intentionally folded into terminal
+            // readback or left unmapped. New event tags are retained below as
+            // neutral diagnostics after exact session binding.
+            _ if is_known_streaming_detail(&envelope.event_type) => Ok(()),
+            _ => self.commit_unclassified_event(&envelope).await,
         }
+    }
+
+    async fn observe_session_status(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(());
+        };
+        if envelope.data.get("sessionID").and_then(Value::as_str) != Some(session_id.as_str()) {
+            return Ok(());
+        }
+        let Some(tag) = envelope
+            .data
+            .get("status")
+            .and_then(|status| status.get("type"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(());
+        };
+        match NativeSessionStatus::from_tag(tag) {
+            NativeSessionStatus::Idle | NativeSessionStatus::Retry | NativeSessionStatus::Busy => {
+                Ok(())
+            }
+            NativeSessionStatus::Other(tag) => {
+                self.commit_unclassified_native(
+                    &session_id,
+                    "",
+                    &envelope.id,
+                    "opencode.session.status.type",
+                    tag,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn commit_unclassified_event(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(());
+        };
+        let data_session = envelope.data.get("sessionID").and_then(Value::as_str);
+        if envelope.data.get("sessionID").is_some() && data_session.is_none() {
+            return Ok(());
+        }
+        let durable_session = envelope
+            .durable
+            .as_ref()
+            .map(|durable| durable.aggregate_id.as_str());
+        if data_session.is_some_and(|native_id| native_id != session_id.as_str())
+            || durable_session.is_some_and(|native_id| native_id != session_id.as_str())
+            || (data_session != Some(session_id.as_str())
+                && durable_session != Some(session_id.as_str()))
+        {
+            return Ok(());
+        }
+        self.commit_unclassified_native(
+            &session_id,
+            "",
+            &envelope.id,
+            "opencode.sse.event_type",
+            &envelope.event_type,
+        )
+        .await
     }
 
     async fn observe_compaction(&mut self, envelope: &SseEnvelope) -> Result<()> {
@@ -1772,11 +1930,23 @@ impl EventProcessor {
             return Ok(());
         }
 
-        let reason = match envelope.data["reason"].as_str() {
-            Some("auto") => "auto",
-            Some("manual") => "manual",
-            _ => "unknown",
+        let native_reason = match envelope.data["reason"].as_str() {
+            Some("auto") => NativeCompactionReason::Auto,
+            Some("manual") => NativeCompactionReason::Manual,
+            Some(other) => NativeCompactionReason::Other(other),
+            None => NativeCompactionReason::Missing,
         };
+        if let NativeCompactionReason::Other(tag) = native_reason {
+            self.commit_unclassified_native(
+                &session_id,
+                "",
+                &envelope.id,
+                "opencode.session.compaction.reason",
+                tag,
+            )
+            .await?;
+        }
+        let reason = native_reason.projection();
         let input_id = envelope.data["inputID"]
             .as_str()
             .filter(|input| !input.trim().is_empty());
@@ -2496,6 +2666,19 @@ impl EventProcessor {
         if self.last_compaction_terminal.as_ref() == Some(&envelope.id) {
             return Ok(());
         }
+        if envelope.event_type == "session.execution.interrupted"
+            && let Some(reason) = terminal.reason.as_deref()
+            && !matches!(reason, "user" | "shutdown" | "superseded" | "inactivity")
+        {
+            self.commit_unclassified_native(
+                &terminal.session_id,
+                "",
+                &envelope.id,
+                "opencode.session.execution.interrupted.reason",
+                reason,
+            )
+            .await?;
+        }
         if let Some(watch) = self.compaction.take() {
             self.status.compaction_in_flight = false;
             self.stashed_started = None;
@@ -2509,6 +2692,7 @@ impl EventProcessor {
         let Some((command_id, turn_id)) = self.resolve_terminal_turn().await? else {
             return Ok(());
         };
+        self.terminal_deadline = None;
         // Fence the captured turn the moment its terminal is observed,
         // independent of readback success: controls interleaving with
         // the readback await below must never see it active again, and
@@ -2523,7 +2707,13 @@ impl EventProcessor {
         let (status, outcome) = match envelope.event_type.as_str() {
             "session.execution.succeeded" => ("completed", "success"),
             "session.execution.failed" => ("failed", "failure"),
-            _ => ("interrupted", "interrupted"),
+            "session.execution.interrupted" => ("interrupted", "interrupted"),
+            _ => {
+                return Err(Error::new(
+                    "invalid",
+                    "OpenCode terminal event type is not classified",
+                ));
+            }
         };
         // The exactly associated stream terminal proves status independently
         // of optional HTTP text/usage enrichment. A dead server cannot revoke
@@ -2687,6 +2877,7 @@ impl EventProcessor {
             });
         }
         self.status.stopped = true;
+        self.terminal_deadline = None;
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
@@ -2717,9 +2908,78 @@ impl EventProcessor {
     }
 
     async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
+        let current = data["turn_id"]
+            .as_str()
+            .is_some_and(|turn| self.status.active_turn_id.as_deref() == Some(turn));
         self.stream_source()
             .commit_event(kind, native_id, data)
-            .await
+            .await?;
+        if current && kind != "turn.unknown" {
+            self.refresh_terminal_deadline();
+        }
+        Ok(())
+    }
+
+    fn refresh_terminal_deadline(&mut self) {
+        if let Some(deadline) = &mut self.terminal_deadline {
+            *deadline = Instant::now() + self.terminal_inactivity;
+        }
+    }
+
+    /// OpenCode has one execution lane per session. Its ordered execution
+    /// deltas belong to the associated turn, including the deltas we do not
+    /// publish to the Store.
+    fn is_active_turn_progress(&self, envelope: &SseEnvelope) -> bool {
+        let (Some(session), Some(turn)) = (
+            self.status.session_id.as_deref(),
+            self.status.active_turn_id.as_deref(),
+        ) else {
+            return false;
+        };
+        let named_session = envelope.data.get("sessionID");
+        let durable = envelope.durable.as_ref();
+        if named_session.is_some_and(|id| id.as_str() != Some(session))
+            || durable.is_some_and(|record| {
+                record.aggregate_id != session
+                    || self.expected_seq.is_some_and(|next| record.seq < next)
+            })
+        {
+            return false;
+        }
+        let kind = envelope.event_type.as_str();
+        if let Some(id) = envelope.data.get("turnID") {
+            return id.as_str() == Some(turn) && (named_session.is_some() || durable.is_some());
+        }
+        (named_session.is_some() || durable.is_some())
+            && (kind.starts_with("session.step.")
+                || kind.starts_with("session.tool.")
+                || kind.starts_with("session.text.")
+                || kind.starts_with("session.reasoning.")
+                || kind == "session.retry.scheduled")
+    }
+
+    async fn commit_unclassified_native(
+        &mut self,
+        session_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        site: &'static str,
+        native_tag: &str,
+    ) -> Result<()> {
+        let native_id = event_id(
+            session_id,
+            turn_id,
+            item_id,
+            UNCLASSIFIED_NATIVE_EVENT,
+            "opencode",
+            "OpenCode",
+        )?;
+        self.commit_event(
+            UNCLASSIFIED_NATIVE_EVENT,
+            native_id,
+            unclassified(site, native_tag),
+        )
+        .await
     }
 
     /// `session.model.selected` / `session.agent.selected`: the switch
@@ -3811,6 +4071,7 @@ async fn run(
 ) {
     loop {
         let accept_frames = processor.accept_frames;
+        let terminal_deadline = processor.terminal_deadline;
         // Frames win over controls when both are ready: association and
         // terminal handling must observe stream order first.
         tokio::select! {
@@ -3822,6 +4083,17 @@ async fn run(
                 }
                 processor.handle_frame(frame).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
+            }
+            _ = async {
+                match terminal_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Err(error) = processor.expire_terminal_deadline().await {
+                    processor.status.source_unknown = true;
+                    processor.status.failure.get_or_insert(*error.message);
+                }
             }
             changed = stream.changed(), if accept_frames => {
                 let current = match changed {

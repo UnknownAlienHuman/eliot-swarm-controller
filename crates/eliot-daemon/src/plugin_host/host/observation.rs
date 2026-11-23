@@ -732,9 +732,11 @@ pub(super) async fn callback_error(
             || params["mechanism"].as_str() != Some("rollout_tail")
             || params["families"].as_array().is_none_or(|families| {
                 families.is_empty()
-                    || families
-                        .iter()
-                        .any(|family| !matches!(family.as_str(), Some("turn" | "message" | "tool")))
+                    || families.iter().any(|family| {
+                        family.as_str().is_none_or(|family| {
+                            !eliot_core::OBSERVED_ROLLOUT_FAMILIES.contains(&family)
+                        })
+                    })
             }))
     {
         return Some(Error::new(

@@ -6,7 +6,7 @@ const SOURCE: &str = "observe";
 
 fn observed_families(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
-        "codex" => Ok(&["session", "turn", "message", "tool"]),
+        "codex" => Ok(eliot_core::OBSERVED_ROLLOUT_FAMILIES),
         _ => Err(Error::new(
             "unsupported",
             "harness has no implemented observer reader",
@@ -138,7 +138,7 @@ pub(super) fn require_reader_source(
 
 pub(super) fn live_families(harness: &str) -> Result<&'static [&'static str]> {
     match harness {
-        "codex" => Ok(&["turn", "message", "tool"]),
+        "codex" => Ok(eliot_core::OBSERVED_ROLLOUT_FAMILIES),
         _ => Err(Error::new(
             "unsupported",
             "harness has no observed live-fact grant",

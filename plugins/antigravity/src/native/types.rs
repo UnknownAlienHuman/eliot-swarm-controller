@@ -171,13 +171,36 @@ pub(crate) fn prompt_turn_usage(result: &PromptResult) -> Option<TurnUsage> {
 
 /// One option the native offers for a `session/request_permission` ask.
 /// `kind` is one of the ACP `PermissionOptionKind` values (`allow_once`,
-/// `allow_always`, `reject_once`, `reject_always`); any other kind is
-/// retained but never maps to a reply decision.
+/// `allow_always`, `reject_once`, `reject_always`); other kinds never map to
+/// a reply decision and their raw tags are returned separately for diagnosis.
 #[derive(Clone, Debug)]
 pub(crate) struct PermissionOption {
     pub option_id: String,
     pub name: String,
-    pub kind: String,
+    pub kind: PermissionOptionKind,
+}
+
+/// ACP permission kinds stay explicit so unfamiliar values can be diagnosed
+/// without ever turning into an approval decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PermissionOptionKind {
+    AllowOnce,
+    AllowAlways,
+    RejectOnce,
+    RejectAlways,
+    Other,
+}
+
+impl PermissionOptionKind {
+    fn parse(value: &str) -> (Self, Option<String>) {
+        match value {
+            "allow_once" => (Self::AllowOnce, None),
+            "allow_always" => (Self::AllowAlways, None),
+            "reject_once" => (Self::RejectOnce, None),
+            "reject_always" => (Self::RejectAlways, None),
+            other => (Self::Other, Some(other.to_owned())),
+        }
+    }
 }
 
 /// A parsed `session/request_permission` ask: the tool call awaiting
@@ -192,17 +215,18 @@ pub(crate) struct PermissionAsk {
     pub tool_kind: Option<String>,
     pub raw_input: Value,
     pub options: Vec<PermissionOption>,
+    pub unclassified_option_kinds: Vec<String>,
 }
 
 /// Map an offered option kind to its reply direction: `true` grants
 /// (`allow_once`, `allow_always`), `false` refuses (`reject_once`,
 /// `reject_always`). Unknown kinds map to nothing and can never drive a
 /// reply on their own.
-pub(crate) fn permission_option_grants(kind: &str) -> Option<bool> {
+pub(crate) fn permission_option_grants(kind: &PermissionOptionKind) -> Option<bool> {
     match kind {
-        "allow_once" | "allow_always" => Some(true),
-        "reject_once" | "reject_always" => Some(false),
-        _ => None,
+        PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways => Some(true),
+        PermissionOptionKind::RejectOnce | PermissionOptionKind::RejectAlways => Some(false),
+        PermissionOptionKind::Other => None,
     }
 }
 
@@ -214,14 +238,20 @@ pub(crate) fn default_permission_option(
     options: &[PermissionOption],
     approve: bool,
 ) -> Option<&PermissionOption> {
-    let kinds: &[&str] = if approve {
-        &["allow_once", "allow_always"]
+    let kinds: &[PermissionOptionKind] = if approve {
+        &[
+            PermissionOptionKind::AllowOnce,
+            PermissionOptionKind::AllowAlways,
+        ]
     } else {
-        &["reject_once", "reject_always"]
+        &[
+            PermissionOptionKind::RejectOnce,
+            PermissionOptionKind::RejectAlways,
+        ]
     };
     kinds
         .iter()
-        .filter_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .filter_map(|kind| options.iter().find(|option| &option.kind == kind))
         .next()
 }
 
@@ -254,6 +284,7 @@ pub(crate) fn parse_permission_request(params: &Value) -> Option<PermissionAsk> 
         .map(str::to_owned);
     let raw_input = tool_call.get("rawInput").cloned().unwrap_or(Value::Null);
     let mut options = Vec::new();
+    let mut unclassified_option_kinds = Vec::new();
     if let Some(offered) = body.get("options").and_then(Value::as_array) {
         for option in offered {
             let entry = option.as_object();
@@ -273,10 +304,14 @@ pub(crate) fn parse_permission_request(params: &Value) -> Option<PermissionAsk> 
             if option_id.trim().is_empty() {
                 continue;
             }
+            let (kind, unclassified_kind) = PermissionOptionKind::parse(kind);
+            if let Some(unclassified_kind) = unclassified_kind {
+                unclassified_option_kinds.push(unclassified_kind);
+            }
             options.push(PermissionOption {
                 option_id: option_id.to_owned(),
                 name: name.to_owned(),
-                kind: kind.to_owned(),
+                kind,
             });
         }
     }
@@ -287,23 +322,27 @@ pub(crate) fn parse_permission_request(params: &Value) -> Option<PermissionAsk> 
         tool_kind,
         raw_input,
         options,
+        unclassified_option_kinds,
     })
 }
 
+#[derive(Debug)]
+pub(crate) enum PromptTerminalStatus {
+    Completed,
+    Cancelled,
+    Failed,
+    Other,
+}
+
 impl PromptResult {
-    /// Map the pinned `StopReason` vocabulary onto Eliot turn statuses.
-    /// `end_turn`/`max_tokens`/`max_turn_requests` end the turn normally,
-    /// `cancelled` is the interrupt settlement, `refusal` fails the turn,
-    /// and anything else is a native protocol violation.
-    pub fn terminal_status(&self) -> eliot_core::Result<Option<&'static str>> {
+    /// Map known stop reasons onto Eliot turn statuses. Preserve unfamiliar
+    /// values explicitly without assigning them a guessed outcome.
+    pub fn terminal_status(&self) -> PromptTerminalStatus {
         match self.stop_reason.as_str() {
-            "end_turn" | "max_tokens" | "max_turn_requests" => Ok(Some("completed")),
-            "cancelled" => Ok(Some("cancelled")),
-            "refusal" => Ok(Some("failed")),
-            _ => Err(eliot_core::Error::new(
-                "native_protocol",
-                "Antigravity prompt stop reason is unknown",
-            )),
+            "end_turn" | "max_tokens" | "max_turn_requests" => PromptTerminalStatus::Completed,
+            "cancelled" => PromptTerminalStatus::Cancelled,
+            "refusal" => PromptTerminalStatus::Failed,
+            _ => PromptTerminalStatus::Other,
         }
     }
 }
@@ -324,7 +363,7 @@ pub(crate) enum AcpUpdate {
         tool_kind: Option<String>,
         tool_name: Option<String>,
         diff_paths: ToolDiffPaths,
-        status: String,
+        status: Option<String>,
     },
     /// A tool call state change.
     ToolCallUpdate {
@@ -333,7 +372,7 @@ pub(crate) enum AcpUpdate {
         tool_kind: Option<String>,
         tool_name: Option<String>,
         diff_paths: ToolDiffPaths,
-        status: String,
+        status: Option<String>,
     },
     /// Context occupancy and cumulative session cost from `usage_update`:
     /// tokens currently in context, context-window capacity, and the
@@ -348,8 +387,8 @@ pub(crate) enum AcpUpdate {
     /// Known metadata updates this adapter does not model (plan, mode,
     /// config, notices, …): handled without input association.
     Ignored,
-    /// A `sessionUpdate` kind outside the pinned vocabulary.
-    Unknown(String),
+    /// A `sessionUpdate` kind outside the known vocabulary.
+    Other(String),
 }
 
 /// Bounded exact paths from ACP's structured file-diff content. Raw output and
@@ -511,8 +550,7 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                 status: update
                     .get("status")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                    .map(str::to_owned),
             },
             "tool_call_update" => AcpUpdate::ToolCallUpdate {
                 tool_call_id: tool_call_id(),
@@ -526,8 +564,7 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                 status: update
                     .get("status")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
+                    .map(str::to_owned),
             },
             "usage_update" => AcpUpdate::SessionUsage {
                 used: eliot_core::usage_counter(update.get("used")),
@@ -543,7 +580,7 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
             | "notice"
             | "compaction_update"
             | "compaction_summary_chunk" => AcpUpdate::Ignored,
-            other => AcpUpdate::Unknown(other.to_owned()),
+            other => AcpUpdate::Other(other.to_owned()),
         },
     ))
 }

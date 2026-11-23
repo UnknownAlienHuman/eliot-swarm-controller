@@ -15,6 +15,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
         EVENT_DEADLINE, MessageCommit, StreamSource, attach_final_text,
@@ -26,7 +27,7 @@ use eliot_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -215,6 +216,7 @@ struct EventProcessor {
     writes_blocked: bool,
     gap_reported: bool,
     final_text: Option<String>,
+    open_tools: BTreeMap<String, String>,
     turn_has_work_or_uncertain_effects: bool,
     /// Usage baseline and latest cumulative snapshot for the exact active
     /// turn, from `thread/tokenUsage/updated`. The baseline is the cumulative
@@ -444,6 +446,7 @@ impl EventProcessor {
             gap_reported: false,
             final_text: None,
             turn_has_work_or_uncertain_effects: false,
+            open_tools: BTreeMap::new(),
             turn_usage: None,
             first_call_usage: FirstCallUsage::default(),
             thread_model: None,
@@ -586,7 +589,7 @@ impl EventProcessor {
     async fn handle_frame(&mut self, frame: Option<NativeFrame>) {
         match frame {
             Some(NativeFrame::Request { id, method, params }) => {
-                if self.take_child_frame(&params) {
+                if self.take_child_frame(&params, true) {
                     self.reject_child_request(id, &method, &params).await;
                 } else if !self.status.ready || self.status.active_turn_id.is_none() {
                     self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
@@ -606,7 +609,7 @@ impl EventProcessor {
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
-                if self.take_child_frame(&params) {
+                if self.take_child_frame(&params, known_notification(&method)) {
                     self.handle_child_notification(&method, params).await;
                     return;
                 }
@@ -662,6 +665,19 @@ impl EventProcessor {
     }
 
     async fn report_gap_if_queue_empty(&mut self, queue_empty: bool) {
+        if queue_empty
+            && self.transport_loss
+            && !self.source_health_attempted
+            && !self.writes_blocked
+            && let (Some(turn), Some(command)) = (
+                self.status.active_turn_id.clone(),
+                self.status.active_command_id.clone(),
+            )
+        {
+            // Drain known completions first. The lost reader can no longer
+            // prove the outcome of anything still open.
+            let _ = self.close_open_tools(&turn, &command).await;
+        }
         if queue_empty
             && !self.gap_reported
             && !self.writes_blocked
@@ -719,7 +735,7 @@ impl EventProcessor {
                 | "item/completed"
                 | "serverRequest/resolved"
                 | "error"
-        ) || turn_activity_notification(method))
+        ) || (known_notification(method) && turn_activity_notification(method)))
             && (!self.status.ready || self.status.active_turn_id.is_none())
     }
 
@@ -838,6 +854,16 @@ impl EventProcessor {
                 "unknown",
                 "Codex event source acknowledgement is unresolved",
             ));
+        }
+        if !self.open_tools.is_empty() {
+            let previous = self.status.last_turn.as_ref().ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "Codex open tools have no previous turn binding",
+                )
+            })?;
+            let (turn, command) = (previous.turn_id.clone(), previous.command_id.clone());
+            self.close_open_tools(&turn, &command).await?;
         }
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
@@ -980,7 +1006,16 @@ impl EventProcessor {
                             "Codex compact turn/started did not match the installed schema",
                         )
                     })?;
-                if notification.turn.status != NativeTurnStatus::InProgress {
+                if matches!(&notification.turn.status, NativeTurnStatus::Other)
+                    && let Some(native_tag) = params.pointer("/turn/status").and_then(Value::as_str)
+                {
+                    self.record_unclassified_native("codex.native_rpc.turn_status", native_tag)
+                        .await?;
+                }
+                if !matches!(
+                    notification.turn.status,
+                    NativeTurnStatus::InProgress | NativeTurnStatus::Other
+                ) {
                     let progress = self.status.compaction.as_mut().unwrap();
                     progress.turn_id = Some(notification.turn.id);
                     progress.terminal_status = Some("unknown".to_owned());
@@ -996,6 +1031,9 @@ impl EventProcessor {
                             "Codex compact item/started did not match the installed schema",
                         )
                     })?;
+                if let Some((site, native_tag, _)) = unclassified_native_item(&notification.item) {
+                    self.record_unclassified_native(site, native_tag).await?;
+                }
                 if notification.item.get("type").and_then(Value::as_str)
                     == Some("contextCompaction")
                 {
@@ -1027,6 +1065,11 @@ impl EventProcessor {
                             "Codex compact item/completed did not match the installed schema",
                         )
                     })?;
+                if let Some(raw_item) = params.get("item")
+                    && let Some((site, native_tag, _)) = unclassified_native_item(raw_item)
+                {
+                    self.record_unclassified_native(site, native_tag).await?;
+                }
                 if let NativeThreadItem::ContextCompaction(item) = &notification.item {
                     let confirmed = {
                         let progress = self.status.compaction.as_mut().unwrap();
@@ -1058,12 +1101,19 @@ impl EventProcessor {
                             "Codex compact turn/completed did not match the installed schema",
                         )
                     })?;
+                if matches!(&notification.turn.status, NativeTurnStatus::Other)
+                    && let Some(native_tag) = params.pointer("/turn/status").and_then(Value::as_str)
+                {
+                    self.record_unclassified_native("codex.native_rpc.turn_status", native_tag)
+                        .await?;
+                }
                 let progress = self.status.compaction.as_mut().unwrap();
-                let status = match notification.turn.status {
+                let status = match &notification.turn.status {
                     NativeTurnStatus::Completed => "completed",
                     NativeTurnStatus::Failed => "failed",
                     NativeTurnStatus::Interrupted => "interrupted",
                     NativeTurnStatus::InProgress => "unknown",
+                    NativeTurnStatus::Other => "unknown",
                 };
                 progress.terminal_status =
                     Some(
@@ -1101,8 +1151,10 @@ impl EventProcessor {
                 break;
             }
             let child = match &frame.frame {
-                BufferedNativeFrame::Notification { params, .. }
-                | BufferedNativeFrame::Request { params, .. } => self.take_child_frame(params),
+                BufferedNativeFrame::Notification { method, params } => {
+                    self.take_child_frame(params, known_notification(method))
+                }
+                BufferedNativeFrame::Request { params, .. } => self.take_child_frame(params, true),
             };
             if child {
                 match frame.frame {
@@ -1482,6 +1534,28 @@ impl EventProcessor {
         self.commit_event("turn.notice", native_id, data).await
     }
 
+    async fn record_unclassified_native(
+        &mut self,
+        site: &'static str,
+        native_tag: &str,
+    ) -> Result<()> {
+        let thread_id = self.status.thread_id.as_deref().ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "Codex unclassified notification has no owned native thread",
+            )
+        })?;
+        self.notice_seq = self.notice_seq.wrapping_add(1);
+        let item_id = format!("unclassified-{}", self.notice_seq);
+        let native_id = event_id(thread_id, "session", &item_id, UNCLASSIFIED_NATIVE_EVENT)?;
+        self.commit_event(
+            UNCLASSIFIED_NATIVE_EVENT,
+            native_id,
+            unclassified(site, native_tag),
+        )
+        .await
+    }
+
     async fn process_notification(&mut self, method: &str, params: Value) -> Result<()> {
         if self
             .process_compaction_notification(method, &params)
@@ -1495,13 +1569,17 @@ impl EventProcessor {
         {
             self.turn_has_work_or_uncertain_effects = true;
         }
+        let native_turn_status = params
+            .pointer("/turn/status")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         match method {
             "turn/started" => {
                 let notification: NativeTurnStartedNotification = serde_json::from_value(params)
                     .map_err(|_| {
                         Error::new(
                             "native_protocol",
-                            "Codex turn/started did not match the 0.161 schema",
+                            "Codex turn/started notification was malformed",
                         )
                     })?;
                 validate_thread_and_turn(
@@ -1513,6 +1591,12 @@ impl EventProcessor {
                     return self
                         .record_gap("Codex turn/started did not match the exact submitted turn")
                         .await;
+                }
+                if matches!(&notification.turn.status, NativeTurnStatus::Other)
+                    && let Some(native_tag) = native_turn_status.as_deref()
+                {
+                    self.record_unclassified_native("codex.native_rpc.turn_status", native_tag)
+                        .await?;
                 }
                 self.turn_has_work_or_uncertain_effects |=
                     has_non_user_items(&notification.turn.items);
@@ -1534,6 +1618,9 @@ impl EventProcessor {
                     return self
                         .record_gap("Codex item/started was outside the exact active turn")
                         .await;
+                }
+                if let Some((site, native_tag, _)) = unclassified_native_item(&notification.item) {
+                    self.record_unclassified_native(site, native_tag).await?;
                 }
                 self.observe_spawn(&notification.item, false).await?;
                 // v2 child announcement: `kind: "started"` confirms the named
@@ -1580,6 +1667,7 @@ impl EventProcessor {
                         );
                     }
                     self.commit_event("tool.started", native_id, data).await?;
+                    self.open_tools.insert(item_id, item_type);
                 }
             }
             "item/completed" => {
@@ -1601,16 +1689,24 @@ impl EventProcessor {
                         .await;
                 }
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
-                self.observe_spawn(&raw_item, true).await?;
-                // v2 child announcement, idempotent with the `item/started`
-                // side: `kind: "started"` confirms, anything else is a no-op.
-                self.observe_sub_agent_activity(notification.thread_id.as_str(), &raw_item)
-                    .await?;
                 let item_type = raw_item
                     .get("type")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 self.turn_has_work_or_uncertain_effects |= item_type != "userMessage";
+                if let Some((site, native_tag, suppress_tool_terminal)) =
+                    unclassified_native_item(&raw_item)
+                {
+                    self.record_unclassified_native(site, native_tag).await?;
+                    if suppress_tool_terminal {
+                        return Ok(());
+                    }
+                }
+                self.observe_spawn(&raw_item, true).await?;
+                // v2 child announcement, idempotent with the `item/started`
+                // side: `kind: "started"` confirms, anything else is a no-op.
+                self.observe_sub_agent_activity(notification.thread_id.as_str(), &raw_item)
+                    .await?;
                 if let NativeThreadItem::ContextCompaction(item) = &notification.item {
                     self.commit_context_compacted(
                         &notification.thread_id,
@@ -1645,7 +1741,16 @@ impl EventProcessor {
             "error" => {
                 self.note_native_error(params).await?;
             }
-            _ => {}
+            _ => {
+                if self.status.ready
+                    && params
+                        .get("threadId")
+                        .is_none_or(|id| id.as_str() == self.status.thread_id.as_deref())
+                {
+                    self.record_unclassified_native("codex.native_rpc.notification", method)
+                        .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1668,7 +1773,7 @@ impl EventProcessor {
             "turn_id": turn_id,
             "text": text,
         });
-        let phase = item.get("phase").and_then(Value::as_str);
+        let phase = native_message_phase(item);
         if let Some(phase) = phase {
             data["phase"] = Value::String(phase.to_owned());
         }
@@ -1764,7 +1869,11 @@ impl EventProcessor {
             'paths: for change in file_change.changes {
                 let move_path = match change.kind {
                     NativePatchChangeKind::Update { move_path } => move_path,
-                    _ => None,
+                    NativePatchChangeKind::Add | NativePatchChangeKind::Delete => None,
+                    NativePatchChangeKind::Other => {
+                        truncated = true;
+                        continue;
+                    }
                 };
                 for path in std::iter::once(change.path).chain(move_path) {
                     let path_bytes = serde_json::to_vec(&path)
@@ -1787,7 +1896,31 @@ impl EventProcessor {
             data["changed_paths"] = json!(changed_paths);
             data["changed_paths_truncated"] = Value::Bool(truncated);
         }
-        self.commit_event("tool.completed", native_id, data).await
+        self.commit_event("tool.completed", native_id, data).await?;
+        self.open_tools.remove(&item_id);
+        Ok(())
+    }
+
+    async fn close_open_tools(&mut self, turn_id: &str, command_id: &str) -> Result<()> {
+        while let Some((item_id, tool)) = self.open_tools.first_key_value() {
+            let item_id = item_id.clone();
+            let native_id = event_id(
+                self.status.thread_id.as_deref().unwrap_or_default(),
+                turn_id,
+                &item_id,
+                "tool.completed",
+            )?;
+            let data = json!({
+                "command_id": command_id,
+                "turn_id": turn_id,
+                "item_id": item_id,
+                "tool": tool,
+                "status": "unknown",
+            });
+            self.commit_event("tool.completed", native_id, data).await?;
+            self.open_tools.remove(&item_id);
+        }
+        Ok(())
     }
 
     /// Fold one `thread/tokenUsage/updated` into the generation's retained
@@ -1862,11 +1995,16 @@ impl EventProcessor {
     }
 
     async fn complete_turn(&mut self, params: Value) -> Result<()> {
+        let native_status = params
+            .pointer("/turn/status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
                 Error::new(
                     "native_protocol",
-                    "Codex turn/completed did not match the 0.161 schema",
+                    "Codex turn/completed notification was malformed",
                 )
             })?;
         validate_thread_and_turn(&self.status, &notification.thread_id, &notification.turn.id)?;
@@ -1874,6 +2012,10 @@ impl EventProcessor {
             return self
                 .record_gap("Codex terminal notification did not match the exact active turn")
                 .await;
+        }
+        if matches!(&notification.turn.status, NativeTurnStatus::Other) {
+            self.record_unclassified_native("codex.native_rpc.turn_status", &native_status)
+                .await?;
         }
         self.settle_spawn_window();
         if notification.turn.status == NativeTurnStatus::InProgress {
@@ -1955,6 +2097,8 @@ impl EventProcessor {
             &notification.turn.id,
             "turn.completed",
         )?;
+        self.close_open_tools(&notification.turn.id, &command_id)
+            .await?;
         if let Err(error) = self.commit_event("turn.completed", native_id, data).await {
             if error.failure_where.as_deref() != Some("plugin.events.put") {
                 return Err(error);
@@ -2067,6 +2211,12 @@ impl EventProcessor {
                 "Codex source acknowledgement is unresolved",
             ));
         }
+        if let (Some(turn_id), Some(command_id)) = (
+            self.status.active_turn_id.clone(),
+            self.status.active_command_id.clone(),
+        ) {
+            self.close_open_tools(&turn_id, &command_id).await?;
+        }
         let native_id = format!(
             "codex:{}:session.ended",
             self.status.thread_id.as_deref().unwrap_or("unresolved")
@@ -2153,6 +2303,25 @@ impl EventProcessor {
 fn turn_activity_notification(method: &str) -> bool {
     (method.starts_with("item/") && !matches!(method, "item/started" | "item/completed"))
         || matches!(method, "turn/diff/updated" | "turn/plan/updated")
+}
+
+fn known_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "turn/started"
+            | "turn/completed"
+            | "item/started"
+            | "item/completed"
+            | "serverRequest/resolved"
+            | "thread/started"
+            | "thread/tokenUsage/updated"
+            | "error"
+            | "turn/diff/updated"
+            | "turn/plan/updated"
+            | "item/mcpToolCall/progress"
+            | "item/commandExecution/terminalInteraction"
+            | "item/fileChange/patchUpdated"
+    )
 }
 
 fn has_non_user_items(items: &[NativeThreadItem]) -> bool {
@@ -2493,6 +2662,57 @@ fn is_tool_type(item_type: &str) -> bool {
     )
 }
 
+fn native_message_phase(item: &Value) -> Option<&'static str> {
+    item.get("phase")
+        .and_then(Value::as_str)
+        .map(|phase| match phase {
+            "commentary" => "commentary",
+            "final_answer" => "final_answer",
+            _ => "other",
+        })
+}
+
+fn unclassified_native_item(item: &Value) -> Option<(&'static str, &str, bool)> {
+    let item_type = item.get("type")?.as_str()?;
+    match item_type {
+        "agentMessage" => item
+            .get("phase")
+            .and_then(Value::as_str)
+            .filter(|phase| !matches!(*phase, "commentary" | "final_answer"))
+            .map(|phase| ("codex.native_rpc.message_phase", phase, false)),
+        "commandExecution" => item
+            .get("status")
+            .and_then(Value::as_str)
+            .filter(|status| !matches!(*status, "inProgress" | "completed" | "failed" | "declined"))
+            .map(|status| ("codex.native_rpc.command_status", status, true)),
+        "fileChange" => {
+            if let Some(status) = item.get("status").and_then(Value::as_str).filter(|status| {
+                !matches!(*status, "inProgress" | "completed" | "failed" | "declined")
+            }) {
+                return Some(("codex.native_rpc.patch_status", status, true));
+            }
+            item.get("changes")
+                .and_then(Value::as_array)?
+                .iter()
+                .find_map(|change| {
+                    let change_kind = change.get("kind")?;
+                    let tag = change_kind
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .or_else(|| change_kind.as_str())?;
+                    (!matches!(tag, "add" | "delete" | "update")).then_some((
+                        "codex.native_rpc.patch_change_kind",
+                        tag,
+                        false,
+                    ))
+                })
+        }
+        "userMessage" | "contextCompaction" => None,
+        _ if is_tool_type(item_type) => None,
+        _ => Some(("codex.native_rpc.item_type", item_type, false)),
+    }
+}
+
 /// The tail of a failed tool's output: the whole text is redacted first, then
 /// the LAST `MAX_TOOL_ERROR_TAIL_BYTES` at a character boundary, starting at a
 /// line boundary when the retained bytes already hold one. A long build keeps
@@ -2520,6 +2740,7 @@ fn turn_status(status: &NativeTurnStatus) -> String {
         NativeTurnStatus::Interrupted => "interrupted".to_owned(),
         NativeTurnStatus::Failed => "failed".to_owned(),
         NativeTurnStatus::InProgress => "inProgress".to_owned(),
+        NativeTurnStatus::Other => "other".to_owned(),
     }
 }
 
@@ -2533,6 +2754,7 @@ fn turn_outcome(status: &NativeTurnStatus) -> &'static str {
         NativeTurnStatus::Interrupted => "interrupted",
         // Unreachable: a nonterminal `inProgress` status gaps before settling.
         NativeTurnStatus::InProgress => "unknown",
+        NativeTurnStatus::Other => "unknown",
     }
 }
 

@@ -366,6 +366,11 @@ impl CommitSink {
 
         let expected_count = i64::try_from(batch.events.len())
             .map_err(|_| Error::new("frame_too_large", "event batch is too large"))?;
+        let offered_diagnostics = batch
+            .events
+            .iter()
+            .filter(|event| event.kind == eliot_core::UNCLASSIFIED_NATIVE_EVENT)
+            .count() as i64;
         let expected_cursor = batch.cursor.clone();
         let mut params = serde_json::to_value(batch)
             .map_err(|_| Error::new("invalid", "event batch could not be encoded"))?;
@@ -388,12 +393,15 @@ impl CommitSink {
             Err(_) => return Err(self.lost_ack()),
         };
         let ack: BatchAck = serde_json::from_value(value).map_err(|_| self.lost_ack())?;
-        let actual_count = ack
-            .last_seq
-            .checked_sub(ack.first_seq)
-            .and_then(|count| count.checked_add(1));
-        if ack.first_seq <= 0
-            || actual_count != Some(expected_count)
+        let actual_count = match (ack.first_seq, ack.last_seq) {
+            (0, 0) => Some(0),
+            (first, last) if first > 0 && last >= first => last
+                .checked_sub(first)
+                .and_then(|range| range.checked_add(1)),
+            _ => None,
+        };
+        if !(0..=offered_diagnostics).contains(&ack.dropped_unclassified)
+            || actual_count != Some(expected_count - ack.dropped_unclassified)
             || ack.cursor != expected_cursor
         {
             return Err(self.lost_ack());

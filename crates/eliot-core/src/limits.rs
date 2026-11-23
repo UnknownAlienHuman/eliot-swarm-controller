@@ -12,6 +12,12 @@ pub const MAX_NATIVE_INBOUND_FRAME_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 512 * 1024;
 /// Persisted event data and final text.
 pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+pub const MAX_UNCLASSIFIED_NATIVE_FACTS_PER_SESSION: i64 = 64;
+
+/// Maximum silence on an associated native turn before its outcome is unknown.
+pub const NATIVE_TERMINAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub const NATIVE_TERMINAL_DEADLINE_REASON: &str = "native_terminal_deadline";
+pub const DEBUG_NATIVE_INACTIVITY_ENV: &str = "SWARM_QA_NATIVE_INACTIVITY_MS";
 
 /// Keep the end of a terminal reply within the encoded event budget.
 /// Callers sanitize the text before applying the bound. Required metadata

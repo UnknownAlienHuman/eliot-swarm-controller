@@ -60,6 +60,11 @@ pub(crate) enum AgyFrame {
     StreamFault(NativeStreamFault),
     /// A `session/update` notification body.
     Update(Value),
+    /// A valid, unfamiliar JSON-RPC notification without a response id.
+    UnclassifiedNotification {
+        method: String,
+        params: Option<Value>,
+    },
     /// The terminal reply of a fenced `session/prompt` call.
     PromptResponse(Result<Value>),
     /// The reply of a fenced `session/load` call: everything before it
@@ -138,10 +143,9 @@ pub(crate) struct AgyProcess {
     stream: watch::Receiver<StreamState>,
 }
 
-/// Inbound ACP methods the server can legitimately send: the
-/// `session/update` notification Eliot consumes (agent-to-client requests
-/// are rejected without answering, so their methods are never recorded).
-/// Oversized-frame diagnosis records only these exact names.
+/// ACP methods owned by this adapter plus methods that may be named in an
+/// oversized-frame diagnostic. Other valid notifications are classified as
+/// unclassified observations; agent-to-client requests are still rejected.
 const OVERSIZED_KNOWN_METHODS: &[&str] = &[
     "initialize",
     "session/new",
@@ -555,7 +559,29 @@ fn classify_agy_frame(
         Some("session/update") => PumpAction::Emit(AgyFrame::Update(
             value.get("params").cloned().unwrap_or(Value::Null),
         )),
-        Some(_) => PumpAction::Skip,
+        Some(method) if method.trim().is_empty() => PumpAction::Malformed(
+            "Antigravity notification did not contain a method name".to_owned(),
+        ),
+        Some(method) => {
+            if value.get("result").is_some() || value.get("error").is_some() {
+                return PumpAction::Malformed(
+                    "Antigravity notification also contained a response body".to_owned(),
+                );
+            }
+            let params = value.get("params").cloned();
+            if params
+                .as_ref()
+                .is_some_and(|params| !params.is_object() && !params.is_array())
+            {
+                return PumpAction::Malformed(
+                    "Antigravity notification params were not structured".to_owned(),
+                );
+            }
+            PumpAction::Emit(AgyFrame::UnclassifiedNotification {
+                method: method.to_owned(),
+                params,
+            })
+        }
         None => {
             PumpAction::Malformed("Antigravity frame was not a notification or response".to_owned())
         }

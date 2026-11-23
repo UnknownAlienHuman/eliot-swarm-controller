@@ -2087,6 +2087,7 @@ async fn launch_session(
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             secrets: plan.secrets.clone(),
+            native: native_client.clone(),
             workspace: plan.workspace.clone(),
         },
     );
