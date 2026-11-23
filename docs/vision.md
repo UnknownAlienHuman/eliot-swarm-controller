@@ -35,6 +35,18 @@ endpoint is authenticated with Cloudflare Access Managed OAuth and native JWT va
 per the existing account documentation, while the local One OS user trust boundary
 remains. This clarification replaces the earlier treatment of remote access as Later.
 
+On 2026-11-22 the owner stated a principle that every layer must follow:
+
+> «Истина хранится вне harness!!! Она хранится в Git!!!! Это ещё в первой архитектуре должно было быть написано и повторяться!!!»
+
+The truth about work lives in Git, outside any harness. A harness session, its model,
+its context window and its transcript are disposable. The task's state is its branch:
+committed progress, the diff and the task card that names it. Any model on any harness
+can take a task over from Git at any moment, for any reason: a provider limit, a cheaper
+or stronger model, a failure, or the Owner's choice. Moving work between models is the
+ordinary path, not a special recovery feature. See
+[Work truth lives in Git](architecture.md#work-truth-lives-in-git).
+
 ## What Eliot is
 
 ### Owner clarification, 2026-11-15

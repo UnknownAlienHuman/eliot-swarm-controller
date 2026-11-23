@@ -140,6 +140,31 @@ The detailed invariants have one owner:
 Do not duplicate these contracts in worker instructions or add another decision for each
 edge case. Repair the owning spec and its actual caller together.
 
+## Work truth lives in Git
+
+The [owner principle](vision.md#owner-statement-source-of-truth) of 2026-11-22: the
+truth about work is stored in Git, outside every harness.
+
+- **Branch.** A task's durable state is its Git branch in a managed worktree: committed
+  progress, the working-tree diff, and the task card naming the branch and goal.
+- **Disposable session.** A harness session (process, model, context, native
+  transcript) is a disposable worker on that branch. Losing it loses no work that was
+  committed.
+- **Checkpoints.** Agents commit progress at meaningful checkpoints on their own branch.
+  Uncommitted work is the only work a lost session can lose.
+- **Handoff brief.** A handoff to another model is built from Git and Store facts (the
+  branch, `git log` and diff since the base, the task card, Goal and open claims). It is
+  never built from a vendor transcript. The same handoff serves every reason: a provider
+  limit, a model or cost choice, a failed or lost session, or an Owner request. Moving
+  work between models is ordinary, not a special failover.
+- **Uncertain effects.** Swarm never replays an uncertain external effect on the new
+  model. The brief states what is uncertain.
+- **Store's role.** Store records who works on which branch and what happened. Git holds
+  the work itself.
+
+Coordination owns the [switch and handoff](spec/coordination.md#agent-switch-implemented)
+transaction; configuration owns which models may take over.
+
 ## Process and recovery boundary
 
 Use one process-owning plugin/app-server per Agent generation. A replacement never
