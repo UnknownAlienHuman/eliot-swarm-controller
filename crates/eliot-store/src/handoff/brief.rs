@@ -50,9 +50,7 @@ pub(super) fn build(
     } = input;
     // A predecessor's brief only quotes the task; the Git record is the task.
     let record = read_facts.and_then(|facts| facts.task_text.as_deref());
-    let task_command = read_facts
-        .and_then(|facts| facts.task_command.as_deref())
-        .or_else(|| (!request.task_command.is_empty()).then_some(request.task_command.as_str()));
+    let task_command = read_facts.and_then(|facts| facts.task_command.as_deref());
     let task_command_record = task_command
         .map(|id| load_command(tx, id))
         .transpose()?
@@ -64,11 +62,6 @@ pub(super) fn build(
                 CommandState::Unknown | CommandState::Dispatched
             )
         });
-    let named_task_missing =
-        !request.task_command.is_empty() && load_command(tx, &request.task_command)?.is_none();
-    let missing_named_task_matches_record = named_task_missing
-        && record.is_some()
-        && task_command == Some(request.task_command.as_str());
     let task_transferred =
         task.is_some_and(|task| transferred.iter().any(|send| send.id == task.id));
     let task_is_brief = task
@@ -79,18 +72,20 @@ pub(super) fn build(
         .filter(|_| task_is_brief)
         .and_then(|task| task.args.get("text"))
         .and_then(Value::as_str)
-        .and_then(|text| text.lines().nth(2))
+        .and_then(|text| {
+            text.lines()
+                .take(5)
+                .find_map(|line| line.strip_prefix("Handoff input status: "))
+        })
         .unwrap_or_default();
     let prior_original_unknown = prior_status.contains(ORIGINAL_UNKNOWN_MARKER);
     let prior_history_unknown = prior_status.contains(HISTORY_UNKNOWN_MARKER);
     let task_row_unverified = task
         .is_some_and(|task| matches!(task.state, CommandState::Unknown | CommandState::Dispatched));
-    let original_task_unverified = task_row_unverified
-        || task_command_unknown
-        || missing_named_task_matches_record
-        || prior_original_unknown;
+    let original_task_unverified =
+        task_row_unverified || task_command_unknown || prior_original_unknown;
     let task_unverified = original_task_unverified || prior_history_unknown;
-    let unverified = unverified_instruction_ids(tx, request)?;
+    let unverified = has_unverified_instructions(tx, request)?;
     let task_command_transferred =
         task_command.is_some_and(|id| transferred.iter().any(|send| send.id == id));
     let task_command_mismatches =
@@ -217,7 +212,7 @@ pub(super) fn build(
     if original_task_unverified {
         status.push(ORIGINAL_UNKNOWN_MARKER);
     }
-    if prior_history_unknown || task_command_unknown || !unverified.is_empty() {
+    if prior_history_unknown || task_command_unknown || unverified {
         status.push(HISTORY_UNKNOWN_MARKER);
     }
     let input_status = if status.is_empty() {
@@ -241,9 +236,7 @@ pub(super) fn build(
                 (format!("\n\nSaved Owner context:\n{text}"), truncated)
             },
         );
-        let shown = task.filter(|_| {
-            !use_record && !task_transferred && !task_unverified && !(task_is_brief && !use_record)
-        });
+        let shown = task.filter(|_| !task_is_brief && !task_transferred && !task_unverified);
         let task_reference = if use_record {
             "the Git task record"
         } else if task_transferred || task_command_transferred {
@@ -397,19 +390,15 @@ fn prior_handoff_input_history(
     Some(policy.redact_text(&history))
 }
 
-fn unverified_instruction_ids(tx: &Connection, request: &HandoffRequest) -> Result<Vec<String>> {
-    let mut statement = tx
-        .prepare(
-            "SELECT id FROM commands WHERE target = ?1
-             AND verb IN ('send', 'steer', 'inject') AND state IN ('unknown', 'dispatched')
-             AND principal NOT LIKE 'swarm_note:%'",
-        )
-        .map_err(sql_error)?;
-    statement
-        .query_map([parse_agent_id(&request.from)?], |row| row.get(0))
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(sql_error)
+fn has_unverified_instructions(tx: &Connection, request: &HandoffRequest) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commands WHERE target = ?1
+           AND verb IN ('send', 'steer', 'inject') AND state IN ('unknown', 'dispatched')
+           AND principal NOT LIKE 'swarm_note:%')",
+        [parse_agent_id(&request.from)?],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 struct LastTurn {
