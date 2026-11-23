@@ -887,7 +887,9 @@ of the explicitly selected release scope.
       and its dropdowns carry that harness's real fields (Codex
       sandbox and approval policy, Claude Code permission mode, Muse approval
       and sandbox, Antigravity mode). A preset shows its agent app (a chooser
-      creates a new preset, taking that app's `cmd` from an existing preset of it)
+      creates a preset with `cmd` omitted so the daemon follows the installed
+      version; explicit Owner overrides remain on their source preset, and
+      Duplicate also omits `cmd`)
       and a Subagents card: Can start (`child_profiles`), the agent app's own
       subagents (`native_subagents`; fixed Allow on Muse and Antigravity) and
       Manages its subagents through Swarm (`control = "tree"`); a refused change
