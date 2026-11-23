@@ -323,7 +323,7 @@ pub(crate) enum AcpUpdate {
         title: String,
         tool_kind: Option<String>,
         tool_name: Option<String>,
-        diff_paths: Vec<String>,
+        diff_paths: ToolDiffPaths,
         status: String,
     },
     /// A tool call state change.
@@ -332,7 +332,7 @@ pub(crate) enum AcpUpdate {
         title: Option<String>,
         tool_kind: Option<String>,
         tool_name: Option<String>,
-        diff_paths: Vec<String>,
+        diff_paths: ToolDiffPaths,
         status: String,
     },
     /// Context occupancy and cumulative session cost from `usage_update`:
@@ -357,8 +357,27 @@ pub(crate) enum AcpUpdate {
 const MAX_TOOL_DIFF_PATHS: usize = 32;
 const MAX_TOOL_DIFF_PATH_BYTES: usize = 4096;
 
-fn tool_diff_paths(update: &Value) -> Vec<String> {
-    let mut paths: Vec<String> = Vec::new();
+#[derive(Debug, Default)]
+pub(crate) struct ToolDiffPaths {
+    pub paths: Vec<String>,
+    pub overflowed: bool,
+}
+
+impl ToolDiffPaths {
+    pub fn insert(&mut self, path: &str) {
+        if self.paths.iter().any(|known| known == path) {
+            return;
+        }
+        if self.paths.len() == MAX_TOOL_DIFF_PATHS {
+            self.overflowed = true;
+        } else {
+            self.paths.push(path.to_owned());
+        }
+    }
+}
+
+fn tool_diff_paths(update: &Value) -> ToolDiffPaths {
+    let mut paths = ToolDiffPaths::default();
     let Some(content) = update.get("content").and_then(Value::as_array) else {
         return paths;
     };
@@ -375,15 +394,11 @@ fn tool_diff_paths(update: &Value) -> Vec<String> {
             [b'/', drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic() => &path[1..],
             _ => path,
         };
-        if path.trim().is_empty()
-            || path.len() > MAX_TOOL_DIFF_PATH_BYTES
-            || path.contains('\0')
-            || paths.iter().any(|known| known == path)
-        {
+        if path.trim().is_empty() || path.len() > MAX_TOOL_DIFF_PATH_BYTES || path.contains('\0') {
             continue;
         }
-        paths.push(path.to_owned());
-        if paths.len() == MAX_TOOL_DIFF_PATHS {
+        paths.insert(path);
+        if paths.overflowed {
             break;
         }
     }

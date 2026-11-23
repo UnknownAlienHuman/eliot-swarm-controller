@@ -34,7 +34,7 @@ use crate::{
     },
     native::{
         AcpUpdate, AgyClient, AgyFrame, FencedGuard, PermissionAsk, PermissionOption, PromptResult,
-        classify_update, default_permission_option, parse_permission_request,
+        ToolDiffPaths, classify_update, default_permission_option, parse_permission_request,
         permission_option_grants, prompt_turn_usage, session_usage_from_update,
     },
 };
@@ -80,14 +80,14 @@ impl ToolStatus {
 struct NativeToolState {
     title: String,
     status: ToolStatus,
-    native_file_edit_tool: bool,
+    native_file_edit_tool: Option<bool>,
     edit_kind: bool,
-    diff_paths: Vec<String>,
+    diff_paths: ToolDiffPaths,
 }
 
-const MAX_TOOL_EDIT_PATHS: usize = 32;
 /// Native file mutation tool names documented by the AGY CLI.
 const NATIVE_FILE_EDIT_TOOLS: &[&str] = &[
+    "write_file",
     "write_to_file",
     "replace_file_content",
     "multi_replace_file_content",
@@ -250,6 +250,7 @@ pub(crate) struct State {
     tool_emitted: HashSet<String>,
     /// Tool calls whose successful terminal event was committed in this turn.
     tool_completed_successfully: HashSet<String>,
+    tool_edit_gap_reported: bool,
     /// Exact native diff paths already represented by a committed edit fact.
     tool_file_edit_emitted: HashSet<(String, String)>,
     /// Partial tool-call deltas merged per vendor id before any event is
@@ -363,6 +364,7 @@ impl State {
             pending_steer: None,
             tool_emitted: HashSet::new(),
             tool_completed_successfully: HashSet::new(),
+            tool_edit_gap_reported: false,
             tool_file_edit_emitted: HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
@@ -724,6 +726,7 @@ impl State {
         self.cancellation = None;
         self.tool_emitted.clear();
         self.tool_completed_successfully.clear();
+        self.tool_edit_gap_reported = false;
         self.tool_file_edit_emitted.clear();
         self.tools.clear();
         self.clear_fenced();
@@ -981,7 +984,14 @@ impl State {
         publication?;
         if !self.tools.contains_key(&ask.tool_call_id) {
             if self.tools.len() < MAX_LIVE_TOOLS {
-                self.merge_tool(&ask.tool_call_id, &ask.title, "pending", None, None, &[]);
+                self.merge_tool(
+                    &ask.tool_call_id,
+                    &ask.title,
+                    "pending",
+                    None,
+                    None,
+                    &ToolDiffPaths::default(),
+                );
             } else {
                 self.record_unattributed_tool().await?;
             }
@@ -1864,19 +1874,17 @@ impl State {
         status: &str,
         tool_kind: Option<&str>,
         tool_name: Option<&str>,
-        diff_paths: &[String],
+        diff_paths: &ToolDiffPaths,
     ) {
-        let native_file_edit_tool =
-            tool_name.is_some_and(|name| NATIVE_FILE_EDIT_TOOLS.contains(&name));
         let known = self
             .tools
             .entry(tool_call_id.to_owned())
             .or_insert_with(|| NativeToolState {
                 title: String::new(),
                 status: ToolStatus::Unknown,
-                native_file_edit_tool: false,
+                native_file_edit_tool: None,
                 edit_kind: false,
-                diff_paths: Vec::new(),
+                diff_paths: ToolDiffPaths::default(),
             });
         if !title.is_empty() {
             known.title = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
@@ -1884,19 +1892,18 @@ impl State {
         if !status.is_empty() {
             known.status = ToolStatus::parse(status);
         }
-        if tool_name.is_some() {
-            known.native_file_edit_tool = native_file_edit_tool;
+        if let Some(name) = tool_name {
+            known.native_file_edit_tool = Some(
+                known.native_file_edit_tool.unwrap_or(true)
+                    && NATIVE_FILE_EDIT_TOOLS.contains(&name),
+            );
         }
         if let Some(tool_kind) = tool_kind {
             known.edit_kind = tool_kind == "edit";
         }
-        for path in diff_paths {
-            if known.diff_paths.len() == MAX_TOOL_EDIT_PATHS {
-                break;
-            }
-            if !known.diff_paths.iter().any(|known| known == path) {
-                known.diff_paths.push(path.clone());
-            }
+        known.diff_paths.overflowed |= diff_paths.overflowed;
+        for path in &diff_paths.paths {
+            known.diff_paths.insert(path);
         }
     }
 
@@ -1955,7 +1962,7 @@ impl State {
             return Ok(());
         };
         // AGY can classify the mutation by ACP kind without sending a tool name.
-        if !tool.native_file_edit_tool && !tool.edit_kind {
+        if !tool.native_file_edit_tool.unwrap_or(tool.edit_kind) {
             return Ok(());
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -1963,7 +1970,15 @@ impl State {
         };
         let command = pending.command.clone();
         let turn = pending.turn.clone();
-        let diff_paths = tool.diff_paths.clone();
+        let diff_paths = tool.diff_paths.paths.clone();
+        if tool.diff_paths.overflowed && !self.tool_edit_gap_reported {
+            self.record_coverage_gap(
+                "Antigravity native edit paths overflowed the per-tool bound",
+                &["tool"],
+            )
+            .await?;
+            self.tool_edit_gap_reported = true;
+        }
 
         for (index, path) in diff_paths.into_iter().enumerate() {
             let emitted_key = (tool_call_id.to_owned(), path.clone());
@@ -2057,14 +2072,22 @@ impl State {
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
         if let Some(checkpoints) = &mut self.checkpoints {
-            for step_index in checkpoints.read_new() {
+            let records = checkpoints.read_new();
+            if checkpoints.take_identity_gap() {
+                self.record_coverage_gap(
+                    "Antigravity transcript exceeded the checkpoint identity bound",
+                    &["session"],
+                )
+                .await?;
+            }
+            for checkpoint in records {
                 // The transcript proves a session checkpoint, even if its
                 // write reached disk after an earlier prompt settled.
                 self.commit(
                     "session.context.compacted",
                     "session",
-                    &format!("checkpoint-{step_index}"),
-                    json!({"step_index": step_index}),
+                    &format!("checkpoint-{}", checkpoint.identity),
+                    json!({"step_index": checkpoint.step_index}),
                 )
                 .await?;
             }

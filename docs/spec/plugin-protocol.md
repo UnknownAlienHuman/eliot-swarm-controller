@@ -625,6 +625,8 @@ callback that names the exact conversation transcript under the profile root.
 ACP prompt settlement reads complete rows forward from the retained byte offset.
 Resume establishes a baseline before reporting new checkpoints. The fact carries
 the native checkpoint index, and the task card waits for the next input.
+When the transcript is replaced, Swarm resets the offset and step watermark
+and uses the completed record digest to avoid replaying retained checkpoints.
 The transcript summary stays in the native store.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.

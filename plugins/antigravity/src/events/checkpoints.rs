@@ -1,5 +1,6 @@
 use serde::Deserialize;
 use std::{
+    collections::HashSet,
     fs::{self, File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
@@ -12,11 +13,15 @@ use std::os::unix::fs::MetadataExt;
 const MAX_TRANSCRIPT_READ_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_TRANSCRIPT_ROW_BYTES: usize = 256 * 1024;
 const ANCHOR_BYTES: usize = 64;
+const MAX_CHECKPOINT_IDENTITIES: usize = 4096;
 
 pub(super) struct Checkpoints {
     path: PathBuf,
     offset: u64,
     last_step: Option<u64>,
+    checkpoint_identities: HashSet<String>,
+    identity_coverage_lost: bool,
+    identity_gap_reported: bool,
     needs_seed: bool,
     line: Vec<u8>,
     discard_line: bool,
@@ -26,6 +31,11 @@ pub(super) struct Checkpoints {
     observed_identity: Option<FileIdentity>,
     prefix_anchor: Option<Vec<u8>>,
     cursor_anchor: Vec<u8>,
+}
+
+pub(super) struct Checkpoint {
+    pub(super) step_index: u64,
+    pub(super) identity: String,
 }
 
 #[derive(Deserialize)]
@@ -88,6 +98,9 @@ impl Checkpoints {
             path,
             offset: 0,
             last_step: None,
+            checkpoint_identities: HashSet::new(),
+            identity_coverage_lost: false,
+            identity_gap_reported: false,
             needs_seed: resumed,
             line: Vec::new(),
             discard_line: false,
@@ -107,7 +120,7 @@ impl Checkpoints {
     /// Consume newly appended, complete transcript rows. Each forward file
     /// read has a fixed byte limit; an incomplete or oversized row is never
     /// parsed as a checkpoint.
-    pub(super) fn read_new(&mut self) -> Vec<u64> {
+    pub(super) fn read_new(&mut self) -> Vec<Checkpoint> {
         let Some(mut file) = self.open() else {
             return Vec::new();
         };
@@ -122,15 +135,23 @@ impl Checkpoints {
             return Vec::new();
         }
         if self.was_rewritten(&mut file, &metadata) {
-            // The native writer can replace a transcript snapshot. Rescan
-            // from byte zero while keeping the highest observed step so
-            // rewritten history cannot replay a card or hide a later row.
+            // A replacement can restart step indexes. Rescan the file and
+            // use the native record identity to suppress retained history.
             self.reset_cursor();
         }
 
         let checkpoints = self.scan_to(&mut file, metadata.len(), true);
         self.remember_file(&mut file, &metadata);
         checkpoints
+    }
+
+    pub(super) fn take_identity_gap(&mut self) -> bool {
+        if self.identity_coverage_lost && !self.identity_gap_reported {
+            self.identity_gap_reported = true;
+            true
+        } else {
+            false
+        }
     }
 
     fn open(&self) -> Option<File> {
@@ -154,7 +175,6 @@ impl Checkpoints {
     /// its bytes and suppress that row if it is completed after the seed.
     fn seed_file(&mut self, file: &mut File, metadata: &Metadata) {
         self.reset_cursor();
-        self.last_step = None;
         self.scan_to(file, metadata.len(), false);
         self.skip_partial_row = !self.line.is_empty() || self.discard_line;
         self.needs_seed = self.offset < metadata.len();
@@ -163,6 +183,7 @@ impl Checkpoints {
 
     fn reset_cursor(&mut self) {
         self.offset = 0;
+        self.last_step = None;
         self.line.clear();
         self.discard_line = false;
         self.skip_partial_row = false;
@@ -212,7 +233,7 @@ impl Checkpoints {
         true
     }
 
-    fn scan_to(&mut self, file: &mut File, end: u64, emit: bool) -> Vec<u64> {
+    fn scan_to(&mut self, file: &mut File, end: u64, emit: bool) -> Vec<Checkpoint> {
         let mut checkpoints = Vec::new();
         if file.seek(SeekFrom::Start(self.offset)).is_err() {
             return checkpoints;
@@ -233,7 +254,7 @@ impl Checkpoints {
         checkpoints
     }
 
-    fn push_byte(&mut self, byte: u8, emit: bool, checkpoints: &mut Vec<u64>) {
+    fn push_byte(&mut self, byte: u8, emit: bool, checkpoints: &mut Vec<Checkpoint>) {
         if self.discard_line {
             if byte == b'\n' {
                 self.discard_line = false;
@@ -243,9 +264,7 @@ impl Checkpoints {
         }
         if byte == b'\n' {
             let suppressed = std::mem::take(&mut self.skip_partial_row);
-            if !suppressed {
-                self.consume_line(emit, checkpoints);
-            }
+            self.consume_line(emit && !suppressed, checkpoints);
             self.line.clear();
             return;
         }
@@ -257,7 +276,7 @@ impl Checkpoints {
         self.line.push(byte);
     }
 
-    fn consume_line(&mut self, emit: bool, checkpoints: &mut Vec<u64>) {
+    fn consume_line(&mut self, emit: bool, checkpoints: &mut Vec<Checkpoint>) {
         let Ok(step) = serde_json::from_slice::<TranscriptStep<'_>>(&self.line) else {
             return;
         };
@@ -268,8 +287,23 @@ impl Checkpoints {
             return;
         }
         self.last_step = Some(step.step_index);
-        if emit && step.source == "SYSTEM" && step.kind == "CHECKPOINT" && step.status == "DONE" {
-            checkpoints.push(step.step_index);
+        if step.source == "SYSTEM" && step.kind == "CHECKPOINT" && step.status == "DONE" {
+            let row = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
+            let identity = eliot_core::api::inference::sha256_hex(row);
+            if self.checkpoint_identities.contains(&identity) {
+                return;
+            }
+            if self.checkpoint_identities.len() == MAX_CHECKPOINT_IDENTITIES {
+                self.identity_coverage_lost = true;
+                return;
+            }
+            self.checkpoint_identities.insert(identity.clone());
+            if emit {
+                checkpoints.push(Checkpoint {
+                    step_index: step.step_index,
+                    identity,
+                });
+            }
         }
     }
 
