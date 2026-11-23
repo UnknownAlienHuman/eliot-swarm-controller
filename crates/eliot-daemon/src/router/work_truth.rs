@@ -575,7 +575,7 @@ impl Router {
         let Some(command) = command else {
             return Ok(());
         };
-        let task_ref = work_truth::task_ref(&command.id);
+        let task_ref = work_truth::task_ref(&command);
         if known.as_deref() == Some(task_ref.as_str()) {
             return Ok(());
         }

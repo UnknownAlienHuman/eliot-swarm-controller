@@ -93,8 +93,15 @@ pub(crate) fn redact_record_value(value: &mut Value, policy: &SecretPolicy) {
     }
 }
 
-pub(crate) fn task_ref(command: &str) -> String {
-    let digest = eliot_core::api::inference::sha256_hex(command.as_bytes());
+pub(crate) fn task_ref(command: &eliot_core::Command) -> String {
+    let identity = format!(
+        "{}\0{}\0{}\0{}",
+        command.target.as_deref().unwrap_or_default(),
+        command.generation.unwrap_or_default(),
+        command.id,
+        command.created_at
+    );
+    let digest = eliot_core::api::inference::sha256_hex(identity.as_bytes());
     format!("refs/eliot/tasks/{digest}")
 }
 
