@@ -4,7 +4,10 @@
 //! Agent's branch, index or files. Project pushes cannot carry these refs.
 
 use crate::{
-    config::{CheckpointLimits, settings::redact_credential_shapes},
+    config::{
+        CheckpointLimits,
+        settings::{contains_credential_shape, redact_credential_shapes},
+    },
     git_monitor::{GitProbe, PathContent, canonical_root, read_path_content},
 };
 use eliot_core::{
@@ -401,17 +404,14 @@ async fn scan_index(
             }
             (None, None) => None,
             (None, Some(oid)) => {
-                let output = git
-                    .workspace_command(root, &["cat-file", "blob", oid], Instant::now() + GIT_TIME)
+                let blob_size = usize::try_from(size).map_err(|_| {
+                    Error::new("unavailable", "staged checkpoint blob size is out of range")
+                })?;
+                let bytes = git
+                    .workspace_blob(root, oid, blob_size, Instant::now() + GIT_TIME)
                     .await?;
-                if output.code != 0 || output.stdout.len() as u64 != size {
-                    return Err(Error::new(
-                        "unavailable",
-                        "staged checkpoint bytes are unreadable",
-                    ));
-                }
                 read_bytes = read_bytes.saturating_add(size);
-                if policy.contains_text(&String::from_utf8_lossy(&output.stdout)) {
+                if contains_checkpoint_credential(&bytes, policy) {
                     withheld.push(GitCheckpointWithheld {
                         path: path.path.clone(),
                         bytes: size,
@@ -421,9 +421,9 @@ async fn scan_index(
                     hasher.update(size.to_le_bytes());
                     continue;
                 }
-                hasher.update(Sha256::digest(&output.stdout));
+                hasher.update(Sha256::digest(&bytes));
                 Some(FileContent {
-                    bytes: output.stdout,
+                    bytes,
                     mode: path.mode.clone().unwrap_or_else(|| "100644".to_owned()),
                 })
             }
@@ -550,6 +550,29 @@ pub(crate) fn is_credential_path(path: &str) -> bool {
         ]
         .iter()
         .any(|needle| name.contains(needle))
+}
+
+pub(crate) fn contains_checkpoint_credential(bytes: &[u8], policy: &SecretPolicy) -> bool {
+    let has_credential = |text: &str| policy.contains_text(text) || contains_credential_shape(text);
+    if has_credential(&String::from_utf8_lossy(bytes)) {
+        return true;
+    }
+    let (little_endian, payload) = match bytes {
+        [0xff, 0xfe, payload @ ..] => (true, payload),
+        [0xfe, 0xff, payload @ ..] => (false, payload),
+        _ => return false,
+    };
+    let text = char::decode_utf16(payload.chunks_exact(2).map(|pair| {
+        let pair = [pair[0], pair[1]];
+        if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    }))
+    .map(|character| character.unwrap_or(char::REPLACEMENT_CHARACTER))
+    .collect::<String>();
+    has_credential(&text)
 }
 
 fn merge_withheld(
@@ -1023,8 +1046,7 @@ fn scan_worktree(
             },
         };
         let outcome = outcome.and_then(|content| match content {
-            Some(file) if policy.contains_text(&String::from_utf8_lossy(&file.bytes)) => {
-                hasher.update(Sha256::digest(&file.bytes));
+            Some(file) if contains_checkpoint_credential(&file.bytes, policy) => {
                 Err("known_secret")
             }
             other => Ok(other),

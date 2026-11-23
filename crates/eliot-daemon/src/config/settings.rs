@@ -1007,6 +1007,10 @@ static CREDENTIAL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLo
 });
 
 /// Replace text shaped like a credential, for records no literal policy knows.
+pub(crate) fn contains_credential_shape(text: &str) -> bool {
+    CREDENTIAL_PATTERN.is_match(text)
+}
+
 pub(crate) fn redact_credential_shapes(text: &str) -> String {
     static PRIVATE_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
