@@ -321,12 +321,18 @@ pub(crate) enum AcpUpdate {
     ToolCall {
         tool_call_id: String,
         title: String,
+        tool_kind: Option<String>,
+        tool_name: Option<String>,
+        diff_paths: Vec<String>,
         status: String,
     },
     /// A tool call state change.
     ToolCallUpdate {
         tool_call_id: String,
         title: Option<String>,
+        tool_kind: Option<String>,
+        tool_name: Option<String>,
+        diff_paths: Vec<String>,
         status: String,
     },
     /// Context occupancy and cumulative session cost from `usage_update`:
@@ -344,6 +350,58 @@ pub(crate) enum AcpUpdate {
     Ignored,
     /// A `sessionUpdate` kind outside the pinned vocabulary.
     Unknown(String),
+}
+
+/// Bounded exact paths from ACP's structured file-diff content. Raw output and
+/// prose are intentionally not inspected for path-like strings.
+const MAX_TOOL_DIFF_PATHS: usize = 32;
+const MAX_TOOL_DIFF_PATH_BYTES: usize = 4096;
+
+fn tool_diff_paths(update: &Value) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let Some(content) = update.get("content").and_then(Value::as_array) else {
+        return paths;
+    };
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("diff") {
+            continue;
+        }
+        let Some(path) = block.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if path.trim().is_empty()
+            || path.len() > MAX_TOOL_DIFF_PATH_BYTES
+            || path.contains('\0')
+            || paths.iter().any(|known| known == path)
+        {
+            continue;
+        }
+        paths.push(path.to_owned());
+        if paths.len() == MAX_TOOL_DIFF_PATHS {
+            break;
+        }
+    }
+    paths
+}
+
+fn tool_name(update: &Value) -> Option<String> {
+    update.get("name").and_then(Value::as_str).map(|name| {
+        if name.len() <= 256 {
+            name.to_owned()
+        } else {
+            String::new()
+        }
+    })
+}
+
+fn tool_kind(update: &Value) -> Option<String> {
+    update.get("kind").and_then(Value::as_str).map(|kind| {
+        if kind.len() <= 64 {
+            kind.to_owned()
+        } else {
+            String::new()
+        }
+    })
 }
 
 /// One finite nonnegative `usage_update` cost amount, from a bare number or
@@ -426,6 +484,9 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                tool_kind: tool_kind(update),
+                tool_name: tool_name(update),
+                diff_paths: tool_diff_paths(update),
                 status: update
                     .get("status")
                     .and_then(Value::as_str)
@@ -438,6 +499,9 @@ pub(crate) fn classify_update(params: &Value) -> Option<(String, AcpUpdate)> {
                     .get("title")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                tool_kind: tool_kind(update),
+                tool_name: tool_name(update),
+                diff_paths: tool_diff_paths(update),
                 status: update
                     .get("status")
                     .and_then(Value::as_str)
