@@ -610,17 +610,24 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
                 &issue.configured_cmd,
                 issue.replacement_cmd.as_deref(),
                 issue.replacement_version.as_deref(),
+                issue.repair_command.as_deref(),
             );
         }
     } else {
         for issue in &response.profile_command_issues {
             let replacement = issue.replacement.as_ref();
+            let repair = response
+                .claude_profile_command_issues
+                .iter()
+                .find(|claude| claude.profile == issue.profile)
+                .and_then(|claude| claude.repair_command.as_deref());
             print_missing_profile_command(
                 &issue.profile,
                 &issue.harness,
                 &issue.configured_cmd,
                 replacement.map(|candidate| candidate.cmd.as_str()),
                 replacement.and_then(|candidate| candidate.version.as_deref()),
+                repair,
             );
         }
     }
@@ -707,6 +714,7 @@ fn print_missing_profile_command(
     configured_cmd: &str,
     replacement_cmd: Option<&str>,
     replacement_version: Option<&str>,
+    automatic_repair: Option<&str>,
 ) {
     println!("Profile {profile} ({harness}): configured executable is missing: {configured_cmd}");
     if let Some(cmd) = replacement_cmd {
@@ -716,6 +724,9 @@ fn print_missing_profile_command(
         println!("  no installed replacement was discovered");
     }
     println!("  repair: omit cmd from this profile to follow the vendor installation");
+    if let Some(command) = automatic_repair.filter(|command| command.ends_with(" --latest")) {
+        println!("  Claude automatic selection: {command}");
+    }
 }
 
 pub(crate) async fn run_heavy(
