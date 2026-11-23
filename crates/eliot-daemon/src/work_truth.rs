@@ -378,7 +378,11 @@ pub(crate) async fn checkpoint_reference(root: &Path, reference: &str) -> Result
     let git = GitProbe::new()?;
     let deadline = Instant::now() + GIT_TIME;
     let result = git
-        .workspace_command(root, &["show-ref", "--exists", reference], deadline)
+        .workspace_command(
+            root,
+            &["show-ref", "--verify", "--quiet", reference],
+            deadline,
+        )
         .await?;
     match result.code {
         0 => read_line(
@@ -389,7 +393,7 @@ pub(crate) async fn checkpoint_reference(root: &Path, reference: &str) -> Result
         )
         .await
         .map(Some),
-        2 => Ok(None),
+        1 => Ok(None),
         _ => Err(Error::new("unavailable", "checkpoint ref readback failed")),
     }
 }
@@ -507,7 +511,7 @@ pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> 
         )
         .await?;
     if listed.code != 0 {
-        return Ok(());
+        return Err(Error::new("unavailable", "checkpoint ref listing failed"));
     }
     let text = String::from_utf8_lossy(&listed.stdout);
     let mut references: Vec<&str> = text

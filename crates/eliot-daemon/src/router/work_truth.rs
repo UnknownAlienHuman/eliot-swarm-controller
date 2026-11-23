@@ -442,9 +442,7 @@ impl Router {
             .stage_git_checkpoint(agent, generation, &input)?;
         if let (Some(reference), Some(oid)) = (&input.checkpoint_ref, &input.oid) {
             let root = crate::git_monitor::canonical_root(&workspace)?;
-            if let Err(error) = work_truth::publish_checkpoint(&root, reference, oid).await {
-                self.log_work_truth_error("daemon.checkpoint_publication_failed", &error);
-            }
+            work_truth::publish_checkpoint(&root, reference, oid).await?;
             self.reconcile_checkpoint_ref(&workspace, &mut input)
                 .await?;
         }
