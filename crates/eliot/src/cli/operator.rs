@@ -72,35 +72,114 @@ async fn stand_owner_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
         .map_err(|_| CoreError::new("unknown", "daemon returned a malformed typed result"))
 }
 
-pub(super) async fn stop_and_drain_stand(data_dir: &Path) -> Result<(), Failure> {
-    let (daemon, initial_status) = require_running_inner(data_dir, true).await?;
+pub(super) async fn stop_and_drain_stand(
+    data_dir: &Path,
+    daemon: &DaemonInfo,
+) -> Result<Option<String>, Failure> {
+    match stop_and_drain_stand_gracefully(data_dir, daemon).await {
+        Ok(()) => Ok(None),
+        Err(blocker) => force_stop_stand(data_dir, daemon, blocker).await,
+    }
+}
+
+async fn stop_and_drain_stand_gracefully(
+    data_dir: &Path,
+    daemon: &DaemonInfo,
+) -> Result<(), Failure> {
+    let (observed, initial_status) = require_running_inner(data_dir, true).await?;
+    if &observed != daemon {
+        return Err(Failure::new(
+            4,
+            "stand daemon identity changed before graceful shutdown",
+        ));
+    }
     if initial_status.store_write_faulted || initial_status.drain.is_none() {
         return Err(Failure::new(1, "the daemon cannot prove a clean stop"));
     }
     let mut stops = Vec::new();
     let result = async {
         stop_stand_agents(data_dir, &mut stops).await?;
-        wait_for_custody_to_settle(data_dir, &daemon).await?;
+        wait_for_custody_to_settle(data_dir, daemon).await?;
         let request = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Drain);
-        stand_shutdown(data_dir, &request).await?;
-        wait_for_exit(&daemon, STARTUP_WAIT).await?;
-        check_same_daemon(data_dir, &daemon)?;
-        if eliot_daemon::last_daemon_phase(data_dir).as_deref() != Some("daemon.stopped") {
-            return Err(Failure::new(
-                4,
-                format!(
-                    "daemon PID {} exited without a clean shutdown record",
-                    daemon.pid
-                ),
-            ));
-        }
-        Ok(())
+        let drain = bounded_stand_shutdown(data_dir, &request).await?;
+        wait_for_exit(daemon, STARTUP_WAIT)
+            .await
+            .map_err(|mut error| {
+                if let Some(blockers) = drain.blockers.filter(|blockers| !blockers.is_empty()) {
+                    error.message = format!("{}; drain blockers: {blockers:?}", error.message);
+                }
+                error
+            })?;
+        verify_stand_daemon_exit(data_dir, daemon)
     }
     .await;
     result.map_err(|mut error| {
         error.message = format!("{}; stand stop requests: {:?}", error.message, stops);
         error
     })
+}
+
+async fn force_stop_stand(
+    data_dir: &Path,
+    daemon: &DaemonInfo,
+    blocker: Failure,
+) -> Result<Option<String>, Failure> {
+    let forced = async {
+        let was_alive = daemon_alive(daemon).map_err(Failure::for_read)?;
+        if was_alive {
+            check_same_daemon(data_dir, daemon)?;
+            let request = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Force);
+            let outcome = bounded_stand_shutdown(data_dir, &request).await;
+            if let Err(exit_error) = wait_for_exit(daemon, STARTUP_WAIT).await {
+                return Err(outcome.err().unwrap_or(exit_error));
+            }
+        }
+        verify_stand_daemon_exit(data_dir, daemon)?;
+        Ok::<bool, Failure>(was_alive)
+    }
+    .await;
+
+    forced
+        .map(|was_alive| was_alive.then(|| blocker.message.clone()))
+        .map_err(|mut failure| {
+            failure.message = format!(
+                "graceful stand drain failed: {}; force fallback failed: {}",
+                blocker.message, failure.message
+            );
+            failure
+        })
+}
+
+async fn bounded_stand_shutdown(
+    data_dir: &Path,
+    request: &DaemonShutdownRequest,
+) -> Result<DaemonShutdownResponse, Failure> {
+    timeout_at(
+        Instant::now() + Duration::from_secs(5),
+        stand_shutdown(data_dir, request),
+    )
+    .await
+    .map_err(|_| Failure::timeout())?
+}
+
+pub(super) fn verify_stand_daemon_exit(
+    data_dir: &Path,
+    daemon: &DaemonInfo,
+) -> Result<(), Failure> {
+    let current = daemon_info(data_dir).map_err(Failure::for_read)?;
+    if current.as_ref() != Some(daemon)
+        || daemon_alive(daemon).map_err(Failure::for_read)?
+        || eliot_daemon::last_daemon_phase(data_dir).as_deref() != Some("daemon.stopped")
+    {
+        return Err(Failure::new(
+            4,
+            format!(
+                "stand daemon PID {} did not leave a verified stopped record",
+                daemon.pid
+            ),
+        ));
+    }
+    Ok(())
 }
 
 async fn stop_stand_agents(data_dir: &Path, stops: &mut Vec<String>) -> Result<(), Failure> {
@@ -374,18 +453,22 @@ async fn stand_shutdown(
 }
 
 pub(super) async fn start_owned(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, None, false).await
+    start_owned_inner(data_dir, binary, None, false)
+        .await
+        .map(|info| info.pid)
 }
 
 pub(super) async fn start_owned_stand(data_dir: &Path, binary: &Path) -> Result<u32, Failure> {
-    start_owned_inner(data_dir, binary, None, true).await
+    start_owned_inner(data_dir, binary, None, true)
+        .await
+        .map(|info| info.pid)
 }
 
 pub(super) async fn start_update(
     data_dir: &Path,
     binary: &Path,
     attempt: &str,
-) -> Result<u32, Failure> {
+) -> Result<DaemonInfo, Failure> {
     start_owned_inner(data_dir, binary, Some(attempt), false).await
 }
 
@@ -394,7 +477,7 @@ async fn start_owned_inner(
     binary: &Path,
     attempt: Option<&str>,
     use_stand_owner: bool,
-) -> Result<u32, Failure> {
+) -> Result<DaemonInfo, Failure> {
     let start_ms = daemon_now_ms();
     let previous = daemon_info(data_dir).map_err(Failure::for_read)?;
     if let Some(info) = &previous
@@ -478,38 +561,67 @@ async fn start_owned_inner(
         ))?
     };
 
-    let result = wait_for_ready(data_dir, pid, previous.as_ref(), start_ms, use_stand_owner).await;
-    if let Err(mut failure) = result {
-        let _publication = if let Some(attempt) = attempt {
-            match eliot_daemon::operator::lock_update_publication(data_dir, attempt) {
-                Ok(guard) if daemon_info(data_dir).is_ok_and(|info| info == previous) => {
-                    Some(guard)
-                }
-                // The candidate may already be admitting writes. Leave it to
-                // the operator rather than terminating it on a timeout.
-                _ => return Err(failure),
-            }
-        } else {
-            None
-        };
+    let result = wait_for_ready(
+        data_dir,
+        pid,
+        previous.as_ref(),
+        start_ms,
+        use_stand_owner,
+        attempt.is_some(),
+    )
+    .await;
+    let identity_matches = |info: &DaemonInfo| {
         #[cfg(windows)]
-        let cleanup = eliot_daemon::operator::stop_candidate(pid, birth).map_err(Failure::for_read);
-        #[cfg(unix)]
-        let cleanup = child
-            .kill()
-            .await
-            .map_err(|error| Failure::new(4, error.to_string()));
-        #[cfg(not(any(windows, unix)))]
-        let cleanup: Result<(), Failure> = Ok(());
-        if let Err(cleanup) = cleanup {
-            failure.message = format!(
-                "{}; replacement custody could not be closed: {}",
-                failure.message, cleanup.message
-            );
+        if info.process_birth != format!("windows-creation-filetime:{birth}") {
+            return false;
         }
-        return Err(failure);
+        info.pid == pid && Some(info) != previous.as_ref()
+    };
+    match result {
+        Ok(info) if identity_matches(&info) => Ok(info),
+        Ok(_) => Err(Failure::new(
+            4,
+            "replacement process birth did not match the spawned process",
+        )),
+        Err(mut failure) => {
+            let _publication = if let Some(attempt) = attempt {
+                match eliot_daemon::operator::lock_update_publication(data_dir, attempt) {
+                    Ok(guard) if daemon_info(data_dir).is_ok_and(|info| info == previous) => {
+                        Some(guard)
+                    }
+                    _ => {
+                        // Publication may have won the timeout race. Pass its
+                        // exact identity to the live-Store rollback path.
+                        if let Ok(Some(info)) = daemon_info(data_dir)
+                            && identity_matches(&info)
+                        {
+                            return Ok(info);
+                        }
+                        return Err(failure);
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(windows)]
+            let cleanup =
+                eliot_daemon::operator::stop_candidate(pid, birth).map_err(Failure::for_read);
+            #[cfg(unix)]
+            let cleanup = child
+                .kill()
+                .await
+                .map_err(|error| Failure::new(4, error.to_string()));
+            #[cfg(not(any(windows, unix)))]
+            let cleanup: Result<(), Failure> = Ok(());
+            if let Err(cleanup) = cleanup {
+                failure.message = format!(
+                    "{}; replacement custody could not be closed: {}",
+                    failure.message, cleanup.message
+                );
+            }
+            Err(failure)
+        }
     }
-    Ok(pid)
 }
 
 async fn wait_for_ready(
@@ -518,7 +630,8 @@ async fn wait_for_ready(
     previous: Option<&DaemonInfo>,
     start_ms: u128,
     use_stand_owner: bool,
-) -> Result<(), Failure> {
+    publication_only: bool,
+) -> Result<DaemonInfo, Failure> {
     let deadline = Instant::now() + STARTUP_WAIT;
     let log_path = data_dir.join("logs").join("daemon.log");
     loop {
@@ -533,6 +646,9 @@ async fn wait_for_ready(
                         current.pid
                     ),
                 ));
+            }
+            if publication_only {
+                return Ok(current);
             }
             // `stand up` binds its registration to the owner token the
             // daemon it just started minted, before any owner call.
@@ -553,7 +669,7 @@ async fn wait_for_ready(
                     .is_ok_and(|status| status.admission == "open" && !status.store_write_faulted)
             {
                 check_same_daemon(data_dir, &current)?;
-                return Ok(());
+                return Ok(current);
             }
         }
         if let Some(failure) = eliot_daemon::daemon_failure_since(data_dir, start_ms) {

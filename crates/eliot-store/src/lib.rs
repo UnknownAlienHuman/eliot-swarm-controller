@@ -40,7 +40,7 @@ pub use goals::{
 };
 pub use handoff::HandoffAdmission;
 pub use projects::ProjectRegistrationInput;
-pub use resolution::{ConfigureReadback, TurnInactiveProof};
+pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
 pub use rules::{
     RuleCatchUpAction, RuleCatchUpActionOutcome, RuleCatchUpAdmission, RuleCursorOutcome,

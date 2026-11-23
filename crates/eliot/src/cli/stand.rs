@@ -1,6 +1,6 @@
 //! Own the directories, expiry, registration, and processes of fresh private stands.
 
-use super::operator::{start_owned_stand, stop_and_drain_stand};
+use super::operator::{start_owned_stand, stop_and_drain_stand, verify_stand_daemon_exit};
 use super::support::{Failure, print_value};
 use eliot_core::api::{
     ArtifactKind, ArtifactRegisterRequest, ArtifactView, DEFAULT_STAND_TTL_MS,
@@ -8,13 +8,14 @@ use eliot_core::api::{
 };
 use eliot_daemon::operator::{
     PinnedStandRoot, STAND_MARKER, StandExternalCleanupReport, StandMarker, StandRegistration,
-    StandRegistryScan, UnusableStandRegistration, add_former_registrations, check_directory_chain,
-    check_nested_roots, cleanup_stand_external_git, create_stand_root, daemon_alive, daemon_info,
-    data_dirs_match, ensure_registry_is_external, inherited_agent_parent_data_dir,
-    list_stand_registrations, locate_stand_registration, lock_offline, lock_transition,
-    parse_stand_ttl_ms, read_stand_registration, registry_name, remove_offline_stand_root,
-    remove_stand_registration, settle_former_registration, stand_base, stand_now_ms,
-    stand_registry, verify_stand_marker, verify_stand_target, write_stand_registration,
+    StandRegistryScan, UnusableStandRegistration, add_former_registrations, bind_stand_owner_token,
+    check_directory_chain, check_nested_roots, cleanup_stand_external_git, create_stand_root,
+    daemon_alive, daemon_info, data_dirs_match, ensure_registry_is_external,
+    inherited_agent_parent_data_dir, list_stand_registrations, locate_stand_registration,
+    lock_offline, lock_transition, parse_stand_ttl_ms, read_stand_registration, registry_name,
+    remove_offline_stand_root, remove_stand_registration, settle_former_registration, stand_base,
+    stand_now_ms, stand_registry, verify_stand_marker, verify_stand_target,
+    write_stand_registration,
 };
 use serde_json::{Value, json};
 use std::fs::{self, File};
@@ -24,14 +25,28 @@ use std::process::Stdio;
 use std::time::Duration;
 
 const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
+const MAX_SETTINGS_BYTES: u64 = 128 * 1024;
 
 pub(crate) async fn up(
     root: Option<PathBuf>,
-    profile: Option<PathBuf>,
+    settings: Option<PathBuf>,
+    profile: Vec<String>,
+    read_only_copy: Option<PathBuf>,
     binary: Option<PathBuf>,
     ttl: Option<String>,
     json_output: bool,
 ) -> Result<u8, Failure> {
+    if read_only_copy.is_some() && (settings.is_some() || !profile.is_empty() || binary.is_some()) {
+        return Err(Failure::new(
+            2,
+            "--read-only-copy cannot be combined with --settings, --profile or --binary",
+        ));
+    }
+    let profiles = if read_only_copy.is_none() {
+        select_profiles(settings.as_deref(), &profile)?
+    } else {
+        None
+    };
     let ttl_ms = match ttl.as_deref() {
         Some(value) => parse_stand_ttl_ms(value).map_err(Failure::for_read)?,
         None => DEFAULT_STAND_TTL_MS,
@@ -97,16 +112,28 @@ pub(crate) async fn up(
     if registry.join(&reg_name).exists() {
         return Err(Failure::new(2, "this path has a prior stand registration"));
     }
-    let binary = match binary {
-        Some(binary) => binary,
-        None => std::env::current_exe().map_err(|error| io_failure("locate Swarm", error))?,
-    }
-    .canonicalize()
-    .map_err(|error| io_failure("resolve stand binary", error))?;
-    if !binary.is_file() {
-        return Err(Failure::new(2, "stand binary must be a file"));
-    }
-    let profile = profile.as_deref().map(read_profile).transpose()?;
+    let binary = if read_only_copy.is_none() {
+        let binary = match binary {
+            Some(binary) => binary,
+            None => std::env::current_exe().map_err(|error| io_failure("locate Swarm", error))?,
+        }
+        .canonicalize()
+        .map_err(|error| io_failure("resolve stand binary", error))?;
+        if !binary.is_file() {
+            return Err(Failure::new(2, "stand binary must be a file"));
+        }
+        Some(binary)
+    } else {
+        None
+    };
+    let read_only_source = read_only_copy
+        .map(|source| {
+            std::path::absolute(&source)
+                .map_err(|error| io_failure("resolve Store copy source", error))?
+                .canonicalize()
+                .map_err(|error| io_failure("resolve Store copy source", error))
+        })
+        .transpose()?;
 
     create_stand_root(&root).map_err(Failure::for_read)?;
     let root = root
@@ -119,7 +146,19 @@ pub(crate) async fn up(
     let pinned_root = PinnedStandRoot::open(&root).map_err(Failure::for_read)?;
     let root_identity = pinned_root.identity().to_owned();
     let workspace = root.join("repo");
-    if let Err(failure) = prepare(&root, &workspace, profile).await {
+    let preparation = match read_only_source.clone() {
+        Some(source) => {
+            let destination = root.clone();
+            tokio::task::spawn_blocking(move || {
+                eliot_daemon::operator::copy_stand_read_only(&source, &destination)
+            })
+            .await
+            .map_err(|error| Failure::new(4, format!("Store copy worker failed: {error}")))
+            .and_then(|result| result.map_err(Failure::for_read))
+        }
+        None => prepare(&root, &workspace, profiles).await,
+    };
+    if let Err(failure) = preparation {
         drop(pinned_root);
         super::cleanup::remove_dir_all(&root).map_err(|error| {
             io_failure(
@@ -168,6 +207,19 @@ pub(crate) async fn up(
     // Close the marker before the bind reads it through the pinned root.
     drop(marker);
     write_stand_registration(&registry, &reg_name, &registration).map_err(Failure::for_read)?;
+    if read_only_source.is_some() {
+        if !bind_stand_owner_token(&root).map_err(Failure::for_read)? {
+            return Err(Failure::new(
+                4,
+                format!(
+                    "read-only stand owner binding incomplete at {}",
+                    display(&root)
+                ),
+            ));
+        }
+        registration =
+            read_stand_registration(&registry, &reg_name, &root).map_err(Failure::for_read)?;
+    }
 
     if let Some(parent_dir) = agent_parent.as_ref()
         && artifact_root
@@ -204,25 +256,33 @@ pub(crate) async fn up(
         }
     }
 
-    // Pass the display path (without Windows \\?\ prefix) so stand worktrees can freeze cleanly.
-    let daemon_root = PathBuf::from(display(&root));
-    let pid = start_owned_stand(&daemon_root, &binary)
-        .await
-        .map_err(|mut failure| {
-            failure.message = format!("{}; stand retained at {}", failure.message, display(&root));
-            failure
-        })?;
-    // The owner token is bound; release the creation pin.
+    let pid = if let Some(binary) = binary.as_deref() {
+        // Pass the display path (without Windows \\?\ prefix) so stand worktrees can freeze cleanly.
+        let daemon_root = PathBuf::from(display(&root));
+        Some(
+            start_owned_stand(&daemon_root, binary)
+                .await
+                .map_err(|mut failure| {
+                    failure.message =
+                        format!("{}; stand retained at {}", failure.message, display(&root));
+                    failure
+                })?,
+        )
+    } else {
+        None
+    };
+    // All stand creation work is complete; release the creation pin.
     drop(pinned_root);
     let data_dir = display(&root);
     let workspace = display(&workspace);
     if json_output {
         print_value(
             &json!({
-                "state": "ready",
+                "state": if read_only_source.is_some() { "read_only_copy" } else { "ready" },
                 "data_dir": data_dir,
-                "workspace": workspace,
+                "workspace": if read_only_source.is_some() { None } else { Some(workspace) },
                 "pid": pid,
+                "read_only": read_only_source.is_some(),
                 "created_at": created_at,
                 "expires_at": expires_at,
                 "artifact_id": registration.artifact_id,
@@ -230,14 +290,7 @@ pub(crate) async fn up(
             true,
         );
     } else {
-        println!("Stand ready at {data_dir} (daemon PID {pid})");
-        println!("Scratch Git repository at {workspace}");
-        println!("Expires at {expires_at} ms (TTL {} ms)", ttl_ms);
-        if let Some(artifact_id) = registration.artifact_id.as_deref() {
-            println!("Registered with parent daemon as artifact {artifact_id}");
-        }
-        println!("swarm --data-dir \"{data_dir}\" status");
-        println!("swarm stand down \"{data_dir}\"");
+        println!("{data_dir}");
     }
     Ok(0)
 }
@@ -277,12 +330,26 @@ fn check_allowed_agent_parent_ancestor(
 struct DownOutcome {
     state: &'static str,
     data_dir: String,
-    daemon_pid: u32,
+    daemon_pid: Option<u32>,
+    force_blocker: Option<String>,
     external_worktrees: Vec<eliot_daemon::operator::StandWorktreeOutcome>,
     external_branches: Vec<eliot_daemon::operator::StandBranchOutcome>,
     unusable_records: Vec<String>,
     /// What happened to a former-location registration, and its path.
     former_registration: Option<(String, String)>,
+}
+
+fn read_only_copy_store(root: &Path) -> Result<bool, Failure> {
+    let path = root.join(eliot_daemon::operator::READ_ONLY_STAND_STORE);
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+        Ok(_) => Err(Failure::new(
+            4,
+            "read-only Store copy marker is not a regular file; files retained",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_failure("inspect read-only Store copy", error)),
+    }
 }
 
 fn former_value(former: Option<&(String, String)>) -> Value {
@@ -306,6 +373,7 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
         "state": outcome.state,
         "data_dir": outcome.data_dir,
         "daemon_pid": outcome.daemon_pid,
+        "force_blocker": outcome.force_blocker,
         "external_worktrees": outcome.external_worktrees,
         "external_branches": outcome.external_branches,
         "unusable_records": outcome.unusable_records,
@@ -314,17 +382,33 @@ pub(crate) async fn down(path: PathBuf, json_output: bool) -> Result<u8, Failure
     if json_output {
         print_value(&payload, true);
     } else if outcome.state == "removed" {
-        println!(
-            "Removed {} after daemon PID {} and its owned processes exited",
-            outcome.data_dir, outcome.daemon_pid
-        );
+        if let Some(blocker) = &outcome.force_blocker {
+            eprintln!("Forced shutdown after graceful drain failed: {blocker}");
+        }
+        if let Some(pid) = outcome.daemon_pid {
+            println!(
+                "Removed {} after daemon PID {} and its owned processes exited",
+                outcome.data_dir, pid
+            );
+        } else {
+            println!("Removed read-only Store copy {}", outcome.data_dir);
+        }
         print_former(outcome.former_registration.as_ref());
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
     } else {
-        eprintln!(
-            "Retained {} (daemon PID {} stopped) because one or more external Git resources or creation records were kept or unknown:",
-            outcome.data_dir, outcome.daemon_pid
-        );
+        if let Some(blocker) = &outcome.force_blocker {
+            eprintln!("Forced shutdown after graceful drain failed: {blocker}");
+        }
+        match outcome.daemon_pid {
+            Some(pid) => eprintln!(
+                "Retained {} (daemon PID {} stopped) because one or more external Git resources or creation records were kept or unknown:",
+                outcome.data_dir, pid
+            ),
+            None => eprintln!(
+                "Retained read-only Store copy {} because one or more creation records were kept or unknown:",
+                outcome.data_dir
+            ),
+        }
         print_former(outcome.former_registration.as_ref());
         print_external_summary(&outcome.external_worktrees, &outcome.external_branches);
         for message in &outcome.unusable_records {
@@ -364,7 +448,8 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
             return Ok(DownOutcome {
                 state: "removed",
                 data_dir: display(&root),
-                daemon_pid: record.removing_pid.unwrap_or_default(),
+                daemon_pid: record.removing_pid.filter(|pid| *pid != 0),
+                force_blocker: None,
                 external_worktrees: Vec::new(),
                 external_branches: Vec::new(),
                 unusable_records: Vec::new(),
@@ -381,21 +466,42 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     }
     check_directory_chain(&root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
-    // Before any action (desktop stop, drain, removal): never a protected
-    // root, and only the stand whose owner token `stand up` bound.
     verify_stand_target(&root, &record).map_err(Failure::for_read)?;
     let _transition = lock_transition(&root).map_err(Failure::for_read)?;
     record =
         read_stand_registration(&located.registry, &reg_name, &root).map_err(Failure::for_read)?;
     verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
+    verify_stand_target(&root, &record).map_err(Failure::for_read)?;
+    let read_only_copy = read_only_copy_store(&root)? || record.removing_pid == Some(0);
+    if read_only_copy && record.removing_pid.is_some_and(|pid| pid != 0) {
+        return Err(Failure::new(
+            4,
+            "read-only Store copy has an unexpected daemon removal record",
+        ));
+    }
     check_nested_roots(&root).map_err(Failure::for_read)?;
-    let pid = match record.removing_pid {
-        Some(pid) => pid,
-        None => prove_stand_exit(&root).await?,
+    let (daemon_pid, force_blocker) = if read_only_copy {
+        (None, None)
+    } else {
+        let (pid, blocker) = match record.removing_pid {
+            Some(pid) => (pid, None),
+            None => prove_stand_exit(&root).await?,
+        };
+        (Some(pid), blocker)
     };
     let offline = lock_offline(&root).map_err(Failure::for_read)?;
-    if let Some(info) = daemon_info(&root).map_err(Failure::for_read)?
-        && ((record.removing_pid.is_none() && info.pid != pid)
+    verify_stand_marker(&root, &record).map_err(Failure::for_read)?;
+    verify_stand_target(&root, &record).map_err(Failure::for_read)?;
+    let current_daemon = daemon_info(&root).map_err(Failure::for_read)?;
+    if read_only_copy {
+        if current_daemon.is_some() {
+            return Err(Failure::new(
+                4,
+                "read-only Store copy has a daemon process record; files retained",
+            ));
+        }
+    } else if let Some(info) = current_daemon
+        && ((record.removing_pid.is_none() && Some(info.pid) != daemon_pid)
             || daemon_alive(&info).map_err(Failure::for_read)?)
     {
         return Err(Failure::new(
@@ -409,36 +515,43 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
         settle_former_registration(&root, &located, &record).map_err(Failure::for_read)?;
     let registry = settled.registry;
     let former_registration = settled.former;
-    let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
-        &root,
-        &registry,
-        &reg_name,
-        &mut record,
-    ))
-    .await
-    .map_err(Failure::for_mutation)?;
-    if report.has_retained_or_unknown() {
-        return Ok(DownOutcome {
-            state: "retained",
-            data_dir: display(&root),
-            daemon_pid: pid,
-            external_worktrees: report.worktrees,
-            external_branches: report.branches,
-            unusable_records: report.unusable_records,
-            former_registration,
-        });
-    }
-    record.removing_pid = Some(pid);
+    let (external_worktrees, external_branches, unusable_records) = if read_only_copy {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
+            &root,
+            &registry,
+            &reg_name,
+            &mut record,
+        ))
+        .await
+        .map_err(Failure::for_mutation)?;
+        if report.has_retained_or_unknown() {
+            return Ok(DownOutcome {
+                state: "retained",
+                data_dir: display(&root),
+                daemon_pid,
+                force_blocker,
+                external_worktrees: report.worktrees,
+                external_branches: report.branches,
+                unusable_records: report.unusable_records,
+                former_registration,
+            });
+        }
+        (report.worktrees, report.branches, report.unusable_records)
+    };
+    record.removing_pid = Some(daemon_pid.unwrap_or_default());
     write_stand_registration(&registry, &reg_name, &record).map_err(Failure::for_read)?;
     remove_offline_stand_root(&root, offline).map_err(Failure::for_read)?;
     remove_stand_registration(&registry, &reg_name).map_err(Failure::for_read)?;
     Ok(DownOutcome {
         state: "removed",
         data_dir: display(&root),
-        daemon_pid: pid,
-        external_worktrees: report.worktrees,
-        external_branches: report.branches,
-        unusable_records: report.unusable_records,
+        daemon_pid,
+        force_blocker,
+        external_worktrees,
+        external_branches,
+        unusable_records,
         former_registration,
     })
 }
@@ -661,23 +774,19 @@ fn outcome_note(reason: Option<&str>, detail: Option<&str>) -> String {
     format!("{reason}{detail}")
 }
 
-async fn prove_stand_exit(root: &Path) -> Result<u32, Failure> {
+async fn prove_stand_exit(root: &Path) -> Result<(u32, Option<String>), Failure> {
     let daemon = daemon_info(root)
         .map_err(Failure::for_read)?
         .ok_or_else(|| unproven_exit(root))?;
     #[cfg(windows)]
     eliot_daemon::operator::stop_desktop(root).map_err(Failure::for_read)?;
-    if daemon_alive(&daemon).map_err(Failure::for_read)? {
-        stop_and_drain_stand(root).await?;
-    }
-    let current = daemon_info(root).map_err(Failure::for_read)?;
-    if current.as_ref() != Some(&daemon)
-        || daemon_alive(&daemon).map_err(Failure::for_read)?
-        || eliot_daemon::last_daemon_phase(root).as_deref() != Some("daemon.stopped")
-    {
-        return Err(unproven_exit(root));
-    }
-    Ok(daemon.pid)
+    let force_blocker = if daemon_alive(&daemon).map_err(Failure::for_read)? {
+        stop_and_drain_stand(root, &daemon).await?
+    } else {
+        None
+    };
+    verify_stand_daemon_exit(root, &daemon).map_err(|_| unproven_exit(root))?;
+    Ok((daemon.pid, force_blocker))
 }
 
 fn unproven_exit(root: &Path) -> Failure {
@@ -760,6 +869,78 @@ async fn git(workspace: &Path, args: &[&str]) -> Result<(), Failure> {
         ));
     }
     Ok(())
+}
+
+fn select_profiles(settings: Option<&Path>, names: &[String]) -> Result<Option<Vec<u8>>, Failure> {
+    if names.is_empty() {
+        if settings.is_some() {
+            return Err(Failure::new(
+                2,
+                "--settings requires at least one --profile name",
+            ));
+        }
+        return Ok(None);
+    }
+
+    let legacy_file = if settings.is_none() && names.len() == 1 {
+        let path = Path::new(&names[0]);
+        path.is_file().then_some(path)
+    } else {
+        None
+    };
+    let source_path = match settings {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let root = match eliot_daemon::operator::inherited_agent_parent_data_dir() {
+                Some(root) => root,
+                None => eliot_daemon::resolve_data_dir(None).map_err(Failure::for_read)?,
+            };
+            root.join("config.toml")
+        }
+    };
+    let source = read_settings_source(&source_path, settings.is_none())?;
+    if source.is_empty() {
+        if let Some(path) = legacy_file {
+            return read_profile(path).map(Some);
+        }
+        return Err(Failure::new(
+            2,
+            "named profiles require an available settings file; omit --profile to use first-run defaults",
+        ));
+    }
+    match eliot_daemon::operator::select_stand_profiles(&source, names) {
+        Ok(profiles) => Ok(Some(profiles)),
+        Err(_) if let Some(path) = legacy_file => read_profile(path).map(Some),
+        Err(error) => Err(Failure::for_read(error)),
+    }
+}
+
+fn read_settings_source(path: &Path, allow_missing: bool) -> Result<Vec<u8>, Failure> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(io_failure("open settings file for stand profiles", error)),
+    };
+    if !file
+        .metadata()
+        .map_err(|error| io_failure("inspect settings file for stand profiles", error))?
+        .is_file()
+    {
+        return Err(Failure::new(
+            2,
+            "stand settings source must be a regular file",
+        ));
+    }
+    let mut source = Vec::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_end(&mut source)
+        .map_err(|error| io_failure("read settings file for stand profiles", error))?;
+    if source.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(Failure::new(2, "stand settings source exceeds 128 KiB"));
+    }
+    Ok(source)
 }
 
 fn read_profile(path: &Path) -> Result<Vec<u8>, Failure> {

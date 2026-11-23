@@ -31,6 +31,7 @@ pub fn is_deterministic_pre_admission_rejection(code: &str) -> bool {
             | "bad_state"
             | "capacity_unavailable"
             | "conflict"
+            | "daemon_update_in_progress"
             | "frame_too_large"
             | "invalid"
             | "not_allowed"

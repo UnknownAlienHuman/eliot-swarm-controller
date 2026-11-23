@@ -165,7 +165,7 @@ impl Router {
             let value = self
                 .inner
                 .workspaces
-                .resolve_absent_workspace(&request, &preparation)
+                .resolve_workspace_resolution(&request, &preparation)
                 .await?;
             self.signal_progress();
             return serde_json::to_value(value)

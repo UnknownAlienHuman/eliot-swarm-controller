@@ -60,9 +60,78 @@ pub struct ConfigureReadback {
     pub model: String,
 }
 
+/// Bounded Git readback for an initial managed launch that never reached its
+/// native start. A preserved result carries the reason and exact retained
+/// location; a removed result means both the owned worktree and empty branch
+/// were read back absent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkspaceLaunchCleanup {
+    Removed,
+    Preserved {
+        code: String,
+        message: String,
+        failure_where: String,
+        location: String,
+    },
+}
+
+impl WorkspaceLaunchCleanup {
+    fn phase(&self) -> WorkspacePhase {
+        match self {
+            Self::Removed => WorkspacePhase::Removed,
+            Self::Preserved { .. } => WorkspacePhase::Failed,
+        }
+    }
+
+    fn value(&self, preparation: &WorkspacePreparation) -> Result<Value> {
+        let value = match self {
+            Self::Removed => json!({
+                "state": "removed",
+                "repo_common_dir": preparation.repo_common_dir,
+                "worktree_path": preparation.worktree_path,
+                "branch": preparation.requested_branch,
+            }),
+            Self::Preserved {
+                code,
+                message,
+                failure_where,
+                location,
+            } => {
+                if code.trim().is_empty()
+                    || message.trim().is_empty()
+                    || failure_where.trim().is_empty()
+                    || location.trim().is_empty()
+                {
+                    return Err(Error::new(
+                        "invalid",
+                        "preserved workspace resolution needs a reason and location",
+                    ));
+                }
+                json!({
+                    "state": "preserved",
+                    "code": code,
+                    "message": message,
+                    "where": failure_where,
+                    "location": location,
+                    "worktree_path": preparation.worktree_path,
+                    "branch": preparation.requested_branch,
+                })
+            }
+        };
+        if encode_json(&value)?.len() > MAX_EVENT_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "workspace launch resolution evidence exceeds 64 KiB",
+            ));
+        }
+        Ok(value)
+    }
+}
+
+#[derive(Clone, Copy)]
 enum CommandReadback<'a> {
     Configure(&'a ConfigureReadback),
-    WorkspaceAbsent(&'a WorkspacePreparation),
+    WorkspaceLaunch(&'a WorkspacePreparation, &'a WorkspaceLaunchCleanup),
     RemovalAbsent(
         &'a WorkspacePreparation,
         &'a eliot_core::WorkspaceRemovalOutcome,
@@ -216,10 +285,27 @@ impl Store {
         preparation: &WorkspacePreparation,
         now: i64,
     ) -> Result<Change<CommandResolveResponse>> {
+        self.resolve_command_with_workspace_launch_cleanup(
+            principal,
+            request,
+            preparation,
+            &WorkspaceLaunchCleanup::Removed,
+            now,
+        )
+    }
+
+    pub fn resolve_command_with_workspace_launch_cleanup(
+        &mut self,
+        principal: &str,
+        request: &CommandResolveRequest,
+        preparation: &WorkspacePreparation,
+        cleanup: &WorkspaceLaunchCleanup,
+        now: i64,
+    ) -> Result<Change<CommandResolveResponse>> {
         self.resolve_command_with_proof(
             principal,
             request,
-            Some(CommandReadback::WorkspaceAbsent(preparation)),
+            Some(CommandReadback::WorkspaceLaunch(preparation, cleanup)),
             now,
         )
     }
@@ -271,6 +357,101 @@ impl Store {
             request,
             &command_resolution_digest(request)?,
         )
+    }
+
+    /// Validate the exact Owner write id and current never-started managed
+    /// launch before the daemon performs any bounded workspace cleanup.
+    pub fn preflight_workspace_launch_resolution(
+        &self,
+        principal: &str,
+        request: &CommandResolveRequest,
+        preparation: &WorkspacePreparation,
+        now: i64,
+    ) -> Result<Option<CommandResolveResponse>> {
+        request.validate()?;
+        if principal != OWNER_ASSERTION {
+            return Err(Error::new(
+                "not_allowed",
+                "command resolution requires the owner principal",
+            ));
+        }
+        if request.resolution != CommandResolution::Failed {
+            return Err(Error::new(
+                "bad_state",
+                "managed launch workspace cleanup resolves only as failed",
+            ));
+        }
+        self.ensure_committed_reads()?;
+        self.ensure_writer_healthy()?;
+        ensure_resolution_write_id(&self.connection, &request.id)?;
+        let digest = command_resolution_digest(request)?;
+        if let Some(value) =
+            stored_command_resolution(&self.connection, principal, request, &digest)?
+        {
+            return Ok(Some(value));
+        }
+        validate_id_age(&request.id, now)?;
+
+        let record = load_command_record(&self.connection, &request.command_id)?
+            .ok_or_else(|| Error::new("not_found", "launch command was not found"))?;
+        let Some(agent_num) = record.target else {
+            return Err(Error::new("bad_state", "launch command has no Agent"));
+        };
+        let eligible = record.state == CommandState::Unknown
+            && record.command.verb == "launch"
+            && record.command.generation == Some(0)
+            && record
+                .command
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["stage"] == "workspace");
+        let agent = load_agent_by_num(&self.connection, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "launch Agent was not found"))?;
+        let stored_workspace = super::workspace::load_workspace(&self.connection, agent_num)?;
+        if !eligible
+            || preparation.agent
+                != record
+                    .target
+                    .map(super::format_agent_id)
+                    .unwrap_or_default()
+            || preparation.start_command_id != request.command_id
+            || preparation.target_generation != 1
+            || preparation.phase != WorkspacePhase::Unknown
+            || stored_workspace.as_ref() != Some(preparation)
+            || agent.generation != 0
+            || agent.state != eliot_core::AgentState::Created
+            || agent.observe_only
+            || agent.active_turn.is_some()
+            || agent.native_ref.is_some()
+            || agent.native_scope.is_some()
+        {
+            return Err(Error::new(
+                "bad_state",
+                "launch, Agent, or workspace changed before cleanup preflight",
+            ));
+        }
+        if super::workspace::workspace_cancel_requested(preparation) {
+            let stop_id = preparation
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.get("stop_command_id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::new("source_integrity", "workspace cancel has no stop"))?;
+            let stop = load_command_record(&self.connection, stop_id)?.ok_or_else(|| {
+                Error::new("source_integrity", "workspace cancel stop was not found")
+            })?;
+            if stop.command.verb != "stop"
+                || stop.target != record.target
+                || stop.command.generation != record.command.generation
+                || (!stop.state.is_terminal() && stop.state != CommandState::Unknown)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "workspace stop is still in flight; read it back before resolving launch",
+                ));
+            }
+        }
+        Ok(None)
     }
 
     fn resolve_command_inner(
@@ -338,9 +519,16 @@ impl Store {
                 },
             ));
         }
-        if is_start_verb(record.command.verb.as_str())
-            && request.resolution == CommandResolution::Applied
-        {
+        let state = request.resolution.state();
+        let workspace_launch = state == CommandState::Failed
+            && record.command.verb == "launch"
+            && record.command.generation == Some(0)
+            && record
+                .command
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome["stage"] == "workspace");
+        if is_start_verb(record.command.verb.as_str()) && state == CommandState::Applied {
             return Err(Error::new(
                 "bad_state",
                 "launch/resume resolution must be failed; an applied start needs its Agent transition",
@@ -353,20 +541,14 @@ impl Store {
             };
             resolve_configure_overlay(&tx, &record, configure, now)?;
         }
-        let state = request.resolution.state();
-        let workspace_launch = state == CommandState::Failed
-            && record.command.verb == "launch"
-            && record.command.generation == Some(0)
-            && record
-                .command
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome["stage"] == "workspace");
+        let mut workspace_transition = None;
+        let mut workspace_resolution_outcome = None;
+        let mut workspace_cleanup_value = None;
         if workspace_launch {
-            let Some(CommandReadback::WorkspaceAbsent(proof)) = readback else {
+            let Some(CommandReadback::WorkspaceLaunch(proof, cleanup)) = readback else {
                 return Err(Error::new(
                     "bad_state",
-                    "managed launch resolution requires Git readback proving the workspace path, registration, and branch are absent",
+                    "managed launch resolution requires bounded Git cleanup or preservation readback",
                 ));
             };
             if record.target != Some(parse_agent_id(&proof.agent)?)
@@ -378,9 +560,38 @@ impl Store {
             {
                 return Err(Error::new(
                     "bad_state",
-                    "workspace changed after Git absence readback",
+                    "workspace changed after Git cleanup readback",
                 ));
             }
+            let agent = load_agent_by_num(&tx, parse_agent_id(&proof.agent)?)?
+                .ok_or_else(|| Error::new("not_found", "launch Agent was not found"))?;
+            if agent.generation != 0
+                || agent.state != eliot_core::AgentState::Created
+                || agent.observe_only
+                || agent.native_scope.is_some()
+                || agent.native_ref.is_some()
+                || agent.active_turn.is_some()
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "launch Agent may have started before workspace cleanup resolution",
+                ));
+            }
+            let cleanup_value = cleanup.value(proof)?;
+            let mut workspace_marker = json!({
+                "stage": "launch_resolution",
+                "start_command_id": request.command_id,
+                "workspace_cleanup": cleanup_value.clone(),
+            });
+            super::workspace::preserve_native_git_write_marker(
+                proof.outcome.as_ref(),
+                &mut workspace_marker,
+            );
+            workspace_transition = Some((cleanup.phase(), workspace_marker));
+            workspace_cleanup_value = Some(cleanup_value.clone());
+            workspace_resolution_outcome = Some(json!({
+                "workspace_cleanup": cleanup_value,
+            }));
             if super::workspace::workspace_cancel_requested(proof) {
                 let stop_id = proof
                     .outcome
@@ -430,12 +641,13 @@ impl Store {
             } else {
                 None
             };
+        let resolution_outcome = workspace_resolution_outcome.or(removal_outcome);
         events.push(resolve_command_tx(
             &tx,
             &record,
             request,
             state,
-            removal_outcome,
+            resolution_outcome,
             now,
         )?);
         if workspace_launch && let Some(agent_num) = record.target {
@@ -446,6 +658,7 @@ impl Store {
                 state,
                 &request.command_id,
                 true,
+                workspace_transition,
                 now,
                 &mut events,
             )?;
@@ -469,6 +682,7 @@ impl Store {
             id: request.id.clone(),
             command_id: request.command_id.clone(),
             state,
+            workspace_cleanup: workspace_cleanup_value,
         };
         insert_resolution_write(
             &tx,

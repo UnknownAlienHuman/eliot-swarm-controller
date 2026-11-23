@@ -19,6 +19,45 @@ pub fn update_backup_path(root: &Path, id: &str) -> Result<PathBuf> {
     Ok(root.join(format!(".eliot.db.update-{id}.tmp")))
 }
 
+pub fn copy_store_for_update_check(root: &Path, id: &str) -> Result<PathBuf> {
+    copy_store_to_private_root(root, root, id)
+}
+
+pub(crate) fn copy_store_to_private_root(
+    source: &Path,
+    destination: &Path,
+    id: &str,
+) -> Result<PathBuf> {
+    let data = DataDir::open_existing(source)?;
+    let source = data.path().join("eliot.db");
+    if !existing_store_file(&source)? {
+        return Err(Error::new("invalid_store", "the source Store is missing"));
+    }
+    let target = DataDir::open_existing(destination)?;
+    let store = Store::open_read_only(&source)?;
+    create(target.path(), id, &store)?;
+    update_backup_path(target.path(), id)
+}
+
+pub fn check_update_store_copy(path: &Path) -> Result<()> {
+    let id = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(".eliot.db.update-"))
+        .and_then(|name| name.strip_suffix(".tmp"))
+        .ok_or_else(|| Error::new("invalid", "expected an update Store copy"))?;
+    let root = path
+        .parent()
+        .ok_or_else(|| Error::new("invalid", "Store copy has no parent"))?;
+    update_backup_path(root, id)?;
+    validate_private_file(path)?;
+    drop(Store::open(path)?);
+    let migrated = Store::open_read_only(path)?;
+    migrated.high_water()?;
+    migrated.list_agents(None, 1)?;
+    Ok(())
+}
+
 pub(crate) fn create(root: &Path, id: &str, store: &Store) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let path = update_backup_path(root, id)?;

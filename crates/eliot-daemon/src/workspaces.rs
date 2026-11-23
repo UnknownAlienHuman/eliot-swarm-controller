@@ -19,7 +19,7 @@ use eliot_core::{
     WorkspacePreparationInput, WorkspaceRemovalOutcome, WorkspaceSetupOutcome,
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::WorkspaceGitReservation;
+use eliot_store::{WorkspaceGitReservation, WorkspaceLaunchCleanup};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -286,7 +286,7 @@ impl WorkspaceManager {
         result
     }
 
-    pub(crate) async fn resolve_absent_workspace(
+    pub(crate) async fn resolve_workspace_resolution(
         &self,
         request: &CommandResolveRequest,
         preparation: &WorkspacePreparation,
@@ -294,73 +294,195 @@ impl WorkspaceManager {
         let result = async {
             let slot = self.register_slot(preparation).await?;
             let _operation = slot.operation.lock().await;
-            let _gate = slot.gate.clone().lock_owned().await;
-            if let Some(value) = self
-                .inner
-                .store
-                .lock()
-                .await
-                .stored_command_resolution("owner", request)?
-            {
-                return Ok(value);
-            }
-            if preparation.phase != WorkspacePhase::Unknown {
-                return Err(problem("bad_state", "workspace preparation is not unknown"));
-            }
-            let removal = request.resolution == eliot_core::api::CommandResolution::Applied;
-            let quiescent = if removal {
-                // An exact no-dispatch marker proves custody for this removal
-                // even when the host cannot establish prior process exit.
-                slot.active.lock_recover().is_none()
-                    && preparation.outcome.as_ref().is_some_and(|outcome| {
+            if request.resolution == eliot_core::api::CommandResolution::Applied {
+                let _gate = slot.gate.clone().lock_owned().await;
+                if let Some(value) = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .stored_command_resolution("owner", request)?
+                {
+                    return Ok(value);
+                }
+                if preparation.phase != WorkspacePhase::Unknown
+                    || slot.active.lock_recover().is_some()
+                    || !preparation.outcome.as_ref().is_some_and(|outcome| {
                         eliot_store::Store::is_legacy_missing_branch_removal(
                             outcome,
                             &request.command_id,
                         )
                     })
-            } else {
-                workspace_git_effect_quiescent(&slot)
-            };
-            if !quiescent {
-                return Err(problem(
-                    "bad_state",
-                    "workspace process custody has not drained",
-                ));
-            }
-            let git = WorkspaceGit::new()?;
-            let removal = if removal {
-                Some(git.verify_absent_removal(preparation).await?)
-            } else {
-                if !git.creation_is_absent(preparation).await? {
+                {
                     return Err(problem(
                         "bad_state",
-                        "workspace path, Git registration, or branch still exists",
+                        "workspace process custody has not drained",
                     ));
                 }
-                None
-            };
+                let git = WorkspaceGit::new()?;
+                let outcome = git.verify_absent_removal(preparation).await?;
+                let mut store = self.inner.store.lock().await;
+                crate::router::owner_inbox::check_binding(&store)?;
+                let change = store.resolve_command_with_absent_removal(
+                    request,
+                    preparation,
+                    &outcome,
+                    now_ms(),
+                )?;
+                self.publish(&change.events);
+                return Ok(change.value);
+            }
+
+            {
+                let _gate = slot.gate.clone().lock_owned().await;
+                let preflight = {
+                    let store = self.inner.store.lock().await;
+                    crate::router::owner_inbox::check_binding(&store)?;
+                    store.preflight_workspace_launch_resolution(
+                        "owner",
+                        request,
+                        preparation,
+                        now_ms(),
+                    )?
+                };
+                if let Some(value) = preflight {
+                    return Ok(value);
+                }
+                if !workspace_git_effect_quiescent(&slot) {
+                    return Err(problem(
+                        "bad_state",
+                        "workspace process custody has not drained",
+                    ));
+                }
+            }
+
+            // Hold the operation lock across both Git phases. Drop the slot
+            // gate before the bounded runner reacquires it for process custody.
+            let git = WorkspaceGit::new()?;
+            let cleanup = self
+                .cleanup_unstarted_launch_workspace(&slot, &git, preparation, request)
+                .await?;
+
+            let _gate = slot.gate.clone().lock_owned().await;
+            if !workspace_git_effect_quiescent(&slot) {
+                return Err(problem(
+                    "bad_state",
+                    "workspace process custody changed during cleanup",
+                ));
+            }
             let mut store = self.inner.store.lock().await;
             crate::router::owner_inbox::check_binding(&store)?;
-            let change = match removal.as_ref() {
-                Some(outcome) => store.resolve_command_with_absent_removal(
-                    request,
-                    preparation,
-                    outcome,
-                    now_ms(),
-                )?,
-                None => store.resolve_command_with_absent_workspace(
-                    "owner",
-                    request,
-                    preparation,
-                    now_ms(),
-                )?,
-            };
+            if let Some(value) = store.preflight_workspace_launch_resolution(
+                "owner",
+                request,
+                preparation,
+                now_ms(),
+            )? {
+                return Ok(value);
+            }
+            let change = store.resolve_command_with_workspace_launch_cleanup(
+                "owner",
+                request,
+                preparation,
+                &cleanup,
+                now_ms(),
+            )?;
             self.publish(&change.events);
             Ok(change.value)
         }
         .await;
         self.retire_slots(&preparation.agent).await;
         result
+    }
+
+    async fn cleanup_unstarted_launch_workspace(
+        &self,
+        slot: &Arc<Slot>,
+        git: &WorkspaceGit,
+        preparation: &WorkspacePreparation,
+        request: &CommandResolveRequest,
+    ) -> Result<WorkspaceLaunchCleanup> {
+        if git.creation_is_absent(preparation).await? {
+            return Ok(WorkspaceLaunchCleanup::Removed);
+        }
+
+        let verification = "owner resolved a managed launch before native start";
+        match git.prepare_created_worktree_rollback(preparation).await {
+            Ok(Some(command)) => {
+                if self
+                    .run_creation_rollback(
+                        slot,
+                        preparation,
+                        command,
+                        verification,
+                        "worktree",
+                        Some(request),
+                    )
+                    .await?
+                    .is_some()
+                {
+                    return Err(problem(
+                        "unknown",
+                        "bounded worktree removal did not reach a verified terminal result",
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Some(cleanup) = preserved_launch_cleanup(
+                    &error,
+                    "workspace.rollback.created_worktree",
+                    &preparation.worktree_path,
+                ) {
+                    return Ok(cleanup);
+                }
+                return Err(error);
+            }
+        }
+
+        match git.prepare_failed_checkout_rollback(preparation).await {
+            Ok(Some(command)) => {
+                if self
+                    .run_creation_rollback(
+                        slot,
+                        preparation,
+                        command,
+                        verification,
+                        "branch",
+                        Some(request),
+                    )
+                    .await?
+                    .is_some()
+                {
+                    return Err(problem(
+                        "unknown",
+                        "bounded branch removal did not reach a verified terminal result",
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let location = format!(
+                    "{}#refs/heads/{}",
+                    preparation.repo_common_dir, preparation.requested_branch
+                );
+                if let Some(cleanup) =
+                    preserved_launch_cleanup(&error, "workspace.rollback.empty_branch", &location)
+                {
+                    return Ok(cleanup);
+                }
+                return Err(error);
+            }
+        }
+
+        if git.creation_is_absent(preparation).await? {
+            Ok(WorkspaceLaunchCleanup::Removed)
+        } else {
+            Err(problem(
+                "unknown",
+                "workspace path, Git registration, and branch are not all absent after rollback",
+            ))
+        }
     }
 
     async fn prepare_workspace(
@@ -690,7 +812,14 @@ impl WorkspaceManager {
             };
             if let Some(command) = worktree
                 && let Some(failure) = self
-                    .run_creation_rollback(slot, preparation, command, verification, "worktree")
+                    .run_creation_rollback(
+                        slot,
+                        preparation,
+                        command,
+                        verification,
+                        "worktree",
+                        None,
+                    )
                     .await?
             {
                 return Ok(failure);
@@ -707,7 +836,7 @@ impl WorkspaceManager {
             };
             if let Some(command) = branch
                 && let Some(failure) = self
-                    .run_creation_rollback(slot, preparation, command, verification, "branch")
+                    .run_creation_rollback(slot, preparation, command, verification, "branch", None)
                     .await?
             {
                 return Ok(failure);
@@ -759,9 +888,25 @@ impl WorkspaceManager {
         command: Command,
         verification: &str,
         subject: &str,
+        resolution: Option<&CommandResolveRequest>,
     ) -> Result<Option<WorkspaceCreationOutcome>> {
         let gate = slot.gate.clone().lock_owned().await;
-        self.require_current(preparation, preparation.phase).await?;
+        if let Some(request) = resolution {
+            let store = self.inner.store.lock().await;
+            crate::router::owner_inbox::check_binding(&store)?;
+            if store
+                .preflight_workspace_launch_resolution("owner", request, preparation, now_ms())?
+                .is_some()
+                || !workspace_git_effect_quiescent(slot)
+            {
+                return Err(problem(
+                    "bad_state",
+                    "workspace resolution or custody changed before Git cleanup",
+                ));
+            }
+        } else {
+            self.require_current(preparation, preparation.phase).await?;
+        }
         let result = self
             .run_owned(
                 slot,
@@ -2226,6 +2371,27 @@ fn workspace_git_effect_quiescent(slot: &Slot) -> bool {
         Some(result) => result.quiescent,
         None => cfg!(windows),
     }
+}
+
+fn preserved_launch_cleanup(
+    error: &Error,
+    fallback_where: &str,
+    location: &str,
+) -> Option<WorkspaceLaunchCleanup> {
+    matches!(
+        error.code.as_str(),
+        "dirty" | "workspace_commits" | "workspace_branch_preserved"
+    )
+    .then(|| WorkspaceLaunchCleanup::Preserved {
+        code: error.code.clone(),
+        message: (*error.message).clone(),
+        failure_where: error
+            .failure_where
+            .as_deref()
+            .unwrap_or(fallback_where)
+            .to_owned(),
+        location: location.to_owned(),
+    })
 }
 
 async fn drain_bounded<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {

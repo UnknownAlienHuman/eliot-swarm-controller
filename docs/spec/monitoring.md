@@ -452,7 +452,9 @@ settles when the durable `native_git_write_dispatched=false` marker rules out a 
 write and the creation stage rules out setup dispatch for that attempt. Recovery
 retains uncertainty and the original bindings when Git or setup effects may have
 occurred. It never repeats either effect. For cancelled creation with a possible Git
-write, see [Owner resolution](api.md#input-turn-and-unknown-gates).
+write, the [Owner failed resolution](api.md#input-turn-and-unknown-gates) can
+remove the exact clean checkout and empty branch or preserve changed artifacts
+with their location after initial-generation custody is proved.
 An invalid cancellation candidate remains unresolved and records
 `workspace.cancel_recovery_skipped`. Recovery continues with the remaining rows.
 On Windows, step completion waits for the owned Job to empty. On supported Linux,

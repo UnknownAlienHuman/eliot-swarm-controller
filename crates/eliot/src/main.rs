@@ -13,6 +13,12 @@ use cli::support::Failure;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(path) = &cli.operator_check_store {
+        return match eliot_daemon::operator::check_update_store_copy(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report_failure(Failure::for_read(error)),
+        };
+    }
     if cli.operator_release_info {
         println!(
             "{}",
@@ -117,6 +123,20 @@ async fn run_inner(cli: Cli) -> ExitCode {
     let result = match command {
         CliCommand::Plugin(PluginArgs { command, .. }) => run_plugin_command(command).await,
         command => {
+            if !matches!(command, CliCommand::Stand(_)) {
+                match eliot_daemon::operator::read_only_stand_exists(&data_dir) {
+                    Ok(true) => {
+                        return report_exit(cli::read_only_stand(
+                            command,
+                            &data_dir,
+                            json_output,
+                            id,
+                        ));
+                    }
+                    Ok(false) => {}
+                    Err(error) => return report_failure(Failure::for_read(error)),
+                }
+            }
             if !matches!(
                 command,
                 CliCommand::Daemon(_)
@@ -155,6 +175,10 @@ async fn run_inner(cli: Cli) -> ExitCode {
             cli::dispatch(command, data_dir, json_output, id, doctor_acl_report).await
         }
     };
+    report_exit(result)
+}
+
+fn report_exit(result: Result<u8, Failure>) -> ExitCode {
     match result {
         Ok(exit_code) => ExitCode::from(exit_code),
         Err(failure) => report_failure(failure),

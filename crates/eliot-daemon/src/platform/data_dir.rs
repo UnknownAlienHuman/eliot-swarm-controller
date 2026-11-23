@@ -194,11 +194,27 @@ pub type OperatorLock = std::os::windows::io::OwnedHandle;
 #[cfg(not(windows))]
 pub type OperatorLock = File;
 
+pub const READ_ONLY_STAND_STORE: &str = ".eliot-stand-read-only.db";
+
+pub fn read_only_stand_exists(root: &Path) -> Result<bool> {
+    match fs::symlink_metadata(root.join(READ_ONLY_STAND_STORE)) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(io_error("inspect read-only stand", error)),
+    }
+}
+
 impl DataDir {
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
         refuse_package_redirected(&path)?;
+        if read_only_stand_exists(&path)? {
+            return Err(Error::new(
+                "read_only_stand",
+                "a read-only Store stand cannot start a daemon",
+            ));
+        }
         // A new root or a missing owner token is new state other processes
         // will read. A root whose token exists only needs the check above.
         let is_missing = |target: &Path| {

@@ -85,6 +85,17 @@ impl Drop for CustodyStart<'_> {
 }
 
 impl AgentCustodies {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restart_groups(&self) -> Vec<super::unix::ProcessGroupIdentity> {
+        self.state
+            .lock_recover()
+            .agents
+            .iter()
+            .filter_map(Weak::upgrade)
+            .map(|agent| agent.membership)
+            .collect()
+    }
+
     pub(crate) fn spawn(
         &self,
         agent: &str,

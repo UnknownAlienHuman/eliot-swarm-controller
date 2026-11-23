@@ -485,9 +485,11 @@ qualification is incomplete; do not describe it as feature complete.
 Implement the bounded retention path first, then build/run the complete campaign against
 the connected product. Keep results in the PR/CI, not a permanent audit/readiness hierarchy.
 
-- [x] Daemon update fences admission, waits for current work, starts the replacement
-      or rolls back, and leaves continuation to boot recovery (#836).
-- [x] Explicit private stand creation and registered teardown of owned files (#837).
+- [x] Daemon update preflights a Store snapshot, fences admission, and starts the
+      replacement or rolls back on the same schema. Deadline Stops use ordinary
+      custody and promptless continuation in parent-first order (#836).
+- [x] Private stand creation imports named profiles and supports offline Store
+      snapshots. Registered teardown forces owned shutdown when drain fails (#837).
 - [x] Unrunnable Goal checks settle with a typed reason and retained round events
       expose check outcomes (#802).
 - [x] Daemon logs attribute errors and count command storms. `swarm status` and

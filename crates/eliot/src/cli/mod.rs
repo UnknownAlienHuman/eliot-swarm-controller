@@ -21,10 +21,60 @@ mod store;
 pub(crate) mod support;
 mod update;
 
-use self::args::{CliCommand, StandAction};
+use self::args::{CliCommand, DaemonAction, LsArgs, PageArgs, StandAction};
 use self::support::Failure;
 pub(crate) use reads::report_doctor_acl;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn read_only_stand(
+    command: CliCommand,
+    data_dir: &Path,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    if id.is_some() {
+        return Err(Failure::new(
+            2,
+            "--id is unavailable on a read-only Store stand",
+        ));
+    }
+    match command {
+        CliCommand::Status => {
+            let high_water = eliot_daemon::operator::stand_copy_event_high_water(data_dir)
+                .map_err(Failure::for_read)?;
+            support::print_value_or_human(
+                &serde_json::json!({"mode":"read_only", "event_high_water":high_water}),
+                json_output,
+                || {
+                    println!("Read-only Store snapshot · event high-water {high_water}");
+                },
+            );
+        }
+        CliCommand::Ls(LsArgs {
+            after,
+            page: PageArgs { limit },
+            filter,
+        }) => {
+            let request = reads::list_params(after, limit, false, json_output, filter)?;
+            let result = eliot_daemon::operator::stand_copy_agents(data_dir, &request)
+                .map_err(Failure::for_read)?;
+            if json_output {
+                let value = serde_json::to_value(result)
+                    .map_err(|_| Failure::new(4, "snapshot Agent list could not be encoded"))?;
+                support::print_value(&value, true);
+            } else {
+                reads::print_agent_table(&result, false, 0, false);
+            }
+        }
+        _ => {
+            return Err(Failure::new(
+                3,
+                "read-only Store stands support status and ls",
+            ));
+        }
+    }
+    Ok(0)
+}
 
 pub(crate) async fn dispatch(
     command: CliCommand,
@@ -37,10 +87,23 @@ pub(crate) async fn dispatch(
         CliCommand::Stand(args) => match args.action {
             StandAction::Up {
                 root,
+                settings,
                 profile,
+                read_only_copy,
                 binary,
                 ttl,
-            } => stand::up(root, profile, binary, ttl, json_output).await,
+            } => {
+                Box::pin(stand::up(
+                    root,
+                    settings,
+                    profile,
+                    read_only_copy,
+                    binary,
+                    ttl,
+                    json_output,
+                ))
+                .await
+            }
             StandAction::Down { path } => stand::down(path, json_output).await,
             StandAction::List => stand::list(json_output).await,
             StandAction::Prune => stand::prune(json_output).await,
@@ -48,6 +111,25 @@ pub(crate) async fn dispatch(
         CliCommand::Cleanup(args) => cleanup::run_cleanup(args, data_dir, json_output, id).await,
         CliCommand::Artifact(args) => cleanup::run_artifact(args, data_dir, json_output, id).await,
         CliCommand::Settings(args) => settings::run(args, data_dir, json_output).await,
+        CliCommand::Daemon(args) if args.interrupt_on_deadline => {
+            let Some(DaemonAction::Update {
+                release,
+                wait_seconds,
+            }) = args.action
+            else {
+                return Err(Failure::new(
+                    2,
+                    "--interrupt-on-deadline requires daemon update",
+                ));
+            };
+            if args.foreground || id.is_some() {
+                return Err(Failure::new(
+                    2,
+                    "--foreground and --id are invalid with daemon update",
+                ));
+            }
+            update::run_interrupting(release, data_dir, wait_seconds, json_output).await
+        }
         CliCommand::Daemon(args) => daemon::run_daemon(args, data_dir, json_output, id).await,
         CliCommand::Mcp(args) => daemon::run_mcp(args, data_dir, json_output).await,
         CliCommand::Status => daemon::run_status(data_dir, json_output).await,

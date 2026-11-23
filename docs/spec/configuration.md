@@ -1956,18 +1956,41 @@ streams disconnected.
 at daemon startup. Continue reopens eligible retained idle sessions without
 input and resumes eligible retained generations that were live, in batches
 of up to four resume commands within configured capacity. Roots resume
-before their children. An unresolved restart Resume holds its descendants.
+before their children. Descendants wait for restart-affected ancestors to resume.
 A resumed live session opens with a framed Swarm note
 naming the interrupted turn. Resume uses the Agent's frozen profile and
 any inherited effective configuration from the retained generation. Goals
 and project assignments follow the Agent to its new generation. A Goal with
-unresolved prior work remains paused until that work is settled. Hold leaves those sessions for explicit resume. Previously
+unresolved prior work remains paused until that work is settled. Hold leaves
+those sessions for explicit resume. Previously
 admitted commands still follow durable command recovery. Interrupted turns
 and uncertain effects stay `unknown` under either policy: they are named,
 never replayed.
 
+`swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
+path for captured active turns after the wait expires. Under `continue`, an
+applied Stop with proven process exit and native source drain allows promptless
+resume after replacement or rollback, with interrupted parents resumed before
+their children. The old turn retains its observed outcome. `hold` keeps those
+generations stopped for the Owner.
+
 A refused automatic resume leaves an Owner notice and a reason in
 `swarm why AGENT`. Address that reason before explicitly resuming the Agent.
+
+### Private stand settings
+
+`swarm stand up --settings FILE --profile NAME` selects a profile from the
+file's `[profiles]` table. Repeat `--profile` to select several. Without `--settings`,
+names resolve in the current data directory's `config.toml`. A single profiles-only
+TOML path is also accepted as `--profile FILE`. When no profiles are supplied,
+first-start discovery supplies the defaults. Imported profiles are written to the new
+stand's private `config.toml`.
+
+`swarm stand up --read-only-copy DATA_DIR` copies committed SQLite state without
+importing config, native sessions or process custody. The offline copy is opened
+through SQLite read-only connections for `status` and `ls`. The copied rows are
+snapshot data and cannot admit Agents, perform cleanup against the source's
+workspaces or start a daemon.
 
 ## Private chats root
 

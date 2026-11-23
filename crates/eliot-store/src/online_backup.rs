@@ -30,7 +30,11 @@ impl Store {
     /// The caller owns a fresh private destination. The backup API includes
     /// committed WAL pages and writes a self-contained SQLite database.
     pub fn online_backup(&self, destination: &Path) -> Result<()> {
-        self.ensure_committed_reads()?;
+        // A read-only source holds a SQLite snapshot across the size check
+        // and page copy. Only a writable source needs the autocommit fence.
+        if !self.connection.is_readonly("main").map_err(sql_error)? {
+            self.ensure_committed_reads()?;
+        }
         #[cfg(windows)]
         let owned_path = eliot_core::verbatim_path(destination);
         #[cfg(windows)]
