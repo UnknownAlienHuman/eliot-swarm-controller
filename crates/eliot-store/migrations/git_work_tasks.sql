@@ -18,3 +18,6 @@ SELECT checkpoint.agent, checkpoint.generation, checkpoint.task_command,
 FROM git_checkpoints checkpoint
 LEFT JOIN commands command ON command.id = checkpoint.task_command
 WHERE checkpoint.task_command IS NOT NULL AND checkpoint.task_ref IS NOT NULL;
+
+CREATE INDEX switch_checkout_owners_switch_command ON switch_checkout_owners(switch_command)
+WHERE switch_command IS NOT NULL;

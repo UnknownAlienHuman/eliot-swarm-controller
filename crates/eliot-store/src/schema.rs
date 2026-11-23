@@ -1,11 +1,12 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = HANDOFF_BUDGET_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = WORK_TASK_BINDINGS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
 const SWITCH_CHECKOUT_VERSION: i64 = 115;
 const HANDOFF_BUDGET_VERSION: i64 = 116;
+const WORK_TASK_BINDINGS_VERSION: i64 = 117;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2741,6 +2742,10 @@ impl Store {
             (
                 HANDOFF_BUDGET_VERSION,
                 include_str!("../migrations/automatic_handoff_budget.sql"),
+            ),
+            (
+                WORK_TASK_BINDINGS_VERSION,
+                include_str!("../migrations/git_work_tasks.sql"),
             ),
         ] {
             if current < version {

@@ -74,11 +74,9 @@ pub(super) fn require_checkout_owner_tx(
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })
-        .map_err(sql_error)?
-        .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
-    drop(statement);
-    for (checkout_key, owner) in rows {
+    for row in rows {
+        let (checkout_key, owner) = row.map_err(sql_error)?;
         if Some(owner) == agent || !checkout_contains_workspace(&checkout_key, &workspace_key) {
             continue;
         }
@@ -86,8 +84,7 @@ pub(super) fn require_checkout_owner_tx(
             continue;
         };
         let owner_is_live = !owner_agent.is_terminal()
-            || !capacity::owned_exit_proof_tx(connection, owner, owner_agent.generation)?
-                .process_custody_exited;
+            || handoff::session_exit_blocker(connection, &owner_agent)?.is_some();
         if owner_is_live {
             return Err(Error::new(
                 "bad_state",
@@ -120,25 +117,26 @@ pub(super) fn require_checkout_launch_tx(
     agent: i64,
     workspace: Option<&str>,
 ) -> Result<()> {
-    let switch_parent: Option<(String, String)> = tx
+    let switch_parent: Option<(Option<String>, Option<String>)> = tx
         .query_row(
-            "SELECT p.id, p.state FROM commands c
-             JOIN commands p ON p.id = c.parent_command
+            "SELECT c.parent_command, p.state FROM commands c
+             LEFT JOIN commands p ON p.id = c.parent_command
              WHERE c.id = ?1 AND c.link_kind = 'switch' AND c.ordinal = 0",
             [id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    if let Some((parent, state)) = &switch_parent
-        && state != "dispatched"
-    {
-        return Err(Error::new(
-            "bad_state",
-            format!("switch launch parent {parent} is {state}, not dispatched"),
-        ));
-    }
-    let parent = switch_parent.map(|(parent, _)| parent);
+    let parent = match switch_parent {
+        Some((Some(parent), Some(state))) if state == "dispatched" => Some(parent),
+        Some(_) => {
+            return Err(Error::new(
+                "bad_state",
+                "switch launch requires its dispatched parent",
+            ));
+        }
+        None => None,
+    };
     let Some(workspace) = workspace else {
         return Ok(());
     };
