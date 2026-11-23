@@ -604,18 +604,15 @@ Ordinary settlement does not acquire this edge; no native receipt or replay resu
 Workspace preparation is the narrow pre-native exception: an exact command-bound
 workspace marker permits `accepted|queued -> failed|unknown` without advancing the
 Agent generation or creating a native token/source. The general settlement API does
-not acquire this permission. For first launch, preparation failure is `failed` at
-generation 0; uncertainty retains `created` at generation 0 with an unknown command.
-Pre-native resume failure/uncertainty preserves the prior terminal Agent projection. For a
-retained managed worktree, a known no-native-effect rejection, failure, cancellation or
-withdrawal restores the exact prior `ready` marker at generation `N`, including its completed
-setup index and retained identity, only after Store proves this exact undispatched Resume owns
-the `N+1` marker and the retained workspace/preparation binding is unchanged. This restores
-Ready metadata only; Store does not assert filesystem contents are unchanged. A later Resume
-still requires ordinary exact Git/worktree identity readback before native dispatch. Do not
-remove or recreate the worktree or replay setup. A dispatched/unknown Resume or unconfirmed
-custody/cleanup remains unresolved and fenced until exact readback; do not restore readiness or
-replay Resume.
+not acquire this permission. A definite first-launch refusal fails the Agent and
+preparation at generation 0; uncertainty retains `created` at generation 0 with an
+unknown command. Pre-native resume failure/uncertainty preserves the prior terminal
+Agent projection. A known no-native-effect Resume refusal, failure, cancellation or
+withdrawal restores the exact prior `ready` marker at generation `N` once Store proves
+the undispatched Resume owns the unchanged `N+1` marker. A later Resume must still
+verify the retained worktree identity before native dispatch. The
+[workspace preparation contract](monitoring.md#workspace-preparation) defines the
+evidence needed to settle an unknown pre-native cancellation.
 After Store proves the exact preparation marker, generation and verb, it uses the
 separate pure `workspace_preparation_transition_allowed(from,to) -> bool` predicate for
 those existing transitions. This does not widen ordinary command settlement.
@@ -640,11 +637,13 @@ its retained identity before native dispatch.
 
 A pre-native stop is bound to an admitted stop command as well as the start command
 and target generation. Its dispatch latches cancellation before custody cleanup and
-blocks setup/native dispatch. Exact stopped custody settles that stop applied, the
-start cancelled, and first-launch Agent stopped at generation 0. Uncertain cleanup
-settles both commands unknown and keeps the first-launch Agent created at generation
-0. Resume cancellation preserves the prior terminal projection. No native request
-answer is treated as permission to acknowledge this cleanup.
+blocks setup/native dispatch. The committed stop dispatch executes the matching
+cancellation. Confirmed cancellation settles the stop applied, the start cancelled,
+and the first-launch Agent stopped at generation 0. Uncertain cleanup settles both
+commands unknown and keeps the first-launch Agent created at generation 0. Resume
+cancellation preserves the prior terminal projection. Recovery preserves a prior
+Owner resolution on the exact Resume when it restores the workspace. No native
+request answer is treated as permission to acknowledge this cleanup.
 
 `worktree.remove` is a normal command for a terminal owner, including failed/stopped
 generation-0 Agents. Its dispatch also verifies that no other nonterminal Agent

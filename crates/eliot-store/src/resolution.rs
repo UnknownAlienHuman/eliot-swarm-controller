@@ -353,7 +353,6 @@ impl Store {
                 || proof.start_command_id != request.command_id
                 || proof.target_generation != 1
                 || proof.phase != WorkspacePhase::Unknown
-                || super::workspace::workspace_cancel_requested(proof)
                 || super::workspace::load_workspace(&tx, parse_agent_id(&proof.agent)?)?.as_ref()
                     != Some(proof)
             {
@@ -361,6 +360,34 @@ impl Store {
                     "bad_state",
                     "workspace changed after Git absence readback",
                 ));
+            }
+            if super::workspace::workspace_cancel_requested(proof) {
+                let stop_id = proof
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.get("stop_command_id"))
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        Error::new("source_integrity", "workspace cancel has no stop")
+                    })?;
+                let stop = load_command_record(&tx, stop_id)?.ok_or_else(|| {
+                    Error::new("source_integrity", "workspace cancel stop was not found")
+                })?;
+                if stop.command.verb != "stop"
+                    || stop.target != record.target
+                    || stop.command.generation != record.command.generation
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "workspace cancel is bound to a different stop",
+                    ));
+                }
+                if !stop.state.is_terminal() && stop.state != CommandState::Unknown {
+                    return Err(Error::new(
+                        "bad_state",
+                        "workspace stop is still in flight; read back the stop before resolving launch",
+                    ));
+                }
             }
         }
         let mut events = vec![resolve_command_tx(&tx, &record, request, state, now)?];

@@ -13,7 +13,7 @@ use crate::common::now_ms;
 use crate::router::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
-    FrozenScriptRun, InjectPoint, Result, SecretPolicy,
+    FrozenScriptRun, InjectPoint, Result, SecretPolicy, WorkspacePhase,
     api::{
         FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
     },
@@ -701,8 +701,7 @@ impl Router {
         if is_start_verb(command.verb.as_str())
             && let Err(error) = self.inner.workspaces.prepare(id).await
         {
-            self.settle_workspace_prepare_error(id, &error).await;
-            self.signal_progress();
+            self.settle_workspace_prepare_error(command, &error).await;
             return false;
         }
         if command.verb == "launch" && !self.capture_launch_instruction_delivery(id, command).await
@@ -2034,13 +2033,40 @@ impl Router {
         let _ = self.settle(id, state, Some(outcome)).await;
     }
 
-    pub(super) async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
-        // Typed creation/setup failures settle in WorkspaceManager. Pre-effect
-        // revision or identity refusals settle as Rejected here; if the final
-        // pre-native identity read is uncertain, Store rechecks the pending
-        // command and workspace phase before recording it.
-        if matches!(error.code.as_str(), "stale_assignment" | "not_allowed") {
+    async fn settle_workspace_prepare_error(&self, start: &Command, error: &Error) {
+        let id = start.id.as_str();
+        // Typed creation/setup outcomes already handled by WorkspaceManager
+        // are terminal or unknown by now. A raw preparation error can be
+        // rejected regardless of code if the exact creation marker rules out
+        // a Git write and no cancellation has taken ownership.
+        let before_git_write = if let Some(target) = start.target.as_deref() {
+            let store = self.inner.store.lock().await;
+            store
+                .get_workspace(target)
+                .ok()
+                .flatten()
+                .is_some_and(|workspace| {
+                    workspace.start_command_id == id
+                        && start
+                            .generation
+                            .and_then(|generation| generation.checked_add(1))
+                            == Some(workspace.target_generation)
+                        && workspace.outcome.as_ref().is_some_and(|outcome| {
+                            outcome["stage"] == "creation"
+                                && outcome["native_git_write_dispatched"] == false
+                                && outcome["cancel_requested"] != true
+                                && (workspace.phase == WorkspacePhase::Creating
+                                    || workspace.phase == WorkspacePhase::Ready
+                                        && start.verb == "resume"
+                                        && outcome["reuse"] == true)
+                        })
+                })
+        } else {
+            false
+        };
+        if before_git_write || matches!(error.code.as_str(), "stale_assignment" | "not_allowed") {
             self.reject_undispatched_error(id, error).await;
+            self.signal_progress();
             return;
         }
         let command = {

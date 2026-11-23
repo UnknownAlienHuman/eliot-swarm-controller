@@ -408,6 +408,11 @@ Flow:
 6. only a `ready` row whose target generation matches the start command permits that
    generation's native dispatch.
 
+A preparation error with an exact creation marker proving no Git write or setup
+dispatch settles the command and workspace with the original error code and message.
+A refused Resume restores its exact prior `ready` marker. Later Resume attempts
+verify Git and worktree identity again before native dispatch.
+
 A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
 checkout can leave its new Git branch after Git has removed the worktree. Cleanup
 requires the creation command's branch reflog marker, the frozen tip and no other
@@ -419,17 +424,20 @@ A failed checkout reports its exit code once readback proves that the checkout a
 branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
 `unknown` unless exact platform evidence proves the process never started. It is never
-rerun. The owner removes/recreates or explicitly resolves the workspace. This needs one
-row and one running marker, not a `workspace_steps` journal or artifact service.
+rerun. Uncertain effects remain unknown pending supported Owner resolution. This needs
+one row and one running marker, not a `workspace_steps` journal or artifact service.
 
 Cancellation stops the current custody. Native start never begins from a non-ready or
 wrong-target-generation workspace. Removal requires terminal Agents and a clean
 checkout apart from allowed relative scratch paths. The branch is retained.
 Cancellation is committed before signalling custody and serializes with process spawn.
-Preparation failure before first native dispatch can fail the generation-0 Agent;
-uncertainty leaves it created with an unknown start command. Neither path installs
-native authority or advances the generation. A resume preparation failure retains the
-previous terminal generation.
+Force shutdown records a diagnostic if a direct cancellation cannot be settled.
+After restart, an exact start/stop cancellation binding on an unknown creation
+settles when the durable `native_git_write_dispatched=false` marker rules out a Git
+write and the creation stage rules out setup dispatch for that attempt. Recovery
+retains uncertainty and the original bindings when Git or setup effects may have
+occurred. It never repeats either effect. For cancelled creation with a possible Git
+write, see [Owner resolution](api.md#input-turn-and-unknown-gates).
 On Windows, step completion waits for the owned Job to empty. On supported Linux,
 successful leader completion and an empty observed process group permit degraded
 completion; escaped descendants remain possible. A signal-zero group query is

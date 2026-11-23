@@ -2714,6 +2714,9 @@ impl Store {
         // Retained children of producer generations that ended before this
         // start (including rows written before this rule existed).
         native_children::end_native_children_with_parent_tx(&tx, None, now, &mut events)?;
+        // Settle only the exact pre-Git creation cancellation after restart
+        // has reconciled both dispatched commands and Agent custody.
+        workspace::recover_workspace_cancellations(&tx, now, &mut events)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
