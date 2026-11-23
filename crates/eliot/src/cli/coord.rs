@@ -380,7 +380,7 @@ pub(crate) async fn run_inbox(
                 )
                 .await;
             }
-            OwnerInboxCommand::Apply { kind, items } => {
+            OwnerInboxCommand::Apply { kind, items, yes } => {
                 let InboxArgs {
                     agent,
                     limit,
@@ -395,8 +395,16 @@ pub(crate) async fn run_inbox(
                         "inbox apply accepts Owner inbox paging only",
                     ));
                 }
-                return bulk_decide_inbox(&data_dir, kind, items, after, limit, json_output, id)
-                    .await;
+                return bulk_decide_inbox(
+                    &data_dir,
+                    kind,
+                    items,
+                    yes,
+                    OwnerInboxRequest { after, limit },
+                    json_output,
+                    id,
+                )
+                .await;
             }
         }
     }
@@ -485,11 +493,12 @@ async fn bulk_decide_inbox(
     data_dir: &Path,
     kind: Option<String>,
     items: Vec<String>,
-    after: Option<String>,
-    limit: Option<usize>,
+    yes: bool,
+    page: OwnerInboxRequest,
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
+    let OwnerInboxRequest { after, limit } = page;
     let refs = match kind {
         Some(kind) if items.is_empty() => {
             if !(1..=MAX_BULK_OWNER_DECISIONS).contains(&limit.unwrap_or(100)) {
@@ -511,6 +520,17 @@ async fn bulk_decide_inbox(
                         .await
                         .map_err(Failure::for_read)?;
                 for item in response.items.into_iter().filter(|item| item.kind == kind) {
+                    if !yes
+                        && item.recommended.as_ref().is_some_and(|action| {
+                            action.method == "command.submit"
+                                && action.args["verb"].as_str() == Some("stop")
+                        })
+                    {
+                        return Err(Failure::new(
+                            2,
+                            "kind-wide apply includes Stop recommendations; pass --yes or use reviewed --item refs",
+                        ));
+                    }
                     refs.insert(
                         (item.kind, item.subject.clone()),
                         OwnerInboxItemRef {

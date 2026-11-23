@@ -1286,14 +1286,16 @@ fn action(choice: &str, method: &str, args: Value) -> OwnerAction {
 fn item(
     kind: OwnerInboxKind,
     subject: String,
-    revision: String,
+    subject_revision: String,
     now: i64,
     since: i64,
     reason: &str,
     recommended: Option<OwnerAction>,
     choices: Vec<OwnerAction>,
 ) -> OwnerInboxItem {
-    let binding = json!([revision, reason, &recommended, &choices]);
+    // The caller supplies a subject revision. Bind every projected choice and
+    // recommendation here, including each action's method and arguments.
+    let binding = json!([subject_revision, reason, &recommended, &choices]);
     let revision = eliot_core::api::inference::sha256_hex(binding.to_string().as_bytes());
     OwnerInboxItem {
         kind,

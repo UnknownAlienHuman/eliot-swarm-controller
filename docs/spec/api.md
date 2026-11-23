@@ -766,7 +766,10 @@ slot. Recommendations
 are derived from retained facts. Send `owner.decide` with the item kind,
 subject, revision, and an offered choice name, `recommended`, or `snooze`.
 The daemon checks the revision under the Store writer when it admits the
-selected mutation. A stale item returns `stale_item`. A snooze lasts until
+selected mutation. For every kind, the revision binds the subject facts, reason,
+offered choices, and recommendation, including the methods and arguments. An
+item gets a new revision when a recommendation appears, changes, or disappears.
+A stale item returns `stale_item`. A snooze lasts until
 the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
@@ -794,10 +797,12 @@ Use repeatable `--arg KEY=VALUE` flags for displayed inputs such as
 `swarm inbox snooze ITEM` hides the displayed revision.
 `swarm inbox apply --kind KIND` snapshots current refs of that kind across the
 Owner inbox pages and submits them as one bounded batch (at most 100 refs); if
-more than 100 match, it refuses before deciding any item. Narrow with
-`--after`, or pass reviewed refs explicitly as repeated
-`swarm inbox apply --item KIND/SUBJECT@REVISION` options. The explicit form
-also submits stale refs so the daemon can report their skip reason. The root
+more than 100 match, it refuses before deciding any item. If the selection
+includes a Stop recommendation, the kind-wide form requires `--yes`. Use
+`--after` to narrow the selection or pass reviewed refs with repeated `--item
+KIND/SUBJECT@REVISION` options. Explicit refs already identify the choices the
+Owner reviewed and may be submitted without `--yes`. The explicit form also
+submits stale refs so the daemon can report their skip reason. The root
 `--id` is the batch ULID and must be reused with the same ordered refs for an
 exact retry. `--json` emits the aggregate response.
 
@@ -3072,7 +3077,7 @@ swarm cmd resolve ID --status completed|failed --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]
 swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
-swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND | --item REF...)
+swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND [--yes] | --item REF...)
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history]
 swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
 swarm project list | show ID

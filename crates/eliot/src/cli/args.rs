@@ -1167,6 +1167,9 @@ pub(crate) enum OwnerInboxCommand {
         kind: Option<String>,
         #[arg(long = "item", value_name = "KIND/SUBJECT@REVISION")]
         items: Vec<String>,
+        /// Confirm a kind-wide apply that includes Stop recommendations.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
