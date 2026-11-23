@@ -13,9 +13,10 @@ use eliot_core::api::{
     AgentProcessesResponse, AgentResultRequest, AgentResultResponse, AgentStatsRequest,
     AgentStatsResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
     EventsBoundsResponse, EventsFilter, EventsReadRequest, EventsReadResponse,
-    EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessDoctorRequest,
-    HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage, ObserveHeavyRequest,
-    ObserveHeavyResponse, ProfileCommandIssue, TurnCounterMissing, UsageSummaryRequest,
+    EventsSubscribeRequest, EventsSubscribeResponse, GoalCheckDeadlineSource, HarnessCheckOutcome,
+    HarnessDoctorRequest, HarnessDoctorResponse, MAX_SWARM_MCP_TURNS, ObservationPage,
+    ObserveHeavyRequest, ObserveHeavyResponse, ProfileCommandIssue, TurnCounterMissing,
+    UsageSummaryRequest,
     UsageSummaryResponse,
 };
 use eliot_core::api::{AgentSummary, activity_state_name};
@@ -590,21 +591,52 @@ pub(crate) fn print_profile_command_issue(issue: &ProfileCommandIssue) {
 
 pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
     println!(
-        "{:<12} {:<9} {:<14} {:<16} {:<5} DOC",
-        "HARNESS", "INSTALLED", "VERSION", "VERIFIED", "DRIFT"
+        "{:<12} {:<9} {:<14} {:<11} DOC",
+        "HARNESS", "INSTALLED", "VERSION", "CHECK"
     );
     for entry in &response.harnesses {
+        let check = match entry.check_outcome {
+            HarnessCheckOutcome::NotChecked => "not-checked",
+            HarnessCheckOutcome::Passed => "passed",
+            HarnessCheckOutcome::Failed => "FAILED",
+        };
         println!(
-            "{:<12} {:<9} {:<14} {:<16} {:<5} {}",
+            "{:<12} {:<9} {:<14} {:<11} {}",
             entry.harness,
             yes_no(entry.installed),
             entry.version.as_deref().unwrap_or("-"),
-            entry.verified_version,
-            yes_no(entry.drift),
+            check,
             entry.doc_section,
         );
-        if let Some(message) = &entry.drift_message {
-            println!("  drift: {message}");
+        match entry.check_outcome {
+            HarnessCheckOutcome::NotChecked => {
+                if let Some(reason) = &entry.not_checked_reason {
+                    println!("  check: not checked ({reason})");
+                } else {
+                    println!("  check: not checked");
+                }
+            }
+            HarnessCheckOutcome::Passed => {
+                println!(
+                    "  check: version {} passed{}",
+                    entry.checked_version.as_deref().unwrap_or("-"),
+                    entry
+                        .check_profile
+                        .as_deref()
+                        .map_or(String::new(), |profile| format!(" on {profile}"))
+                );
+            }
+            HarnessCheckOutcome::Failed => {
+                println!(
+                    "  check: version {} FAILED at {}{}",
+                    entry.checked_version.as_deref().unwrap_or("-"),
+                    entry.failure_step.as_deref().unwrap_or("?"),
+                    entry
+                        .failure_error
+                        .as_deref()
+                        .map_or(String::new(), |error| format!(": {error}"))
+                );
+            }
         }
         if let Some(mismatch) = &entry.contract_mismatch {
             println!("  contract mismatch: {mismatch}");

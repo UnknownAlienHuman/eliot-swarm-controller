@@ -659,8 +659,7 @@ fn project_harness_checks(
         "SELECT harness, installed_version, outcome, checked_version, checked_at,
                 COALESCE(check_profile, ''), failure_step, failure_error
          FROM harness_checks
-         WHERE outcome IN ('passed', 'failed')
-           AND checked_version <> '' AND checked_version = installed_version",
+         WHERE outcome IN ('passed', 'failed') AND checked_version <> ''",
         "('harness:' || harness)=?1",
         bindings,
     )?;
@@ -679,10 +678,16 @@ fn project_harness_checks(
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (harness, _installed, outcome, checked, checked_at, profile, step, error) =
+        let (harness, installed, outcome, checked, checked_at, profile, step, error) =
             row.map_err(sql_error)?;
         if harness.trim().is_empty() || checked.trim().is_empty() {
             return Err(crate::Error::new("corrupt", "invalid harness check fact"));
+        }
+        // The recorded outcome belongs to the current installed surface only
+        // when the versions fold together (`codex-cli 0.167.1` meets
+        // `0.167.1`); a stale record after a version change projects no item.
+        if !eliot_core::same_harness_version(&harness, &installed, &checked) {
+            continue;
         }
         let subject = format!("harness:{harness}");
         let subject_revision = format!(

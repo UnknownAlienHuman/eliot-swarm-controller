@@ -714,6 +714,7 @@ impl PluginHost {
         let (mut target_environment, mcp_environment) =
             build_target_environment(&self.state.data_root, &agent, &agent_token)?;
         let mcp_environment = if agent.is_automatic_provider_probe()
+            || agent.is_harness_check()
             || HarnessCapabilities::of(&agent.harness).data_root_only_mcp
         {
             Some(data_root_only_mcp_environment(&mcp_environment)?)
@@ -757,6 +758,7 @@ impl PluginHost {
         }
         if let Some(root) = artifact_root
             && !agent.is_automatic_provider_probe()
+            && !agent.is_harness_check()
             && target_environment
                 .get(crate::daemon::AGENT_DATA_SCOPE_ENV)
                 .is_some()

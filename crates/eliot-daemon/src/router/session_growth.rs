@@ -12,6 +12,7 @@ impl Router {
             || agent.archived
             || agent.observe_only
             || agent.is_automatic_provider_probe()
+            || agent.is_harness_check()
             || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
         {
             return Ok(());

@@ -930,9 +930,10 @@ session boundary. After a successful commandless native continuation, a growth
 switch keeps the prior task command as its handoff anchor and includes the
 latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 [automatic background-process wake](automation.md#automatic-background-process-wake).
-`swarm doctor` compares live installed harness versions and contract markers against
-the diagnostic `VERIFIED_HARNESSES` baseline without blocking launch; those versions
-do not pin executable selection. It also reports every profile whose explicitly
+`swarm doctor` shows each installed harness version with its self-check record
+(installed version plus when that version last passed Swarm's own scenario,
+#932) without blocking launch; no version gate pins executable selection.
+It also reports every profile whose explicitly
 pinned executable is missing, with the configured path, current replacement
 path/version when available, and the exact `profiles.<name>.cmd` setting to remove.
 The desktop reads

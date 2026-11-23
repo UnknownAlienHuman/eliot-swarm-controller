@@ -56,9 +56,105 @@ pub(crate) async fn run(
             shutdown.clone(),
             reactions_enabled
         ),
+        run_harness_check_maintenance(router.clone(), Arc::clone(&policy), shutdown.clone()),
         run_missing_worktree_reconciliation(router, policy, shutdown),
     )?;
     Ok(())
+}
+
+/// Swarm's own post-update harness check (#932 item 3). Each tick notes the
+/// installed versions, admits due checks (at most one runs at a time), and
+/// drives admitted scenarios to their recorded outcome on spawned tasks.
+/// Check Agents orphaned by a dead daemon are deleted here.
+async fn run_harness_check_maintenance(
+    router: crate::router::Router,
+    policy: Arc<SecretPolicy>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut ticker =
+        tokio::time::interval(Duration::from_secs(eliot_core::HARNESS_CHECK_TICK_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut check_tasks = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let available = eliot_core::HARNESS_CHECK_BATCH_LIMIT
+                    .saturating_sub(check_tasks.len());
+                match router.maintain_harness_checks(available).await {
+                    Ok((started, orphans)) => {
+                        for agent_id in orphans {
+                            let orphan_router = router.clone();
+                            let mut orphan_shutdown = shutdown.clone();
+                            check_tasks.spawn(async move {
+                                orphan_router
+                                    .cleanup_harness_check_agent(&agent_id, &mut orphan_shutdown)
+                                    .await
+                            });
+                        }
+                        for work in started {
+                            let drive_router = router.clone();
+                            let drive_shutdown = shutdown.clone();
+                            check_tasks.spawn(async move {
+                                drive_router.drive_harness_check(work, drive_shutdown).await
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        logging::record(
+                            &policy,
+                            "daemon.harness_check_maintenance_failed",
+                            &[
+                                ("producer", "daemon.harness_check_maintenance"),
+                                ("method", "harness.check.maintenance"),
+                            ],
+                            Some(&error),
+                        );
+                    }
+                }
+                continue;
+            }
+            joined = check_tasks.join_next(), if !check_tasks.is_empty() => {
+                match joined {
+                    Some(Ok(Err(error))) => {
+                        logging::record(
+                            &policy,
+                            "daemon.harness_check_failed",
+                            &[
+                                ("producer", "daemon.harness_check"),
+                                ("method", "harness.check.drive"),
+                            ],
+                            Some(&error),
+                        );
+                    }
+                    Some(Err(error)) => {
+                        let error = maintenance_join_error("harness check", &error);
+                        logging::record(
+                            &policy,
+                            "daemon.harness_check_task_failed",
+                            &[
+                                ("producer", "daemon.harness_check"),
+                                ("method", "harness.check.drive.join"),
+                            ],
+                            Some(&error),
+                        );
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    while let Some(joined) = check_tasks.join_next().await {
+                        if let Ok(Err(error)) = joined {
+                            logging::record(&policy, "daemon.harness_check_failed", &[], Some(&error));
+                        }
+                    }
+                    return Ok(());
+                }
+                continue;
+            }
+        }
+    }
 }
 
 async fn run_missing_worktree_reconciliation(

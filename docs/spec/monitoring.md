@@ -1387,9 +1387,10 @@ retention does not delete Agent or turn rows. Explicit Agent deletion removes
 the Agent and its dependent history, so the policy, usage, and executor rows
 describe the retained fleet. Event-dependent rows also report known event gaps.
 
-## Heavy work, session growth and harness drift
+## Heavy work, session growth and harness checks
 
-Three event families capture heavy work, session growth, and vendor drift.
+Two event families capture heavy work and session growth, plus the durable
+harness self-check fact.
 
 - `activity.heavy`: one event per command whose wall time, CPU or peak RSS
   crossed a `daemon.heavy_*` threshold. Attribution walks the observed tree to
@@ -1417,16 +1418,26 @@ Three event families capture heavy work, session growth, and vendor drift.
   cache read/write counters from terminal readback. OpenCode has no capacity or
   session-file-size source, and the Muse event log exposes no size; those signals
   remain unavailable rather than guessed.
-- `harness.drift`: one event per harness and installed surface while the installed
-   version or contract marker differs from the diagnostic `VERIFIED_HARNESSES`
-   baseline (`crates/eliot-core/src/observe.rs`). Versions compare normalized per
-   harness (product prefix stripped, build metadata kept), so `codex-cli 0.167.1`
-   matches `0.167.1` while `1.4.20` differs from `1.4.0-R4161.1`. This baseline
-   does not pin the executable selected for a launch. Drift never blocks launch; it
-   annotates `swarm doctor` and the launch flag only.
+- `harness_checks`: one durable fact per harness, not an event: the installed
+   version and when that version last passed Swarm's own scenario
+   (`crates/eliot-store/src/harness_checks.rs`, #932). A new installed version
+   is always accepted and marked "not checked"; it is never refused. Versions
+   compare normalized per harness (product prefix stripped, build metadata
+   kept), so `codex-cli 0.167.1` meets `0.167.1` while `1.4.20` differs from
+   `1.4.0-R4161.1`. No version gate pins the executable selected for a launch.
+   When Swarm sees a changed installed version, the daemon runs one short
+   scenario for that harness and version on a daemon-owned isolated Agent
+   (launch, a turn with a tool call, steer, stop, resume) on the cheapest
+   configured model, inside a hard time limit, at most once per harness and
+   version. The result goes to the Owner inbox (`harness_check` kind): passed,
+   or the failed step with the vendor's error. A quota refusal stays
+   "not checked" and runs again after the hold ends. A failed check removes
+   the harness from automatic routing until a later check passes; explicit
+   Owner launches still work.
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
-(per-harness installed vs verified, also `swarm doctor`), `heavy`/`session_growth` on
-`agent.stats`, the `OBS` column of `swarm top`, and the Heavy work section of the
-desktop Details panel (shown only when an episode or growth signal was recorded).
+(per-harness installed version plus its self-check record, also `swarm doctor`),
+`heavy`/`session_growth` on `agent.stats`, the `OBS` column of `swarm top`, and
+the Heavy work section of the desktop Details panel (shown only when an episode
+or growth signal was recorded).
 Readbacks degrade to `None`/quiet text rather than failing the view.

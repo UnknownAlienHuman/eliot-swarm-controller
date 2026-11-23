@@ -38,6 +38,19 @@ pub const HARNESS_CHECK_LAUNCH_ARG: &str = "_harness_check";
 /// Hard wall-clock budget for one harness check run, in seconds.
 pub const HARNESS_CHECK_TIMEOUT_SECS: u64 = 600;
 
+/// At most one harness check runs at a time: checks spend real model quota,
+/// so they never run in parallel.
+pub const HARNESS_CHECK_BATCH_LIMIT: usize = 1;
+
+/// How often the daemon looks for installed versions with a due check, in
+/// seconds. Version changes are rare; the tick only runs read-only `--version`
+/// probes until a check is due.
+pub const HARNESS_CHECK_TICK_SECS: u64 = 60;
+
+/// Stale-claim horizon in milliseconds: a live run always finishes inside
+/// the check timeout, so an older claim belongs to a dead daemon.
+pub const HARNESS_CHECK_STALE_ATTEMPT_MS: i64 = (HARNESS_CHECK_TIMEOUT_SECS as i64 + 300) * 1000;
+
 /// Cooldown before a quota-deferred check may run again, in seconds.
 pub const HARNESS_CHECK_QUOTA_RETRY_SECS: i64 = 900;
 

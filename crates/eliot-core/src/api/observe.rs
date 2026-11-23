@@ -462,10 +462,10 @@ impl DoctorHarnessEntry {
         if let Some(checked) = &self.checked_version {
             text(checked, "doctor checked version")?;
         }
-        if let Some(at) = self.checked_at {
-            if at < 0 {
-                return Err(Error::new("invalid", "doctor check time is invalid"));
-            }
+        if let Some(at) = self.checked_at
+            && at < 0
+        {
+            return Err(Error::new("invalid", "doctor check time is invalid"));
         }
         if let Some(profile) = &self.check_profile {
             text(profile, "doctor check profile")?;
@@ -482,12 +482,11 @@ impl DoctorHarnessEntry {
                         "doctor unchecked harness carries no check record",
                     ));
                 }
-                if let Some(reason) = &self.not_checked_reason {
-                    if reason != crate::NOT_CHECKED_NEW_VERSION
-                        && reason != crate::NOT_CHECKED_QUOTA
-                    {
-                        return Err(Error::new("invalid", "doctor unchecked reason is invalid"));
-                    }
+                if let Some(reason) = &self.not_checked_reason
+                    && reason != crate::NOT_CHECKED_NEW_VERSION
+                    && reason != crate::NOT_CHECKED_QUOTA
+                {
+                    return Err(Error::new("invalid", "doctor unchecked reason is invalid"));
                 }
             }
             HarnessCheckOutcome::Passed => {

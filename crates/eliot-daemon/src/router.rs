@@ -16,6 +16,7 @@ pub(crate) mod discovery;
 mod goal_scope;
 mod goals;
 mod handoff;
+mod harness_check;
 mod hierarchy;
 mod inference;
 mod insertion_facts;

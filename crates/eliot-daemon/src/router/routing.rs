@@ -524,6 +524,19 @@ impl Router {
             }
         };
         let harness = required_text(&snapshot, "harness")?.to_owned();
+        // A failed self-check removes the harness from automatic routing until
+        // a later check passes (#932 item 3). Explicit Owner launches bypass
+        // routing, so they still work.
+        if preflight.automatic
+            && self
+                .inner
+                .store
+                .lock()
+                .await
+                .harness_check_blocks_automatic(&harness)?
+        {
+            return Ok(Err(RouteSkipReason::HarnessCheckFailed));
+        }
         if let Some(parent) = parent
             && hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err()
         {
