@@ -2078,6 +2078,7 @@ fn settle_owner_interrupted_turn_tx(
     };
     if turn.resolution_source == Some(eliot_core::TurnResolutionSource::Owner)
         || (reason == "interrupted_by_owner"
+            && turn.state != eliot_core::TurnState::Unknown
             && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))
         || (turn.state == eliot_core::TurnState::Completed
             && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))

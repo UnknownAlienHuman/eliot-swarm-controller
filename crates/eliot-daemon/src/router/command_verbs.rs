@@ -858,6 +858,7 @@ impl Router {
         if terminal.is_some() || confirmed {
             let reason = match terminal {
                 Some(TurnOutcome::Interrupted) if ack => "interrupted_by_owner",
+                None if command.turn_id.is_none() => "session_interrupt_confirmed",
                 None => "interrupted_by_owner",
                 _ => "turn_ended",
             };

@@ -924,7 +924,7 @@ fn dispatch_control_tx(
         .expected_turn_id
         .as_deref()
         .is_some_and(|expected| turn_id != Some(expected))
-        || current_turn.as_deref() != turn_id
+        || ((!owner_interrupt || turn_id.is_some()) && current_turn.as_deref() != turn_id)
     {
         return Err(Error::new(
             "stale_generation",
@@ -1033,7 +1033,8 @@ impl Store {
                 || interrupt.state != CommandState::Dispatched
                 || agent.generation != generation
                 || agent.is_terminal()
-                || admission::owner_control_turn(&tx, &agent)? != interrupt.command.turn_id
+                || (interrupt.command.turn_id.is_some()
+                    && admission::owner_control_turn(&tx, &agent)? != interrupt.command.turn_id)
             {
                 return Ok(None);
             }
