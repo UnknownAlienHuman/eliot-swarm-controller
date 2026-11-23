@@ -1079,14 +1079,11 @@ impl MusePlugin {
                 .find(|model| model.model_id == requested_model),
         );
         if let Some(effort) = requested.effort.as_deref()
-            && !selection.allows_effort(|entry| {
-                is_reasoning_effort_tier(effort)
-                    && match entry.variants.as_ref() {
-                        Some(NativeModelEffortVariants::Known(variants)) => {
-                            variants.iter().any(|variant| variant == effort)
-                        }
-                        _ => true,
-                    }
+            && !selection.allows_effort(|entry| match entry.variants.as_ref() {
+                Some(NativeModelEffortVariants::Known(variants)) => {
+                    variants.iter().any(|variant| variant == effort)
+                }
+                _ => true,
             })
         {
             return Ok(json!({
@@ -2098,8 +2095,15 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
     let effort = args
         .get("effort")
         .and_then(Value::as_str)
-        .filter(|effort| !effort.trim().is_empty())
         .map(str::to_owned);
+    if let Some(effort) = effort.as_deref()
+        && !is_reasoning_effort_tier(effort)
+    {
+        return Err(Error::new(
+            "invalid",
+            format!("Muse effort {effort} is not a supported reasoning tier"),
+        ));
+    }
     if model.is_none() && effort.is_none() {
         return Err(Error::new(
             "invalid",

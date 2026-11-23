@@ -703,13 +703,32 @@ impl Session {
             }
             return Err(error);
         }
-        if let Some(level) = target.level.as_deref() {
-            self.write_config_option("thought_level", level, deadline)
-                .await
-                .map_err(|error| error.with_code("unknown"))?;
-        }
         let catalogue_omits_model = selection.catalogue_omits_model();
-        self.current_base = target.base.clone();
+        self.current_base = target.base;
+        if let Some(level) = target.level.as_deref() {
+            match self
+                .write_config_option("thought_level", level, deadline)
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if error.code == "native_rejected" => {
+                    return Ok(with_model_catalogue_diagnostic(
+                        json!({
+                            "state": "failed",
+                            "code": error.code,
+                            "reason": error.message,
+                            "origin": FailureOrigin::Harness,
+                            "origin_evidence": "ACP thought level setter returned a native error",
+                            "where": "plugin.antigravity.configure.set_thought_level",
+                            "model": self.current_base,
+                            "model_verified": true,
+                        }),
+                        catalogue_omits_model,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
         self.current_level = target.level.clone();
         Ok(with_model_catalogue_diagnostic(
             json!({
