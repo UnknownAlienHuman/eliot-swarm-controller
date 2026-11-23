@@ -282,7 +282,9 @@ impl Router {
             self.signal_launch_arbitration();
             return;
         }
-        self.process_command(source_stop_command, None).await;
+        self.clone()
+            .process_command(source_stop_command, None)
+            .await;
         let source_exit_proven = {
             let store = self.inner.store.lock().await;
             store.switch_source_exit_proven(id)
