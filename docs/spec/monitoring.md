@@ -1197,7 +1197,13 @@ waiting turn without an active wake keep their existing Moving/Long/Stuck
 classification.
 
 Stuck inbox rows keep `recommended` absent when Store facts do not prove a safe
-correction; available inspection choices remain executable. For a Stuck busy or
+correction; available inspection choices remain executable. A stuck managed
+launch offers Stop when the exact generation is still Created and its workspace
+is Creating with explicit proof that Git creation has yet to dispatch. Stop
+uses the normal workspace-cancellation path and exact generation fence. The
+same item offers command inspection.
+
+For a Stuck busy or
 waiting Agent, the Owner-only `stop` recommendation is present only when its
 current generation has no active-turn pointer, pending request, running or
 unknown turn, or unsettled command, and Store has both an open native source and
