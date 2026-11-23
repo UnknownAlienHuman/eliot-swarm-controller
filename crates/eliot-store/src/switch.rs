@@ -1017,6 +1017,7 @@ impl Store {
                         self.hierarchy_limits,
                         transfer,
                     )?;
+                    super::work_truth::inherit_work_task_tx(&tx, &source, &destination, now)?;
                     tx.execute("UPDATE commands SET parent_command=?1,link_kind='switch',ordinal=1 WHERE id=?2", params![id,plan.handoff_command]).map_err(sql_error)?;
                     // The continuation rides the existing overlay: B's
                     // link records the source it continues. Plain text,
