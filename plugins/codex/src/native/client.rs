@@ -50,24 +50,19 @@ impl NativeStdioConfig for CodexStdioConfig {
             ))
     }
 
-    /// The exact notification methods the Codex event task consumes today
-    /// (`process_notification` / `process_child_notification` arms in `events.rs`,
-    /// including `thread/started` child confirmation and the `error` validation
-    /// arm). Every other well-formed notification is already ignored there
-    /// (`_ => {}`), so dropping it at the pump preserves semantics while keeping
-    /// ignored traffic out of the bounded queue. Server requests and responses
-    /// always pass through untouched.
+    /// These installed 0.167.1 item deltas are high-volume but intentionally
+    /// outside the normalized event projection. Skip them before the lossy
+    /// queue; unrecognized methods still reach the event task for diagnostics.
     fn consumes_notification(method: &str) -> bool {
-        matches!(
+        !matches!(
             method,
-            "turn/started"
-                | "turn/completed"
-                | "item/started"
-                | "item/completed"
-                | "serverRequest/resolved"
-                | "thread/started"
-                | "thread/tokenUsage/updated"
-                | "error"
+            "item/agentMessage/delta"
+                | "item/commandExecution/outputDelta"
+                | "item/fileChange/outputDelta"
+                | "item/plan/delta"
+                | "item/reasoning/summaryPartAdded"
+                | "item/reasoning/summaryTextDelta"
+                | "item/reasoning/textDelta"
         )
     }
 }

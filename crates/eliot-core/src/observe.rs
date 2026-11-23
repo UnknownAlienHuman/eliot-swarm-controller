@@ -19,6 +19,9 @@ pub const ACTIVITY_HEAVY_KIND: &str = "activity.heavy";
 /// Journal kind for a native-session size warning.
 pub const SESSION_GROWTH_KIND: &str = "session.growth";
 pub const ATTENTION_STEP_KIND: &str = "x.user.agent.attention_step";
+/// Families transferred to the bound live rollout. Its session grant carries
+/// unclassified diagnostics only.
+pub const OBSERVED_ROLLOUT_FAMILIES: &[&str] = &["session", "turn", "message", "tool"];
 
 /// One recorded reaction and its binding to the original incident.
 #[derive(

@@ -9,7 +9,10 @@ use eliot_core::{
         ObservationQuery,
     },
 };
-use eliot_plugin::{FileIdentity, file_final_path, file_identity};
+use eliot_plugin::{
+    FileIdentity, file_final_path, file_identity,
+    native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -30,7 +33,6 @@ const MAX_SCAN_BYTES: usize = 1024 * 1024;
 const ANCHOR_BYTES: usize = 4096;
 const MAX_PATH_BYTES: usize = 4096;
 const LIVE_CURSOR_PREFIX: &str = "codex-rollout-live-v1:";
-const LIVE_CLI_VERSION: &str = "0.161.0";
 
 pub(crate) struct LiveRecord {
     pub events: Vec<NativeEvent>,
@@ -61,7 +63,6 @@ struct LiveFile {
     header_end: u64,
     header_hash: String,
     native_ref: String,
-    cli_version: String,
     binding: String,
     policy: Arc<SecretPolicy>,
 }
@@ -96,6 +97,8 @@ struct LiveCursor {
     offset: u64,
     anchor_sha256: String,
     current_turn_id: Option<String>,
+    #[serde(default)]
+    saw_unbound_abort: bool,
     calls: BTreeMap<String, LiveCall>,
 }
 
@@ -111,18 +114,11 @@ impl LiveRollout {
         path: PathBuf,
         home: PathBuf,
         native_ref: String,
-        cli_version: String,
         binding: String,
         policy: Arc<SecretPolicy>,
         deadline: Instant,
     ) -> Result<Self> {
-        if cli_version != LIVE_CLI_VERSION {
-            return Err(Error::new(
-                "unsupported",
-                "Codex live rollout codec requires 0.161.0",
-            ));
-        }
-        for value in [&native_ref, &cli_version, &binding] {
+        for value in [&native_ref, &binding] {
             live_identifier(value, &policy)?;
         }
         if !path.is_absolute() || Instant::now() >= deadline {
@@ -143,11 +139,11 @@ impl LiveRollout {
             read_complete_line(&mut file, 0, MAX_HEADER_BYTES, deadline)?
                 .ok_or_else(unavailable)?;
         let header = parse_line(&header_bytes)?;
-        validate_header(&header, &native_ref, &cli_version)?;
+        validate_header(&header, &native_ref)?;
         native_timestamp(&header.timestamp)?;
         let binding = fingerprint(json!({
             "domain":"eliot/codex/live-rollout/v1", "caller":binding,
-            "native_ref":native_ref, "cli_version":cli_version, "file_identity":identity,
+            "native_ref":native_ref, "file_identity":identity,
             "home":home.to_str().ok_or_else(unavailable)?,
             "path":final_path.to_str().ok_or_else(unavailable)?,
         }))?;
@@ -160,6 +156,7 @@ impl LiveRollout {
             offset,
             anchor_sha256: anchor_at(&mut file, offset, deadline)?,
             current_turn_id: None,
+            saw_unbound_abort: false,
             calls: BTreeMap::new(),
         };
         let baseline = encode_live_cursor(&cursor, &policy)?;
@@ -172,7 +169,6 @@ impl LiveRollout {
                 header_end,
                 header_hash: hex_digest(&header_bytes),
                 native_ref,
-                cli_version,
                 binding,
                 policy,
             }),
@@ -253,7 +249,7 @@ impl LiveFile {
         let (bytes, end) = read_complete_line(&mut self.file, 0, MAX_HEADER_BYTES, deadline)?
             .ok_or_else(unavailable)?;
         let header = parse_line(&bytes)?;
-        validate_header(&header, &self.native_ref, &self.cli_version)?;
+        validate_header(&header, &self.native_ref)?;
         if end != self.header_end || hex_digest(&bytes) != self.header_hash {
             return Err(integrity());
         }
@@ -471,14 +467,13 @@ fn live_gap(cursor: &str, error: &Error) -> LiveRolloutPage {
     }
 }
 
-// Pinned format: openai/codex 979011409de0a60b52f179721948e65531d26144,
+// Known writer behavior: openai/codex 979011409de0a60b52f179721948e65531d26144,
 // protocol/src/protocol.rs and rollout/src/policy.rs (`should_persist_event_msg`).
 // Lifecycle EventMsg records (`task_started`/`turn_started`, `task_complete`/`turn_complete`,
-// `task_aborted`/`turn_aborted`) are canonical. Every other EventMsg the pinned
+// `task_aborted`/`turn_aborted`) are canonical. Every other EventMsg the known
 // writer persists (usage/thread metadata, completion bookkeeping, legacy echoes
-// and legacy-mode records) is ignorable without clearing binding. A never-
-// persisted, genuinely unknown EventMsg gaps without resetting binding unless
-// identity is lost or corrupt.
+// and legacy-mode records) is ignorable without clearing binding. An unknown
+// EventMsg is recorded as unclassified and leaves lifecycle binding unchanged.
 fn normalize_live_line(
     state: &mut LiveCursor,
     line: &RolloutLine,
@@ -492,48 +487,64 @@ fn normalize_live_line(
     if line.kind == "session_meta" {
         return Err(integrity());
     }
-    if !line.payload.is_object() {
-        return Err(integrity());
-    }
-    if line.kind == "turn_context" {
-        let turn = live_optional_id(&line.payload, "turn_id", policy)?;
-        if state.current_turn_id.as_deref() != turn {
-            state.calls.clear();
+    let normalized = if !known_rollout_kind(&line.kind) {
+        vec![(
+            UNCLASSIFIED_NATIVE_EVENT,
+            unclassified("codex.rollout.record", &line.kind),
+        )]
+    } else {
+        if !line.payload.is_object() {
+            return Err(integrity());
         }
-        state.current_turn_id = turn.map(str::to_owned);
-        return Ok(Vec::new());
-    }
-    let normalized = match line.kind.as_str() {
-        "event_msg" => normalize_live_event(state, &line.payload, policy)?,
-        "response_item" => normalize_live_item(state, &line.payload, policy)?,
-        _ => return Ok(Vec::new()),
+        if line.kind == "turn_context" {
+            let turn = live_optional_id(&line.payload, "turn_id", policy)?;
+            if state.current_turn_id.as_deref() != turn {
+                state.calls.clear();
+                state.saw_unbound_abort = false;
+            }
+            state.current_turn_id = turn.map(str::to_owned);
+            return Ok(Vec::new());
+        }
+        match line.kind.as_str() {
+            "event_msg" => normalize_live_event(state, &line.payload, policy)?,
+            "response_item" => normalize_live_item(state, &line.payload, policy)?
+                .into_iter()
+                .collect(),
+            _ => return Ok(Vec::new()),
+        }
     };
-    let Some((kind, mut data)) = normalized else {
-        return Ok(Vec::new());
-    };
-    // Binding values are checked before any body redaction. Object keys are
-    // never rewritten; a known secret in a publication key rejects the record.
-    data["native_timestamp"] = json!(line.timestamp);
-    sanitize_live_publication(kind, &mut data, policy)?;
-    let digest = fingerprint(json!({
-        "domain":"eliot/codex/live-rollout-record/v1", "native_ref":native_ref,
-        "file_identity":identity, "byte_start":start, "byte_end":end,
-        "kind":kind, "data":data, "ts":ts,
-    }))?;
-    let native_id = format!("codex-rollout:{digest}");
-    if policy.contains_text(&native_id) {
-        return Err(live_secret());
-    }
-    let event = NativeEvent {
-        kind: kind.to_owned(),
-        native_id,
-        data,
-        ts: Some(ts),
-    };
-    if serde_json::to_vec(&event).map_err(|_| integrity())?.len() > eliot_plugin::MAX_EVENT_BYTES {
-        return Err(too_large());
-    }
-    Ok(vec![event])
+    normalized
+        .into_iter()
+        .map(|(kind, mut data)| {
+            // Diagnostics use the common payload shape. Their timestamp is
+            // still retained in the native event envelope.
+            if kind != UNCLASSIFIED_NATIVE_EVENT {
+                data["native_timestamp"] = json!(line.timestamp);
+            }
+            sanitize_live_publication(kind, &mut data, policy)?;
+            let digest = fingerprint(json!({
+                "domain":"eliot/codex/live-rollout-record/v1", "native_ref":native_ref,
+                "file_identity":identity, "byte_start":start, "byte_end":end,
+                "kind":kind, "data":data, "ts":ts,
+            }))?;
+            let native_id = format!("codex-rollout:{digest}");
+            if policy.contains_text(&native_id) {
+                return Err(live_secret());
+            }
+            let event = NativeEvent {
+                kind: kind.to_owned(),
+                native_id,
+                data,
+                ts: Some(ts),
+            };
+            if serde_json::to_vec(&event).map_err(|_| integrity())?.len()
+                > eliot_plugin::MAX_EVENT_BYTES
+            {
+                return Err(too_large());
+            }
+            Ok(event)
+        })
+        .collect()
 }
 
 fn sanitize_live_publication(kind: &str, data: &mut Value, policy: &SecretPolicy) -> Result<()> {
@@ -546,6 +557,8 @@ fn sanitize_live_publication(kind: &str, data: &mut Value, policy: &SecretPolicy
         "input",
         "tool",
         "native_timestamp",
+        "site",
+        "native_tag",
         "error",
     ] {
         if let Some(value) = data.get_mut(field) {
@@ -573,7 +586,7 @@ fn normalize_live_event(
     state: &mut LiveCursor,
     payload: &Value,
     policy: &SecretPolicy,
-) -> Result<Option<(&'static str, Value)>> {
+) -> Result<Vec<(&'static str, Value)>> {
     let event_type = payload
         .get("type")
         .and_then(Value::as_str)
@@ -601,17 +614,33 @@ fn normalize_live_event(
             // usage, thread settings/goal/rollback, completion bookkeeping, legacy
             // echoes/mode records. Ignorable without clearing turn/tool binding;
             // only lifecycle records below mutate binding, the rest still gaps on lost identity.
-            return Ok(None);
+            return Ok(Vec::new());
         }
         "task_started" | "turn_started" | "task_complete" | "turn_complete" | "task_aborted"
         | "turn_aborted" => {}
-        _ => return Err(live_unsupported()),
+        _ => {
+            return Ok(vec![(
+                UNCLASSIFIED_NATIVE_EVENT,
+                unclassified("codex.rollout.event", event_type),
+            )]);
+        }
     }
-    let turn = live_optional_id(payload, "turn_id", policy)?.ok_or_else(live_unbound)?;
+    let aborted = matches!(event_type, "task_aborted" | "turn_aborted");
+    let started = matches!(event_type, "task_started" | "turn_started");
+    let explicit_turn = live_optional_id(payload, "turn_id", policy)?;
+    if aborted && explicit_turn.is_none() {
+        state.saw_unbound_abort = state.current_turn_id.is_some();
+        return Ok(vec![(
+            UNCLASSIFIED_NATIVE_EVENT,
+            unclassified("codex.rollout.unbound_abort", event_type),
+        )]);
+    }
+    let turn = explicit_turn.ok_or_else(live_unbound)?.to_owned();
     if state
         .current_turn_id
         .as_deref()
-        .is_some_and(|current| current != turn)
+        .is_some_and(|current| current != turn.as_str())
+        && !(started && state.saw_unbound_abort)
     {
         return Err(live_unbound());
     }
@@ -627,9 +656,15 @@ fn normalize_live_event(
         }
         data["duration_ms"] = json!(duration);
     }
-    if matches!(event_type, "task_started" | "turn_started") {
-        state.current_turn_id = Some(turn.to_owned());
-        return Ok(Some(("turn.started", data)));
+    if started {
+        if state.saw_unbound_abort {
+            // A later start proves its own binding. It cannot settle the
+            // preceding turn or inherit any of its pending tool calls.
+            state.calls.clear();
+            state.saw_unbound_abort = false;
+        }
+        state.current_turn_id = Some(turn);
+        return Ok(vec![("turn.started", data)]);
     }
     let has_error = match payload.get("error") {
         None | Some(Value::Null) => false,
@@ -639,19 +674,24 @@ fn normalize_live_event(
         }
         Some(_) => return Err(integrity()),
     };
-    let aborted = matches!(event_type, "task_aborted" | "turn_aborted");
+    let mut events = Vec::new();
     if aborted {
         let reason = payload
             .get("reason")
             .and_then(Value::as_str)
             .ok_or_else(integrity)?;
-        if !matches!(
+        if matches!(
             reason,
             "interrupted" | "replaced" | "review_ended" | "budget_limited"
         ) {
-            return Err(live_unsupported());
+            data["abort_reason"] = json!(reason);
+        } else {
+            events.push((
+                UNCLASSIFIED_NATIVE_EVENT,
+                unclassified("codex.rollout.abort_reason", reason),
+            ));
+            data["abort_reason"] = json!("other");
         }
-        data["abort_reason"] = json!(reason);
     } else {
         match payload.get("last_agent_message") {
             None | Some(Value::Null) => {}
@@ -667,7 +707,9 @@ fn normalize_live_event(
             .get("reason")
             .and_then(Value::as_str)
             .is_some_and(|reason| reason == "interrupted");
-    let (status, outcome) = if interrupted_abort {
+    let (status, outcome) = if !events.is_empty() {
+        ("unknown", "unknown")
+    } else if interrupted_abort {
         ("interrupted", "interrupted")
     } else if aborted || has_error {
         ("failed", "failure")
@@ -676,18 +718,19 @@ fn normalize_live_event(
     };
     data["status"] = json!(status);
     data["outcome"] = json!(outcome);
-    // Keep the raw native reason next to the outcome: the abort reason when
-    // the turn never ran to a native terminal, otherwise the rollout line type.
-    if aborted && let Some(reason) = payload.get("reason").and_then(Value::as_str) {
-        data["native_status"] = json!(reason);
+    // Only classified abort reasons are asserted as native statuses.
+    if aborted {
+        data["native_status"] = data["abort_reason"].clone();
     } else {
         data["native_status"] = json!(event_type);
     }
     state.current_turn_id = None;
+    state.saw_unbound_abort = false;
     state.calls.retain(|_, call| call.turn_id != turn);
     // The terminal's own final_text is retained without emitting a duplicate
     // message completion from last_agent_message.
-    Ok(Some(("turn.completed", data)))
+    events.push(("turn.completed", data));
+    Ok(events)
 }
 
 fn normalize_live_item(
@@ -710,7 +753,10 @@ fn normalize_live_item(
             | "function_call_output"
             | "custom_tool_call_output"
     ) {
-        return Err(live_unsupported());
+        return Ok(Some((
+            UNCLASSIFIED_NATIVE_EVENT,
+            unclassified("codex.rollout.item", kind),
+        )));
     }
     let explicit = match payload.get("internal_chat_message_metadata_passthrough") {
         None | Some(Value::Null) => None,
@@ -888,7 +934,7 @@ fn native_timestamp(value: &str) -> Result<i64> {
 fn live_unsupported() -> Error {
     Error::new(
         "unsupported",
-        "Codex rollout record is outside the 0.161.0 live projection",
+        "Codex rollout record shape is outside the live projection",
     )
 }
 
@@ -910,7 +956,6 @@ pub(super) struct RolloutReadRequest {
     pub path: PathBuf,
     pub codex_home: PathBuf,
     pub native_ref: String,
-    pub cli_version: String,
     pub query: ObservationQuery,
     pub binding: String,
     pub secrets: Vec<String>,
@@ -965,7 +1010,6 @@ pub(super) fn read_page(request: RolloutReadRequest) -> Result<RolloutPage> {
         path,
         codex_home,
         native_ref,
-        cli_version,
         query,
         binding,
         secrets,
@@ -976,7 +1020,6 @@ pub(super) fn read_page(request: RolloutReadRequest) -> Result<RolloutPage> {
     let raw_cursor = query.cursor.as_deref();
     let limit = query.limit;
     validate_text(&native_ref, 256)?;
-    validate_text(&cli_version, 256)?;
     validate_text(&binding, 256)?;
     if query.source != "rollout"
         || !matches!(view, "subject" | "turns" | "items")
@@ -1014,7 +1057,8 @@ pub(super) fn read_page(request: RolloutReadRequest) -> Result<RolloutPage> {
     if header.kind != "session_meta" {
         return Err(integrity());
     }
-    let subject = validate_header(&header, &native_ref, &cli_version)?;
+    let subject = validate_header(&header, &native_ref)?;
+    let cli_version = subject.get("cli_version").cloned().ok_or_else(integrity)?;
 
     if view == "subject" {
         if raw_cursor.is_some() {
@@ -1182,6 +1226,7 @@ pub(super) fn read_page(request: RolloutReadRequest) -> Result<RolloutPage> {
         "scan_limited": scan_limited,
         "page_limited": stopped_for_page_bound,
         "turn_state": turn_state,
+        "cli_version": cli_version,
         "rewrite_detection": "file_identity_and_bounded_boundary_anchor",
     });
     let next_cursor = if raw_cursor == Some(encoded_cursor.as_str()) {
@@ -1264,6 +1309,9 @@ fn project_line(
     view: &str,
     requested_turn: Option<&str>,
 ) -> Result<Vec<Value>> {
+    if !known_rollout_kind(&line.kind) {
+        return Ok(Vec::new());
+    }
     let event_type = if line.kind == "event_msg" {
         line.payload.get("type").and_then(Value::as_str)
     } else {
@@ -1350,20 +1398,20 @@ fn project_line(
         }
     }
 
-    // The release below runs after the items projection: the abort row
-    // itself must still resolve to the aborted turn (upstream
-    // `TurnAbortedEvent.turn_id` is optional, so a schema-valid abort may
-    // carry no turn id and only the current binding names the turn).
+    // An id-less abort cannot be projected as an item or as a terminal.
     let mut release_aborted_turn = false;
     if matches!(event_type, Some("task_aborted" | "turn_aborted")) {
-        let aborted_turn_id = explicit_turn
-            .or(state.current_turn_id.as_deref())
-            .map(str::to_owned);
-        if let Some(turn_id) = aborted_turn_id {
+        let Some(turn_id) = explicit_turn.map(str::to_owned) else {
+            return Ok(entries);
+        };
+        {
             validate_text(&turn_id, 256)?;
             state.any_turn_complete = true;
-            state.last_completed_turn_id = Some(turn_id.clone());
-            state.pending_turn_context = false;
+            if state.current_turn_id.as_deref() == Some(turn_id.as_str()) {
+                state.last_completed_turn_id = Some(turn_id.clone());
+                state.pending_turn_context = false;
+                release_aborted_turn = true;
+            }
             state.requested_turn_seen |= requested_turn == Some(turn_id.as_str());
             state.requested_turn_complete |= requested_turn == Some(turn_id.as_str());
             let active = state
@@ -1391,9 +1439,6 @@ fn project_line(
                     "ordinal": line.ordinal,
                 }));
             }
-            // Defer the release past the items projection below: the abort
-            // row itself still belongs to the aborted turn.
-            release_aborted_turn = true;
         }
     }
 
@@ -1484,12 +1529,6 @@ fn parse_line(bytes: &[u8]) -> Result<RolloutLine> {
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(integrity)?;
-    if !known_rollout_kind(kind) {
-        return Err(Error::new(
-            "unsupported",
-            "Codex rollout line type is outside the pinned 0.161 projection",
-        ));
-    }
     let payload = object.get("payload").cloned().ok_or_else(integrity)?;
     let metadata = object.get("metadata").cloned();
     Ok(RolloutLine {
@@ -1501,7 +1540,7 @@ fn parse_line(bytes: &[u8]) -> Result<RolloutLine> {
     })
 }
 
-fn validate_header(line: &RolloutLine, native_ref: &str, cli_version: &str) -> Result<Value> {
+fn validate_header(line: &RolloutLine, native_ref: &str) -> Result<Value> {
     if line.kind != "session_meta" {
         return Err(integrity());
     }
@@ -1516,7 +1555,7 @@ fn validate_header(line: &RolloutLine, native_ref: &str, cli_version: &str) -> R
         .ok_or_else(integrity)?;
     validate_text(id, 256)?;
     validate_text(version, 256)?;
-    if id != native_ref || version != cli_version {
+    if id != native_ref {
         return Err(integrity());
     }
     let cwd = payload

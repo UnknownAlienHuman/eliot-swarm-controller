@@ -88,6 +88,11 @@ impl Store {
             ));
         }
         let mut views = Vec::with_capacity(names.len());
+        let diagnostic_counts = if generation == current.generation {
+            load_native_diagnostic_counts(&self.connection, &current)?
+        } else {
+            None
+        };
         for source in names {
             let state = load_source_state(&self.connection, agent_num, generation, &source)?
                 .ok_or_else(|| Error::new("source_integrity", "source state disappeared"))?;
@@ -123,6 +128,9 @@ impl Store {
                 "last_batch_id": state.last_batch_id, "last_batch_first_seq": state.last_batch_first_seq,
                 "last_batch_last_seq": state.last_batch_last_seq,
                 "gap_id": state.gap_id, "gap_from": state.gap_from, "gap_to": state.gap_to, "gap_seq": state.gap_seq,
+                "native_diagnostics": if matches!(source.as_str(), "stream" | "observe" | "transcript") {
+                    diagnostic_counts.as_ref()
+                } else { None },
             }));
         }
         if encode_json(&views)?.len() > MAX_PAGE_BYTES {
@@ -161,10 +169,14 @@ impl Store {
         }
         let state = load_source_state(&self.connection, agent_num, generation, source)?
             .ok_or_else(|| Error::new("source_integrity", "source has no committed state"))?;
-        let observer_ready = match load_agent_by_num(&self.connection, agent_num)? {
-            Some(agent) => observer::live_ready(&self.connection, &agent, generation)?,
-            None => false,
-        };
+        let (observer_ready, diagnostic_counts) =
+            match load_agent_by_num(&self.connection, agent_num)? {
+                Some(agent) => (
+                    observer::live_ready(&self.connection, &agent, generation)?,
+                    load_native_diagnostic_counts(&self.connection, &agent)?,
+                ),
+                None => (false, None),
+            };
         let mut statement = self
             .connection
             .prepare(
@@ -205,6 +217,7 @@ impl Store {
             "last_handoff": state.last_handoff.as_deref().map(decode_json).transpose()?,
             "owners": source_handoff::owner_bindings(&self.connection, agent_num, generation)?,
             "observer_ready": observer_ready,
+            "native_diagnostics": diagnostic_counts,
         });
         if encode_json(&state)?.len() > MAX_PAGE_BYTES {
             return Err(Error::new(
@@ -602,6 +615,9 @@ impl Store {
         for event in &batch.events {
             require_nonempty(&event.kind, "event kind")?;
             require_nonempty(&event.native_id, "native_id")?;
+            if event.kind == core::UNCLASSIFIED_NATIVE_EVENT {
+                core::validate_unclassified_native_data(&event.data)?;
+            }
             if !native_ids.insert(event.native_id.as_str()) {
                 return Err(Error::new(
                     "source_integrity",
@@ -674,7 +690,16 @@ impl Store {
             let families = batch
                 .events
                 .iter()
-                .map(|event| family_for_kind(&event.kind).map(str::to_owned))
+                .map(|event| {
+                    let family = family_for_kind(&event.kind)?;
+                    if family == "session" && event.kind != core::UNCLASSIFIED_NATIVE_EVENT {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "observer session facts are limited to unclassified diagnostics",
+                        ));
+                    }
+                    Ok(family.to_owned())
+                })
                 .collect::<Result<Vec<_>>>()?;
             observer_live::require_transcript_families(&tx, &projection, &batch.source, &families)?;
         } else {
@@ -718,6 +743,7 @@ impl Store {
                         Error::new("internal", "source batch ack is missing its last sequence")
                     })?,
                     cursor: source.cursor,
+                    dropped_unclassified: source.last_batch_dropped,
                     permission_refusal: None,
                 };
                 commit_source_batch(tx, &self.write_faulted)?;
@@ -788,8 +814,15 @@ impl Store {
         let mut committed_events = Vec::with_capacity(batch.events.len());
         let mut command_events = Vec::new();
         let mut provider_events = Vec::new();
+        let mut dropped_unclassified = 0;
         for (index, (source_event, published)) in batch.events.iter().zip(&publication).enumerate()
         {
+            if source_event.kind == core::UNCLASSIFIED_NATIVE_EVENT
+                && !admit_native_diagnostic(&tx, &projection)?
+            {
+                dropped_unclassified += 1;
+                continue;
+            }
             let mut enriched = None;
             if !observed
                 && batch.source == "stream"
@@ -859,7 +892,9 @@ impl Store {
             let (next, effects) = if observed {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
-            } else if resolves_recovered {
+            } else if resolves_recovered
+                && projection.active_turn.as_deref() != native_event.data["turn_id"].as_str()
+            {
                 (
                     projection.clone(),
                     vec![core::resolve_recovered_turn(
@@ -966,14 +1001,8 @@ impl Store {
             committed_events.push(stored);
         }
 
-        let first_seq = committed_events
-            .first()
-            .map(|event| event.seq)
-            .ok_or_else(|| Error::new("internal", "non-empty batch stored no events"))?;
-        let last_seq = committed_events
-            .last()
-            .map(|event| event.seq)
-            .ok_or_else(|| Error::new("internal", "non-empty batch stored no events"))?;
+        let first_seq = committed_events.first().map_or(0, |event| event.seq);
+        let last_seq = committed_events.last().map_or(0, |event| event.seq);
         // Keep native batch ACKs scoped to native rows; the associated command
         // event follows those rows but commits in the same transaction.
         for command_event in command_events {
@@ -1004,9 +1033,10 @@ impl Store {
         };
         db!(tx.execute(
             "UPDATE source_state
-             SET cursor = ?1, last_store_seq = ?2, last_batch_id = ?3,
+             SET cursor = ?1, last_store_seq = COALESCE(NULLIF(?2, 0), last_store_seq), last_batch_id = ?3,
                  last_batch_digest = ?4, last_batch_first_seq = ?5,
-                 last_batch_last_seq = ?6, state = ?7, updated_at = ?8
+                 last_batch_last_seq = ?6, state = ?7, updated_at = ?8,
+                 last_batch_dropped = ?12
              WHERE agent = ?9 AND generation = ?10 AND source = ?11",
             params![
                 batch.cursor,
@@ -1020,6 +1050,7 @@ impl Store {
                 agent_num,
                 batch.generation,
                 batch.source,
+                dropped_unclassified,
             ],
         ));
         commit_source_batch(tx, &self.write_faulted)?;
@@ -1028,11 +1059,62 @@ impl Store {
                 first_seq,
                 last_seq,
                 cursor: batch.cursor,
+                dropped_unclassified,
                 permission_refusal: None,
             },
             events: committed_events,
         })
     }
+}
+
+fn admit_native_diagnostic(tx: &Transaction<'_>, agent: &Agent) -> Result<bool> {
+    let (Some(scope), Some(native_ref)) =
+        (agent.native_scope.as_deref(), agent.native_ref.as_deref())
+    else {
+        // No subject binding exists yet. A diagnostic cannot establish one.
+        return Ok(false);
+    };
+    let admitted = tx.execute(
+        "INSERT INTO native_session_unclassified(harness, native_scope, native_ref, admitted, dropped)
+         VALUES (?1, ?2, ?3, 1, 0)
+         ON CONFLICT(harness, native_scope, native_ref) DO UPDATE SET admitted = admitted + 1
+         WHERE admitted < ?4",
+        params![agent.harness, scope, native_ref, core::limits::MAX_UNCLASSIFIED_NATIVE_FACTS_PER_SESSION],
+    ).map_err(sql_error)?;
+    if admitted == 0 {
+        tx.execute(
+            "UPDATE native_session_unclassified SET dropped = dropped + 1
+             WHERE harness = ?1 AND native_scope = ?2 AND native_ref = ?3 AND dropped < ?4",
+            params![agent.harness, scope, native_ref, i64::MAX],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(admitted != 0)
+}
+
+fn load_native_diagnostic_counts(
+    connection: &Connection,
+    agent: &Agent,
+) -> Result<Option<core::api::NativeDiagnosticCounts>> {
+    let (Some(scope), Some(native_ref)) =
+        (agent.native_scope.as_deref(), agent.native_ref.as_deref())
+    else {
+        return Ok(None);
+    };
+    connection
+        .query_row(
+            "SELECT admitted, dropped FROM native_session_unclassified
+         WHERE harness = ?1 AND native_scope = ?2 AND native_ref = ?3",
+            params![agent.harness, scope, native_ref],
+            |row| {
+                Ok(core::api::NativeDiagnosticCounts {
+                    unclassified_admitted: row.get(0)?,
+                    unclassified_dropped: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)
 }
 
 // Statement errors return before COMMIT. If COMMIT itself fails, a

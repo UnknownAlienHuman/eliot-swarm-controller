@@ -465,6 +465,8 @@ pub enum NativeTurnStatus {
     Interrupted,
     Failed,
     InProgress,
+    #[serde(other)]
+    Other,
 }
 
 /// Native turn error (fresh `TurnError`; required: message only).
@@ -683,6 +685,8 @@ pub struct NativeThreadTokenUsage {
 pub enum NativeMessagePhase {
     Commentary,
     FinalAnswer,
+    #[serde(other)]
+    Other,
 }
 
 /// Exact native `agentMessage` item (required: id + text + type).
@@ -702,6 +706,8 @@ pub enum NativeCommandStatus {
     Completed,
     Failed,
     Declined,
+    #[serde(other)]
+    Other,
 }
 
 /// Exact native `commandExecution` item (required: command +
@@ -731,6 +737,8 @@ pub enum NativePatchApplyStatus {
     Completed,
     Failed,
     Declined,
+    #[serde(other)]
+    Other,
 }
 
 /// Native file-change kind (`type`-tagged; `update.move_path`
@@ -747,6 +755,8 @@ pub enum NativePatchChangeKind {
         #[serde(default, skip_serializing_if = "Option::is_none", rename = "move_path")]
         move_path: Option<String>,
     },
+    #[serde(other)]
+    Other,
 }
 
 /// One native file diff (required: diff + kind + path).
@@ -816,7 +826,6 @@ pub struct NativeThreadCompactStartParams {
 
 /// The app-server acknowledges thread/compact/start immediately with an empty object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct NativeThreadCompactStartResponse {}
 
 /// Minimal installed-schema v2 thread/resume params.

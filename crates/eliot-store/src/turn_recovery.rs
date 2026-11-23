@@ -157,13 +157,10 @@ impl Store {
 }
 
 /// Whether this native event is the adapter's own `turn.completed` for the
-/// exact turn whose latest settlement is the monitor's recovery
-/// `turn.unknown` in this live generation, bound to that settlement's send.
-/// Such a terminal is evidence: it resolves the turn instead of being
-/// refused as inactive. A loss, stop or adapter `turn.unknown`, an Owner
-/// resolution (the turn is no longer unknown), an earlier native resolution,
-/// another turn or another send all return false and keep the ordinary
-/// refusal.
+/// exact turn whose latest settlement is an inconclusive monitor recovery or
+/// the adapter's bound observation deadline in this live generation. The
+/// terminal must name the same send. Loss, stop and Owner resolution retain
+/// their ordinary refusal.
 pub(super) fn resolves_recovered_turn_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
@@ -178,23 +175,28 @@ pub(super) fn resolves_recovered_turn_tx(
     if event.kind != "turn.completed"
         || agent.observe_only
         || agent.generation != generation
-        || agent.active_turn.as_deref() == Some(turn_id)
         || load_turn(tx, agent_num, generation, turn_id)?
             .is_none_or(|turn| turn.state != TurnState::Unknown)
     {
         return Ok(false);
     }
-    // Only `settle_recovered_turn` writes a daemon `turn.unknown` naming its
-    // source episode; an expired settlement event proves nothing.
     let recovered: Option<bool> = tx
         .query_row(
-            "SELECT source = 'daemon' AND json_extract(data, '$.command_id') IS ?4
-                    AND json_type(data, '$.source_event_seq') = 'integer'
+            "SELECT json_extract(data, '$.command_id') IS ?4 AND (
+                    (NOT ?6 AND source = 'daemon' AND json_type(data, '$.source_event_seq') IS 'integer')
+                    OR (source = 'stream' AND json_extract(data, '$.reason') IS ?5))
              FROM events INDEXED BY events_agent
              WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.unknown'
                AND json_extract(data, '$.turn_id') = ?3
              ORDER BY seq DESC LIMIT 1",
-            params![agent_num, generation, turn_id, command_id],
+            params![
+                agent_num,
+                generation,
+                turn_id,
+                command_id,
+                core::limits::NATIVE_TERMINAL_DEADLINE_REASON,
+                agent.active_turn.as_deref() == Some(turn_id)
+            ],
             |row| row.get(0),
         )
         .optional()
@@ -245,6 +247,11 @@ fn active_turn_recovery(
         return Ok(None);
     };
     let agent_num = parse_agent_id(&agent.id)?;
+    if load_turn(connection, agent_num, agent.generation, turn_id)?
+        .is_some_and(|turn| turn.state == TurnState::Unknown)
+    {
+        return Ok(None);
+    }
     // A source can fail between send dispatch and the committed turn.started.
     // Bind the window to that same send, never to an unrelated historical gap.
     let command: Option<(Option<String>, i64, bool)> = connection

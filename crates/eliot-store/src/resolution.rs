@@ -577,6 +577,14 @@ impl Store {
                 },
             ));
         }
+        if request.generation == agent.generation
+            && agent.active_turn.as_deref() == Some(request.turn_id.as_str())
+        {
+            return Err(Error::new(
+                "bad_state",
+                "turn retains its live native binding",
+            ));
+        }
         // The stored active turn alone is never proof: a live generation
         // resolves only with a native readback proving this exact turn
         // inactive. A stored terminal generation needs no proof, and neither

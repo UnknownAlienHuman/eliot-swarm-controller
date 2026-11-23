@@ -25,6 +25,7 @@ pub mod local_provider;
 mod mcp_policy;
 mod naming;
 mod native_child;
+mod native_data;
 mod native_store;
 mod observe;
 mod presentation;
@@ -75,18 +76,21 @@ pub use native_child::{
     MUSE_NATIVE_CHILD_FAMILIES, NATIVE_CHILD_FAMILIES, NativeChildActivity,
     NativeChildActivityState, native_child_families_for_harness,
 };
+pub use native_data::{
+    UNCLASSIFIED_NATIVE_EVENT, is_native_discriminator, validate_unclassified_native_data,
+};
 pub use native_store::NativeStoreBinding;
 pub use observe::{
     ACTIVITY_HEAVY_KIND, ATTENTION_STEP_KIND, AttentionStep, BUILD_WORKER_PROGRAMS,
     CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE, CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS,
     DEFAULT_HEAVY_RSS_BYTES, DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES,
     DEFAULT_SESSION_GROWTH_RATIO, HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds,
-    OBSERVE_LEVEL_DEBUG, OBSERVE_LEVEL_STANDARD, SESSION_GROWTH_KIND, SHELL_WRAPPER_PROGRAMS,
-    SessionGrowth, SessionGrowthBasis, SessionGrowthThresholds, VERIFIED_HARNESSES,
-    VerifiedHarness, check_harness_drift, classify_heavy_command, compact_hint_for_harness,
-    evaluate_session_growth, merge_heavy_episodes, normalize_harness_version,
-    resolve_heavy_category, split_unix_cmdline, split_windows_command_line, unwrap_shell_command,
-    verified_harness,
+    OBSERVE_LEVEL_DEBUG, OBSERVE_LEVEL_STANDARD, OBSERVED_ROLLOUT_FAMILIES, SESSION_GROWTH_KIND,
+    SHELL_WRAPPER_PROGRAMS, SessionGrowth, SessionGrowthBasis, SessionGrowthThresholds,
+    VERIFIED_HARNESSES, VerifiedHarness, check_harness_drift, classify_heavy_command,
+    compact_hint_for_harness, evaluate_session_growth, merge_heavy_episodes,
+    normalize_harness_version, resolve_heavy_category, split_unix_cmdline,
+    split_windows_command_line, unwrap_shell_command, verified_harness,
 };
 pub use presentation::{
     count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
@@ -1436,6 +1440,8 @@ pub struct BatchAck {
     pub first_seq: i64,
     pub last_seq: i64,
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub dropped_unclassified: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_refusal: Option<PermissionRefusal>,
 }
@@ -2530,9 +2536,14 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             require_live_turn(agent, event)?;
             let command_id = optional_command_id(event)?;
             let turn_id = required_text(event, "turn_id")?;
-            next.state = AgentState::Idle;
-            next.active_turn = None;
-            next.pending.clear();
+            // An inactivity verdict says nothing about native termination.
+            // Preserve the live binding and its pending requests so exact
+            // later facts can still be committed.
+            if event.data["reason"].as_str() != Some(limits::NATIVE_TERMINAL_DEADLINE_REASON) {
+                next.state = AgentState::Idle;
+                next.active_turn = None;
+                next.pending.clear();
+            }
             effects.push(Effect::TurnTerminal {
                 command_id,
                 turn_id,
@@ -2609,6 +2620,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 require_live_turn(agent, event)?;
             }
         }
+        UNCLASSIFIED_NATIVE_EVENT => {}
         "tool.file.edited" => {
             require_live_turn(agent, event)?;
         }

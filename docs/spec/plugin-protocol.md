@@ -551,11 +551,13 @@ Commit any new gap boundary, successor-open fact, owner transfer, `source.handof
 and predecessor `last_handoff_digest`/`last_handoff` acknowledgement in that transaction.
 Publish the committed events and return `SourceHandoffAck` only after commit. The
 connected native adapter waits for the committed handoff ACK before publishing
-successor facts. Private history cannot be handed off or published by this caller. The separate Codex observe-only live grant is limited
-to `turn`, `message` and `tool`, with `observe` to `transcript` and mechanism
-`rollout_tail`. It reads the exact subject's rollout file from its captured live edge,
-commits an explicit gap-backed handoff before publishing complete normalized records,
-and never publishes private history, control identity or input/command acknowledgement.
+successor facts. Private history cannot be handed off or published by this caller.
+The Codex observe-only live grant covers `turn`, `message`, `tool` and
+`session.native_unclassified` (the sole permitted `session` fact). It reads the exact
+subject's rollout file from its captured live edge and commits an explicit gap-backed
+handoff from `observe` to `transcript` using `rollout_tail` before publishing complete
+normalized records. It never publishes private history, control identity or
+input/command acknowledgement.
 
 The private authenticated `source.state` readback includes paired nullable
 `last_handoff_digest` (32-byte array) and `last_handoff` (ACK) fields, null before the
@@ -764,6 +766,15 @@ exact-turn `turn.completed` is accepted, and only against an `unknown` settlemen
 evidence and resolves that turn once ([turn resolution](api.md#input-turn-and-unknown-gates)).
 Every other late fact is refused. Retiring or duplicate
 exit observations cannot settle a newer generation and never authorize replay.
+
+Claude and OpenCode arm a 30-minute inactivity deadline at the committed turn
+start. Native progress bound to that turn resets it, including live deltas that
+the adapter does not journal. When the deadline expires, the adapter commits
+`turn.unknown` with reason `native_terminal_deadline`. The live turn binding and
+pending requests stay in place. Later bound facts still commit, later sends stay
+fenced, and the exact native terminal can resolve the unknown outcome. Debug
+private stands can shorten the interval with `SWARM_QA_NATIVE_INACTIVITY_MS`
+(positive integer milliseconds up to the production interval).
 An event owner closing before the tail barrier or a drain deadline expiring is
 an explicit unknown retirement error, never successful tail settlement. Retirement
 still ends the unusable plugin; the daemon records missing native evidence as gaps
@@ -811,6 +822,30 @@ Contain owned children before tools run; use absolute deadlines. Drain buffered 
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
+All adapters follow the shared [native data rule](../../crates/eliot-plugin/src/native_data.rs).
+Skip extra fields. Decode an unfamiliar enum value as `Other` and emit a diagnostic.
+Record an unfamiliar event as a `session.native_unclassified` native fact and keep
+processing the stream. These facts carry the adapter's decode site and a bounded
+native discriminator, without the raw payload. They have no lifecycle, authority or
+outcome semantics. A terminal record with an unfamiliar outcome cannot establish
+success, failure or interruption. Preserve frame integrity and exact binding checks.
+Detect native capabilities from advertised or observed behavior. Installed version
+strings are diagnostic metadata and do not select a decoder or gate a session.
+
+Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
+`item/commandExecution/outputDelta`, `item/fileChange/outputDelta`, `item/plan/delta`,
+`item/reasoning/summaryPartAdded`, `item/reasoning/summaryTextDelta` and
+`item/reasoning/textDelta` before its transport queue. These notifications have
+no independent normalized event; supported completions carry the durable facts.
+An unfamiliar method cannot establish a native turn binding.
+
+Store applies one 64-fact cap per exact native session, across turns, generations,
+and both Codex stream and rollout publishers. `native_diagnostics` in the source
+readback reports the session's admitted and dropped counts. Suppression updates
+the saturating counter in the same transaction as the batch acknowledgement and
+cursor. `dropped_unclassified` counts suppressed facts in that acknowledgement;
+an all-suppressed batch has zero first and last event sequences. Retrying the
+latest exact batch returns its retained acknowledgement and count.
 
 Native harness inputs use the shared 8 MiB
 [`MAX_NATIVE_INBOUND_FRAME_BYTES`](../../crates/eliot-core/src/limits.rs) bound.
@@ -820,10 +855,10 @@ newline ends an envelope with no top-level `id`. The reader counts the bytes
 while discarding the record and queues one gap in wire order. The gap records
 the method, size and limit and leaves the native prompt reply authoritative.
 If an update was omitted during a turn, its final text is reported unavailable
-with `native_update_gap`. Oversized replies, requests and unclassified records
-are fatal. Discard ends in a fatal oversized-frame fault if the newline never
-arrives before the discard deadline. `swarm why` shows the retained reason for
-the Agent.
+with `native_update_gap`. An oversized frame is fatal when the reader cannot prove
+it is a discardable notification. Discard ends in a fatal oversized-frame fault
+if the newline never arrives before the discard deadline. `swarm why` shows the
+retained reason for the Agent.
 
 Native reader faults split by proven line boundary. Fatal reader end (EOF,
 codec/UTF-8/IO fault, a required oversized record, exit-drain

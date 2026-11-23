@@ -33,9 +33,10 @@ use crate::{
         MAX_HOOK_FRAME_BYTES,
     },
     native::{
-        AcpUpdate, AgyClient, AgyFrame, FencedGuard, PermissionAsk, PermissionOption, PromptResult,
-        ToolDiffPaths, classify_update, default_permission_option, parse_permission_request,
-        permission_option_grants, prompt_turn_usage, session_usage_from_update,
+        AcpUpdate, AgyClient, AgyFrame, FencedGuard, PermissionAsk, PermissionOption,
+        PermissionOptionKind, PromptResult, PromptTerminalStatus, ToolDiffPaths, classify_update,
+        default_permission_option, parse_permission_request, permission_option_grants,
+        prompt_turn_usage, session_usage_from_update,
     },
 };
 
@@ -63,6 +64,7 @@ enum ToolStatus {
     Completed,
     Failed,
     Unknown,
+    Other,
 }
 
 impl ToolStatus {
@@ -72,7 +74,7 @@ impl ToolStatus {
             "in_progress" => Self::InProgress,
             "completed" => Self::Completed,
             "failed" => Self::Failed,
-            _ => Self::Unknown,
+            _ => Self::Other,
         }
     }
 }
@@ -206,11 +208,11 @@ fn fallback_permission_outcome(ask: &PermissionAsk) -> Value {
     let selected = ask
         .options
         .iter()
-        .find(|option| option.kind == "reject_once")
+        .find(|option| option.kind == PermissionOptionKind::RejectOnce)
         .or_else(|| {
             ask.options
                 .iter()
-                .find(|option| option.kind == "reject_always")
+                .find(|option| option.kind == PermissionOptionKind::RejectAlways)
         })
         .map(|option| option.option_id.clone());
     match selected {
@@ -886,6 +888,10 @@ impl State {
                 ))
             };
         }
+        for native_tag in &ask.unclassified_option_kinds {
+            self.record_unclassified("session.request_permission.option.kind", native_tag)
+                .await?;
+        }
         if self.pending_requests.len() >= MAX_PENDING_REQUESTS {
             return self
                 .stray_permission_request(
@@ -987,7 +993,7 @@ impl State {
             self.merge_tool(
                 &ask.tool_call_id,
                 &ask.title,
-                if known_tool { "" } else { "pending" },
+                if known_tool { None } else { Some("pending") },
                 ask.tool_kind.as_deref(),
                 ask.tool_name.as_deref(),
                 &ToolDiffPaths::default(),
@@ -1448,6 +1454,23 @@ impl State {
                 Ok(())
             }
             AgyFrame::Update(params) => self.update(&params).await,
+            AgyFrame::UnclassifiedNotification { method, params } => {
+                if self.conversation.is_empty() {
+                    return Ok(());
+                }
+                if let Some(session_id) = params.as_ref().and_then(|params| params.get("sessionId"))
+                {
+                    let Some(session_id) = session_id.as_str() else {
+                        return Err(Error::new(
+                            "native_protocol",
+                            "Antigravity notification session binding was invalid",
+                        ));
+                    };
+                    self.check_conversation(session_id)?;
+                }
+                self.record_unclassified("jsonrpc.notification.method", &method)
+                    .await
+            }
             // The ordered load boundary: consumed after every history
             // update ahead of it on the wire. Publish the outcome for
             // `Session::start` and leave loading mode; nothing here
@@ -1554,6 +1577,19 @@ impl State {
         if self.load_request_id.is_some() {
             return Ok(());
         }
+        let unknown_tool_status = match &update {
+            AcpUpdate::ToolCall { status, .. } => Some(status.as_deref().unwrap_or("missing")),
+            AcpUpdate::ToolCallUpdate {
+                status: Some(status),
+                ..
+            } => Some(status.as_str()),
+            _ => None,
+        }
+        .filter(|status| !matches!(*status, "pending" | "in_progress" | "completed" | "failed"));
+        if let Some(native_tag) = unknown_tool_status {
+            self.record_unclassified("session.update.tool_call.status", native_tag)
+                .await?;
+        }
         match update {
             // AGY can continue natively when an asynchronous tool finishes
             // after the fenced terminal reply. An idle update has no Eliot turn.
@@ -1628,7 +1664,7 @@ impl State {
                 self.merge_tool(
                     &tool_call_id,
                     &title,
-                    &status,
+                    status.as_deref().or(Some("missing")),
                     tool_kind.as_deref(),
                     tool_name.as_deref(),
                     &diff_paths,
@@ -1659,17 +1695,17 @@ impl State {
                 self.merge_tool(
                     &tool_call_id,
                     title.as_deref().unwrap_or(""),
-                    &status,
+                    status.as_deref(),
                     tool_kind.as_deref(),
                     tool_name.as_deref(),
                     &diff_paths,
                 );
                 self.publish_tool_status(&tool_call_id).await
             }
-            AcpUpdate::Unknown(kind) => Err(Error::new(
-                "native_protocol",
-                format!("Antigravity session update is unconnected: {kind}"),
-            )),
+            AcpUpdate::Other(native_tag) => {
+                self.record_unclassified("session.update.sessionUpdate", &native_tag)
+                    .await
+            }
         }
     }
 
@@ -1719,11 +1755,31 @@ impl State {
                 self.tool_event(tool_call_id, "tool.completed", "failed")
                     .await
             }
-            ToolStatus::Unknown => Err(Error::new(
-                "native_protocol",
-                "Antigravity tool call status is unknown",
-            )),
+            ToolStatus::Unknown | ToolStatus::Other => Ok(()),
         }
+    }
+
+    /// Close every tool whose `tool.started` was committed without a matching
+    /// `tool.completed`. A terminal prompt reply ends these lifecycles, but
+    /// does not prove that the native tool succeeded or failed.
+    async fn close_open_tools_at_terminal(&mut self) -> Result<()> {
+        let open_tool_ids: Vec<String> = self
+            .tools
+            .keys()
+            .filter(|tool_call_id| {
+                self.tool_emitted
+                    .contains(&format!("{tool_call_id}:tool.started"))
+                    && !self
+                        .tool_emitted
+                        .contains(&format!("{tool_call_id}:tool.completed"))
+            })
+            .cloned()
+            .collect();
+        for tool_call_id in open_tool_ids {
+            self.tool_event(&tool_call_id, "tool.completed", "unknown")
+                .await?;
+        }
+        Ok(())
     }
 
     /// Commit one accepted session snapshot as its own `session.usage` fact,
@@ -1863,14 +1919,14 @@ impl State {
         self.text_accum.push_str(text);
     }
 
-    /// Merge partial tool-call facts into the known per-id state. Empty
-    /// title/status and omitted name/kind inherit their last known values;
-    /// exact diff paths accumulate until the turn is cleared.
+    /// Merge partial tool-call facts into the known per-id state. Empty title
+    /// and omitted status/name/kind inherit their last known values; exact
+    /// diff paths accumulate until the turn is cleared.
     fn merge_tool(
         &mut self,
         tool_call_id: &str,
         title: &str,
-        status: &str,
+        status: Option<&str>,
         tool_kind: Option<&str>,
         tool_name: Option<&str>,
         diff_paths: &ToolDiffPaths,
@@ -1888,8 +1944,13 @@ impl State {
         if !title.is_empty() {
             known.title = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
         }
-        if !status.is_empty() {
-            known.status = ToolStatus::parse(status);
+        if let Some(status) = status {
+            let next = ToolStatus::parse(status);
+            let is_other = matches!(next, ToolStatus::Other);
+            let was_terminal = matches!(known.status, ToolStatus::Completed | ToolStatus::Failed);
+            if !is_other || !was_terminal {
+                known.status = next;
+            }
         }
         if let Some(name) = tool_name {
             known.native_file_edit_tool = Some(
@@ -2018,8 +2079,21 @@ impl State {
     }
 
     async fn settle_prompt(&mut self, result: &PromptResult) -> Result<()> {
-        let Some(mut status) = result.terminal_status()? else {
-            return Ok(());
+        let (mut status, native_status) = match result.terminal_status() {
+            PromptTerminalStatus::Completed => {
+                ("completed", self.policy.redact_text(&result.stop_reason))
+            }
+            PromptTerminalStatus::Cancelled => {
+                ("cancelled", self.policy.redact_text(&result.stop_reason))
+            }
+            PromptTerminalStatus::Failed => {
+                ("failed", self.policy.redact_text(&result.stop_reason))
+            }
+            PromptTerminalStatus::Other => {
+                self.record_unclassified("session.prompt.stopReason", &result.stop_reason)
+                    .await?;
+                ("unknown", "other".to_owned())
+            }
         };
         self.finish_assistant_text();
         let observed_at = std::time::SystemTime::now()
@@ -2046,7 +2120,6 @@ impl State {
         // status and raw stopReason before any write (even `turn.started`),
         // so a failed write costs only its own fact and the exact-turn
         // snapshot still proves the outcome.
-        let native_status = self.policy.redact_text(&result.stop_reason);
         if let Some(pending) = self.pending.as_ref() {
             self.last_turn = Some(TurnFacts {
                 command_id: pending.command.clone(),
@@ -2108,6 +2181,10 @@ impl State {
         // Unanswered asks die with their turn: close them before the
         // terminal commit, without a command binding.
         self.close_pending_requests(Some(&turn)).await?;
+        // This is the exact fenced `session/prompt` terminal for the bound
+        // conversation. Close only this State's still-open tool lifecycles;
+        // a terminal response cannot establish their native outcome.
+        self.close_open_tools_at_terminal().await?;
         let text = self.policy.redact_text(&self.text_accum);
         let missing_text = self.text_unavailable;
         let mut data = json!({"command_id": command, "turn_id": turn,
@@ -2246,6 +2323,22 @@ impl State {
         self.source().commit_event(kind, id, data).await
     }
 
+    async fn record_unclassified(&mut self, site: &'static str, native_tag: &str) -> Result<()> {
+        let item = format!("native-unclassified-{}", Ulid::new());
+        let native_tag = if native_tag.is_empty() {
+            "empty"
+        } else {
+            native_tag
+        };
+        self.commit(
+            eliot_plugin::native_data::UNCLASSIFIED_NATIVE_EVENT,
+            "session",
+            &item,
+            eliot_plugin::native_data::unclassified(site, native_tag),
+        )
+        .await
+    }
+
     pub async fn lose(&mut self, reason: &str) {
         self.lose_inner(reason, true).await;
     }
@@ -2259,6 +2352,16 @@ impl State {
     }
 
     async fn lose_inner(&mut self, reason: &str, report_gap: bool) {
+        if !self.writes_blocked
+            && self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.associated)
+        {
+            // Reconcile the still-bound tool lifecycle before publishing loss
+            // and allowing Store to settle the prompt unknown.
+            let _ = self.close_open_tools_at_terminal().await;
+        }
         self.source_unknown = true;
         self.fail_pending_steer(Error::new(
             "unknown",

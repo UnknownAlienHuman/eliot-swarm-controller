@@ -1755,19 +1755,6 @@ fn antigravity_capability_error() -> core::Error {
     )
 }
 
-fn agy_help_has_acp(help: &[u8]) -> bool {
-    std::str::from_utf8(help).is_ok_and(|help| {
-        help.contains("--stdio")
-            && help.contains("--dangerously-skip-permissions")
-            && help.lines().any(|line| {
-                let mut words = line.split_whitespace();
-                words.next() == Some("Usage:")
-                    && matches!(words.next(), Some("agy" | "agy.exe"))
-                    && words.next() == Some("acp")
-            })
-    })
-}
-
 /// The installed CLI carries its upstream Go module name. Screen the file
 /// before execution so an IDE copied to a file named agy is also refused.
 fn has_agy_cli_module(program: &str, deadline: Instant) -> bool {
@@ -2030,9 +2017,10 @@ fn probe_version_uncached(program: &str, agy: bool, deadline: Instant) -> Versio
             deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
         )?;
         discovery_remaining(deadline)?;
-        if !help.is_some_and(|capture| {
-            agy_help_has_acp(&capture.stdout) || agy_help_has_acp(capture.stderr.text.as_bytes())
-        }) {
+        // The binary module identity and successful subcommand invocation
+        // establish the CLI surface. Help prose and option spelling are not
+        // version gates; launch still supplies its explicit configured argv.
+        if !help.is_some_and(|capture| capture.status.success()) {
             return Ok(None);
         }
     }

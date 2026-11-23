@@ -18,6 +18,7 @@ pub(super) struct ChildState {
     failure: Option<String>,
     final_text: Option<String>,
     lifecycle: ChildLifecycle,
+    unclassified_seq: u64,
     /// Baseline and latest cumulative token snapshot for this exact child
     /// turn. The terminal event carries only their difference.
     turn_usage: Option<(String, NativeTokenUsageDelta, NativeTokenUsageDelta)>,
@@ -36,6 +37,7 @@ impl ChildState {
             failure: None,
             final_text: None,
             lifecycle: ChildLifecycle::default(),
+            unclassified_seq: 0,
             turn_usage: None,
             ready_committed: false,
         }
@@ -120,6 +122,29 @@ impl ChildState {
             failure: &mut self.failure,
         };
         source.record_gap(reason).await
+    }
+
+    async fn record_unclassified(
+        &mut self,
+        child_thread: &str,
+        sink: &mut CommitSink,
+        host: &PeerClient,
+        credential: &str,
+        site: &'static str,
+        native_tag: &str,
+    ) -> Result<()> {
+        self.unclassified_seq = self.unclassified_seq.wrapping_add(1);
+        let item_id = format!("unclassified-{}", self.unclassified_seq);
+        let native_id = event_id(child_thread, "session", &item_id, UNCLASSIFIED_NATIVE_EVENT)?;
+        self.commit_event(
+            sink,
+            host,
+            credential,
+            UNCLASSIFIED_NATIVE_EVENT,
+            native_id,
+            unclassified(site, native_tag),
+        )
+        .await
     }
 }
 
@@ -356,7 +381,7 @@ impl EventProcessor {
     /// a non-owned thread's frame is never validated as owned. Still-unknown
     /// threads are held as unconfirmed and buffered; settle points gap them
     /// only when no spawn ever announces them.
-    pub(super) fn take_child_frame(&mut self, params: &Value) -> bool {
+    pub(super) fn take_child_frame(&mut self, params: &Value, allow_unconfirmed: bool) -> bool {
         let Some(thread) = frame_thread_id(params) else {
             return false;
         };
@@ -367,6 +392,12 @@ impl EventProcessor {
             .is_none_or(|owned| owned == thread)
         {
             return false;
+        }
+        if !allow_unconfirmed {
+            return self
+                .child_states
+                .get(thread)
+                .is_some_and(|state| state.ready_committed);
         }
         // A thread already retained as unconfirmed while a spawn window was
         // open must keep routing to the child after that window closes
@@ -1014,6 +1045,17 @@ impl EventProcessor {
                             "Codex child turn/started omitted turn id",
                         )
                     })?;
+                let native_status = params
+                    .pointer("/turn/status")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new("native_protocol", "Codex child turn/started omitted status")
+                    })?;
+                let unknown_status = (!matches!(
+                    native_status,
+                    "completed" | "interrupted" | "failed" | "inProgress"
+                ))
+                .then(|| native_status.to_owned());
                 let state = self
                     .child_states
                     .get_mut(child_thread)
@@ -1021,6 +1063,18 @@ impl EventProcessor {
                 state.lifecycle.started(turn_id);
                 state.final_text = None;
                 state.turn_usage = None;
+                if let Some(native_tag) = unknown_status.as_deref() {
+                    state
+                        .record_unclassified(
+                            child_thread,
+                            &mut self.sink,
+                            &self.host,
+                            &self.credential,
+                            "codex.native_rpc.turn_status",
+                            native_tag,
+                        )
+                        .await?;
+                }
                 let native_id = event_id(child_thread, turn_id, turn_id, "turn.started")?;
                 state
                     .commit_event(
@@ -1035,6 +1089,24 @@ impl EventProcessor {
             }
             "item/started" => {
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                if let Some((site, native_tag, _)) = unclassified_native_item(&raw_item) {
+                    let host = self.host.clone();
+                    let credential = self.credential.clone();
+                    let state = self
+                        .child_states
+                        .get_mut(child_thread)
+                        .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                    state
+                        .record_unclassified(
+                            child_thread,
+                            &mut self.sink,
+                            &host,
+                            &credential,
+                            site,
+                            native_tag,
+                        )
+                        .await?;
+                }
                 self.observe_child_spawn(child_thread, &raw_item, false)
                     .await?;
                 // Depth-2 v2 announcement from a confirmed child: same
@@ -1044,6 +1116,24 @@ impl EventProcessor {
             }
             "item/completed" => {
                 let raw_item = params.get("item").cloned().unwrap_or(Value::Null);
+                if let Some((site, native_tag, _)) = unclassified_native_item(&raw_item) {
+                    let host = self.host.clone();
+                    let credential = self.credential.clone();
+                    let state = self
+                        .child_states
+                        .get_mut(child_thread)
+                        .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                    state
+                        .record_unclassified(
+                            child_thread,
+                            &mut self.sink,
+                            &host,
+                            &credential,
+                            site,
+                            native_tag,
+                        )
+                        .await?;
+                }
                 self.observe_child_spawn(child_thread, &raw_item, true)
                     .await?;
                 self.observe_sub_agent_activity(child_thread, &raw_item)
@@ -1063,7 +1153,24 @@ impl EventProcessor {
             "thread/tokenUsage/updated" => {
                 self.note_child_token_usage(child_thread, &params)?;
             }
-            _ => {}
+            _ => {
+                let host = self.host.clone();
+                let credential = self.credential.clone();
+                let state = self
+                    .child_states
+                    .get_mut(child_thread)
+                    .ok_or_else(|| Error::new("bad_state", "Codex child state missing"))?;
+                state
+                    .record_unclassified(
+                        child_thread,
+                        &mut self.sink,
+                        &host,
+                        &credential,
+                        "codex.native_rpc.notification",
+                        method,
+                    )
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -1136,7 +1243,7 @@ impl EventProcessor {
             "turn_id": turn_id.as_str(),
             "text": text,
         });
-        if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+        if let Some(phase) = super::native_message_phase(item) {
             data["phase"] = Value::String(phase.to_owned());
         }
         let host = self.host.clone();
@@ -1154,6 +1261,11 @@ impl EventProcessor {
     }
 
     async fn complete_child_turn(&mut self, child_thread: &str, params: Value) -> Result<()> {
+        let native_status = params
+            .pointer("/turn/status")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let notification: NativeTurnCompletedNotification = serde_json::from_value(params)
             .map_err(|_| {
                 Error::new(
@@ -1179,11 +1291,26 @@ impl EventProcessor {
                 )
                 .await;
         }
+        if matches!(&notification.turn.status, NativeTurnStatus::Other) {
+            state
+                .record_unclassified(
+                    child_thread,
+                    sink,
+                    &host,
+                    &credential,
+                    "codex.native_rpc.turn_status",
+                    &native_status,
+                )
+                .await?;
+        }
         let status_text = turn_status(&notification.turn.status);
         let mut data = json!({
             "turn_id": notification.turn.id,
             "status": status_text,
         });
+        if matches!(&notification.turn.status, NativeTurnStatus::Other) {
+            data["outcome"] = json!("unknown");
+        }
         let turn_usage = state
             .turn_usage
             .take()

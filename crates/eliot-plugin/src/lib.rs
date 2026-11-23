@@ -5,6 +5,7 @@ pub mod event_actor;
 mod file_identity;
 pub mod native_child;
 pub mod native_cli;
+pub mod native_data;
 pub mod native_lifecycle;
 pub mod native_stdio;
 pub mod native_transport;

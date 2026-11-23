@@ -1332,6 +1332,15 @@ pub struct SourceState {
     pub gap_to: Option<String>,
     #[serde(deserialize_with = "nullable")]
     pub gap_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_diagnostics: Option<NativeDiagnosticCounts>,
+}
+
+/// Cumulative counters for the exact native session shared by source lanes.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeDiagnosticCounts {
+    pub unclassified_admitted: i64,
+    pub unclassified_dropped: i64,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

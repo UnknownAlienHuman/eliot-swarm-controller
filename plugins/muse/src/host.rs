@@ -1713,7 +1713,7 @@ impl MusePlugin {
                     "Muse interrupt refused: native view unavailable ({}); the recorded source gap leaves the turn outcome unknown",
                     event_status
                         .view_unavailable_reason
-                        .unwrap_or(crate::native::types::NativeHistoryNoneReason::Unknown)
+                        .unwrap_or(crate::native::types::NativeHistoryNoneReason::Other)
                         .label(),
                 )
             } else {
@@ -2666,7 +2666,7 @@ async fn read_latest_native_turn_status(
                     NativeTurnTerminal::Completed => "completed",
                     NativeTurnTerminal::Failed => "failed",
                     NativeTurnTerminal::Cancelled => "cancelled",
-                    NativeTurnTerminal::Unknown => {
+                    NativeTurnTerminal::Other => {
                         return Err(Error::new(
                             "native_readback",
                             "Muse view turn/completed carried an unknown terminal",
@@ -2796,7 +2796,7 @@ fn observe_view_event(
                     NativeTurnTerminal::Completed => "completed".to_owned(),
                     NativeTurnTerminal::Failed => "failed".to_owned(),
                     NativeTurnTerminal::Cancelled => "interrupted".to_owned(),
-                    NativeTurnTerminal::Unknown => {
+                    NativeTurnTerminal::Other => {
                         return Err(Error::new(
                             "native_readback",
                             "Muse view turn/completed carried an unknown terminal",

@@ -1,9 +1,9 @@
 //! Publication of normalized Codex rollout facts and verified file boundaries.
 
 use eliot_core::{
-    Error, NativeEvent, Result, SecretPolicy, SourceBatch, SourceGap, SourceGapAck, SourceHandoff,
-    SourceHandoffAck, SourceHandoffGap, SourceHealthUpdate, api::MAX_OBSERVATION_CURSOR_BYTES,
-    parse_agent_id,
+    Error, NativeEvent, OBSERVED_ROLLOUT_FAMILIES, Result, SecretPolicy, SourceBatch, SourceGap,
+    SourceGapAck, SourceHandoff, SourceHandoffAck, SourceHandoffGap, SourceHealthUpdate,
+    UNCLASSIFIED_NATIVE_EVENT, api::MAX_OBSERVATION_CURSOR_BYTES, parse_agent_id,
 };
 use eliot_plugin::{CommitSink, ObserverAttachParams, PeerClient, protocol::MAX_CREDENTIAL_BYTES};
 use serde_json::{Value, json};
@@ -14,8 +14,14 @@ use ulid::Ulid;
 const OBSERVER_SOURCE: &str = "observe";
 const TRANSCRIPT_SOURCE: &str = "transcript";
 const MECHANISM: &str = "rollout_tail";
-const LIVE_FAMILIES: [&str; 3] = ["turn", "message", "tool"];
 const BASELINE_REASON: &str = "codex_observer_live_baseline";
+
+pub(super) enum LiveCommitOutcome {
+    /// The source batch was acknowledged and durably advanced its cursor.
+    Acknowledged(String),
+    /// Store durably acknowledged only its suppression counter and cursor.
+    Suppressed(String),
+}
 
 /// Owns one Codex observer's durable live-source operations.
 pub(super) struct RecoveryPublisher {
@@ -64,7 +70,7 @@ impl RecoveryPublisher {
                     "Codex observer attachment omitted its captured source plan",
                 )
             })?;
-        let mut families: Vec<_> = LIVE_FAMILIES
+        let mut families: Vec<_> = OBSERVED_ROLLOUT_FAMILIES
             .iter()
             .filter(|family| plan.get(**family).and_then(Value::as_str) == Some("native_read"))
             .map(|family| (*family).to_owned())
@@ -154,7 +160,7 @@ impl RecoveryPublisher {
         mut events: Vec<NativeEvent>,
         cursor: String,
         deadline: Instant,
-    ) -> Result<String> {
+    ) -> Result<LiveCommitOutcome> {
         self.ensure_ready()?;
         self.prepare_events(&mut events, &cursor)?;
         let batch = SourceBatch {
@@ -175,7 +181,11 @@ impl RecoveryPublisher {
             .map_err(|error| self.safe_error(error, "native event commit"))?;
         let checkpoint = ack.cursor.ok_or_else(unknown_error)?;
         self.last_checkpoint = Some(checkpoint.clone());
-        Ok(checkpoint)
+        if ack.first_seq == 0 {
+            Ok(LiveCommitOutcome::Suppressed(checkpoint))
+        } else {
+            Ok(LiveCommitOutcome::Acknowledged(checkpoint))
+        }
     }
 
     /// Report an uncovered native interval with its observed boundary, if any.
@@ -426,6 +436,7 @@ impl RecoveryPublisher {
 
 fn family_for_kind(kind: &str) -> Option<&'static str> {
     match kind {
+        UNCLASSIFIED_NATIVE_EVENT => Some("session"),
         "turn.started" | "turn.completed" => Some("turn"),
         "message.completed" => Some("message"),
         "tool.started" | "tool.completed" => Some("tool"),

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 104;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 105;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2455,6 +2455,33 @@ impl Store {
                        AND verb IN ('stop', 'interrupt')
                        AND state IN ('applied', 'rejected', 'failed', 'unknown');
                  INSERT INTO schema_migrations(version) VALUES (104);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 105 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE native_session_unclassified (
+                     harness TEXT NOT NULL,
+                     native_scope TEXT NOT NULL,
+                     native_ref TEXT NOT NULL,
+                     admitted INTEGER NOT NULL CHECK (admitted >= 0),
+                     dropped INTEGER NOT NULL CHECK (dropped >= 0),
+                     PRIMARY KEY (harness, native_scope, native_ref)
+                 ) WITHOUT ROWID;
+                 ALTER TABLE source_state ADD COLUMN last_batch_dropped INTEGER NOT NULL DEFAULT 0
+                     CHECK (last_batch_dropped >= 0);
+                 INSERT INTO native_session_unclassified
+                 SELECT a.harness, a.native_scope, a.native_ref, count(*), 0
+                 FROM events e JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+                 WHERE e.kind = 'session.native_unclassified'
+                   AND a.native_scope IS NOT NULL AND a.native_ref IS NOT NULL
+                 GROUP BY a.harness, a.native_scope, a.native_ref;
+                 INSERT INTO schema_migrations(version) VALUES (105);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

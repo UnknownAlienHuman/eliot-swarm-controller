@@ -383,7 +383,7 @@ pub enum NativeHistoryNoneReason {
     ProjectionUnavailable,
     ProjectionReadLimit,
     #[serde(other)]
-    Unknown,
+    Other,
 }
 
 impl NativeHistoryNoneReason {
@@ -394,7 +394,7 @@ impl NativeHistoryNoneReason {
             Self::HistoryBudget => "historyBudget",
             Self::ProjectionUnavailable => "projectionUnavailable",
             Self::ProjectionReadLimit => "projectionReadLimit",
-            Self::Unknown => "unknown",
+            Self::Other => "other",
         }
     }
 }
@@ -412,7 +412,7 @@ impl NativeSessionHistory {
                 | NativeHistoryNoneReason::CursorSuffix
                 | NativeHistoryNoneReason::HistoryBudget,
             ) => None,
-            reason => Some(reason.unwrap_or(NativeHistoryNoneReason::Unknown)),
+            reason => Some(reason.unwrap_or(NativeHistoryNoneReason::Other)),
         }
     }
 }
@@ -431,7 +431,7 @@ pub struct NativeSessionViewHealthChangedNotification {
 pub enum NativeViewHealth {
     Unavailable,
     #[serde(other)]
-    Unknown,
+    Other,
 }
 
 /// `session/resume` result (SS2.5.2). `pendingRequests` is the late-joiner
@@ -559,7 +559,7 @@ pub enum NativeTurnTerminal {
     Failed,
     Cancelled,
     #[serde(other)]
-    Unknown,
+    Other,
 }
 
 /// The settled turn-failure object: `{kind, message, retryable}`.
@@ -1326,13 +1326,13 @@ pub struct NativeWorkflowItemNotification {
 impl NativeTurnTerminal {
     /// Parse a workflow-child `terminal` string with the turn-terminal
     /// vocabulary (`completed` | `failed` | `cancelled`). Wire-open: unknown
-    /// values decode as `Unknown` and must not settle a turn.
+    /// values decode as `Other` and must not settle a turn.
     pub fn parse_workflow_terminal(value: &str) -> Self {
         match value {
             "completed" => Self::Completed,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
-            _ => Self::Unknown,
+            _ => Self::Other,
         }
     }
 }

@@ -386,7 +386,7 @@ pub(super) fn persist_effects(
         db!(tx.execute(
             "UPDATE turns SET tool_calls = tool_calls + 1
              WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
-               AND state = 'running'",
+               AND state IN ('running', 'unknown')",
             params![agent_num, generation, turn_id],
         ));
     }
@@ -638,7 +638,9 @@ fn persist_native_turn_started(
 /// A turn fact without a command is valid only for the exact running
 /// self-started turn no send has bound to.
 fn require_unbound_native_turn(scope: EffectScope<'_, '_>, turn_id: &str) -> Result<()> {
-    if is_unbound_native_turn(scope.tx, scope.agent_num, scope.generation, turn_id)? {
+    if scope.next_agent.active_turn.as_deref() == Some(turn_id)
+        && native_terminal_for_unbound_turn(scope, turn_id)?
+    {
         return Ok(());
     }
     Err(Error::new(
@@ -974,7 +976,7 @@ fn persist_message_completed(
         .execute(
             "UPDATE turns SET final_text = ?1, messages = messages + 1
              WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
-               AND state = 'running'",
+               AND state IN ('running', 'unknown')",
             params![text, agent_num, generation, turn_id],
         )
         .map_err(sql_error)?;
@@ -1105,17 +1107,18 @@ fn persist_turn_terminal(
     if load_turn(tx, agent_num, generation, turn_id)?
         .is_some_and(|turn| turn.state == TurnState::Unknown)
     {
-        if state != TurnState::Completed || native_event.kind != "turn.completed" {
+        if native_event.kind == "turn.completed" && state == TurnState::Completed {
+            db!(tx.execute(
+                "UPDATE turns SET outcome = NULL, preceded_by = NULL
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'unknown'",
+                params![agent_num, generation, turn_id],
+            ));
+        } else if native_event.kind != "session.ended" || state != TurnState::Unknown {
             return Err(Error::new(
                 "source_integrity",
                 "an unknown turn resolves only from its native turn.completed",
             ));
         }
-        db!(tx.execute(
-            "UPDATE turns SET outcome = NULL, preceded_by = NULL
-             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'unknown'",
-            params![agent_num, generation, turn_id],
-        ));
     }
     let usage = usage.map(encode_json).transpose()?;
     let outcome = outcome.map(|outcome| outcome.as_str());
@@ -1178,6 +1181,9 @@ fn persist_turn_terminal(
             || (final_text.is_some_and(|text| !text.trim().is_empty())
                 && native_event.data["model_output"].as_bool() != Some(false));
         settle_inline_mail(scope, turn_id, delivered)?;
+    }
+    if native_event.kind == "turn.unknown" && next_agent.active_turn.as_deref() == Some(turn_id) {
+        return Ok(Vec::new());
     }
     db!(tx.execute(
         "UPDATE pending_requests SET state = 'stale'
