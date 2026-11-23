@@ -1850,6 +1850,15 @@ impl EventProcessor {
                 self.expected_seq = Some(expected.saturating_add(1));
                 Ok(())
             }
+            Some(expected)
+                if expected.checked_add(1) == Some(durable.seq)
+                    && compaction_reports_private_usage(envelope) =>
+            {
+                // OpenCode 2.2.7 excludes the durable usage record from the
+                // public feed and repeats its figures on the compaction terminal.
+                self.expected_seq = Some(durable.seq.saturating_add(1));
+                Ok(())
+            }
             Some(expected) if durable.seq < expected => {
                 // A duplicate replay of an already-seen record: ignore.
                 Ok(())
@@ -3170,6 +3179,20 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
+}
+
+fn compaction_reports_private_usage(envelope: &SseEnvelope) -> bool {
+    matches!(
+        envelope.event_type.as_str(),
+        "session.compaction.ended" | "session.compaction.failed"
+    ) && matches!(envelope.data["reason"].as_str(), Some("auto" | "manual"))
+        && envelope.data["sessionID"].as_str()
+            == envelope
+                .durable
+                .as_ref()
+                .map(|durable| durable.aggregate_id.as_str())
+        && envelope.data["cost"].is_number()
+        && envelope.data["tokens"].is_object()
 }
 
 fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {
