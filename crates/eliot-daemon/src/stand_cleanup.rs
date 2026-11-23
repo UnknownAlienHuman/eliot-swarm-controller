@@ -8,10 +8,7 @@ use crate::operator::{
 };
 use crate::platform::script_file::directory_identity;
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
-use crate::workspace_git::{
-    WorkspaceGit,
-    containment::{CleanupFetches, branch_rev_parse},
-};
+use crate::workspace_git::{WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
 use eliot_core::{
     Error, Result, WorkspacePreparation, WorkspaceRemovalOutcome, workspace_path_key,
@@ -1766,12 +1763,10 @@ async fn drain_stand_output<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {
 }
 
 pub(crate) async fn plan_external_git(
-    transport_data_root: &Path,
     stand_root: &Path,
     registry: &Path,
     registry_file: &str,
     registration: &StandRegistration,
-    mut fetches: Option<&mut CleanupFetches>,
 ) -> Result<()> {
     if registration.pending_write_guard.is_some() {
         return Err(Error::new(
@@ -1847,7 +1842,6 @@ pub(crate) async fn plan_external_git(
 }
 
 pub async fn cleanup_stand_external_git(
-    transport_data_root: &Path,
     stand_root: &Path,
     registry: &Path,
     registry_file: &str,
@@ -1867,11 +1861,10 @@ pub async fn cleanup_stand_external_git(
     }
     let git = WorkspaceGit::new()?;
     let probe = GitProbe::new()?;
-    let mut fetches = CleanupFetches::default();
     let deadline = Instant::now() + STAND_GIT_TIME;
     let mut blocked_branches = BTreeSet::new();
 
-    // Pass 1: clean, contained external worktrees.
+    // Pass 1: clean external worktrees.
     for rec in &workspaces {
         let wt_key = external_worktree_key(&rec.preparation.worktree_path);
         let branch_key = external_branch_key(
@@ -2338,7 +2331,6 @@ pub(crate) async fn plan_stand_artifact(
     daemon_data_root: &Path,
     stand_root: &Path,
     expected_identity: &str,
-    fetches: Option<&mut CleanupFetches>,
 ) -> Result<u64> {
     if directory_identity(stand_root)? != expected_identity {
         return Err(Error::new(
@@ -2357,12 +2349,10 @@ pub(crate) async fn plan_stand_artifact(
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
     Box::pin(plan_external_git(
-        daemon_data_root,
         stand_root,
         &registry,
         &reg_name,
         &registration,
-        fetches,
     ))
     .await?;
     stand_tree_bytes(stand_root)
@@ -2412,7 +2402,6 @@ pub(crate) async fn apply_stand_artifact(
     }
     let bytes = stand_tree_bytes(stand_root)?;
     let report = Box::pin(cleanup_stand_external_git(
-        daemon_data_root,
         stand_root,
         &registry,
         &reg_name,

@@ -411,7 +411,6 @@ async fn down_inner(path: &Path) -> Result<DownOutcome, Failure> {
     let former_registration = settled.former;
     let report: StandExternalCleanupReport = Box::pin(cleanup_stand_external_git(
         &root,
-        &root,
         &registry,
         &reg_name,
         &mut record,

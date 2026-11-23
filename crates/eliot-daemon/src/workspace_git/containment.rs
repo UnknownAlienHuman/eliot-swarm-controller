@@ -1,55 +1,16 @@
-//! Fresh-upstream proof shared by workspace and branch cleanup.
+//! Fresh-upstream proof for explicit remote branch deletion.
 
 use crate::{
     git_actions::{CleanupTransportOp, run_cleanup_transport},
     git_monitor::{Captured, GitProbe},
 };
 use eliot_core::{Error, Result, api::is_git_oid};
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::Path, time::Duration};
 use tokio::time::Instant;
 
-const CONTENT_COMMITS: usize = 64;
 const CONTENT_TIME: Duration = Duration::from_secs(6);
 
-enum Containment {
-    Ancestor,
-    Content(String),
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum ContainmentScope {
-    Worktree,
-    BranchDeletion,
-}
-
-impl ContainmentScope {
-    fn absent(self) -> Error {
-        match self {
-            Self::Worktree => unmerged(),
-            Self::BranchDeletion => Error::new(
-                "content_not_at_tip",
-                "branch changes are absent from the current upstream default tip",
-            ),
-        }
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct CleanupFetches {
-    upstreams: BTreeMap<(PathBuf, String), FetchedUpstream>,
-}
-
-struct FetchedUpstream {
-    url: String,
-    default_tip: Result<String>,
-}
-
 pub(crate) struct BranchClassification {
-    pub(crate) reason: String,
     pub(crate) remote: String,
     pub(crate) url: String,
     pub(crate) tip: String,
@@ -60,9 +21,8 @@ async fn prove_containment(
     repo: &Path,
     tip: &str,
     default_tip: &str,
-    scope: ContainmentScope,
     deadline: Instant,
-) -> Result<Containment> {
+) -> Result<()> {
     let deadline = deadline.min(Instant::now() + CONTENT_TIME);
     if repo
         .join("info/grafts")
@@ -80,7 +40,7 @@ async fn prove_containment(
     .await?
     .code
     {
-        0 => return Ok(Containment::Ancestor),
+        0 => return Ok(()),
         1 => {}
         _ => return Err(merge_check_failed()),
     }
@@ -104,7 +64,7 @@ async fn prove_containment(
     .await?;
     match base.code {
         0 => {}
-        1 => return Err(scope.absent()),
+        1 => return Err(content_not_at_tip()),
         _ => return Err(merge_check_failed()),
     }
     let base = std::str::from_utf8(&base.stdout)
@@ -115,51 +75,12 @@ async fn prove_containment(
 
     let delta = tree_delta(probe, repo, base, tip, deadline).await?;
     let expected = raw_entries(&delta)?;
-    if expected.is_empty() {
-        return Err(scope.absent());
+    if !expected.is_empty()
+        && delta_matches(probe, repo, base, default_tip, &expected, deadline).await?
+    {
+        return Ok(());
     }
-    if delta_matches(probe, repo, base, default_tip, &expected, deadline).await? {
-        return Ok(Containment::Content(default_tip.to_owned()));
-    }
-    if matches!(scope, ContainmentScope::BranchDeletion) {
-        return Err(scope.absent());
-    }
-    let count = format!("--max-count={}", CONTENT_COMMITS + 1);
-    let range = format!("{base}..{default_tip}");
-    let history = proof_command(
-        probe,
-        repo,
-        &[
-            "rev-list",
-            "--first-parent",
-            "--ancestry-path",
-            &count,
-            &range,
-        ],
-        deadline,
-    )
-    .await?;
-    if history.code != 0 {
-        return Err(merge_check_failed());
-    }
-    let history = std::str::from_utf8(&history.stdout).map_err(|_| merge_check_failed())?;
-    for (index, commit) in history.lines().enumerate() {
-        if index == CONTENT_COMMITS {
-            return Err(Error::new(
-                "merge_scan_limit",
-                "upstream content scan reached its commit limit",
-            ));
-        }
-        if !is_git_oid(commit) {
-            return Err(merge_check_failed());
-        }
-        if commit != default_tip
-            && delta_matches(probe, repo, base, commit, &expected, deadline).await?
-        {
-            return Ok(Containment::Content(commit.to_owned()));
-        }
-    }
-    Err(unmerged())
+    Err(content_not_at_tip())
 }
 
 async fn delta_matches(
@@ -257,25 +178,19 @@ fn merge_check_failed() -> Error {
     )
 }
 
-fn unmerged() -> Error {
+fn content_not_at_tip() -> Error {
     Error::new(
-        "unmerged",
-        "branch changes are absent from the upstream default branch",
+        "content_not_at_tip",
+        "branch changes are absent from the current upstream default tip",
     )
 }
 
-/// Fetch the branch upstream and classify the local branch. `safe` means
-/// the fresh fetch succeeded, the tip is contained in the upstream
-/// default branch and no commits are unpushed; anything else is a keep
-/// reason or an explicit refusal. The fetch updates remote-tracking
-/// state but never deletes a branch; deletion happens only at apply.
+/// Preserve the upstream safety gate for explicit remote deletion.
 pub(crate) async fn classify_branch(
     data_root: &Path,
     checkout: &str,
     common: &Path,
     branch: &str,
-    scope: ContainmentScope,
-    fetches: Option<&mut CleanupFetches>,
     deadline: Instant,
 ) -> Result<BranchClassification> {
     if !crate::git_actions::valid_cleanup_branch(branch) {
@@ -289,33 +204,8 @@ pub(crate) async fn classify_branch(
     let branch_ref = format!("refs/heads/{branch}");
     let remote = branch_upstream_remote(&probe, repo, &branch_ref, deadline).await?;
     let url = branch_remote_url(&probe, repo, &remote, deadline).await?;
-    let default_tip = {
-        let fetch = fetch_default_tip(&probe, data_root, checkout, repo, &remote, &url, deadline);
-        if let Some(fetches) = fetches {
-            match fetches.upstreams.entry((common.to_owned(), remote.clone())) {
-                Entry::Occupied(entry) => {
-                    let fetched = entry.get();
-                    if fetched.url != url {
-                        return Err(Error::new(
-                            "identity_changed",
-                            "remote URL changed during the plan",
-                        ));
-                    }
-                    fetched.default_tip.clone()
-                }
-                Entry::Vacant(entry) => {
-                    let default_tip = fetch.await;
-                    entry.insert(FetchedUpstream {
-                        url: url.clone(),
-                        default_tip: default_tip.clone(),
-                    });
-                    default_tip
-                }
-            }
-        } else {
-            fetch.await
-        }
-    }?;
+    let default_tip =
+        fetch_default_tip(&probe, data_root, checkout, repo, &remote, &url, deadline).await?;
     let tip = branch_rev_parse(&probe, repo, &branch_ref, "branch_absent", deadline).await?;
     let upstream =
         branch_upstream_tip(&probe, repo, &branch_ref, &remote, branch, deadline).await?;
@@ -347,7 +237,7 @@ pub(crate) async fn classify_branch(
             "branch carries commits its upstream tracking ref lacks",
         ));
     }
-    let proof = prove_containment(&probe, repo, &tip, &default_tip, scope, deadline).await?;
+    prove_containment(&probe, repo, &tip, &default_tip, deadline).await?;
     let remote_heads = run_cleanup_transport(
         data_root,
         checkout,
@@ -371,18 +261,7 @@ pub(crate) async fn classify_branch(
             "remote branch exists without a freshly resolved tracking tip",
         ));
     }
-    Ok(BranchClassification {
-        reason: match proof {
-            Containment::Ancestor if remote_heads.stdout.is_empty() => {
-                "merged_remote_deleted".to_owned()
-            }
-            Containment::Ancestor => "merged".to_owned(),
-            Containment::Content(commit) => format!("content_contained_at {commit}"),
-        },
-        remote,
-        url,
-        tip,
-    })
+    Ok(BranchClassification { remote, url, tip })
 }
 
 async fn fetch_default_tip(

@@ -4,9 +4,7 @@ use crate::git_monitor::GitBinding;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
 use crate::platform::script_file::directory_identity;
-use crate::workspace_git::containment::{
-    BranchClassification, CleanupFetches, ContainmentScope, classify_branch,
-};
+use crate::workspace_git::containment::{BranchClassification, classify_branch};
 use eliot_core::FailureOrigin;
 use eliot_core::api::*;
 use std::path::{Component, Path};
@@ -1386,7 +1384,6 @@ impl Router {
         )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
-        let mut fetches = CleanupFetches::default();
         for artifact in artifacts {
             let mut candidate = CleanupCandidate {
                 artifact,
@@ -1522,10 +1519,7 @@ impl Router {
                 {
                     break;
                 }
-                match self
-                    .cleanup_preflight_with_fetches(&candidate.artifact, Some(&mut fetches))
-                    .await
-                {
+                match self.cleanup_preflight(&candidate.artifact).await {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = if ownership_root {
@@ -1890,14 +1884,6 @@ impl Router {
     }
 
     async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<u64> {
-        self.cleanup_preflight_with_fetches(artifact, None).await
-    }
-
-    async fn cleanup_preflight_with_fetches(
-        &self,
-        artifact: &ArtifactView,
-        fetches: Option<&mut CleanupFetches>,
-    ) -> Result<u64> {
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -1943,7 +1929,6 @@ impl Router {
                 &self.inner.data_root,
                 &path,
                 &artifact.identity,
-                fetches,
             )
             .await;
         }
@@ -2558,8 +2543,6 @@ impl Router {
             &git.repo,
             Path::new(&git.common),
             &git.branch,
-            ContainmentScope::BranchDeletion,
-            None,
             Instant::now() + Duration::from_secs(60),
         )
         .await
@@ -2644,104 +2627,61 @@ impl Router {
         let deadline = Instant::now() + Duration::from_secs(30);
         let branch_ref = format!("refs/heads/{}", git.branch);
         let archive_ref = format!("refs/eliot/archive/{}", git.branch);
-        for attempt in 0..2 {
-            Self::ensure_branch_detached(&probe, repo, common, &git.branch, deadline).await?;
-            let branch_tip =
-                Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline).await?;
-            let archive_tip =
-                Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline).await?;
-            if archive_tip
-                .as_deref()
-                .is_some_and(|archived| archived != expected_tip)
-            {
-                return Err(Error::new(
-                    "archive_collision",
-                    "local branch archive ref already names a different tip",
-                ));
-            }
-            match branch_tip.as_deref() {
-                Some(tip) if tip != expected_tip => {
-                    return Err(Error::new(
-                        "identity_changed",
-                        "branch tip moved since the plan was retained",
-                    ));
-                }
-                None if archive_tip.as_deref() == Some(expected_tip) => return Ok(()),
-                None => return Err(Error::new("branch_absent", "local branch is absent")),
-                Some(_) => {}
-            }
-
-            let transaction = match archive_tip.as_deref() {
-                Some(_) => format!(
-                    "start\nverify {archive_ref} {expected_tip}\ndelete {branch_ref} {expected_tip}\nprepare\ncommit\n"
-                ),
-                None => format!(
-                    "start\ncreate {archive_ref} {expected_tip}\ndelete {branch_ref} {expected_tip}\nprepare\ncommit\n"
-                ),
-            };
-            let applied =
-                Self::run_branch_ref_transaction(&probe, repo, common, &transaction, deadline)
-                    .await?;
-            let branch_after = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline)
-                .await
-                .map_err(|_| {
-                    Error::new(
-                        "unknown",
-                        "local branch retirement settlement is unavailable",
-                    )
-                })?;
-            let archive_after = Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
-                .await
-                .map_err(|_| {
-                    Error::new(
-                        "unknown",
-                        "local branch retirement settlement is unavailable",
-                    )
-                })?;
-            if archive_after
-                .as_deref()
-                .is_some_and(|archived| archived != expected_tip)
-            {
-                return Err(Error::new(
-                    "archive_collision",
-                    "local branch archive ref changed during retirement",
-                ));
-            }
-            if archive_after.as_deref() == Some(expected_tip) && branch_after.is_none() {
-                return Ok(());
-            }
-            if archive_after.as_deref() == Some(expected_tip)
-                && branch_after.as_deref() == Some(expected_tip)
-                && archive_tip.is_none()
-                && attempt == 0
-                && !applied
-            {
-                continue;
-            }
-            if branch_after
-                .as_deref()
-                .is_some_and(|tip| tip != expected_tip)
-            {
-                return Err(Error::new(
-                    "identity_changed",
-                    "branch tip changed during retirement",
-                ));
-            }
-            if branch_after.as_deref() == Some(expected_tip) && !applied {
-                return Err(Error::new(
-                    "branch_delete_refused",
-                    "atomic local branch retirement was refused",
-                ));
-            }
+        let branch_tip = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline).await?;
+        let archive_tip =
+            Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline).await?;
+        if archive_tip
+            .as_deref()
+            .is_some_and(|archived| archived != expected_tip)
+        {
             return Err(Error::new(
-                "unknown",
-                "local branch retirement did not reach an exact archived state",
+                "archive_collision",
+                "local branch archive ref already names a different tip",
             ));
         }
-        Err(Error::new(
-            "branch_delete_refused",
-            "atomic local branch retirement was refused",
-        ))
+        match branch_tip.as_deref() {
+            Some(tip) if tip != expected_tip => {
+                return Err(Error::new(
+                    "identity_changed",
+                    "branch tip moved since planning",
+                ));
+            }
+            None if archive_tip.as_deref() == Some(expected_tip) => return Ok(()),
+            None => return Err(Error::new("branch_absent", "local branch is absent")),
+            Some(_) => {}
+        }
+        Self::ensure_branch_detached(&probe, repo, common, &git.branch, deadline).await?;
+        let archive = match archive_tip {
+            Some(_) => format!("verify {archive_ref} {expected_tip}"),
+            None => format!("create {archive_ref} {expected_tip}"),
+        };
+        let transaction = format!(
+            "start\noption no-deref\n{archive}\noption no-deref\ndelete {branch_ref} {expected_tip}\nprepare\ncommit\n"
+        );
+        let applied =
+            Self::run_branch_ref_transaction(&probe, repo, common, &transaction, deadline).await?;
+        let unknown = || {
+            Error::new(
+                "unknown",
+                "exact local branch retirement could not be confirmed",
+            )
+        };
+        let branch_after = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline)
+            .await
+            .map_err(|_| unknown())?;
+        let archive_after = Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
+            .await
+            .map_err(|_| unknown())?;
+        if archive_after.as_deref() == Some(expected_tip) && branch_after.is_none() {
+            return Ok(());
+        }
+        if !applied && branch_after.is_some() {
+            return Err(Error::new(
+                "branch_delete_refused",
+                "Git refused the atomic archive and delete transaction and the local branch still exists",
+            ));
+        }
+        Err(unknown())
     }
 
     async fn ensure_branch_detached(
@@ -2758,7 +2698,7 @@ impl Router {
         let worktrees = probe
             .workspace_command_bound(
                 Path::new(repo),
-                &["worktree", "list", "--porcelain"],
+                &["worktree", "list", "--porcelain", "-z"],
                 binding,
                 deadline,
             )
@@ -2771,9 +2711,10 @@ impl Router {
             ));
         }
         let attached = format!("branch refs/heads/{branch}");
-        if String::from_utf8_lossy(&worktrees.stdout)
-            .lines()
-            .any(|line| line == attached)
+        if worktrees
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|field| field == attached.as_bytes())
         {
             return Err(Error::new(
                 "branch_checked_out",
@@ -2795,60 +2736,47 @@ impl Router {
             common_dir: common,
         };
         let root = Path::new(repo);
-        let symbolic = probe
-            .workspace_command_bound(
-                root,
-                &["symbolic-ref", "--quiet", reference],
-                binding,
-                deadline,
-            )
-            .await
-            .map_err(|_| Error::new("branch_read_failed", "Git ref could not be read"))?;
-        if symbolic.code == 0 {
-            return Err(Error::new(
-                if reference.starts_with("refs/eliot/archive/") {
-                    "archive_collision"
-                } else {
-                    "branch_read_failed"
-                },
-                "branch retirement refuses symbolic refs",
-            ));
-        }
-        if symbolic.code != 1 {
-            return Err(Error::new(
-                "branch_read_failed",
-                "Git ref could not be read",
-            ));
-        }
         let output = probe
             .workspace_command_bound(
                 root,
-                &["show-ref", "--verify", "--hash", reference],
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)%00%(symref)",
+                    reference,
+                ],
                 binding,
                 deadline,
             )
             .await
             .map_err(|_| Error::new("branch_read_failed", "Git ref could not be read"))?;
-        if output.code == 1 && output.stdout.is_empty() {
-            return Ok(None);
-        }
         if output.code != 0 {
             return Err(Error::new(
                 "branch_read_failed",
                 "Git ref could not be read",
             ));
         }
-        let oid = std::str::from_utf8(&output.stdout)
-            .map_err(|_| Error::new("branch_read_failed", "Git ref is not valid text"))?
-            .trim()
-            .to_owned();
-        if !eliot_core::api::is_git_oid(&oid) {
-            return Err(Error::new(
-                "branch_read_failed",
-                "Git ref object id is invalid",
-            ));
+        for line in output.stdout.split(|byte| *byte == b'\n') {
+            let mut fields = line
+                .strip_suffix(b"\r")
+                .unwrap_or(line)
+                .split(|byte| *byte == 0);
+            if fields.next() != Some(reference.as_bytes()) {
+                continue;
+            }
+            let oid = fields
+                .next()
+                .and_then(|field| std::str::from_utf8(field).ok())
+                .filter(|oid| eliot_core::api::is_git_oid(oid))
+                .ok_or_else(|| Error::new("branch_read_failed", "Git ref object id is invalid"))?;
+            if fields.next() != Some(b"") {
+                return Err(Error::new(
+                    "branch_read_failed",
+                    "branch retirement requires direct Git refs",
+                ));
+            }
+            return Ok(Some(oid.to_owned()));
         }
-        Ok(Some(oid))
+        Ok(None)
     }
 
     async fn run_branch_ref_transaction(
@@ -2877,7 +2805,7 @@ impl Router {
                 "branch retirement deadline elapsed",
             ));
         }
-        let (_, cancellation) = tokio::sync::watch::channel(false);
+        let (_keep_open, cancellation) = tokio::sync::watch::channel(false);
         match crate::scripts::process::run_owned_process(
             command,
             transaction.as_bytes().to_vec(),

@@ -818,6 +818,37 @@ pub(super) fn workspace_event(
     )
 }
 
+fn last_available_git_observation(
+    tx: &Transaction<'_>,
+    agent: i64,
+    workspace: &WorkspacePreparation,
+) -> Result<Value> {
+    let observation: Option<(i64, String)> = tx
+        .query_row(
+            "SELECT ts, data FROM events
+             WHERE agent = ?1 AND generation = ?2 AND source = 'git' AND kind = 'git.changed'
+               AND json_extract(data, '$.workspace') = ?3
+               AND json_extract(data, '$.complete') = 1
+             ORDER BY seq DESC LIMIT 1",
+            params![agent, workspace.target_generation, workspace.worktree_path],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((observed_at, data)) = observation else {
+        return Ok(Value::Null);
+    };
+    let data: Value = decode_json(&data)?;
+    let dirty_path_count = data["dirty"].as_array().map_or(0, Vec::len);
+    Ok(json!({
+        "observed_at": observed_at,
+        "dirty": dirty_path_count > 0,
+        "dirty_path_count": dirty_path_count,
+        "dirty_digest": data["dirty_digest"],
+        "head": data["head"],
+    }))
+}
+
 pub(super) fn preserve_native_git_write_marker(previous: Option<&Value>, outcome: &mut Value) {
     if let Some(marker) = previous.and_then(|value| value.get("native_git_write_dispatched")) {
         outcome["native_git_write_dispatched"] = marker.clone();
@@ -2041,8 +2072,19 @@ impl Store {
                 workspace_cancel_marker(&workspace, stop, outcome)?
             }
             WorkspaceAction::Removal(outcome) => {
-                json!({"stage": "removal", "command_id": command_id, "result": outcome,
-                    "previous_phase": workspace.outcome.as_ref().and_then(|value| value.get("previous_phase"))})
+                let mut marker = json!({"stage": "removal", "command_id": command_id, "result": outcome,
+                    "previous_phase": workspace.outcome.as_ref().and_then(|value| value.get("previous_phase"))});
+                if matches!(
+                    outcome,
+                    WorkspaceRemovalOutcome::Removed {
+                        directory_absent_before_remove: true,
+                        ..
+                    }
+                ) {
+                    marker["last_available_git_observation"] =
+                        last_available_git_observation(&tx, agent_num, &workspace)?;
+                }
+                marker
             }
         };
         preserve_native_git_write_marker(old.outcome.as_ref(), &mut marker);
