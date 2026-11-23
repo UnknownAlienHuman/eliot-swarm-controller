@@ -995,10 +995,14 @@ query and resolves native notices in one page-scoped query over the existing eve
 index. `agent.get` uses the same projection for its single Agent. Neither read adds a
 polling source. `AgentView.policy_opt_out_reason` retains an explicit project-policy
 opt-out reason; `swarm show` includes it in human output and JSON keeps the view field.
-`AgentGetResponse.last_control_failure` is the latest retained Owner `stop` or
-`interrupt` command in `rejected`, `failed` or `unknown` state for the current generation.
-It carries the command id, verb, state, generation, and a bounded reason from the retained
-command outcome. It is omitted when no such result is visible to the
+`AgentGetResponse.last_control_failure` reflects the newest retained Owner
+`stop` or `interrupt` result in `applied`, `rejected`, `failed` or `unknown` state,
+ordered by admission for the current generation. It includes the Agent's result
+from a tree stop. A `rejected`, `failed` or `unknown` result is returned, and a newer
+`applied` result clears an earlier failure. Internal interrupt and fallback
+steps are reported through their parent control. The field carries the
+command id, verb, state, generation, and a bounded reason
+from the retained command outcome. It is omitted when no such result is visible to the
 caller; Router applies the same command-read visibility check used by `command.get`.
 For a valid Owner control refused at Store admission due to the Agent's current state
 or a stale binding, the daemon returns a retained `rejected` result with `outcome.message`.
