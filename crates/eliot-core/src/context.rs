@@ -58,16 +58,15 @@ pub enum ContextEditPath {
 }
 
 impl ContextEditPath {
-    pub fn outside(path: &str, policy: &crate::SecretPolicy) -> Self {
+    pub fn outside(path: &str, display_path: &str, policy: &crate::SecretPolicy) -> Self {
         let sha256 = crate::api::inference::sha256_hex(path.as_bytes());
-        let display_path = crate::display_path(path);
         let basename = path
             .rsplit(['/', '\\'])
             .find(|part| !part.is_empty())
             .filter(|name| !name.chars().any(char::is_control))
             .unwrap_or("unavailable");
         let basename = policy.redact_text(basename);
-        let redacted_path = policy.redact_text(&display_path);
+        let redacted_path = policy.redact_text(display_path);
         let path_redacted = redacted_path != display_path;
         let path = (!display_path.chars().any(char::is_control))
             .then_some(redacted_path)

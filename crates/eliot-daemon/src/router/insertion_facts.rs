@@ -92,7 +92,7 @@ impl Router {
                 && !basename.contains(['/', '\\'])
                 && !basename.chars().any(char::is_control)
             {
-                let path = path.map(|path| eliot_core::display_path(&path));
+                let path = path.map(|path| eliot_plugin::edit_path::display_outside(&path));
                 let path_redacted = path_redacted
                     || path
                         .as_deref()
@@ -106,7 +106,10 @@ impl Router {
                     None
                 } else {
                     path.as_deref()
-                        .and_then(|path| verified_outside_path_key(workspace, path))
+                        .and_then(|path| eliot_plugin::edit_path::resolve_display(workspace, path))
+                        .and_then(|path| {
+                            verified_outside_path_key(workspace, &path.to_string_lossy())
+                        })
                 };
                 outside_worktree.insert(ContextEditPath::OutsideOrUnverifiable {
                     sha256,
@@ -129,7 +132,7 @@ impl Router {
                 } else {
                     let path = Path::new(workspace).join(raw_path);
                     let path_text = path.to_string_lossy();
-                    let mut edit = ContextEditPath::outside(&path_text, &policy);
+                    let mut edit = eliot_plugin::edit_path::outside_evidence(&path_text, &policy);
                     if let ContextEditPath::OutsideOrUnverifiable {
                         canonical_sha256,
                         path_redacted,

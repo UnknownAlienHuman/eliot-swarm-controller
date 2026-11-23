@@ -226,14 +226,7 @@ fn hook_edit_path(
         .and_then(|fields| fields.get("file_path").or_else(|| fields.get("path")))
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())?;
-    Some(
-        match eliot_plugin::edit_path::normalize(&workspace.to_string_lossy(), path) {
-            Ok(relative) if relative.len() <= 4096 && policy.redact_text(&relative) == relative => {
-                ContextEditPath::Relative { path: relative }
-            }
-            _ => ContextEditPath::outside(&workspace.join(path).to_string_lossy(), policy),
-        },
-    )
+    eliot_plugin::edit_path::evidence(&workspace.to_string_lossy(), path, policy)
 }
 
 /// Lexical workspace-relative normalization mirroring the Store's native

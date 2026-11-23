@@ -117,6 +117,7 @@ const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 #[derive(Default)]
 struct ToolPart {
     name: Option<String>,
+    write_path: Option<String>,
     started: bool,
     completed: bool,
 }
@@ -2088,6 +2089,12 @@ impl EventProcessor {
             return Ok(());
         }
         let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
+        if matches!(tool.as_str(), "write" | "edit") {
+            part.write_path = envelope.data["input"]["path"]
+                .as_str()
+                .filter(|path| path.len() <= 4096)
+                .map(str::to_owned);
+        }
         let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
@@ -2202,6 +2209,7 @@ impl EventProcessor {
                 .await;
         }
         let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
+        let write_path = part.write_path.take();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id,
@@ -2228,8 +2236,68 @@ impl EventProcessor {
             "OpenCode",
         )?;
         self.commit_event("tool.completed", native_id, data).await?;
+        if !failed && envelope.data["executed"] != true {
+            self.commit_file_edits(
+                &terminal,
+                &turn_id,
+                &tool,
+                write_path.as_deref(),
+                &envelope.data,
+                &secrets,
+            )
+            .await?;
+        }
         if let Some(part) = self.tool_parts.get_mut(&terminal.id) {
             part.completed = true;
+        }
+        Ok(())
+    }
+
+    async fn commit_file_edits(
+        &mut self,
+        terminal: &ToolEventData,
+        turn_id: &str,
+        tool: &str,
+        write_path: Option<&str>,
+        data: &Value,
+        policy: &SecretPolicy,
+    ) -> Result<()> {
+        let files = data["metadata"]["files"].as_array();
+        let paths: Vec<_> = match (tool, files) {
+            ("edit" | "patch", Some(files)) => files
+                .iter()
+                .filter_map(|file| file["file"].as_str())
+                .collect(),
+            ("write" | "edit", _) => write_path.into_iter().collect(),
+            _ => return Ok(()),
+        };
+        for (index, path) in paths.iter().take(MAX_TOOL_PARTS).enumerate() {
+            if let Some(edit_path) =
+                eliot_plugin::edit_path::evidence(self.http.directory(), path, policy)
+            {
+                let id = event_id(
+                    &terminal.session_id,
+                    turn_id,
+                    &format!("{}:{index}", terminal.id),
+                    "tool.file.edited",
+                    "opencode",
+                    "OpenCode",
+                )?;
+                self.commit_event(
+                    "tool.file.edited",
+                    id,
+                    json!({"turn_id":turn_id,"edit_path":edit_path}),
+                )
+                .await?;
+            }
+        }
+        if paths.len() > MAX_TOOL_PARTS {
+            self.stream_source()
+                .record_coverage_gap(
+                    "OpenCode file edits overflowed the tool fact bound",
+                    &["tool"],
+                )
+                .await?;
         }
         Ok(())
     }

@@ -1288,8 +1288,9 @@ impl StreamSource<'_> {
     /// gap: the source keeps its configured families for later reports.
     pub async fn record_coverage_gap(&mut self, reason: &str, families: &[&str]) -> Result<()> {
         let deadline = Instant::now() + EVENT_DEADLINE;
-        self.record_gap_inner_until(reason, families, (None, None), deadline, false)
+        self.record_gap_inner_until(reason, families, (None, None), deadline, false, None)
             .await
+            .map(|_| ())
     }
 
     pub async fn record_gap_until(&mut self, reason: &str, deadline: Instant) -> Result<()> {
@@ -1306,8 +1307,34 @@ impl StreamSource<'_> {
         deadline: Instant,
     ) -> Result<()> {
         let families = self.families;
-        self.record_gap_inner_until(reason, families, (from, to), deadline, true)
+        self.record_gap_inner_until(reason, families, (from, to), deadline, true, None)
             .await
+            .map(|_| ())
+    }
+
+    /// Report an unverified cursor gap and use the daemon's committed decision
+    /// about continuing from the exact native compaction terminal.
+    pub async fn record_compaction_gap(
+        &mut self,
+        reason: &str,
+        expected: u64,
+        observed: u64,
+        command_id: &str,
+        native_ref: &str,
+    ) -> Result<bool> {
+        let boundary = eliot_core::CompactionGapBoundary {
+            command_id: command_id.to_owned(),
+            native_ref: native_ref.to_owned(),
+        };
+        self.record_gap_inner_until(
+            reason,
+            self.families,
+            (Some(expected.to_string()), Some(observed.to_string())),
+            Instant::now() + EVENT_DEADLINE,
+            true,
+            Some(boundary),
+        )
+        .await
     }
 
     async fn record_gap_inner_until(
@@ -1317,7 +1344,8 @@ impl StreamSource<'_> {
         bounds: (Option<String>, Option<String>),
         deadline: Instant,
         terminal_unknown: bool,
-    ) -> Result<()> {
+        boundary: Option<eliot_core::CompactionGapBoundary>,
+    ) -> Result<bool> {
         if *self.writes_blocked {
             *self.source_unknown = true;
             return Err(Error::new(
@@ -1334,7 +1362,7 @@ impl StreamSource<'_> {
                 format!("{} source already has an unresolved gap", self.harness),
             ));
         }
-        if terminal_unknown {
+        if terminal_unknown && boundary.is_none() {
             *self.source_unknown = true;
             *self.gap_reported = true;
         }
@@ -1353,13 +1381,16 @@ impl StreamSource<'_> {
             from: bounds.0,
             to: bounds.1,
         };
-        let result = self.send_gap_until(&gap, deadline).await;
+        let result = self.send_gap_until(&gap, boundary.as_ref(), deadline).await;
         match result {
             Ok(ack) if Self::is_canonical_gap_ack(&gap, &ack) => {
-                if terminal_unknown {
+                let can_continue = boundary.is_some() && ack["can_continue"] == true;
+                if terminal_unknown && !can_continue {
+                    *self.source_unknown = true;
+                    *self.gap_reported = true;
                     *self.failure = Some(format!("{reason}; terminal outcome is unknown"));
                 }
-                Ok(())
+                Ok(can_continue)
             }
             Ok(_) | Err(_) => {
                 *self.source_unknown = true;
@@ -1378,24 +1409,27 @@ impl StreamSource<'_> {
         }
     }
 
-    async fn send_gap_until(&self, gap: &SourceGap, deadline: Instant) -> Result<Value> {
-        self.host
-            .call(
-                "source.gap",
-                json!({
-                    "credential": self.credential,
-                    "agent_id": gap.agent_id,
-                    "generation": gap.generation,
-                    "source": gap.source,
-                    "gap_id": gap.gap_id,
-                    "families": gap.families,
-                    "reason": gap.reason,
-                    "from": gap.from,
-                    "to": gap.to,
-                }),
-                deadline,
-            )
-            .await
+    async fn send_gap_until(
+        &self,
+        gap: &SourceGap,
+        boundary: Option<&eliot_core::CompactionGapBoundary>,
+        deadline: Instant,
+    ) -> Result<Value> {
+        let mut params = json!({
+            "credential": self.credential,
+            "agent_id": gap.agent_id,
+            "generation": gap.generation,
+            "source": gap.source,
+            "gap_id": gap.gap_id,
+            "families": gap.families,
+            "reason": gap.reason,
+            "from": gap.from,
+            "to": gap.to,
+        });
+        if let Some(boundary) = boundary {
+            params["compaction_boundary"] = json!(boundary);
+        }
+        self.host.call("source.gap", params, deadline).await
     }
 
     /// Whether `ack` canonically establishes `gap` (same gap_id, positive seq).

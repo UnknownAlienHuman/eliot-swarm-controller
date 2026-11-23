@@ -883,9 +883,11 @@ the turn and covers the turn's final files. A round already in flight also count
 because the driver runs on the newest unspent idle key when that round ends. Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
 the observation to a running turn. A worktree note identifies the reported path
-when a bounded, redacted path is available, explains what worktree tracking
-covers, and asks the Agent to move the change into the worktree or explain why
-it belongs outside. Unavailable paths use the redacted basename and a hash.
+and asks the Agent to move an outside change into the worktree or explain why
+it belongs outside. Edit facts use workspace-relative paths when verified inside
+the worktree. Outside paths retain a bounded, redacted location and replace the
+user-profile prefix with `%USERPROFILE%` before persistence. Unavailable paths
+use the redacted basename and a hash.
 Swarm deduplicates worktree notes by captured Agent, generation, turn and path.
 Goal scope notes deduplicate each path across the generation. Up to four edit
 notes can be admitted for a turn.

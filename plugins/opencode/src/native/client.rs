@@ -152,6 +152,10 @@ impl OpenCodeHttp {
         })
     }
 
+    pub(crate) fn directory(&self) -> &str {
+        &self.directory
+    }
+
     /// `GET /api/config`: effective configuration documents. A read, so any
     /// failure is `native_readback`, never `unknown`.
     pub async fn get_config(&self, deadline: Instant) -> Result<Vec<ConfigEntry>> {

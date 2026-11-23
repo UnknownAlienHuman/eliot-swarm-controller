@@ -611,9 +611,11 @@ the item lifecycle over the deprecated `thread/compacted` notification.
 OpenCode uses the durable `session.compaction.ended` fact for the exact native
 session. The adapter includes `turn_id` when a Swarm turn is active. An idle
 compaction leaves the task card for the next input through the shared note path.
-OpenCode 2.2.7 repeats the private durable usage record's figures on the
-public compaction terminal. The sequence check accounts for a single skipped
-record at that boundary when the terminal includes those figures.
+The OpenCode public feed can omit durable records. The adapter reports a forward
+sequence gap with its native bounds. After recording the gap, the daemon can
+authorize continuation across a single missing cursor at the terminal of an exact
+dispatched manual compaction on the same idle session. The gap still marks the
+affected source history incomplete. An unresolved gap elsewhere fences the stream.
 Antigravity reports completed system checkpoints from the exact owned native
 conversation transcript. The isolated root supplies the path for private
 profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
@@ -831,9 +833,11 @@ callback and reports `claude.PreToolUse.additionalContext` or
 Both Claude tool hooks have a three-second native timeout and matching adapter deadlines.
 Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
 Only a context delivery emits a `hook.after_tool` receipt. A successful file write
-with an empty selection emits a `tool.file.edited` fact. The `edit_path` on both
-events carries a verified worktree-relative path or an outside-or-unverifiable
+with an empty selection emits a `tool.file.edited` fact. OpenCode and Antigravity
+also emit this fact for successful native edits with an attributable edit path.
+The `edit_path` carries a verified worktree-relative path or an outside-or-unverifiable
 SHA-256 and redacted basename, with a bounded redacted path when available.
+Outside paths replace the user-profile prefix with `%USERPROFILE%` before persistence.
 A native `compact_boundary` record yields
 `session.context.compacted` and includes `turn_id` only for a committed active turn.
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),

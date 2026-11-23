@@ -188,7 +188,7 @@ fn turn_scoped_path_key(turn: &str, path_key: &str) -> String {
 
 pub(super) fn edit_note_text(kind: &str, paths: &[ContextEditPath]) -> String {
     let mut text = if kind == "outside_worktree" {
-        "Managed change tracking covers verified edits inside your worktree. Move edits from outside your managed worktree into it, or explain why they need to stay outside. Check the location of any unverified path.".to_owned()
+        "These edits are outside your managed worktree or could not be verified inside it. Move outside edits into the worktree, or explain why they need to stay outside. Check the location of any unverified path.".to_owned()
     } else {
         "Edits are outside the frozen Goal scope".to_owned()
     };

@@ -1461,6 +1461,14 @@ pub struct SourceGapAck {
     pub seq: i64,
 }
 
+/// Native identity for a reported cursor gap at an idle compaction terminal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionGapBoundary {
+    pub command_id: String,
+    pub native_ref: String,
+}
+
 /// Bounded machine signal for Muse native view-health episodes. The Muse
 /// plugin authors these exact reason strings and the readback marker; the
 /// three outcomes are exactly countable from the journal (see the Muse
