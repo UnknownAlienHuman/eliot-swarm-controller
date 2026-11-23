@@ -1954,6 +1954,7 @@ impl Router {
         let error = self.sanitized_failure(error, "swarm.start.pre_spawn");
         let mut outcome = self.command_error_outcome(&error, "code");
         outcome["reason"] = json!(error.code);
+        outcome["unspawned_start"] = Value::Bool(true);
         let (result, write_faulted) = {
             let mut store = self.inner.store.lock().await;
             let result = store.settle_unspawned_start(id, outcome, now_ms());

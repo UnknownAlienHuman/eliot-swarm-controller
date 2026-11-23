@@ -302,7 +302,7 @@ const MAX_AUTH_SELECTOR_BYTES: usize = 128;
 /// Ad-hoc auth shape: only the OpenCode slice transfers a canonical auth
 /// integration, so only it accepts `--auth`. The syntax mirrors the
 /// profile's `auth_integration` selector.
-fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
+pub(crate) fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
     if harness != "opencode" {
         return Err(core::Error::new(
             "unsupported",
@@ -2125,7 +2125,7 @@ const MAX_AUTH_LIST_BYTES: usize = 64 * 1024;
 /// reads. Only nonsecret ids leave this function; connection bodies stay
 /// unread. `None` when the helper cannot be spawned, times out, exits
 /// non-zero, or its document is unreadable.
-fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
+pub(crate) fn opencode_auth_ids(program: &str) -> Option<Vec<String>> {
     let stdout = native_read(
         program,
         &["auth", "list", "--format", "json", "--standalone"],

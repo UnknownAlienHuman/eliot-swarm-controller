@@ -159,11 +159,12 @@ impl ChildState {
 #[derive(Default)]
 pub(super) struct ChildThreads {
     confirmed: HashSet<String>,
-    pending_spawns: HashMap<String, HashSet<String>>,
+    pending_spawns: HashMap<String, HashMap<String, Option<String>>>,
     unconfirmed: HashMap<String, Option<String>>,
     bound: HashSet<String>,
     pub(super) parents: HashMap<String, String>,
     pub(super) spawn_items: HashMap<String, String>,
+    pub(super) spawn_turns: HashMap<String, String>,
 }
 
 impl ChildThreads {
@@ -189,13 +190,12 @@ impl ChildThreads {
         self.pending_spawns.values().any(|items| !items.is_empty())
     }
     fn pending_count(&self) -> usize {
-        self.pending_spawns.values().map(HashSet::len).sum()
+        self.pending_spawns.values().map(HashMap::len).sum()
     }
-    pub(super) fn pending_items<'a>(&'a self, producer: &'a str) -> Vec<&'a String> {
-        self.pending_spawns
-            .get(producer)
-            .map(|items| items.iter().collect::<Vec<_>>())
-            .unwrap_or_default()
+    pub(super) fn sole_pending_item(&self, producer: &str) -> Option<&str> {
+        let mut items = self.pending_spawns.get(producer)?.keys();
+        let item = items.next()?;
+        items.next().is_none().then_some(item.as_str())
     }
     pub(super) fn producers(&self) -> Vec<String> {
         self.pending_spawns
@@ -252,18 +252,20 @@ impl ChildThreads {
         &mut self,
         producer: &str,
         item_id: String,
+        turn: Option<&str>,
     ) -> std::result::Result<(), &'static str> {
         let known = self
             .pending_spawns
             .get(producer)
-            .is_some_and(|items| items.contains(&item_id));
+            .is_some_and(|items| items.contains_key(&item_id));
         if self.pending_count() >= MAX_CHILD_THREADS && !known {
             return Err("Codex had more native spawns in flight than are tracked");
         }
         self.pending_spawns
             .entry(producer.to_owned())
             .or_default()
-            .insert(item_id);
+            .entry(item_id)
+            .or_insert_with(|| turn.map(str::to_owned));
         Ok(())
     }
 
@@ -273,14 +275,23 @@ impl ChildThreads {
         owned: &str,
         item_id: &str,
         receivers: &[String],
+        turn: Option<&str>,
     ) -> std::result::Result<(), &'static str> {
-        if let Some(items) = self.pending_spawns.get_mut(producer) {
-            items.remove(item_id);
-        }
+        let started_turn = self
+            .pending_spawns
+            .get_mut(producer)
+            .and_then(|items| items.remove(item_id))
+            .flatten();
+        let turn = turn.or(started_turn.as_deref());
         for receiver in receivers {
             self.confirm(owned, receiver)?;
             self.spawn_items
                 .insert(receiver.clone(), item_id.to_owned());
+            if let Some(turn) = turn {
+                self.spawn_turns
+                    .entry(receiver.clone())
+                    .or_insert_with(|| turn.to_owned());
+            }
         }
         let items = self.pending_spawns.get(producer);
         if items.is_none_or(|items| items.is_empty()) {
@@ -326,6 +337,10 @@ impl ChildThreads {
 
     fn spawn_item_of(&self, thread: &str) -> Option<String> {
         self.spawn_items.get(thread).cloned()
+    }
+
+    pub(super) fn pending_spawn_turn(&self, parent: &str, item: &str) -> Option<String> {
+        self.pending_spawns.get(parent)?.get(item)?.clone()
     }
 }
 impl EventProcessor {
@@ -419,7 +434,12 @@ impl EventProcessor {
     }
 
     /// Track spawnAgent calls; completed receivers register before facts publish.
-    pub(super) async fn observe_spawn(&mut self, item: &Value, completed: bool) -> Result<()> {
+    pub(super) async fn observe_spawn(
+        &mut self,
+        item: &Value,
+        completed: bool,
+        turn: &str,
+    ) -> Result<()> {
         let Some((item_id, receivers)) = spawn_call(item) else {
             return Ok(());
         };
@@ -427,14 +447,14 @@ impl EventProcessor {
             return Ok(());
         };
         if !completed {
-            return match self.children.spawn_started(&owned, item_id) {
+            return match self.children.spawn_started(&owned, item_id, Some(turn)) {
                 Ok(()) => Ok(()),
                 Err(reason) => self.record_gap(reason).await,
             };
         }
-        let outcome = self
-            .children
-            .spawn_completed(&owned, &owned, &item_id, &receivers);
+        let outcome =
+            self.children
+                .spawn_completed(&owned, &owned, &item_id, &receivers, Some(turn));
         for receiver in &receivers {
             if self.children.is_bound(receiver) {
                 self.children
@@ -476,6 +496,7 @@ impl EventProcessor {
         &mut self,
         producer: &str,
         item: &Value,
+        turn: Option<&str>,
     ) -> Result<()> {
         let Some((agent_thread, kind)) = sub_agent_activity(item) else {
             return Ok(());
@@ -501,6 +522,12 @@ impl EventProcessor {
         self.children
             .parents
             .insert(agent_thread.to_owned(), producer.to_owned());
+        if let Some(turn) = turn {
+            self.children
+                .spawn_turns
+                .entry(agent_thread.to_owned())
+                .or_insert_with(|| turn.to_owned());
+        }
         self.collect_orphan_child_state();
         // Boxed: this helper runs on both the owned and the child frame
         // path, and registration flushes buffered child frames back through
@@ -824,14 +851,16 @@ impl EventProcessor {
             .children
             .spawn_item_of(child_thread)
             .unwrap_or_else(|| format!("spawn-{child_thread}"));
-        Ok(build_registration(
+        let mut registration = build_registration(
             &spawn_item,
             &parent_id,
             parent_generation,
             &parent_native_ref,
             &self.native_scope,
             child_thread,
-        ))
+        );
+        registration.parent_turn_id = self.children.spawn_turns.get(child_thread).cloned();
+        Ok(registration)
     }
 
     async fn register_pending_child(
@@ -1107,11 +1136,12 @@ impl EventProcessor {
                         )
                         .await?;
                 }
-                self.observe_child_spawn(child_thread, &raw_item, false)
+                let turn = params["turnId"].as_str();
+                self.observe_child_spawn(child_thread, &raw_item, false, turn)
                     .await?;
                 // Depth-2 v2 announcement from a confirmed child: same
                 // confirmation as the owned thread's, idempotent on repeat.
-                self.observe_sub_agent_activity(child_thread, &raw_item)
+                self.observe_sub_agent_activity(child_thread, &raw_item, turn)
                     .await?;
             }
             "item/completed" => {
@@ -1134,9 +1164,10 @@ impl EventProcessor {
                         )
                         .await?;
                 }
-                self.observe_child_spawn(child_thread, &raw_item, true)
+                let turn = params["turnId"].as_str();
+                self.observe_child_spawn(child_thread, &raw_item, true, turn)
                     .await?;
-                self.observe_sub_agent_activity(child_thread, &raw_item)
+                self.observe_sub_agent_activity(child_thread, &raw_item, turn)
                     .await?;
                 let item_type = raw_item
                     .get("type")
@@ -1344,20 +1375,21 @@ impl EventProcessor {
         parent_thread: &str,
         item: &Value,
         completed: bool,
+        turn: Option<&str>,
     ) -> Result<()> {
         let Some((item_id, receivers)) = spawn_call(item) else {
             return Ok(());
         };
         if !completed {
-            return match self.children.spawn_started(parent_thread, item_id) {
+            return match self.children.spawn_started(parent_thread, item_id, turn) {
                 Ok(()) => Ok(()),
                 Err(reason) => self.record_child_spawn_gap(parent_thread, reason).await,
             };
         }
         let owned = self.status.thread_id.as_deref().unwrap_or(parent_thread);
-        let outcome = self
-            .children
-            .spawn_completed(parent_thread, owned, &item_id, &receivers);
+        let outcome =
+            self.children
+                .spawn_completed(parent_thread, owned, &item_id, &receivers, turn);
         for receiver in &receivers {
             if self.children.is_bound(receiver) {
                 self.children

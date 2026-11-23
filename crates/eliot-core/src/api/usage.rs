@@ -11,6 +11,7 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_FIRST_CALL_TURNS: usize = 64;
+pub const MAX_NATIVE_CHILD_TURN_MARKERS: usize = 64;
 pub const PROFILE_FIRST_CALL_WINDOW: usize = 256;
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +23,22 @@ pub struct FirstCallInput {
     pub input_tokens: i64,
 }
 
+/// Native-child attribution for one exact retained parent turn. `Some(true)`
+/// means a retained registration names this turn; `Some(false)` means no
+/// registration names the turn and its parent generation has no unbound rows.
+/// `None` preserves uncertainty when an older/unbound row could belong to it.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeChildTurnMarker {
+    pub agent: String,
+    pub generation: i64,
+    pub turn_id: String,
+    /// `None` means an unbound retained registration in this generation may
+    /// belong to the turn.
+    #[serde(default)]
+    pub has_native_children: Option<bool>,
+}
+
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileFirstCallInput {
@@ -30,6 +47,63 @@ pub struct ProfileFirstCallInput {
     pub mcp_policy: Option<String>,
     pub sampled_turns: usize,
     pub average_input_tokens: i64,
+}
+
+/// Bounded comparison of completed parent turns, grouped by the exact current
+/// profile snapshot. Median token counts use only that parent's own reported
+/// turn-scoped usage; child usage remains separately attributed in `usage.summary`.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileNativeChildUsage {
+    pub profile: String,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_policy: Option<String>,
+    pub sampled_turns: usize,
+    pub turns_with_children: usize,
+    pub turns_without_children: usize,
+    pub turns_with_unknown_children: usize,
+    pub token_samples_with_children: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_parent_tokens_with_children: Option<i64>,
+    pub token_samples_without_children: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub median_parent_tokens_without_children: Option<i64>,
+}
+
+impl ProfileNativeChildUsage {
+    pub fn validate(&self) -> Result<()> {
+        validate_text(&self.profile)?;
+        validate_text(&self.harness)?;
+        let classified = self
+            .turns_with_children
+            .checked_add(self.turns_without_children)
+            .and_then(|count| count.checked_add(self.turns_with_unknown_children));
+        if self.sampled_turns == 0
+            || classified != Some(self.sampled_turns)
+            || self.token_samples_with_children > self.turns_with_children
+            || self.token_samples_without_children > self.turns_without_children
+            || self.median_parent_tokens_with_children.is_some()
+                != (self.token_samples_with_children > 0)
+            || self.median_parent_tokens_without_children.is_some()
+                != (self.token_samples_without_children > 0)
+            || self
+                .median_parent_tokens_with_children
+                .is_some_and(|tokens| tokens < 0)
+            || self
+                .median_parent_tokens_without_children
+                .is_some_and(|tokens| tokens < 0)
+        {
+            return Err(Error::new(
+                "invalid",
+                "doctor native-child usage sample is invalid",
+            ));
+        }
+        if let Some(policy) = &self.mcp_policy {
+            validate_text(policy)?;
+        }
+        Ok(())
+    }
 }
 
 /// One usage-summary scope: exactly one of `agent`, `project` or `root`.
@@ -352,6 +426,15 @@ pub struct UsageSummaryResponse {
     pub first_calls: Vec<FirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub first_calls_truncated: bool,
+    /// Most recent retained turn markers; older entries are omitted when
+    /// `native_child_turns_truncated` is true.
+    #[serde(default)]
+    pub native_child_turns: Vec<NativeChildTurnMarker>,
+    #[serde(default)]
+    pub native_child_turns_truncated: bool,
+    /// Retained registrations in this scope that lack an exact parent turn.
+    #[serde(default)]
+    pub native_child_registrations_unbound: usize,
     #[serde(default)]
     pub swarm_mcp: Vec<super::SwarmMcpTurnUsage>,
     #[serde(default)]
@@ -446,6 +529,22 @@ impl UsageSummaryResponse {
             {
                 return Err(invalid_response());
             }
+        }
+        if self.native_child_turns.len() > MAX_NATIVE_CHILD_TURN_MARKERS {
+            return Err(invalid_response());
+        }
+        let mut native_child_turns = std::collections::BTreeSet::new();
+        if self.native_child_turns.iter().any(|marker| {
+            crate::parse_agent_id(&marker.agent).is_err()
+                || marker.generation < 0
+                || marker.turn_id.trim().is_empty()
+                || !native_child_turns.insert((
+                    marker.agent.as_str(),
+                    marker.generation,
+                    marker.turn_id.as_str(),
+                ))
+        }) {
+            return Err(invalid_response());
         }
         let mut first_calls = std::collections::BTreeSet::new();
         if self.first_calls.len() > MAX_FIRST_CALL_TURNS

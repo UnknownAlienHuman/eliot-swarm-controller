@@ -13,7 +13,7 @@ use eliot_core::api::{
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{sync::atomic::Ordering, time::Instant};
 
 impl Router {
@@ -267,6 +267,19 @@ impl Router {
         workspace: Option<String>,
         deadline: Instant,
     ) -> Result<HarnessModelsResponse> {
+        if harness == "opencode"
+            && label == "adhoc"
+            && snapshot.as_ref().is_some_and(|profile| {
+                profile.get("auth_integration").is_none()
+                    && !profile
+                        .get("local_provider")
+                        .is_some_and(|provider| !provider.is_null())
+            })
+        {
+            return self
+                .opencode_adhoc_models(snapshot, discovered, workspace, deadline)
+                .await;
+        }
         let (scope, credential) = catalog::describe_snapshot(label, harness, snapshot.as_ref());
         let read = async {
             let mut profile = snapshot.ok_or_else(|| {
@@ -344,6 +357,93 @@ impl Router {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// A general OpenCode catalogue has no single launch model from which to
+    /// select one integration. Preview each canonical integration in its own
+    /// launch-shaped isolated store and union only the models the standalone
+    /// API reports for that store.
+    async fn opencode_adhoc_models(
+        &self,
+        snapshot: Option<Value>,
+        discovered: Option<HarnessCandidate>,
+        workspace: Option<String>,
+        deadline: Instant,
+    ) -> Result<HarnessModelsResponse> {
+        let snapshot = snapshot.ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "OpenCode model catalogue executable was not discovered",
+            )
+        })?;
+        let program = snapshot["cmd"].as_str().ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "OpenCode model catalogue executable was not discovered",
+            )
+        })?;
+        let program = program.to_owned();
+        let integrations = crate::adhoc::blocking_discovery(deadline, move || {
+            crate::adhoc::opencode_auth_ids(&program)
+        })
+        .await?
+        .ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "OpenCode auth integrations could not be read for an isolated model preview",
+            )
+        })?;
+        if integrations.is_empty() {
+            return Err(Error::new(
+                "unavailable",
+                "OpenCode has no auth integration for an isolated model preview",
+            ));
+        }
+
+        let mut combined: Option<HarnessModelsResponse> = None;
+        let mut models = Vec::new();
+        let mut seen = HashSet::new();
+        for integration in integrations {
+            if Instant::now() >= deadline {
+                break;
+            }
+            let integration = crate::adhoc::validate_adhoc_auth("opencode", &integration)?;
+            let mut selected = snapshot.clone();
+            selected["auth_integration"] = json!(integration);
+            let response = Box::pin(self.models_for_snapshot(
+                "opencode",
+                Some(selected),
+                "adhoc",
+                discovered.clone(),
+                workspace.clone(),
+                deadline,
+            ))
+            .await?;
+            if combined.is_none() {
+                let mut first = response.clone();
+                first.models.clear();
+                combined = Some(first);
+            }
+            for model in response.models {
+                if seen.insert(model.id.clone()) {
+                    models.push(model);
+                }
+            }
+        }
+        let mut response = combined.ok_or_else(|| {
+            Error::new(
+                "unavailable",
+                "OpenCode auth integrations produced no isolated model preview",
+            )
+        })?;
+        response.models = models;
+        response.default = None;
+        response.scope = "profile:adhoc harness:opencode auth:available".to_owned();
+        response.credential = "auth:available".to_owned();
+        response.note = Some("OpenCode launch previews from isolated stores, one integration per read. Use a named profile to see one exact auth selection.".to_owned());
+        response.fetched_at_ms = now_ms();
+        response.validate()?;
+        Ok(response)
     }
 
     /// Provider-supported account quota readback: timestamp, scope and an
@@ -811,10 +911,14 @@ impl Router {
                         Error::new("internal", "harness models could not be decoded")
                     })?;
                 let held = held_harness(harness);
-                let quota = tokio::time::timeout_at(discovery_deadline, read_quota(params))
-                    .await
-                    .ok()
-                    .and_then(Result::ok);
+                let quota = if response.credential == "auth:available" {
+                    None
+                } else {
+                    tokio::time::timeout_at(discovery_deadline, read_quota(params))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                };
                 for model in response.models {
                     models.push(catalog::catalog_entry(
                         harness,
@@ -1046,15 +1150,11 @@ pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
 /// session-true source produced the list.
 fn opencode_catalog_note(provenance: &str) -> &'static str {
     match provenance {
-        "session" => {
-            "OpenCode catalogue from the live session GET /api/model; the picker lists exactly what configure admits for this Agent generation"
-        }
+        "session" => "Advisory OpenCode catalogue from the live session GET /api/model",
         "preview" => {
             "OpenCode launch preview using the profile's provider settings and auth; workspace and live provider state can change availability"
         }
-        _ => {
-            "OpenCode preview from the canonical native stores; an isolated session may accept a different set"
-        }
+        _ => "Advisory OpenCode model catalogue",
     }
 }
 

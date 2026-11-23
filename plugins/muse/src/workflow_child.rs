@@ -176,6 +176,7 @@ impl WorkflowChildKey {
             registration_id: self.registration_id(),
             parent_id: parent_id.to_owned(),
             parent_generation,
+            parent_turn_id: None,
             parent_native_ref: self.parent_session.clone(),
             native_scope: native_scope.to_owned(),
             native_ref: self.native_ref(),

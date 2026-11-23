@@ -29,6 +29,7 @@ pub(crate) fn build_registration(
         registration_id: registration_id(spawn_item_id, child_thread),
         parent_id: parent_id.to_owned(),
         parent_generation,
+        parent_turn_id: None,
         parent_native_ref: parent_native_ref.to_owned(),
         native_scope: native_scope.to_owned(),
         native_ref: child_thread.to_owned(),

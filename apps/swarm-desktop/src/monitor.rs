@@ -680,6 +680,7 @@ impl MonitorRow {
             (_, Some(NativeChildActivityState::Running)) => "Working",
             (_, Some(NativeChildActivityState::Idle)) => "Idle",
             (_, Some(NativeChildActivityState::Interrupted)) => "Interrupted",
+            (_, Some(NativeChildActivityState::Stopped)) => "Stopped",
             (_, Some(NativeChildActivityState::Lost)) => "Lost",
             _ => state_words(self.state),
         }

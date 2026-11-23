@@ -566,6 +566,7 @@ pub(super) fn require_workspace_removable(
     agent: &Agent,
     workspace: &WorkspacePreparation,
     now: i64,
+    fresh_refusal: bool,
 ) -> Result<()> {
     // A worktree bound to a current project assignment is never removed,
     // borrowed or not: release the assignment first.
@@ -601,7 +602,7 @@ pub(super) fn require_workspace_removable(
             "another nonterminal Agent references this worktree or a descendant",
         ));
     }
-    if workspace_quiet_until(connection, agent, workspace)? > now {
+    if !fresh_refusal && workspace_quiet_until(connection, agent, workspace)? > now {
         return Err(Error::new(
             "busy",
             "worktree has not been quiet for the required removal period",
@@ -1506,7 +1507,7 @@ impl Store {
             .ok_or_else(|| Error::new("not_found", "managed workspace was not found"))?;
         let owner = load_agent_by_num(&self.connection, id)?
             .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
-        require_workspace_removable(&self.connection, &owner, &preparation, now)?;
+        require_workspace_removable(&self.connection, &owner, &preparation, now, false)?;
         Ok(preparation)
     }
 

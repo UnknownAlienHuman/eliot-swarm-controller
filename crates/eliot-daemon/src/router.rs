@@ -21,6 +21,7 @@ mod inference;
 mod insertion_facts;
 mod instructions;
 pub(crate) mod launch_queue;
+mod launch_refusal;
 mod launch_result;
 pub(crate) use launch_result::RULE_WORKTREE_GUARD_ARG;
 mod loss_recovery;
@@ -4930,6 +4931,8 @@ impl Router {
             });
         }
         let (profile_first_calls, profile_first_calls_truncated) = store.profile_first_calls()?;
+        let (profile_native_child_usage, profile_native_child_usage_truncated) =
+            store.profile_native_child_usage()?;
         drop(store);
         let data_root = self.inner.data_root.clone();
         let (owner_rules_drift, owner_rules_check_unavailable) = match tokio::task::spawn_blocking(
@@ -4945,6 +4948,8 @@ impl Router {
             profile_command_issues,
             profile_first_calls,
             profile_first_calls_truncated,
+            profile_native_child_usage,
+            profile_native_child_usage_truncated,
             goal_check_deadlines: self.goal_check_deadlines().await?,
             attention_thresholds: Some(self.attention_thresholds().await?),
             owner_rules_drift,

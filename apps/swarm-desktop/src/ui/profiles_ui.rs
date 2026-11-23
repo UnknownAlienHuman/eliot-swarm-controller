@@ -209,24 +209,12 @@ impl DesktopApp {
                 } else {
                     children.retain(|existing| *existing != child);
                 }
-                let mut draft = profiles::set_list_field(
+                let draft = profiles::set_list_field(
                     &self.editor.draft,
                     &name,
                     "child_profiles",
                     &children,
                 );
-                // A harness that cannot turn its own subagents off keeps
-                // them allowed explicitly: with child presets an omitted
-                // value means "deny", which it does not support.
-                if !children.is_empty()
-                    && self
-                        .preset_harness(&name)
-                        .is_some_and(|harness| profiles::native_subagents_fixed(&harness).is_some())
-                {
-                    draft = draft.and_then(|draft| {
-                        profiles::set_field(&draft, &name, "native_subagents", Some("allow"))
-                    });
-                }
                 self.apply_form_edit(draft, context);
             }
             ProfilesMsg::NativeSubagentsToggled(on) => {
@@ -503,7 +491,7 @@ impl DesktopApp {
         let subagents = selected
             .as_deref()
             .zip(harness.as_deref())
-            .map(|(name, harness)| self.subagents_form(name, harness));
+            .map(|(name, _harness)| self.subagents_form(name));
         let children: Vec<String> = subagents
             .as_ref()
             .and_then(|form| form.children.as_ref())
@@ -581,7 +569,7 @@ impl DesktopApp {
 
     /// The selected preset's Subagents section from the draft: the other
     /// presets it may start, its app's own subagents and its control scope.
-    fn subagents_form(&self, name: &str, harness: &str) -> config_view::SubagentsForm {
+    fn subagents_form(&self, name: &str) -> config_view::SubagentsForm {
         let draft = &self.editor.draft;
         let children = match profiles::list_field(draft, name, "child_profiles") {
             profiles::ListField::Complex => None,
@@ -618,7 +606,6 @@ impl DesktopApp {
         config_view::SubagentsForm {
             children,
             native_allowed: profiles::native_subagents_allowed(draft, name),
-            native_fixed: profiles::native_subagents_fixed(harness),
             control,
         }
     }

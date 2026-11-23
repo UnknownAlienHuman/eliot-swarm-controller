@@ -510,6 +510,25 @@ impl HarnessDoctorRequest {
         if sampled_turns > super::usage::PROFILE_FIRST_CALL_WINDOW {
             return Err(Error::new("invalid", "doctor context sample is oversized"));
         }
+        let mut native_child_profiles = std::collections::HashSet::new();
+        let mut native_child_turns = 0_usize;
+        for sample in &reply.profile_native_child_usage {
+            sample.validate()?;
+            native_child_turns = native_child_turns.saturating_add(sample.sampled_turns);
+            if !native_child_profiles.insert((
+                sample.profile.as_str(),
+                sample.harness.as_str(),
+                sample.mcp_policy.as_deref(),
+            )) {
+                return Err(Error::new("invalid", "doctor native-child profiles repeat"));
+            }
+        }
+        if native_child_turns > super::usage::PROFILE_FIRST_CALL_WINDOW {
+            return Err(Error::new(
+                "invalid",
+                "doctor native-child sample is oversized",
+            ));
+        }
         if reply.goal_check_deadlines.len() > super::goals::MAX_GOAL_CHECK_DEADLINE_STATUS {
             return Err(Error::new("invalid", "doctor check history is oversized"));
         }
@@ -530,6 +549,10 @@ pub struct HarnessDoctorResponse {
     pub profile_first_calls: Vec<super::usage::ProfileFirstCallInput>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub profile_first_calls_truncated: bool,
+    #[serde(default)]
+    pub profile_native_child_usage: Vec<super::usage::ProfileNativeChildUsage>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub profile_native_child_usage_truncated: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub goal_check_deadlines: Vec<super::goals::GoalCheckDeadlineStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

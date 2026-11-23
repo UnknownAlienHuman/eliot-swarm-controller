@@ -1622,12 +1622,14 @@ impl EventProcessor {
                 if let Some((site, native_tag, _)) = unclassified_native_item(&notification.item) {
                     self.record_unclassified_native(site, native_tag).await?;
                 }
-                self.observe_spawn(&notification.item, false).await?;
+                self.observe_spawn(&notification.item, false, &notification.turn_id)
+                    .await?;
                 // v2 child announcement: `kind: "started"` confirms the named
                 // thread; any other kind is a no-op lifecycle fact.
                 self.observe_sub_agent_activity(
                     notification.thread_id.as_str(),
                     &notification.item,
+                    Some(&notification.turn_id),
                 )
                 .await?;
                 let item_type = notification
@@ -1702,11 +1704,16 @@ impl EventProcessor {
                         return Ok(());
                     }
                 }
-                self.observe_spawn(&raw_item, true).await?;
+                self.observe_spawn(&raw_item, true, &notification.turn_id)
+                    .await?;
                 // v2 child announcement, idempotent with the `item/started`
                 // side: `kind: "started"` confirms, anything else is a no-op.
-                self.observe_sub_agent_activity(notification.thread_id.as_str(), &raw_item)
-                    .await?;
+                self.observe_sub_agent_activity(
+                    notification.thread_id.as_str(),
+                    &raw_item,
+                    Some(&notification.turn_id),
+                )
+                .await?;
                 if let NativeThreadItem::ContextCompaction(item) = &notification.item {
                     self.commit_context_compacted(
                         &notification.thread_id,
@@ -2166,24 +2173,21 @@ impl EventProcessor {
                 .or_else(|| top_parent.filter(|parent| self.children.is_parent(&owned, parent)));
             if let Some(parent) = parent {
                 let parent = parent.to_owned();
-                let spawn_item = params
-                    .get("thread")
-                    .and_then(spawned_item_id)
-                    .map(str::to_owned)
-                    .or_else(|| {
-                        let producers = self.children.producers();
-                        if producers.len() == 1 {
-                            self.children
-                                .pending_items(producers[0].as_str())
-                                .into_iter()
-                                .next()
-                                .cloned()
-                        } else {
-                            None
-                        }
-                    });
                 if let Err(reason) = self.children.confirm(&owned, thread_id) {
                     return self.record_gap(reason).await;
+                }
+                let spawn_item = thread
+                    .and_then(spawned_item_id)
+                    .or_else(|| self.children.sole_pending_item(&parent))
+                    .map(str::to_owned);
+                if let Some(turn) = spawn_item
+                    .as_deref()
+                    .and_then(|item| self.children.pending_spawn_turn(&parent, item))
+                {
+                    self.children
+                        .spawn_turns
+                        .entry(thread_id.to_owned())
+                        .or_insert(turn);
                 }
                 self.children.parents.insert(thread_id.to_owned(), parent);
                 if let Some(spawn_item) = spawn_item {

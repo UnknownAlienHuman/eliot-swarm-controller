@@ -694,10 +694,8 @@ impl ClaudePlugin {
         let requested_mcp_allow = eliot_core::parse_snapshot_allow_list(profile)
             .map_err(|error| Error::new("profile_error", format!("Claude {}", error.message)))?;
         check_mcp_allow_empty(&requested_mcp_allow)?;
-        let native_subagents_deny = profile
-            .get("native_subagents")
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == "deny");
+        let native_subagents_deny =
+            profile.get("native_subagents").and_then(Value::as_str) != Some("allow");
         let workspace = params
             .workspace
             .as_deref()

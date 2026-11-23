@@ -153,7 +153,7 @@ pub const SWARM_MCP_SERVER_NAME: &str = eliot_plugin::native_cli::WORKER_SWARM_M
 /// readback on create and resume); that session layer is authoritative and
 /// this config entry is only a second layer.
 fn native_subagents_permission(native_subagents: Option<&str>) -> Option<serde_json::Value> {
-    if native_subagents == Some("deny") {
+    if native_subagents != Some("allow") {
         Some(serde_json::json!({"task": "deny"}))
     } else {
         None

@@ -17,6 +17,7 @@ pub enum NativeChildActivityState {
     Running,
     Idle,
     Interrupted,
+    Stopped,
     Lost,
     Unknown,
 }
@@ -43,6 +44,8 @@ pub struct ChildRegistration {
     pub registration_id: String,
     pub parent_id: String,
     pub parent_generation: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_turn_id: Option<String>,
     pub parent_native_ref: String,
     pub native_scope: String,
     pub native_ref: String,
@@ -106,6 +109,9 @@ impl ChildRegistration {
             .iter()
             .any(|value| value.trim().is_empty() || value.chars().any(char::is_control))
             || self.parent_native_ref == self.native_ref
+            || self.parent_turn_id.as_ref().is_some_and(|turn| {
+                turn.trim().is_empty() || turn.len() > 256 || turn.chars().any(char::is_control)
+            })
         {
             return Err(Error::new("invalid", "invalid native child registration"));
         }
