@@ -22,6 +22,10 @@ A UUID-stamped input written while a tool turn was busy emitted its exact
 inside the running turn. An idle follow-up emitted its own exact lifecycle
 and terminal. This observation does not establish that every CLI version or
 every busy input will produce that sequence.
+On 2026-11-22, a fresh plain Haiku 5.5 stream-json capture on Claude Code 2.1.330
+echoed the submitted `user.uuid` in both `result.user_message_uuid` and the sole
+entry in `result.user_message_uuids`. The same UUID appeared as
+`command_lifecycle.command_uuid` in the `queued`, `started`, and `completed` records.
 On 2026-11-15, a real 2.1.325 stream-json turn with 129 native `Read` calls
 reproduced the tool telemetry bound: the 129th `tool_result` was reported as
 unknown, and later sends to the session were rejected. The repaired path keeps
@@ -58,18 +62,24 @@ the old generation and cannot affect replacement work. Native subagents normally
 environment; no independent Eliot token without actual isolated environment support.
 Sidechain assistant/user frames tagged with `parent_tool_use_id` and `agent_id`
 are discarded before active-turn/session validation, so they cannot be rebound
-to the foreground turn. A pending task notification followed by `system/init`
-marks subsequent assistant/user output as autonomous, even if a foreground
-input has started; suppression remains through the next terminal result because
-the `started` lifecycle can race with autonomous frames. The ambiguous output
-prefix and final text are omitted with a message/tool coverage gap rather than
-attributed to the foreground turn. A task-notification result without a current
-input UUID never settles that turn; with an exact UUID it may settle the
-consumed input, while the autonomous output remains omitted. A `tool_use` with
+to the foreground turn. A `tool_use` with
 `input.run_in_background = true` commits `native_background: true` on `tool.started`,
 because Claude wakes itself when that task ends. The `task_notification` naming that
 `tool_use_id` commits `tool.background_ended` with the turn that started the call.
 `tool.started` and `tool.completed` carry the frame `timestamp` as `native_at_ms`.
+
+Claude's self-started turns map to the
+[core contract](../spec/core.md#self-started-native-turns). Verified on installed
+2.1.330 (2026-11-22) with a background shell and a background subagent: the wake is
+`system/task_notification`, then a `system/init` with no `user_message_uuids`, then a
+`result` with `origin.kind = "task-notification"`. With no turn active, that notification
+and init prove a start with trigger `task-notification` and the init's `uuid` as its turn
+id. A send that overlaps a notification may bind on its exact lifecycle while the
+native turn is open, or on the result that names its UUID if that result arrives first.
+After the native terminal, a late `queued` frame for that send leaves it pending for
+its exact `started` or `cancelled` lifecycle. Once a send is bound, a result settles
+it if it names the bound UUID or supplies no input IDs. A result naming only other
+inputs accounts for the prefix, regardless of the result origin.
 
 ## Transport
 
@@ -194,7 +204,7 @@ The installed 2.1.325 interrupt capture on 2026-11-17 reports
 
 The daemon owns the SEND FIFO and normally waits for the previous turn. The
 plugin separately refuses a fresh SEND before writing when its session/source
-is unavailable, an exact turn is still active, or one prior input still awaits
+is unavailable, a turn with a bound send is still active, or one prior input still awaits
 association. These are authoritative `rejected` replies carrying the actual
 reason: a generic `busy` RPC error after daemon dispatch would be classified
 `unknown` despite no native input having been written. The event task repeats
@@ -332,9 +342,7 @@ a lost stream proves none of these, so the daemon monitor settles the turn
 Transcript JSONL is later observe/recovery data with file identity/offset where valid,
 not a parallel live producer. No proven replay cursor means gap + exact current
 readback, never full-history republishing. Child completion needs exact tool/task
-provenance, not parent idle. Background task-notification facts without an exact
-user-message UUID are omitted rather than attributed to the active or most recent
-user turn. Resumed cumulative cost is session scope, not a turn delta.
+provenance, not parent idle. Resumed cumulative cost is session scope, not a turn delta.
 
 ## Login
 

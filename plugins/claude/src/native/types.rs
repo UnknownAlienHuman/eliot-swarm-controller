@@ -224,8 +224,8 @@ pub(crate) struct UserContentBlock {
     pub content: Option<Value>,
 }
 
-/// Terminal `result` record. Autonomous task notifications are not terminals
-/// for a submitted input, even when another Eliot turn is active.
+/// Terminal `result` record. A submitted input is identified by its UUID
+/// independently of what triggered the run.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct ResultRecord {
     #[serde(default)]
@@ -238,6 +238,18 @@ pub(crate) struct ResultRecord {
     pub user_message_uuid: Option<String>,
     #[serde(default)]
     pub user_message_uuids: Vec<String>,
+}
+
+impl ResultRecord {
+    pub(crate) fn names_input(&self, input: &str) -> bool {
+        self.user_message_uuid.as_deref() == Some(input)
+            || self.user_message_uuids.iter().any(|uuid| uuid == input)
+    }
+
+    pub(crate) fn names_only_other_inputs(&self, input: &str) -> bool {
+        (self.user_message_uuid.is_some() || !self.user_message_uuids.is_empty())
+            && !self.names_input(input)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

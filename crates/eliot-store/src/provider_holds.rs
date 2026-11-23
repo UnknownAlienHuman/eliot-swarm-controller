@@ -854,7 +854,7 @@ pub(super) fn terminal_tx(
     now: i64,
 ) -> Result<Vec<core::Event>> {
     let core::Effect::TurnTerminal {
-        command_id: Some(command_id),
+        command_id,
         turn_id,
         state,
         status,
@@ -878,7 +878,7 @@ pub(super) fn terminal_tx(
     let agent_num = parse_agent_id(&agent.id)?;
     let generation = agent.generation;
     if native_event.kind != "turn.completed"
-        || native_event.data.get("command_id").and_then(Value::as_str) != Some(command_id.as_str())
+        || native_event.data.get("command_id").and_then(Value::as_str) != command_id.as_deref()
         || native_event.data.get("turn_id").and_then(Value::as_str) != Some(turn_id.as_str())
         || agent.observe_only
     {
@@ -887,23 +887,31 @@ pub(super) fn terminal_tx(
             "provider hold fact is not bound to the controlled terminal turn",
         ));
     }
-    let command = super::load_command_record(tx, command_id)?.ok_or_else(|| {
-        Error::new(
-            "source_integrity",
-            "provider hold terminal references an unknown command",
-        )
-    })?;
-    if command.target != Some(agent_num)
-        || command.command.generation != Some(generation)
-        || command.command.verb != "send"
-        || command.command.turn_id.as_deref() != Some(turn_id.as_str())
-        || command.state != CommandState::Applied
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "provider hold terminal is not bound to the exact applied SEND",
-        ));
-    }
+    // A self-started native turn has no command: its refusal still records
+    // the restriction, and only a bound send can resolve a probe claim.
+    let command = command_id
+        .as_deref()
+        .map(|command_id| -> Result<_> {
+            let command = super::load_command_record(tx, command_id)?.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "provider hold terminal references an unknown command",
+                )
+            })?;
+            if command.target != Some(agent_num)
+                || command.command.generation != Some(generation)
+                || command.command.verb != "send"
+                || command.command.turn_id.as_deref() != Some(turn_id.as_str())
+                || command.state != CommandState::Applied
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "provider hold terminal is not bound to the exact applied SEND",
+                ));
+            }
+            Ok((command_id, command))
+        })
+        .transpose()?;
 
     let restriction_present = native_event.data.get("provider_restriction").is_some();
     let mut events = Vec::new();
@@ -924,6 +932,9 @@ pub(super) fn terminal_tx(
         )?);
     }
 
+    let Some((command_id, command)) = command else {
+        return Ok(events);
+    };
     if command.command.probe {
         let scope = core::frozen_provider_scope(agent)?;
         let Some(hold) = get(tx, &scope)? else {

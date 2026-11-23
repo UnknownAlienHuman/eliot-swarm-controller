@@ -35,8 +35,20 @@ pub(super) fn child_capture_is_current(
 }
 
 pub(super) async fn probe_native_status(router: &Router, captured: &CapturedAgent) -> NativeStatus {
-    let turn = captured
-        .turn_command_id
+    // For an unbound self-started turn the start command selects the session
+    // for this read-only probe. The turn's command binding stays absent.
+    let snapshot_selector = captured.turn_command_id.clone().or_else(|| {
+        captured
+            .self_started_turn
+            .then(|| {
+                router
+                    .inner
+                    .plugin_host
+                    .session_start_command(&captured.agent)
+            })
+            .flatten()
+    });
+    let turn = snapshot_selector
         .as_deref()
         .zip(captured.agent.active_turn.as_deref());
     let result = if captured.agent.active_turn.is_some() && turn.is_none() {
@@ -195,6 +207,9 @@ pub(super) async fn capture_agent(
             code_progress,
         )
     };
+    let self_started_turn = turn
+        .as_ref()
+        .is_some_and(|turn| turn.native_trigger.is_some());
     let turn_started_at = turn.and_then(|turn| turn.started_at);
     let progress_basis_at = match (last_model_progress_at, turn_started_at) {
         (Some(progress), Some(started)) => Some(progress.max(started)),
@@ -224,6 +239,7 @@ pub(super) async fn capture_agent(
         progress_basis_at,
         progress_age_ms,
         turn_command_id,
+        self_started_turn,
         tool_coverage,
         pending_kinds,
         pending_kinds_truncated,

@@ -339,6 +339,42 @@ Compute `apply(state,input) -> (next_state,effects)` without I/O or mutating pub
 
 The Store commits event, next projection and derived facts atomically, then publishes.
 
+### Self-started native turns
+
+A harness can start a turn with no Eliot input, as Claude Code does when its own
+background task ends. The adapter reports `turn.started` with `native_trigger` and no
+`command_id`, using the native run's id as the turn id. `native_trigger` is
+the positive native start signal, such as Claude's `task-notification`.
+The Agent is `busy`, and the turn is an ordinary `turns` row with no starting command, so
+results, usage, Goal turn counts, checks and background wakes read it like any other
+turn. No command is invented. Facts of this turn omit `command_id`, and Store accepts
+that only for the exact running turn that has a trigger and no bound send.
+
+One Agent generation never runs two overlapping turns. Input follows one rule:
+
+- While the Agent is `busy` in a self-started turn with no bound send, the next `send`
+  dispatches at once. A `waiting` turn, or one that already has a bound send, queues
+  later input as usual.
+- The adapter's exact input association commits `turn.input_bound
+  {command_id, turn_id, input_id}`. One transaction applies the send on that turn and
+  records it as the turn's starting command. Later facts of the turn name that command.
+- The same rule covers a send written just before the harness started the turn. Its
+  association arrives after the native start and binds to that turn.
+- A terminal can prove the association itself when it names the still-pending input.
+  Queue admission reported after the native terminal requires a later native start
+  to open a separate turn.
+- A terminal that names the bound input or supplies no input IDs settles the
+  turn and its final text. A terminal that names only other inputs ends the
+  prefix of the run and adds its usage to the turn.
+- If the harness drops the bound input, the turn ends with its own native terminal, or
+  as interrupted when the prefix already ended.
+
+An unbound self-started turn reads back through `agent.snapshot` with its exact
+turn id and the generation's start command as the session selector. The returned turn
+facts carry no command. Recovery uses the turn's stored send binding for command
+settlement and attribution. Stop, interrupt, steer, requests and unknown settlement bind
+to its exact turn id as for any turn.
+
 ## Profile
 
 ```text

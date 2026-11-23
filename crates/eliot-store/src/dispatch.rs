@@ -489,7 +489,7 @@ fn dispatch_send_tx(
             "cannot dispatch input to a terminal Agent",
         ));
     }
-    let ready = send_gate_open(tx, agent_num, agent.generation)?;
+    let ready = send_input_gate_open(tx, agent_num, agent.generation)?;
     let earliest = earliest_pending_send(tx, agent_num, agent.generation)?;
     // Shared admission order: only a configure admitted no later
     // than this send holds the settings lane. A later configure

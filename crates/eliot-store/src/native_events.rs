@@ -306,6 +306,9 @@ pub(super) fn persist_effects(
             } => {
                 command_events.extend(persist_turn_associated(scope, command_id, turn_id, effort)?);
             }
+            Effect::NativeTurnStarted { turn_id, trigger } => {
+                persist_native_turn_started(scope, turn_id, trigger)?;
+            }
             Effect::RequestPending {
                 request_id,
                 turn_id,
@@ -333,7 +336,7 @@ pub(super) fn persist_effects(
                 turn_id,
                 text,
             } => {
-                persist_message_completed(scope, command_id, turn_id, text)?;
+                persist_message_completed(scope, command_id.as_deref(), turn_id, text)?;
             }
             Effect::TurnTerminal {
                 command_id,
@@ -358,7 +361,7 @@ pub(super) fn persist_effects(
                     usage.as_ref(),
                     *completed_at,
                 )?);
-                if command_id.is_some() {
+                if command_id.is_some() || native_event.kind == "turn.completed" {
                     provider_events.extend(provider_holds::terminal_tx(
                         scope.tx,
                         scope.next_agent,
@@ -434,36 +437,56 @@ fn persist_turn_associated(
             "turn.started does not match an unresolved send command and expected turn",
         ));
     }
-    if load_turn(tx, agent_num, generation, turn_id)?.is_some() {
-        return Err(Error::new(
-            "source_integrity",
-            format!("turn {turn_id} already exists in this Agent generation"),
-        ));
+    if native_event.kind == "turn.input_bound" {
+        // The harness merged this send into its running self-started turn:
+        // the existing turn gains its command instead of a second turn.
+        let changed = tx
+            .execute(
+                "UPDATE turns SET start_command_id = ?1
+                 WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4 AND state = 'running'
+                   AND native_trigger IS NOT NULL AND start_command_id IS NULL",
+                params![command_id, agent_num, generation, turn_id],
+            )
+            .map_err(sql_error)?;
+        if changed != 1 {
+            return Err(Error::new(
+                "source_integrity",
+                "turn.input_bound does not target a running unbound native turn",
+            ));
+        }
+    } else {
+        if load_turn(tx, agent_num, generation, turn_id)?.is_some() {
+            return Err(Error::new(
+                "source_integrity",
+                format!("turn {turn_id} already exists in this Agent generation"),
+            ));
+        }
+        insert_turn(
+            tx,
+            TurnInsert {
+                agent: agent_num,
+                generation,
+                turn_id,
+                start_command_id: Some(command_id),
+                state: TurnState::Running,
+                status: None,
+                outcome: None,
+                native_status: None,
+                final_text: None,
+                started_at: Some(now),
+                completed_at: None,
+                usage: None,
+                config_revision: command.config_revision,
+                preceded_by: None,
+                effective_model: (command.config_revision == 0)
+                    .then_some(next_agent.effective.as_ref())
+                    .flatten()
+                    .and_then(|effective| effective.get("model"))
+                    .and_then(Value::as_str),
+                native_trigger: None,
+            },
+        )?;
     }
-    insert_turn(
-        tx,
-        TurnInsert {
-            agent: agent_num,
-            generation,
-            turn_id,
-            start_command_id: Some(command_id),
-            state: TurnState::Running,
-            status: None,
-            outcome: None,
-            native_status: None,
-            final_text: None,
-            started_at: Some(now),
-            completed_at: None,
-            usage: None,
-            config_revision: command.config_revision,
-            preceded_by: None,
-            effective_model: (command.config_revision == 0)
-                .then_some(next_agent.effective.as_ref())
-                .flatten()
-                .and_then(|effective| effective.get("model"))
-                .and_then(Value::as_str),
-        },
-    )?;
     // A SEND dispatched before Stop may acquire its exact turn after Stop
     // dispatch. Capture the association before any drained session terminal
     // clears the Agent's active-turn pointer.
@@ -563,6 +586,70 @@ fn persist_turn_associated(
     Ok(command_events)
 }
 
+/// Record a turn the harness started by itself. It runs under the current
+/// configuration revision and has no command until a send binds to it.
+fn persist_native_turn_started(
+    scope: EffectScope<'_, '_>,
+    turn_id: &str,
+    trigger: &str,
+) -> Result<()> {
+    let EffectScope {
+        tx,
+        agent_num,
+        generation,
+        now,
+        next_agent,
+        ..
+    } = scope;
+    if load_turn(tx, agent_num, generation, turn_id)?.is_some() {
+        return Err(Error::new(
+            "source_integrity",
+            format!("turn {turn_id} already exists in this Agent generation"),
+        ));
+    }
+    let config_revision = current_config_revision_tx(tx, agent_num, generation)?;
+    insert_turn(
+        tx,
+        TurnInsert {
+            agent: agent_num,
+            generation,
+            turn_id,
+            start_command_id: None,
+            state: TurnState::Running,
+            status: None,
+            outcome: None,
+            native_status: None,
+            final_text: None,
+            started_at: Some(now),
+            completed_at: None,
+            usage: None,
+            config_revision,
+            preceded_by: None,
+            effective_model: (config_revision == 0)
+                .then_some(next_agent.effective.as_ref())
+                .flatten()
+                .and_then(|effective| effective.get("model"))
+                .and_then(Value::as_str),
+            native_trigger: Some(trigger),
+        },
+    )
+}
+
+/// A turn fact without a command is valid only for the exact running
+/// self-started turn no send has bound to.
+fn require_unbound_native_turn(scope: EffectScope<'_, '_>, turn_id: &str) -> Result<()> {
+    if is_unbound_native_turn(scope.tx, scope.agent_num, scope.generation, turn_id)? {
+        return Ok(());
+    }
+    Err(Error::new(
+        "source_integrity",
+        format!(
+            "{} has no command for a send-bound turn",
+            scope.native_event.kind
+        ),
+    ))
+}
+
 fn persist_request_effect(
     scope: EffectScope<'_, '_>,
     request_id: &str,
@@ -592,6 +679,10 @@ fn persist_request_effect(
             "request effect is not bound to its exact native request and turn",
         ));
     }
+    if pending && native_event.data.get("command_id").is_none() {
+        require_unbound_native_turn(scope, turn_id)?;
+        return persist_request_opened(scope, None, request_id, turn_id, kind, details);
+    }
     let command_id = required_string(&native_event.data, "command_id")?;
     let command = load_command_record(tx, &command_id)?.ok_or_else(|| {
         Error::new(
@@ -608,8 +699,7 @@ fn persist_request_effect(
     if pending {
         persist_request_opened(
             scope,
-            &command,
-            &command_id,
+            Some((&command, &command_id)),
             request_id,
             turn_id,
             kind,
@@ -622,8 +712,7 @@ fn persist_request_effect(
 
 fn persist_request_opened(
     scope: EffectScope<'_, '_>,
-    command: &CommandRecord,
-    command_id: &str,
+    command: Option<(&CommandRecord, &str)>,
     request_id: &str,
     turn_id: &str,
     kind: Option<&str>,
@@ -636,7 +725,9 @@ fn persist_request_opened(
         next_agent,
         ..
     } = scope;
-    require_effect_command(command, agent_num, generation, "send", command_id)?;
+    if let Some((command, command_id)) = command {
+        require_effect_command(command, agent_num, generation, "send", command_id)?;
+    }
     let kind =
         kind.ok_or_else(|| Error::new("source_integrity", "request.opened is missing its kind"))?;
     let details = details
@@ -648,9 +739,10 @@ fn persist_request_opened(
             "pending request details exceed 64 KiB",
         ));
     }
-    if command.command.state != CommandState::Applied
-        || command.command.turn_id.as_deref() != Some(turn_id)
-    {
+    if command.is_some_and(|(command, _)| {
+        command.command.state != CommandState::Applied
+            || command.command.turn_id.as_deref() != Some(turn_id)
+    }) {
         return Err(Error::new(
             "source_integrity",
             "request.opened is not bound to its exact applied send turn",
@@ -843,7 +935,7 @@ fn persist_request_closed(
 
 fn persist_message_completed(
     scope: EffectScope<'_, '_>,
-    command_id: &str,
+    command_id: Option<&str>,
     turn_id: &str,
     text: &str,
 ) -> Result<()> {
@@ -859,20 +951,24 @@ fn persist_message_completed(
             "final message exceeds 64 KiB",
         ));
     }
-    let command = load_command_record(tx, command_id)?.ok_or_else(|| {
-        Error::new(
-            "source_integrity",
-            "message.completed references an unknown command",
-        )
-    })?;
-    require_effect_command(&command, agent_num, generation, "send", command_id)?;
-    if command.command.turn_id.as_deref() != Some(turn_id)
-        || command.command.state != CommandState::Applied
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "message.completed is not bound to the command's exact active turn",
-        ));
+    if let Some(command_id) = command_id {
+        let command = load_command_record(tx, command_id)?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "message.completed references an unknown command",
+            )
+        })?;
+        require_effect_command(&command, agent_num, generation, "send", command_id)?;
+        if command.command.turn_id.as_deref() != Some(turn_id)
+            || command.command.state != CommandState::Applied
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "message.completed is not bound to the command's exact active turn",
+            ));
+        }
+    } else {
+        require_unbound_native_turn(scope, turn_id)?;
     }
     let changed = tx
         .execute(
@@ -995,6 +1091,13 @@ fn persist_turn_terminal(
                 "turn terminal command is not associated with this exact turn",
             ));
         }
+    } else if native_event.kind == "turn.completed"
+        && !native_terminal_for_unbound_turn(scope, turn_id)?
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "turn.completed has no command for a send-bound turn",
+        ));
     }
     // A recovered turn resolved by its native terminal (only the Store's
     // recovered-turn check admits it): the settlement's unknown outcome and
@@ -1093,6 +1196,24 @@ fn persist_turn_terminal(
         ));
     }
     context::settle_ended_turn_context_tx(tx, agent_num, generation, turn_id, now)
+}
+
+/// A commandless native terminal: the running unbound turn, or that turn
+/// after the monitor's recovery settled it `unknown`.
+fn native_terminal_for_unbound_turn(scope: EffectScope<'_, '_>, turn_id: &str) -> Result<bool> {
+    scope
+        .tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
+                   AND state IN ('running', 'unknown')
+                   AND native_trigger IS NOT NULL AND start_command_id IS NULL
+             )",
+            params![scope.agent_num, scope.generation, turn_id],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)
 }
 
 /// Persist one `session.usage` snapshot as the latest for its Agent
@@ -1253,7 +1374,7 @@ fn effect_cause_tx(
             }
         }
         Effect::MessageCompleted {
-            command_id,
+            command_id: Some(command_id),
             turn_id,
             ..
         }
@@ -1294,7 +1415,11 @@ fn effect_cause_tx(
         | Effect::TurnTerminal { turn_id, .. } => {
             command_cause_for_turn_tx(tx, agent_num, generation, turn_id)
         }
-        Effect::SessionUsageUpdated { .. } => Ok(None),
+        Effect::SessionUsageUpdated { .. }
+        | Effect::NativeTurnStarted { .. }
+        | Effect::MessageCompleted {
+            command_id: None, ..
+        } => Ok(None),
     }
 }
 

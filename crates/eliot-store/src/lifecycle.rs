@@ -1701,6 +1701,7 @@ fn mark_lost_turn_unknown_tx(
                     config_revision: current_config_revision_tx(tx, agent_num, generation)?,
                     preceded_by: None,
                     effective_model: None,
+                    native_trigger: None,
                 },
             )?;
         }

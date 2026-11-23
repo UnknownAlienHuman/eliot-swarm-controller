@@ -265,26 +265,39 @@ impl Router {
         }
         // Read the stored generation and the readback binding first; the
         // resolving transaction below re-checks terminality and the proof.
-        let (agent, readback_command) = {
+        let (agent, readback) = {
             let store = self.inner.store.lock().await;
             let agent = store.get_agent(&request.agent)?;
-            let readback_command = match &agent {
+            let readback = match &agent {
                 Some(agent)
                     if !agent.state.is_terminal() && agent.generation == request.generation =>
                 {
-                    store.turn_readback_command(
+                    let bound = store.turn_readback_command(
                         &request.agent,
                         request.generation,
                         &request.turn_id,
-                    )?
+                    )?;
+                    if let Some(command_id) = bound {
+                        Some((command_id, false))
+                    } else if store
+                        .get_turn(&request.agent, request.generation, &request.turn_id)?
+                        .is_some_and(|turn| turn.native_trigger.is_some())
+                    {
+                        self.inner
+                            .plugin_host
+                            .session_start_command(agent)
+                            .map(|id| (id, true))
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             };
-            (agent, readback_command)
+            (agent, readback)
         };
-        let proof = match (agent, readback_command) {
-            (Some(agent), Some(command_id)) => {
-                self.snapshot_turn_proof(&agent, &command_id, &request.turn_id)
+        let proof = match (agent, readback) {
+            (Some(agent), Some((command_id, self_started))) => {
+                self.snapshot_turn_proof(&agent, &command_id, &request.turn_id, self_started)
                     .await
             }
             _ => None,
@@ -309,6 +322,7 @@ impl Router {
         agent: &Agent,
         command_id: &str,
         turn_id: &str,
+        self_started: bool,
     ) -> Option<TurnInactiveProof> {
         let snapshot = self
             .inner
@@ -316,7 +330,9 @@ impl Router {
             .snapshot_turn(agent, command_id, turn_id)
             .await
             .ok()?;
-        if snapshot["command_id"].as_str() != Some(command_id) {
+        if snapshot["command_id"].as_str() != Some(command_id)
+            || (self_started && !snapshot["last_turn"]["command_id"].is_null())
+        {
             return None;
         }
         turn_inactive_proof(&snapshot, &agent.id, agent.generation, turn_id)

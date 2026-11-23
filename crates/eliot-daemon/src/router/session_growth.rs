@@ -315,9 +315,15 @@ impl Router {
         if !matches!(turn.outcome, Some(TurnOutcome::Success)) {
             return Ok(None);
         }
-        let Some(task_command) =
-            store.turn_command_id(&agent.id, agent.generation, &turn.turn_id)?
-        else {
+        let mut task_command = store.turn_command_id(&agent.id, agent.generation, &turn.turn_id)?;
+        if task_command.is_none()
+            && turn.native_trigger.is_some()
+            && let Some(task) = store.latest_handoff_task_turn(&agent.id, agent.generation)?
+            && task.outcome == Some(TurnOutcome::Success)
+        {
+            task_command = store.turn_command_id(&agent.id, agent.generation, &task.turn_id)?;
+        }
+        let Some(task_command) = task_command else {
             return Ok(None);
         };
         if store.is_handoff_brief(&task_command)? {

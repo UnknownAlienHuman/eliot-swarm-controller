@@ -911,6 +911,10 @@ pub struct Turn {
     /// Message from the committed native terminal error.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_error_message: Option<String>,
+    /// Why the harness started this turn by itself (for example
+    /// `task-notification`). Absent for a turn started by a Swarm `send`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_trigger: Option<String>,
 }
 
 /// Native token usage attributed to one terminal turn. Every member is
@@ -1484,6 +1488,11 @@ pub enum Effect {
         #[serde(default)]
         effort: Option<String>,
     },
+    /// The harness started this turn by itself; no command caused it.
+    NativeTurnStarted {
+        turn_id: String,
+        trigger: String,
+    },
     RequestPending {
         request_id: String,
         turn_id: String,
@@ -1498,7 +1507,7 @@ pub enum Effect {
         turn_id: String,
     },
     MessageCompleted {
-        command_id: String,
+        command_id: Option<String>,
         turn_id: String,
         text: String,
     },
@@ -2252,8 +2261,21 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if agent.state != AgentState::Idle || agent.active_turn.is_some() {
                 return Err(bad_state(event, "turn.started requires an idle Agent"));
             }
-            let command_id = required_text(event, "command_id")?;
             let turn_id = required_text(event, "turn_id")?;
+            if let Some(trigger) = optional_native_trigger(event)? {
+                if event.data.get("command_id").is_some() {
+                    return Err(Error::new(
+                        "invalid",
+                        "a self-started native turn has no starting command",
+                    ));
+                }
+                next.state = AgentState::Busy;
+                next.active_turn = Some(turn_id.clone());
+                effects.push(Effect::NativeTurnStarted { turn_id, trigger });
+                next.updated_at = now;
+                return Ok((next, effects));
+            }
+            let command_id = required_text(event, "command_id")?;
             let effort = optional_observed_effort(event)?;
             let model = optional_observed_model(event)?;
             next.state = AgentState::Busy;
@@ -2284,6 +2306,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 effort,
             });
         }
+        "turn.input_bound" => {
+            // A send the harness merged into its running self-started turn.
+            // Store proves the turn is native and still has no command.
+            require_live_turn(agent, event)?;
+            effects.push(Effect::CommandTurnAssociated {
+                command_id: required_text(event, "command_id")?,
+                turn_id: required_text(event, "turn_id")?,
+                effort: None,
+            });
+        }
         "turn.model_observed" => {
             require_live_turn(agent, event)?;
             record_serving_model(&mut next, required_text(event, "model")?);
@@ -2302,7 +2334,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "message.completed" => {
             require_live_turn(agent, event)?;
-            let command_id = required_text(event, "command_id")?;
+            let command_id = optional_command_id(event)?;
             let turn_id = required_text(event, "turn_id")?;
             let text = required_text(event, "text")?;
             if let Some(model) = optional_observed_model(event)? {
@@ -2455,13 +2487,13 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             // until the turn is explicitly resolved. Never a success or
             // failure outcome.
             require_live_turn(agent, event)?;
-            let command_id = required_text(event, "command_id")?;
+            let command_id = optional_command_id(event)?;
             let turn_id = required_text(event, "turn_id")?;
             next.state = AgentState::Idle;
             next.active_turn = None;
             next.pending.clear();
             effects.push(Effect::TurnTerminal {
-                command_id: Some(command_id),
+                command_id,
                 turn_id,
                 state: TurnState::Unknown,
                 status: None,
@@ -2608,7 +2640,7 @@ pub fn resolve_recovered_turn(agent: &Agent, event: &NativeEvent, now: i64) -> R
 /// The turn-terminal effect a native `turn.completed` carries.
 fn native_turn_terminal(event: &NativeEvent, now: i64) -> Result<Effect> {
     Ok(Effect::TurnTerminal {
-        command_id: Some(required_text(event, "command_id")?),
+        command_id: optional_command_id(event)?,
         turn_id: required_text(event, "turn_id")?,
         state: TurnState::Completed,
         status: Some(required_text(event, "status")?),
@@ -2650,6 +2682,31 @@ fn required_text(event: &NativeEvent, field: &str) -> Result<String> {
                 format!("{} requires non-empty string field {field}", event.kind),
             )
         })
+}
+
+/// The bound send of a turn fact. Only a self-started native turn omits it,
+/// which Store proves against the exact turn row.
+fn optional_command_id(event: &NativeEvent) -> Result<Option<String>> {
+    if event.data.get("command_id").is_none() {
+        return Ok(None);
+    }
+    required_text(event, "command_id").map(Some)
+}
+
+/// Bounded label of what started a native turn, kept for readback.
+fn optional_native_trigger(event: &NativeEvent) -> Result<Option<String>> {
+    const MAX_NATIVE_TRIGGER_BYTES: usize = 64;
+    if event.data.get("native_trigger").is_none() {
+        return Ok(None);
+    }
+    let trigger = required_text(event, "native_trigger")?;
+    if trigger.len() > MAX_NATIVE_TRIGGER_BYTES || trigger.chars().any(char::is_control) {
+        return Err(Error::new(
+            "invalid",
+            "turn.started native_trigger must be a short plain label",
+        ));
+    }
+    Ok(Some(trigger))
 }
 
 /// Merge source for a harness-observed MCP inventory carried on a turn
