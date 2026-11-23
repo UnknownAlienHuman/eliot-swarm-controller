@@ -761,8 +761,14 @@ A turn the harness started by itself follows the
 that turn's facts until a send binds. The host queues new sends unless the adapter
 declares it can bind one into the open native turn. When the harness accepts a send
 into that turn, the adapter reports the exact association with `turn.input_bound`,
-and the applied response names the turn it joined. Exact-turn `agent.snapshot` uses the session's start command as the session
-selector for an unbound turn, and the returned turn facts omit `command_id`.
+and the applied response names the turn it joined. Exact-turn `agent.snapshot`
+uses the session's start command as the session selector for an unbound turn, and
+the returned turn facts omit `command_id`.
+
+When a terminal supplies positive evidence that the harness still has work that
+will drive a follow-up, the adapter sets `turn.completed.data.native_followup_pending`
+to `true`. The Goal's idle gate holds across that turn boundary. The next native
+lifecycle takes precedence and each terminal reports its own pending work.
 
 `turn.completed.data.native_error` optionally summarizes an available native error as
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its

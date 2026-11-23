@@ -2017,7 +2017,11 @@ time-based driver fires them.
 The daemon also drives active Eliot-mode Goals automatically on idle: when a
 generation commits an idle event, the driver starts one round with the event
 seq as an idle key through the same `goal round` path — same probe, gates,
-check custody and conditional commit — under a fresh owner mutation id. It
+check custody and conditional commit — under a fresh owner mutation id. A
+self-started native turn blocks the idle gate like any other running turn. The
+gate also waits for confirmed pending native follow-up work and unsettled turns
+in that generation. The same gate is evaluated at the round's final commit, so
+a native wake invalidates a round that was already in flight (#916). The driver
 skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task

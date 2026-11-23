@@ -2562,6 +2562,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.completed" => {
             require_live_turn(agent, event)?;
+            if event
+                .data
+                .get("native_followup_pending")
+                .is_some_and(|pending| !pending.is_boolean())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "turn.completed native_followup_pending must be a boolean",
+                ));
+            }
             let terminal = native_turn_terminal(event, now)?;
             if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
                 && event.data["model_unverified_reason"].as_str()

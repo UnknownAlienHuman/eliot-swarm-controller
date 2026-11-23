@@ -2669,12 +2669,6 @@ impl Store {
                 }
             }
         }
-        if let Some(source) = first_unhealthy_open_source(&tx, agent_num, row.generation)? {
-            return Err(Error::new(
-                "stale_round",
-                format!("source {source} left healthy during the round"),
-            ));
-        }
         let agent_row = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
         if let Some(history) = &commit.check_history
@@ -2691,26 +2685,8 @@ impl Store {
                 "Goal check history does not match the frozen project and argv",
             ));
         }
-        if count_agent_commands(&tx, agent_num, row.generation, true)? > 0 {
-            return Err(Error::new(
-                "stale_round",
-                "an unknown command appeared during the round",
-            ));
-        }
-        if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
-            return Err(Error::new(
-                "stale_round",
-                "a command opened during the round",
-            ));
-        }
-        if agent_row.active_turn.is_some() {
-            return Err(Error::new("stale_round", "a turn started during the round"));
-        }
-        if !agent_row.pending.is_empty() {
-            return Err(Error::new(
-                "stale_round",
-                "a request opened during the round",
-            ));
+        if let Some(refusal) = idle_round_refusal(&tx, agent_num, &agent_row, row.generation)? {
+            return Err(Error::new("stale_round", refusal.message));
         }
         let turn_count = count_turns(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
@@ -3820,6 +3796,31 @@ fn idle_round_refusal(
     }
     if count_agent_commands(connection, agent_num, generation, false)? > 0 {
         return Ok(Some(Error::new("busy", "Agent has open commands")));
+    }
+    if !send_outcome_gate_open(connection, agent_num, generation)? {
+        return Ok(Some(Error::new(
+            "bad_state",
+            "resolve unsettled turns before the goal round",
+        )));
+    }
+    let native_followup_pending: bool = connection
+        .query_row(
+            "SELECT COALESCE((
+                 SELECT kind = 'turn.completed' AND json_extract(data, '$.native_followup_pending') IS 1
+                 FROM events INDEXED BY events_turn_lifecycle
+                 WHERE agent = ?1 AND generation = ?2 AND source = 'stream'
+                   AND kind IN ('turn.started', 'turn.completed', 'turn.unknown')
+                 ORDER BY seq DESC LIMIT 1
+             ), 0)",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if native_followup_pending {
+        return Ok(Some(Error::new(
+            "busy",
+            "the harness reported pending native follow-up work",
+        )));
     }
     Ok(None)
 }
