@@ -76,16 +76,13 @@ struct WorktreeEntry {
     locked: bool,
 }
 
-pub(crate) enum MissingWorktreeRemoval {
-    Present,
-    Absent {
-        parent: Directory,
-        #[expect(
-            clippy::disallowed_types,
-            reason = "The worktree owner dispatches the prepared exact Git removal command."
-        )]
-        command: Option<Command>,
-    },
+pub(crate) struct MissingWorktreeRemoval {
+    pub(crate) parent: Directory,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "The worktree owner dispatches the prepared exact Git removal command."
+    )]
+    pub(crate) command: Option<Command>,
 }
 
 struct Subject {
@@ -954,10 +951,10 @@ impl WorkspaceGit {
         preparation: &WorkspacePreparation,
         expected_tip: Option<&str>,
         deadline: Instant,
-    ) -> Result<MissingWorktreeRemoval> {
+    ) -> Result<Option<MissingWorktreeRemoval>> {
         let path = Path::new(&preparation.worktree_path);
         let Some(parent) = observe_worktree_absence(path)? else {
-            return Ok(MissingWorktreeRemoval::Present);
+            return Ok(None);
         };
         timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
             .await
@@ -980,10 +977,10 @@ impl WorkspaceGit {
         let entries = self.entries(&source.root, deadline).await?;
         let mut matches = entries.iter().filter(|entry| entry.path == target);
         let Some(entry) = matches.next() else {
-            return Ok(MissingWorktreeRemoval::Absent {
+            return Ok(Some(MissingWorktreeRemoval {
                 parent,
                 command: None,
-            });
+            }));
         };
         if entry.locked {
             return Err(problem(
@@ -1033,10 +1030,10 @@ impl WorkspaceGit {
             )
             .await?;
         confirm_worktree_absence(path, &parent)?;
-        Ok(MissingWorktreeRemoval::Absent {
+        Ok(Some(MissingWorktreeRemoval {
             parent,
             command: Some(command),
-        })
+        }))
     }
 
     /// Non-force worktree removal command for an offline private stand whose

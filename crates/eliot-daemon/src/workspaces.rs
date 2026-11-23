@@ -839,7 +839,7 @@ impl WorkspaceManager {
             .prepare_missing_remove(preparation, expected_tip, deadline)
             .await
         {
-            Ok(MissingWorktreeRemoval::Present)
+            Ok(None)
                 if command.args.get("observe_missing").and_then(Value::as_bool) == Some(true) =>
             {
                 return removal_refused(
@@ -848,15 +848,15 @@ impl WorkspaceManager {
                     "missing_path",
                 );
             }
-            Ok(MissingWorktreeRemoval::Present) => {
+            Ok(None) => {
                 return self
                     .remove_present(command, preparation, slot, git, deadline)
                     .await;
             }
-            Ok(MissingWorktreeRemoval::Absent {
+            Ok(Some(MissingWorktreeRemoval {
                 parent,
                 command: mutator,
-            }) => {
+            })) => {
                 let outcome = if let Some(mutator) = mutator {
                     self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
                         .await
