@@ -960,22 +960,26 @@ impl Session {
                 "Antigravity interrupt accepts no request target or args",
             ));
         }
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new("stale_turn", "turn/interrupt requires a captured turn id")
-            })?;
-        let mut settlement = {
+        let bound_turn = params.turn_id.as_deref().filter(|id| !id.is_empty());
+        let (turn_id, mut settlement) = {
             let state = self.state.lock().await;
-            if state.active_turn() != Some(turn_id) {
+            if state.stopped || self.native.transport.process_exit_observed() {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "Antigravity native session is closed",
+                ));
+            }
+            if !params.owner_control && (bound_turn.is_none() || state.active_turn() != bound_turn)
+            {
                 return Err(Error::new(
                     "stale_turn",
                     "turn/interrupt does not match the exact active native turn",
                 ));
             }
-            state.subscribe_settlement()
+            (
+                bound_turn.or(state.active_turn()).map(str::to_owned),
+                state.subscribe_settlement(),
+            )
         };
         if params.command_id == self.start_command
             || self.stop.as_ref().is_some_and(|s| s.0 == params.command_id)
@@ -988,10 +992,23 @@ impl Session {
         // Re-check the exact turn under the same lock discipline as send:
         // a turn that ended since the first check was never interrupted.
         let dispatched = self
-            .cancel_turn(&params.command_id, turn_id, Instant::now() + TIMEOUT, None)
+            .cancel_turn(
+                &params.command_id,
+                turn_id.as_deref(),
+                params.owner_control,
+                Instant::now() + TIMEOUT,
+            )
             .await;
         match dispatched {
             Ok(()) => {
+                let Some(turn_id) = turn_id.as_deref() else {
+                    let state = self.state.lock().await;
+                    return Ok(json!({
+                        "state": "applied", "command_id": params.command_id, "turn_id": null,
+                        "interrupt_confirmed": self.ready && state.active_turn().is_none()
+                            && !state.source_unknown && !state.batch_unknown,
+                    }));
+                };
                 // Per the ACP cancellation contract, answer every pending
                 // permission ask of this exact turn with `cancelled`
                 // before waiting: the native cannot reach its cancelled
@@ -1009,7 +1026,17 @@ impl Session {
                     })
                 })
                 .await;
-                interrupt_settlement_outcome("Antigravity", &params.command_id, turn_id, cancelled)
+                let mut outcome = interrupt_settlement_outcome(
+                    "Antigravity",
+                    &params.command_id,
+                    turn_id,
+                    cancelled,
+                )?;
+                if params.owner_control {
+                    outcome["turn_id"] = json!(params.turn_id);
+                    outcome["interrupt_confirmed"] = json!(cancelled == Some(true));
+                }
+                Ok(outcome)
             }
             // The locked re-check refused before native I/O. Preserve that
             // refusal and leave private history available for the next command.
@@ -1024,12 +1051,20 @@ impl Session {
     async fn cancel_turn(
         &mut self,
         command_id: &str,
-        turn_id: &str,
+        turn_id: Option<&str>,
+        owner_control: bool,
         until: Instant,
-        _seq: Option<i64>,
     ) -> Result<()> {
         let mut state = self.state.lock().await;
-        admit_cancel(&state, turn_id)?;
+        if !owner_control {
+            let turn_id = turn_id.ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "Antigravity interrupt requires a captured turn",
+                )
+            })?;
+            admit_cancel(&state, turn_id)?;
+        }
         // Hold the event lock across write and latch so late asks observe intent.
         let dispatched = self
             .client
@@ -1040,9 +1075,9 @@ impl Session {
             )
             .await;
         if !matches!(&dispatched, Err(error) if native_no_write(&error.code)) {
-            state.latch_cancellation(command_id, Some(turn_id));
+            state.latch_cancellation(command_id, turn_id);
             state
-                .answer_pending_cancelled(&self.client, command_id, Some(turn_id))
+                .answer_pending_cancelled(&self.client, command_id, turn_id)
                 .await;
         }
         dispatched
