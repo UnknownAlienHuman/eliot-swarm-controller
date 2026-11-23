@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) const CURRENT_SCHEMA_VERSION: i64 = WORK_TRUTH_INTENT_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
+const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
 
 impl Store {
@@ -2652,7 +2653,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < 113 {
+        if current < WORK_TRUTH_VERSION {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2691,8 +2692,12 @@ impl Store {
                      generation INTEGER NOT NULL,
                      successor INTEGER NOT NULL
                  );
-                 CREATE INDEX agent_successors_successor ON agent_successors(successor);
-                 INSERT INTO schema_migrations(version) VALUES (113);",
+                 CREATE INDEX agent_successors_successor ON agent_successors(successor);",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [WORK_TRUTH_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
