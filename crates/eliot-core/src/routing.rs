@@ -31,6 +31,7 @@ pub struct RoutingDecision {
 #[serde(rename_all = "snake_case")]
 pub enum RouteSkipReason {
     NotInstalled,
+    MissingProfileCommand,
     ProviderHold,
     ProviderFailure,
     QuotaExhausted,
@@ -45,6 +46,9 @@ impl RouteSkipReason {
     pub fn user_message(self) -> &'static str {
         match self {
             Self::NotInstalled => "not installed",
+            Self::MissingProfileCommand => {
+                "pinned executable missing (omit cmd to follow the installation)"
+            }
             Self::ProviderHold => "provider on hold",
             Self::ProviderFailure => "provider refused the previous attempt",
             Self::QuotaExhausted => "quota used up",

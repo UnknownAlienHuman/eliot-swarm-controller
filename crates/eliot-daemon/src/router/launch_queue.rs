@@ -210,6 +210,7 @@ impl Router {
             routing::LaunchRouting {
                 arbitrated: true,
                 owner_automation,
+                ..Default::default()
             },
             false,
         )

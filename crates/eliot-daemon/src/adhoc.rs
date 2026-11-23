@@ -1259,6 +1259,44 @@ pub(crate) async fn resolve_profile_command(
     resolve_profile_command_until(profile, harness, cmd, Instant::now() + DISCOVERY_BUDGET).await
 }
 
+/// A confined launch keeps the executable authority of the source generation.
+/// Check explicit pins by path and carry the frozen command facts without
+/// running an executable during authorization.
+pub(crate) fn inherit_profile_command(
+    snapshot: &mut Value,
+    source: &Value,
+    harness: &str,
+) -> core::Result<()> {
+    let source_cmd = source["cmd"].as_str();
+    if let Some(cmd) = explicit_profile_command(snapshot, harness)
+        && Some(cmd) != source_cmd
+        && (source_cmd.is_none()
+            || resolve_native_executable(cmd, harness).ok().as_deref() != source_cmd)
+    {
+        return Err(core::Error::new(
+            "not_allowed",
+            "profile executable differs from the frozen launch authority",
+        ));
+    }
+    let profile = snapshot.as_object_mut().ok_or_else(|| {
+        core::Error::new("profile_error", "launch profile snapshot must be an object")
+    })?;
+    for key in ["cmd", "cmd_version"] {
+        if let Some(value) = source.get(key) {
+            profile.insert(key.to_owned(), value.clone());
+        } else {
+            profile.remove(key);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn explicit_profile_command<'a>(snapshot: &'a Value, harness: &str) -> Option<&'a str> {
+    snapshot["cmd"]
+        .as_str()
+        .filter(|cmd| !(harness == "claude" && is_latest_claude_selector(cmd)))
+}
+
 pub(crate) async fn resolve_profile_command_until(
     profile: &str,
     harness: &str,
@@ -1331,21 +1369,6 @@ fn resolve_claude_profile_command_sync(
 
     discover_verified_claude(deadline)
         .map_err(|error| core::Error::new(error.code, format!("{profile}: {}", error.message)))
-}
-
-pub(crate) async fn ensure_claude_profile_command(profile: &str, cmd: &str) -> core::Result<()> {
-    let profile = profile.to_owned();
-    let cmd = cmd.to_owned();
-    let deadline = Instant::now() + DISCOVERY_BUDGET;
-    blocking_discovery(deadline, move || {
-        let cmd = validate_claude_cmd(&profile, &cmd)?;
-        if is_native_executable(Path::new(&cmd)) {
-            return Ok(());
-        }
-        let candidates = discover_claude_candidates(deadline);
-        Err(missing_claude_profile_command(&profile, &cmd, &candidates))
-    })
-    .await?
 }
 
 fn missing_claude_profile_command(

@@ -244,6 +244,8 @@ impl Router {
                     false,
                     routing::LaunchRouting {
                         owner_automation,
+                        provider_source: (provider_route.is_some() || profile_authority.is_some())
+                            .then_some(&source.profile_snapshot),
                         ..Default::default()
                     },
                     true,

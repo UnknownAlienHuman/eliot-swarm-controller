@@ -3075,7 +3075,7 @@ impl Router {
         principal: &Principal,
         project_authority_preverified: bool,
         submission_scope_preverified: bool,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
         if request
@@ -3438,7 +3438,7 @@ impl Router {
         request: &mut SubmitCommand,
         resolve_project: bool,
         parent_workspace_shared: bool,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
     ) -> Result<Option<WorkspacePreparationInput>> {
         if matches!(principal, Principal::Agent { .. })
             && request.args.get("base").is_some()
@@ -3724,7 +3724,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        routing: routing::LaunchRouting,
+        routing: routing::LaunchRouting<'_>,
     ) -> Result<bool> {
         if self.hydrate_retained_launch(request).await? {
             return Ok(true);
@@ -3941,7 +3941,15 @@ impl Router {
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
                 hierarchy::inherit_child_launch_bounds(&mut snapshot, &parent)?;
-                Some((name.to_owned(), harness, snapshot, false))
+                let command_bound = harness == parent.harness;
+                if command_bound {
+                    crate::adhoc::inherit_profile_command(
+                        &mut snapshot,
+                        &parent.profile_snapshot,
+                        &harness,
+                    )?;
+                }
+                Some((name.to_owned(), harness, snapshot, command_bound))
             } else {
                 Some((
                     parent.profile.clone(),
@@ -3953,8 +3961,8 @@ impl Router {
         } else {
             None
         };
-        let (profile_name, mut snapshot, harness, inherited_snapshot) = match agent_child_snapshot {
-            Some((name, harness, snapshot, inherited)) => (name, snapshot, harness, inherited),
+        let (profile_name, mut snapshot, harness, command_bound) = match agent_child_snapshot {
+            Some((name, harness, snapshot, bound)) => (name, snapshot, harness, bound),
             None => {
                 let profile_name = match request.args.get("profile") {
                     Some(Value::String(name)) => name.to_owned(),
@@ -3972,7 +3980,21 @@ impl Router {
                     .filter(|harness| !harness.trim().is_empty())
                     .ok_or_else(|| Error::new("invalid", "resolved profile must name its harness"))?
                     .to_owned();
-                (profile_name, snapshot, harness, false)
+                let command_bound = if let Some(source) = routing.provider_source {
+                    crate::adhoc::inherit_profile_command(&mut snapshot, source, &harness)?;
+                    if eliot_core::provider_switch_authority(&snapshot)?
+                        != eliot_core::provider_switch_authority(source)?
+                    {
+                        return Err(Error::new(
+                            "not_allowed",
+                            "profile authority differs from the source generation",
+                        ));
+                    }
+                    true
+                } else {
+                    false
+                };
+                (profile_name, snapshot, harness, command_bound)
             }
         };
         // The retained wire shape keeps the named profile so Store admission
@@ -3980,19 +4002,28 @@ impl Router {
         if let Some(args) = request.args.as_object_mut() {
             args.insert("profile".to_owned(), Value::String(profile_name.clone()));
         }
-        if inherited_snapshot {
-            if harness == "claude" {
-                let cmd = snapshot
-                    .get("cmd")
-                    .and_then(Value::as_str)
-                    .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd))
-                    .ok_or_else(|| {
-                        Error::new(
-                            "bad_state",
-                            "inherited Claude snapshot has no frozen executable path",
-                        )
-                    })?;
-                crate::adhoc::ensure_claude_profile_command(&profile_name, cmd).await?;
+        if matches!(principal, Principal::Agent { .. }) {
+            install_frozen_profile(request, &harness, snapshot.clone(), true)?;
+            let store = self.inner.store.lock().await;
+            hierarchy::check_agent_launch_authority(&store, principal, request)?;
+        }
+        if command_bound {
+            let cmd = crate::adhoc::explicit_profile_command(&snapshot, &harness);
+            if harness == "claude" && cmd.is_none() {
+                return Err(Error::new(
+                    "bad_state",
+                    "inherited Claude snapshot has no frozen executable path",
+                ));
+            }
+            if let Some(cmd) = cmd
+                && !crate::adhoc::profile_command_exists(cmd)
+            {
+                return Err(crate::adhoc::missing_profile_command_refusal(
+                    &profile_name,
+                    &harness,
+                    cmd,
+                    None,
+                ));
             }
         } else {
             let candidate = crate::adhoc::resolve_profile_command(

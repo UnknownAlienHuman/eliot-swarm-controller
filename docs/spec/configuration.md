@@ -505,7 +505,7 @@ permissions, MCP policy and credential references/selector bindings. Parent poli
 names are never reinterpreted on the child's harness, and parent credential or
 native-store bindings are never copied across harnesses. An approved same-harness
 profile can set its model, effort, and daemon context ceiling. Same-harness children
-inherit captured credential bindings verbatim. Control remains equal or narrower on
+inherit captured credential bindings and the frozen executable. Control remains equal or narrower on
 every harness; workspace and project
 remain inherited. A cross-harness child retains its own capacity scopes and every
 non-profile scope of the parent with the same bounds; conflicting bounds reject.
@@ -1537,6 +1537,9 @@ Role names use letters, digits, `-` and `_`; each role allows at most 64 candida
 unknown profile references. The `--role` launch argument selects the role only
 when `--profile` is omitted; omission stays absent on the wire and means
 `default`. An explicit profile continues to bypass routing.
+An explicit profile with a missing pin refuses with the replacement guidance.
+Role routing records a missing pin as `missing_profile_command` in the ordered
+skips shown by `swarm why`.
 At first admission, candidates must be installed, outside provider holds, not known
 quota-exhausted where passive readback is supported, and within configured capacity.
 Unknown quota is reported as unknown rather than fabricated availability. Freeze the
@@ -1558,6 +1561,8 @@ freezes and reserves nothing, so the next launch evaluates again and may differ.
 desktop shows it on the composer's Auto chip. Same-ID replay returns the frozen choice.
 Provider holds and capacity are rechecked transactionally at admission;
 a concurrent state change can refuse an otherwise prepared choice before dispatch.
+Routing checks launch authority and holds before running native probes. A provider
+switch keeps the executable bound to the source generation.
 
 #### Owner quota reserve (#872)
 

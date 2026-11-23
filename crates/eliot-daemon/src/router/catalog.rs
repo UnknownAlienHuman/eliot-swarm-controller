@@ -499,9 +499,14 @@ impl Router {
             });
         }
         if harness == "antigravity" {
-            let cmd = profile["cmd"].as_str().unwrap_or("agy");
-            let (cmd, _) = crate::adhoc::reader_executable(cmd, &harness, deadline).await?;
-            profile["cmd"] = Value::String(cmd);
+            let candidate = crate::adhoc::resolve_profile_command_until(
+                &label,
+                &harness,
+                profile["cmd"].as_str(),
+                deadline,
+            )
+            .await?;
+            crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
         let cache_key = catalog::canonical_cache_identity(
             &label,

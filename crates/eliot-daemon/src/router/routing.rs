@@ -6,12 +6,13 @@ use crate::config::{
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
 #[derive(Clone, Copy, Default)]
-pub(super) struct LaunchRouting {
+pub(super) struct LaunchRouting<'a> {
     pub(super) arbitrated: bool,
     pub(super) owner_automation: bool,
+    pub(super) provider_source: Option<&'a Value>,
 }
 
-impl LaunchRouting {
+impl LaunchRouting<'_> {
     fn automatic(self, principal: &Principal) -> bool {
         self.owner_automation
             || matches!(
@@ -82,12 +83,12 @@ struct RoutePreflight {
     automatic: bool,
     provider_switch: bool,
     provider_authority: Option<[u8; 32]>,
+    provider_source: Option<Value>,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
     provider_refusal: Option<Error>,
-    profile_command_refusal: Option<Error>,
     quota_policies: HashMap<String, QuotaPolicy>,
-    quota_deadline: Option<std::time::Instant>,
+    discovery_deadline: Option<std::time::Instant>,
 }
 
 impl RoutePreflight {
@@ -145,7 +146,7 @@ impl Router {
         &self,
         principal: &Principal,
         request: &mut SubmitCommand,
-        mode: LaunchRouting,
+        mode: LaunchRouting<'_>,
     ) -> Result<(String, String, Value)> {
         let role = request
             .args
@@ -242,16 +243,12 @@ impl Router {
                 policy.enabled().then(|| (name.clone(), policy))
             })
             .collect();
-        if !preflight.quota_policies.is_empty() {
-            preflight.quota_deadline =
-                Some(std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
-        }
     }
 
     pub(super) async fn check_explicit_launch_quota(
         &self,
         principal: &Principal,
-        mode: LaunchRouting,
+        mode: LaunchRouting<'_>,
         profile: &str,
         harness: &str,
         snapshot: &Value,
@@ -329,6 +326,7 @@ impl Router {
         let mut preflight = RoutePreflight {
             provider_switch: true,
             provider_authority: Some(authority),
+            provider_source: Some(source.profile_snapshot.clone()),
             ..RoutePreflight::default()
         };
         preflight.held_accounts.insert(
@@ -360,7 +358,9 @@ impl Router {
         mut decision: RoutingDecision,
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
-        let rank_by_quota = preflight.quota_deadline.is_some();
+        let rank_by_quota = !preflight.quota_policies.is_empty();
+        preflight.discovery_deadline =
+            Some(std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
         let mut failover_candidates =
             (rank_by_quota && decision.provider_failover.is_some()).then(Vec::new);
         let mut selected: Option<AvailableRoute> = None;
@@ -453,9 +453,7 @@ impl Router {
             serde_json::to_string(&decision)
                 .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
         );
-        let mut error = wait
-            .or(preflight.profile_command_refusal)
-            .unwrap_or(routing_error);
+        let mut error = wait.unwrap_or(routing_error);
         error.routing = Some(Box::new(decision));
         Err(error)
     }
@@ -515,27 +513,18 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if !inherited_snapshot {
-            let configured_cmd = snapshot
-                .get("cmd")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            match crate::adhoc::resolve_profile_command(name, &harness, configured_cmd.as_deref())
-                .await
-            {
-                Ok(candidate) => {
-                    crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
-                }
-                Err(error) => {
-                    if let Some(cmd) = configured_cmd.as_deref()
-                        && !(harness == "claude" && crate::adhoc::is_latest_claude_selector(cmd))
-                        && !crate::adhoc::profile_command_exists(cmd)
-                    {
-                        preflight.profile_command_refusal.get_or_insert(error);
-                    }
-                    return Ok(Err(RouteSkipReason::NotInstalled));
-                }
-            }
+        let configured_pin = crate::adhoc::explicit_profile_command(&snapshot, &harness).is_some();
+        let command_source = preflight.provider_source.as_ref().or_else(|| {
+            parent
+                .filter(|parent| parent.harness == harness)
+                .map(|parent| &parent.profile_snapshot)
+        });
+        let command_bound = inherited_snapshot || command_source.is_some();
+        if !inherited_snapshot
+            && let Some(source) = command_source
+            && crate::adhoc::inherit_profile_command(&mut snapshot, source, &harness).is_err()
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
         }
         if parent.is_some() {
             let mut candidate = request.clone();
@@ -563,16 +552,48 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if inherited_snapshot && !native_installed(&harness, &snapshot) {
-            return Ok(Err(RouteSkipReason::NotInstalled));
-        }
         if preflight.check_candidate_holds() {
             let store = self.inner.store.lock().await;
             if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
                 return Ok(Err(preflight.record(error, harness, account)));
             }
         }
-        let quota = if preflight.arbitrated && preflight.quota_deadline.is_none() {
+        if configured_pin
+            && let Some(cmd) = crate::adhoc::explicit_profile_command(&snapshot, &harness)
+            && !crate::adhoc::profile_command_exists(cmd)
+        {
+            return Ok(Err(RouteSkipReason::MissingProfileCommand));
+        }
+        let deadline = preflight
+            .discovery_deadline
+            .ok_or_else(|| Error::new("internal", "routing has no discovery deadline"))?;
+        if command_bound {
+            if !native_installed(&harness, &snapshot) {
+                return Ok(Err(RouteSkipReason::NotInstalled));
+            }
+        } else {
+            let cmd = snapshot["cmd"].as_str();
+            match crate::adhoc::resolve_profile_command_until(name, &harness, cmd, deadline).await {
+                Ok(candidate) => {
+                    crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
+                }
+                Err(error) => {
+                    let refusal = eliot_core::AdmissionRefusal::of_parts(
+                        &error.code,
+                        error.failure_where.as_deref(),
+                        error.origin,
+                    );
+                    return Ok(Err(
+                        if refusal == Some(eliot_core::AdmissionRefusal::ProfileCommand) {
+                            RouteSkipReason::MissingProfileCommand
+                        } else {
+                            RouteSkipReason::NotInstalled
+                        },
+                    ));
+                }
+            }
+        }
+        let quota = if preflight.arbitrated && preflight.quota_policies.is_empty() {
             CandidateQuota {
                 status: RouteQuotaStatus::Unknown,
                 unmapped: false,
@@ -580,9 +601,6 @@ impl Router {
                 headroom: None,
             }
         } else {
-            let deadline = preflight
-                .quota_deadline
-                .unwrap_or_else(|| std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
             self.read_candidate_quota(name, &harness, &snapshot, deadline)
                 .await
         };
