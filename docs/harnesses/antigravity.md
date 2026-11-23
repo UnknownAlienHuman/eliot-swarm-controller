@@ -508,10 +508,10 @@ stays in the plugin spec.
 
 ## Ad-hoc launch
 
-`swarm launch --harness antigravity [--model M] [--cmd PATH] --workspace W "prompt"` is
+`swarm launch --harness antigravity --model M [--cmd PATH] --workspace W "prompt"` is
 Owner-only and freezes a profile-equivalent snapshot from safe defaults
-(`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A model
-may be omitted to preserve the verified ACP session default described above.
+(`dangerously_skip_permissions = false`, explicit MCP `inherit`) plus flags. A named
+profile may omit its model to preserve the verified ACP session default described above.
 Omitted profile `cmd` and ad-hoc `--cmd` use the same discovery for the installed
 `agy` CLI (it serves both `acp` and `models`); the selected native executable is
 frozen in the launch generation. `--cmd PATH` is the Owner's one-launch override;

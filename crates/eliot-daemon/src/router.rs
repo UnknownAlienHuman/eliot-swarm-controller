@@ -3743,8 +3743,8 @@ impl Router {
                 .args
                 .get("harness")
                 .and_then(Value::as_str)
-                .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?
-                .to_owned();
+                .ok_or_else(|| Error::new("invalid", "launch harness must be a non-empty string"))?;
+            let harness = crate::adhoc::validate_adhoc_harness(harness)?;
             let model = request
                 .args
                 .get("model")
@@ -3799,22 +3799,22 @@ impl Router {
             // otherwise the installed executable is discovered on the
             // blocking pool. Shape is validated with the frozen snapshot
             // below.
-            let (cmd, selected_version) = if harness == "claude" {
-                let selector = explicit_cmd
-                    .as_deref()
-                    .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd));
-                let candidate = crate::adhoc::resolve_claude_profile_command(
-                    &crate::adhoc::adhoc_profile_name(&harness),
-                    selector,
-                )
-                .await?;
-                (Some(candidate.cmd), candidate.version)
-            } else {
-                let cmd = match explicit_cmd {
-                    Some(cmd) => Some(cmd),
-                    None => crate::adhoc::discover_cmd_for_harness_async(&harness).await?,
-                };
-                (cmd, None)
+            let profile_name = crate::adhoc::adhoc_profile_name(&harness);
+            let (cmd, selected_version) = match explicit_cmd.as_deref() {
+                Some(cmd) if harness == "muse" => {
+                    let cmd = crate::adhoc::validate_native_cmd(&profile_name, cmd)?;
+                    let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+                    let (cmd, version) =
+                        crate::adhoc::reader_executable(&cmd, &harness, deadline).await?;
+                    (Some(cmd), version)
+                }
+                Some(_) if harness != "claude" => (explicit_cmd, None),
+                selector => {
+                    let candidate =
+                        crate::adhoc::resolve_profile_command(&profile_name, &harness, selector)
+                            .await?;
+                    (Some(candidate.cmd), candidate.version)
+                }
             };
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             let mut snapshot = crate::adhoc::blocking_discovery(deadline, move || {

@@ -551,7 +551,7 @@ pub(crate) fn adhoc_snapshot(
 }
 
 /// Ad-hoc cmd shape: one explicit executable path, never a shell command.
-fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<String> {
+pub(crate) fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<String> {
     let cmd = crate::config::validate_executable_name(cmd).map_err(|class| {
         core::Error::new("profile_error", format!("ad-hoc {profile}: cmd {class}"))
     })?;
@@ -638,10 +638,6 @@ fn has_native_executable_magic(path: &std::path::Path) -> bool {
 /// enumeration plus the bounded `--version` probes runs on the blocking
 /// pool, so slow native CLIs never stall async command/event service while
 /// cached catalogue data already exists.
-pub(crate) async fn discover_cmd_for_harness_async(harness: &str) -> core::Result<Option<String>> {
-    discover_cmd_until(harness, Instant::now() + DISCOVERY_BUDGET).await
-}
-
 pub(crate) async fn discover_cmd_until(
     harness: &str,
     deadline: Instant,
