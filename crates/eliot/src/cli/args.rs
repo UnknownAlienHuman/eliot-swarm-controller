@@ -949,12 +949,16 @@ pub(crate) struct SwitchArgs {
     pub(crate) from: String,
     #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
     pub(crate) generation: i64,
+    /// Command stating the task. Omitted, Swarm finds it in the Store and Git.
     #[arg(long)]
-    pub(crate) task_command: String,
+    pub(crate) task_command: Option<String>,
     /// Ordered undispatched plain SENDs, at most 64.
     pub(crate) commands: Vec<String>,
-    #[arg(long, conflicts_with = "harness")]
+    #[arg(long, conflicts_with_all = ["harness", "role"])]
     pub(crate) profile: Option<String>,
+    /// Let routing choose B from this role's candidates.
+    #[arg(long, conflicts_with = "harness")]
+    pub(crate) role: Option<String>,
     #[arg(long)]
     pub(crate) harness: Option<String>,
     #[arg(long, requires = "harness")]

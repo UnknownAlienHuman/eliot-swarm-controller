@@ -1,8 +1,9 @@
 use eliot_core::{Result, SecretPolicy, api::GoalDefinition};
 use eliot_store::Store;
 
-const TASK_CARD_MAX_BYTES: usize = 600;
+const TASK_CARD_MAX_BYTES: usize = 700;
 const TASK_BYTES: usize = 160;
+const BRANCH_BYTES: usize = 91;
 const GOAL_BYTES: usize = 125;
 const SCOPE_BYTES: usize = 100;
 const LIMITS_BYTES: usize = 55;
@@ -54,7 +55,20 @@ pub(super) fn read_task_card(
         .goal_get(agent, "eliot")?
         .filter(|goal| goal.generation == generation)
         .map(|goal| goal.definition);
-    Ok(render_task_card(text.as_deref(), goal.as_ref(), policy))
+    let branch = current
+        .workspace
+        .as_deref()
+        .map(|workspace| store.worktree_branch_base(workspace))
+        .transpose()?
+        .flatten()
+        .map(|(branch, _)| branch)
+        .or_else(|| current.branch.clone());
+    Ok(render_task_card(
+        text.as_deref(),
+        branch.as_deref(),
+        goal.as_ref(),
+        policy,
+    ))
 }
 
 fn original_task(brief: &str) -> &str {
@@ -80,6 +94,7 @@ fn brief_field<'a>(brief: Option<&'a str>, labels: &[&str]) -> Option<&'a str> {
 
 fn render_task_card(
     launch_brief: Option<&str>,
+    branch: Option<&str>,
     goal: Option<&GoalDefinition>,
     policy: &SecretPolicy,
 ) -> Option<String> {
@@ -121,8 +136,11 @@ fn render_task_card(
         .map(|check| bounded_field(&check, CHECK_BYTES, policy))
         .unwrap_or_else(|| "not set".to_owned());
 
+    let branch = branch.map_or_else(String::new, |branch| {
+        format!("\nBranch: {}", bounded_field(branch, BRANCH_BYTES, policy))
+    });
     let mut card = format!(
-        "Task: {task}\nGoal: {goal_text}\nWrite scope: {scope}\nLimits: {limits}\nCheck: {check}"
+        "Task: {task}{branch}\nGoal: {goal_text}\nWrite scope: {scope}\nLimits: {limits}\nCheck: {check}"
     );
     if card.len() > TASK_CARD_MAX_BYTES {
         card.truncate(card.floor_char_boundary(TASK_CARD_MAX_BYTES));
@@ -130,7 +148,7 @@ fn render_task_card(
     Some(card)
 }
 
-fn without_source_block(text: &str) -> &str {
+pub(super) fn without_source_block(text: &str) -> &str {
     SOURCE_BLOCK_MARKERS
         .iter()
         .filter_map(|marker| text.find(marker))

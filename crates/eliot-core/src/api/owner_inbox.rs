@@ -18,10 +18,14 @@ pub enum OwnerInboxKind {
     LaunchQueue,
     Stuck,
     HarnessCheck,
+    /// A successor continued after a turn whose effects may be partial.
+    Handoff,
+    /// Work that is not fully recorded in Git.
+    WorkNotInGit,
 }
 
 impl OwnerInboxKind {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::HarnessRequest,
         Self::UnknownCommand,
         Self::UnknownTurn,
@@ -31,6 +35,8 @@ impl OwnerInboxKind {
         Self::LaunchQueue,
         Self::Stuck,
         Self::HarnessCheck,
+        Self::Handoff,
+        Self::WorkNotInGit,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -44,6 +50,8 @@ impl OwnerInboxKind {
             Self::LaunchQueue => "launch_queue",
             Self::Stuck => "stuck",
             Self::HarnessCheck => "harness_check",
+            Self::Handoff => "handoff",
+            Self::WorkNotInGit => "work_not_in_git",
         }
     }
 }
@@ -72,6 +80,9 @@ pub struct OwnerInboxItem {
     pub reason: String,
     pub recommended: Option<OwnerAction>,
     pub choices: Vec<OwnerAction>,
+    /// Exact commands for the Owner when no single action does the work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
 
 impl OwnerInboxItem {

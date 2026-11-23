@@ -1197,6 +1197,45 @@ impl GitProbe {
         Ok(paths)
     }
 
+    /// Run one local plumbing command that reads `input` on stdin.
+    pub(crate) async fn workspace_input_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        self.run(root, args, &overrides, input, deadline).await
+    }
+
+    /// The sanitized configuration for a batch of plumbing commands.
+    pub(crate) async fn batch_overrides(
+        &self,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<Vec<(String, String)>> {
+        self.safe_overrides(root, deadline).await
+    }
+
+    /// One plumbing command of a batch, optionally bound to a private index.
+    pub(crate) async fn workspace_input_with(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        index_file: Option<&Path>,
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let command = self.build_command_with_index(root, args, overrides, None, index_file)?;
+        let (code, stdout) = Self::capture_git(command, input, deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
+    }
+
     /// Read using one explicitly scoped index file, without inheriting any
     /// caller-provided Git index override.
     pub(crate) async fn workspace_command_with_index(
@@ -2085,14 +2124,14 @@ fn dirty_worktree_digest(
 
 /// Content of one Git path under `root`, read without following a link or
 /// non-directory among its parents.
-enum PathContent {
+pub(crate) enum PathContent {
     Missing,
     Link(PathBuf),
     File(Vec<u8>),
     Other,
 }
 
-fn read_path_content(
+pub(crate) fn read_path_content(
     root: &Path,
     path: &str,
     max_file_bytes: u64,

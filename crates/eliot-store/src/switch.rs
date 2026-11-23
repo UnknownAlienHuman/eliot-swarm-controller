@@ -1,15 +1,30 @@
 //! Switch orchestration uses only existing command rows and normal launch/handoff admission.
 use super::*;
 use eliot_core::api::{
-    ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent, SwitchAgent, SwitchLaunch,
-    SwitchRequest, SwitchResponse,
+    HandoffReason, ORGANIZATION_CHANGED_KIND, OrgRowChange, OrganizationChangedEvent,
+    ReparentRequest, SwitchAgent, SwitchLaunch, SwitchRequest, SwitchResponse,
 };
+
+mod automatic;
+pub use automatic::{AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING};
 
 const METHOD: &str = "swarm.switch";
 const PROVIDER_FAILURE: &str = "provider_failure";
 const PROVIDER_AUTHORITY: &str = "provider_authority";
 const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 const OWNER_AUTOMATION: &str = "owner_automation";
+const CONTINUATION: &str = "continuation";
+const REQUESTED_BY: &str = "requested_by";
+
+/// Retained reason of a daemon-initiated continuation.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SwitchContinuation {
+    pub reason: HandoffReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<core::ProviderRestrictionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_since: Option<i64>,
+}
 
 #[derive(Clone, Copy)]
 pub struct ProviderSwitchFailure {
@@ -39,6 +54,9 @@ pub struct SwitchWork {
     pub provider_failure: Option<ProviderSwitchFailure>,
     pub profile_authority: Option<[u8; 32]>,
     pub owner_automation: bool,
+    pub continuation: Option<SwitchContinuation>,
+    /// The manager principal that requested this switch.
+    pub requested_by: Option<String>,
 }
 
 struct RetainedSwitch {
@@ -46,6 +64,8 @@ struct RetainedSwitch {
     provider_failure: Option<ProviderSwitchFailure>,
     profile_authority: Option<[u8; 32]>,
     owner_automation: bool,
+    continuation: Option<SwitchContinuation>,
+    requested_by: Option<String>,
 }
 
 fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
@@ -72,13 +92,201 @@ fn decode_switch(mut args: Value) -> Result<RetainedSwitch> {
         .transpose()
         .map_err(|_| malformed())?
         .unwrap_or(false);
+    let continuation = args_map
+        .remove(CONTINUATION)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
+    let requested_by = args_map
+        .remove(REQUESTED_BY)
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| malformed())?;
     let request = serde_json::from_value(args).map_err(|_| malformed())?;
     Ok(RetainedSwitch {
         request,
         provider_failure: failure.map(|kind| ProviderSwitchFailure { kind, authority }),
         profile_authority,
         owner_automation,
+        continuation,
+        requested_by,
     })
+}
+
+/// The retained arguments and replay digest. A manager's request binds its
+/// principal, so another caller cannot read it back by reusing the ID.
+fn switch_args(principal: &str, request: &SwitchRequest) -> Result<(Value, Vec<u8>)> {
+    let mut args = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", "cannot encode switch"))?;
+    if principal != "owner" {
+        args[REQUESTED_BY] = json!(principal);
+    }
+    let digest = canonical::digest(&args)?;
+    Ok((args, digest))
+}
+
+fn require_switch_principal(principal: &str) -> Result<()> {
+    if principal == "owner" || principal.starts_with("agent:") {
+        Ok(())
+    } else {
+        Err(Error::new(
+            "not_allowed",
+            "only the Owner or a manager may switch Agents",
+        ))
+    }
+}
+
+/// A manager moves a worker in its own controlled scope to a profile or role,
+/// in the worker's own worktree.
+fn require_switch_caller(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SwitchRequest,
+) -> Result<()> {
+    if principal == "owner" {
+        return Ok(());
+    }
+    let caller = hierarchy::parse_caller(tx, principal)?;
+    let hierarchy::Caller::Agent { num, id, .. } = &caller else {
+        return Err(Error::new("not_allowed", "switch caller is not a manager"));
+    };
+    let manager = load_agent_by_num(tx, *num)?
+        .ok_or_else(|| Error::new("stale_generation", "caller generation is not current"))?;
+    observer::require_controlled(&manager)?;
+    let launch = &request.launch;
+    if request.from == *id
+        || launch.harness.is_some()
+        || launch.project.is_some()
+        || launch.workspace.is_some()
+        || launch.worktree.is_some()
+        || launch.base.is_some()
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "a manager switches another worker to a profile or role in that worker's worktree",
+        ));
+    }
+    let source = load_agent_by_num(tx, parse_agent_id(&request.from)?)?
+        .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+    hierarchy::caller_may_command(tx, &caller, &source)
+}
+
+/// The exact check for a successor nobody with Owner authority chose by hand.
+fn require_handoff_bounds(
+    tx: &Connection,
+    source: &Agent,
+    successor: &Value,
+    workspace: Option<&str>,
+    profile: Option<&str>,
+    requested_by: Option<&str>,
+) -> Result<()> {
+    if let Some(reason) = core::handoff_authority_refusal(&source.profile_snapshot, successor) {
+        return Err(Error::new(
+            "not_allowed",
+            format!("successor authority refused: {reason}"),
+        ));
+    }
+    if workspace != source.workspace.as_deref() {
+        return Err(Error::new(
+            "not_allowed",
+            "a bounded handoff must keep the source worktree",
+        ));
+    }
+    if let Some(principal) = requested_by {
+        let caller = hierarchy::parse_caller(tx, principal)?;
+        hierarchy::caller_may_command(tx, &caller, source)?;
+        let hierarchy::Caller::Agent { num, .. } = caller else {
+            return Err(Error::new("not_allowed", "switch caller is not a manager"));
+        };
+        let manager = load_agent_by_num(tx, num)?
+            .ok_or_else(|| Error::new("stale_generation", "caller generation is not current"))?;
+        let allowed = profile == Some(source.profile.as_str())
+            || manager.profile_snapshot["child_profiles"]
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == profile));
+        if !allowed {
+            return Err(Error::new(
+                "not_allowed",
+                "successor profile is outside the manager's child profiles",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One session's work has one successor at a time. A second switch in the
+/// same worktree would put two Agents on one branch.
+fn switch_blocker(tx: &Connection, request: &SwitchRequest) -> Result<Option<Error>> {
+    let open: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_unsettled_created
+             WHERE state IN ('accepted', 'queued', 'dispatched', 'unknown')
+               AND verb = 'switch' AND method = ?1 AND id <> ?2
+               AND json_extract(args, '$.from') = ?3
+               AND json_extract(args, '$.from_generation') = ?4)",
+            params![METHOD, request.id, request.from, request.from_generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if open {
+        return Ok(Some(Error::new(
+            "busy",
+            format!("Agent {} already has a switch in progress", request.from),
+        )));
+    }
+    let launch = &request.launch;
+    if launch.workspace.is_some() || launch.worktree.is_some() || launch.project.is_some() {
+        return Ok(None);
+    }
+    let moved: Option<String> = tx
+        .query_row(
+            "SELECT json_extract(data, '$.to') FROM events INDEXED BY events_kind
+             WHERE kind = ?1 AND agent = ?2 AND generation = ?3
+             ORDER BY seq DESC LIMIT 1",
+            params![
+                handoff::AGENT_HANDED_OFF,
+                parse_agent_id(&request.from)?,
+                request.from_generation
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(moved.map(|successor| {
+        Error::new(
+            "bad_state",
+            format!(
+                "Agent {} already handed this work to {successor}; switch that Agent instead",
+                request.from
+            ),
+        )
+    }))
+}
+
+fn continuation_directive(
+    reason: HandoffReason,
+    kind: Option<core::ProviderRestrictionKind>,
+    source: &str,
+    successor: &str,
+    uncertain: bool,
+) -> String {
+    let why = match reason {
+        HandoffReason::Request => format!("the work was moved from {source} to {successor}"),
+        HandoffReason::Routing => format!("routing moved the work from {source} to {successor}"),
+        HandoffReason::ProviderHold => format!(
+            "{source} is on a provider {} hold",
+            kind.map_or("quota", core::ProviderRestrictionKind::as_str)
+        ),
+        HandoffReason::SessionLost => format!("the {source} session was lost or failed"),
+    };
+    let caution = if uncertain {
+        "\nThe previous turn stopped partway. Do not repeat any of its steps until Git and the files show that step did not take effect."
+    } else {
+        ""
+    };
+    format!(
+        "Handoff brief: continue this task from its worktree. Why: {why}.{caution}\nYou now own this branch and its files as they are on disk, including uncommitted changes. The previous session and its context are gone. Git, the files and the Store facts below are the truth. The original task was written for the first session, so a step it limits to a first or earlier turn is already past. Read git status and git diff first, then finish the remaining work and commit at meaningful checkpoints on this branch. If the work is already complete, verify that and report it. Queued input, if any, arrives in separate messages after this one."
+    )
 }
 
 pub(super) fn reserve_rule_switch_tx(
@@ -124,6 +332,9 @@ fn reserve_switch_tx(
     digest: &[u8],
     now: i64,
 ) -> Result<Change<SwitchResponse>> {
+    if let Some(error) = switch_blocker(tx, request)? {
+        return Err(error);
+    }
     let value = SwitchResponse {
         id: request.id.clone(),
         from: request.from.clone(),
@@ -228,6 +439,9 @@ pub(super) fn reserve_provider_switch_tx(
         commands: Vec::new(),
         launch: SwitchLaunch::default(),
     };
+    if switch_blocker(tx, &request)?.is_some() {
+        return Ok(());
+    }
     let mut args = serde_json::to_value(&request)
         .map_err(|_| Error::new("internal", "cannot encode provider switch"))?;
     args[PROVIDER_FAILURE] = json!(restriction.kind);
@@ -297,7 +511,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT id FROM commands WHERE state='accepted' AND verb='switch' AND method=?1
-                 AND json_extract(args,'$.provider_failure') IS NOT NULL AND id > ?2
+                 AND (json_extract(args,'$.provider_failure') IS NOT NULL
+                      OR json_extract(args,'$.continuation') IS NOT NULL) AND id > ?2
                  ORDER BY id LIMIT 64",
             )
             .map_err(sql_error)?;
@@ -314,12 +529,9 @@ impl Store {
     ) -> Result<Option<SwitchResponse>> {
         self.ensure_committed_reads()?;
         request.validate()?;
-        owner(principal)?;
-        let digest = canonical::digest(
-            &serde_json::to_value(request)
-                .map_err(|_| Error::new("internal", "cannot encode switch"))?,
-        )?;
-        replay_on(&self.connection, principal, request, &digest)
+        require_switch_principal(principal)?;
+        let (_, digest) = switch_args(principal, request)?;
+        replay_on(&self.connection, "owner", request, &digest)
     }
 
     /// Retain both child identities before any profile/auth/Git/native preparation.
@@ -340,9 +552,7 @@ impl Store {
         }
         self.ensure_writer_healthy()?;
         let result = (|| {
-            let mut args = serde_json::to_value(request)
-                .map_err(|_| Error::new("internal", "cannot encode switch"))?;
-            let digest = canonical::digest(&args)?;
+            let (mut args, digest) = switch_args(principal, request)?;
             if let Some(authority) = profile_authority {
                 args[SESSION_GROWTH_AUTHORITY] = json!(authority);
             }
@@ -350,7 +560,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            if let Some(value) = replay_on(&tx, principal, request, &digest)? {
+            if let Some(value) = replay_on(&tx, "owner", request, &digest)? {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(Change {
                     value,
@@ -370,6 +580,7 @@ impl Store {
                     "switch exceeds command budget",
                 ));
             }
+            require_switch_caller(&tx, principal, request)?;
             source_tx(&tx, request, self.hierarchy_limits, policy)?;
             let mut change = reserve_switch_tx(&tx, request, args, &digest, now)?;
             annotate_owner_events(&tx, &mut change.events, owner_process)?;
@@ -412,8 +623,12 @@ impl Store {
                 provider_failure,
                 profile_authority,
                 owner_automation,
+                continuation,
+                requested_by,
             } = decode_switch(command.args)?;
             let owner_automation = owner_automation
+                || continuation.is_some()
+                || requested_by.is_some()
                 || profile_authority.is_some()
                 || command_cause_tx(&tx, id)?.is_some_and(|cause| cause.rule.is_some())
                 || (provider_failure.is_some()
@@ -455,6 +670,8 @@ impl Store {
                     provider_failure,
                     profile_authority,
                     owner_automation,
+                    continuation,
+                    requested_by,
                 }),
                 events,
             })
@@ -516,9 +733,29 @@ impl Store {
             let RetainedSwitch {
                 request: source,
                 provider_failure,
+                continuation,
+                requested_by,
                 ..
             } = decode_switch(parent.args)?;
             let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
+            if continuation.is_some() || requested_by.is_some() {
+                require_handoff_bounds(
+                    &tx,
+                    &agent,
+                    &request.args["profile_snapshot"],
+                    request.args.get("workspace").and_then(Value::as_str),
+                    request.args.get("profile").and_then(Value::as_str),
+                    requested_by.as_deref(),
+                )?;
+            }
+            if let Some(held_since) = continuation.and_then(|value| value.held_since)
+                && !automatic::hold_is_current(&tx, &agent, held_since)?
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "the provider hold changed before the handoff",
+                ));
+            }
             if let Some(failure) = provider_failure {
                 require_provider_retry(&tx, &agent, &source.task_command)?;
                 failure.require_authority(&agent.profile_snapshot)?;
@@ -678,6 +915,7 @@ impl Store {
         &mut self,
         id: &str,
         policy: &core::SecretPolicy,
+        facts: &handoff::BriefFacts,
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
         self.ensure_writer_healthy()?;
@@ -697,8 +935,19 @@ impl Store {
             let RetainedSwitch {
                 request,
                 provider_failure,
+                continuation,
+                requested_by,
                 ..
             } = decode_switch(parent.args)?;
+            let handoff_reason = continuation.map_or(
+                if request.launch.role.is_some() {
+                    HandoffReason::Routing
+                } else {
+                    HandoffReason::Request
+                },
+                |value| value.reason,
+            );
+            let mut uncertain = false;
             let plan = stored_result(&parent.outcome)?;
             let launch = component(&tx, id, &plan.launch_command, 0)?
                 .ok_or_else(|| Error::new("bad_state", "switch launch not admitted"))?;
@@ -718,16 +967,46 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
+                    let (source, _) = source_tx(&tx, &request, self.hierarchy_limits, policy)?;
                     if let Some(failure) = provider_failure {
-                        let (agent, _) = source_tx(&tx, &request, self.hierarchy_limits, policy)?;
-                        require_provider_retry(&tx, &agent, &request.task_command)?;
-                        failure.require_authority(&agent.profile_snapshot)?;
+                        require_provider_retry(&tx, &source, &request.task_command)?;
+                        failure.require_authority(&source.profile_snapshot)?;
                         failure.require_authority(&destination.profile_snapshot)?;
                     }
+                    if continuation.is_some() || requested_by.is_some() {
+                        require_handoff_bounds(
+                            &tx,
+                            &source,
+                            &destination.profile_snapshot,
+                            destination.workspace.as_deref(),
+                            Some(destination.profile.as_str()),
+                            requested_by.as_deref(),
+                        )?;
+                    }
+                    let source_num = parse_agent_id(&request.from)?;
+                    uncertain =
+                        handoff::last_turn_uncertain(&tx, source_num, request.from_generation)?
+                            || has_unknown_gate(&tx, source_num)?;
+                    let directive = continuation_directive(
+                        handoff_reason,
+                        continuation.and_then(|value| value.kind),
+                        &source.profile,
+                        &destination.profile,
+                        uncertain,
+                    );
                     let transfer = if provider_failure.is_some() {
                         handoff::HandoffInput::ProviderRetry
+                    } else if request.launch.project.is_some() {
+                        // Continuing a chat in a project waits for the Owner.
+                        handoff::HandoffInput::Brief {
+                            facts,
+                            discover: true,
+                        }
                     } else {
-                        handoff::HandoffInput::Brief
+                        handoff::HandoffInput::Continuation {
+                            directive: &directive,
+                            facts,
+                        }
                     };
                     let change = handoff::handoff_tx(
                         &tx,
@@ -744,6 +1023,21 @@ impl Store {
                     // never a foreign key, so deleting the source
                     // afterwards cannot fault the Store writer.
                     let created = parse_agent_id(&destination.id)?;
+                    // B now owns A's worktree, so A takes no further input.
+                    if request.launch.workspace.is_none()
+                        && request.launch.worktree.is_none()
+                        && request.launch.project.is_none()
+                    {
+                        db!(tx.execute(
+                            "INSERT OR REPLACE INTO agent_successors(agent, generation, successor)
+                             VALUES (?1, ?2, ?3)",
+                            params![
+                                parse_agent_id(&request.from)?,
+                                request.from_generation,
+                                created
+                            ],
+                        ));
+                    }
                     // An existing row (a menu write raced the handoff)
                     // moves to a new revision like any overlay write, so
                     // a menu that read it before the switch is refused.
@@ -783,6 +1077,27 @@ impl Store {
                             Error::new("internal", "cannot encode organization event")
                         })?,
                     )?);
+                    // B takes A's place under A's live manager.
+                    if let Some(parent_id) = source.parent.as_deref()
+                        && let Some(manager) = load_agent_by_num(&tx, parse_agent_id(parent_id)?)?
+                        && !manager.is_terminal()
+                    {
+                        let moved = reparent::reparent_tx(
+                            &tx,
+                            &ReparentRequest {
+                                id: plan.handoff_command.clone(),
+                                agent: Some(destination.id.clone()),
+                                children_of: None,
+                                expected_generation: destination.generation,
+                                parent: manager.id.clone(),
+                                parent_generation: manager.generation,
+                            },
+                            self.hierarchy_limits,
+                            now,
+                            true,
+                        )?;
+                        change.events.extend(moved.events);
+                    }
                     Ok(change)
                 })()
             } else {
@@ -886,6 +1201,29 @@ impl Store {
                         "continued_to": value.created.as_ref().filter(|_| state == CommandState::Applied).map(|agent| &agent.agent),
                         "profile": launch.args.get("profile"),
                         "retry_command": value.handoff.as_ref().map(|handoff| &handoff.brief_command),
+                        "error": value.error,
+                        "state": state,
+                    }),
+                )?);
+            } else {
+                events.push(insert_daemon_event(
+                    &tx,
+                    now,
+                    HANDOFF_SETTLED,
+                    "handoff",
+                    Some(parse_agent_id(&request.from)?),
+                    Some(request.from_generation),
+                    json!({
+                        "switch_command": id,
+                        "task_command": request.task_command,
+                        "reason": handoff_reason,
+                        "kind": continuation.and_then(|value| value.kind),
+                        "requested_by": requested_by,
+                        "continued_to": value.created.as_ref()
+                            .filter(|_| state == CommandState::Applied)
+                            .map(|agent| &agent.agent),
+                        "profile": launch.args.get("profile"),
+                        "uncertain": uncertain && state == CommandState::Applied,
                         "error": value.error,
                         "state": state,
                     }),
@@ -1151,7 +1489,7 @@ fn source_tx(
     if source.generation != request.from_generation {
         return Err(Error::new("stale_generation", "source generation moved"));
     }
-    handoff::quiescent(tx, &source, false)?;
+    handoff::transfer_source_ready(tx, &source)?;
     project_transfer::require_no_intent(tx, &source.project)?;
     handoff::source_inputs(
         tx,

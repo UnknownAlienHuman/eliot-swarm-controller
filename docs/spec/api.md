@@ -730,7 +730,7 @@ event and context response.
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
-`busy`, `unavailable`, `auth_required`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
+`busy`, `handed_off`, `unavailable`, `auth_required`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
 
 `auth_required` on a failed Claude start means the native CLI reported it
@@ -760,7 +760,9 @@ age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn
 outcomes, owner-required holds, unarchived lost/failed Agents, blocked Goals,
-launch items waiting for the owner, and #871 stuck objects. For a stuck Goal
+launch items waiting for the owner, #871 stuck objects, handoffs after a turn with
+uncertain effects (`handoff`) and [work not recorded in Git](monitoring.md#work-recorded-in-git)
+(`work_not_in_git`). For a stuck Goal
 (`active_goal_without_round_or_timer`, #871, #904), the item offers a ready
 `goal.round` action (`round`) as the recommended choice alongside `goal.get`
 (`inspect`) when the Agent is cleanly idle with an unconsumed key or due cadence
@@ -2149,12 +2151,13 @@ during drain; it never launches another B or repeats work. See
 [Coordination](coordination.md#agent-switch-implemented) for crash/boundary semantics.
 
 ```text
-swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --profile PROFILE
-swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
 ```
 
-Both forms accept optional `--workspace`, `--worktree` and `--base`. An initially
-busy A refuses before B is allocated. If readiness/transfer fails after B is
+Both forms accept optional `--workspace`, `--worktree` and `--base`. Without
+`--task-command`, or when that command is no longer retained, Swarm finds the task in
+the Store and the Git task record. An initially busy A refuses before B is allocated. If readiness/transfer fails after B is
 created, B remains visible and A's transfer is rolled back. A definitely launched
 but untransferred B is finished with ordinary `swarm.handoff` using B's exact
 identity and a new handoff mutation ID; no finish mutation exists. Stopping either
@@ -2997,7 +3000,8 @@ started for that directory.
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. Repeat `--profile NAME` to import
 profiles from the current settings or from `--settings FILE`. The private
-profiles-only TOML file form `--profile FILE` remains available. It accepts
+ profile TOML file form `--profile FILE` remains available. It contains a
+ `[profiles]` table and can include `[routing]`. The stand accepts
 an optional alternate Swarm binary and
 `--ttl DURATION` (default `DEFAULT_STAND_TTL_MS` = 24 hours, max `MAX_ARTIFACT_TTL_MS` = 30 days in [`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs)). It prints the new
 data directory as the only line of stdout after the daemon is ready. `--json`

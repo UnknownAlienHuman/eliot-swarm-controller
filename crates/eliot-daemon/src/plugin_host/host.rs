@@ -3036,6 +3036,25 @@ async fn resolve_send_config(
 /// turn at send time (Codex). A resolution failure is a typed startup
 /// error: starting with the frozen values would contradict the explicit
 /// overlay inheritance, so the caller fails startup before any native I/O.
+/// Git roots for a sandboxed harness on a managed worktree, so its own
+/// commits work without any wider access.
+async fn resolve_commit_roots(actor: &AgentActorConfig) -> Vec<String> {
+    if !crate::work_truth::needs_commit_roots(&actor.agent.harness, &actor.agent.profile_snapshot) {
+        return Vec::new();
+    }
+    let (Some(workspace), Some(state)) = (actor.agent.workspace.as_deref(), actor.state.upgrade())
+    else {
+        return Vec::new();
+    };
+    let managed = state.store.lock().await.worktree_branch_base(workspace);
+    let Ok(Some((branch, _))) = managed else {
+        return Vec::new();
+    };
+    crate::work_truth::commit_roots(workspace, &branch)
+        .await
+        .unwrap_or_default()
+}
+
 async fn resolve_resume_config(
     actor: &AgentActorConfig,
 ) -> Result<Option<(Option<String>, Option<String>, i64)>> {

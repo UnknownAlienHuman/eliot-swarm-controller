@@ -240,17 +240,15 @@ pub fn validate_stand_profiles(source: &[u8]) -> Result<()> {
     let format_error = || {
         Error::new(
             "invalid",
-            "stand profile file must contain a TOML [profiles] table",
+            "stand profile file must contain a TOML [profiles] table and at most a [routing] table",
         )
     };
     let text = std::str::from_utf8(source).map_err(|_| format_error())?;
     let table = text.parse::<toml::Table>().map_err(|_| format_error())?;
-    if table.len() != 1
-        || table
-            .get("profiles")
-            .and_then(toml::Value::as_table)
-            .is_none()
-    {
+    let only_known = table
+        .iter()
+        .all(|(name, value)| matches!(name.as_str(), "profiles" | "routing") && value.is_table());
+    if !only_known || !table.contains_key("profiles") {
         return Err(format_error());
     }
     Ok(())

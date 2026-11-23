@@ -25,6 +25,11 @@ Skip Swarm when your task needs no child, mail, shared state or shared-file coor
 
 `child.run` inherits your workspace and profile. Provide `text`; `sources` and an allow-listed `profile` are optional. Use `wait_ms:0` if you can finish and take the durable wake; use a bounded wait to get the result now. If it returns `still_running`, continue with the same id. Keep your own ULID when you need to recover a lost launch reply; retry that reply with the same id and payload. Check `status` and `final_text`; if truncated, use `agent.result` with the exact Agent, generation and turn. Never replay an uncertain effect.
 
+## Keep work in Git
+
+Your worktree is the task's state and your session is disposable. Commit on your branch at meaningful checkpoints. Swarm saves private snapshots of uncommitted files, but only your commits reach review and merge. A message starting `Handoff brief:` means you took this work over: read `git status` and `git diff`, then continue from the files. Do not repeat a step the brief marks uncertain until you have checked its effect. An Agent that handed its work off refuses new input with `handed_off` and names its successor; send to that Agent. A manager moves a worker to another allowed profile or role with `swarm.switch`, in the same worktree.
+
+
 ## Mail and shared work
 
 `mail.send` queues by default. `wake:false` defers mail to the next Swarm-supplied input for that generation. Wait for a reply with `mail.inbox` and the exact delivery id; reply with `reply_to_delivery` to wake the asker. If you can finish while waiting, end your turn. For count-only notices or separately read mail, use `mail.inbox`, `mail.read` for the exact delivery, then `mail.ack` for that id.

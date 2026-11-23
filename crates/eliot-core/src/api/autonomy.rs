@@ -39,6 +39,7 @@ pub struct AutonomyResponse {
     pub owner_waiting: AutonomyRow<AutonomyOwnerWaiting>,
     pub usage: AutonomyRow<AutonomyUsage>,
     pub executor_swarm: AutonomyRow<AutonomyExecutorSwarm>,
+    pub work_in_git: AutonomyRow<AutonomyWorkInGit>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
@@ -194,6 +195,18 @@ pub struct AutonomyUsage {
     pub observed_calls: u64,
     pub manager_input_share: Option<f64>,
     pub average_context_tokens: Option<f64>,
+}
+
+/// Whether finished turns left their whole state in Git, and how often work
+/// moved to a successor.
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AutonomyWorkInGit {
+    pub turns: u64,
+    pub turns_in_git: u64,
+    pub snapshots: u64,
+    pub not_in_git: u64,
+    pub handoffs: u64,
+    pub automatic_handoffs: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]

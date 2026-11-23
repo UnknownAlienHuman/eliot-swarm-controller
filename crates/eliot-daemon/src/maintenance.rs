@@ -20,6 +20,8 @@ pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Known provider resets and due probes are serviced within one second.
 pub(crate) const PROVIDER_HOLD_INTERVAL: Duration = Duration::from_secs(1);
+/// A held or lost session waits at most this long for its successor.
+const AUTOMATIC_HANDOFF_INTERVAL: Duration = Duration::from_secs(5);
 
 fn maintenance_join_error(task: &str, error: &tokio::task::JoinError) -> Error {
     let (code, reason) = if error.is_cancelled() {
@@ -190,8 +192,19 @@ async fn run_provider_maintenance(
     let mut provider_ticker = tokio::time::interval(PROVIDER_HOLD_INTERVAL);
     provider_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut provider_probe_tasks = tokio::task::JoinSet::new();
+    let mut handoff_ticker = tokio::time::interval(AUTOMATIC_HANDOFF_INTERVAL);
+    handoff_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = handoff_ticker.tick() => {
+                if let Err(error) = router.finish_session_checkpoints().await {
+                    logging::record(&policy, "daemon.session_checkpoints_failed", &[], Some(&error));
+                }
+                if let Err(error) = router.run_automatic_handoffs().await {
+                    logging::record(&policy, "daemon.automatic_handoffs_failed", &[], Some(&error));
+                }
+                continue;
+            }
             _ = provider_ticker.tick() => {
                 router.flush_command_storms(false);
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT

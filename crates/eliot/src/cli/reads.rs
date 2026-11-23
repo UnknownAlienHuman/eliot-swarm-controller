@@ -107,6 +107,60 @@ pub(crate) async fn run_top(
     }
 }
 
+fn print_work_truth(work: &eliot_core::api::AgentWorkTruthView) {
+    use eliot_core::api::GitCheckpointState as State;
+    if let Some(task) = &work.task_ref {
+        println!("Task record: {task}");
+    }
+    if let Some(checkpoint) = &work.checkpoint {
+        match checkpoint.state {
+            State::Snapshot => println!(
+                "Uncommitted work: {} paths captured in {}",
+                checkpoint.paths.len(),
+                checkpoint
+                    .checkpoint_ref
+                    .as_deref()
+                    .unwrap_or("unknown ref")
+            ),
+            State::Clean | State::Unchanged => println!("Work in Git: all committed"),
+            State::Failed => println!(
+                "Work NOT in Git: checkpoint failed ({})",
+                checkpoint.error.as_deref().unwrap_or("unavailable")
+            ),
+        }
+    }
+    if let Some(checkpoint) = &work.checkpoint {
+        for file in &checkpoint.withheld {
+            println!(
+                "Not captured in Git: {} ({} bytes, {})",
+                file.path, file.bytes, file.reason
+            );
+        }
+        if checkpoint.withheld_truncated {
+            println!("Not captured in Git: more files omitted");
+        }
+    }
+    if work.awaiting_exit {
+        println!("Final checkpoint: waiting for proof that the process tree exited");
+    }
+    if let Some(handoff) = &work.handoff {
+        let why = handoff.reason.map_or("handoff", |reason| reason.as_str());
+        match (&handoff.continued_to, handoff.message.as_deref()) {
+            (Some(agent), _) => println!(
+                "Handoff ({why}): continued on {agent} ({}){}",
+                handoff.profile.as_deref().unwrap_or("unknown profile"),
+                if handoff.uncertain {
+                    "; last turn may have left partial effects"
+                } else {
+                    ""
+                }
+            ),
+            (None, Some(message)) => println!("Handoff ({why}): {}. {message}", handoff.state),
+            (None, None) => println!("Handoff ({why}): {}", handoff.state),
+        }
+    }
+}
+
 pub(crate) async fn run_show(
     ShowArgs { agent }: ShowArgs,
     data_dir: PathBuf,
@@ -150,6 +204,17 @@ pub(crate) async fn run_show(
             }
             if let Some(turn) = &agent.active_turn {
                 println!("Active turn: {turn}");
+            }
+            if let Some(work) = &response.work_truth {
+                print_work_truth(work);
+            }
+            if let Some(choice) = &agent.profile_choice
+                && choice
+                    .skipped
+                    .iter()
+                    .any(|skip| skip.reason == eliot_core::RouteSkipReason::ProviderFailure)
+            {
+                println!("Continued here: {}", choice.reason);
             }
             if let Some(activity) = response.agent.activity.as_ref() {
                 println!(

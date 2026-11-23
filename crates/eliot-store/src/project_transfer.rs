@@ -700,7 +700,7 @@ fn commit_transfer(
             now,
         )?);
     }
-    let goal_revision = goals::transfer_goal_tx(tx, from, to, policy, now, &mut events)?;
+    let goal_revision = goals::transfer_goal_tx(tx, from, to, policy, false, now, &mut events)?;
     let (claims, _, _) = attribution::transfer_claims_tx(tx, from, to, policy, now, &mut events)?;
     if let Some(path) = &value.assignment.workspace {
         workspace::transfer_workspace_custody(tx, path, from, to, now, &mut events)?;

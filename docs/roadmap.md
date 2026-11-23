@@ -402,6 +402,13 @@ the existing protocol. Start with Claude Code and OpenCode for the product accep
 scenarios. Muse, Antigravity, ACP and other adapters are opt-in tasks, not blockers for
 Codex or for unrelated adapters.
 
+- [x] **H4 Work moves from Git (#918, #922).** One switch serves an Owner or manager
+      request, a routing choice, a provider hold and a lost or failed session, with
+      authority never wider. The daemon snapshots worktrees into private refs, keeps the
+      task and journal in Git, builds the brief from Git, file-system and Store facts, and
+      signals work that is not in Git. Qualified on a private daemon with real Claude Haiku
+      and OpenCode (2026-11-22) and Codex (2026-11-23) Agents, including a killed harness,
+      a deleted task file and a Codex successor's commit.
 - [x] **L6.1 Claude Code.** Native SDK/stream, exact callbacks and reported application
       points. The separate shared context-injection and hook-event integration remains
       tracked in L6.6.

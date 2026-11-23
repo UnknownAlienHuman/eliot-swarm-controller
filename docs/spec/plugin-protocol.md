@@ -227,6 +227,10 @@ When OpenCode cannot prove consumption of a steered native input, it translates
 the cancel and readback into a removal fact. The shared settlement returns
 `unknown` and latches the session unless that fact proves removal.
 
+`commit_roots` lists the Git directories the daemon computed for a sandboxed Agent on a
+managed worktree. The adapter only maps them to native writable roots and verifies them
+in the readback.
+
 `eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
 preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional
 fields decode as `None`, and serialization retains their nullable wire fields. Store's

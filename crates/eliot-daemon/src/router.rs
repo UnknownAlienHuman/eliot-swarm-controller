@@ -48,6 +48,7 @@ mod switch;
 mod task_card;
 mod tool_incident;
 mod wake;
+mod work_truth;
 
 #[path = "plugin_host/mod.rs"]
 pub(in crate::router) mod plugin_host;
@@ -66,6 +67,7 @@ pub(crate) use goals::{real_goal_check, run_goal_driver};
 pub(crate) use project_checks::run_project_checks;
 pub(crate) use tool_incident::run_tool_failure_attention;
 pub(crate) use wake::run_agent_wakes;
+pub(crate) use work_truth::run_work_truth;
 
 use self::plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, UnknownCommands};
 use crate::{
@@ -181,6 +183,8 @@ struct RouterInner {
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
     background_wake_max_wait_ms: i64,
+    /// Automatic handoff covers only sessions lost since this daemon started.
+    started_at_ms: i64,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -457,6 +461,7 @@ impl Router {
                 mail,
                 attention,
                 background_wake_max_wait_ms,
+                started_at_ms: now_ms(),
                 owner_token,
                 secrets,
                 agent_credentials,
@@ -5314,6 +5319,12 @@ impl Router {
             });
             (config, pending_background_wake)
         };
+        let work_truth = {
+            let store = self.inner.store.lock().await;
+            store
+                .agent_work_truth(&agent.id, agent.generation)
+                .unwrap_or(None)
+        };
         let mut response = AgentGetResponse {
             agent,
             observation,
@@ -5329,6 +5340,7 @@ impl Router {
             owner_rules_delivery,
             pending_background_wake,
             last_control_failure,
+            work_truth,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)

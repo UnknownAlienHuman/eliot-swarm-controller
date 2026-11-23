@@ -156,6 +156,12 @@ pub struct NativeThreadConfigOverrides {
     pub multi_agent_v2: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_environment_policy: Option<serde_json::Value>,
+    #[serde(
+        rename = "sandbox_workspace_write.writable_roots",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub writable_roots: Option<Vec<String>>,
 }
 
 impl NativeThreadConfigOverrides {
@@ -163,6 +169,7 @@ impl NativeThreadConfigOverrides {
         model_reasoning_effort: Option<String>,
         native_subagents: Option<&str>,
         pass_agent_identity_to_shell: bool,
+        commit_roots: &[String],
     ) -> Option<Self> {
         let deny = (native_subagents != Some("allow")).then_some(false);
         let shell_environment_policy = (!pass_agent_identity_to_shell).then(|| {
@@ -177,14 +184,19 @@ impl NativeThreadConfigOverrides {
                 }
             })
         });
-        (model_reasoning_effort.is_some() || deny.is_some() || shell_environment_policy.is_some())
-            .then_some(Self {
-                model_reasoning_effort,
-                agents_enabled: deny,
-                multi_agent: deny,
-                multi_agent_v2: deny,
-                shell_environment_policy,
-            })
+        let writable_roots = (!commit_roots.is_empty()).then(|| commit_roots.to_vec());
+        (model_reasoning_effort.is_some()
+            || deny.is_some()
+            || shell_environment_policy.is_some()
+            || writable_roots.is_some())
+        .then_some(Self {
+            model_reasoning_effort,
+            agents_enabled: deny,
+            multi_agent: deny,
+            multi_agent_v2: deny,
+            shell_environment_policy,
+            writable_roots,
+        })
     }
 }
 

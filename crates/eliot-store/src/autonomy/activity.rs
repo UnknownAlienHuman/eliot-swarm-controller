@@ -1,7 +1,7 @@
 use crate::usage::manager_at_sql;
 use eliot_core::api::{
     AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyNotes, AutonomyRow,
-    AutonomySteer, AutonomyWaits, SWARM_MAIL_SENDER,
+    AutonomySteer, AutonomyWaits, AutonomyWorkInGit, SWARM_MAIL_SENDER,
 };
 use rusqlite::{Connection, params};
 
@@ -64,6 +64,7 @@ pub(super) struct Activity {
     pub(super) waits: AutonomyRow<AutonomyWaits>,
     pub(super) notes: AutonomyRow<AutonomyNotes>,
     pub(super) executor_swarm: AutonomyRow<AutonomyExecutorSwarm>,
+    pub(super) work_in_git: AutonomyRow<AutonomyWorkInGit>,
 }
 
 pub(super) fn read(tx: &Connection, since: i64, until: i64) -> eliot_core::Result<Activity> {
@@ -74,7 +75,91 @@ pub(super) fn read(tx: &Connection, since: i64, until: i64) -> eliot_core::Resul
         waits,
         notes: read_notes(tx, since, until)?,
         executor_swarm: read_executor_swarm(tx, since, until)?,
+        work_in_git: read_work_in_git(tx, since, until)?,
     })
+}
+
+fn read_work_in_git(
+    tx: &Connection,
+    since: i64,
+    until: i64,
+) -> eliot_core::Result<AutonomyRow<AutonomyWorkInGit>> {
+    let mut counts = AutonomyWorkInGit {
+        turns: 0,
+        turns_in_git: 0,
+        snapshots: 0,
+        not_in_git: 0,
+        handoffs: 0,
+        automatic_handoffs: 0,
+    };
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(data, '$.state'), COALESCE(json_extract(data, '$.withheld'), 0)
+             FROM events INDEXED BY work_truth_events_window
+             WHERE kind = 'git.checkpoint' AND ts BETWEEN ?1 AND ?2
+               AND json_extract(data, '$.trigger') = 'turn_end'
+             ORDER BY ts, seq LIMIT ?3",
+        )
+        .map_err(crate::sql_error)?;
+    let rows = statement
+        .query_map(params![since, until, INPUT_PROBE_ROWS], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(crate::sql_error)?;
+    let mut truncated = false;
+    for (index, row) in rows.enumerate() {
+        if index == MAX_INPUT_ROWS {
+            truncated = true;
+            break;
+        }
+        counts.turns += 1;
+        let (state, withheld) = row.map_err(crate::sql_error)?;
+        if state.as_deref() == Some("snapshot") {
+            counts.snapshots += 1;
+        }
+        // A file left out of the checkpoint exists only in the worktree.
+        if withheld == 0 && matches!(state.as_deref(), Some("snapshot" | "clean" | "unchanged")) {
+            counts.turns_in_git += 1;
+        } else {
+            counts.not_in_git += 1;
+        }
+    }
+    let mut statement = tx
+        .prepare(
+            "SELECT json_extract(data, '$.reason') FROM events
+             INDEXED BY work_truth_events_window
+             WHERE kind = 'handoff.settled' AND ts BETWEEN ?1 AND ?2
+               AND json_extract(data, '$.state') = 'applied'
+             ORDER BY ts, seq LIMIT ?3",
+        )
+        .map_err(crate::sql_error)?;
+    let rows = statement
+        .query_map(params![since, until, INPUT_PROBE_ROWS], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .map_err(crate::sql_error)?;
+    for (index, row) in rows.enumerate() {
+        if index == MAX_INPUT_ROWS {
+            truncated = true;
+            break;
+        }
+        counts.handoffs += 1;
+        if matches!(
+            row.map_err(crate::sql_error)?.as_deref(),
+            Some("provider_hold" | "session_lost")
+        ) {
+            counts.automatic_handoffs += 1;
+        }
+    }
+    let mut row = AutonomyRow::partial(
+        "retained git.checkpoint and handoff.settled events",
+        "turns before the daemon recorded checkpoints are outside this source",
+        counts,
+    );
+    if truncated {
+        row.limit_coverage("the checkpoint scan reached its limit");
+    }
+    Ok(row)
 }
 
 fn read_steer(

@@ -401,6 +401,13 @@ pub(crate) struct RoutingConfig {
     pub(crate) default: Vec<String>,
     #[serde(default)]
     on_provider_failure: OnProviderFailure,
+    /// Move owed work off a held or lost session. Absent means on.
+    #[serde(default)]
+    auto_handoff: Option<bool>,
+    /// Ordered successors for Agents launched with an explicit profile, and
+    /// for a role with no other candidate.
+    #[serde(default)]
+    pub(crate) handoff_fallback: Vec<String>,
     /// Additional extensible roles share the same ordered candidate syntax.
     #[serde(flatten)]
     pub(crate) roles: BTreeMap<String, Vec<String>>,
@@ -425,6 +432,10 @@ impl RoutingConfig {
 
     pub(crate) fn provider_failover(&self) -> bool {
         self.on_provider_failure == OnProviderFailure::Next
+    }
+
+    pub(crate) fn auto_handoff(&self) -> bool {
+        self.auto_handoff.unwrap_or(true)
     }
 }
 
@@ -1077,6 +1088,22 @@ pub(crate) struct DaemonConfig {
     /// background process to exit before delivering a still-running Swarm note.
     #[serde(default = "default_background_wake_max_wait_secs")]
     pub(crate) background_wake_max_wait_secs: i64,
+    /// A changed file above this size stays out of worktree checkpoints.
+    #[serde(default = "default_checkpoint_max_file_bytes")]
+    pub(crate) checkpoint_max_file_bytes: i64,
+    /// Most changed-file bytes one worktree checkpoint reads and stores.
+    #[serde(default = "default_checkpoint_max_total_bytes")]
+    pub(crate) checkpoint_max_total_bytes: i64,
+}
+
+/// Bounds of one worktree checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CheckpointLimits {
+    pub(crate) file_bytes: u64,
+    pub(crate) total_bytes: u64,
+    /// New object bytes one generation may add across all its checkpoints.
+    /// Retention deletes refs, and Git keeps their objects until it collects them.
+    pub(crate) generation_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1108,9 +1135,23 @@ impl Default for DaemonConfig {
             session_growth_ratio_permille: default_session_growth_ratio_permille(),
             session_file_bytes: default_session_file_bytes(),
             background_wake_max_wait_secs: default_background_wake_max_wait_secs(),
+            checkpoint_max_file_bytes: default_checkpoint_max_file_bytes(),
+            checkpoint_max_total_bytes: default_checkpoint_max_total_bytes(),
         }
     }
 }
+
+fn default_checkpoint_max_file_bytes() -> i64 {
+    16 * 1024 * 1024
+}
+
+fn default_checkpoint_max_total_bytes() -> i64 {
+    64 * 1024 * 1024
+}
+
+/// Upper bound for one checkpoint, whose changed files are held in memory.
+const MAX_CHECKPOINT_TOTAL_BYTES: i64 = 1024 * 1024 * 1024;
+const CHECKPOINT_GENERATION_FACTOR: u64 = 8;
 
 fn default_attention_suspicion_secs() -> i64 {
     15 * 60
@@ -1220,6 +1261,17 @@ impl DaemonConfig {
                 ),
             ));
         }
+        if self.checkpoint_max_file_bytes <= 0
+            || self.checkpoint_max_total_bytes < self.checkpoint_max_file_bytes
+            || self.checkpoint_max_total_bytes > MAX_CHECKPOINT_TOTAL_BYTES
+        {
+            return Err(core::Error::new(
+                "profile_error",
+                format!(
+                    "config.toml: daemon.checkpoint_max_file_bytes must be positive and at most checkpoint_max_total_bytes, which must be at most {MAX_CHECKPOINT_TOTAL_BYTES}"
+                ),
+            ));
+        }
         Ok(Self {
             chats_root: self.chats_root,
             on_restart: self.on_restart,
@@ -1235,7 +1287,18 @@ impl DaemonConfig {
             session_growth_ratio_permille: self.session_growth_ratio_permille,
             session_file_bytes: self.session_file_bytes,
             background_wake_max_wait_secs: self.background_wake_max_wait_secs,
+            checkpoint_max_file_bytes: self.checkpoint_max_file_bytes,
+            checkpoint_max_total_bytes: self.checkpoint_max_total_bytes,
         })
+    }
+
+    pub(crate) fn checkpoint_limits(&self) -> CheckpointLimits {
+        let total_bytes = self.checkpoint_max_total_bytes.max(0) as u64;
+        CheckpointLimits {
+            file_bytes: self.checkpoint_max_file_bytes.max(0) as u64,
+            total_bytes,
+            generation_bytes: total_bytes.saturating_mul(CHECKPOINT_GENERATION_FACTOR),
+        }
     }
 
     pub(crate) fn heavy_thresholds(&self) -> core::Result<core::HeavyThresholds> {
@@ -1824,6 +1887,7 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
     config.desktop.validate()?;
     let mut role_candidates = Vec::with_capacity(config.routing.roles.len() + 1);
     role_candidates.push(("default", &config.routing.default));
+    role_candidates.push((HANDOFF_FALLBACK_KEY, &config.routing.handoff_fallback));
     role_candidates.extend(
         config
             .routing
@@ -1857,7 +1921,9 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
         }
     }
     for (role, profiles) in role_candidates {
-        validate_routing_role(role)?;
+        if role != HANDOFF_FALLBACK_KEY {
+            validate_routing_role(role)?;
+        }
         if profiles.len() > 64 {
             return Err(core::Error::new(
                 "profile_error",
@@ -1891,9 +1957,13 @@ fn parse_config_document(source: &str) -> core::Result<FileConfig> {
     toml::from_str(source).map_err(|error| map_toml_error(source, error))
 }
 
+const HANDOFF_FALLBACK_KEY: &str = "handoff_fallback";
+
 pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
-    if role == "on_provider_failure"
-        || role.is_empty()
+    if matches!(
+        role,
+        "on_provider_failure" | "auto_handoff" | HANDOFF_FALLBACK_KEY
+    ) || role.is_empty()
         || role.len() > MAX_PROFILE_NAME_LEN
         || !role
             .chars()
@@ -1901,7 +1971,7 @@ pub(crate) fn validate_routing_role(role: &str) -> core::Result<()> {
     {
         return Err(core::Error::new(
             "profile_error",
-            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore and cannot be on_provider_failure",
+            "config.toml: routing role names must be nonempty letters, digits, hyphen or underscore and cannot be a routing setting",
         ));
     }
     Ok(())

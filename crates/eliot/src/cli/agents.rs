@@ -953,10 +953,11 @@ pub(crate) async fn run_switch(
         id: mutation_id(id)?,
         from: args.from,
         from_generation: args.generation,
-        task_command: args.task_command,
+        task_command: args.task_command.unwrap_or_default(),
         commands: args.commands,
         launch: eliot_core::api::SwitchLaunch {
             profile: args.profile,
+            role: args.role,
             harness: args.harness,
             model: args.model,
             effort: args.effort,

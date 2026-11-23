@@ -98,6 +98,8 @@ fn kind_title(kind: OwnerInboxKind) -> &'static str {
         OwnerInboxKind::BlockedGoal => "Blocked Goals",
         OwnerInboxKind::LaunchQueue => "Waiting launches",
         OwnerInboxKind::Stuck => "Stuck",
+        OwnerInboxKind::Handoff => "Handoffs to check",
+        OwnerInboxKind::WorkNotInGit => "Work not in Git",
     }
 }
 
@@ -113,6 +115,8 @@ fn kind_count(kind: OwnerInboxKind, count: usize) -> String {
         OwnerInboxKind::BlockedGoal => ("blocked Goal", "blocked Goals"),
         OwnerInboxKind::LaunchQueue => ("waiting launch", "waiting launches"),
         OwnerInboxKind::Stuck => ("stuck", "stuck"),
+        OwnerInboxKind::Handoff => ("handoff to check", "handoffs to check"),
+        OwnerInboxKind::WorkNotInGit => ("item not in Git", "items not in Git"),
     };
     eliot_core::count_words(count as u64, one, many)
 }
@@ -498,6 +502,14 @@ impl DesktopApp {
             None if busy => m3::secondary("Deciding…").into(),
             None => View::empty(),
         };
+        let instructions: View = match &item.instructions {
+            Some(text) => m3::secondary(text.clone())
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true)
+                .automation_name(format!("Commands to run: {subject}"))
+                .into(),
+            None => View::empty(),
+        };
         m3::card(palette)
             .automation_name(format!("{subject}: {reason}, {age}"))
             .content(
@@ -514,6 +526,7 @@ impl DesktopApp {
                                 .vertical_alignment(VerticalAlignment::Center),
                         )),
                     m3::secondary(reason).text_wrapping(TextWrapping::Wrap),
+                    instructions,
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(tokens::spacing::SM)

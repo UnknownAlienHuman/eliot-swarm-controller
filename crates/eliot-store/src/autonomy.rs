@@ -39,6 +39,7 @@ impl Store {
             owner_waiting: fleet.owner_waiting,
             usage: fleet.usage,
             executor_swarm: activity.executor_swarm,
+            work_in_git: activity.work_in_git,
         };
         if event_window_pruned(&tx, since)? {
             let reason = "the event retention boundary overlaps the requested window";
@@ -46,6 +47,7 @@ impl Store {
             report.waits.limit_coverage(reason);
             report.notes.limit_coverage(reason);
             report.executor_swarm.limit_coverage(reason);
+            report.work_in_git.limit_coverage(reason);
         }
         tx.commit().map_err(sql_error)?;
         Ok(report)

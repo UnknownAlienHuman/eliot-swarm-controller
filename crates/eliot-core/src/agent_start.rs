@@ -58,6 +58,11 @@ pub struct AgentStartParams {
     /// the overrides above apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_revision: Option<i64>,
+    /// Git directories a sandboxed harness needs to commit on this managed
+    /// worktree's own branch. The daemon computes them; the adapter maps them
+    /// to its native writable roots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commit_roots: Vec<String>,
 }
 
 impl AgentStartParams {
@@ -84,6 +89,7 @@ impl AgentStartParams {
             model_override: None,
             effort_override: None,
             config_revision: None,
+            commit_roots: Vec::new(),
         }
     }
 }

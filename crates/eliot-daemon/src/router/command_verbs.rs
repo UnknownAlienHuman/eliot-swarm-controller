@@ -604,6 +604,32 @@ impl Router {
 
     /// Remove a managed worktree and settle a removal failure.
     pub(super) async fn execute_worktree_remove_command(&self, id: &str, dispatched: Command) {
+        // Capture what is on disk while it still exists. A failed capture is
+        // recorded and does not change the removal's own safety checks.
+        let directory_gone = dispatched.args.get("observe_missing") == Some(&Value::Bool(true));
+        if let Some(target) = dispatched.target.as_deref().filter(|_| !directory_gone) {
+            let generation = self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_agent(target)
+                .ok()
+                .flatten()
+                .map(|agent| agent.generation);
+            if let Some(generation) = generation
+                && let Err(error) = self
+                    .checkpoint_work(target, generation, "worktree_remove", None)
+                    .await
+            {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.removal_checkpoint_failed",
+                    &[("command", id)],
+                    Some(&error),
+                );
+            }
+        }
         match self.inner.workspaces.remove(&dispatched).await {
             Ok(_) => {}
             Err(error) => {

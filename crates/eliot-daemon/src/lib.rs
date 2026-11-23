@@ -33,6 +33,7 @@ mod skill;
 mod stand_cleanup;
 pub mod startup;
 mod update_backup;
+mod work_truth;
 mod workspace_git;
 mod workspaces;
 

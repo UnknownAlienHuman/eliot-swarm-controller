@@ -339,6 +339,9 @@ impl Router {
         {
             steps.push(step);
         }
+        if let Some(step) = handoff_step(&store, agent, generation)? {
+            steps.push(step);
+        }
         let (command, turn) = store.agent_unknowns(agent)?;
         if let Some(command) = command {
             let mut step = command_step(&command);
@@ -536,6 +539,58 @@ fn provider_switch_step(
         (
             "exhausted",
             format!("Provider refusal ({cause}). No later candidate remains in this role."),
+        )
+    };
+    Ok(Some(routing_step(code, message, Some(event.ts))))
+}
+
+/// The latest ordinary handoff of this generation, for every reason.
+fn handoff_step(
+    store: &eliot_store::Store,
+    agent: &str,
+    generation: i64,
+) -> Result<Option<DiagnoseStep>> {
+    let Some(event) = store.latest_handoff_event(agent, generation)? else {
+        return Ok(None);
+    };
+    let data = &event.data;
+    let why = data["reason"]
+        .as_str()
+        .unwrap_or("handoff")
+        .replace('_', " ");
+    let (code, message) = if let Some(destination) = data["continued_to"].as_str() {
+        let profile = data["profile"].as_str().unwrap_or("unknown profile");
+        let uncertain = if data["uncertain"].as_bool() == Some(true) {
+            " The last turn may have left partial effects; the brief says so."
+        } else {
+            ""
+        };
+        (
+            "handed_off",
+            format!("Handoff ({why}). Continued on {destination} ({profile}).{uncertain}"),
+        )
+    } else if event.kind == eliot_store::HANDOFF_WAITING {
+        (
+            "handoff_waiting",
+            format!(
+                "Handoff ({why}) is waiting. {}",
+                data["message"]
+                    .as_str()
+                    .unwrap_or("No successor is eligible.")
+            ),
+        )
+    } else if event.kind == eliot_store::HANDOFF_QUEUED {
+        ("handoff_queued", format!("Handoff ({why}) is in progress."))
+    } else {
+        (
+            "handoff_stopped",
+            format!(
+                "Handoff ({why}) stopped: {}.",
+                data["message"]
+                    .as_str()
+                    .or_else(|| data["error"].as_str())
+                    .unwrap_or("no successor")
+            ),
         )
     };
     Ok(Some(routing_step(code, message, Some(event.ts))))

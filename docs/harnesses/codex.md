@@ -97,6 +97,15 @@ exercise used `permissions = "read-only"`. The mode also accepts `"default"`; om
 preserves the native default. Model and effort stay pinned, and permissions are configured
 independently of the collaboration mode.
 
+### Commits in a managed worktree
+
+The native sandbox protects Git metadata, so a linked worktree cannot commit by default.
+The daemon passes [`commit_roots`](../spec/coordination.md#agent-switch-implemented), and
+the adapter maps them to `sandbox_workspace_write.writable_roots` on thread start and
+resume and requires them in the readback. Git can still print a `packed-refs.lock`
+permission error after a successful commit, because `packed-refs` stays outside those
+roots. The commit stands.
+
 ### Eliot MCP bridge
 
 Each controlled Agent generation receives a private process-local stdio server named

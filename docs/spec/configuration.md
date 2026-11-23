@@ -918,6 +918,8 @@ heavy_rss_bytes = 1073741824
 session_growth_ratio_permille = 800
 session_file_bytes = 67108864
 background_wake_max_wait_secs = 1800
+checkpoint_max_file_bytes = 16777216
+checkpoint_max_total_bytes = 67108864
 ```
 
 A child-process tree whose wall time, consumed CPU or peak RSS crosses any one
@@ -930,6 +932,8 @@ session boundary. After a successful commandless native continuation, a growth
 switch keeps the prior task command as its handoff anchor and includes the
 latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 [automatic background-process wake](automation.md#automatic-background-process-wake).
+`checkpoint_max_file_bytes` and `checkpoint_max_total_bytes` (at most 1 GiB) bound
+[worktree checkpoints](monitoring.md#work-recorded-in-git) and apply to the next one.
 `swarm doctor` shows each installed harness version with its self-check record
 (installed version plus when that version last passed Swarm's own scenario,
 #932) without blocking launch; no version gate pins executable selection.
@@ -1630,6 +1634,37 @@ transaction with fresh command IDs, the retained workspace and the next eligible
 candidate. Each switch consumes part of the frozen order. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
 An automated launch's provider successor applies the same quota admission policy.
+
+#### Automatic handoff (#918)
+
+A session that can no longer continue its work hands it to another model through the
+[ordinary switch](coordination.md#agent-switch-implemented). There is no separate
+failover path, and a hold never makes work wait for its reset when a successor exists.
+
+```toml
+[routing]
+auto_handoff = true                    # default; false turns automatic handoff off
+handoff_fallback = ["claude-haiku", "opencode-free"]
+default = ["codex-luna", "muse"]
+```
+
+The daemon evaluates this every five seconds for root and child Agents outside chats:
+
+- a quota or rate-limit hold on an idle Agent that still owes work: its held turn did
+  not finish, input is waiting or was refused by the hold, or a Goal is active;
+- a lost or failed session of this daemon's lifetime with the same kinds of owed work,
+  20 seconds after the loss so native process-loss recovery can reopen it first.
+
+Candidates are the role that launched the Agent, then `handoff_fallback` when the role
+has no other profile. An Agent launched with an explicit profile uses
+`handoff_fallback` alone and stays put when it is empty. A lost session may restart on
+its own profile first; a held or failed one may not. Profiles this task already left are
+skipped. Each candidate passes installation, hold, capacity, quota reserve and the
+[equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
+eligible candidate the Agent keeps its work, `swarm why` names each skip, and the check
+repeats. A refused admission is tried again after five minutes and a failed launch or
+transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
+ordinary request. Settings changes apply to the next evaluation.
 
 ### CLI editing
 

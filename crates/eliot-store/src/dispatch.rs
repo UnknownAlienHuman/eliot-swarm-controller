@@ -39,6 +39,9 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     if !is_attachment_verb(command.command.verb.as_str()) {
         observer::require_controlled(&agent)?;
     }
+    if matches!(command.command.verb.as_str(), "send" | "steer" | "resume") {
+        handoff::require_not_handed_off(tx, agent_num)?;
+    }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;
     }
@@ -868,6 +871,7 @@ fn dispatch_inject_tx(
             "active_turn inject unexpectedly has a native request id",
         ));
     }
+    handoff::require_not_handed_off(tx, parse_agent_id(&agent.id)?)?;
     provider_holds::require_dispatch_tx(tx, agent, &command.command)?;
     if args
         .expires_at_ms

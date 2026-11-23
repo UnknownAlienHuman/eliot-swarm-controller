@@ -2294,6 +2294,14 @@ fn submit_tx_mode(
     if let Some(admission) = replay {
         return Ok(admission);
     }
+    if matches!(
+        request.verb.as_str(),
+        "send" | "steer" | "inject" | "resume"
+    ) && let Some(target) = request.target.as_deref()
+        && let Ok(target) = parse_agent_id(target)
+    {
+        handoff::require_not_handed_off(tx, target)?;
+    }
     if restart_resume {
         let target = request
             .target

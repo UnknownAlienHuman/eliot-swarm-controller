@@ -740,6 +740,61 @@ Only already-dirty/untracked, nonignored, nonscratch paths are read. Symlink tar
 is hashed without following it. File/byte caps return `unavailable`; incomplete data
 never counts as no progress. No temporary index, `git add`, `write-tree` or object write.
 
+## Work recorded in Git
+
+Issue #922 applies [Work truth lives in Git and the file system](../architecture.md#work-truth-lives-in-git-and-the-file-system)
+without relying on the model. The daemon's work-truth worker follows committed events
+through its own durable cursor.
+
+**Checkpoint.** At each turn end and session end, and before a switch, handoff or
+worktree removal, the daemon captures changed and new files, except ignored ones, under
+`refs/eliot/checkpoints/<agent>/g<generation>/<time>`. It uses a private index,
+`commit-tree` and `update-ref`, so the Agent's branch, index and files are untouched. An
+unchanged worktree writes no Git object. The newest 20 refs per generation are kept.
+A failed capture is recorded and never blocks a turn, stop, handoff or removal.
+
+Each file is read once, and those exact bytes are scanned and stored. A checkpoint does
+not copy a file over `daemon.checkpoint_max_file_bytes` (default 16 MiB), past
+`daemon.checkpoint_max_total_bytes` per checkpoint (default 64 MiB), past 512 changed
+files, or past a generation budget of eight checkpoint totals of newly written bytes.
+Retention deletes refs and Git keeps their objects until it collects them, so that
+budget is what bounds repository growth. It also leaves out a file holding a value Swarm
+knows is a secret, a nested repository, and anything else it cannot read as a file.
+Each such file is recorded with its path, size and reason in the checkpoint, `swarm show`
+and the handoff brief as not captured. It exists only in the worktree, and the turn
+counts as not fully in Git. A checkpoint that could capture nothing is a failed one.
+
+The final checkpoint of a session waits for the
+[owned exit proof](#process-identity-and-custody): the process family has exited and the
+native source has drained. A lost state alone does not prove that, because an orphaned
+harness child could still be writing. A lost or failed source qualifies for a successor
+in its worktree under the same proof. On Windows the Job proves the whole family. Unix
+custody is degraded and proves what its process-group drain can.
+
+**Task record.** `refs/eliot/tasks/<branch>` holds `task.md` (the full task),
+`card.json` (branch, base, Agent, profile, Goal and check) and `journal.md`. Known
+secrets and text shaped like a credential are redacted in all three. For a task the
+Owner wrote directly, the card lists the path, size and SHA-256 of up to eight absolute
+`.md`/`.txt` files the task names. When that task text is only a pointer (at most 512
+bytes outside any delivered source block), the named file is the task, so a regular
+UTF-8 file of at most 256 KiB is also saved, redacted, under `sources/`, and the brief
+names it next to the original task. A file holding a known secret is neither hashed nor
+saved. Other files stay out of Git, because every Agent with access to the repository
+can read its refs. To keep such a file with the task, deliver it with `--source`. The
+journal gains each finished turn's report when work changes or
+the session ends, and keeps its newest 128 KiB. A successor on the branch reuses the
+record. These refs are local: an ordinary branch push does not carry them.
+
+**Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
+Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.
+`owner.inbox` shows `work_not_in_git` for a failed checkpoint, an Agent
+that ended with uncommitted work and no successor, or a managed worktree that
+[missing-folder reconciliation](coordination.md#registered-artifacts-and-cleanup-k69) settled while its last
+checkpoint or Git observation held uncommitted work. That item carries the exact commands
+that restore it: `git worktree prune`, `git worktree add <dir> <branch>` and
+`git restore --source=<checkpoint> --worktree -- .`.
+A failed capture keeps the reference to the last good checkpoint.
+
 ## Provider holds
 
 Provider holds are durable local coordination state. Their view and restriction shapes
@@ -1292,6 +1347,7 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 | Swarm fact notes | Deliveries, moves and cancellations of retained fact notes, with counts and confirmed corrections by kind. |
 | Owner backlog | All current decision subjects, including snoozed revisions, with per-kind counts and ages from each source row's recorded transition time. |
 | Usage | Retained normalized turn input and measured first-call context. The role is evaluated at turn completion. |
+| Work in Git | Retained `git.checkpoint` turn-end facts: turns whose whole state is in Git by commit or snapshot, snapshots and unrecorded turns. Applied `handoff.settled` facts, with the automatic ones counted. |
 | Executors calling Swarm | Retained turn starts and authenticated Swarm MCP starts attributed to executor activity, grouped by profile. |
 
 The attention worker samples liveness on startup and every three minutes (#871).

@@ -24,6 +24,9 @@ pub struct HandoffRequest {
 
 impl HandoffRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.task_command.is_empty() {
+            return Err(Error::new("invalid", "handoff names no original task"));
+        }
         validate_selection(
             &self.id,
             &self.from,
@@ -73,7 +76,7 @@ pub(super) fn validate_selection(
     commands: &[String],
 ) -> Result<()> {
     parse_agent_id(from)?;
-    if id.trim().is_empty() || generation < 1 || task.is_empty() || task.len() > 256 {
+    if id.trim().is_empty() || generation < 1 || task.len() > 256 {
         return Err(Error::new(
             "invalid",
             "invalid transfer source or selection",

@@ -39,7 +39,7 @@ pub use goals::{
     GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundCommitResult, GoalRoundDecision,
     GoalRoundKey, GoalRoundProbe,
 };
-pub use handoff::HandoffAdmission;
+pub use handoff::{AGENT_HANDED_OFF, BriefFacts, HandoffAdmission};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
@@ -247,8 +247,13 @@ pub use source_batches::CompletionWorktreeCapture;
 mod source_handoff;
 mod source_install;
 mod switch;
-pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
+pub use switch::{
+    AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING, PROVIDER_SWITCH_QUEUED,
+    PROVIDER_SWITCH_SETTLED, SwitchContinuation, SwitchWork,
+};
 mod swarm_usage;
+mod work_truth;
+pub use work_truth::{GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput, JournalTurn};
 mod turn_recovery;
 pub(crate) mod usage;
 mod wakes;

@@ -1,6 +1,9 @@
 //! One durable switch worker composes normal launch and H2 transfer.
+use super::routing::HandoffRoute;
 use super::*;
-use eliot_core::api::{SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest};
+use eliot_core::api::{
+    HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest,
+};
 
 fn log_refusal(policy: &eliot_core::SecretPolicy, id: &str, code: &str, reason: &str) {
     let error = Error::new(code, reason).with_origin(eliot_core::FailureOrigin::Swarm, reason);
@@ -34,6 +37,30 @@ fn reuse_retained_checkout(
 }
 
 impl Router {
+    /// The profiles a manager may place a worker on: the worker's own and the
+    /// manager's frozen child profiles.
+    async fn manager_successors(&self, manager: &str, source: &Agent) -> Result<Vec<String>> {
+        let id = manager
+            .strip_prefix("agent:")
+            .and_then(|rest| rest.split(':').next())
+            .ok_or_else(|| Error::new("not_allowed", "switch caller is not a manager"))?;
+        let row = {
+            let store = self.inner.store.lock().await;
+            store.get_agent(id)?
+        }
+        .ok_or_else(|| Error::new("stale_generation", "switch caller is gone"))?;
+        let mut allowed = vec![source.profile.clone()];
+        allowed.extend(
+            row.profile_snapshot["child_profiles"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned),
+        );
+        Ok(allowed)
+    }
+
     pub(crate) async fn run_provider_switches(
         &self,
         mut receiver: broadcast::Receiver<Event>,
@@ -44,7 +71,10 @@ impl Router {
                 _ = shutdown.changed() => return Ok(()),
                 event = receiver.recv() => {
                     match event {
-                        Ok(event) if event.kind == eliot_store::PROVIDER_SWITCH_QUEUED => {
+                        Ok(event)
+                            if event.kind == eliot_store::PROVIDER_SWITCH_QUEUED
+                                || event.kind == eliot_store::HANDOFF_QUEUED =>
+                        {
                             if let Some(id) = event.data["switch_command"].as_str() {
                                 self.schedule_command(id.to_owned(), None);
                             }
@@ -78,7 +108,12 @@ impl Router {
         owner_process: Option<&OwnerProcess>,
         profile_authority: Option<[u8; 32]>,
     ) -> Result<Value> {
-        require_owner(principal)?;
+        if !matches!(principal, Principal::Owner | Principal::Agent { .. }) {
+            return Err(Error::new(
+                "not_allowed",
+                "only the Owner or a manager may switch Agents",
+            ));
+        }
         let request: SwitchRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
@@ -133,6 +168,8 @@ impl Router {
             provider_failure,
             profile_authority,
             owner_automation,
+            continuation,
+            requested_by,
         }) = work
         else {
             return;
@@ -185,7 +222,33 @@ impl Router {
             };
             launch.args = request.launch.args(&workspace)?;
             let mut owner_automation = owner_automation;
-            let provider_route = if let Some(failure) = provider_failure {
+            let handoff_route = if let Some(value) = continuation {
+                Some(HandoffRoute {
+                    reason: value.reason,
+                    kind: value.kind,
+                    role: None,
+                    allowed: None,
+                })
+            } else if let (Some(manager), Some(role)) =
+                (requested_by.as_deref(), request.launch.role.as_deref())
+            {
+                Some(HandoffRoute {
+                    reason: HandoffReason::Routing,
+                    kind: None,
+                    role: Some(role.to_owned()),
+                    allowed: Some(self.manager_successors(manager, &source).await?),
+                })
+            } else {
+                None
+            };
+            let provider_route = if let Some(route) = &handoff_route {
+                if let Some(args) = launch.args.as_object_mut() {
+                    args.remove("role");
+                }
+                let (name, identity) = self.route_handoff(&mut launch, &source, route).await?;
+                launch.args["profile"] = json!(name);
+                Some((launch.args["profile_choice"].take(), identity))
+            } else if let Some(failure) = provider_failure {
                 let authority = failure.require_authority(&source.profile_snapshot)?;
                 owner_automation |= source
                     .profile_choice
@@ -244,8 +307,9 @@ impl Router {
                     false,
                     routing::LaunchRouting {
                         owner_automation,
-                        provider_source: (provider_route.is_some() || profile_authority.is_some())
-                            .then_some(&source.profile_snapshot),
+                        provider_source: (provider_failure.is_some()
+                            || profile_authority.is_some())
+                        .then_some(&source.profile_snapshot),
                         ..Default::default()
                     },
                     true,
@@ -420,9 +484,14 @@ impl Router {
         })
         .await;
         let policy = self.secret_policy_snapshot();
+        // Git and the file system are the state B continues from. Outside the
+        // Store lock: reading them can take seconds.
+        let git = self
+            .handoff_git_facts(&request.from, Some(&request.task_command))
+            .await;
         let result = {
             let mut store = self.inner.store.lock().await;
-            let result = store.finish_switch(id, &policy, now_ms());
+            let result = store.finish_switch(id, &policy, &git, now_ms());
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
                 if let Some(handoff) = &change.value.handoff {

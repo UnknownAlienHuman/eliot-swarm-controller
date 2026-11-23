@@ -1090,37 +1090,45 @@ notes are redacted; known-secret identifiers refuse the transfer. An Agent hando
 transfers no claims: live claims stay on A.
 Claims never prove ownership or silently reassign work. An Owner handoff transfers
 only a quiescent Eliot Goal when B has none: clear A's Goal and install its
-definition/budgets/counters paused on B's generation with a new revision and no
-inherited idle/round key. A cleared destination Goal row may supply the next revision;
+definition/budgets/counters on B's generation with a new revision and no
+inherited idle/round key. It arrives paused, except that a
+[switch](#agent-switch-implemented) keeps an active Goal active and its first round
+waits for the turn of the brief. A cleared destination Goal row may supply the next revision;
 another destination Goal refuses. Completed/cleared source Goals stay historical; a
 blocked source Goal refuses until explicitly reset or cleared, so handoff cannot
 bypass its block. Without a transferable source Goal, B keeps its own Goal unchanged.
 An Agent handoff transfers no Goal: both Goals stay put. A private additive used-turn
 baseline preserves consumed turns and charges each subsequent B turn immediately,
 including across another handoff. Cadence re-anchors at handoff; reserved continuations
-and running/unknown Goal markers on either Agent refuse. Explicit
-resume is required; reserved/unknown continuations are never copied. Native Goals
+and running/unknown Goal markers on either Agent refuse, except that an unknown round
+of a lost or failed source stays burned and does not block its successor. A paused
+Goal needs an explicit resume; reserved/unknown continuations are never copied. Native Goals
 remain `unsupported` until the relevant adapters expose them. An Owner handoff
 transfers controlled children through the same re-parent transaction and its
 limits. Observed native children keep their harness-owned parentage. An Agent
 handoff leaves children in place. Validation failure rolls back the transfer.
 
 The first successor input is one bounded handoff brief, admitted as ordinary `send`
-to B's exact generation. It contains the original task text from the named retained
-command; a quoted history of the later send/steer/inject texts A received after
+to B's exact generation. It contains the original task text, which a switch finds as
+described under [Agent switch](#agent-switch-implemented); a quoted history of the later send/steer/inject texts A received after
 it, oldest first, each with its command principal and verb. These capture limits
 and clarifications, and omit A's automatic Goal continuations. The brief also
-includes Store facts about A (workspace and its Git work, Goal status and last check
-exit, open or unknown commands of the handed-off generation), labelled as recorded by
-Swarm; A's latest retained final output (exact turn binding, or an explicit absence),
-framed as quoted model output, and pointers to A/generation/command/turn
-retained history. Apply existing known-secret
+includes Store facts about A (workspace, branch and base, Git work, Goal status and
+last check exit, open claims, open or unknown commands of the handed-off generation,
+and any last turn whose effects are uncertain), labelled as recorded by Swarm. It
+then quotes facts the Router read from
+[Git and the file system](monitoring.md#work-recorded-in-git) for this transfer:
+HEAD, base, status, commits since the base, the diff from the base, the uncommitted
+patch of tracked files, the latest checkpoint and the task record. New files are named
+in the status and kept in the checkpoint, because the brief itself is persisted. It carries
+pointers to A/generation/command/turn retained history. A vendor transcript or a
+model's own report is never part of the brief. Apply existing known-secret
 filtering/redaction and SEND/frame limits; label any truncated text and history gaps.
 Never copy credentials, raw native context or an inferred successful result. B keeps
-its own native context. The brief is labelled as context only and precedes successor
-inputs in FIFO order.
-The builder reads retained source text in the transfer transaction and labels missing
-or pruned final output without inferring success. Each new input receives a fresh ULID,
+its own native context. An ordinary handoff to an existing Agent labels the brief as
+context only. A switch tells B to continue the task from the worktree. The brief
+precedes successor inputs in FIFO order.
+The builder reads retained source text in the transfer transaction. Each new input receives a fresh ULID,
 frozen in the parent result before commit, and shares its parent/ordinal representation.
 
 Local admission is atomic; native application is not. The Store-only parent is `applied`
@@ -1148,18 +1156,69 @@ the committed transfer and its current brief state.
 
 ### Agent switch (implemented)
 
-`swarm.switch` is one Owner launch-plus-handoff operation. Its sole wire DTOs are
+`swarm.switch` is the one operation that moves work to a new session. It serves
+every [`HandoffReason`](../../crates/eliot-core/src/api/switch.rs): an Owner or manager
+request, a routing choice, a provider hold, and a lost or failed session. A session is
+disposable. [Git and the file system](../architecture.md#work-truth-lives-in-git-and-the-file-system)
+hold the task, so B in the same worktree continues from the files as they are and no
+commit is required first.
+
+Its sole wire DTOs are
 [`SwitchRequest` / `SwitchResponse`](../../crates/eliot-core/src/api/switch.rs).
-Choose an explicit profile or the existing ad-hoc `harness/model/effort/auth/cmd`
-selectors, including another harness. Workspace defaults to A's retained workspace;
+Choose an explicit profile, a routing `role`, or the existing ad-hoc
+`harness/model/effort/auth/cmd` selectors, including another harness. A manager may
+switch a worker in its controlled scope to that worker's profile or one of the manager's
+frozen `child_profiles`, by profile or role, in the worker's worktree. B takes A's place
+under A's live manager. Workspace defaults to A's retained workspace;
 explicit workspace/worktree/base use normal launch canonicalization and Git freeze.
 The route binds B to A's retained project identity, including worktree preparation;
 it does not make B a child of A or rewrite either frozen native profile.
 Normal launch profile/credential checks, provider holds, capacity and workspace
 reservation/dispatch still apply. No native process or context is transplanted.
 
-Before external preparation the Store checks A's exact generation and quiescence,
-the retained task and selected SENDs, transferable Goal, and controlled child
+A daemon-initiated or manager switch must pass
+[`handoff_authority_refusal`](../../crates/eliot-core/src/routing.rs) at routing, launch
+admission and transfer. B's authority must be provably equal or narrower than A's:
+
+- Native access maps to a range on one ladder (read-only, ask, automatic, full). B's
+  highest possible level must not exceed A's lowest. A value that native settings can
+  still change spans every level it could resolve to. OpenCode has no frozen permission
+  knob or OS sandbox, so it counts as ask through full.
+- Swarm control is equal or narrower. Native subagents and MCP inheritance are not
+  enabled unless A had them. `mcp_allow`, `child_profiles`, `pass_env` and `scratch` are subsets.
+  B's shell receives the Agent identity only if A's did.
+- Sandbox, environment selection, collaboration mode and setup commands are identical.
+- The worktree is A's exact worktree.
+
+Credentials, model and executable belong to the profile the Owner named in policy.
+A held account is never replaced by another account of the same harness.
+
+A source generation has at most one open switch. A second switch in the same worktree
+after a transfer is refused and names the successor to switch instead. From then on the
+source refuses `send`, `steer`, `inject` and `resume` with `handed_off`, naming the Agent
+that now holds the worktree, and automatic resume skips it. `stop` still works. The
+transfer closes any lost or failed `owner.inbox` item for the source. A busy source is
+refused with the remedy: run `swarm interrupt <agent>`, then retry.
+
+A Codex `workspace-write` Agent in a managed worktree whose branch has a `/` gets the
+worktree's Git admin directory, the object store, and the branch's parent ref and log
+directories as extra writable roots, so it can commit. Sibling branches under that same
+parent are writable too: Git creates `<branch>.lock` beside the ref, and Windows grants file
+creation per directory, so a grant on the ref file alone cannot commit. Hooks, repository
+config, top-level branches such as `main`, tags and other ref directories stay denied. Routing skips such
+a candidate as `cannot_commit` for an unmanaged workspace or a top-level branch, unless
+it is the source's own profile.
+
+A may be idle, or lost, failed or stopped with its process tree proven gone, in any
+generation. The task comes from the named command of any of A's generations, else A's
+first retained instruction, else the [Git task record](monitoring.md). None of them being
+retained does not refuse the switch: the brief says so and points at Git. An uncertain
+command or turn of an ended generation cannot still land, so it is named in the brief
+and never replayed. On a live idle A, one in its running generation refuses with the
+remedy `swarm stop <agent>`.
+
+Before external preparation the Store checks A's exact generation and readiness,
+any named task and selected SENDs, transferable Goal, and controlled child
 limits for the prospective root. The parent freezes the launch and handoff IDs
 after these checks pass. The worker rechecks the source when admitting the
 ordinary promptless launch and its parent link. H2 validates the complete
@@ -1183,6 +1242,14 @@ for readback.
 
 The switch parent is Accepted at reservation and Dispatched while orchestrating.
 Applied means the H2 Store transfer committed, not that the brief/task succeeded.
+A lost or failed source qualifies once
+[custody proves its process tree exited](monitoring.md#work-recorded-in-git). Its unknown
+commands and turns stay unknown, keep their Owner inbox items and are named in the
+brief. Input its end cancelled, or a hold refused at dispatch, had no native effect and
+transfers to B. When the last turn may have left partial effects, the brief tells B not
+to repeat its steps before checking them, and the Owner inbox gets a `handoff` item.
+Swarm never replays that turn.
+[Automatic handoff](configuration.md#automatic-handoff-918) reserves this same operation.
 An opt-in [provider switch](configuration.md#routing-policy-s3) reserves the same
 operation in the exact failed turn's transaction. It rechecks the source again
 at successor launch admission and H2 transfer. The first H2 SEND carries the

@@ -17,6 +17,9 @@ use serde_json::{Map, Value, json};
 /// The routing roles every launch path knows, shown even when unset.
 pub const ROLES: [&str; 4] = ["default", "manager", "worker", "audit"];
 
+/// `[routing]` keys that are settings rather than candidate roles.
+const ROUTING_SETTINGS: [&str; 3] = ["on_provider_failure", "auto_handoff", "handoff_fallback"];
+
 /// The Cloud MCP fields, in form order, with their labels.
 pub const CLOUD_FIELDS: [(&str, &str); 6] = [
     ("cloudflared_executable", "cloudflared executable"),
@@ -81,7 +84,7 @@ pub fn routing_roles(draft: &Value) -> Vec<String> {
         roles.extend(
             map.keys()
                 .filter(|key| {
-                    key.as_str() != "on_provider_failure" && !ROLES.contains(&key.as_str())
+                    !ROUTING_SETTINGS.contains(&key.as_str()) && !ROLES.contains(&key.as_str())
                 })
                 .cloned(),
         );
@@ -144,8 +147,8 @@ pub fn routing_add_role(draft: &mut Value, role: &str) -> Result<(), String> {
     if routing_roles(draft).iter().any(|known| known == role) {
         return Err(format!("{role} is already listed."));
     }
-    if role == "on_provider_failure" {
-        return Err("That name is reserved for the provider failure setting.".to_owned());
+    if ROUTING_SETTINGS.contains(&role) {
+        return Err("That name is reserved for a routing setting.".to_owned());
     }
     object(draft).insert(role.to_owned(), json!([]));
     Ok(())

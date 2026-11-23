@@ -905,8 +905,31 @@ pub(super) fn require_handoff_source_goal(
     source: &Agent,
     policy: &core::SecretPolicy,
 ) -> Result<()> {
-    require_settled_handoff_round(tx, parse_agent_id(&source.id)?)?;
+    require_handoff_round(tx, source, true)?;
     transferable_source_goal(tx, source, policy)?;
+    Ok(())
+}
+
+/// An ended session cannot finish a Goal round. Its unknown round stays
+/// burned and is reported; only a live round blocks the transfer.
+fn require_handoff_round(tx: &Transaction<'_>, source: &Agent, continuation: bool) -> Result<()> {
+    let agent = parse_agent_id(&source.id)?;
+    if !(continuation && source.is_terminal()) {
+        return require_settled_handoff_round(tx, agent);
+    }
+    let running: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM goal_markers WHERE agent=?1 AND state='running')",
+            [agent],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if running {
+        return Err(Error::new(
+            "busy",
+            format!("Agent {} has a Goal round still running", source.id),
+        ));
+    }
     Ok(())
 }
 
@@ -985,12 +1008,13 @@ pub(super) fn transfer_goal_tx(
     from: &Agent,
     to: &Agent,
     policy: &core::SecretPolicy,
+    continuation: bool,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<Option<i64>> {
     let from_num = parse_agent_id(&from.id)?;
     let to_num = parse_agent_id(&to.id)?;
-    require_settled_handoff_round(tx, from_num)?;
+    require_handoff_round(tx, from, continuation)?;
     require_settled_handoff_round(tx, to_num)?;
     let Some(mut source) = transferable_source_goal(tx, from, policy)? else {
         return Ok(None);
@@ -1028,7 +1052,15 @@ pub(super) fn transfer_goal_tx(
     let revision = destination
         .map_or(Some(1), |row| row.revision.checked_add(1))
         .ok_or_else(|| Error::new("bad_state", "Goal revision overflow"))?;
-    source.state.status = GoalStatus::Paused;
+    // A continuing successor keeps the Goal running: its first round waits
+    // for the brief's turn. Any other transfer needs an explicit resume.
+    let keep_active = continuation && source.state.status == GoalStatus::Active;
+    source.state.status = if keep_active {
+        GoalStatus::Active
+    } else {
+        GoalStatus::Paused
+    };
+    source.state.await_first_turn = keep_active;
     source.state.stop_paused = false;
     // The assignment launch cause names the source Agent's launch: the
     // destination was not launched by the assignment, so its Goal is not
@@ -1048,7 +1080,7 @@ pub(super) fn transfer_goal_tx(
         .last_observation
         .as_deref()
         .map(|text| policy.redact_text(text));
-    source.state.paused_reason = Some("handoff_requires_explicit_resume".into());
+    source.state.paused_reason = (!keep_active).then(|| "handoff_requires_explicit_resume".into());
     source.state.transferred_turns = total_used;
     source.state.counters.turns_at_set = count_turns(tx, to_num, to.generation)?;
     source.state.last_committed_slot = None;
@@ -1061,7 +1093,11 @@ pub(super) fn transfer_goal_tx(
         params![to_num,to.generation,revision,encode_json(&source.definition)?,encode_json(&source.state)?,now]).map_err(sql_error)?;
     for (num, generation, status) in [
         (from_num, from.generation, "cleared"),
-        (to_num, to.generation, "paused"),
+        (
+            to_num,
+            to.generation,
+            if keep_active { "active" } else { "paused" },
+        ),
     ] {
         events.push(insert_daemon_event(
             tx,
