@@ -1954,7 +1954,8 @@ impl State {
         let Some(tool) = self.tools.get(tool_call_id) else {
             return Ok(());
         };
-        if !tool.native_file_edit_tool || !tool.edit_kind {
+        // AGY can classify the mutation by ACP kind without sending a tool name.
+        if !tool.native_file_edit_tool && !tool.edit_kind {
             return Ok(());
         }
         let Some(pending) = self.pending.as_ref() else {
@@ -1962,7 +1963,6 @@ impl State {
         };
         let command = pending.command.clone();
         let turn = pending.turn.clone();
-        let title = tool.title.clone();
         let diff_paths = tool.diff_paths.clone();
 
         for (index, path) in diff_paths.into_iter().enumerate() {
@@ -1981,7 +1981,6 @@ impl State {
                 "command_id": command,
                 "turn_id": turn,
                 "item_id": base_item,
-                "tool": title,
                 "status": "completed",
                 "edit_path": edit_path,
             });
