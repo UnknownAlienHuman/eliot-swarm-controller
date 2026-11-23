@@ -1944,6 +1944,32 @@ impl Store {
     }
 }
 
+/// Spend a notice cooldown only when this exact send still owns its recipient's
+/// open slot; called with every terminal state write to include cancellation
+/// and resolution paths outside `Store::settle_inner`.
+pub(super) fn settle_notice_terminal_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    state: CommandState,
+    now: i64,
+) -> Result<()> {
+    if !matches!(
+        state,
+        CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+    ) {
+        return Ok(());
+    }
+    tx.execute(
+        "UPDATE mail_notices SET last_notice_at = ?1, open_notice_command = NULL
+         WHERE recipient = (
+             SELECT target FROM commands WHERE id = ?2 AND verb = 'send'
+         ) AND open_notice_command = ?2",
+        params![now, command_id],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
 /// Inline ordinary unread messages for agent's current generation and
 /// self-registered completion digests whose exact eligibility still holds.
 /// The full encoded send request must fit before any delivery is bound.
