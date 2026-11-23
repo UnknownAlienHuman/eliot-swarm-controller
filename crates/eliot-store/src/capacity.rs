@@ -8,7 +8,20 @@ pub(super) type PolicyLoader = dyn Fn() -> Result<ScopeLimits> + Send + Sync;
 const MIGRATION_BATCH_SIZE: i64 = 128;
 const RETAINED_PAGE_SIZE: i64 = 128;
 
-const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
+// Bind eligibility and the note to the same retained restart event.
+const RESTART_RESUME_EVENT: &str = r#"
+    JOIN events restart ON restart.seq = (
+        SELECT e.seq FROM events e
+        WHERE e.agent = a.id AND e.generation = a.generation
+          AND ((e.kind = 'agent.lost'
+                AND json_extract(e.data, '$.reason') = 'daemon_restart')
+            OR (e.kind = 'agent.stopped'
+                AND json_extract(e.data, '$.reason') = 'owned_exit_before_restart'))
+        ORDER BY e.seq DESC LIMIT 1
+    )
+"#;
+
+const RESTART_RESUME_ELIGIBILITY: &str = r#"
     a.observe_only = 0 AND a.archived = 0
     AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
     AND a.state IN ('lost', 'stopped')
@@ -16,16 +29,6 @@ const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
     AND a.harness IN ('codex', 'muse', 'claude', 'opencode', 'antigravity')
     AND TRIM(COALESCE(a.native_scope, '')) <> ''
     AND TRIM(COALESCE(a.native_ref, '')) <> ''
-    AND EXISTS (
-        SELECT 1 FROM events restart_event
-        WHERE restart_event.agent = a.id
-          AND restart_event.generation = a.generation
-          AND ((restart_event.kind = 'agent.lost'
-                AND json_extract(restart_event.data, '$.reason') = 'daemon_restart'
-                AND json_extract(restart_event.data, '$.previous_state') = 'idle')
-            OR (restart_event.kind = 'agent.stopped'
-                AND json_extract(restart_event.data, '$.reason') = 'owned_exit_before_restart'))
-    )
     AND EXISTS (
         SELECT 1 FROM events custody_event
         WHERE custody_event.agent = a.id
@@ -36,23 +39,26 @@ const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
     )
     AND NOT EXISTS (
         SELECT 1 FROM commands c
-        WHERE c.target = a.id
-          AND c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+        WHERE c.target = a.id AND c.generation = a.generation
+          AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+               OR (c.verb = 'stop' AND c.principal = 'owner' AND c.state = 'applied')
+               OR (c.verb = 'stop' AND c.state = 'cancelled'
+                   AND json_extract(c.outcome, '$.reason') = 'generation_lost')
+               OR (c.verb = 'resume' AND c.state IN ('rejected', 'failed')
+                   AND EXISTS (SELECT 1 FROM restart_resume_intents r WHERE r.command_id = c.id)))
     )
     AND NOT EXISTS (
-        SELECT 1 FROM commands c
-        WHERE c.target = a.id AND c.generation = a.generation
-          AND c.verb = 'resume'
-    )
-    AND NOT EXISTS (
-        SELECT 1 FROM commands c
-        WHERE c.target = a.id AND c.generation = a.generation
-          AND c.verb = 'stop' AND c.state = 'cancelled'
-          AND json_extract(c.outcome, '$.reason') = 'generation_lost'
+        SELECT 1 FROM events stopped
+        WHERE stopped.agent = a.id AND stopped.generation = a.generation
+          AND stopped.kind = 'agent.stopped' AND stopped.seq > restart.seq
+          AND json_type(stopped.data, '$.command_id') = 'text'
     )
     AND NOT EXISTS (
         SELECT 1 FROM turns t
-        WHERE t.agent = a.id AND t.state IN ('running', 'unknown')
+        WHERE t.agent = a.id AND t.generation = a.generation
+          AND (t.state = 'running'
+               OR (t.state = 'unknown'
+                   AND t.turn_id IS NOT json_extract(restart.data, '$.turn_id')))
     )
     AND NOT EXISTS (
         SELECT 1 FROM pending_requests r
@@ -66,20 +72,67 @@ const RESTART_IDLE_RESUME_ELIGIBILITY: &str = r#"
     )
 "#;
 
-pub(super) fn restart_idle_resume_candidate_tx(
+pub(super) fn owner_stop_fences_restart_resume_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commands
+         WHERE target = ?1 AND generation = ?2 AND verb = 'stop' AND principal = 'owner'
+           AND state IN ('accepted', 'queued', 'dispatched', 'unknown', 'applied'))",
+        params![agent, generation],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+/// Check in the admission transaction, after the parent batch has settled.
+/// Filtering the page itself would skip children across cursor boundaries
+/// before their parents can leave the terminal generation.
+pub(super) fn restart_ancestor_fences_resume_tx(
+    connection: &Connection,
+    agent: i64,
+) -> Result<bool> {
+    let query = format!(
+        "WITH RECURSIVE ancestors(id, parent) AS (
+             SELECT p.id, p.parent FROM agents child JOIN agents p ON p.id = child.parent
+             WHERE child.id = ?1
+             UNION ALL
+             SELECT p.id, p.parent FROM ancestors child JOIN agents p ON p.id = child.parent
+         )
+         SELECT EXISTS (
+             SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
+             {RESTART_RESUME_EVENT}
+             WHERE a.state IN ('lost', 'stopped')
+             UNION ALL
+             SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
+             JOIN commands c ON c.target = a.id AND c.generation = a.generation
+             JOIN restart_resume_intents r ON r.command_id = c.id
+             WHERE c.state IN ('accepted', 'queued', 'dispatched', 'unknown', 'failed', 'rejected')
+         )"
+    );
+    connection
+        .query_row(&query, [agent], |row| row.get(0))
+        .map_err(sql_error)
+}
+
+pub(super) fn restart_resume_candidate_tx(
     connection: &Connection,
     agent: &str,
     generation: i64,
 ) -> Result<bool> {
     let agent_num = parse_agent_id(agent)?;
     let query = format!(
-        "SELECT EXISTS(SELECT 1 FROM agents a
-         WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_IDLE_RESUME_ELIGIBILITY})"
+        "SELECT EXISTS(SELECT 1 FROM agents a {RESTART_RESUME_EVENT}
+         WHERE a.id = ?1 AND a.generation = ?2 AND {RESTART_RESUME_ELIGIBILITY})"
     );
     let candidate: bool = connection
         .query_row(&query, params![agent_num, generation], |row| row.get(0))
         .map_err(sql_error)?;
-    Ok(candidate && has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)?)
+    Ok(candidate
+        && has_owned_exit_and_reader_drain_tx(connection, agent_num, generation)?
+        && !restart_ancestor_fences_resume_tx(connection, agent_num)?)
 }
 
 /// Shared generation proof for stop settlement and restart resume.
@@ -122,12 +175,14 @@ pub struct RetainedGeneration {
     pub processes_truncated: bool,
 }
 
-/// One exact terminal generation that was idle at daemon restart and is now
-/// safe to reopen without replaying input.
+/// One restart candidate and its position in the Agent hierarchy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RestartResumeCandidate {
     pub agent: String,
     pub generation: i64,
+    pub depth: i64,
+    pub interrupted: bool,
+    pub turn_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,14 +216,15 @@ impl Store {
                AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
                AND NOT EXISTS (
                    SELECT 1 FROM commands c WHERE c.target = a.id
+                   AND c.generation = e.generation
                    AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
-                        OR (c.generation = e.generation AND c.verb = 'resume')
-                        OR (c.generation = e.generation AND c.verb = 'stop'
+                        OR (c.verb = 'stop'
                             AND c.state = 'cancelled'
                             AND json_extract(c.outcome, '$.reason') = 'generation_lost'))
                )
                AND NOT EXISTS (
                    SELECT 1 FROM turns t WHERE t.agent = a.id
+                   AND t.generation = e.generation
                    AND t.state IN ('running', 'unknown')
                )
                AND NOT EXISTS (
@@ -392,36 +448,40 @@ impl Store {
         Ok(retained)
     }
 
-    /// Page durable, promptless restart candidates. Eligibility is derived
-    /// from the retained restart event and exact custody proof, so a crash
-    /// between loss settlement and automatic Resume admission does not lose
-    /// the candidate. Any uncertain turn, command, request, stop intent, or
-    /// Goal round keeps it held.
-    pub fn restart_idle_resume_candidates(
+    /// Page eligible generations in hierarchy order. The retained loss event
+    /// supplies the interrupted turn's identity and the transaction rechecks
+    /// eligibility before admitting Resume.
+    pub fn restart_resume_candidates(
         &self,
-        after: Option<&str>,
+        after: Option<&RestartResumeCandidate>,
     ) -> Result<Vec<RestartResumeCandidate>> {
-        let after = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let (depth, after_id) = match after {
+            Some(candidate) => (candidate.depth, parse_agent_id(&candidate.agent)?),
+            None => (0, 0),
+        };
         let query = format!(
-            "SELECT a.id, a.generation FROM agents a
-             WHERE a.id > ?1 AND {RESTART_IDLE_RESUME_ELIGIBILITY}
-             ORDER BY a.id LIMIT ?2"
+            "SELECT a.id, a.generation, a.depth,
+                    restart.kind = 'agent.lost'
+                      AND json_extract(restart.data, '$.previous_state') IS NOT 'idle',
+                    json_extract(restart.data, '$.turn_id')
+             FROM agents a {RESTART_RESUME_EVENT}
+             WHERE (a.depth, a.id) > (?1, ?2) AND {RESTART_RESUME_ELIGIBILITY}
+             ORDER BY a.depth, a.id LIMIT ?3"
         );
         let mut statement = self.connection.prepare(&query).map_err(sql_error)?;
         let rows = statement
-            .query_map(params![after, RETAINED_PAGE_SIZE], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            .query_map(params![depth, after_id, RETAINED_PAGE_SIZE], |row| {
+                Ok(RestartResumeCandidate {
+                    agent: format_agent_id(row.get(0)?),
+                    generation: row.get(1)?,
+                    depth: row.get(2)?,
+                    interrupted: row.get(3)?,
+                    turn_id: row.get(4)?,
+                })
             })
-            .map_err(sql_error)?
-            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
-        Ok(rows
-            .into_iter()
-            .map(|(agent, generation)| RestartResumeCandidate {
-                agent: format_agent_id(agent),
-                generation,
-            })
-            .collect())
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
     }
 
     /// Commit custody closure that the daemon verified outside the Store lock,

@@ -205,12 +205,19 @@ Readers accept persisted rows carrying any of these reasons.
 
 With the default [restart policy](configuration.md#agent-restart-policy), the
 daemon reopens an eligible retained idle session after restart through a
-generation-bound `resume` without text. Eligibility requires the prior
-generation's exact custody closure and no unsettled work. The new generation
-keeps the same native subject. An interrupted turn or uncertain dispatched
-effect stays `unknown` with the restart reason until it can be settled through
-the normal recovery path. A terminal `send` refusal identifies the next
-explicit action for that Agent.
+generation-bound `resume` without text, and resumes an eligible retained
+generation that was live through a `resume` carrying a framed Swarm note as
+the new generation's first input. Roots resume before their children.
+Descendants wait for restart-affected ancestors to resume. A completed Owner
+Stop or a failed or rejected restart Resume ends automatic attempts for that
+generation.
+Eligibility requires exact custody closure and settled commands, requests,
+and Goal rounds for the prior generation. The exact turn interrupted by the
+restart may remain unknown. The new generation keeps the native subject and
+its retained settings. The note names the interrupted turn and asks the Agent
+to inspect its workspace before continuing. That turn and other uncertain
+effects keep their `unknown` outcome until normal settlement. A terminal
+`send` refusal identifies the next explicit action for that Agent.
 
 An open stop/transition is a command beside the observed state, not another state
 machine. Generation transition blocks ordinary turn work. A stop in `dispatched`

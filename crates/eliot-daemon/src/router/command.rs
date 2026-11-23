@@ -1686,8 +1686,17 @@ impl Router {
             let generation = validate_retained_resume_agent(&agent, &command)?;
             let source =
                 store.read_source_state(&agent_id, generation, CONTROLLED_PLUGIN_SOURCE)?;
+            // A promptless Codex resume opens the same thread in a new generation.
+            // Its newest native turn can still belong to an earlier generation.
+            let turn_generation = if agent.harness == "codex" {
+                store
+                    .latest_retained_turn_generation(&agent_id, generation)?
+                    .unwrap_or(generation)
+            } else {
+                generation
+            };
             let latest_turn = store
-                .list_turns(&agent_id, generation, 1)?
+                .list_turns(&agent_id, turn_generation, 1)?
                 .into_iter()
                 .next()
                 .map(|turn| {

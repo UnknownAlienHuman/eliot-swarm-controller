@@ -482,10 +482,12 @@ impl MusePlugin {
             Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
         };
         let policy = SecretPolicy::new(secrets.iter());
+        let resume_model = resume_subject.as_ref().and(requested_model.as_deref());
         let mut host = match catalogue::CatalogueHost::open(
             &launch,
             Path::new(&initialized.instance_dir),
             &policy,
+            resume_model,
         )
         .await
         {
@@ -580,6 +582,7 @@ impl MusePlugin {
                 &session.native_client,
                 &subject.native_ref,
                 subject.retained_turn.as_deref(),
+                resume_model.filter(|_| initialized_native.catalogue_omits_model),
             )
             .await
             {
@@ -588,7 +591,12 @@ impl MusePlugin {
                     error.message
                 );
                 // Only prerequisite reads ran; native session effects were not dispatched.
-                let error = error.with_code("native_readback").with_message(message);
+                let error = if error.code == "profile_error" {
+                    error
+                } else {
+                    error.with_code("native_readback")
+                }
+                .with_message(message);
                 let error = discard_failed_start(&mut session, error).await;
                 if session.phase == SessionPhase::Unknown {
                     let message = format!(
@@ -2163,9 +2171,13 @@ impl MusePlugin {
             environment: environment.variables,
         };
         let policy = SecretPolicy::new(environment.secrets.iter().chain([&initialized.credential]));
-        let mut host =
-            catalogue::CatalogueHost::open(&launch, Path::new(&initialized.instance_dir), &policy)
-                .await?;
+        let mut host = catalogue::CatalogueHost::open(
+            &launch,
+            Path::new(&initialized.instance_dir),
+            &policy,
+            None,
+        )
+        .await?;
         host.close().await?;
         if host.catalogue.models.is_empty() && host.refresh_failed() {
             return Err(host.catalogue_error(Error::new(
@@ -2569,6 +2581,7 @@ async fn verify_resume_preflight(
     client: &NativeClient,
     session_id: &str,
     retained_turn: Option<&str>,
+    unlisted_resume_model: Option<&str>,
 ) -> Result<()> {
     let readback = read_owned_session(client, session_id).await?;
     if let Some(reason) = readback.history.unavailable_reason() {
@@ -2591,7 +2604,16 @@ async fn verify_resume_preflight(
         newest_turn
             .as_ref()
             .map(|(id, status)| (id.as_str(), status.as_str())),
-    )
+    )?;
+    if let Some(model) = unlisted_resume_model
+        && session.model_id.as_deref() != Some(model)
+    {
+        return Err(Error::new(
+            "profile_error",
+            "Muse cannot verify the retained profile model for realignment; restore access to that model and retry Resume",
+        ));
+    }
+    Ok(())
 }
 
 /// Accepting `idle`/`notLoaded` here is NOT proof the generation-1 host is

@@ -560,7 +560,12 @@ pub(crate) async fn run_send(
         return Ok(submit_exit);
     }
     let deadline = deadline.ok_or_else(|| Failure::new(2, "missing wait deadline"))?;
-    let completed = wait_for_turn(&data_dir, &submitted.command_id, deadline).await?;
+    let completed = match submitted.linked_command.as_deref() {
+        Some(linked) => {
+            wait_for_linked_turn(&data_dir, &submitted.command_id, linked, deadline).await?
+        }
+        None => wait_for_turn(&data_dir, &submitted.command_id, deadline).await?,
+    };
     let exit_code = turn_exit_code(&completed);
     print_value(&turn_value(completed)?, json_output);
     Ok(exit_code)

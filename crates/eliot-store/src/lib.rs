@@ -593,9 +593,16 @@ impl Store {
         result
     }
 
-    /// Admit one internal promptless Resume only while its durable restart
-    /// candidate remains eligible in this same Store transaction.
+    /// Admit one internal restart Resume only while its durable restart
+    /// candidate remains eligible in this same Store transaction. The request
+    /// carries no linked input, or only new linked text: the framed Swarm
+    /// note naming the interrupted turn.
     pub fn submit_restart_resume(&mut self, request: SubmitCommand, now: i64) -> Result<Admission> {
+        let promptless = request.args == json!({});
+        let noted = request
+            .args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string));
         if request.verb != "resume"
             || request.target.is_none()
             || request.expected_generation.is_none()
@@ -603,11 +610,11 @@ impl Store {
             || request.request_id.is_some()
             || request.probe
             || request.selector.is_some()
-            || request.args != json!({})
+            || !(promptless || noted)
         {
             return Err(Error::new(
                 "invalid",
-                "restart Resume requires one exact-generation, promptless Agent request",
+                "restart Resume requires one exact-generation Agent request with no input or only new linked text",
             ));
         }
         self.ensure_writer_healthy()?;
@@ -1842,16 +1849,39 @@ impl Store {
     /// Exact gate for a planned restart. The router holds the writer while
     /// evaluating this gate and closing the last control admissions.
     pub fn has_restart_work(&self) -> Result<bool> {
-        let active: bool = self
+        // A bound native turn can be interrupted by retiring its owned runtime.
+        // Starts and unsettled commands must still reach their effect boundary.
+        let starting: bool = self
             .connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM agents WHERE observe_only = 0 AND
-                (active_turn IS NOT NULL OR state IN ('created', 'starting', 'busy', 'waiting')))",
+                state IN ('created', 'starting'))",
                 [],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        Ok(active || self.count_unsettled_commands_excluding_retained()? != 0)
+        if starting {
+            return Ok(true);
+        }
+        // Deferred Swarm notes wait for an input or safe point and may have
+        // no consumer until after restart. Loss recovery cancels them with
+        // the old generation. A claimed note is already dispatched and
+        // must settle through the usual command gate.
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM commands
+                     WHERE state = 'dispatched'
+                        OR (state IN ('accepted', 'queued') AND NOT (
+                            verb = 'inject' AND principal GLOB 'swarm_note:*'
+                            AND COALESCE(json_extract(args, '$.point'), '')
+                                IN ('next_input', 'turn_safe_point')
+                        ))
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     /// Total unsettled commands ignoring the drain list bound and the page
@@ -2336,6 +2366,22 @@ impl Store {
                 count: active.len(),
             }
         })
+    }
+
+    /// Find the newest retained generation with a turn at or before the resume source.
+    pub fn latest_retained_turn_generation(
+        &self,
+        agent: &str,
+        through_generation: i64,
+    ) -> Result<Option<i64>> {
+        let agent_num = parse_agent_id(agent)?;
+        self.connection
+            .query_row(
+                "SELECT MAX(generation) FROM turns WHERE agent = ?1 AND generation <= ?2",
+                params![agent_num, through_generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
     }
 
     pub fn list_turns(&self, agent: &str, generation: i64, limit: usize) -> Result<Vec<Turn>> {

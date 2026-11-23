@@ -797,14 +797,17 @@ fn has_unresolved_goal_round(tx: &Transaction<'_>, agent_num: i64, mode: &str) -
     .map_err(sql_error)
 }
 
+const RESTART_GOAL_WORK_UNRESOLVED: &str = "prior Agent work is unresolved after restart";
+
 /// Carry a Goal to a resumed generation without rearming an uncertain round
 /// or unresolved Agent effect. A stop-paused Goal follows the generation for
-/// accounting and stays paused behind the prior work fence.
+/// accounting. Restart recovery also carries the Goal behind the same fence.
 pub(super) fn advance_resume_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     old_generation: i64,
     next_generation: i64,
+    reason: eliot_core::api::GenerationReason,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -818,7 +821,8 @@ pub(super) fn advance_resume_tx(
     }
     let unresolved_work = has_unresolved_goal_round(tx, agent_num, &row.mode)?
         || super::has_unknown_gate(tx, agent_num)?;
-    if unresolved_work && !row.state.stop_paused {
+    let restart = reason == eliot_core::api::GenerationReason::RestartResume;
+    if unresolved_work && !row.state.stop_paused && !restart {
         if row.state.status == GoalStatus::Active {
             row.state.status = GoalStatus::Paused;
             row.state.paused_reason = Some("prior Agent work is unresolved".to_owned());
@@ -836,7 +840,15 @@ pub(super) fn advance_resume_tx(
         return Ok(());
     }
     if unresolved_work {
-        row.state.paused_reason = Some("prior Agent work is unresolved".to_owned());
+        row.state.status = GoalStatus::Paused;
+        row.state.paused_reason = Some(
+            if restart {
+                RESTART_GOAL_WORK_UNRESOLVED
+            } else {
+                "prior Agent work is unresolved"
+            }
+            .to_owned(),
+        );
     }
 
     let old_turn_count = count_turns(tx, agent_num, old_generation)?;
@@ -2135,6 +2147,15 @@ impl Store {
                 return Err(Error::new(
                     "stale_generation",
                     "goal binds a past Agent generation; set a new goal",
+                ));
+            }
+            if row.state.paused_reason.as_deref() == Some(RESTART_GOAL_WORK_UNRESOLVED)
+                && (super::has_unknown_gate(&tx, agent_num)?
+                    || has_unresolved_goal_round(&tx, agent_num, &row.mode)?)
+            {
+                return Err(Error::new(
+                    "bad_state",
+                    "settle prior Agent work before resuming this Goal",
                 ));
             }
             let mut state = row.state;

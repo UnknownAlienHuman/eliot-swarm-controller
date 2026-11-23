@@ -2932,17 +2932,19 @@ success.
 Swarm executable. Both releases must support Store backup updates. A schema
 downgrade is refused before the admission fence. The running daemon uses the planned-restart
 `daemon.shutdown` modes. `prepare_restart` records a bounded admission
-fence. The writer accepts `restart` under that fence only after admitted
-turns and workers finish. If the wait expires, `cancel_restart` reopens the
+fence. The writer accepts `restart` under that fence after Agent starts,
+unsettled commands and daemon-owned operation workers settle. In-flight
+native turns can be interrupted, and unclaimed deferred Swarm notes are
+cancelled with their old generation. If the wait expires, `cancel_restart` reopens the
 same daemon. The fence also expires if its client disappears. Before
 committing the restart, the writer checks free space, creates an online
 SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
 source page count. The restart receipt commits only after the old Store
 connection has been sealed. Confirmed cancellation discards its backup.
 
-After commit, the old daemon retires its owned idle processes and leaves
+After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
-both use #851 continuation and honor `on_restart`. The CLI submits no Agent
+both honor `on_restart` and continue eligible idle and interrupted Agents. The CLI submits no Agent
 Stop or Resume commands during update. The output identifies the previous
 and running release and includes observed Agent state. Boot recovery can
 still be settling when that state is read.

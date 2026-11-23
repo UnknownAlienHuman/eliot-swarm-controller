@@ -189,17 +189,18 @@ With a fresh data root, `serve` returned an empty `bundledCatalog` even
 after `session/start`. The installed `muse exec --help` documents
 `exec --list-models`, which fetches models and populates Muse's cache under
 `XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
-The adapter first reads the host's `model/list` snapshot. An empty snapshot
-triggers one refresh with the resolved executable and environment, from
-the private plugin directory. The refresh and each host query have separate
-deadlines. A fresh `serve` reads the resulting cache even if the refresh fails.
-
-An explicit or frozen model is sent unchanged to `session/start` or
-`session/setModel`. An exact catalogue row supplies effort variants when
-known. An omitted row adds `catalogue_omits_model: true` and Muse receives
-the requested effort unchanged. Native refusals carry Muse's error message
-and harness attribution. The effective session `modelId` must match the
-request to set `model_verified`.
+The adapter first reads the host's `model/list` snapshot. An empty snapshot,
+or a missing exact retained model on resume, triggers one refresh with the
+resolved executable and environment from the private plugin directory. The
+refresh and each host query have separate deadlines. A fresh `serve` reads the
+resulting cache even if the refresh fails. A resume can reopen a session
+already on its retained model when the catalogue omits that model. If the
+session needs realignment to an omitted model, preflight asks the Owner to
+restore access before sending `session/resume`. Launch still sends an omitted
+model unchanged and reports `catalogue_omits_model: true`. An exact row
+supplies effort variants when known, so a known model/effort mismatch fails
+before a native start or resume. The effective session `modelId` must match
+the request to set `model_verified`.
 
 Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
 `model/list`, resume preflight) return a failed-state start

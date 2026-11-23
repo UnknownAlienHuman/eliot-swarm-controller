@@ -391,6 +391,11 @@ Native subject is `(canonical Codex store/account scope, exact thread id)`. The 
 wire is line-delimited JSON; it does not require a `jsonrpc:"2.0"` field. The Eliot
 plugin envelope is separate and includes Agent/generation.
 
+Resume checks the newest native turn against the latest retained turn for the same
+Agent. A promptless Resume can leave the latest turn in an earlier generation of
+the same thread. The source binding still comes from the immediately preceding
+generation, and the native readback must confirm the exact turn is terminal.
+
 One app-server can host many threads, but per-Agent processes keep environment, Eliot
 token, Git identity and custody separate. Native child threads share the parent
 process environment and have no independent Eliot CLI principal unless isolation is
