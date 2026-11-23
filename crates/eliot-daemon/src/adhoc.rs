@@ -1194,12 +1194,12 @@ pub(crate) fn claude_candidate_available() -> bool {
         .any(|path| is_native_executable(path))
 }
 
-pub(crate) fn write_claude_command_snapshot(
+pub(crate) fn write_profile_command_snapshot(
     snapshot: &mut Value,
     candidate: core::api::HarnessCandidate,
 ) -> core::Result<()> {
     let profile = snapshot.as_object_mut().ok_or_else(|| {
-        core::Error::new("profile_error", "Claude launch snapshot must be an object")
+        core::Error::new("profile_error", "launch profile snapshot must be an object")
     })?;
     profile.insert("cmd".to_owned(), Value::String(candidate.cmd));
     if let Some(version) = candidate.version {
@@ -1210,13 +1210,102 @@ pub(crate) fn write_claude_command_snapshot(
     Ok(())
 }
 
-pub(crate) async fn resolve_claude_profile_command(
+/// Build one shared refusal for an explicit pin that no longer resolves.
+/// `replacement` is one bounded candidate from the same native discovery path
+/// used for launch; the repair always omits `cmd` so future launches follow
+/// the installed executable.
+pub(crate) fn missing_profile_command_refusal(
+    profile: &str,
+    harness: &str,
+    configured_cmd: &str,
+    replacement: Option<&core::api::HarnessCandidate>,
+) -> core::Error {
+    let fallback = if harness == "claude" {
+        format!(
+            "omit cmd from profiles.{profile} to follow the installed version, or use {}",
+            claude_latest_settings_command(profile)
+        )
+    } else {
+        format!("omit cmd from profiles.{profile} to follow the installed version")
+    };
+    let replacement_note = match replacement {
+        Some(candidate) => {
+            let version = candidate
+                .version
+                .as_deref()
+                .map(|version| format!(" version {version}"))
+                .unwrap_or_default();
+            format!(
+                "an installed native {harness}{version} was found at {}",
+                core::display_path(&candidate.cmd)
+            )
+        }
+        None => format!("no installed native {harness} replacement was discovered"),
+    };
+    core::AdmissionRefusal::ProfileCommand.error(format!(
+        "{profile}: configured {harness} executable was not found at {}; {replacement_note}; {fallback}",
+        core::display_path(configured_cmd)
+    ))
+}
+
+/// Resolve a named profile's configured executable pin, or discover the
+/// installed native executable when the profile omits `cmd`. The returned
+/// candidate is frozen into the launch snapshot by the caller.
+pub(crate) async fn resolve_profile_command(
+    profile: &str,
+    harness: &str,
+    cmd: Option<&str>,
+) -> core::Result<core::api::HarnessCandidate> {
+    resolve_profile_command_until(profile, harness, cmd, Instant::now() + DISCOVERY_BUDGET).await
+}
+
+pub(crate) async fn resolve_profile_command_until(
+    profile: &str,
+    harness: &str,
+    cmd: Option<&str>,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    if harness == "claude" {
+        return resolve_claude_profile_command_until(profile, cmd, deadline).await;
+    }
+    let Some(cmd) = cmd else {
+        return discover_profile_command_candidate(harness, deadline).await;
+    };
+    match reader_executable(cmd, harness, deadline).await {
+        Ok((cmd, version)) => Ok(core::api::HarnessCandidate { cmd, version }),
+        Err(_) if !profile_command_exists(cmd) => {
+            let replacement = discover_profile_command_candidate(harness, deadline)
+                .await
+                .ok();
+            Err(missing_profile_command_refusal(
+                profile,
+                harness,
+                cmd,
+                replacement.as_ref(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn discover_profile_command_candidate(
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    let selected = discover_cmd_until(harness, deadline)
+        .await?
+        .unwrap_or_else(|| harness.to_owned());
+    let (cmd, version) = reader_executable(&selected, harness, deadline).await?;
+    Ok(core::api::HarnessCandidate { cmd, version })
+}
+
+async fn resolve_claude_profile_command_until(
     profile: &str,
     cmd: Option<&str>,
+    deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
     let profile = profile.to_owned();
     let cmd = cmd.map(str::to_owned);
-    let deadline = Instant::now() + DISCOVERY_BUDGET;
     blocking_discovery(deadline, move || {
         resolve_claude_profile_command_sync(&profile, cmd.as_deref(), deadline)
     })
@@ -1264,34 +1353,8 @@ fn missing_claude_profile_command(
     cmd: &str,
     candidates: &[core::api::HarnessCandidate],
 ) -> core::Error {
-    let replacement = verified_claude_candidate_from_candidates(candidates).map(|candidate| {
-        let version = candidate.version.as_deref().unwrap_or("version unknown");
-        let candidate_cmd = core::display_path(&candidate.cmd);
-        let command = claude_settings_command(profile, &candidate_cmd);
-        format!("installed Claude Code {version} at {candidate_cmd}; replace it with {command}")
-    });
-    let detail = replacement.unwrap_or_else(|| {
-        if candidates.is_empty() {
-            format!(
-                "Install Claude Code or reset the profile with {} after installation",
-                claude_latest_settings_command(profile)
-            )
-        } else {
-            "Claude executables were found, but none had a successful parseable --version result; repair an installation before using automatic selection".to_owned()
-        }
-    });
-    core::AdmissionRefusal::ProfileCommand.error(format!(
-        "{profile}: Claude executable was not found at {}; {detail}",
-        core::display_path(cmd)
-    ))
-}
-
-pub(crate) fn claude_settings_command(profile: &str, cmd: &str) -> String {
-    format!(
-        "swarm settings claude-cmd {} --cmd {}",
-        shell_quote_settings_arg(profile),
-        shell_quote_settings_arg(cmd)
-    )
+    let replacement = verified_claude_candidate_from_candidates(candidates);
+    missing_profile_command_refusal(profile, "claude", cmd, replacement)
 }
 
 pub(crate) fn claude_latest_settings_command(profile: &str) -> String {
@@ -1609,7 +1672,8 @@ pub(crate) fn antigravity_ide_unsupported(cmd: &str) -> core::Error {
 
 /// Resolve and check the exact executable before any probe. An IDE symlink
 /// cannot pass the CLI name check on its resolved target.
-fn resolve_native_executable(cmd: &str, antigravity: bool) -> core::Result<String> {
+fn resolve_native_executable(cmd: &str, harness: &str) -> core::Result<String> {
+    let antigravity = harness == "antigravity";
     if antigravity && !antigravity_cli_identity(cmd) {
         return Err(antigravity_ide_unsupported(cmd));
     }
@@ -1632,7 +1696,9 @@ fn resolve_native_executable(cmd: &str, antigravity: bool) -> core::Result<Strin
     if antigravity && !antigravity_cli_identity(&canonical.to_string_lossy()) {
         return Err(antigravity_ide_unsupported(cmd));
     }
-    if !is_native_executable(&canonical) {
+    if !is_native_executable(&canonical)
+        || (harness != "codex" && is_script_wrapper(&canonical.to_string_lossy()))
+    {
         return Err(native_cmd_unavailable());
     }
     // Keep ordinary platform path spelling; Windows native CLIs may reject
@@ -1721,9 +1787,10 @@ pub(crate) async fn reader_executable(
     deadline: Instant,
 ) -> core::Result<(String, Option<String>)> {
     let cmd = cmd.to_owned();
+    let harness = harness.to_owned();
     let agy = harness == "antigravity";
     blocking_discovery(deadline, move || {
-        let cmd = resolve_native_executable(&cmd, agy)?;
+        let cmd = resolve_native_executable(&cmd, &harness)?;
         let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
@@ -1740,7 +1807,7 @@ pub(crate) async fn claude_reader_executable(
 ) -> core::Result<core::api::HarnessCandidate> {
     blocking_discovery(deadline, move || {
         let best = discover_verified_claude(deadline)?;
-        let cmd = resolve_native_executable(&best.cmd, false)?;
+        let cmd = resolve_native_executable(&best.cmd, "claude")?;
         Ok(core::api::HarnessCandidate {
             cmd,
             version: best.version.clone(),
@@ -1789,12 +1856,11 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     let read = || -> core::Result<Value> {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
         let agy = harness == "antigravity";
-        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or("codex"), agy)?;
+        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or(harness), harness)?;
         let version = probe_optional_native_version(&cmd, agy, deadline)?;
         if agy && version.is_none() {
             return Err(antigravity_capability_error());
         }
-        let cmd = if agy { Some(cmd) } else { discovered };
         Ok(json!({"harness": harness, "installed": true, "cmd": cmd, "version": version}))
     };
     read().unwrap_or_else(|error| installation_error(harness, error))

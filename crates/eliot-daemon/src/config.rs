@@ -2272,17 +2272,11 @@ fn validate_profile_tail(
                 cmd
             })
         }
-        None if matches!(harness, "codex" | "claude") => None,
-        None => {
-            return Err(profile_field_error(
-                source,
-                table_offset,
-                name,
-                "cmd",
-                "required explicit cmd is missing",
-                "profile_error",
-            ));
-        }
+        // Named profiles follow the installed native executable at launch.
+        // An explicit `cmd` remains a user pin; when omitted, daemon discovery
+        // freezes the selected native path and version into that launch's
+        // snapshot without changing config.toml.
+        None => None,
     };
     crate::setup::validate_entries(&entry.setup).map_err(|error| {
         profile_field_error(
@@ -2343,9 +2337,10 @@ fn insert_profile_tail(
     Ok(())
 }
 
-/// Freeze a Muse profile. The PR1 slice carries an explicit model id, a
-/// required explicit native `cmd` (no PATH default: resolving `muse` would
-/// land on the launcher wrapper and orphan the host on stop), an optional
+/// Freeze a Muse profile. The PR1 slice carries an explicit model id, an
+/// optional native `cmd` pin (omitting it discovers the launcher's native
+/// payload; resolving `muse` from PATH could land on the launcher wrapper and
+/// orphan the host on stop), an optional
 /// reasoning effort, optional approval mode, and explicit permissions
 /// (`workspace-write` or `danger-full-access`; host birth control passes
 /// `--disable-sandbox` for full access); collaboration presets, adopted routes,
@@ -2458,9 +2453,9 @@ fn muse_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Freeze a Claude profile. The PR2 slice carries an exact model id, a
-/// required explicit native `cmd` (no PATH default: a resolved wrapper would
-/// orphan the real CLI on stop), the CLI permission modes mapped from
+/// Freeze a Claude profile. The PR2 slice carries an exact model id, an
+/// optional explicit native `cmd` pin (`latest` or omission selects the
+/// newest verified native CLI), the CLI permission modes mapped from
 /// `approval`, and approve/deny replies through the stdio permission
 /// callback, and the CLI `--effort` level (low, medium, high, xhigh, max).
 /// Collaboration presets, non-default permissions, and a non-`never`
@@ -2609,8 +2604,8 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
 }
 
 /// Freeze an OpenCode profile. The L6.2 PR1 slice carries an explicit model
-/// id in the installed `provider/model` form (split at the first slash) and a required explicit
-/// native `cmd` (the Muse treatment: stop and process registration address
+/// id in the installed `provider/model` form (split at the first slash) and an optional native
+/// `cmd` pin (discovery follows the package executable, never the `.cmd` shim; stop and process registration address
 /// the exact spawned PID, so `.cmd`/`.bat`/`.ps1` wrappers are rejected).
 /// An optional nonsecret `auth_integration` names the one native integration
 /// whose canonical credential the pre-serve transfer prepares; the plugin
@@ -2743,8 +2738,8 @@ fn opencode_snapshot_from_entry(
     Ok(Value::Object(snapshot))
 }
 
-/// Freeze an Antigravity profile. The L6.4 slice carries an exact model id, a
-/// required explicit native `cmd`, an optional native `mode` and an explicit
+/// Freeze an Antigravity profile. The L6.4 slice carries an exact model id, an
+/// optional native `cmd` pin (discovery selects the `agy` CLI), an optional native `mode` and an explicit
 /// `dangerously_skip_permissions` flag. Effort, approval, collaboration,
 /// permission and approval-policy presets have no mapping and stay rejected.
 fn antigravity_snapshot_from_entry(

@@ -85,6 +85,7 @@ struct RoutePreflight {
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
     provider_refusal: Option<Error>,
+    profile_command_refusal: Option<Error>,
     quota_policies: HashMap<String, QuotaPolicy>,
     quota_deadline: Option<std::time::Instant>,
 }
@@ -447,14 +448,14 @@ impl Router {
                 .then_some(preflight.provider_refusal)
                 .flatten()
         });
-        let mut error = match wait {
-            Some(error) => error,
-            None => Error::new(
-                quota_wait.map_or("routing_unavailable", quota_wait_code),
-                serde_json::to_string(&decision)
-                    .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
-            ),
-        };
+        let routing_error = Error::new(
+            quota_wait.map_or("routing_unavailable", quota_wait_code),
+            serde_json::to_string(&decision)
+                .map_err(|_| Error::new("internal", "routing refusal encoding failed"))?,
+        );
+        let mut error = wait
+            .or(preflight.profile_command_refusal)
+            .unwrap_or(routing_error);
         error.routing = Some(Box::new(decision));
         Err(error)
     }
@@ -490,6 +491,7 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
+        let inherited_snapshot = parent.is_some_and(|parent| parent.profile == name);
         let mut snapshot = if let Some(parent) = parent.filter(|parent| parent.profile == name) {
             parent.profile_snapshot.clone()
         } else {
@@ -512,6 +514,30 @@ impl Router {
             if hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err() {
                 return Ok(Err(RouteSkipReason::Unauthorized));
             }
+        }
+        if !inherited_snapshot {
+            let configured_cmd = snapshot
+                .get("cmd")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            match crate::adhoc::resolve_profile_command(&name, &harness, configured_cmd.as_deref())
+                .await
+            {
+                Ok(candidate) => {
+                    crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
+                }
+                Err(error) => {
+                    if let Some(cmd) = configured_cmd.as_deref()
+                        && !(harness == "claude" && crate::adhoc::is_latest_claude_selector(cmd))
+                        && !crate::adhoc::profile_command_exists(cmd)
+                    {
+                        preflight.profile_command_refusal.get_or_insert(error);
+                    }
+                    return Ok(Err(RouteSkipReason::NotInstalled));
+                }
+            }
+        }
+        if let Some(parent) = parent {
             let mut candidate = request.clone();
             candidate.args["profile"] = Value::String(name.to_owned());
             install_frozen_profile(&mut candidate, &harness, snapshot.clone(), true)?;
@@ -537,7 +563,7 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if !native_installed(&harness, &snapshot) {
+        if inherited_snapshot && !native_installed(&harness, &snapshot) {
             return Ok(Err(RouteSkipReason::NotInstalled));
         }
         if preflight.check_candidate_holds() {
