@@ -54,48 +54,48 @@ mod window_place;
 #[cfg(windows)]
 mod winrt;
 
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod attachments;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod chat;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod client;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod config_client;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod feed;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod handoff;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod history;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod live;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod markdown;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod monitor;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod nav;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod picker;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod profiles;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod quota;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod scripts;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod settings;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod settings_model;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod state;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod theme;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 #[path = "ui/tokens.rs"]
 mod tokens;
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod worktrees;
 
 #[cfg(windows)]
