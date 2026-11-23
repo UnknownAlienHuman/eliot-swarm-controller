@@ -251,10 +251,11 @@ An actor that retires control without proof of exit records the Agent as lost
 and keeps the custody reservation for reconciliation.
 
 When an Owner-requested stop proves both facts, its captured turn becomes
-`interrupted` with `resolution_source=owner` and reason `stopped_by_owner` if the
+`interrupted` with status `interrupted_by_owner`, `resolution_source=owner`
+and reason `stopped_by_owner` if the
 turn was unresolved or its native outcome was interrupted. An acknowledged
 Owner interrupt with an exact native interruption also sets
-`resolution_source=owner` and emits `turn.resolved` with
+that status and resolution source and emits `turn.resolved` with
 `reason=interrupted_by_owner`. A SEND dispatched before the stop can supply
 its exact turn binding while the Owner stop is in flight. Preserve natural
 completion and failure, and retain native status, text and usage. A turn not captured by

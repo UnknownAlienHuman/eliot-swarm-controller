@@ -2085,7 +2085,7 @@ fn settle_owner_interrupted_turn_tx(
         return Ok(());
     }
     let changed = db!(tx.execute(
-        "UPDATE turns SET state = 'completed', status = 'interrupted', outcome = 'interrupted',
+        "UPDATE turns SET state = 'completed', status = 'interrupted_by_owner', outcome = 'interrupted',
                           completed_at = COALESCE(completed_at, ?1), resolution_source = 'owner'
          WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
            AND (state IN ('running', 'unknown') OR outcome = 'interrupted')",

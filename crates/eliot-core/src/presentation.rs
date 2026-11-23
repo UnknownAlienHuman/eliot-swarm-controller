@@ -50,6 +50,7 @@ pub fn reason_words(code: &str) -> String {
         "failure" | "failed" | "agent.failed" => "The Agent could not finish",
         "lost" | "agent.lost" => "Lost contact with the Agent",
         "interrupted" => "Interrupted",
+        "interrupted_by_owner" | "stopped_by_owner" => "Stopped by you",
         "refused" | "rejected" => "The request was declined",
         "cancelled" => "Cancelled",
         "crashed" => "The Agent software stopped unexpectedly",

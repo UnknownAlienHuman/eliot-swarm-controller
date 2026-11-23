@@ -912,7 +912,7 @@ pub struct Turn {
     /// recorded. Trailing field; absent on old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preceded_by: Option<String>,
-    /// `owner` qualifies the recorded status and outcome as an Owner assertion.
+    /// `owner` qualifies the result as an Owner assertion or a confirmed Owner control.
     /// `unknown` means a legacy terminal row lacks evidence of its source.
     /// Absent for native completion, unsettled turns, and old wire payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
