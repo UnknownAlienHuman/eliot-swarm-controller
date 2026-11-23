@@ -1086,7 +1086,9 @@ impl Router {
                 let Some(command) = store.get_command(&id)? else {
                     continue;
                 };
-                if command.state != CommandState::Accepted || !is_start_verb(command.verb.as_str())
+                if command.state != CommandState::Accepted
+                    || !is_start_verb(command.verb.as_str())
+                    || !store.recoverable_workspace_start(&id)?
                 {
                     continue;
                 }

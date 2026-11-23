@@ -775,6 +775,8 @@ files, or past a generation budget of eight checkpoint totals of newly written b
 Each withheld file is recorded with its path, size and reason in the checkpoint,
 `swarm show` and the handoff brief. It exists only in the worktree, and the turn counts
 as not fully in Git. A checkpoint that could capture nothing is a failed one.
+An Agent explicitly staging or committing `.env` on its own branch uses ordinary Git
+behavior. The checkpoint filter applies to daemon-owned capture.
 
 An Owner restores a retained checkpoint with `swarm checkpoint restore` after recreating
 the worktree. Restore requires a clean target at the captured HEAD and in the same Git
@@ -820,7 +822,8 @@ that restore it: `git worktree prune`, `git worktree add <dir> <branch>`, and
 A failed capture keeps the reference to the last good checkpoint.
 
 Checkpoint capture and accounting share the repository write lane with managed Git
-operations. Store reserves the lane and a bounded byte allowance before capture,
+operations. The unique repository intent serializes checkpoints, and Store reserves
+the lane and a bounded byte allowance before capture,
 then records the candidate ref, OID and exact byte charge before ref publication.
 On restart, exact Git readback determines whether the ref was published. Swarm
 settles the Store projection and releases the lane together. An interrupted capture

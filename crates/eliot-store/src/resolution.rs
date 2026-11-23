@@ -498,6 +498,44 @@ impl Store {
                 "observe-only Agents have no resolvable commands",
             ));
         }
+        if super::switch::has_releasable_switch_fence(&tx, &record.command)? {
+            if request.resolution != CommandResolution::Failed {
+                return Err(Error::new(
+                    "bad_state",
+                    "a switch fence releases only as failed",
+                ));
+            }
+            let mut events = Vec::new();
+            let state = super::switch::owner_release_switch_fence_tx(
+                &tx,
+                &record.command,
+                &request.reason,
+                now,
+                &mut events,
+            )?;
+            let value = CommandResolveResponse {
+                id: request.id.clone(),
+                command_id: request.command_id.clone(),
+                state,
+            };
+            insert_resolution_write(
+                &tx,
+                &request.id,
+                principal,
+                RESOLVE_COMMAND_METHOD,
+                &payload_digest,
+                &value,
+                now,
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Change { value, events });
+        }
+        if record.command.verb == "switch" {
+            return Err(Error::new(
+                "bad_state",
+                "switch has no interrupted checkout fence to release",
+            ));
+        }
         let failed_brief = record.state == CommandState::Failed
             && request.resolution == CommandResolution::Applied
             && super::handoff::is_brief_tx(&tx, &request.command_id)?;

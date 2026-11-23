@@ -1287,6 +1287,16 @@ original task text after a confirmed pre-work refusal. Ordinary readiness,
 workspace, authority, claims, Goal and successor delivery rules still apply.
 Rejected means preparation/admission refused; Failed means a known launch or
 handoff refusal; Unknown retains an uncertain launch or interrupted orchestration.
+
+After restart, Swarm releases an interrupted checkout fence once Store can prove that
+the source and any successor stopped writing. Recovery cancels linked operations
+that never dispatched and leaves uncertain native effects available for readback.
+A fence that still needs Owner review appears in `swarm inbox` as Stuck with
+`release_checkout`. After verifying that the writers exited, the Owner can run
+`swarm cmd resolve <switch-id> --status failed --reason "<exit evidence>"`. The
+transaction releases only that switch's fence, rejects known live writers or active
+workspace operations, and records the Owner's reason.
+
 Automatic handoffs have a durable budget of three admissions per continuation lineage.
 Store maps each Agent generation to its lineage, initially the root Agent ID, and carries
 that mapping through completed switches and resume. The budget and last outcome live in

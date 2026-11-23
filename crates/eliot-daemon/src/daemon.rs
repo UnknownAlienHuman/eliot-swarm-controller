@@ -557,6 +557,12 @@ async fn initialize_runtime(
         on_restart: daemon_config.on_restart,
     };
     let report = restart_capacity::reconcile_first_pass(&capacity).await?;
+    let switch_events = store
+        .lock()
+        .await
+        .reconcile_switch_checkout_fences(now_ms())?;
+    bus.publish(&switch_events);
+    router.note_events(&switch_events);
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
     logging::record_debug(
         &policy,

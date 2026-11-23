@@ -934,6 +934,8 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                 ),
                 (EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id)
                   OR EXISTS(SELECT 1 FROM project_transfers p WHERE p.launch_command = c.id)
+                  OR EXISTS(SELECT 1 FROM switch_checkout_owners f
+                            WHERE f.switch_command = c.id OR f.switch_command = c.parent_command)
                   OR EXISTS(SELECT 1 FROM git_integration_custody j
                             WHERE j.command_id = c.id AND j.cleaned = 0)),
                 EXISTS(SELECT 1 FROM provider_holds h WHERE h.probe_command = c.id),

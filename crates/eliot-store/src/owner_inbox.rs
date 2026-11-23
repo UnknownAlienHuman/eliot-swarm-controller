@@ -27,6 +27,7 @@ pub(crate) fn project(
     project_assignment_waits(connection, now, &mut items, &mut liveness, &[])?;
     project_timers(connection, now, &mut items, &mut liveness, &[])?;
     project_handoffs(connection, now, &mut items, &mut liveness, &[])?;
+    project_switch_fences(connection, now, &mut items, &mut liveness, &[])?;
     project_work_not_in_git(connection, now, &mut items, &mut liveness, &[])?;
 
     items.sort_by(|left, right| {
@@ -66,6 +67,7 @@ pub(crate) fn project_item(
             Some(("command", id)) if kind == OwnerInboxKind::Stuck => {
                 (project_unknown_commands, id)
             }
+            Some(("switch", id)) if kind == OwnerInboxKind::Stuck => (project_switch_fences, id),
             Some(("hold", scope)) if kind == OwnerInboxKind::Stuck => (project_holds, scope),
             Some(("goal", goal)) if kind == OwnerInboxKind::Stuck => (project_goals, goal),
             Some(("timer", timer)) if kind == OwnerInboxKind::Stuck => (project_timers, timer),
@@ -528,6 +530,51 @@ fn project_unknown_turns(
 }
 
 /// A successor is working after a turn that may have left partial effects.
+fn project_switch_fences(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    _stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT c.id, c.updated_at FROM commands c
+         WHERE c.method = 'swarm.switch'
+           AND c.state IN ('unknown','failed','rejected','cancelled')
+           AND EXISTS(SELECT 1 FROM switch_checkout_owners f WHERE f.switch_command = c.id)",
+        "c.id = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (id, updated) = row.map_err(sql_error)?;
+        let choices = vec![
+            action("inspect", "command.get", json!({"id":id})),
+            action(
+                "release_checkout",
+                "command.resolve",
+                json!({"command_id":id,"as":"failed","reason":null}),
+            ),
+        ];
+        items.push(item(
+            OwnerInboxKind::Stuck,
+            format!("switch:{id}"),
+            format!("fence:{updated}"),
+            now,
+            updated,
+            "switch_checkout_release_needs_owner",
+            None,
+            choices,
+        ));
+    }
+    Ok(())
+}
+
 fn project_handoffs(
     db: &Connection,
     now: i64,

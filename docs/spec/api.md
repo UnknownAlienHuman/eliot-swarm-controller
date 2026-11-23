@@ -489,7 +489,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `turn.get` | implemented running/completed/unknown turn read |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
-| `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes; failed handoff brief may be Owner-applied |
+| `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes, interrupted switch checkout release, and asserted application of a failed handoff brief |
 | `swarm.switch` | Owner launch-plus-handoff to a new Agent, using normal launch and the H2 transfer |
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner or issuing-manager withdrawal of undispatched SEND |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
