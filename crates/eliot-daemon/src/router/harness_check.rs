@@ -838,26 +838,44 @@ impl Router {
                         command.generation,
                         command.turn_id.as_deref(),
                     ) {
-                        let turn_ids = [turn_id.to_owned()];
-                        if store
-                            .turns_with_unknown_commands(
-                                agent,
-                                generation,
-                                &turn_ids,
-                                &marks.memory,
-                            )
-                            .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?
-                            .contains(turn_id)
-                        {
-                            return Err(CheckEnd::fail(
-                                step,
-                                "unknown",
-                                "harness check turn outcome is unknown",
-                            ));
-                        }
-                        store
+                        let fetched = store
                             .get_turn(agent, generation, turn_id)
-                            .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?
+                            .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?;
+                        // A turn the SEND completed with a definite outcome is
+                        // provable even when a later foreign command (like the
+                        // scenario steer) sits unsettled on the same turn: the
+                        // foreign command cannot un-complete it. Anything less
+                        // than Applied-plus-definite keeps the unknown mask.
+                        if !command_settles
+                            && command.state == CommandState::Applied
+                            && fetched.as_ref().is_some_and(|turn| {
+                                !matches!(
+                                    Self::turn_entry_status(turn),
+                                    "still_running" | "unknown"
+                                )
+                            })
+                        {
+                            fetched
+                        } else {
+                            let turn_ids = [turn_id.to_owned()];
+                            if store
+                                .turns_with_unknown_commands(
+                                    agent,
+                                    generation,
+                                    &turn_ids,
+                                    &marks.memory,
+                                )
+                                .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?
+                                .contains(turn_id)
+                            {
+                                return Err(CheckEnd::fail(
+                                    step,
+                                    "unknown",
+                                    "harness check turn outcome is unknown",
+                                ));
+                            }
+                            fetched
+                        }
                     } else {
                         None
                     };
