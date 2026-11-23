@@ -168,14 +168,17 @@ With a fresh data root, `serve` returned an empty `bundledCatalog` even
 after `session/start`. The installed `muse exec --help` documents
 `exec --list-models`, which fetches models and populates Muse's cache under
 `XDG_DATA_HOME/muse/model-catalog` without creating a session or running a turn.
-The adapter first reads the host's `model/list` snapshot. An empty
-snapshot or a missing exact launch model triggers one refresh with the
-same executable and environment, from the private plugin directory.
-The refresh and each host query have separate deadlines. A fresh
-`serve` reads the resulting cache even if the refresh failed. If the
-model is still missing, the refusal includes the refresh failure and
-its bounded, redacted stderr. The picker refreshes only an empty
-snapshot.
+The adapter first reads the host's `model/list` snapshot. An empty snapshot
+triggers one refresh with the resolved executable and environment, from
+the private plugin directory. The refresh and each host query have separate
+deadlines. A fresh `serve` reads the resulting cache even if the refresh fails.
+
+An explicit or frozen model is sent unchanged to `session/start` or
+`session/setModel`. An exact catalogue row supplies effort variants when
+known. An omitted row adds `catalogue_omits_model: true` and Muse receives
+the requested effort unchanged. Native refusals carry Muse's error message
+and harness attribution. The effective session `modelId` must match the
+request to set `model_verified`.
 
 Pre-session-effect refusals (profile, catalogue refresh, spawn, initialize,
 `model/list`, resume preflight) return a failed-state start
@@ -649,8 +652,8 @@ No adapter-specific journal, proof receipts or secondary workflow model is impor
 snapshot from safe defaults (`workspace-write`, `never`, explicit MCP `inherit`) plus
 flags. An omitted `--model` defers to the server default whether or not the
 catalogue marks a row with `isDefault` (an empty catalogue refuses launch); the
-effective id is read back from the session. An unavailable requested model
-fails without substitution. `cmd` is discovered from the launcher dir version
+effective id is read back from the session. An explicit model is passed
+unchanged even when the catalogue omits it. `cmd` is discovered from the launcher dir version
 the launcher marks current (`muse.cmd` wrappers are never frozen); omitted
 profile `cmd` uses this same discovery. The selected native executable is
 frozen only in the launch generation. `--cmd` is the Owner's one-launch

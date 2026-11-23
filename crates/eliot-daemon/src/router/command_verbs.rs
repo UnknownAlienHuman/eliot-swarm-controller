@@ -946,6 +946,9 @@ impl Router {
                     "harness": agent.harness,
                     "model_verified": model_verified,
                 });
+                if proven.get("catalogue_omits_model").and_then(Value::as_bool) == Some(true) {
+                    outcome["catalogue_omits_model"] = Value::Bool(true);
+                }
                 if agent.harness == "claude" {
                     outcome["accepted_model"] = json!(config.model);
                     outcome["effective"]["model"] = Value::Null;

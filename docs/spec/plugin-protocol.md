@@ -65,6 +65,15 @@ or a result is returned. The host joins metadata by exact `provider/model` ID.
 Optional metadata failures permit ids-only output only after
 confirmed cleanup; cancellation or unconfirmed closure never becomes success.
 
+A launch or configure passes its explicit or frozen model selector to the
+harness unchanged. An exact catalogue row provides model metadata, including
+any advertised effort variants. A successful catalogue read that omits the model
+adds `catalogue_omits_model: true` to effective start settings or the configure
+outcome. The harness receives the requested model and effort and decides whether
+to accept them. A native refusal carries the harness origin and its error
+message. Effective readback establishes `model_verified`; a request or a
+catalogue row alone cannot verify the serving model.
+
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below
 900 KiB. Both semantic and encoded limits apply, including JSON escaping. Reject

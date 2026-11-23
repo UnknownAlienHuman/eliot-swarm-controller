@@ -1556,6 +1556,38 @@ pub fn model_catalogue_profile<'a>(
     Ok(profile)
 }
 
+/// An explicit or frozen selector is authoritative. The exact catalogue row,
+/// when present, provides metadata for that selector.
+pub struct ModelSelection<'a, T> {
+    pub id: &'a str,
+    pub catalogue_entry: Option<&'a T>,
+}
+
+impl<'a, T> ModelSelection<'a, T> {
+    pub fn new(id: &'a str, catalogue_entry: Option<&'a T>) -> Self {
+        Self {
+            id,
+            catalogue_entry,
+        }
+    }
+
+    pub fn allows_effort(&self, supports: impl FnOnce(&T) -> bool) -> bool {
+        self.catalogue_entry.is_none_or(supports)
+    }
+
+    pub fn catalogue_omits_model(&self) -> bool {
+        self.catalogue_entry.is_none()
+    }
+}
+
+/// A catalogue omission is advisory on readiness and configure results.
+pub fn with_model_catalogue_diagnostic(mut value: Value, catalogue_omits_model: bool) -> Value {
+    if catalogue_omits_model {
+        value["catalogue_omits_model"] = Value::Bool(true);
+    }
+    value
+}
+
 pub enum LaunchModelRequest<'a> {
     Explicit(&'a str),
     Frozen(&'a str),
