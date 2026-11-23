@@ -1731,6 +1731,68 @@ impl Router {
         }
     }
 
+    /// Reconcile disappearance independently of the retention cleanup policy.
+    /// The ordinary removal command binds generation and rechecks absence.
+    pub(crate) async fn reconcile_missing_worktrees(
+        &self,
+        after: &mut Option<String>,
+    ) -> Result<()> {
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Ok(());
+        }
+        let (workspaces, _, more) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_managed_workspaces(after.as_deref(), 64)?;
+        *after = workspaces
+            .last()
+            .filter(|_| more)
+            .map(|row| row.agent.clone());
+        for workspace in workspaces {
+            if workspace.phase != WorkspacePhase::Ready
+                || !std::fs::symlink_metadata(&workspace.worktree_path)
+                    .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            {
+                continue;
+            }
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "worktree.remove");
+            request.target = Some(workspace.agent);
+            request.expected_generation = Some(workspace.target_generation);
+            request.args = json!({"observe_missing": true});
+            let admission = {
+                let mut store = self.inner.store.lock().await;
+                match self.admit_prepared_submission(
+                    &mut store,
+                    "owner",
+                    PreparedSubmission {
+                        request,
+                        workspace: None,
+                    },
+                    SubmissionContext::default(),
+                ) {
+                    Ok(admission) => {
+                        self.publish_locked(&admission.events);
+                        admission
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "busy" | "bad_state" | "not_found" | "invalid"
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            self.schedule_admission(&admission);
+            self.signal_progress();
+        }
+        Ok(())
+    }
+
     async fn sweep_automatic_cleanup(&self, after: &mut Option<String>) -> Result<()> {
         let config = crate::config::load_automation_config(&self.inner.data_root)?;
         if config.auto_cleanup == Some(false) {
@@ -2430,19 +2492,25 @@ impl Router {
                     CommandState::Applied => return Ok(0),
                     CommandState::Unknown => return Err(unknown()),
                     state if state.is_terminal() => {
-                        let code = command
+                        let refusal = command
                             .outcome
                             .as_ref()
+                            .map(|outcome| outcome.get("result").unwrap_or(outcome));
+                        let code = refusal
                             .and_then(|outcome| outcome.get("code"))
                             .and_then(Value::as_str)
                             .unwrap_or("worktree_remove_refused");
-                        let message = command
-                            .outcome
-                            .as_ref()
+                        let message = refusal
                             .and_then(|outcome| outcome.get("message"))
                             .and_then(Value::as_str)
                             .unwrap_or("worktree removal settled without a recorded reason");
-                        return Err(Error::new(code, message));
+                        let error = Error::new(code, message);
+                        return Err(
+                            match refusal.and_then(|outcome| outcome["where"].as_str()) {
+                                Some(location) => error.with_where(location),
+                                None => error,
+                            },
+                        );
                     }
                     _ => {}
                 }

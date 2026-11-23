@@ -51,36 +51,31 @@ or all. Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
 Clean managed worktrees require exact reciprocal Git/common-directory identity.
 Tracked changes and untracked or ignored paths outside frozen scratch paths keep the
-worktree; approved relative scratch paths are removed only by guarded cleanup.
+worktree. Guarded cleanup can remove approved relative scratch files.
 Native stores are never deleted as files. A Codex or OpenCode session of a
 terminal Swarm-created Agent is `safe` with reason `native_archive_pending`.
 Attached or observed sessions and every other harness stay
 `keep(no_native_archive)`.
 Managed worktree cleanup, including direct `worktree.remove` and automatic
-cleanup, does not require ancestry or content proof against an upstream branch.
+cleanup, accepts clean checkouts on unmerged branches.
 After the existing terminal-owner, borrower, assignment, age, reciprocal Git
 identity, cleanliness and filesystem-guard checks pass, Swarm removes only the
 checkout and its private worktree administration directory. The local branch
-and its exact tip remain unchanged, whether or not they are merged. A dirty
-checkout stays kept; a snapshot from #922 is not presumed by this contract.
+retains its exact tip. A dirty checkout stays kept. #922 owns the snapshot step.
 
-Local managed-branch cleanup is separate from worktree removal and remains an
-explicit Owner cleanup selection. It does not infer a merge from file contents.
+Local managed-branch cleanup requires an explicit cleanup selection or an
+applicable cleanup policy.
 After confirming the branch's planned tip is still current and no worktree uses
 it, one Git ref transaction creates `refs/eliot/archive/<branch>` at that exact
-tip and deletes the local branch name. The transaction never overwrites an
-existing archive ref; a collision or changed tip refuses without deleting the
-branch. An uncertain transaction remains `unknown` until exact branch and
-archive readback settles it, and is never replayed blindly. Archive refs are
-local and are never pushed to a remote. An explicitly selected remote-branch
-deletion remains a separate operation; it does not push the archive ref. Stand
+tip and deletes the local branch name. A conflicting archive ref or changed tip
+keeps the branch. An uncertain transaction remains `unknown` until exact branch
+and archive readback settles it. Archive refs stay local. An explicitly selected
+remote-branch deletion uses its existing remote-state checks. Stand
 plan/apply and `stand down` retain their independent root, registry, marker,
 owner-binding and #885 two-pass cleanup checks.
 
-Plans anchor the managed workspace identity and branch tip; apply rechecks the
-same identity and exact local tip before mutation. Upstream merge state,
-tracking-branch state and remote default-branch discovery do not gate managed
-worktree removal or local branch archival. Missing or changed local identity,
+Plans anchor the managed workspace identity and branch tip. Apply rechecks the
+same identity and exact local tip before mutation. Missing or changed local identity,
 checked-out branches, filesystem guards and Git readiness still keep/refuse the
 candidate with their concrete reason. A present
 `daemon.lock` with a live owner keeps a data directory. Only a provably dead
@@ -127,16 +122,12 @@ Unix reports unsupported rather than using pathname unlink. Worktree directory
 and its exact private Git administration directory are removed; its local branch
 is retained when the worktree is removed through worktree cleanup. A selected
 managed branch is archived and deleted in one local ref transaction after
-current-tip verification and confirmation that no worktree uses it. Refusal
-reasons identify the concrete blocker, including `branch_checked_out`,
-`archive_ref_exists`, `branch_tip_changed` and `identity_changed`; an uncertain
-ref transaction is `unknown` until readback proves the outcome. Refused cleanup
-preserves the originating bounded, sanitized message and precise failure `where`
-alongside its stable code; it never substitutes a generic pre-spawn refusal.
+current-tip verification and confirmation that no worktree uses it. A refused
+`worktree.remove` command carries its stable code and the originating bounded,
+sanitized message, with the failure location in `where`.
 Remote branch deletion remains a separate explicit Owner-only flag
-(`delete_remote`) on `cleanup.apply` and is never automatic: its existing
-remote-state checks remain in force, and a remote failure after local deletion
-is `unknown`, never `skipped`. No remote operation pushes an archive ref.
+(`delete_remote`) on `cleanup.apply`. Its existing remote-state checks remain
+in force. A remote failure after local deletion is `unknown`.
 Native sessions are archived at apply through the harness documented archive
 method (Codex `thread/archive`, OpenCode session delete on the retained
 per-Agent store) using the Agent's frozen profile. Only a Swarm-created Agent's
@@ -242,8 +233,7 @@ planning and apply. Each completed paged
 sweep updates aggregate status and sends one Owner `notify` with would-remove and
 kept totals and enablement; intermediate pages do not send notices. Per-item
 `cleanup.automatic` reason events remain available. The sweep keeps dirty
-worktrees and their generation's artifacts; an unmerged branch alone does not
-keep an otherwise eligible clean worktree.
+worktrees and their generation's artifacts.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
 and artifacts under exact Swarm-created generation roots. A generation root can be
 removed when its creation identity is still bound, its registered descendants are

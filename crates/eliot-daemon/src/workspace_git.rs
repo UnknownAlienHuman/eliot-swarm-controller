@@ -1118,11 +1118,15 @@ impl WorkspaceGit {
                 "removed workspace branch was not retained",
             ));
         }
+        if !absent(&target)? {
+            return Err(problem("unknown", "removed workspace path reappeared"));
+        }
         Ok(WorkspaceRemovalOutcome::Removed {
             repo_common_dir: path_text(&source.common_dir)?,
             worktree_path: path_text(&target)?,
             branch: preparation.requested_branch.clone(),
             branch_retained: true,
+            directory_absent_before_remove: false,
         })
     }
 

@@ -120,11 +120,12 @@ impl Slot {
         preparation: &WorkspacePreparation,
         code: &str,
         message: &str,
+        location: &str,
     ) -> WorkspaceRemovalOutcome {
         if self.removal_may_have_begun(command_id, preparation) {
             removal_unknown("workspace_removal_may_have_begun")
         } else {
-            removal_refused(code, message)
+            removal_refused(code, message, location)
         }
     }
 }
@@ -790,7 +791,7 @@ impl WorkspaceManager {
                 self.remove_prepared(command, preparation, &slot, &git)
                     .await
             }
-            Err(error) => removal_preflight_error(&error),
+            Err(error) => removal_preflight_error(&error, "git_probe"),
         };
         let _gate = slot.gate.clone().lock_owned().await;
         let outcome = if matches!(&outcome, WorkspaceRemovalOutcome::Failed { .. })
@@ -834,7 +835,7 @@ impl WorkspaceManager {
             return removal_unknown("workspace_git_drain_unknown");
         }
         let expected_tip = command.args.get("expected_tip").and_then(Value::as_str);
-        match git
+        let mut outcome = match git
             .prepare_missing_remove(preparation, expected_tip, deadline)
             .await
         {
@@ -844,30 +845,52 @@ impl WorkspaceManager {
                 return removal_refused(
                     "worktree_present",
                     "the managed worktree directory exists at reconciliation",
+                    "missing_path",
                 );
             }
-            Ok(MissingWorktreeRemoval::Present) => {}
-            Ok(MissingWorktreeRemoval::AlreadyUnregistered) => {
-                return git.inspect_removal(preparation).await;
-            }
-            Ok(MissingWorktreeRemoval::Registered(mutator)) => {
+            Ok(MissingWorktreeRemoval::Present) => {
                 return self
-                    .run_removal_mutator(command, preparation, slot, git, mutator, deadline)
+                    .remove_present(command, preparation, slot, git, deadline)
                     .await;
             }
-            Err(error) => return removal_preflight_error(&error),
+            Ok(MissingWorktreeRemoval::AlreadyUnregistered) => {
+                git.inspect_removal(preparation).await
+            }
+            Ok(MissingWorktreeRemoval::Registered(mutator)) => {
+                self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
+                    .await
+            }
+            Err(error) => return removal_preflight_error(&error, "missing_path"),
+        };
+        if let WorkspaceRemovalOutcome::Removed {
+            directory_absent_before_remove,
+            ..
+        } = &mut outcome
+        {
+            *directory_absent_before_remove = true;
         }
+        outcome
+    }
+
+    async fn remove_present(
+        &self,
+        command: &CoreCommand,
+        preparation: &WorkspacePreparation,
+        slot: &Arc<Slot>,
+        git: &WorkspaceGit,
+        deadline: Instant,
+    ) -> WorkspaceRemovalOutcome {
         if let Err(error) = reject_links(Path::new(&preparation.worktree_path)) {
-            return removal_preflight_error(&error);
+            return removal_preflight_error(&error, "path");
         }
         let mut write_guard =
             match WorktreeWriteGuard::prepare(Path::new(&preparation.worktree_path)) {
                 Ok(guard) => guard,
-                Err(error) => return removal_preflight_error(&error),
+                Err(error) => return removal_preflight_error(&error, "write_guard"),
             };
         let journal = match write_guard.journal() {
             Ok(journal) => journal,
-            Err(error) => return removal_preflight_error(&error),
+            Err(error) => return removal_preflight_error(&error, "write_guard_journal"),
         };
         let (prepared, profile, guarded) = {
             let _gate = slot.gate.clone().lock_owned().await;
@@ -876,6 +899,7 @@ impl WorkspaceManager {
                 return removal_refused(
                     "daemon_stopping",
                     "daemon shutdown closed the worktree write gate",
+                    "write_guard",
                 );
             }
             if self.require_removing(preparation, command).await.is_err() {
@@ -889,9 +913,10 @@ impl WorkspaceManager {
                         return removal_refused(
                             "not_found",
                             "worktree owner disappeared during removal",
+                            "owner_read",
                         );
                     }
-                    Err(error) => return removal_preflight_error(&error),
+                    Err(error) => return removal_preflight_error(&error, "owner_read"),
                 };
                 match store.set_workspace_removal_write_guard(
                     preparation,
@@ -909,7 +934,7 @@ impl WorkspaceManager {
                 self.remove_guarded(command, &prepared, slot, git, &profile, deadline)
                     .await
             }
-            Err(error) => removal_preflight_error(&error),
+            Err(error) => removal_preflight_error(&error, "write_guard"),
         };
         if !workspace_git_effect_quiescent(slot) {
             write_guard.leave_active();
@@ -954,7 +979,7 @@ impl WorkspaceManager {
         .await
         {
             Ok(Ok(candidates)) => candidates,
-            Ok(Err(error)) => return removal_preflight_error(&error),
+            Ok(Err(error)) => return removal_preflight_error(&error, "cleanliness"),
             Err(_) => return removal_unknown("workspace_scratch_deadline"),
         };
         if let Err(outcome) = self
@@ -977,7 +1002,7 @@ impl WorkspaceManager {
         .await
         {
             Ok(Ok(command)) => command,
-            Ok(Err(error)) => return removal_preflight_error(&error),
+            Ok(Err(error)) => return removal_preflight_error(&error, "git_prepare"),
             Err(_) => return removal_unknown("workspace_remove_deadline"),
         };
         self.run_removal_mutator(command, preparation, slot, git, mutator, deadline)
@@ -1010,13 +1035,14 @@ impl WorkspaceManager {
             now_ms(),
         );
         match reservation {
-            Err(error) => return removal_preflight_error(&error),
+            Err(error) => return removal_preflight_error(&error, "git_reservation"),
             Ok(WorkspaceGitReservation::Deferred) => {
                 return slot.refuse_removal(
                     &command.id,
                     preparation,
                     "repository_busy",
                     "another Git operation holds the repository write fence",
+                    "git_reservation",
                 );
             }
             Ok(WorkspaceGitReservation::MayHaveBegun) => {
@@ -1039,6 +1065,7 @@ impl WorkspaceManager {
                 preparation,
                 "workspace_process_not_started",
                 "the owned Git worktree removal process did not start",
+                "git_spawn",
             );
         }
         if !result.quiescent {
@@ -1069,6 +1096,7 @@ impl WorkspaceManager {
                     preparation,
                     "daemon_stopping",
                     "daemon shutdown closed the worktree write gate",
+                    "scratch",
                 ));
             }
             if self.require_removing(preparation, command).await.is_err() {
@@ -1454,6 +1482,7 @@ impl WorkspaceManager {
                                 &current,
                                 "daemon_stopping",
                                 "daemon shutdown interrupted worktree removal before effects",
+                                "shutdown",
                             )
                         },
                         now_ms(),
@@ -2257,10 +2286,11 @@ fn reject_path_components(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn removal_refused(code: &str, message: &str) -> WorkspaceRemovalOutcome {
+fn removal_refused(code: &str, message: &str, location: &str) -> WorkspaceRemovalOutcome {
     WorkspaceRemovalOutcome::Failed {
         code: code.to_owned(),
         message: message.to_owned(),
+        failure_where: Some(format!("daemon.workspace.remove.{location}")),
     }
 }
 
@@ -2279,14 +2309,21 @@ fn native_removal_may_have_begun(preparation: &WorkspacePreparation) -> bool {
         != Some(false)
 }
 
-fn removal_preflight_error(error: &Error) -> WorkspaceRemovalOutcome {
+fn removal_preflight_error(error: &Error, location: &str) -> WorkspaceRemovalOutcome {
     if matches!(error.code.as_str(), "unknown" | "timeout") {
         WorkspaceRemovalOutcome::Unknown {
             code: error.code.clone(),
             message: error.message.to_string(),
         }
     } else {
-        removal_refused(&error.code, &error.message)
+        WorkspaceRemovalOutcome::Failed {
+            code: error.code.clone(),
+            message: error.message.to_string(),
+            failure_where: Some(error.failure_where.as_deref().map_or_else(
+                || format!("daemon.workspace.remove.{location}"),
+                str::to_owned,
+            )),
+        }
     }
 }
 

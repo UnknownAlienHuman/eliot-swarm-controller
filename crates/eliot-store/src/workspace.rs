@@ -2362,6 +2362,7 @@ impl Store {
                         worktree_path,
                         branch,
                         branch_retained,
+                        ..
                     } => {
                         if repo_common_dir != workspace.repo_common_dir
                             || worktree_path != workspace.worktree_path

@@ -50,9 +50,39 @@ pub(crate) async fn run(
             initial,
             shutdown.clone()
         ),
-        run_provider_maintenance(router, policy, shutdown, reactions_enabled),
+        run_provider_maintenance(
+            router.clone(),
+            Arc::clone(&policy),
+            shutdown.clone(),
+            reactions_enabled
+        ),
+        run_missing_worktree_reconciliation(router, policy, shutdown),
     )?;
     Ok(())
+}
+
+async fn run_missing_worktree_reconciliation(
+    router: crate::router::Router,
+    policy: Arc<SecretPolicy>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut after = None;
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if let Err(error) = router.reconcile_missing_worktrees(&mut after).await {
+                    logging::record(&policy, "daemon.missing_worktree_reconciliation_failed", &[], Some(&error));
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 async fn run_provider_maintenance(
