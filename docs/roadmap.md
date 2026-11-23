@@ -111,6 +111,10 @@ engine, second scheduler or critic loop.
 - [x] **Background-process wake (#879, #881, #883).** Claude Haiku started a
       60-second background command and ended its turn; Swarm woke it once with
       exit code 7. An Agent with its own wake got no duplicate; a stopped Agent got nothing.
+- [x] **Worktree notes and task cards (#881, #882, #883).** Claude Haiku
+      received one in-turn note with the full path and corrective action for
+      two edits to the same outside file. OpenCode 2.2.7 and Antigravity 1.5.14
+      each received one task card on the next input after manual compaction.
 - [x] **Claude self-started turns (#907).** After a background shell or subagent ended,
       real Haiku Agents showed `busy` and `swarm result` listed the native turn with its
       final text. A `send` during that turn merged into one turn with the reply captured.
