@@ -2686,7 +2686,7 @@ impl Store {
             ));
         }
         if let Some(refusal) = idle_round_refusal(&tx, agent_num, &agent_row, row.generation)? {
-            return Err(Error::new("stale_round", refusal.message));
+            return Err(Error::new("stale_round", *refusal.message));
         }
         let turn_count = count_turns(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
