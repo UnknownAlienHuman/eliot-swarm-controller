@@ -31,6 +31,10 @@ See AGENTS.md for the work loop.
         next eligible profile after a confirmed pre-work refusal. A private Windows
         daemon switched a Codex HTTP 429 to a successful turn in the same worktree
         and showed the decision in `swarm why`.
+      - [x] **Provider hold recovery (#828).** A due hold admitted a fresh role
+        launch as a probe on a private Windows daemon. A second HTTP 429
+        extended the hold. After the profile switched to OpenCode free, its
+        queued launch succeeded at the next deadline and cleared the hold.
       - [x] **Owner quota reserve (#872).** On a private Windows daemon, the
         reserve refused an automatic Claude child and timer launch while the
         Owner's Claude launch completed. A worker role recorded `quota_reserve`

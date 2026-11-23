@@ -1978,7 +1978,7 @@ source marker.
 Optional `after` and `limit` select the page; the response provides `holds` and
 `next`. The canonical Core `ProviderHoldsRequest`/`ProviderHoldsResponse` DTOs own
 the wire shape.
-`swarm status` shows the first page of held scopes, when each was first held,
+`swarm status` shows the first page of held scopes, each hold's age,
 and any scheduled retry or probe. JSON adds the age in milliseconds and a
 continuation cursor for `swarm provider holds` when the status page is full.
 `provider.clear_hold` is an owner-only idempotent write using
