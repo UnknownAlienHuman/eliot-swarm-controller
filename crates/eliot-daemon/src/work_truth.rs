@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -601,11 +601,11 @@ async fn previous_checkpoint_oids(
     let Some(snapshot) = snapshot else {
         return HashSet::new();
     };
-    let path = format!("{snapshot}:manifest.json");
+    let path = format!("{snapshot}:blobs");
     let output = git
         .workspace_command(
             root,
-            &["cat-file", "blob", &path],
+            &["ls-tree", "-z", "--name-only", &path],
             Instant::now() + GIT_TIME,
         )
         .await;
@@ -615,14 +615,12 @@ async fn previous_checkpoint_oids(
     if output.code != 0 {
         return HashSet::new();
     }
-    let Ok(manifest) = serde_json::from_slice::<CheckpointManifest>(&output.stdout) else {
-        return HashSet::new();
-    };
-    manifest
-        .staged
-        .iter()
-        .chain(&manifest.worktree)
-        .filter_map(|file| file.oid.clone())
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .filter(|entry| eliot_core::api::is_git_oid(entry))
+        .map(str::to_owned)
         .collect()
 }
 
@@ -781,7 +779,6 @@ async fn write_checkpoint(
         blobs,
         ..
     } = prepared;
-    let mut blob_entries = Vec::with_capacity(blobs.len());
     for (oid, bytes) in blobs {
         let written = git
             .workspace_input_with(
@@ -796,8 +793,24 @@ async fn write_checkpoint(
         if written.code != 0 || first_line(&written.stdout)? != oid {
             return Err(Error::new("unavailable", "checkpoint blob readback failed"));
         }
-        blob_entries.push(("100644".to_owned(), "blob".to_owned(), oid.clone(), oid));
     }
+    // A checkpoint owns every object referenced by its manifest, including
+    // deduplicated bytes written by an earlier, potentially prunable ref.
+    let blob_entries: Vec<_> = staged
+        .iter()
+        .chain(&worktree)
+        .filter_map(|file| file.oid.as_deref())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|oid| {
+            (
+                "100644".to_owned(),
+                "blob".to_owned(),
+                oid.to_owned(),
+                oid.to_owned(),
+            )
+        })
+        .collect();
     let blob_tree = write_tree(git, repository, &blob_entries, Instant::now() + GIT_TIME).await?;
     let manifest = CheckpointManifest {
         version: 1,
