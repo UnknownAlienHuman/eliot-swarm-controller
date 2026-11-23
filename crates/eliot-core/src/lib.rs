@@ -264,11 +264,15 @@ pub enum WorkspaceRemovalOutcome {
         worktree_path: String,
         branch: String,
         branch_retained: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        directory_absent_before_remove: bool,
     },
     /// Proven no destructive effect: the registered checkout remains intact.
     Failed {
         code: String,
         message: String,
+        #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+        failure_where: Option<String>,
     },
     Unknown {
         code: String,

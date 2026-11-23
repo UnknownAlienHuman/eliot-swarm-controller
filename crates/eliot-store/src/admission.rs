@@ -1397,12 +1397,16 @@ fn admit_worktree_remove_tx(
         .as_object()
         .ok_or_else(|| Error::new("invalid", "worktree.remove arguments must be an object"))?;
     let expected_tip = args.get("expected_tip");
+    let observe_missing = args.get("observe_missing");
     if request.request_id.is_some()
         || request.expected_turn_id.is_some()
         || request
             .expected_generation
             .is_some_and(|expected| expected != agent.generation)
-        || args.keys().any(|key| key != "expected_tip")
+        || args
+            .keys()
+            .any(|key| key != "expected_tip" && key != "observe_missing")
+        || observe_missing.is_some_and(|value| value != &Value::Bool(true) || principal != "owner")
         || expected_tip.is_some_and(|tip| !tip.as_str().is_some_and(eliot_core::api::is_git_oid))
     {
         return Err(Error::new(
@@ -1412,10 +1416,30 @@ fn admit_worktree_remove_tx(
     }
     let workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
+    if observe_missing.is_some()
+        && tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands
+                 WHERE target = ?1 AND generation = ?2 AND verb = 'worktree.remove'
+                   AND (state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                        OR (created_at >= ?3 AND json_extract(args, '$.observe_missing') = 1)))",
+                params![agent_num, agent.generation, now.saturating_sub(300_000)],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?
+    {
+        return Err(Error::new(
+            "busy",
+            "worktree removal is pending or missing-directory reconciliation was attempted recently",
+        ));
+    }
     workspace::require_workspace_removable(tx, &agent, &workspace, now)?;
     let mut args = json!({"target_generation": workspace.target_generation});
     if let Some(tip) = expected_tip {
         args["expected_tip"] = tip.clone();
+    }
+    if observe_missing.is_some() {
+        args["observe_missing"] = Value::Bool(true);
     }
     events.push(admit_command(
         tx,

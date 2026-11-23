@@ -8,10 +8,7 @@ use crate::operator::{
 };
 use crate::platform::script_file::directory_identity;
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
-use crate::workspace_git::{
-    WorkspaceGit,
-    containment::{self, BranchClassification, CleanupFetches, ContainmentScope, branch_rev_parse},
-};
+use crate::workspace_git::{WorkspaceGit, containment::branch_rev_parse};
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
 use eliot_core::{
     Error, Result, WorkspacePreparation, WorkspaceRemovalOutcome, workspace_path_key,
@@ -1766,12 +1763,10 @@ async fn drain_stand_output<R: AsyncRead + Unpin>(mut stream: R) -> Result<()> {
 }
 
 pub(crate) async fn plan_external_git(
-    transport_data_root: &Path,
     stand_root: &Path,
     registry: &Path,
     registry_file: &str,
     registration: &StandRegistration,
-    mut fetches: Option<&mut CleanupFetches>,
 ) -> Result<()> {
     if registration.pending_write_guard.is_some() {
         return Err(Error::new(
@@ -1804,15 +1799,7 @@ pub(crate) async fn plan_external_git(
         }
         check_worktree_record(registry, registry_file, &rec.preparation)?;
         check_stand_worktree_location(stand_root, &rec.preparation.worktree_path)?;
-        Box::pin(git.removal_candidates(
-            transport_data_root,
-            &rec.preparation,
-            &rec.scratch,
-            None,
-            fetches.as_deref_mut(),
-            deadline,
-        ))
-        .await?;
+        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)).await?;
         planned_worktrees.insert(wt_key);
     }
 
@@ -1843,22 +1830,18 @@ pub(crate) async fn plan_external_git(
                 "stand branch is checked out in another worktree",
             ));
         }
-        Box::pin(containment::classify_branch(
-            transport_data_root,
+        crate::router::Router::pin_local_branch_tip(
             &rec.preparation.repo_path,
             &common,
             &rec.preparation.requested_branch,
-            ContainmentScope::BranchDeletion,
-            fetches.as_deref_mut(),
             deadline,
-        ))
+        )
         .await?;
     }
     Ok(())
 }
 
 pub async fn cleanup_stand_external_git(
-    transport_data_root: &Path,
     stand_root: &Path,
     registry: &Path,
     registry_file: &str,
@@ -1878,11 +1861,10 @@ pub async fn cleanup_stand_external_git(
     }
     let git = WorkspaceGit::new()?;
     let probe = GitProbe::new()?;
-    let mut fetches = CleanupFetches::default();
     let deadline = Instant::now() + STAND_GIT_TIME;
     let mut blocked_branches = BTreeSet::new();
 
-    // Pass 1: clean, contained external worktrees.
+    // Pass 1: clean external worktrees.
     for rec in &workspaces {
         let wt_key = external_worktree_key(&rec.preparation.worktree_path);
         let branch_key = external_branch_key(
@@ -1985,13 +1967,7 @@ pub async fn cleanup_stand_external_git(
         }
 
         let outcome = Box::pin(remove_guarded_stand_worktree(
-            transport_data_root,
-            stand_root,
-            &git,
-            rec,
-            &mut guard,
-            &mut fetches,
-            deadline,
+            stand_root, &git, rec, &mut guard, deadline,
         ))
         .await;
         match outcome {
@@ -2130,25 +2106,22 @@ pub async fn cleanup_stand_external_git(
             });
             continue;
         }
-        let classification = match Box::pin(containment::classify_branch(
-            transport_data_root,
+        let tip = match crate::router::Router::pin_local_branch_tip(
             &rec.preparation.repo_path,
             &common,
             &rec.preparation.requested_branch,
-            ContainmentScope::BranchDeletion,
-            Some(&mut fetches),
             deadline,
-        ))
+        )
         .await
         {
-            Ok(classification) => classification,
+            Ok(tip) => tip,
             Err(error) => {
                 report.branches.push(StandBranchOutcome {
                     repo_common_dir: eliot_core::display_path(&rec.preparation.repo_common_dir),
                     branch: rec.preparation.requested_branch.clone(),
                     outcome: "kept".to_owned(),
                     reason: Some(error.code),
-                    detail: None,
+                    detail: Some(*error.message),
                 });
                 continue;
             }
@@ -2160,14 +2133,9 @@ pub async fn cleanup_stand_external_git(
             worktree: rec.preparation.worktree_path.clone(),
             admin: String::new(),
             admin_identity: String::new(),
-            planned_tip: Some(classification.tip.clone()),
+            planned_tip: Some(tip.clone()),
         };
-        match Box::pin(crate::router::Router::delete_local_branch(
-            &binding,
-            &classification.tip,
-        ))
-        .await
-        {
+        match Box::pin(crate::router::Router::delete_local_branch(&binding, &tip)).await {
             Ok(()) => {
                 registration.settled_external_branches.push(branch_key);
                 write_stand_registration(registry, registry_file, registration)?;
@@ -2190,7 +2158,7 @@ pub async fn cleanup_stand_external_git(
                     }
                     .to_owned(),
                     reason: Some(error.code),
-                    detail: None,
+                    detail: Some(*error.message),
                 });
             }
         }
@@ -2222,24 +2190,15 @@ enum GuardedOutcome {
 }
 
 async fn remove_guarded_stand_worktree(
-    transport_data_root: &Path,
     stand_root: &Path,
     git: &WorkspaceGit,
     rec: &StandWorkspaceRecord,
     _guard: &mut WorktreeWriteGuard,
-    fetches: &mut CleanupFetches,
     deadline: Instant,
 ) -> GuardedOutcome {
-    let (branch_class, files): (BranchClassification, Vec<PathBuf>) = match timeout_at(
+    let (tip, files) = match timeout_at(
         deadline,
-        Box::pin(git.removal_candidates(
-            transport_data_root,
-            &rec.preparation,
-            &rec.scratch,
-            None,
-            Some(fetches),
-            deadline,
-        )),
+        Box::pin(git.removal_candidates(&rec.preparation, &rec.scratch, None, deadline)),
     )
     .await
     {
@@ -2279,7 +2238,7 @@ async fn remove_guarded_stand_worktree(
 
     let command = match timeout_at(
         deadline,
-        Box::pin(git.prepare_stand_worktree_remove(&rec.preparation, &branch_class.tip, deadline)),
+        Box::pin(git.prepare_stand_worktree_remove(&rec.preparation, &tip, deadline)),
     )
     .await
     {
@@ -2372,7 +2331,6 @@ pub(crate) async fn plan_stand_artifact(
     daemon_data_root: &Path,
     stand_root: &Path,
     expected_identity: &str,
-    fetches: Option<&mut CleanupFetches>,
 ) -> Result<u64> {
     if directory_identity(stand_root)? != expected_identity {
         return Err(Error::new(
@@ -2391,12 +2349,10 @@ pub(crate) async fn plan_stand_artifact(
     crate::operator::verify_stand_target(stand_root, &registration)?;
     let _ = verify_stand_stopped(stand_root, &registration)?;
     Box::pin(plan_external_git(
-        daemon_data_root,
         stand_root,
         &registry,
         &reg_name,
         &registration,
-        fetches,
     ))
     .await?;
     stand_tree_bytes(stand_root)
@@ -2446,7 +2402,6 @@ pub(crate) async fn apply_stand_artifact(
     }
     let bytes = stand_tree_bytes(stand_root)?;
     let report = Box::pin(cleanup_stand_external_git(
-        daemon_data_root,
         stand_root,
         &registry,
         &reg_name,

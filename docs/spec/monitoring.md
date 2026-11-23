@@ -431,7 +431,8 @@ one row and one running marker, not a `workspace_steps` journal or artifact serv
 
 Cancellation stops the current custody. Native start never begins from a non-ready or
 wrong-target-generation workspace. Removal requires terminal Agents and a clean
-checkout apart from allowed relative scratch paths. The branch is retained.
+checkout apart from allowed relative scratch paths. Worktree removal preserves
+the local branch name and exact tip, including for an unmerged branch.
 Cancellation is committed before signalling custody and serializes with process spawn.
 Force shutdown records a diagnostic if a direct cancellation cannot be settled.
 After restart, an exact start/stop cancellation binding on an unknown creation
@@ -462,10 +463,11 @@ the same eligibility checks as direct removal. The Store checks the terminal own
 overlapping borrowers, current assignment binding and settled preparation in the
 transaction that sets `removing`. Admission to the checkout or its descendants
 stops at that phase until settlement. Removal requires at least 60 seconds since
-the last owner or borrower ended. Git must confirm fresh upstream
-[containment](coordination.md#registered-artifacts-and-cleanup-k69) for the
-worktree tip and a clean index and worktree apart from regular untracked or
-ignored files in frozen scratch paths.
+the last owner or borrower ended. Git must confirm the exact managed repository,
+worktree and branch identity, plus a clean index and worktree apart from regular
+untracked or ignored files in frozen scratch paths. A refused removal carries
+its stable code, the originating bounded and sanitized message, and the failure
+location in `where`.
 The cached path inventory includes Git links. Cleanup accepts empty or absent
 submodule directories and retains populated submodule checkouts.
 
@@ -476,9 +478,15 @@ configuration of the source checkout and the target. A host that cannot establis
 the write guard keeps the checkout. On Windows the existing removal row retains
 the original directory permissions before the guard changes them. Recovery
 restores those permissions for remaining directories using their retained identities.
-Exact path and registration absence plus the
-retained branch settle `removed`. Keep the row so a later resume cannot treat the
-deleted checkout as an ordinary shared workspace. A deadline or failure after
+Exact path and registration absence plus the retained branch settle `removed`.
+For an already missing checkout, Swarm requires two absence observations at
+least 15 seconds apart from the same readable parent before removing the
+stale Git registration or settling the row. An unavailable parent keeps the
+row unsettled. A confirmed disappearance commits `workspace.removed` with
+`directory_absent_before_remove` and the last available retained Git observation.
+That observation can show that the checkout had changes before it vanished.
+Keep the row so a later resume cannot treat the deleted checkout as an
+ordinary shared workspace. A deadline or failure after
 possible mutation is `unknown` until exact readback proves removal. No effect is
 replayed.
 Before filesystem changes, wait for the checkout's terminal Git sources to drain and

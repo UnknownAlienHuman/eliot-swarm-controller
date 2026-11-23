@@ -1,11 +1,10 @@
 //! Bounded artifact cleanup through the authenticated Router and Store writer.
 use super::*;
+use crate::git_monitor::GitBinding;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
 use crate::platform::script_file::directory_identity;
-use crate::workspace_git::containment::{
-    BranchClassification, CleanupFetches, ContainmentScope, branch_rev_parse, classify_branch,
-};
+use crate::workspace_git::containment::{BranchClassification, classify_branch};
 use eliot_core::FailureOrigin;
 use eliot_core::api::*;
 use std::path::{Component, Path};
@@ -1048,7 +1047,6 @@ impl Router {
     async fn automatic_cleanup_worktree_keep_reason(
         &self,
         agent: &Agent,
-        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let artifact = {
             let store = self.inner.store.lock().await;
@@ -1080,7 +1078,7 @@ impl Router {
         if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
             return Ok(Some(error.code));
         }
-        match self.worktree_cleanup_preflight(&artifact, fetches).await {
+        match self.worktree_cleanup_preflight(&artifact).await {
             Ok(_) => Ok(None),
             Err(error) => Ok(Some(error.code)),
         }
@@ -1092,7 +1090,6 @@ impl Router {
         retention_ms: i64,
         now: i64,
         allow_fenced_root: bool,
-        fetches: Option<&mut CleanupFetches>,
     ) -> Result<Option<String>> {
         let (agent, ended_at) = {
             let store = self.inner.store.lock().await;
@@ -1151,10 +1148,7 @@ impl Router {
             return Ok(Some("manual_only".to_owned()));
         }
         if artifact.kind != ArtifactKind::Worktree {
-            match self
-                .automatic_cleanup_worktree_keep_reason(&agent, fetches)
-                .await
-            {
+            match self.automatic_cleanup_worktree_keep_reason(&agent).await {
                 Ok(Some(reason)) => return Ok(Some(reason)),
                 Err(error) => return Ok(Some(error.code)),
                 Ok(None) => {}
@@ -1390,7 +1384,6 @@ impl Router {
         )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
-        let mut fetches = CleanupFetches::default();
         for artifact in artifacts {
             let mut candidate = CleanupCandidate {
                 artifact,
@@ -1420,7 +1413,6 @@ impl Router {
                         retention_ms,
                         now_ms(),
                         false,
-                        Some(&mut fetches),
                     )
                     .await
                 {
@@ -1453,8 +1445,7 @@ impl Router {
                 {
                     break;
                 }
-                self.classify_worktree(&mut candidate, Some(&mut fetches))
-                    .await;
+                self.classify_worktree(&mut candidate).await;
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
                     candidate.reason = "source_integrity".to_owned();
@@ -1478,18 +1469,17 @@ impl Router {
                     continue;
                 }
                 match self
-                    .cleanup_branch_classification_with_deadline(
+                    .cleanup_branch_tip(
                         &candidate.artifact,
                         git,
-                        Some(&mut fetches),
                         Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
                     )
                     .await
                 {
-                    Ok(classification) => {
-                        candidate.artifact.identity = classification.tip.clone();
+                    Ok(tip) => {
+                        candidate.artifact.identity = tip;
                         candidate.verdict = "safe".to_owned();
-                        candidate.reason = classification.reason;
+                        candidate.reason = "local_branch_retirement".to_owned();
                         candidate.bytes = Some(0);
                     }
                     Err(error) => candidate.reason = error.code,
@@ -1529,10 +1519,7 @@ impl Router {
                 {
                     break;
                 }
-                match self
-                    .cleanup_preflight_with_fetches(&candidate.artifact, Some(&mut fetches))
-                    .await
-                {
+                match self.cleanup_preflight(&candidate.artifact).await {
                     Ok(bytes) => {
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = if ownership_root {
@@ -1674,35 +1661,24 @@ impl Router {
         Ok(after)
     }
 
-    async fn classify_worktree(
-        &self,
-        candidate: &mut CleanupCandidate,
-        fetches: Option<&mut CleanupFetches>,
-    ) {
+    async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
         if candidate.artifact.state != "registered" {
             candidate.reason = candidate.artifact.state.clone();
             return;
         }
-        match self
-            .worktree_cleanup_preflight(&candidate.artifact, fetches)
-            .await
-        {
-            Ok(classification) => {
+        match self.worktree_cleanup_preflight(&candidate.artifact).await {
+            Ok(tip) => {
                 if let Some(git) = candidate.artifact.git.as_mut() {
-                    git.planned_tip = Some(classification.tip);
+                    git.planned_tip = Some(tip);
                 }
                 candidate.verdict = "safe".to_owned();
-                candidate.reason = classification.reason;
+                candidate.reason = "clean_worktree".to_owned();
             }
             Err(error) => candidate.reason = error.code,
         }
     }
 
-    async fn worktree_cleanup_preflight(
-        &self,
-        artifact: &ArtifactView,
-        fetches: Option<&mut CleanupFetches>,
-    ) -> Result<BranchClassification> {
+    async fn worktree_cleanup_preflight(&self, artifact: &ArtifactView) -> Result<String> {
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -1733,11 +1709,10 @@ impl Router {
                 &preparation,
                 &profile,
                 None,
-                fetches,
                 Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
             )
             .await?;
-        Ok(preflight.branch)
+        Ok(preflight.tip)
     }
 
     pub(crate) async fn auto_cleanup_worktrees(&self, after: &mut Option<String>) {
@@ -1748,6 +1723,72 @@ impl Router {
             }
             self.automatic_cleanup_failed(&error);
         }
+    }
+
+    /// Reconcile disappearance independently of the retention cleanup policy.
+    /// The ordinary removal command binds generation and rechecks absence.
+    pub(crate) async fn reconcile_missing_worktrees(
+        &self,
+        after: &mut Option<String>,
+    ) -> Result<()> {
+        if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            return Ok(());
+        }
+        let (workspaces, _, more) = self
+            .inner
+            .store
+            .lock()
+            .await
+            .list_managed_workspaces(after.as_deref(), 64)?;
+        *after = workspaces
+            .last()
+            .filter(|_| more)
+            .map(|row| row.agent.clone());
+        for workspace in workspaces {
+            if workspace.phase != WorkspacePhase::Ready
+                || !matches!(
+                    crate::workspace_git::observe_worktree_absence(Path::new(
+                        &workspace.worktree_path
+                    )),
+                    Ok(Some(_))
+                )
+            {
+                continue;
+            }
+            let mut request = SubmitCommand::new(ulid::Ulid::new().to_string(), "worktree.remove");
+            request.target = Some(workspace.agent);
+            request.expected_generation = Some(workspace.target_generation);
+            request.args = json!({"observe_missing": true});
+            let admission = {
+                let mut store = self.inner.store.lock().await;
+                match self.admit_prepared_submission(
+                    &mut store,
+                    "owner",
+                    PreparedSubmission {
+                        request,
+                        workspace: None,
+                    },
+                    SubmissionContext::default(),
+                ) {
+                    Ok(admission) => {
+                        self.publish_locked(&admission.events);
+                        admission
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            "busy" | "bad_state" | "not_found" | "invalid"
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            self.schedule_admission(&admission);
+            self.signal_progress();
+        }
+        Ok(())
     }
 
     async fn sweep_automatic_cleanup(&self, after: &mut Option<String>) -> Result<()> {
@@ -1838,7 +1879,7 @@ impl Router {
         }
         let age = crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
         if let Some(reason) = self
-            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true, None)
+            .automatic_cleanup_keep_reason(artifact, age, now_ms(), true)
             .await?
         {
             return Err(Error::new(reason, "automatic cleanup eligibility changed"));
@@ -1847,14 +1888,6 @@ impl Router {
     }
 
     async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<u64> {
-        self.cleanup_preflight_with_fetches(artifact, None).await
-    }
-
-    async fn cleanup_preflight_with_fetches(
-        &self,
-        artifact: &ArtifactView,
-        fetches: Option<&mut CleanupFetches>,
-    ) -> Result<u64> {
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -1865,7 +1898,8 @@ impl Router {
                 .git
                 .as_ref()
                 .ok_or_else(|| Error::new("invalid", "branch Git binding absent"))?;
-            self.cleanup_branch_classification(artifact, git).await?;
+            self.cleanup_branch_tip(artifact, git, Instant::now() + Duration::from_secs(30))
+                .await?;
             return Ok(0);
         }
         if let Some(expires_at) = artifact.expires_at
@@ -1899,7 +1933,6 @@ impl Router {
                 &self.inner.data_root,
                 &path,
                 &artifact.identity,
-                fetches,
             )
             .await;
         }
@@ -2046,10 +2079,16 @@ impl Router {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                     bytes_reclaimed: bytes,
                 },
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
+                    detail: (item.artifact.kind == ArtifactKind::Branch).then(|| {
+                        let secrets: Vec<_> =
+                            self.inner.secrets.lock_recover().iter().cloned().collect();
+                        eliot_core::SecretPolicy::new(secrets).redact_bounded(&error.message, 512)
+                    }),
                     outcome: if matches!(error.code.as_str(), "unknown" | "remote_delete_failed") {
                         // A failed remote deletion lands here only after the
                         // local branch is already gone: the item is partial,
@@ -2099,17 +2138,27 @@ impl Router {
                     ));
                 }
             }
-            // Re-verify against a fresh fetch at apply time: no plan-time
-            // classification is trusted across the plan/apply gap.
-            let classification = self.cleanup_branch_classification(artifact, git).await?;
-            if classification.tip != artifact.identity {
+            // Local retirement pins the current local tip. An explicit remote
+            // deletion retains its existing fresh upstream and containment gate.
+            let remote_classification = if request.delete_remote {
+                Some(self.cleanup_branch_classification(artifact, git).await?)
+            } else {
+                None
+            };
+            let tip = if let Some(classification) = &remote_classification {
+                classification.tip.as_str().to_owned()
+            } else {
+                self.cleanup_branch_tip(artifact, git, Instant::now() + Duration::from_secs(30))
+                    .await?
+            };
+            if tip != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
                     "branch tip moved since the plan was retained",
                 ));
             }
             Self::delete_local_branch(git, &artifact.identity).await?;
-            if request.delete_remote {
+            if let Some(classification) = remote_classification {
                 Self::delete_remote_branch(
                     &self.inner.data_root,
                     git,
@@ -2449,16 +2498,25 @@ impl Router {
                     CommandState::Applied => return Ok(0),
                     CommandState::Unknown => return Err(unknown()),
                     state if state.is_terminal() => {
-                        let code = command
+                        let refusal = command
                             .outcome
                             .as_ref()
+                            .map(|outcome| outcome.get("result").unwrap_or(outcome));
+                        let code = refusal
                             .and_then(|outcome| outcome.get("code"))
                             .and_then(Value::as_str)
                             .unwrap_or("worktree_remove_refused");
-                        return Err(Error::new(
-                            code,
-                            "worktree removal was refused before mutation",
-                        ));
+                        let message = refusal
+                            .and_then(|outcome| outcome.get("message"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("worktree removal settled without a recorded reason");
+                        let error = Error::new(code, message);
+                        return Err(
+                            match refusal.and_then(|outcome| outcome["where"].as_str()) {
+                                Some(location) => error.with_where(location),
+                                None => error,
+                            },
+                        );
                     }
                     _ => {}
                 }
@@ -2473,22 +2531,6 @@ impl Router {
         &self,
         artifact: &ArtifactView,
         git: &CleanupGitBinding,
-    ) -> Result<BranchClassification> {
-        self.cleanup_branch_classification_with_deadline(
-            artifact,
-            git,
-            None,
-            Instant::now() + Duration::from_secs(60),
-        )
-        .await
-    }
-
-    async fn cleanup_branch_classification_with_deadline(
-        &self,
-        artifact: &ArtifactView,
-        git: &CleanupGitBinding,
-        fetches: Option<&mut CleanupFetches>,
-        deadline: Instant,
     ) -> Result<BranchClassification> {
         let workspace = self
             .inner
@@ -2511,16 +2553,71 @@ impl Router {
             &git.repo,
             Path::new(&git.common),
             &git.branch,
-            ContainmentScope::BranchDeletion,
-            fetches,
-            deadline,
+            Instant::now() + Duration::from_secs(60),
         )
         .await
     }
 
-    /// Only called after fresh current-tip containment. Recheck attachment
-    /// and the pinned tip before deleting. Git's ancestry gate does not
-    /// recognize squash merges, so use `-D` after these checks.
+    async fn cleanup_branch_tip(
+        &self,
+        artifact: &ArtifactView,
+        git: &CleanupGitBinding,
+        deadline: Instant,
+    ) -> Result<String> {
+        let workspace = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_workspace(&artifact.agent)?;
+        if workspace.is_some_and(|workspace| {
+            workspace.phase != WorkspacePhase::Removed
+                && workspace.requested_branch == git.branch
+                && workspace.repo_common_dir == git.common
+        }) {
+            return Err(Error::new(
+                "worktree_attached",
+                "the retained worktree still uses this branch",
+            ));
+        }
+        Self::pin_local_branch_tip(&git.repo, Path::new(&git.common), &git.branch, deadline).await
+    }
+
+    /// Pin a local branch tip for retirement without an upstream containment
+    /// scan. The archive ref collision check is local and never contacts a remote.
+    pub(crate) async fn pin_local_branch_tip(
+        repo: &str,
+        common: &Path,
+        branch: &str,
+        deadline: Instant,
+    ) -> Result<String> {
+        if !crate::git_actions::valid_cleanup_branch(branch) {
+            return Err(Error::new(
+                "invalid_branch",
+                "branch name is not admissible",
+            ));
+        }
+        let probe = crate::git_monitor::GitProbe::new()?;
+        let branch_ref = format!("refs/heads/{branch}");
+        let archive_ref = format!("refs/eliot/archive/{branch}");
+        let tip = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline)
+            .await?
+            .ok_or_else(|| Error::new("branch_absent", "local branch is absent"))?;
+        if Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
+            .await?
+            .is_some_and(|archived| archived != tip)
+        {
+            return Err(Error::new(
+                "archive_collision",
+                "local branch archive ref already names a different tip",
+            ));
+        }
+        Ok(tip)
+    }
+
+    /// Atomically create or verify the local archive ref and CAS-delete the
+    /// branch ref. Checkout guards and the plan's pinned local tip are checked
+    /// immediately before each transaction.
     pub(crate) async fn delete_local_branch(
         git: &CleanupGitBinding,
         expected_tip: &str,
@@ -2531,11 +2628,103 @@ impl Router {
                 "branch name is not admissible",
             ));
         }
-        let repo = Path::new(&git.common);
+        if !eliot_core::api::is_git_oid(expected_tip) {
+            return Err(Error::new("invalid_branch", "branch tip is invalid"));
+        }
+        let repo = git.repo.as_str();
+        let common = Path::new(&git.common);
         let probe = crate::git_monitor::GitProbe::new()?;
         let deadline = Instant::now() + Duration::from_secs(30);
+        let branch_ref = format!("refs/heads/{}", git.branch);
+        let archive_ref = format!("refs/eliot/archive/{}", git.branch);
+        let branch_tip = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline).await?;
+        let archive_tip =
+            Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline).await?;
+        if archive_tip
+            .as_deref()
+            .is_some_and(|archived| archived != expected_tip)
+        {
+            return Err(Error::new(
+                "archive_collision",
+                "local branch archive ref already names a different tip",
+            ));
+        }
+        match branch_tip.as_deref() {
+            Some(tip) if tip != expected_tip => {
+                return Err(Error::new(
+                    "identity_changed",
+                    "branch tip moved since planning",
+                ));
+            }
+            None if archive_tip.as_deref() == Some(expected_tip) => return Ok(()),
+            None => return Err(Error::new("branch_absent", "local branch is absent")),
+            Some(_) => {}
+        }
+        Self::ensure_branch_detached(&probe, repo, common, &git.branch, deadline).await?;
+        let archive = match archive_tip {
+            Some(_) => format!("verify {archive_ref} {expected_tip}"),
+            None => format!("create {archive_ref} {expected_tip}"),
+        };
+        let transaction = format!(
+            "start\noption no-deref\n{archive}\noption no-deref\ndelete {branch_ref} {expected_tip}\nprepare\ncommit\n"
+        );
+        let refusal =
+            Self::run_branch_ref_transaction(&probe, repo, common, &transaction, deadline).await?;
+        let unknown = || {
+            Error::new(
+                "unknown",
+                "exact local branch retirement could not be confirmed",
+            )
+        };
+        let branch_after = Self::cleanup_ref_oid(&probe, repo, common, &branch_ref, deadline)
+            .await
+            .map_err(|_| unknown())?;
+        let archive_after = Self::cleanup_ref_oid(&probe, repo, common, &archive_ref, deadline)
+            .await
+            .map_err(|_| unknown())?;
+        if archive_after.as_deref() == Some(expected_tip) && branch_after.is_none() {
+            return Ok(());
+        }
+        if let Some(refusal) = refusal
+            && branch_after == branch_tip
+            && archive_after == archive_tip
+        {
+            // Git is run with LC_ALL=C. This D/F conflict includes the
+            // blocking ref and the exact archive ref Git tried to create.
+            let conflict = format!("' exists; cannot create '{archive_ref}'");
+            if let Some((before, _)) = refusal.split_once(&conflict)
+                && let Some((_, blocking_ref)) = before.rsplit_once(": '")
+            {
+                return Err(Error::new(
+                    "archive_collision",
+                    format!(
+                        "Git could not create the archive because {blocking_ref} already exists"
+                    ),
+                ));
+            }
+            return Err(Error::new("branch_delete_refused", refusal));
+        }
+        Err(unknown())
+    }
+
+    async fn ensure_branch_detached(
+        probe: &crate::git_monitor::GitProbe,
+        repo: &str,
+        common: &Path,
+        branch: &str,
+        deadline: Instant,
+    ) -> Result<()> {
+        let binding = GitBinding {
+            git_dir: common,
+            common_dir: common,
+        };
         let worktrees = probe
-            .workspace_command(repo, &["worktree", "list", "--porcelain"], deadline)
+            .workspace_command_bound(
+                Path::new(repo),
+                &["worktree", "list", "--porcelain", "-z"],
+                binding,
+                deadline,
+            )
             .await
             .map_err(|_| Error::new("branch_read_failed", "worktree attachments are unreadable"))?;
         if worktrees.code != 0 {
@@ -2544,54 +2733,146 @@ impl Router {
                 "worktree attachments are unreadable",
             ));
         }
-        let attached = format!("branch refs/heads/{}", git.branch);
-        if String::from_utf8_lossy(&worktrees.stdout)
-            .lines()
-            .any(|line| line == attached)
+        let attached = format!("branch refs/heads/{branch}");
+        if worktrees
+            .stdout
+            .split(|byte| *byte == 0)
+            .any(|field| field == attached.as_bytes())
         {
             return Err(Error::new(
                 "branch_checked_out",
                 "branch is checked out in a live worktree",
             ));
         }
-        let tip = branch_rev_parse(
-            &probe,
-            repo,
-            &format!("refs/heads/{}", git.branch),
-            "branch_absent",
-            deadline,
-        )
-        .await?;
-        if tip != expected_tip {
-            return Err(Error::new(
-                "identity_changed",
-                "branch tip moved since the plan was retained",
-            ));
-        }
-        let deleted = match probe
-            .workspace_command(repo, &["branch", "-D", "--", &git.branch], deadline)
-            .await
-        {
-            Ok(deleted) => deleted.code,
-            Err(_) => -1,
+        Ok(())
+    }
+
+    async fn cleanup_ref_oid(
+        probe: &crate::git_monitor::GitProbe,
+        repo: &str,
+        common: &Path,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>> {
+        let binding = GitBinding {
+            git_dir: common,
+            common_dir: common,
         };
-        if deleted == 0 {
-            return Ok(());
-        }
-        let branch_ref = format!("refs/heads/{}", git.branch);
-        let again = branch_rev_parse(&probe, repo, &branch_ref, "branch_absent", deadline)
+        let root = Path::new(repo);
+        let output = probe
+            .workspace_command_bound(
+                root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname)%00%(objectname)%00%(symref)",
+                    reference,
+                ],
+                binding,
+                deadline,
+            )
             .await
-            .map_err(|_| Error::new("unknown", "branch deletion outcome is uncertain"))?;
-        if !again.is_empty() {
+            .map_err(|_| Error::new("branch_read_failed", "Git ref could not be read"))?;
+        if output.code != 0 {
             return Err(Error::new(
-                "branch_delete_refused",
-                "Git refused branch deletion and the branch still exists",
+                "branch_read_failed",
+                "Git ref could not be read",
             ));
         }
-        Err(Error::new(
-            "unknown",
-            "branch vanished during deletion; outcome is uncertain",
-        ))
+        for line in output.stdout.split(|byte| *byte == b'\n') {
+            let mut fields = line
+                .strip_suffix(b"\r")
+                .unwrap_or(line)
+                .split(|byte| *byte == 0);
+            if fields.next() != Some(reference.as_bytes()) {
+                continue;
+            }
+            let oid = fields
+                .next()
+                .and_then(|field| std::str::from_utf8(field).ok())
+                .filter(|oid| eliot_core::api::is_git_oid(oid))
+                .ok_or_else(|| Error::new("branch_read_failed", "Git ref object id is invalid"))?;
+            if fields.next() != Some(b"") {
+                return Err(Error::new(
+                    "branch_read_failed",
+                    "branch retirement requires direct Git refs",
+                ));
+            }
+            return Ok(Some(oid.to_owned()));
+        }
+        Ok(None)
+    }
+
+    /// Return a known Git refusal only for a quiescent nonzero exit.
+    /// The caller must read the refs to classify the effect.
+    async fn run_branch_ref_transaction(
+        probe: &crate::git_monitor::GitProbe,
+        repo: &str,
+        common: &Path,
+        transaction: &str,
+        deadline: Instant,
+    ) -> Result<Option<String>> {
+        use crate::scripts::process::{ProcessFailure, ProcessOutcome};
+        let binding = GitBinding {
+            git_dir: common,
+            common_dir: common,
+        };
+        let command = probe
+            .prepare_workspace_command(
+                Path::new(repo),
+                &["update-ref", "--stdin"],
+                binding,
+                deadline,
+            )
+            .await?;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(Error::new(
+                "unavailable",
+                "branch retirement deadline elapsed",
+            ));
+        }
+        let (_keep_open, cancellation) = tokio::sync::watch::channel(false);
+        match crate::scripts::process::run_owned_process(
+            command,
+            transaction.as_bytes().to_vec(),
+            timeout,
+            std::sync::Arc::new(eliot_core::SecretPolicy::default()),
+            cancellation,
+        )
+        .await
+        {
+            ProcessOutcome::Completed(capture) if capture.status.success() => Ok(None),
+            ProcessOutcome::Completed(capture)
+            | ProcessOutcome::Failed {
+                reason: ProcessFailure::Exit,
+                capture: Some(capture),
+            } => {
+                let stderr = capture.stderr.text.trim();
+                let detail = stderr
+                    .lines()
+                    .find(|line| line.starts_with("fatal:"))
+                    .unwrap_or(stderr);
+                Ok(Some(if detail.is_empty() {
+                    format!("Git update-ref exited with {}", capture.status)
+                } else {
+                    eliot_core::SecretPolicy::default().redact_bounded(detail, 1024)
+                }))
+            }
+            ProcessOutcome::Failed {
+                reason: ProcessFailure::Exit,
+                capture: None,
+            } => Ok(Some("Git update-ref exited unsuccessfully".to_owned())),
+            ProcessOutcome::NotSpawned(error) | ProcessOutcome::ProgramUnrunnable(error) => {
+                Err(error)
+            }
+            ProcessOutcome::Unknown {
+                quiescent: false, ..
+            } => Err(Error::new(
+                "unknown",
+                "local branch retirement process custody is uncertain",
+            )),
+            _ => Ok(None),
+        }
     }
 
     /// Owner-only remote deletion after the local branch is already gone. The
@@ -2899,7 +3180,7 @@ impl Router {
             reason: "retirement_preflight".to_owned(),
         };
         if candidate.artifact.kind == ArtifactKind::Worktree {
-            self.classify_worktree(&mut candidate, None).await;
+            self.classify_worktree(&mut candidate).await;
             return candidate;
         }
         let gate = self
@@ -3031,10 +3312,12 @@ impl Router {
                     artifact_id: item.artifact.id.clone(),
                     outcome: "removed".to_owned(),
                     reason: None,
+                    detail: None,
                     bytes_reclaimed: bytes,
                 },
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
+                    detail: None,
                     outcome: if error.code == "unknown" {
                         "unknown"
                     } else {

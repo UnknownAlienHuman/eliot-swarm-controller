@@ -2,6 +2,7 @@
 //! mutations, under its durable cancellation/spawn gate and ordinary custody.
 
 use crate::git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links};
+use crate::platform::script_file::Directory;
 use eliot_core::api::{is_git_oid, validate_integration_branch};
 use eliot_core::{
     Error, Result, WorkspaceCreationOutcome, WorkspacePhase, WorkspacePreparation,
@@ -19,7 +20,7 @@ use std::{
     reason = "Workspace Git prepares native commands for authorized worktree effects."
 )]
 use tokio::process::Command;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, sleep_until, timeout_at};
 
 pub(crate) mod containment;
 mod readback;
@@ -28,6 +29,7 @@ const READ_TIME: Duration = Duration::from_secs(15);
 /// Shared Git command budget for a project readback.
 const ORIGIN_READ_TIME: Duration = Duration::from_secs(3);
 const METADATA_BYTES: u64 = 64 * 1024;
+const ABSENCE_GRACE: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug)]
 pub(crate) struct FrozenWorkspaceGit {
@@ -70,6 +72,17 @@ struct WorktreeEntry {
     branch: Option<String>,
     head: Option<String>,
     incomplete: bool,
+    prunable: bool,
+    locked: bool,
+}
+
+pub(crate) struct MissingWorktreeRemoval {
+    pub(crate) parent: Directory,
+    #[expect(
+        clippy::disallowed_types,
+        reason = "The worktree owner dispatches the prepared exact Git removal command."
+    )]
+    pub(crate) command: Option<Command>,
 }
 
 struct Subject {
@@ -767,13 +780,11 @@ impl WorkspaceGit {
     /// directory recursively or use this list as authority for tracked files.
     pub(crate) async fn removal_candidates(
         &self,
-        data_root: &Path,
         preparation: &WorkspacePreparation,
         scratch: &[String],
         expected_tip: Option<&str>,
-        fetches: Option<&mut containment::CleanupFetches>,
         deadline: Instant,
-    ) -> Result<(containment::BranchClassification, Vec<PathBuf>)> {
+    ) -> Result<(String, Vec<PathBuf>)> {
         let subject = self.subject(preparation, deadline).await?;
         if expected_tip.is_some_and(|tip| tip != subject.head) {
             return Err(problem(
@@ -782,22 +793,6 @@ impl WorkspaceGit {
             ));
         }
         self.require_tracked_clean(&subject, deadline).await?;
-        let branch = containment::classify_branch(
-            data_root,
-            &preparation.repo_path,
-            &subject.source.common_dir,
-            &preparation.requested_branch,
-            containment::ContainmentScope::Worktree,
-            fetches,
-            deadline,
-        )
-        .await?;
-        if branch.tip != subject.head {
-            return Err(problem(
-                "identity_changed",
-                "worktree tip moved during containment check",
-            ));
-        }
         let root = &subject.target.root;
         let mut allowed = BTreeSet::new();
         for prefix in scratch {
@@ -828,7 +823,7 @@ impl WorkspaceGit {
         if other.is_empty() && ignored.is_empty() {
             self.confirm_subject(preparation, &subject, deadline)
                 .await?;
-            return Ok((branch, Vec::new()));
+            return Ok((subject.head, Vec::new()));
         }
         let cached = scratch_index_paths(self.git.cached_index_paths(root, deadline).await?)?;
         let mut tracked = BTreeSet::new();
@@ -895,7 +890,7 @@ impl WorkspaceGit {
         }
         self.confirm_subject(preparation, &subject, deadline)
             .await?;
-        Ok((branch, candidates.into_iter().collect()))
+        Ok((subject.head, candidates.into_iter().collect()))
     }
 
     async fn require_tracked_clean(&self, subject: &Subject, deadline: Instant) -> Result<()> {
@@ -920,7 +915,7 @@ impl WorkspaceGit {
         if snapshot.dirty.iter().any(|entry| entry.status != "??") {
             return Err(problem(
                 "dirty",
-                "tracked changes forbid all scratch cleanup",
+                "worktree contains staged or unstaged tracked changes",
             ));
         }
         Ok(())
@@ -946,6 +941,99 @@ impl WorkspaceGit {
         }
         self.prepare_remove_checked(preparation, verified_tip, deadline)
             .await
+    }
+
+    /// A hand-deleted directory has no contents left to guard. Only a unique,
+    /// unlocked, prunable registration of the frozen path and branch may be
+    /// passed to Git's non-force removal. Never prune unrelated worktrees.
+    pub(crate) async fn prepare_missing_remove(
+        &self,
+        preparation: &WorkspacePreparation,
+        expected_tip: Option<&str>,
+        deadline: Instant,
+    ) -> Result<Option<MissingWorktreeRemoval>> {
+        let path = Path::new(&preparation.worktree_path);
+        let Some(parent) = observe_worktree_absence(path)? else {
+            return Ok(None);
+        };
+        timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
+            .await
+            .map_err(|_| {
+                problem(
+                    "unavailable",
+                    "worktree absence observation deadline elapsed",
+                )
+            })?;
+        confirm_worktree_absence(path, &parent)?;
+        let target = destination_path(&preparation.worktree_path)?;
+        if !git_path_matches(path, &target) {
+            return Err(problem(
+                "identity_changed",
+                "missing worktree path changed during observation",
+            ));
+        }
+        let source = self.source(preparation, deadline).await?;
+        separate_target(&source, &target)?;
+        let entries = self.entries(&source.root, deadline).await?;
+        let mut matches = entries.iter().filter(|entry| entry.path == target);
+        let Some(entry) = matches.next() else {
+            return Ok(Some(MissingWorktreeRemoval {
+                parent,
+                command: None,
+            }));
+        };
+        if entry.locked {
+            return Err(problem(
+                "worktree_locked",
+                "missing worktree still has a locked Git registration",
+            ));
+        }
+        let branch = branch_ref(&preparation.requested_branch);
+        if matches.next().is_some()
+            || !entry.prunable
+            || entry.branch.as_deref() != Some(branch.as_str())
+            || entry.head.is_none()
+        {
+            return Err(problem(
+                "source_integrity",
+                "missing worktree's Git registration does not match its managed path and branch",
+            ));
+        }
+        if expected_tip.is_some_and(|tip| entry.head.as_deref() != Some(tip)) {
+            return Err(problem(
+                "identity_changed",
+                "missing worktree branch tip moved since the plan",
+            ));
+        }
+        if self
+            .branch_oid(&source.root, &preparation.requested_branch, deadline)
+            .await?
+            != entry.head
+        {
+            return Err(problem(
+                "source_integrity",
+                "missing worktree registration and retained branch tip disagree",
+            ));
+        }
+        let target_arg = git_path_argument(&target)?;
+        let command = self
+            .git
+            .prepare_workspace_command_with_config_roots(
+                &source.root,
+                &["worktree", "remove", "--", &target_arg],
+                GitBinding {
+                    git_dir: &source.git_dir,
+                    common_dir: &source.common_dir,
+                },
+                &[],
+                deadline,
+            )
+            .await?;
+        confirm_worktree_absence(path, &parent)?;
+        Ok(Some(MissingWorktreeRemoval {
+            parent,
+            command: Some(command),
+        }))
     }
 
     /// Non-force worktree removal command for an offline private stand whose
@@ -1022,12 +1110,17 @@ impl WorkspaceGit {
         let source = self.source(preparation, deadline).await?;
         let target = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target)?;
-        if !absent(&target)?
-            || self
-                .entries(&source.root, deadline)
-                .await?
-                .iter()
-                .any(|entry| entry.path == target)
+        let Some(parent) = observe_worktree_absence(&target)? else {
+            return Err(problem(
+                "unknown",
+                "worktree path still exists after removal",
+            ));
+        };
+        if self
+            .entries(&source.root, deadline)
+            .await?
+            .iter()
+            .any(|entry| entry.path == target)
         {
             return Err(problem(
                 "unknown",
@@ -1044,11 +1137,13 @@ impl WorkspaceGit {
                 "removed workspace branch was not retained",
             ));
         }
+        confirm_worktree_absence(&target, &parent)?;
         Ok(WorkspaceRemovalOutcome::Removed {
             repo_common_dir: path_text(&source.common_dir)?,
             worktree_path: path_text(&target)?,
             branch: preparation.requested_branch.clone(),
             branch_retained: true,
+            directory_absent_before_remove: false,
         })
     }
 
@@ -1350,6 +1445,8 @@ impl WorkspaceGit {
                 branch: None,
                 head: None,
                 incomplete: false,
+                prunable: false,
+                locked: false,
             };
             for field in fields {
                 if let Some(branch) = field.strip_prefix("branch ") {
@@ -1371,6 +1468,8 @@ impl WorkspaceGit {
                     || field.starts_with("prunable ")
                 {
                     entry.incomplete = true;
+                    entry.locked |= field == "locked" || field.starts_with("locked ");
+                    entry.prunable |= field == "prunable" || field.starts_with("prunable ");
                 }
             }
             entries.push(entry);
@@ -1381,7 +1480,10 @@ impl WorkspaceGit {
     async fn read(&self, root: &Path, args: &[&str], deadline: Instant) -> Result<Vec<u8>> {
         let output = self.git.workspace_command(root, args, deadline).await?;
         if output.code != 0 {
-            return Err(problem("unavailable", "workspace Git readback failed"));
+            return Err(Error::new(
+                "unavailable",
+                format!("Git {} exited with code {}", args[0], output.code),
+            ));
         }
         Ok(output.stdout)
     }
@@ -1471,6 +1573,47 @@ fn absent(path: &Path) -> Result<bool> {
             "workspace path presence cannot be read",
         )),
     }
+}
+
+/// Observe a missing leaf from a readable parent. Windows keeps that parent
+/// and its ancestors pinned while the caller retains the returned guard.
+pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>> {
+    if !absent(path)? {
+        return Ok(None);
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| problem("invalid", "worktree has no parent directory"))?;
+    let unreadable = |_| {
+        problem(
+            "unavailable",
+            "worktree parent directory is unavailable or unreadable",
+        )
+    };
+    let guard = Directory::open(parent).map_err(unreadable)?;
+    let list_error = |_| problem("unavailable", "worktree parent directory cannot be listed");
+    for entry in fs::read_dir(parent).map_err(list_error)? {
+        if git_path_matches(&entry.map_err(list_error)?.path(), path) {
+            return Ok(None);
+        }
+    }
+    Ok(absent(path)?.then_some(guard))
+}
+
+fn confirm_worktree_absence(path: &Path, previous: &Directory) -> Result<()> {
+    let Some(current) = observe_worktree_absence(path)? else {
+        return Err(problem(
+            "worktree_present",
+            "worktree reappeared during absence verification",
+        ));
+    };
+    if current.identity()? != previous.identity()? {
+        return Err(problem(
+            "identity_changed",
+            "worktree parent changed during absence verification",
+        ));
+    }
+    Ok(())
 }
 
 fn separate_target(source: &Repository, target: &Path) -> Result<()> {

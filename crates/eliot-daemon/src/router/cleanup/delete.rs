@@ -79,7 +79,6 @@ impl Router {
 
     async fn plan_agent_deletion(&self, agents: &[Agent]) -> Result<CleanupPlan> {
         let mut items = Vec::new();
-        let mut fetches = CleanupFetches::default();
         for agent in agents {
             if let Some(artifact) = self.agent_delete_session(agent).await? {
                 items.push(CleanupCandidate {
@@ -91,17 +90,15 @@ impl Router {
             }
 
             if let Some(mut artifact) = self.agent_delete_worktree(agent).await? {
-                let classification = self
-                    .worktree_cleanup_preflight(&artifact, Some(&mut fetches))
-                    .await?;
+                let tip = self.worktree_cleanup_preflight(&artifact).await?;
                 if let Some(git) = artifact.git.as_mut() {
-                    git.planned_tip = Some(classification.tip);
+                    git.planned_tip = Some(tip);
                 }
                 items.push(CleanupCandidate {
                     artifact,
                     bytes: None,
                     verdict: "safe".to_owned(),
-                    reason: classification.reason,
+                    reason: "clean_worktree".to_owned(),
                 });
             }
             #[cfg(windows)]
