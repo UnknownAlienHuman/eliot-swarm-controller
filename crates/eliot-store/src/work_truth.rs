@@ -149,6 +149,7 @@ fn checkpoint_switch_gate(
     tx: &Transaction<'_>,
     intent: &GitCheckpointIntent,
     agent: i64,
+    source: &Agent,
 ) -> Result<Option<GitCheckpointReservation>> {
     use GitCheckpointReservation::{Deferred, Skipped};
     let retired: bool = tx
@@ -178,7 +179,14 @@ fn checkpoint_switch_gate(
         .map_err(sql_error)?;
     Ok(match switch {
         Some((_, true)) => Some(Deferred),
-        Some((state, false)) if state == "dispatched" && intent.input.trigger == "handoff" => None,
+        Some((state, false))
+            if state == "dispatched"
+                && intent.input.trigger == "handoff"
+                && source.is_terminal()
+                && handoff::session_exit_blocker(tx, source)?.is_none() =>
+        {
+            None
+        }
         Some(_) => Some(Deferred),
         None => None,
     })
@@ -243,13 +251,13 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            if !load_agent_by_num(&tx, agent)?.is_some_and(|row| {
+            let Some(row) = load_agent_by_num(&tx, agent)?.filter(|row| {
                 row.generation == intent.generation
                     && row.workspace.as_deref() == Some(intent.workspace.as_str())
-            }) {
+            }) else {
                 return Ok(Skipped);
-            }
-            if let Some(outcome) = checkpoint_switch_gate(&tx, intent, agent)? {
+            };
+            if let Some(outcome) = checkpoint_switch_gate(&tx, intent, agent, &row)? {
                 return Ok(outcome);
             }
             if repo_git_write_blocked_tx(
