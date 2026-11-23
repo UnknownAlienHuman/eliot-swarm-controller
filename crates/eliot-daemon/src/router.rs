@@ -27,6 +27,7 @@ mod loss_recovery;
 mod organization;
 mod overview;
 pub(crate) mod owner_inbox;
+mod owner_inbox_bulk;
 mod owner_rules_doctor;
 mod patch_digest;
 mod project_assignment;
@@ -827,6 +828,7 @@ impl Router {
             "goal.round" => self.goal_round(&params, &principal).await,
             "owner.inbox" => self.owner_inbox(&params, &principal).await,
             "owner.decide" => self.owner_decide(&params, &principal, context).await,
+            "owner.decide.bulk" => self.owner_decide_bulk(&params, &principal, context).await,
             "mail.send" => self.mail_send(&params, &principal).await,
             "mail.inbox" => self.mail_inbox(&params, &principal).await,
             "mail.read" => self.mail_read(&params, &principal).await,

@@ -771,6 +771,20 @@ the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
+`owner.decide.bulk` applies each item's own recommended action for an explicit
+ordered set of 1–100 `OwnerInboxItemRef`s, with at most 16 KiB of encoded refs.
+It is Owner-only. The batch ULID is recorded against the exact ordered refs
+before any item is decided; reusing it with changed refs conflicts. Each item
+uses a deterministic `owner.decide` mutation ID derived from the batch ULID and
+its complete kind/subject/revision ref, so exact retries replay the same inner
+decision. The item revision binds the projected reason, choices and exact
+recommended action. Each ref then goes through the ordinary `owner.decide`
+authority and Store revision check. Changed or missing items and items without
+a recommendation are returned as skipped. Other items continue after a
+failure; the compact response groups applied, skipped and failed refs, and
+marks failures whose action outcome may be unknown. Retrying the exact batch
+does not replay uncertain external effects.
+
 `swarm inbox` prints Owner decisions in text. With `--json` it emits the
 response DTO. An Agent's `swarm inbox` reads its own mailbox. Use
 `swarm msg inbox` or the existing mailbox selectors to read mail explicitly.
@@ -778,6 +792,14 @@ Copy the printed item reference into `swarm inbox decide ITEM CHOICE`.
 Use repeatable `--arg KEY=VALUE` flags for displayed inputs such as
 `choice_id` and `feedback`. Pass JSON for `answers`.
 `swarm inbox snooze ITEM` hides the displayed revision.
+`swarm inbox apply --kind KIND` snapshots current refs of that kind across the
+Owner inbox pages and submits them as one bounded batch (at most 100 refs); if
+more than 100 match, it refuses before deciding any item. Narrow with
+`--after`, or pass reviewed refs explicitly as repeated
+`swarm inbox apply --item KIND/SUBJECT@REVISION` options. The explicit form
+also submits stale refs so the daemon can report their skip reason. The root
+`--id` is the batch ULID and must be reused with the same ordered refs for an
+exact retry. `--json` emits the aggregate response.
 
 The view calls use the Core view DTOs linked above. `daemon.status` is owner-only
 and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
@@ -3049,7 +3071,7 @@ swarm cmd resolve ID --status completed|failed --reason TEXT
 swarm why CMD|AGENT|AGENT:TURN
 swarm events [--after SEQ] [--limit N]
 swarm msg send --to RECIPIENT... TEXT | msg show DELIVERY [AGENT] | msg ack [AGENT] --delivery DELIVERY...
-swarm inbox [AGENT] [--wait SECS]
+swarm inbox [AGENT] [--wait SECS] | inbox decide ITEM CHOICE | inbox snooze ITEM | inbox apply (--kind KIND | --item REF...)
 swarm var set KEY [VALUE | --value-file PATH] [--as-json] [...] | var get ... | who [--project P] [--history]
 swarm claim set GLOB [AGENT] [--note TEXT] [--ttl-secs N] | claim list [AGENT] [--project P] | claim release GLOB [AGENT]
 swarm project list | show ID
