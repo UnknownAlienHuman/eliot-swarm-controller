@@ -152,6 +152,11 @@ impl Failure {
     ) -> Self {
         let mut failure = Self::new(exit_code, message);
         if let Some(outcome) = command.outcome.as_ref() {
+            let outcome = if command.verb == "worktree.remove" {
+                outcome.get("result").unwrap_or(outcome)
+            } else {
+                outcome
+            };
             let code = outcome
                 .get("code")
                 .or_else(|| outcome.get("reason"))

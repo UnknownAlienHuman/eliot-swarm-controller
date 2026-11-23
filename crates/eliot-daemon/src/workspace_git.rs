@@ -945,10 +945,6 @@ impl WorkspaceGit {
     /// A hand-deleted directory has no contents left to guard. Only a unique,
     /// unlocked, prunable registration of the frozen path and branch may be
     /// passed to Git's non-force removal. Never prune unrelated worktrees.
-    #[expect(
-        clippy::disallowed_types,
-        reason = "This prepares non-force Git removal of the exact stale registration."
-    )]
     pub(crate) async fn prepare_missing_remove(
         &self,
         preparation: &WorkspacePreparation,
