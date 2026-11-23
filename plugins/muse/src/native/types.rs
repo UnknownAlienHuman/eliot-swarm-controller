@@ -247,10 +247,8 @@ pub struct NativeModelListResult {
     /// Where the catalogue came from (`providerCatalog`, `bundledCatalog`,
     /// ...; open enum). Only the source is modelled: the accompanying
     /// `profileId` is account data and stays ignored, never persisted.
-    /// A `bundledCatalog` source with zero models is an honestly empty
-    /// account catalogue (Muse Code 1.4.20 serves exactly this on a host
-    /// whose provider catalogue is unreachable); the miss is reported,
-    /// never bypassed.
+    /// An empty `bundledCatalog` means the host has no visible rows in its
+    /// snapshot. The exact-model check still applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }

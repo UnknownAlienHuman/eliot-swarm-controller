@@ -3,15 +3,15 @@
 
 use super::{
     AgentSession, Initialized, InitializedNative, MusePlugin, RPC_TIMEOUT, SessionPhase,
-    contextual_error, discard_failed_start, discover_model, muse_scope, muse_serve_args,
-    new_command_id, read_effective_reasoning_effort,
+    catalogue::CatalogueHost, contextual_error, discard_failed_start, muse_scope, muse_serve_args,
+    new_command_id, read_effective_reasoning_effort, select_launch_model,
 };
 use crate::{
     events::{self, EventConfig},
     native::{
-        NativeClient, NativeLaunch, NativeProcess,
+        NativeLaunch, NativeProcess,
         types::{
-            NativeInitializeResult, NativeModelEffortVariants, NativeModelSelection, NativeSession,
+            NativeModelEffortVariants, NativeModelSelection, NativeSession,
             NativeSessionSetApprovalModeParams, NativeSessionSetApprovalModeResult,
             NativeSessionSetModelParams, NativeSessionSetModelResult,
             NativeSessionSetReasoningEffortParams, NativeSessionSetReasoningEffortResult,
@@ -19,7 +19,7 @@ use crate::{
         },
     },
 };
-use eliot_core::{Error, Result, SecretPolicy};
+use eliot_core::{Error, Result};
 use eliot_plugin::{
     AgentStartParams, PeerClient,
     session::{
@@ -190,13 +190,7 @@ pub(super) fn prepare_profile(
     })
 }
 
-pub(super) async fn spawn_owned_session(
-    params: &AgentStartParams,
-    initialized: &Initialized,
-    launch: NativeLaunch,
-    secrets: Vec<String>,
-    peer: &PeerClient,
-) -> Result<AgentSession> {
+pub(super) fn skill_pointer(params: &AgentStartParams) -> Result<String> {
     // Muse serves the skill on demand through a pointer in the first turn.
     // Its data root arrives through the scoped integration environment.
     let data_dir = params
@@ -221,13 +215,21 @@ pub(super) async fn spawn_owned_session(
         )
     })?;
     let skill_path = eliot_core::display_path(&skill_path.to_string_lossy());
-    let skill_pointer = format!(
+    Ok(format!(
         "The inherited `swarm` MCP tool is available for coordination.\n\
          Read the skill for delegation, mail, claims, variables, or artifacts. Skip it for solo work.\n\
          Skill file: {skill_path}"
-    );
-    let mut native =
-        NativeProcess::spawn(launch, SecretPolicy::new(secrets.iter().cloned())).await?;
+    ))
+}
+
+pub(super) fn bind_owned_session(
+    params: &AgentStartParams,
+    initialized: &Initialized,
+    mut native: NativeProcess,
+    secrets: Vec<String>,
+    skill_pointer: String,
+    peer: &PeerClient,
+) -> Result<AgentSession> {
     let frames = native.take_frames()?;
     let stream = native.stream_state();
     let native_client = native.client();
@@ -326,32 +328,12 @@ impl MusePlugin {
         }
     }
 
-    pub(super) async fn initialize_native(
-        client: &NativeClient,
+    pub(super) fn validate_catalogue(
+        host: &CatalogueHost,
         requested_model: Option<&str>,
         requested_effort: Option<&str>,
     ) -> Result<InitializedNative> {
-        let init_params = super::native_initialize_params();
-        let init_value = serde_json::to_value(init_params)
-            .map_err(|_| Error::new("internal", "Muse initialize params could not be encoded"))?;
-        let initialized: NativeInitializeResult = serde_json::from_value(
-            client
-                .call("initialize", init_value, Instant::now() + RPC_TIMEOUT)
-                .await
-                .map_err(|error| {
-                    contextual_error(
-                        error,
-                        "profile_error",
-                        "Muse session host initialize failed",
-                    )
-                })?,
-        )
-        .map_err(|_| {
-            Error::new(
-                "profile_error",
-                "Muse session host initialize response was invalid",
-            )
-        })?;
+        let initialized = &host.identity;
         if initialized.muse_home.trim().is_empty() {
             return Err(Error::new(
                 "profile_error",
@@ -368,18 +350,8 @@ impl MusePlugin {
                 "Muse session host initialize omitted runtime identity fields",
             ));
         }
-        client
-            .notify("initialized", None, Instant::now() + RPC_TIMEOUT)
-            .await
-            .map_err(|error| {
-                contextual_error(
-                    error,
-                    "profile_error",
-                    "Muse session host did not accept initialized",
-                )
-            })?;
-
-        let model = discover_model(client, requested_model).await?;
+        let model = select_launch_model(&host.catalogue, requested_model)
+            .map_err(|error| host.catalogue_error(error))?;
         if let (Some(effort), Some(selected)) = (requested_effort, model.as_ref())
             && let Some(NativeModelEffortVariants::Known(variants)) = selected.variants.as_ref()
             && !variants.iter().any(|variant| variant == effort)
@@ -392,7 +364,7 @@ impl MusePlugin {
         Ok(InitializedNative {
             effort: requested_effort.map(str::to_owned),
             scope: muse_scope(&initialized.muse_home),
-            fingerprint: initialized.schema.fingerprint,
+            fingerprint: initialized.schema.fingerprint.clone(),
         })
     }
 

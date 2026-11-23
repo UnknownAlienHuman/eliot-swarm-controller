@@ -11,9 +11,10 @@ use std::{
     ffi::{OsStr, OsString},
     path::PathBuf,
     process::Stdio,
+    sync::Arc,
 };
 
-use eliot_core::{Error, Result};
+use eliot_core::{Error, Result, SecretPolicy, StderrSnapshot};
 #[expect(
     clippy::disallowed_types,
     reason = "The bounded native CLI adapter accepts an explicitly owned process command."
@@ -21,7 +22,7 @@ use eliot_core::{Error, Result};
 use tokio::process::Command;
 use tokio::{io::AsyncReadExt, time::Instant};
 
-use crate::native_lifecycle::kill_and_reap;
+use crate::{harness_diagnostic, native_lifecycle::kill_and_reap, spawn_stderr};
 
 /// Static message labels for one bounded one-shot read. Every harness keeps
 /// its exact pinned strings; only these labels differ between call sites.
@@ -55,12 +56,32 @@ pub async fn run_bounded(
 ) -> Result<Vec<u8>> {
     read_bounded_stdout(command, cap, deadline, false)
         .await
-        .map_err(|error| match error {
-            BoundedReadError::Spawn(_) => Error::new("native_spawn", labels.start),
-            BoundedReadError::Deadline => Error::new("native_spawn", labels.deadline),
-            BoundedReadError::Unreadable => Error::new("native_readback", labels.unreadable),
-            BoundedReadError::Status => Error::new("native_readback", labels.status),
-        })
+        .map_err(|error| read_error(error, labels))
+}
+
+/// Run a bounded one-shot child and attach its redacted stderr tail on failure.
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper bounds output and custody for a native CLI child."
+)]
+pub async fn run_bounded_with_stderr(
+    command: Command,
+    cap: usize,
+    deadline: Instant,
+    labels: &BoundedReadLabels,
+    policy: &SecretPolicy,
+) -> Result<Vec<u8>> {
+    let (result, stderr) = read_bounded_output(command, cap, deadline, false, Some(policy)).await;
+    result.map_err(|error| harness_diagnostic(read_error(error, labels), policy, stderr))
+}
+
+fn read_error(error: BoundedReadError, labels: &BoundedReadLabels) -> Error {
+    match error {
+        BoundedReadError::Spawn(_) => Error::new("native_spawn", labels.start),
+        BoundedReadError::Deadline => Error::new("native_spawn", labels.deadline),
+        BoundedReadError::Unreadable => Error::new("native_readback", labels.unreadable),
+        BoundedReadError::Status => Error::new("native_readback", labels.status),
+    }
 }
 
 #[derive(Debug)]
@@ -78,19 +99,66 @@ pub enum BoundedReadError {
     reason = "This helper reads bounded stdout from a native query child."
 )]
 pub async fn read_bounded_stdout(
-    mut command: Command,
+    command: Command,
     cap: usize,
     deadline: Instant,
     accept_non_success: bool,
 ) -> std::result::Result<Vec<u8>, BoundedReadError> {
+    read_bounded_output(command, cap, deadline, accept_non_success, None)
+        .await
+        .0
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper owns the bounded native query process and its pipes."
+)]
+async fn read_bounded_output(
+    mut command: Command,
+    cap: usize,
+    deadline: Instant,
+    accept_non_success: bool,
+    policy: Option<&SecretPolicy>,
+) -> (
+    std::result::Result<Vec<u8>, BoundedReadError>,
+    Option<StderrSnapshot>,
+) {
+    let stderr = if policy.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .kill_on_drop(true);
-    let mut child = command.spawn().map_err(BoundedReadError::Spawn)?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return (Err(BoundedReadError::Spawn(error)), None),
+    };
+    let stderr = policy.and_then(|policy| {
+        child
+            .stderr
+            .take()
+            .map(|pipe| spawn_stderr(pipe, Arc::new(policy.clone())))
+    });
+    let result = read_child_stdout(&mut child, cap, deadline, accept_non_success).await;
+    let stderr = match stderr {
+        Some(stderr) if result.is_err() => Some(stderr.finish(deadline).await),
+        _ => None,
+    };
+    (result, stderr)
+}
+
+async fn read_child_stdout(
+    child: &mut tokio::process::Child,
+    cap: usize,
+    deadline: Instant,
+    accept_non_success: bool,
+) -> std::result::Result<Vec<u8>, BoundedReadError> {
     let Some(mut stdout) = child.stdout.take() else {
-        kill_and_reap(&mut child).await;
+        kill_and_reap(child).await;
         return Err(BoundedReadError::Unreadable);
     };
     let mut buffer = Vec::new();
@@ -100,26 +168,26 @@ pub async fn read_bounded_stdout(
     };
     match tokio::time::timeout_at(deadline, read).await {
         Err(_) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(BoundedReadError::Deadline);
         }
         Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(BoundedReadError::Unreadable);
         }
         Ok(Ok(_)) => {}
     }
     if buffer.len() > cap {
-        kill_and_reap(&mut child).await;
+        kill_and_reap(child).await;
         return Err(BoundedReadError::Unreadable);
     }
     let status = match tokio::time::timeout_at(deadline, child.wait()).await {
         Err(_) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(BoundedReadError::Deadline);
         }
         Ok(Err(_)) => {
-            kill_and_reap(&mut child).await;
+            kill_and_reap(child).await;
             return Err(BoundedReadError::Unreadable);
         }
         Ok(Ok(status)) => status,
