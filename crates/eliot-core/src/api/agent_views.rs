@@ -2200,7 +2200,7 @@ pub struct DaemonStatusResponse {
     pub observer_readers: usize,
     pub discovery_readers: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub claude_profile_command_issues: Vec<crate::api::harness::ClaudeProfileCommandIssue>,
+    pub profile_command_issues: Vec<crate::api::ProfileCommandIssue>,
     #[serde(deserialize_with = "object")]
     pub workspace_custody: WorkspaceCustodyView,
     #[serde(deserialize_with = "nullable")]
