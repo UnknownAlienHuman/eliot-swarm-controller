@@ -62,11 +62,11 @@ pub use agent_requests::{
 };
 pub use agent_views::{
     AGENT_LIST_STATES, AGENT_NOTICE_MESSAGE_CHARS, AGENT_PREVIEW_CHARS, AgentBackgroundWakeView,
-    AgentConfigView, AgentEditsResponse, AgentGetResponse, AgentGitResponse, AgentListResponse,
-    AgentListRow, AgentNativeNotice, AgentPatchDigestResponse, AgentProcessesResponse,
-    AgentProviderHold, AgentStateTotal, AgentStatsResponse, AgentSummary, AttentionStepReadback,
-    AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView, CloudMcpCustody,
-    CloudMcpHealth, CloudMcpStatus, CommandWithoutDispatcherStatus, CrashMarker,
+    AgentConfigView, AgentControlFailure, AgentEditsResponse, AgentGetResponse, AgentGitResponse,
+    AgentListResponse, AgentListRow, AgentNativeNotice, AgentPatchDigestResponse,
+    AgentProcessesResponse, AgentProviderHold, AgentStateTotal, AgentStatsResponse, AgentSummary,
+    AttentionStepReadback, AutomaticCleanupPolicy, AutomaticCleanupSweep, AutomaticCleanupView,
+    CloudMcpCustody, CloudMcpHealth, CloudMcpStatus, CommandWithoutDispatcherStatus, CrashMarker,
     DaemonBuildIdentity, DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse,
     DiagnoseStep, DrainReport, GitCredentialHelper, INSTRUCTION_FILE_PATHS,
     InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionReadStatus,

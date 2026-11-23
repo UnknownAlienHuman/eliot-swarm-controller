@@ -7,6 +7,7 @@ mod attention_steps;
 mod autonomy;
 mod canonical;
 mod capacity;
+mod control_failures;
 mod launch_queue;
 mod launch_result;
 mod online_backup;

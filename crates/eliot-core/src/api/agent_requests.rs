@@ -49,6 +49,9 @@ impl AgentGetRequest {
                 .pending_background_wake
                 .as_ref()
                 .is_some_and(|wake| wake.validate().is_err())
+            || reply.last_control_failure.as_ref().is_some_and(|failure| {
+                failure.validate().is_err() || failure.generation != reply.agent.generation
+            })
             || reply
                 .session_usage
                 .as_ref()

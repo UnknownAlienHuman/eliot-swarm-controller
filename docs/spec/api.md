@@ -995,6 +995,14 @@ query and resolves native notices in one page-scoped query over the existing eve
 index. `agent.get` uses the same projection for its single Agent. Neither read adds a
 polling source. `AgentView.policy_opt_out_reason` retains an explicit project-policy
 opt-out reason; `swarm show` includes it in human output and JSON keeps the view field.
+`AgentGetResponse.last_control_failure` is the latest retained, settled Owner `stop` or
+`interrupt` command in `rejected` or `failed` state for the current generation. It carries
+the command id, verb, state, generation, and the concrete code/reason/message strings
+retained by command settlement. It is omitted when no such failure is visible to the
+caller; Router applies the same command-read visibility check used by `command.get`.
+Preflight refusals without a retained command row are not projected. The Store selects
+one row through the failure-only command index and does not add a polling source.
+Older `agent.get` responses may omit this trailing field.
 The Agent `effective` settings are the last
 natively admitted values, never a prediction: the launch `session.ready`
 readback sets them, and a `configure` revision's turn refreshes them when the

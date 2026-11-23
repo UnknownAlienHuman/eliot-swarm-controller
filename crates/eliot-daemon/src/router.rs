@@ -5097,12 +5097,25 @@ impl Router {
             native_notice,
             instruction_delivery,
             owner_rules_delivery,
+            last_control_failure,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
             let agent = store
                 .get_agent(id)?
                 .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))?;
+            let last_control_failure = match store.latest_owner_control_failure(&agent)? {
+                Some(command) => {
+                    match hierarchy::authorize_command_read(&store, principal, &command) {
+                        Ok(()) => Some(eliot_core::api::AgentControlFailure::from_command(
+                            &command,
+                        )?),
+                        Err(error) if error.code == "not_allowed" => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => None,
+            };
             let (provider_hold, native_notice) = store.agent_status_projection(&agent)?;
             let instruction_delivery = store.get_agent_instruction_delivery(id)?;
             let owner_rules_delivery = store.get_agent_owner_rules_delivery(id)?;
@@ -5122,6 +5135,7 @@ impl Router {
                 native_notice,
                 instruction_delivery,
                 owner_rules_delivery,
+                last_control_failure,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5205,6 +5219,7 @@ impl Router {
             instruction_delivery,
             owner_rules_delivery,
             pending_background_wake,
+            last_control_failure,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
