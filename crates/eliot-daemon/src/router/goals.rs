@@ -1327,6 +1327,8 @@ pub(crate) async fn run_goal_driver(
     router.note_worker_task_running("goal_driver");
     let mut events = router.subscribe_rule_events();
     let mut goal_changes = router.subscribe_goal_reconcile();
+    let mut followup_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    followup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut rounds: JoinSet<(String, i64)> = JoinSet::new();
     let mut in_flight: HashMap<String, InFlightAutoRound> = HashMap::new();
     // Newest event per Goal with a round in flight, driven as a follow-up
@@ -1350,6 +1352,12 @@ pub(crate) async fn run_goal_driver(
     .await;
     loop {
         tokio::select! {
+            _ = followup_tick.tick() => {
+                let expired = router.inner.store.lock().await.expire_goal_native_followups(now_ms())?;
+                if expired {
+                    router.notify_goal_reconcile();
+                }
+            }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     for running in in_flight.values() {

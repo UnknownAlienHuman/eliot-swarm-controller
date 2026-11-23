@@ -290,6 +290,15 @@ pub(super) fn persist_effects(
     {
         provider_events.push(event);
     }
+    if native_event.kind == "tool.background_ended"
+        && native_event.data["native_followup_pending"].as_bool() == Some(false)
+    {
+        db!(tx.execute(
+            "UPDATE turns SET native_followup_pending = 0
+             WHERE agent = ?1 AND generation = ?2 AND native_followup_pending = 1",
+            params![agent_num, generation],
+        ));
+    }
     if matches!(
         native_event.kind.as_str(),
         "hook.before_tool" | "hook.after_tool" | "hook.before_model"
