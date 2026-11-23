@@ -148,6 +148,9 @@ fn read_task_files(text: &str, policy: &eliot_core::SecretPolicy) -> (Vec<Value>
     let pointer = named.trim().len() <= MAX_POINTER_TASK_BYTES;
     let (mut facts, mut sources) = (Vec::new(), Vec::new());
     for path in referenced_files(named) {
+        if work_truth::is_credential_path(&path.to_string_lossy()) {
+            continue;
+        }
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             continue;
         };
@@ -451,10 +454,9 @@ impl Router {
             .await
             .stage_git_checkpoint(agent, generation, &input)?;
         if let (Some(reference), Some(oid)) = (&input.checkpoint_ref, &input.oid) {
-            let root = crate::git_monitor::canonical_root(&workspace)?;
+            let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
             work_truth::publish_checkpoint(&root, reference, oid).await?;
-            self.reconcile_checkpoint_ref(&workspace, &mut input)
-                .await?;
+            self.reconcile_checkpoint_ref(&mut input).await?;
         }
         // A turn that changed nothing adds nothing to Git. Its report joins
         // the journal with the next change or when the session ends.
@@ -474,7 +476,7 @@ impl Router {
             if let (Some(task), false) = (task, turns.is_empty()) {
                 let policy = self.secret_policy_snapshot();
                 let entries = journal_entries(&row, &turns, &policy);
-                if work_truth::append_journal(&workspace, &task, &entries)
+                if work_truth::append_journal(&self.inner.data_root, &workspace, &task, &entries)
                     .await
                     .is_ok()
                 {
@@ -489,11 +491,7 @@ impl Router {
         Ok(Some(input))
     }
 
-    async fn reconcile_checkpoint_ref(
-        &self,
-        workspace: &str,
-        input: &mut GitCheckpointInput,
-    ) -> Result<()> {
+    async fn reconcile_checkpoint_ref(&self, input: &mut GitCheckpointInput) -> Result<()> {
         if input.state != GitCheckpointState::Snapshot {
             return Ok(());
         }
@@ -503,7 +501,7 @@ impl Router {
                 "checkpoint intent has no ref or OID",
             ));
         };
-        let root = crate::git_monitor::canonical_root(workspace)?;
+        let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
         match work_truth::checkpoint_reference(&root, reference).await? {
             Some(actual) if &actual == expected => {
                 if let Err(error) = work_truth::prune_checkpoints(&root, reference).await {
@@ -534,12 +532,11 @@ impl Router {
         for GitCheckpointIntent {
             agent,
             generation,
-            workspace,
             mut input,
             ..
         } in intents
         {
-            if let Err(error) = self.reconcile_checkpoint_ref(&workspace, &mut input).await {
+            if let Err(error) = self.reconcile_checkpoint_ref(&mut input).await {
                 self.log_work_truth_error("daemon.checkpoint_recovery_failed", &error);
                 continue;
             }
@@ -638,6 +635,7 @@ impl Router {
         });
         work_truth::redact_record_value(&mut card, &policy);
         work_truth::ensure_task(
+            &self.inner.data_root,
             &workspace,
             &TaskRecord {
                 task_ref: task_ref.clone(),
@@ -717,8 +715,8 @@ impl Router {
             .unwrap_or_default();
         let (task_note, task_text) = match task.as_deref() {
             Some(reference) => (
-                work_truth::task_source_note(workspace, reference).await,
-                work_truth::task_record_text(workspace, reference).await,
+                work_truth::task_source_note(&self.inner.data_root, workspace, reference).await,
+                work_truth::task_record_text(&self.inner.data_root, workspace, reference).await,
             ),
             None => (None, None),
         };

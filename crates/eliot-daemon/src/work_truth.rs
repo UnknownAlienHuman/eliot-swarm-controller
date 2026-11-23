@@ -1,14 +1,11 @@
-//! The daemon's own record of work in Git. A checkpoint captures changed and
-//! new files under a private ref through a separate index, so the Agent's
-//! branch, index and working tree are never touched. The task record keeps the
-//! full task, its card and a journal under `refs/eliot/tasks`. Ordinary branch
-//! pushes do not carry these refs.
+//! The daemon's own record of work in Git. Snapshots and task records live in
+//! a daemon-owned bare repository outside the project's Git common directory.
+//! Checkpoint capture records staged and worktree layers without changing the
+//! Agent's branch, index or files. Project pushes cannot carry these refs.
 
 use crate::{
     config::{CheckpointLimits, settings::redact_credential_shapes},
     git_monitor::{GitProbe, PathContent, canonical_root, read_path_content},
-    publication::TemporaryGitIndex,
-    scripts::process::ProcessOutcome,
 };
 use eliot_core::{
     Error, Result, SecretPolicy,
@@ -16,20 +13,22 @@ use eliot_core::{
     bound_chars, workspace_path_key,
 };
 use eliot_store::GitCheckpointInput;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
-use tokio::{sync::watch, time::Instant};
+use tokio::time::Instant;
 
 const GIT_TIME: Duration = Duration::from_secs(30);
 /// Owner decision on #922: the newest 20 checkpoints per generation.
-const KEEP_CHECKPOINTS: usize = 20;
+pub(crate) const KEEP_CHECKPOINTS: usize = 20;
+const _: usize = KEEP_CHECKPOINTS;
 const MAX_REPORTED_PATHS: usize = 64;
 const MAX_JOURNAL_BYTES: usize = 128 * 1024;
 const MAX_FACT_BYTES: usize = 6 * 1024;
@@ -73,6 +72,24 @@ pub(crate) struct TaskRecord {
 pub(crate) struct TaskSource {
     pub(crate) name: String,
     pub(crate) text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SnapshotFile {
+    path: String,
+    mode: Option<String>,
+    oid: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CheckpointManifest {
+    version: u8,
+    agent: String,
+    generation: i64,
+    head: String,
+    repository_common_dir: String,
+    staged: Vec<SnapshotFile>,
+    worktree: Vec<SnapshotFile>,
 }
 
 /// Task text and report text as stored in Git: known secrets and anything
@@ -146,12 +163,22 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         return Err(Error::new("unavailable", "checkpoint status failed"));
     }
     let dirty = dirty_paths(&status.stdout)?;
-    let scan = {
-        let (scan_root, policy, limits, scan_head) = (
+    let common_dir = read_line(
+        &git,
+        &root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        Instant::now() + GIT_TIME,
+    )
+    .await?;
+    let common_dir = canonical_root(&common_dir)?;
+    let repository_common_dir = common_dir.to_string_lossy().into_owned();
+    let worktree = {
+        let (scan_root, policy, limits, scan_head, dirty) = (
             root.clone(),
             Arc::clone(&request.policy),
             request.limits,
             head.clone(),
+            dirty.clone(),
         );
         tokio::task::spawn_blocking(move || {
             scan_worktree(&scan_root, &scan_head, dirty, &policy, limits)
@@ -159,11 +186,29 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         .await
         .map_err(|_| Error::new("internal", "checkpoint scan failed"))?
     };
-    let WorktreeScan {
-        files,
-        mut withheld,
-        fingerprint,
-    } = scan;
+    let staged = scan_index(&git, &root, &head, &dirty, &request.policy, request.limits).await?;
+    let withheld = merge_withheld(worktree.withheld, staged.withheld);
+    let withheld_paths: HashSet<String> = withheld.iter().map(|file| file.path.clone()).collect();
+    let mut staged_files: Vec<_> = staged
+        .files
+        .into_iter()
+        .filter(|file| !withheld_paths.contains(&file.path))
+        .collect();
+    let mut worktree_files: Vec<_> = worktree
+        .files
+        .into_iter()
+        .filter(|file| !withheld_paths.contains(&file.path))
+        .collect();
+    staged_files.sort_by(|left, right| left.path.cmp(&right.path));
+    worktree_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(worktree.fingerprint.as_bytes());
+    fingerprint.update(staged.fingerprint.as_bytes());
+    let fingerprint: String = fingerprint
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
     let mut input = GitCheckpointInput {
         state: GitCheckpointState::Unchanged,
         trigger: request.trigger.to_owned(),
@@ -185,159 +230,585 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         return Ok(input);
     }
     input.head = Some(head.clone());
-    if files.is_empty() && withheld.is_empty() {
+    if staged_files.is_empty() && worktree_files.is_empty() && withheld.is_empty() {
         input.state = GitCheckpointState::Clean;
         return Ok(input);
     }
+    // No private repository object or ref is written until both disk and
+    // index paths and the exact bytes have passed the bounded secret scan.
+    let repository = crate::work_truth_repo::open(request.data_root, request.workspace).await?;
     let overrides = git
-        .batch_overrides(&root, Instant::now() + GIT_TIME)
+        .batch_overrides(&repository, Instant::now() + GIT_TIME)
         .await?;
-    let known = previous_blobs(
+    let previous_oids =
+        previous_checkpoint_oids(&git, &repository, request.previous_snapshot.as_deref()).await;
+    let prepared = prepare_layers(
         &git,
-        &root,
+        &repository,
         &overrides,
-        request.previous_snapshot.as_deref(),
-        &files,
+        staged_files,
+        worktree_files,
+        &head,
+        &request,
+        previous_oids,
+        withheld,
     )
-    .await;
-    let zero = "0".repeat(head.len());
-    let mut index_info = Vec::new();
-    let mut captured = Vec::with_capacity(files.len());
-    let mut new_bytes = 0_u64;
-    let mut write_failed = false;
-    for file in files {
-        let ScannedFile { path, content } = file;
-        let Some(FileContent { bytes, mode, link }) = content else {
-            index_info.extend_from_slice(format!("0 {zero}\t{path}").as_bytes());
-            index_info.push(0);
-            captured.push(path);
-            continue;
-        };
-        let size = bytes.len() as u64;
-        // A blob the last snapshot already holds costs no new storage, so
-        // an exhausted budget still keeps unchanged files in the checkpoint.
-        let room = request
-            .generation_used
-            .saturating_add(new_bytes)
-            .saturating_add(size)
-            <= request.limits.generation_bytes;
-        let path_arg = format!("--path={path}");
-        let mut args = vec!["hash-object", "--stdin"];
-        if room {
-            args.push("-w");
-        }
-        args.push(if link {
-            "--no-filters"
-        } else {
-            path_arg.as_str()
-        });
-        // The bytes hashed here are the bytes the secret scan read.
-        let written = git
-            .workspace_input_with(
-                &root,
-                &args,
-                &overrides,
-                None,
-                &bytes,
-                Instant::now() + GIT_TIME,
-            )
-            .await;
-        let written = match written {
-            Ok(written) if written.code == 0 => written,
-            _ => {
-                write_failed = true;
-                break;
-            }
-        };
-        let Ok(oid) = first_line(&written.stdout) else {
-            write_failed = true;
-            break;
-        };
-        let unchanged = known.get(&path) == Some(&oid);
-        if !room && !unchanged {
-            withheld.push(GitCheckpointWithheld {
-                path,
-                bytes: size,
-                reason: "generation_budget".to_owned(),
-            });
-            continue;
-        }
-        if !unchanged {
-            new_bytes = new_bytes.saturating_add(size);
-        }
-        index_info.extend_from_slice(format!("{mode} {oid}\t{path}").as_bytes());
-        index_info.push(0);
-        captured.push(path);
+    .await?;
+    input.captured_bytes = prepared.captured_bytes;
+    set_withheld(&mut input, prepared.withheld);
+    if prepared.staged.is_empty() && prepared.worktree.is_empty() {
+        input.state = GitCheckpointState::Failed;
+        input.fingerprint = None;
+        input.error = Some("no changed path could be captured".to_owned());
+        return Ok(input);
     }
-    input.captured_bytes = new_bytes;
-    set_withheld(&mut input, withheld);
-    // Blobs already written count against the budget even if publishing fails.
-    let failure = if write_failed {
-        Some("checkpoint step hash-object failed".to_owned())
-    } else if index_info.is_empty() {
-        Some("no changed file could be captured".to_owned())
-    } else {
-        match prepare_snapshot(&request, &git, &root, &overrides, &head, &index_info).await {
-            Ok((reference, oid)) => {
-                input.state = GitCheckpointState::Snapshot;
-                input.checkpoint_ref = Some(reference);
-                input.oid = Some(oid);
-                input.paths_truncated = captured.len() > MAX_REPORTED_PATHS;
-                input.paths = captured.into_iter().take(MAX_REPORTED_PATHS).collect();
-                None
-            }
-            Err(error) => Some(bound_chars(
+    let mut captured: Vec<String> = prepared
+        .staged
+        .iter()
+        .chain(&prepared.worktree)
+        .map(|file| file.path.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    captured.sort();
+    match write_checkpoint(
+        &git,
+        &repository,
+        &overrides,
+        &request,
+        &head,
+        &repository_common_dir,
+        prepared.staged,
+        prepared.worktree,
+        prepared.blobs,
+    )
+    .await
+    {
+        Ok((reference, oid)) => {
+            input.state = GitCheckpointState::Snapshot;
+            input.checkpoint_ref = Some(reference);
+            input.oid = Some(oid);
+            input.paths_truncated = captured.len() > MAX_REPORTED_PATHS;
+            input.paths = captured.into_iter().take(MAX_REPORTED_PATHS).collect();
+        }
+        Err(error) => {
+            input.state = GitCheckpointState::Failed;
+            input.fingerprint = None;
+            input.error = Some(bound_chars(
                 &request
                     .policy
                     .redact_text(&format!("{}: {}", error.code, error.message)),
                 240,
-            )),
+            ));
         }
-    };
-    if let Some(error) = failure {
-        input.state = GitCheckpointState::Failed;
-        input.fingerprint = None;
-        input.error = Some(error);
     }
     Ok(input)
 }
 
-/// Build the snapshot commit. The caller must retain its intent before publication.
-async fn prepare_snapshot(
-    request: &CheckpointRequest<'_>,
+#[derive(Clone)]
+struct StagedPath {
+    path: String,
+    mode: Option<String>,
+    oid: Option<String>,
+}
+
+struct IndexScan {
+    files: Vec<ScannedFile>,
+    withheld: Vec<GitCheckpointWithheld>,
+    fingerprint: String,
+}
+
+async fn scan_index(
     git: &GitProbe,
     root: &Path,
-    overrides: &[(String, String)],
     head: &str,
-    index_info: &[u8],
-) -> Result<(String, String)> {
-    let index = TemporaryGitIndex::create_with_prefix(request.data_root, "checkpoint-index")?;
-    let (_cancel, cancellation) = watch::channel(false);
-    let run = Effect {
-        git,
-        root,
-        index: index.path(),
-        policy: &request.policy,
-        cancellation: &cancellation,
-    };
-    run.output(&["read-tree", head]).await?;
-    let staged = git
-        .workspace_input_with(
+    dirty: &[DirtyPath],
+    policy: &SecretPolicy,
+    limits: CheckpointLimits,
+) -> Result<IndexScan> {
+    let raw = git
+        .workspace_command(
             root,
-            &["update-index", "-z", "--index-info"],
-            overrides,
-            Some(index.path()),
-            index_info,
+            &[
+                "diff",
+                "--cached",
+                "--raw",
+                "--no-abbrev",
+                "-z",
+                "--no-renames",
+                head,
+            ],
             Instant::now() + GIT_TIME,
         )
         .await?;
-    if staged.code != 0 {
-        return Err(Error::new(
-            "unavailable",
-            "checkpoint step update-index failed",
-        ));
+    if raw.code != 0 {
+        return Err(Error::new("unavailable", "checkpoint index scan failed"));
     }
-    let tree = run.line(&["write-tree"]).await?;
+    let staged = parse_staged_paths(&raw.stdout)?;
+    let dirty_by_path: HashMap<_, _> = dirty
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect();
+    let mut files = Vec::new();
+    let mut withheld = Vec::new();
+    let mut read_bytes = 0_u64;
+    let mut hasher = Sha256::new();
+    hasher.update(head.as_bytes());
+    for (index, path) in staged.into_iter().enumerate() {
+        hasher.update([0]);
+        hasher.update(path.path.as_bytes());
+        let dirty_path = dirty_by_path.get(path.path.as_str()).copied();
+        let size = if let Some(oid) = path.oid.as_deref() {
+            read_line(
+                git,
+                root,
+                &["cat-file", "-s", oid],
+                Instant::now() + GIT_TIME,
+            )
+            .await?
+            .parse::<u64>()
+            .map_err(|_| Error::new("unavailable", "staged checkpoint size is unreadable"))?
+        } else {
+            0
+        };
+        let refusal = if is_credential_path(&path.path) {
+            Some("credential_path")
+        } else if dirty_path.is_some_and(|entry| entry.unmerged) {
+            Some("unmerged_index")
+        } else if dirty_path.is_some_and(|entry| entry.nested)
+            || path.mode.as_deref() == Some("160000")
+        {
+            Some("nested_repository")
+        } else if index >= MAX_CHECKPOINT_FILES {
+            Some("too_many_files")
+        } else if size > limits.file_bytes {
+            Some("file_too_large")
+        } else if read_bytes.saturating_add(size) > limits.total_bytes {
+            Some("checkpoint_total_limit")
+        } else {
+            None
+        };
+        let content = match (refusal, path.oid.as_deref()) {
+            (Some(reason), _) => {
+                withheld.push(GitCheckpointWithheld {
+                    path: path.path.clone(),
+                    bytes: size,
+                    reason: reason.to_owned(),
+                });
+                hasher.update(reason.as_bytes());
+                hasher.update(size.to_le_bytes());
+                continue;
+            }
+            (None, None) => None,
+            (None, Some(oid)) => {
+                let output = git
+                    .workspace_command(root, &["cat-file", "blob", oid], Instant::now() + GIT_TIME)
+                    .await?;
+                if output.code != 0 || output.stdout.len() as u64 != size {
+                    return Err(Error::new(
+                        "unavailable",
+                        "staged checkpoint bytes are unreadable",
+                    ));
+                }
+                read_bytes = read_bytes.saturating_add(size);
+                if policy.contains_text(&String::from_utf8_lossy(&output.stdout)) {
+                    withheld.push(GitCheckpointWithheld {
+                        path: path.path.clone(),
+                        bytes: size,
+                        reason: "known_secret".to_owned(),
+                    });
+                    hasher.update(b"known_secret");
+                    hasher.update(size.to_le_bytes());
+                    continue;
+                }
+                hasher.update(Sha256::digest(&output.stdout));
+                Some(FileContent {
+                    bytes: output.stdout,
+                    mode: path.mode.clone().unwrap_or_else(|| "100644".to_owned()),
+                })
+            }
+        };
+        hasher.update(path.mode.as_deref().unwrap_or("deleted").as_bytes());
+        if content.is_none() {
+            hasher.update(b"missing");
+        }
+        files.push(ScannedFile {
+            path: path.path,
+            content,
+        });
+    }
+    let fingerprint = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(IndexScan {
+        files,
+        withheld,
+        fingerprint,
+    })
+}
+
+fn parse_staged_paths(raw: &[u8]) -> Result<Vec<StagedPath>> {
+    let mut fields = raw.split(|byte| *byte == 0);
+    let mut staged = Vec::new();
+    while let Some(metadata) = fields.next().filter(|field| !field.is_empty()) {
+        let metadata = std::str::from_utf8(metadata)
+            .map_err(|_| Error::new("unavailable", "checkpoint index metadata is unreadable"))?;
+        let mut parts = metadata
+            .strip_prefix(':')
+            .ok_or_else(|| Error::new("unavailable", "checkpoint index metadata is unreadable"))?
+            .split_ascii_whitespace();
+        let (Some(_old_mode), Some(new_mode), Some(_old_oid), Some(new_oid), Some(_status)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            return Err(Error::new(
+                "unavailable",
+                "checkpoint index metadata is unreadable",
+            ));
+        };
+        let path = fields
+            .next()
+            .ok_or_else(|| Error::new("unavailable", "checkpoint index path is missing"))?;
+        let path = std::str::from_utf8(path)
+            .map_err(|_| Error::new("unavailable", "checkpoint index path is unreadable"))?
+            .to_owned();
+        if !valid_relative_git_path(&path) {
+            return Err(Error::new(
+                "unavailable",
+                "checkpoint index path is invalid",
+            ));
+        }
+        let deleted = new_oid.bytes().all(|byte| byte == b'0') || new_mode == "000000";
+        staged.push(StagedPath {
+            path,
+            mode: (!deleted).then(|| new_mode.to_owned()),
+            oid: (!deleted).then(|| new_oid.to_owned()),
+        });
+    }
+    Ok(staged)
+}
+
+fn valid_relative_git_path(path: &str) -> bool {
+    !path.is_empty()
+        && !Path::new(path).is_absolute()
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && !path.contains('\\')
+}
+
+pub(crate) fn is_credential_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/").to_ascii_lowercase();
+    let components: Vec<_> = normalized.split('/').collect();
+    let name = components.last().copied().unwrap_or_default();
+    let public_env = [".env.example", ".env.sample", ".env.template", ".env.dist"];
+    let env_file = name == ".env" || (name.starts_with(".env.") && !public_env.contains(&name));
+    let credential_token = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|token| {
+            matches!(
+                token,
+                "secret"
+                    | "secrets"
+                    | "credential"
+                    | "credentials"
+                    | "token"
+                    | "tokens"
+                    | "key"
+                    | "keys"
+                    | "apikey"
+                    | "privatekey"
+            )
+        });
+    env_file
+        || credential_token
+        || components.iter().any(|part| {
+            matches!(
+                *part,
+                ".ssh" | ".aws" | ".gnupg" | "secrets" | "credentials" | "tokens"
+            )
+        })
+        || matches!(
+            name,
+            ".netrc" | ".npmrc" | ".pypirc" | "credentials" | "credentials.json"
+        )
+        || [".pem", ".p12", ".pfx", ".key", ".jks", ".keystore"]
+            .iter()
+            .any(|extension| name.ends_with(extension))
+        || [
+            "id_rsa",
+            "id_ed25519",
+            "id_ecdsa",
+            "id_dsa",
+            "private_key",
+            "privatekey",
+        ]
+        .iter()
+        .any(|needle| name.contains(needle))
+}
+
+fn merge_withheld(
+    first: Vec<GitCheckpointWithheld>,
+    second: Vec<GitCheckpointWithheld>,
+) -> Vec<GitCheckpointWithheld> {
+    let mut entries = BTreeMap::new();
+    for file in first.into_iter().chain(second) {
+        entries
+            .entry(file.path.clone())
+            .and_modify(|known: &mut GitCheckpointWithheld| {
+                known.bytes = known.bytes.max(file.bytes);
+                if known.reason != "credential_path" && file.reason == "credential_path" {
+                    known.reason = file.reason.clone();
+                }
+            })
+            .or_insert(file);
+    }
+    entries.into_values().collect()
+}
+
+async fn previous_checkpoint_oids(
+    git: &GitProbe,
+    root: &Path,
+    snapshot: Option<&str>,
+) -> HashSet<String> {
+    let Some(snapshot) = snapshot else {
+        return HashSet::new();
+    };
+    let path = format!("{snapshot}:manifest.json");
+    let output = git
+        .workspace_command(
+            root,
+            &["cat-file", "blob", &path],
+            Instant::now() + GIT_TIME,
+        )
+        .await;
+    let Ok(output) = output else {
+        return HashSet::new();
+    };
+    if output.code != 0 {
+        return HashSet::new();
+    }
+    let Ok(manifest) = serde_json::from_slice::<CheckpointManifest>(&output.stdout) else {
+        return HashSet::new();
+    };
+    manifest
+        .staged
+        .iter()
+        .chain(&manifest.worktree)
+        .filter_map(|file| file.oid.clone())
+        .collect()
+}
+
+async fn hash_blob(
+    git: &GitProbe,
+    root: &Path,
+    overrides: &[(String, String)],
+    bytes: &[u8],
+) -> Result<String> {
+    let result = git
+        .workspace_input_with(
+            root,
+            &["hash-object", "--stdin", "--no-filters"],
+            overrides,
+            None,
+            bytes,
+            Instant::now() + GIT_TIME,
+        )
+        .await?;
+    if result.code != 0 {
+        return Err(Error::new("unavailable", "checkpoint blob scan failed"));
+    }
+    first_line(&result.stdout)
+}
+
+struct PreparedLayers {
+    staged: Vec<SnapshotFile>,
+    worktree: Vec<SnapshotFile>,
+    blobs: BTreeMap<String, Vec<u8>>,
+    captured_bytes: u64,
+    withheld: Vec<GitCheckpointWithheld>,
+}
+
+async fn prepare_layers(
+    git: &GitProbe,
+    repository: &Path,
+    overrides: &[(String, String)],
+    staged_files: Vec<ScannedFile>,
+    worktree_files: Vec<ScannedFile>,
+    head: &str,
+    request: &CheckpointRequest<'_>,
+    previous_oids: HashSet<String>,
+    mut withheld: Vec<GitCheckpointWithheld>,
+) -> Result<PreparedLayers> {
+    let mut layers: BTreeMap<String, (Option<ScannedFile>, Option<ScannedFile>)> = BTreeMap::new();
+    for file in staged_files {
+        let path = file.path.clone();
+        layers.entry(path).or_default().0 = Some(file);
+    }
+    for file in worktree_files {
+        let path = file.path.clone();
+        layers.entry(path).or_default().1 = Some(file);
+    }
+    let mut staged = Vec::new();
+    let mut worktree = Vec::new();
+    let mut blobs = BTreeMap::new();
+    let mut known = previous_oids;
+    let mut checkpoint_bytes = 0_u64;
+    let mut captured_bytes = 0_u64;
+    for (path, (staged_file, worktree_file)) in layers {
+        let contents: Vec<_> = staged_file
+            .iter()
+            .chain(worktree_file.iter())
+            .filter_map(|file| file.content.as_ref())
+            .collect();
+        let path_size: u64 = contents
+            .iter()
+            .map(|content| content.bytes.len() as u64)
+            .sum();
+        if checkpoint_bytes.saturating_add(path_size) > request.limits.total_bytes {
+            withheld.push(GitCheckpointWithheld {
+                path,
+                bytes: path_size,
+                reason: "checkpoint_total_limit".to_owned(),
+            });
+            continue;
+        }
+        let mut staged_oid = None;
+        let mut worktree_oid = None;
+        let mut path_blobs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut path_oids = HashSet::new();
+        let mut path_known = HashSet::new();
+        let mut path_new_bytes = 0_u64;
+        for (file, is_staged) in [
+            (staged_file.as_ref(), true),
+            (worktree_file.as_ref(), false),
+        ] {
+            let Some(content) = file.and_then(|file| file.content.as_ref()) else {
+                continue;
+            };
+            let oid = hash_blob(git, repository, overrides, &content.bytes).await?;
+            if !known.contains(&oid) && path_oids.insert(oid.clone()) {
+                path_new_bytes = path_new_bytes.saturating_add(content.bytes.len() as u64);
+                path_blobs.push((oid.clone(), content.bytes.clone()));
+            }
+            path_known.insert(oid.clone());
+            if is_staged {
+                staged_oid = Some(oid);
+            } else {
+                worktree_oid = Some(oid);
+            }
+        }
+        if request
+            .generation_used
+            .saturating_add(captured_bytes)
+            .saturating_add(path_new_bytes)
+            > request.limits.generation_bytes
+        {
+            withheld.push(GitCheckpointWithheld {
+                path,
+                bytes: path_size,
+                reason: "generation_budget".to_owned(),
+            });
+            continue;
+        }
+        captured_bytes = captured_bytes.saturating_add(path_new_bytes);
+        known.extend(path_known);
+        checkpoint_bytes = checkpoint_bytes.saturating_add(path_size);
+        for (oid, bytes) in path_blobs {
+            blobs.entry(oid).or_insert(bytes);
+        }
+        if let Some(file) = staged_file {
+            staged.push(SnapshotFile {
+                path: path.clone(),
+                mode: file.content.as_ref().map(|content| content.mode.clone()),
+                oid: staged_oid,
+            });
+        }
+        if let Some(file) = worktree_file {
+            worktree.push(SnapshotFile {
+                path: path.clone(),
+                mode: file.content.as_ref().map(|content| content.mode.clone()),
+                oid: worktree_oid,
+            });
+        }
+    }
+    let _ = (head, request.agent, request.generation);
+    Ok(PreparedLayers {
+        staged,
+        worktree,
+        blobs,
+        captured_bytes,
+        withheld,
+    })
+}
+
+async fn write_checkpoint(
+    git: &GitProbe,
+    repository: &Path,
+    overrides: &[(String, String)],
+    request: &CheckpointRequest<'_>,
+    head: &str,
+    repository_common_dir: &str,
+    staged: Vec<SnapshotFile>,
+    worktree: Vec<SnapshotFile>,
+    blobs: BTreeMap<String, Vec<u8>>,
+) -> Result<(String, String)> {
+    let mut blob_entries = Vec::with_capacity(blobs.len());
+    for (oid, bytes) in blobs {
+        let written = git
+            .workspace_input_with(
+                repository,
+                &["hash-object", "-w", "--stdin", "--no-filters"],
+                overrides,
+                None,
+                &bytes,
+                Instant::now() + GIT_TIME,
+            )
+            .await?;
+        if written.code != 0 || first_line(&written.stdout)? != oid {
+            return Err(Error::new("unavailable", "checkpoint blob readback failed"));
+        }
+        blob_entries.push(("100644".to_owned(), "blob".to_owned(), oid.clone(), oid));
+    }
+    let blob_tree = write_tree(git, repository, &blob_entries, Instant::now() + GIT_TIME).await?;
+    let manifest = CheckpointManifest {
+        version: 1,
+        agent: request.agent.to_owned(),
+        generation: request.generation,
+        head: head.to_owned(),
+        repository_common_dir: repository_common_dir.to_owned(),
+        staged,
+        worktree,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest)
+        .map_err(|_| Error::new("internal", "checkpoint manifest cannot be encoded"))?;
+    let manifest_oid =
+        write_blob(git, repository, &manifest_bytes, Instant::now() + GIT_TIME).await?;
+    let tree = write_tree(
+        git,
+        repository,
+        &[
+            (
+                "100644".to_owned(),
+                "blob".to_owned(),
+                manifest_oid,
+                "manifest.json".to_owned(),
+            ),
+            (
+                "040000".to_owned(),
+                "tree".to_owned(),
+                blob_tree,
+                "blobs".to_owned(),
+            ),
+        ],
+        Instant::now() + GIT_TIME,
+    )
+    .await?;
     let message = format!(
         "eliot checkpoint {} g{} {}",
         request.agent, request.generation, request.trigger
@@ -346,19 +817,25 @@ async fn prepare_snapshot(
     commit_args.extend([
         "commit-tree",
         tree.as_str(),
-        "-p",
-        head,
         "--no-gpg-sign",
         "-m",
         message.as_str(),
     ]);
-    let oid = run.line(&commit_args).await?;
-    let prefix = format!(
-        "refs/eliot/checkpoints/{}/g{}/",
-        request.agent, request.generation
+    let oid = input_line(
+        git,
+        repository,
+        &commit_args,
+        &[],
+        Instant::now() + GIT_TIME,
+    )
+    .await?;
+    let reference = format!(
+        "refs/eliot/checkpoints/{}/g{}/{:016}-{}",
+        request.agent,
+        request.generation,
+        request.label,
+        ulid::Ulid::new()
     );
-    // The time prefix orders retention; the suffix keeps equal times distinct.
-    let reference = format!("{prefix}{:016}-{}", request.label, ulid::Ulid::new());
     Ok((reference, oid))
 }
 
@@ -412,96 +889,6 @@ fn set_withheld(input: &mut GitCheckpointInput, mut withheld: Vec<GitCheckpointW
     input.withheld = withheld;
 }
 
-/// The blob each path holds in the previous snapshot, read in one process.
-async fn previous_blobs(
-    git: &GitProbe,
-    root: &Path,
-    overrides: &[(String, String)],
-    snapshot: Option<&str>,
-    files: &[ScannedFile],
-) -> HashMap<String, String> {
-    let Some(snapshot) = snapshot else {
-        return HashMap::new();
-    };
-    let paths: Vec<&str> = files
-        .iter()
-        .filter(|file| file.content.is_some() && !file.path.contains('\n'))
-        .map(|file| file.path.as_str())
-        .collect();
-    let mut input = String::new();
-    for path in &paths {
-        input.push_str(&format!("{snapshot}:{path}\n"));
-    }
-    let Ok(output) = git
-        .workspace_input_with(
-            root,
-            &["cat-file", "--batch-check=%(objectname)"],
-            overrides,
-            None,
-            input.as_bytes(),
-            Instant::now() + GIT_TIME,
-        )
-        .await
-    else {
-        return HashMap::new();
-    };
-    if output.code != 0 {
-        return HashMap::new();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    paths
-        .iter()
-        .zip(text.lines())
-        .filter(|(_, line)| !line.ends_with(" missing"))
-        .map(|(path, line)| ((*path).to_owned(), line.trim().to_owned()))
-        .collect()
-}
-
-struct Effect<'a> {
-    git: &'a GitProbe,
-    root: &'a Path,
-    index: &'a Path,
-    policy: &'a Arc<SecretPolicy>,
-    cancellation: &'a watch::Receiver<bool>,
-}
-
-impl Effect<'_> {
-    async fn output(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let outcome = self
-            .git
-            .workspace_effect_command_with_index(
-                self.root,
-                args,
-                self.index,
-                GIT_TIME,
-                Arc::clone(self.policy),
-                self.cancellation.clone(),
-            )
-            .await?;
-        match outcome {
-            ProcessOutcome::Completed(capture)
-                if capture.stdout_complete && capture.status.success() =>
-            {
-                Ok(capture.stdout)
-            }
-            _ => Err(Error::new(
-                "unavailable",
-                format!(
-                    "checkpoint step {} failed",
-                    args.iter()
-                        .find(|arg| !arg.starts_with('-') && !arg.contains('='))
-                        .unwrap_or(&"git")
-                ),
-            )),
-        }
-    }
-
-    async fn line(&self, args: &[&str]) -> Result<String> {
-        let output = self.output(args).await?;
-        first_line(&output)
-    }
-}
-
 pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> {
     let git = GitProbe::new()?;
     let Some((prefix, _)) = current.rsplit_once('/') else {
@@ -539,17 +926,19 @@ pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> 
     Ok(())
 }
 
+#[derive(Clone)]
 struct DirtyPath {
     path: String,
     /// Worktree mode from Git; absent for an untracked path.
     mode: Option<String>,
     nested: bool,
+    unmerged: bool,
 }
 
+#[derive(Clone)]
 struct FileContent {
     bytes: Vec<u8>,
     mode: String,
-    link: bool,
 }
 
 struct ScannedFile {
@@ -580,7 +969,12 @@ fn scan_worktree(
     let mut withheld = Vec::new();
     let mut read_bytes = 0_u64;
     for (index, entry) in dirty.into_iter().enumerate() {
-        let DirtyPath { path, mode, nested } = entry;
+        let DirtyPath {
+            path,
+            mode,
+            nested,
+            unmerged,
+        } = entry;
         hasher.update([0]);
         hasher.update(path.as_bytes());
         let meta = std::fs::symlink_metadata(root.join(&path)).ok();
@@ -588,7 +982,13 @@ fn scan_worktree(
             .as_ref()
             .filter(|meta| meta.is_file())
             .map_or(0, std::fs::Metadata::len);
-        let refusal = if nested {
+        let refusal = if !valid_relative_git_path(&path) {
+            Some("invalid_path")
+        } else if is_credential_path(&path) {
+            Some("credential_path")
+        } else if unmerged {
+            Some("unmerged_index")
+        } else if nested {
             Some("nested_repository")
         } else if index >= MAX_CHECKPOINT_FILES {
             Some("too_many_files")
@@ -612,12 +1012,10 @@ fn scan_worktree(
                 Ok(PathContent::Link(target)) => Ok(Some(FileContent {
                     bytes: target.to_string_lossy().replace('\\', "/").into_bytes(),
                     mode: "120000".to_owned(),
-                    link: true,
                 })),
                 Ok(PathContent::File(bytes)) => Ok(Some(FileContent {
                     mode: file_mode(mode.as_deref(), meta.as_ref()),
                     bytes,
-                    link: false,
                 })),
                 Ok(PathContent::Other) => Err("not_a_file"),
                 Err("cap_exceeded") => Err("file_too_large"),
@@ -706,6 +1104,7 @@ fn dirty_paths(status: &[u8]) -> Result<Vec<DirtyPath>> {
                     path: path.trim_end_matches('/').to_owned(),
                     mode: None,
                     nested: path.ends_with('/'),
+                    unmerged: false,
                 });
                 continue;
             }
@@ -720,6 +1119,7 @@ fn dirty_paths(status: &[u8]) -> Result<Vec<DirtyPath>> {
             path: parts[path_at].to_owned(),
             mode: Some(parts[mode_at].to_owned()),
             nested: parts[2].starts_with('S'),
+            unmerged: text.as_bytes()[0] == b'u',
         });
     }
     Ok(paths)
@@ -853,9 +1253,13 @@ async fn task_commit(
 }
 
 /// Write the task record once. A successor on the same branch reuses it.
-pub(crate) async fn ensure_task(workspace: &str, record: &TaskRecord) -> Result<()> {
+pub(crate) async fn ensure_task(
+    data_root: &Path,
+    workspace: &str,
+    record: &TaskRecord,
+) -> Result<()> {
     let git = GitProbe::new()?;
-    let root = canonical_root(workspace)?;
+    let root = crate::work_truth_repo::open(data_root, workspace).await?;
     let deadline = Instant::now() + GIT_TIME;
     if task_commit(&git, &root, &record.task_ref, deadline)
         .await
@@ -1150,9 +1554,15 @@ fn same_workspace_path(left: &Path, right: &Path) -> bool {
 }
 
 /// The task text kept in the record, for when the Store no longer has it.
-pub(crate) async fn task_record_text(workspace: &str, task_ref: &str) -> Option<String> {
+pub(crate) async fn task_record_text(
+    data_root: &Path,
+    workspace: &str,
+    task_ref: &str,
+) -> Option<String> {
     let git = GitProbe::new().ok()?;
-    let root = canonical_root(workspace).ok()?;
+    let root = crate::work_truth_repo::open(data_root, workspace)
+        .await
+        .ok()?;
     let path = format!("{task_ref}:task.md");
     let output = git
         .workspace_command(
@@ -1170,9 +1580,15 @@ pub(crate) async fn task_record_text(workspace: &str, task_ref: &str) -> Option<
 }
 
 /// How a successor reads the task files saved with the record.
-pub(crate) async fn task_source_note(workspace: &str, task_ref: &str) -> Option<String> {
+pub(crate) async fn task_source_note(
+    data_root: &Path,
+    workspace: &str,
+    task_ref: &str,
+) -> Option<String> {
     let git = GitProbe::new().ok()?;
-    let root = canonical_root(workspace).ok()?;
+    let root = crate::work_truth_repo::open(data_root, workspace)
+        .await
+        .ok()?;
     let tree = format!("{task_ref}:sources");
     let listed = git
         .workspace_command(
@@ -1185,26 +1601,50 @@ pub(crate) async fn task_source_note(workspace: &str, task_ref: &str) -> Option<
     if listed.code != 0 {
         return None;
     }
-    let commands: Vec<String> = listed
+    let names: Vec<String> = listed
         .stdout
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
         .filter_map(|name| std::str::from_utf8(name).ok())
-        .map(|name| format!("git show \"{task_ref}:sources/{name}\""))
+        .map(str::to_owned)
         .collect();
-    (!commands.is_empty()).then(|| {
-        format!(
-            "[The task file named above is saved in Git, even if its path is gone: {}]",
-            commands.join("; ")
-        )
-    })
+    if names.is_empty() {
+        return None;
+    }
+    let mut note = String::from(
+        "Saved task sources from Eliot's private work-truth repository follow as quoted task data:\n",
+    );
+    for name in names {
+        let path = format!("{task_ref}:sources/{name}");
+        let output = git
+            .workspace_command(
+                &root,
+                &["cat-file", "blob", &path],
+                Instant::now() + GIT_TIME,
+            )
+            .await
+            .ok()?;
+        if output.code != 0 {
+            return None;
+        }
+        let text = std::str::from_utf8(&output.stdout).ok()?;
+        note.push_str(&format!(
+            "\n--- saved source: {name} ---\n{text}\n--- end saved source ---\n"
+        ));
+    }
+    Some(note)
 }
 
 /// Append to the journal, keeping its newest bytes. The ref holds one commit,
 /// so replaced journals become unreachable instead of growing history.
-pub(crate) async fn append_journal(workspace: &str, task_ref: &str, entries: &str) -> Result<()> {
+pub(crate) async fn append_journal(
+    data_root: &Path,
+    workspace: &str,
+    task_ref: &str,
+    entries: &str,
+) -> Result<()> {
     let git = GitProbe::new()?;
-    let root = canonical_root(workspace)?;
+    let root = crate::work_truth_repo::open(data_root, workspace).await?;
     let deadline = Instant::now() + GIT_TIME;
     let Some(parent) = task_commit(&git, &root, task_ref, deadline).await else {
         return Ok(());
@@ -1361,9 +1801,9 @@ pub(crate) async fn handoff_facts(
     .await;
     let task = task.map_or_else(
         || "Task record: none".to_owned(),
-        |reference| {
+        |_reference| {
             format!(
-                "Task record: git show {reference}:task.md (card.json holds the card and the paths and hashes of files the task names; sources/ holds a task file when the task was a pointer to it; journal.md holds earlier turn reports)"
+                "Task record and sources are held in Eliot's private work-truth repository; the task text and saved task sources follow in this brief. Its card records referenced-file hashes, and its journal keeps earlier turn reports."
             )
         },
     );

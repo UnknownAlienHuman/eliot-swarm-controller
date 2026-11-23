@@ -34,6 +34,7 @@ mod stand_cleanup;
 pub mod startup;
 mod update_backup;
 mod work_truth;
+mod work_truth_repo;
 mod workspace_git;
 mod workspaces;
 
