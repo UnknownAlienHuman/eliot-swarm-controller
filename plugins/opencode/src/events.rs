@@ -47,11 +47,12 @@ use crate::native::{
     },
     sse::SseFrame,
     types::{
-        AgentSelectedData, AssistantContent, AssistantTokens, EliotContextHook,
-        EliotContextResolveInput, ExecutionEventData, FormCancelledData, FormCreatedData,
-        FormRepliedData, InboxEventData, Message, ModelRef, ModelSelectedData, PermissionAskedData,
-        PermissionRepliedData, RetryScheduledData, SessionLifecycleData, SseEnvelope,
-        StepStartedData, StructuredError, ToolEventData, ToolFailedData, ToolInputStartedData,
+        AgentSelectedData, AssistantContent, AssistantTokens, CompactionEventData,
+        CompactionReason, EliotContextHook, EliotContextResolveInput, ExecutionEventData,
+        FormCancelledData, FormCreatedData, FormRepliedData, InboxEventData, Message, ModelRef,
+        ModelSelectedData, PermissionAskedData, PermissionRepliedData, RetryScheduledData,
+        SessionLifecycleData, SseEnvelope, StepStartedData, StructuredError, ToolEventData,
+        ToolFailedData, ToolInputStartedData,
     },
 };
 
@@ -1651,6 +1652,16 @@ impl EventProcessor {
     }
 
     async fn process_envelope(&mut self, envelope: SseEnvelope) -> Result<()> {
+        if matches!(
+            envelope.event_type.as_str(),
+            "session.compaction.started" | "session.compaction.ended" | "session.compaction.failed"
+        ) && envelope.durable.as_ref().is_some_and(|durable| {
+            self.status.session_id.as_deref() == Some(durable.aggregate_id.as_str())
+                && self.expected_seq.is_some_and(|next| durable.seq < next)
+        }) {
+            // Keep a replay bound to the original observation, even after its turn ends.
+            return Ok(());
+        }
         let next_retry = envelope.event_type == "session.retry.scheduled"
             && envelope.durable.as_ref().is_some_and(|durable| {
                 self.expected_seq == Some(durable.seq)
@@ -1670,10 +1681,7 @@ impl EventProcessor {
             "session.execution.started" => self.observe_execution_started(&envelope).await,
             "session.compaction.started"
             | "session.compaction.ended"
-            | "session.compaction.failed" => {
-                self.observe_compaction(&envelope);
-                Ok(())
-            }
+            | "session.compaction.failed" => self.observe_compaction(&envelope).await,
             "session.retry.scheduled" if next_retry => {
                 self.observe_retry_scheduled(&envelope).await
             }
@@ -1708,24 +1716,74 @@ impl EventProcessor {
         }
     }
 
-    fn observe_compaction(&mut self, envelope: &SseEnvelope) {
-        if self.status.session_id.as_deref() != envelope.data["sessionID"].as_str()
-            || envelope.data["reason"] != "manual"
-            || self.stashed_started.is_none()
-        {
-            return;
-        }
-        let Some(watch) = self.compaction.as_mut() else {
-            return;
+    async fn observe_compaction(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let Some(session_id) = self.status.session_id.as_deref() else {
+            return Ok(());
         };
-        match envelope.event_type.as_str() {
-            "session.compaction.started" if watch.input.is_none() => {
-                watch.input = envelope.data["inputID"].as_str().map(str::to_owned);
-            }
-            "session.compaction.ended" if watch.input.is_some() => watch.result = Some(true),
-            "session.compaction.failed" if watch.input.is_some() => watch.result = Some(false),
-            _ => {}
+        if envelope.data["sessionID"].as_str() != Some(session_id) {
+            return Ok(());
         }
+        let compaction: CompactionEventData = serde_json::from_value(envelope.data.clone())
+            .map_err(|_| {
+                Error::new(
+                    "native_protocol",
+                    "OpenCode compaction event omitted its session or reason",
+                )
+            })?;
+        if !envelope
+            .durable
+            .as_ref()
+            .is_some_and(|durable| durable.aggregate_id == compaction.session_id)
+        {
+            return Err(Error::new(
+                "native_protocol",
+                "OpenCode compaction event was not durable for its exact session",
+            ));
+        }
+        if envelope.id.trim().is_empty() {
+            return Err(Error::new(
+                "native_protocol",
+                "OpenCode compaction event omitted its native identity",
+            ));
+        }
+
+        if self.stashed_started.is_some()
+            && compaction.reason == CompactionReason::Manual
+            && let Some(watch) = self.compaction.as_mut()
+        {
+            match envelope.event_type.as_str() {
+                "session.compaction.started" if watch.input.is_none() => {
+                    watch.input = compaction.input_id.filter(|input| !input.trim().is_empty());
+                }
+                "session.compaction.ended" if watch.input.is_some() => {
+                    watch.result = Some(true);
+                }
+                "session.compaction.failed"
+                    if watch.input.is_some() && watch.input == compaction.input_id =>
+                {
+                    watch.result = Some(false);
+                }
+                _ => {}
+            }
+        }
+
+        if envelope.event_type == "session.compaction.ended" {
+            let native_id = event_id(
+                session_id,
+                "session",
+                &envelope.id,
+                "session.context.compacted",
+                "opencode",
+                "OpenCode",
+            )?;
+            let mut data = json!({"reason": compaction.reason.as_str()});
+            if let Some(turn_id) = self.status.active_turn_id.as_deref() {
+                data["turn_id"] = json!(turn_id);
+            }
+            self.commit_event("session.context.compacted", native_id, data)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn observe_retry_scheduled(&mut self, envelope: &SseEnvelope) -> Result<()> {
