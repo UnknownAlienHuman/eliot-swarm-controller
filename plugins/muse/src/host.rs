@@ -1691,11 +1691,7 @@ impl MusePlugin {
             params.generation,
             "Muse",
         )?;
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| Error::new("stale_turn", "turn/cancel requires a captured turn id"))?;
+        let turn_id = params.turn_id.as_deref().filter(|id| !id.is_empty());
         if params.request_id.is_some() {
             return Err(Error::new(
                 "invalid",
@@ -1709,7 +1705,9 @@ impl MusePlugin {
             ));
         }
         let event_status = session.events.status();
-        if session.phase != SessionPhase::Ready || event_status.source_unknown {
+        if !params.owner_control
+            && (session.phase != SessionPhase::Ready || event_status.source_unknown)
+        {
             let reason = if event_status.view_unavailable {
                 format!(
                     "Muse interrupt refused: native view unavailable ({}); the recorded source gap leaves the turn outcome unknown",
@@ -1728,23 +1726,25 @@ impl MusePlugin {
         // active turn and answers behind the terminal commit, so an interrupt
         // that arrives after the terminal batch sees `stale_turn` instead of
         // sending a second native cancel.
-        let live = match session.events.check_turn(turn_id).await {
-            Ok(live) => live,
-            Err(error) => {
-                let result = unknown_control(&error.message);
-                return Ok(result);
+        if !params.owner_control {
+            let turn_id = turn_id.ok_or_else(|| {
+                Error::new("stale_turn", "turn/cancel requires a captured turn id")
+            })?;
+            match session.events.check_turn(turn_id).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Ok(rejected_control(
+                        "Muse turn/cancel does not match the exact active turn",
+                    ));
+                }
+                Err(error) => return Ok(unknown_control(&error.message)),
             }
-        };
-        if !live {
-            return Ok(rejected_control(
-                "Muse turn/cancel does not match the exact active turn",
-            ));
         }
         let Some(native_session) = session.session_id.clone() else {
             let result = unknown_control("Muse session identity is unresolved");
             return Ok(result);
         };
-        // The exact active turn is always named explicitly: halt running,
+        // Name the captured turn when known: halt running,
         // keep queue — queued submits are a different object (`turn/unqueue`)
         // and are never touched here. Admission is not the stop: the turn
         // ends when its `turn/completed` with terminal `cancelled` folds on
@@ -1753,7 +1753,7 @@ impl MusePlugin {
         let cancel_params = NativeTurnCancelParams {
             command_id: native_command_id.clone(),
             session_id: native_session,
-            turn_id: Some(turn_id.to_owned()),
+            turn_id: turn_id.map(str::to_owned),
         };
         let encoded = match serde_json::to_value(cancel_params) {
             Ok(encoded) => encoded,
@@ -1772,7 +1772,10 @@ impl MusePlugin {
                     || error.code == "native_rejected"
                     || error.code == "frame_too_large" =>
             {
-                let result = rejected_control("Muse turn/cancel was not applied");
+                let result = rejected_control(&format!(
+                    "Muse turn/cancel was not applied: {}",
+                    error.message
+                ));
                 Ok(result)
             }
             Err(_) => {
@@ -1789,7 +1792,8 @@ impl MusePlugin {
                 };
                 if cancelled.command_id != native_command_id
                     || cancelled.status != "accepted"
-                    || cancelled.turn_id != turn_id
+                    || cancelled.turn_id.is_empty()
+                    || turn_id.is_some_and(|id| cancelled.turn_id != id)
                 {
                     let result = unknown_control("Muse turn/cancel did not stop its exact turn");
                     return Ok(result);
@@ -1797,7 +1801,7 @@ impl MusePlugin {
                 let result = json!({
                     "state": "applied",
                     "command_id": params.command_id,
-                    "turn_id": turn_id,
+                    "turn_id": params.turn_id,
                 });
                 Ok(result)
             }
