@@ -369,24 +369,24 @@ fn source_task(
 ) -> Result<Option<Command>> {
     let binding =
         crate::Store::work_task_binding(connection, &from.id, from.generation, task_command)?;
-    if let Some((_, issuer)) = binding {
-        if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
-            return Err(Error::new(
-                "not_allowed",
-                "handoff transfers only SENDs issued by the caller",
-            ));
-        }
-        return Ok(None);
-    }
     let Some(task) = load_command(connection, task_command)? else {
+        if let Some((_, issuer)) = binding {
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
+        }
         return Err(Error::new(
             "not_found",
             format!("original task SEND {task_command} is not retained"),
         ));
     };
     if task.verb != "send"
-        || task.target.as_deref() != Some(&from.id)
-        || task.generation != Some(from.generation)
+        || (task.target.as_deref() != Some(&from.id) || task.generation != Some(from.generation))
+            && binding.is_none()
     {
         return Err(Error::new(
             "invalid",
@@ -692,7 +692,9 @@ pub(super) fn handoff_tx(
     }
     quiescent(tx, &to, true)?;
     let input_principal = manager_caller.as_ref().map(|_| principal);
-    let task = if from_switch {
+    let task = if matches!(input, HandoffInput::ProviderRetry) {
+        source_task(tx, &from, &request.task_command, input_principal)?
+    } else if from_switch {
         continuation_task(tx, &from, &request.task_command, input_principal)?
     } else if project_transfer && request.task_command.is_empty() {
         None
