@@ -1819,6 +1819,52 @@ pub(super) fn owner_control_turn(tx: &Transaction<'_>, agent: &Agent) -> Result<
         .map(|(id, _)| id))
 }
 
+/// Retain state refusals for validated Owner controls so the command result
+/// and Agent view can report the same reason, including on an exact retry.
+fn retain_owner_control_refusal(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    result: Result<()>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if principal != "owner"
+        || !matches!(request.verb.as_str(), "interrupt" | "stop")
+        || !matches!(error.code.as_str(), "bad_state" | "stale_generation")
+    {
+        return Err(error);
+    }
+    let Some(target) = request.target.as_deref() else {
+        return Err(error);
+    };
+    let agent_num = parse_agent_id(target)?;
+    let Some(agent) = load_agent_by_num(tx, agent_num)? else {
+        return Err(error);
+    };
+    let outcome = json!({"code": error.code, "message": error.message});
+    events.push(admit_command(
+        tx,
+        &CommandInsert {
+            state: CommandState::Rejected,
+            outcome: Some(&outcome),
+            ..CommandInsert::admitted(
+                principal,
+                request,
+                payload_digest,
+                (agent_num, agent.generation),
+                now,
+            )
+        },
+        json!({"command_id": request.id, "verb": request.verb, "state": "rejected", "outcome": outcome}),
+    )?);
+    Ok(())
+}
+
 /// Admit one turn-control command: authority, generation, state, turn and request.
 pub(super) fn admit_control_tx(
     tx: &Transaction<'_>,
@@ -2281,7 +2327,17 @@ fn submit_tx_mode(
             &mut events,
         )?,
         "send" | "stop" => {
-            admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
+            let result =
+                admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events);
+            retain_owner_control_refusal(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                result,
+                now,
+                &mut events,
+            )?;
             None
         }
         "worktree.remove" => {
@@ -2298,12 +2354,21 @@ fn submit_tx_mode(
             None
         }
         "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-            admit_control_tx(
+            let result = admit_control_tx(
                 tx,
                 principal,
                 &request,
                 &payload_digest,
                 None,
+                now,
+                &mut events,
+            );
+            retain_owner_control_refusal(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                result,
                 now,
                 &mut events,
             )?;
