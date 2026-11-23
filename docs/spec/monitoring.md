@@ -1156,7 +1156,9 @@ The private crash directory holds up to 64 marker files of each kind.
 Daemon startup consumes the previous `daemon.panicked` files and exposes the latest
 as `previous_crash`. `daemon.status` consumes validated `plugin.panicked` files by
 deleting them and keeps the latest eight consumed plugin markers for the current
-daemon run. `swarm status` shows a summary for each.
+daemon run. `swarm status` shows a summary for each. Readers discard malformed
+published markers and log the discard. A concurrent daemon panic can wait
+briefly for the marker writer before attempting its own distinct file.
 
 `daemon.status` also exposes retention and drain information. Compact
 `agent.list` reads and history-derived attention thresholds use SQLite read

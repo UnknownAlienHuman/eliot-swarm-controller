@@ -30,8 +30,8 @@ use eliot_core::{
 use eliot_plugin::sync::LockExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock, TryLockError};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 /// Per-spawn nonce a plugin received as its first stdin line from its daemon.
@@ -40,6 +40,7 @@ static PLUGIN_CRASH_NONCE: OnceLock<String> = OnceLock::new();
 pub const PLUGIN_CRASH_LINE: &str = "eliot_crash";
 const MAX_MARKERS_PER_CODE: usize = 64;
 const MAX_MARKER_BYTES: usize = 64 * 1024;
+const DAEMON_MARKER_LOCK_WAIT: Duration = Duration::from_millis(50);
 static DAEMON_MARKER_WRITER: Mutex<()> = Mutex::new(());
 static PLUGIN_MARKER_WRITER: Mutex<()> = Mutex::new(());
 static MARKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -188,11 +189,19 @@ fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPoli
 /// Never fails the panicking process further.
 pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
     let _writer = if marker.code == "daemon.panicked" {
-        // A nested or concurrent daemon panic must not wait inside its hook.
-        let Ok(writer) = DAEMON_MARKER_WRITER.try_lock() else {
-            return;
-        };
-        writer
+        // Give concurrent panics a chance to write a distinct marker, with
+        // a bounded wait in case the first writer is stuck in filesystem I/O.
+        let until = Instant::now() + DAEMON_MARKER_LOCK_WAIT;
+        loop {
+            match DAEMON_MARKER_WRITER.try_lock() {
+                Ok(writer) => break writer,
+                Err(TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(TryLockError::WouldBlock) => return,
+            }
+        }
     } else {
         PLUGIN_MARKER_WRITER.lock_recover()
     };
@@ -244,15 +253,18 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
 }
 
 /// Read and consume (delete) every valid marker of one code, oldest first.
-/// Temporary or incomplete files are ignored, never deleted by a reader.
-pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
+/// Published but malformed markers are discarded. Temporary files and
+/// files with an inconclusive read failure stay available for later reads.
+fn take_markers(dir: &Path, code: &str, policy: &SecretPolicy) -> Vec<CrashMarker> {
     let mut markers = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return markers;
     };
     let prefix = format!("{code}-");
     let mut paths: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -261,14 +273,24 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
         .collect();
     paths.sort();
     for path in paths {
-        let parsed = crate::platform::data_dir::read_private_bytes(&path, MAX_MARKER_BYTES)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<CrashMarker>(&bytes).ok())
-            .filter(|marker| marker.code == code && marker.validate().is_ok());
-        if let Some(marker) = parsed
-            && std::fs::remove_file(path).is_ok()
-        {
-            markers.push(marker);
+        let parsed = match crate::platform::data_dir::read_private_bytes(&path, MAX_MARKER_BYTES) {
+            Ok(bytes) => serde_json::from_slice::<CrashMarker>(&bytes)
+                .ok()
+                .filter(|marker| marker.code == code && marker.validate().is_ok()),
+            Err(error) if error.code == "source_integrity" => None,
+            Err(_) => continue,
+        };
+        if std::fs::remove_file(path).is_ok() {
+            if let Some(marker) = parsed {
+                markers.push(marker);
+            } else {
+                crate::logging::record(
+                    policy,
+                    "daemon.crash_marker_discarded",
+                    &[("operation", code)],
+                    None,
+                );
+            }
         }
     }
     markers.sort_by_key(|marker| marker.timestamp);
@@ -279,13 +301,13 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
 /// consumed `daemon.panicked` marker, redacted with the daemon secrets.
 /// Consumption is once-only: files are deleted on read.
 pub(crate) fn load_previous_crash(data_root: &Path, policy: &SecretPolicy) -> Option<CrashMarker> {
-    let mut markers = take_markers(&crash_dir(data_root), "daemon.panicked");
+    let mut markers = take_markers(&crash_dir(data_root), "daemon.panicked", policy);
     markers.pop().map(|marker| redact_marker(marker, policy))
 }
 
 /// Read, redact and consume plugin panic markers for the status snapshot.
 pub(crate) fn take_plugin_crashes(data_root: &Path, policy: &SecretPolicy) -> Vec<CrashMarker> {
-    take_markers(&crash_dir(data_root), "plugin.panicked")
+    take_markers(&crash_dir(data_root), "plugin.panicked", policy)
         .into_iter()
         .map(|marker| redact_marker(marker, policy))
         .collect()

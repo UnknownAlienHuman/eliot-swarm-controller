@@ -1284,7 +1284,7 @@ async fn run_global_rules_inner(
             }
         }
     }
-    'worker: loop {
+    loop {
         if *shutdown.borrow() {
             join_cleanup_task(cleanup_task).await;
             return Ok(RuleWorkerExit::Shutdown);
@@ -1295,15 +1295,17 @@ async fn run_global_rules_inner(
                 .await?;
             recover_rule_children = false;
         }
-        let firing_open = router.rule_firings_open();
-        if firing_open {
+        let firing_open = 'firings: {
+            if !router.rule_firings_open() {
+                break 'firings false;
+            }
             let high_water = router.rule_high_water().await?;
             if !reconcile_event_rules(&router, &mut rules, high_water, now_ms(), max_event_backlog)
                 .await?
             {
-                // Admission can reopen after update quiescence. Recheck the
-                // gate without discarding this worker's retained state.
-                continue;
+                // A fence can close during reconciliation. Wait for the next
+                // wake without arming timers that can't currently fire.
+                break 'firings false;
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
@@ -1316,7 +1318,7 @@ async fn run_global_rules_inner(
                     )
                     .await?
                 {
-                    continue 'worker;
+                    break 'firings false;
                 }
             }
 
@@ -1330,7 +1332,8 @@ async fn run_global_rules_inner(
             )
             .await?
             {
-                continue;
+                arbitrate_launches = arbitrate_now;
+                break 'firings false;
             }
             for namespace in &mut project_rules {
                 if namespace.registration_current
@@ -1342,10 +1345,11 @@ async fn run_global_rules_inner(
                     )
                     .await?
                 {
-                    continue 'worker;
+                    break 'firings false;
                 }
             }
-        }
+            true
+        };
 
         let now = now_ms();
         let timer_wait = if firing_open {
