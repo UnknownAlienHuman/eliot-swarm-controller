@@ -533,12 +533,8 @@ impl Router {
                 self.log_work_truth_error("daemon.checkpoint_recovery_failed", &error);
                 continue;
             }
-            let events = self.inner.store.lock().await.record_git_checkpoint(
-                &agent,
-                generation,
-                &input,
-                now_ms(),
-            )?;
+            let mut store = self.inner.store.lock().await;
+            let events = store.record_git_checkpoint(&agent, generation, &input, now_ms())?;
             self.publish_locked(&events);
         }
         Ok(())

@@ -4639,9 +4639,8 @@ fn repo_git_write_blocked_tx(
     common_dir: &str,
 ) -> Result<bool> {
     let current_rowid: i64 = if command_id.is_empty() {
-        // An event-driven writer may wait for in-flight Git commands but
-        // cannot make a queued command wait for something it cannot see.
-        0
+        // An event-driven writer starts behind already-admitted Git commands.
+        i64::MAX
     } else {
         tx.query_row(
             "SELECT rowid FROM commands WHERE id = ?1",
