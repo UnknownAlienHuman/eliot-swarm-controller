@@ -138,7 +138,7 @@ impl Router {
                         "command.submit"
                             if matches!(
                                 action.args["verb"].as_str(),
-                                Some("approve" | "deny" | "answer" | "resume")
+                                Some("approve" | "deny" | "answer" | "resume" | "stop")
                             ) =>
                         {
                             let result = self.submit_bound(&action.args, principal, context).await;

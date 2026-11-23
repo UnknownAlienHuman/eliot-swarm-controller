@@ -777,6 +777,8 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
             println!("  {}", item.reason);
             if let Some(action) = &item.recommended {
                 println!("  Recommended: {} {}", action.method, action.args);
+            } else if item.kind == OwnerInboxKind::Stuck {
+                println!("  No safe recommended action.");
             }
             for action in &item.choices {
                 if item.recommended.as_ref() == Some(action) {

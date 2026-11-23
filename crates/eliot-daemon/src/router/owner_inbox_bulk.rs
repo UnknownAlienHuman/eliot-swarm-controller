@@ -84,6 +84,15 @@ impl Router {
                                     uncertain: false,
                                 });
                             }
+                            Some(CommandState::Cancelled) => {
+                                result.failed.push(OwnerBulkDecisionFailed {
+                                    item,
+                                    mutation_id,
+                                    code: "command_cancelled".to_owned(),
+                                    message: "recommended command was cancelled".to_owned(),
+                                    uncertain: false,
+                                });
+                            }
                             Some(CommandState::Unknown) => {
                                 result.failed.push(OwnerBulkDecisionFailed {
                                     item,

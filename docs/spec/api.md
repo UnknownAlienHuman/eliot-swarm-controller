@@ -805,8 +805,9 @@ The view calls use the Core view DTOs linked above. `daemon.status` is owner-onl
 and accepts an empty object. Its bounded blocker/command lists retain truncation flags;
 unknown commands remain unknown. Agent list observations appear only when requested.
 `owner_inbox` counts visible items by kind. `liveness` counts the current
-Moving, Asked, Stuck, and Long classifications and groups Stuck and Long
-objects by reason.
+Moving, Asked, Parked, Stuck, and Long classifications and groups Parked,
+Stuck, and Long objects by reason. See the [monitoring spec](monitoring.md#liveness)
+for the evidence used to classify a wait.
 Absent source cursors and sequence/acknowledgement values remain null.
 When a previous daemon panic marker was consumed once at startup or plugin panic markers exist, `daemon.status` exposes `previous_crash` and `plugin_crashes`, and human `swarm status` renders one summary line for each.
 When explicit Claude profile cmd paths no longer exist, status and doctor return
