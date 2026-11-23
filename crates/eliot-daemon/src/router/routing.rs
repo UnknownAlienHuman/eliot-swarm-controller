@@ -499,7 +499,7 @@ impl Router {
                 .lock()
                 .await
                 .worktree_branch_base(workspace)?
-                .is_some_and(|(branch, _)| branch.contains('/')),
+                .is_some(),
             None => false,
         };
         let mut preflight = RoutePreflight {
