@@ -379,7 +379,7 @@ impl Store {
                 "SELECT id FROM commands INDEXED BY commands_target
                  WHERE target = ?1 AND verb = 'send'
                    AND state IN ('dispatched','applied','unknown')
-                   AND link_kind IS NOT 'handoff'
+                   AND (link_kind IS NOT 'handoff' OR ordinal > 0)
                    AND principal NOT LIKE 'swarm_note:%'
                    AND json_type(args, '$.text') = 'text'
                  ORDER BY created_at, rowid LIMIT 1",
