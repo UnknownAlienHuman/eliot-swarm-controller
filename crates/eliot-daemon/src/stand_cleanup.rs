@@ -10,7 +10,7 @@ use crate::platform::script_file::directory_identity;
 use crate::platform::{OwnedChild, is_reparse_point, worktree_guard::WorktreeWriteGuard};
 use crate::workspace_git::{
     WorkspaceGit,
-    containment::{self, CleanupFetches, ContainmentScope, branch_rev_parse},
+    containment::{CleanupFetches, branch_rev_parse},
 };
 use eliot_core::api::{CleanupGitBinding, MAX_ARTIFACT_TTL_MS};
 use eliot_core::{
@@ -1835,15 +1835,12 @@ pub(crate) async fn plan_external_git(
                 "stand branch is checked out in another worktree",
             ));
         }
-        Box::pin(containment::classify_branch(
-            transport_data_root,
+        crate::router::Router::pin_local_branch_tip(
             &rec.preparation.repo_path,
             &common,
             &rec.preparation.requested_branch,
-            ContainmentScope::BranchDeletion,
-            fetches.as_deref_mut(),
             deadline,
-        ))
+        )
         .await?;
     }
     Ok(())
@@ -2116,18 +2113,15 @@ pub async fn cleanup_stand_external_git(
             });
             continue;
         }
-        let classification = match Box::pin(containment::classify_branch(
-            transport_data_root,
+        let tip = match crate::router::Router::pin_local_branch_tip(
             &rec.preparation.repo_path,
             &common,
             &rec.preparation.requested_branch,
-            ContainmentScope::BranchDeletion,
-            Some(&mut fetches),
             deadline,
-        ))
+        )
         .await
         {
-            Ok(classification) => classification,
+            Ok(tip) => tip,
             Err(error) => {
                 report.branches.push(StandBranchOutcome {
                     repo_common_dir: eliot_core::display_path(&rec.preparation.repo_common_dir),
@@ -2146,14 +2140,9 @@ pub async fn cleanup_stand_external_git(
             worktree: rec.preparation.worktree_path.clone(),
             admin: String::new(),
             admin_identity: String::new(),
-            planned_tip: Some(classification.tip.clone()),
+            planned_tip: Some(tip.clone()),
         };
-        match Box::pin(crate::router::Router::delete_local_branch(
-            &binding,
-            &classification.tip,
-        ))
-        .await
-        {
+        match Box::pin(crate::router::Router::delete_local_branch(&binding, &tip)).await {
             Ok(()) => {
                 registration.settled_external_branches.push(branch_key);
                 write_stand_registration(registry, registry_file, registration)?;
