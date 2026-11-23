@@ -1211,8 +1211,8 @@ refused with the remedy: run `swarm interrupt <agent>`, then retry.
 
 A Codex `workspace-write` Agent in a managed worktree gets its worktree admin directory
 and the repository's common `objects` directory as writable roots. Generated branches
-use `<project>/<aN>/work`; the daemon adds that branch's ref and reflog parent only after
-Git's full ref inventory and the on-disk directories show no sibling refs or logs. Store
+use `<project>/<aN>/work`; Git's full ref inventory and the on-disk directories verify
+whether its ref and reflog parents are exclusive. Store
 admission prevents another managed worktree from sharing the `<project>/<aN>` parent,
 and a successor inherits the same roots from its managed branch despite having a different
 Agent ID.

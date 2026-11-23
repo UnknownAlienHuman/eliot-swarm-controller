@@ -230,8 +230,8 @@ the cancel and readback into a removal fact. The shared settlement returns
 `commit_roots` lists the Git directories the daemon computed for a sandboxed Agent on a
 managed worktree. The adapter maps them to native writable roots and verifies them in the
 readback. Roots include the worktree's admin directory and the repository's common
-`objects` directory. Generated `<project>/<aN>/work` branches receive ref and reflog
-parents only when the branch parent is exclusive; Store admission prevents another
+`objects` directory. Generated `<project>/<aN>/work` branches use their own ref and reflog
+parents by default. Store admission prevents another
 managed worktree from sharing it, and successors inherit the roots from the retained
 branch even with a different Agent ID.
 
