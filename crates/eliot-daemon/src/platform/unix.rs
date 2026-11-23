@@ -1306,6 +1306,10 @@ pub(crate) fn process_start_unix_ms(start_ticks: u64) -> Option<i64> {
         .parse()
         .ok()?;
     // SAFETY: sysconf only reads a process-independent numeric limit.
+    #[allow(
+        clippy::useless_conversion,
+        reason = "c_long is i64 on 64-bit Unix and narrower on other targets"
+    )]
     let ticks_per_second = i64::try_from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) })
         .ok()
         .filter(|n| *n > 0)?;

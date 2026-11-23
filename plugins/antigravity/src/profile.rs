@@ -833,7 +833,10 @@ pub(crate) fn reader_environment(snapshot: &Value) -> Result<TargetEnvironment> 
             }
         }
     }
-    #[cfg_attr(not(windows), allow(unused_mut))]
+    #[cfg_attr(
+        not(windows),
+        allow(unused_mut, reason = "only Windows prepends System32 to PATH")
+    )]
     let mut environment = target_environment(
         Some(&Value::Object(object)),
         snapshot.get("pass_env"),
