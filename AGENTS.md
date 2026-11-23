@@ -38,10 +38,10 @@ runtime or tooling. Select the next unchecked increment in the roadmap.
 
 ## Keep the implementation small
 
-- [Work truth lives in Git](docs/architecture.md#work-truth-lives-in-git), not in any
-  harness. Commit progress on your branch at checkpoints; a session is disposable. Any
-  model takes work over from the branch. Handoffs are built from Git and Store facts,
-  never from a vendor transcript.
+- [Work truth lives in Git and the file system](docs/architecture.md#work-truth-lives-in-git-and-the-file-system),
+  not in any harness. Commit progress on your branch at checkpoints; a session is
+  disposable. Any model takes work over from the worktree. Handoffs are built from Git,
+  file-system and Store facts, never from a vendor transcript.
 - Core types/reducer contain no I/O. Store owns SQLite; plugins own vendor protocols.
   Automation and coordination call the router, never another harness executor.
 - Use one serializable DTO per implemented wire message. Validate syntax at its owning
