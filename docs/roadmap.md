@@ -715,11 +715,14 @@ of the explicitly selected release scope.
       header hides it to a rail (show sidebar, New task, the Monitor with the
       fleet's dot, Settings) for the session; Settings keeps its navigation.
       Navigation works as in Codex (owner review 2026-11-19): the app title
-      goes home (the new-task view); a project's name opens the project (a
-      new task there, its tasks unfolded) and its chevron folds it; Back and
+      goes home (the new-task view); a project's name opens its page (its
+      tasks by state as the daemon reads them, branches and worktrees, check,
+      automations and New task) and its chevron folds it; Back and
       Forward (the header's arrows, Alt+←/→, the keyboard's Back and Forward
       keys and the mouse's side buttons) walk the places visited: a
-      project's new task, a conversation, a Settings page. WinUI 3 takes
+      project's new task, a conversation, a project page, a Settings page.
+      A conversation reopens by Agent id through the daemon, whatever the
+      sidebar has loaded, and only a deleted Agent leaves the history. WinUI 3 takes
       mouse input outside the thread's message queue, so the side buttons
       come from a low-level mouse hook that only reads them over the
       desktop's own foreground window. Running tasks stay on top, then newest first;

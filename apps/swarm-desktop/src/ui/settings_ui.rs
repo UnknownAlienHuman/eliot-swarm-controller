@@ -519,7 +519,7 @@ pub(super) struct SettingsState {
     /// sections that differ from them, and only those are sent.
     all_from: BTreeMap<Section, Value>,
     new_role: String,
-    project_open: Option<String>,
+    pub(super) project_open: Option<String>,
     /// The open project's policy editor.
     pub(super) policy: Option<PolicyDraft>,
     /// Projects checked for Remove selected (registration IDs).
@@ -544,6 +544,11 @@ impl SettingsState {
             .get(&section)
             .cloned()
             .unwrap_or_else(|| json!({}))
+    }
+
+    /// One project's saved launch policy, for its project page.
+    pub(super) fn policy_of(&self, id: &str) -> model::PolicyFields {
+        model::policy_fields(&self.base(Section::Projects), id)
     }
 
     fn busy(&self) -> bool {

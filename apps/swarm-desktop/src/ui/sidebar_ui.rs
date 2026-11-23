@@ -67,8 +67,10 @@ pub(super) struct PlaceEntry {
     pub(super) name: String,
     /// A linked worktree's subproject, as the owner renamed it.
     pub(super) subproject: Option<String>,
-    /// Its name starts a new task in its checkout.
+    /// Its name opens the project page.
     pub(super) opens: bool,
+    /// Its project page is the one shown.
+    pub(super) selected: bool,
     /// A missing folder's registration, which Remove removes.
     pub(super) registered: Option<String>,
     pub(super) tasks: Vec<TaskEntry>,
@@ -535,11 +537,11 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
     if section.missing {
         label.push_str(", folder missing");
     }
-    // The name opens the project (Codex: a new task in that project, its
-    // tasks in view); the few places with no one checkout fold.
+    // The name opens the project page, its tasks in view; the few places
+    // with no one checkout fold.
     let toggle = Message::Shell(ShellMsg::ProjectToggled(section.key.clone()));
     let opens = place.opens;
-    let row = m3::row(palette, false)
+    let row = m3::row(palette, place.selected)
         .automation_name(if opens {
             format!("Open {label}")
         } else {

@@ -19,11 +19,13 @@ use crate::theme::winui::Palette;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Main {
     Conversation,
+    /// A project's page: its tasks, worktrees, check and automations.
+    Project,
     Settings,
 }
 
 /// A place Back and Forward return to (Codex's history): the new-task
-/// view in a project, a conversation, a Settings page.
+/// view in a project, a conversation, a project page, a Settings page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Location {
     /// The new-task view: its project's checkout, or a chat with no project.
@@ -32,7 +34,17 @@ pub(super) enum Location {
         chat: bool,
     },
     Agent(String),
+    /// A project page, by its sidebar key.
+    Project(String),
     Settings(settings_ui::Page),
+}
+
+/// A step to an Agent, waiting for its read: the step is taken only when
+/// the daemon has answered and the owner is still where they pressed it.
+#[derive(Clone, Debug)]
+pub(super) struct PlaceRead {
+    epoch: u64,
+    from: Option<Location>,
 }
 
 /// The optional right panel.
@@ -111,9 +123,12 @@ pub(super) enum ShellMsg {
     AgentOpened(UiAgent),
     /// A project's new-task button: a new task in this checkout.
     ProjectPicked(String),
-    /// A project's name: open the project (a new task in its checkout,
-    /// its tasks unfolded). Carries the checkout and the section key.
+    /// A project's name: open its page, its tasks unfolded in the sidebar.
+    /// Carries the checkout and the section key.
     ProjectOpened(String, String),
+    /// Back or Forward's read of one Agent by id: the step's epoch, its
+    /// direction, the Agent and what the daemon said.
+    PlaceRead(u64, bool, String, Box<MutationResult<UiAgent>>),
     /// A project's chevron: collapse or expand the project (its section key).
     ProjectToggled(String),
     /// A project's "Show N older" row: unfold or fold its older tasks.
@@ -307,6 +322,10 @@ pub(super) struct ShellState {
     pub(super) sidebar_collapsed: bool,
     /// The places visited, for Back and Forward.
     pub(super) history: crate::history::History<Location>,
+    /// The Back or Forward step waiting for its Agent's read.
+    pub(super) place_read: Option<PlaceRead>,
+    /// Tags those reads: a reply for an older step is dropped.
+    pub(super) place_epoch: u64,
 }
 
 /// The sidebar search: what the box shows, what was typed and the
@@ -697,12 +716,51 @@ impl DesktopApp {
                 }
             }
             ShellMsg::ProjectOpened(checkout, key) => {
-                if self.can_launch_here(&checkout) {
+                if self.nav.collapsed.remove(&key) {
+                    self.collapsed_projects_changed(context);
+                }
+                // A checkout whose group the daemon has not returned yet
+                // has no page to show: it opens a new task there.
+                if !self.open_project(&key, context) && self.can_launch_here(&checkout) {
                     self.pick_project(&checkout);
                     self.new_task(context);
                 }
-                if self.nav.collapsed.remove(&key) {
-                    self.collapsed_projects_changed(context);
+            }
+            ShellMsg::PlaceRead(epoch, forward, id, read) => {
+                // Dropped when a newer step started or the owner went
+                // somewhere else while the daemon answered.
+                let current = self.location();
+                let Some(step) = self.nav.place_read.take_if(|step| step.epoch == epoch) else {
+                    return;
+                };
+                let place = Location::Agent(id);
+                if step.from != current || self.nav.history.peek(forward) != Some(&place) {
+                    return;
+                }
+                match *read {
+                    Ok(agent) => {
+                        let _ = if forward {
+                            self.nav.history.forward()
+                        } else {
+                            self.nav.history.back()
+                        };
+                        match self.nav.agents.iter_mut().find(|row| row.id == agent.id) {
+                            Some(row) => {
+                                row.generation = agent.generation;
+                                row.state = agent.state;
+                            }
+                            None => self.nav.agents.push(agent.clone()),
+                        }
+                        self.shell_update(ShellMsg::AgentOpened(agent), context);
+                    }
+                    // Only a deleted Agent leaves the history.
+                    Err(error) if error.code == "not_found" => {
+                        self.nav.history.forget(&place);
+                        self.step(forward, context);
+                    }
+                    Err(error) => {
+                        self.alert(format!("Task not opened: {}", error.user_message()));
+                    }
                 }
             }
             ShellMsg::ExpandToggled(id, expand) => {
@@ -1033,6 +1091,9 @@ impl DesktopApp {
                     self.watch_list(context);
                     return;
                 }
+                if self.main == Main::Project {
+                    self.read_project(context);
+                }
                 self.nav.batch = Some(Vec::new());
                 if self.preferences_loaded && !self.nav.agents_loading {
                     self.refresh_head(context);
@@ -1156,6 +1217,7 @@ impl DesktopApp {
         }
         Some(match self.main {
             Main::Settings => Location::Settings(self.settings_page),
+            Main::Project => Location::Project(self.project.key.clone()),
             Main::Conversation => match self.selected_agent_id() {
                 Some(agent) => Location::Agent(agent),
                 // A folder being typed is no place yet.
@@ -1180,27 +1242,52 @@ impl DesktopApp {
         }
     }
 
-    /// One step back (or forward) through the places visited. A task that
-    /// is gone from the lists is skipped.
+    /// One step back (or forward) through the places visited. A task is
+    /// read by id from the daemon first, whatever the sidebar has loaded
+    /// ([`ShellMsg::PlaceRead`] takes the step); a removed project is
+    /// skipped.
     fn step(&mut self, forward: bool, context: &ComponentContext<Self>) {
-        loop {
-            let place = if forward {
-                self.nav.history.forward()
-            } else {
-                self.nav.history.back()
-            };
-            let Some(place) = place else {
-                return;
-            };
-            if self.go_to(&place, context) {
-                return;
+        while let Some(place) = self.nav.history.peek(forward).cloned() {
+            match &place {
+                Location::Agent(id) => {
+                    self.read_place(id.clone(), forward, context);
+                    return;
+                }
+                Location::Project(key) if !self.project_exists(key) => {
+                    self.nav.history.forget(&place);
+                }
+                _ => {
+                    let _ = if forward {
+                        self.nav.history.forward()
+                    } else {
+                        self.nav.history.back()
+                    };
+                    self.go_to(&place, context);
+                    return;
+                }
             }
-            self.nav.history.forget(&place);
         }
     }
 
-    /// Show `place`; false when it no longer exists.
-    fn go_to(&mut self, place: &Location, context: &ComponentContext<Self>) -> bool {
+    /// Read the Agent of a Back or Forward step, by id.
+    fn read_place(&mut self, id: String, forward: bool, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.nav.place_epoch += 1;
+        let epoch = self.nav.place_epoch;
+        self.nav.place_read = Some(PlaceRead {
+            epoch,
+            from: self.location(),
+        });
+        let _task = context.spawn_background(move |_| {
+            let read = read_agent_row(&data_dir, &id);
+            Message::Shell(ShellMsg::PlaceRead(epoch, forward, id, Box::new(read)))
+        });
+    }
+
+    /// Show a place that needs no read.
+    fn go_to(&mut self, place: &Location, context: &ComponentContext<Self>) {
         match place {
             Location::Home { checkout, chat } => {
                 self.new_task(context);
@@ -1212,19 +1299,12 @@ impl DesktopApp {
                 } else if self.can_launch_here(checkout) {
                     self.pick_project(checkout);
                 }
-                true
             }
-            Location::Agent(id) => match self.find_agent(id).cloned() {
-                Some(agent) => {
-                    self.shell_update(ShellMsg::AgentOpened(agent), context);
-                    true
-                }
-                None => false,
-            },
-            Location::Settings(page) => {
-                self.open_settings(Some(*page), context);
-                true
+            Location::Agent(_) => {}
+            Location::Project(key) => {
+                self.open_project(key, context);
             }
+            Location::Settings(page) => self.open_settings(Some(*page), context),
         }
     }
 
@@ -1690,7 +1770,7 @@ impl DesktopApp {
     /// The right panel belongs to the conversation: Settings shows two
     /// columns (its navigation and the page), as in the Codex app.
     fn panel_shown(&self) -> bool {
-        self.panel != Panel::Closed && self.main == Main::Conversation && !self.link_view_shown()
+        self.panel != Panel::Closed && self.main != Main::Settings && !self.link_view_shown()
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -1922,7 +2002,7 @@ impl DesktopApp {
     /// merge them into the loaded history without dropping appended older
     /// pages: a launch or a state change while the desktop is open arrives
     /// on the next poll, even after Show more.
-    fn refresh_head(&mut self, context: &ComponentContext<Self>) {
+    pub(super) fn refresh_head(&mut self, context: &ComponentContext<Self>) {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
@@ -2032,12 +2112,12 @@ impl DesktopApp {
         m3::set_palette(palette);
 
         let main: View = match self.main {
-            Main::Conversation if self.link_view_shown() => {
+            Main::Conversation | Main::Project if self.link_view_shown() => {
                 self.startup_error_view(context, palette)
             }
-            // Settings is drawn in the conversation's place, which keeps
-            // its transcript (see `chat_view`).
-            Main::Conversation | Main::Settings => self.chat_view(context, palette),
+            // Settings and a project page are drawn in the conversation's
+            // place, which keeps its transcript (see `chat_view`).
+            Main::Conversation | Main::Project | Main::Settings => self.chat_view(context, palette),
         };
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
@@ -2208,6 +2288,7 @@ impl DesktopApp {
                     .map(|row| self.task_entry(row, now))
                     .collect();
                 PlaceEntry {
+                    selected: self.main == Main::Project && self.project.key == section.key,
                     section,
                     name,
                     subproject,

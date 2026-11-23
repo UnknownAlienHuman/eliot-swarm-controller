@@ -528,18 +528,7 @@ impl DesktopApp {
                 Err(error) => self.alert(format!("Copy failed: {error}")),
             },
             (Action::Stop, Target::Agent(agent)) => {
-                let bound = BoundAction::agent_control(&agent.id, agent.generation);
-                let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
-                self.submit_lifecycle("Stop", key, context, move |data_dir, id| {
-                    client::block_on(client::submit_stop(
-                        data_dir,
-                        id,
-                        &bound.agent,
-                        bound.generation,
-                        false,
-                    ))
-                    .map(|reply| submit_note(&reply))
-                });
+                self.stop_agent(&agent.id, agent.generation, context);
             }
             (Action::Archive(archived), Target::Agent(agent)) => {
                 self.submit_archive(agent.clone(), archived, false, context);

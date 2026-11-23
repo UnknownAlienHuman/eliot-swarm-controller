@@ -67,6 +67,7 @@ mod monitor_ui;
 mod move_ui;
 mod picker_ui;
 mod profiles_ui;
+mod project_ui;
 mod reveal;
 mod scripts_ui;
 mod settings_ui;
@@ -83,6 +84,7 @@ use menu_ui::MenuMsg;
 use monitor_ui::MonitorMsg;
 use move_ui::MoveMsg;
 use profiles_ui::ProfilesMsg;
+use project_ui::ProjectMsg;
 use scripts_ui::ScriptsMsg;
 use settings_ui::{Page, SettingsMsg};
 use shell_ui::{Main, Panel, ShellMsg};
@@ -170,6 +172,8 @@ struct UiDetail {
     /// The routing decision recorded at admission (None: an explicit
     /// profile or harness).
     routing: Option<eliot_core::RoutingDecision>,
+    /// The latest Owner stop or interrupt the daemon retained as refused.
+    control_failure: Option<eliot_core::api::AgentControlFailure>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -246,6 +250,7 @@ enum Message {
     Monitor(MonitorMsg),
     Inbox(inbox_ui::InboxMsg),
     Profiles(ProfilesMsg),
+    Project(ProjectMsg),
     Automation(AutomationMsg),
     Scripts(ScriptsMsg),
     Handoff(handoff_ui::HandoffMsg),
@@ -380,6 +385,8 @@ struct DesktopApp {
     /// The Owner inbox: its items and the navigation's counts.
     inbox: inbox_ui::InboxState,
     automation: automation_ui::AutomationState,
+    /// The open project page and its reads.
+    project: project_ui::ProjectState,
     /// The sidebar's right-click menu, rename and confirmation.
     menu: menu_ui::MenuState,
     /// The open bulk action (remove projects, archive or delete tasks).
@@ -651,6 +658,22 @@ fn load_agents_blocking(
     })
 }
 
+/// One Agent by id, whatever page it is on: `agent.get` decides whether it
+/// exists; a word search on its id supplies its listed title when it can.
+fn read_agent_row(data_dir: &Path, id: &str) -> MutationResult<UiAgent> {
+    let reply = client::block_on(client::get_agent(data_dir, id))?;
+    let request = AgentListRequest {
+        limit: AGENT_PAGE,
+        order: AgentListOrder::Recent,
+        query: Some(id.to_owned()),
+        ..Default::default()
+    };
+    let listed = load_agents_blocking(data_dir, &request, Some("include"))
+        .ok()
+        .and_then(|page| page.rows.into_iter().find(|row| row.id == id));
+    Ok(UiAgent::from_read(&reply.agent, listed))
+}
+
 fn detail_from(reply: &AgentGetResponse) -> UiDetail {
     let pending = reply
         .agent
@@ -685,6 +708,7 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         workspace: reply.agent.workspace.clone(),
         project_instructions: crate::monitor_view::project_instruction_lines(reply),
         routing: reply.agent.profile_choice.clone(),
+        control_failure: reply.last_control_failure.clone(),
     }
 }
 
@@ -873,6 +897,8 @@ impl Component for DesktopApp {
                 shortcuts: None,
                 sidebar_collapsed: false,
                 history: Default::default(),
+                place_read: None,
+                place_epoch: 0,
                 batch: None,
             },
             launch: launch_ui::LaunchState {
@@ -907,11 +933,13 @@ impl Component for DesktopApp {
                 pending_retry: HashMap::new(),
                 answers: HashMap::new(),
                 confirm_force: None,
+                control_failures: HashSet::new(),
                 loss: None,
             },
             monitor: monitor_ui::MonitorState::default(),
             inbox: inbox_ui::InboxState::default(),
             automation: automation_ui::AutomationState::default(),
+            project: project_ui::ProjectState::default(),
             menu: menu_ui::MenuState::default(),
             bulk: None,
             bulk_seq: 0,
@@ -959,6 +987,7 @@ impl Component for DesktopApp {
             Message::Monitor(msg) => self.monitor_update(msg, context),
             Message::Inbox(msg) => self.inbox_update(msg, context),
             Message::Profiles(msg) => self.profiles_update(msg, context),
+            Message::Project(msg) => self.project_update(msg, context),
             Message::Settings(msg) => self.settings_update(msg, context),
             Message::Automation(msg) => self.automation_update(msg, context),
             Message::Scripts(msg) => self.scripts_update(msg, context),
