@@ -116,13 +116,24 @@ pub enum RowNote {
     Under(String),
 }
 
+/// How a Stop Agent button shows now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopButton {
+    /// It can be pressed.
+    Ready,
+    /// Another action is settling first.
+    Waiting,
+    /// This Agent's Stop was sent and has not settled.
+    Stopping,
+}
+
 /// What a row does: the row itself opens the conversation; a resumable
 /// one also offers Resume (its callback and whether it is enabled).
 pub struct RowActions {
     pub open: Callback<()>,
     pub resume: Option<(Callback<()>, bool)>,
     /// Stop for a live controlled row, idle included.
-    pub stop: Option<(Callback<()>, bool)>,
+    pub stop: Option<(Callback<()>, StopButton)>,
 }
 
 /// What one list row shows besides its Agent.
@@ -269,18 +280,23 @@ pub fn list_row(
                 .content(crate::m3::label("Resume")),
         ));
     }
-    if let Some((stop, enabled)) = actions.stop {
-        beside.push(KeyedView::new(
-            "stop",
+    if let Some((stop, state)) = actions.stop {
+        let view: View = if state == StopButton::Stopping {
+            crate::m3::text_button(palette)
+                .is_enabled(false)
+                .automation_name(format!("Stopping {}", look.title))
+                .content(crate::m3::label("Stopping…"))
+        } else {
             crate::m3::icon_button(palette)
-                .is_enabled(enabled)
+                .is_enabled(state == StopButton::Ready)
                 .automation_name(format!(
                     "Stop Agent {} (run {})",
                     look.title, row.generation
                 ))
                 .on_click(stop)
-                .content(crate::m3::icon(crate::m3::glyph::STOP)),
-        ));
+                .content(crate::m3::icon(crate::m3::glyph::STOP))
+        };
+        beside.push(KeyedView::new("stop", view));
     }
     if beside.is_empty() {
         return button;
@@ -754,8 +770,8 @@ pub struct RowEntry {
     pub note: Option<RowNote>,
     /// Resume for a resumable row: whether it is enabled.
     pub resume: Option<bool>,
-    /// Stop for a live controlled row: whether it is enabled.
-    pub stop: Option<bool>,
+    /// Stop for a live controlled row, as it shows now.
+    pub stop: Option<StopButton>,
     pub indent: f64,
 }
 
@@ -851,13 +867,13 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                     enabled,
                 )
             });
-            let stop = entry.stop.map(|enabled| {
+            let stop = entry.stop.map(|state| {
                 let (stop, id, generation) = (input.stop.clone(), id.clone(), entry.row.generation);
                 (
                     Callback::new(move |()| {
                         let _ = stop.call((id.clone(), generation));
                     }),
-                    enabled,
+                    state,
                 )
             });
             let open_id = id.clone();

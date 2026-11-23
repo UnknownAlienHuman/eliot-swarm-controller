@@ -45,6 +45,9 @@ pub(super) enum Location {
 pub(super) struct PlaceRead {
     epoch: u64,
     from: Option<Location>,
+    forward: bool,
+    /// Further presses of the same direction while this read runs.
+    more: u32,
 }
 
 /// The optional right panel.
@@ -752,11 +755,14 @@ impl DesktopApp {
                             None => self.nav.agents.push(agent.clone()),
                         }
                         self.shell_update(ShellMsg::AgentOpened(agent), context);
+                        if step.more > 0 {
+                            self.walk(forward, step.more - 1, context);
+                        }
                     }
                     // Only a deleted Agent leaves the history.
                     Err(error) if error.code == "not_found" => {
                         self.nav.history.forget(&place);
-                        self.step(forward, context);
+                        self.walk(forward, step.more, context);
                     }
                     Err(error) => {
                         self.alert(format!("Task not opened: {}", error.user_message()));
@@ -1247,10 +1253,25 @@ impl DesktopApp {
     /// ([`ShellMsg::PlaceRead`] takes the step); a removed project is
     /// skipped.
     fn step(&mut self, forward: bool, context: &ComponentContext<Self>) {
+        let here = self.location();
+        if let Some(read) = self
+            .nav
+            .place_read
+            .as_mut()
+            .filter(|read| read.forward == forward && read.from == here)
+        {
+            read.more += 1;
+            return;
+        }
+        self.walk(forward, 0, context);
+    }
+
+    /// Take one step and `more` after it, reading each task first.
+    fn walk(&mut self, forward: bool, mut more: u32, context: &ComponentContext<Self>) {
         while let Some(place) = self.nav.history.peek(forward).cloned() {
             match &place {
                 Location::Agent(id) => {
-                    self.read_place(id.clone(), forward, context);
+                    self.read_place(id.clone(), forward, more, context);
                     return;
                 }
                 Location::Project(key) if !self.project_exists(key) => {
@@ -1263,22 +1284,37 @@ impl DesktopApp {
                         self.nav.history.back()
                     };
                     self.go_to(&place, context);
-                    return;
+                    if more == 0 {
+                        return;
+                    }
+                    more -= 1;
                 }
             }
         }
     }
 
     /// Read the Agent of a Back or Forward step, by id.
-    fn read_place(&mut self, id: String, forward: bool, context: &ComponentContext<Self>) {
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
+    fn read_place(
+        &mut self,
+        id: String,
+        forward: bool,
+        more: u32,
+        context: &ComponentContext<Self>,
+    ) {
+        let data_dir = match self.data_dir.clone() {
+            Ok(data_dir) => data_dir,
+            Err(error) => {
+                self.alert(format!("Task not opened: {error}"));
+                return;
+            }
         };
         self.nav.place_epoch += 1;
         let epoch = self.nav.place_epoch;
         self.nav.place_read = Some(PlaceRead {
             epoch,
             from: self.location(),
+            forward,
+            more,
         });
         let _task = context.spawn_background(move |_| {
             let read = read_agent_row(&data_dir, &id);

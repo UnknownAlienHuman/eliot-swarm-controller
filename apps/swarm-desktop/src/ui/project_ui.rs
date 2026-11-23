@@ -112,7 +112,8 @@ impl DesktopApp {
                 }
             }
             ProjectMsg::More(group) => {
-                let after = self.project.lists[group as usize].next.clone();
+                let list = &self.project.lists[group as usize];
+                let after = list.next.clone().filter(|_| !list.reading);
                 if after.is_some() {
                     self.read_group(group, after, context);
                 }
@@ -158,7 +159,7 @@ impl DesktopApp {
                 key: key.to_owned(),
                 id,
                 checkout,
-                epoch: self.project.epoch,
+                epoch: self.project.epoch + 1,
                 lists: Default::default(),
             };
         }
@@ -176,11 +177,14 @@ impl DesktopApp {
         true
     }
 
-    /// Read every state group again (a refresh keeps the rows already paged).
+    /// Read the state groups again (a refresh keeps the rows already paged).
+    /// A group whose read is still running keeps it: on a busy daemon a read
+    /// slower than the poll still lands instead of being replaced.
     pub(super) fn read_project(&mut self, context: &ComponentContext<Self>) {
-        self.project.epoch += 1;
         for group in Group::ALL {
-            self.read_group(group, None, context);
+            if !self.project.lists[group as usize].reading {
+                self.read_group(group, None, context);
+            }
         }
     }
 
@@ -269,6 +273,11 @@ impl DesktopApp {
             .projects
             .iter()
             .find(|project| project.id == state.id);
+        // Counts come from the loaded rows: with rows left to page they are
+        // a lower bound, and the line says so.
+        let partial = groups
+            .iter()
+            .any(|group| group.more || group.reading || group.error.is_some());
         let mut worktrees: Vec<WorktreeLine> = registered
             .map(|project| project.git_checkouts.as_slice())
             .unwrap_or_default()
@@ -294,6 +303,7 @@ impl DesktopApp {
                     path: checkout.path.clone(),
                     main: checkout.main,
                     tasks,
+                    partial,
                 }
             })
             .collect();
@@ -363,6 +373,8 @@ struct WorktreeLine {
     path: String,
     main: bool,
     tasks: usize,
+    /// More tasks exist than are loaded: `tasks` is a lower bound.
+    partial: bool,
 }
 
 /// What the project page shows, read by the window.
@@ -527,12 +539,16 @@ fn worktrees_view(
         ),
     )];
     for line in worktrees {
-        let trailing = match (line.main, line.tasks) {
-            (true, 0) => "main checkout".to_owned(),
-            (true, tasks) => format!("main checkout · {tasks}"),
-            (false, 0) => String::new(),
-            (false, 1) => "1 task".to_owned(),
-            (false, tasks) => format!("{tasks} tasks"),
+        let count = match (line.tasks, line.partial) {
+            (0, _) => String::new(),
+            (tasks, true) => format!("{tasks}+ tasks"),
+            (1, false) => "1 task".to_owned(),
+            (tasks, false) => format!("{tasks} tasks"),
+        };
+        let trailing = match (line.main, count.is_empty()) {
+            (true, true) => "main checkout".to_owned(),
+            (true, false) => format!("main checkout · {count}"),
+            (false, _) => count,
         };
         rows.push(KeyedView::new(
             line.path.clone(),

@@ -934,6 +934,8 @@ impl Component for DesktopApp {
                 answers: HashMap::new(),
                 confirm_force: None,
                 control_failures: HashSet::new(),
+                stopping: None,
+                stopped: HashMap::new(),
                 loss: None,
             },
             monitor: monitor_ui::MonitorState::default(),

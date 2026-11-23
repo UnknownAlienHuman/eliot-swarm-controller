@@ -636,7 +636,9 @@ impl DesktopApp {
                 line,
                 note,
                 resume: row.resumable().then(|| !self.submitting()),
-                stop: (!row.native_child && !row.ended()).then(|| !self.submitting()),
+                stop: (!row.native_child && !row.ended())
+                    .then(|| self.stop_button(&row.id, row.generation))
+                    .flatten(),
                 indent,
             },
         )));

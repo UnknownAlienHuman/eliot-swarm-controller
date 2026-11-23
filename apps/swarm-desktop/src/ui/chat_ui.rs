@@ -106,6 +106,26 @@ const MENU_DETACH: &str = "Detach";
 /// How long the desktop waits for a Stop's final state before saying so.
 const CONTROL_SETTLE_SECONDS: u64 = 10;
 
+/// The outcome reason of an interrupt the daemon replaced with a proven stop.
+const INTERRUPT_FELL_BACK: &str = "interrupt_unconfirmed_agent_stopped";
+
+/// A retained failure's `code: reason: message` in [`command_reason`]'s
+/// words: its message when it has one, else its last code in words.
+fn failure_reason(reason: &str) -> String {
+    let mut rest = reason.trim();
+    while let Some((head, tail)) = rest.split_once(": ") {
+        if head.contains(char::is_whitespace) {
+            break;
+        }
+        rest = tail;
+    }
+    if rest.contains(char::is_whitespace) {
+        rest.to_owned()
+    } else {
+        eliot_core::reason_words(rest)
+    }
+}
+
 /// Why a command did not apply, in the daemon's words.
 fn command_reason(outcome: Option<&serde_json::Value>) -> String {
     let field = |name: &str| {
@@ -387,6 +407,11 @@ pub(super) struct ChatState {
     pub(super) confirm_force: Option<(BoundAction, String)>,
     /// Refused Stop commands already told to the owner in this window.
     pub(super) control_failures: HashSet<String>,
+    /// The Agent and generation whose Stop was sent and has not settled.
+    pub(super) stopping: Option<(String, i64)>,
+    /// The last generation of each Agent whose Stop applied (its row can
+    /// lag behind until the next read).
+    pub(super) stopped: HashMap<String, i64>,
     /// The open lost Agent's loss in words, read once per generation from
     /// `diagnose` (`None` inside: nothing to say beyond Lost).
     pub(super) loss: Option<(String, i64, Option<String>)>,
@@ -976,15 +1001,11 @@ impl DesktopApp {
                 }
             }
             ChatMsg::ControlWatched(what, outcome) => {
-                let outcome = *outcome;
-                self.settle_mutation(
-                    outcome
-                        .as_ref()
-                        .err()
-                        .is_none_or(|error| !crate::state::uncertain(error)),
-                );
-                match outcome {
+                // The action stays in flight until its command settles, so a
+                // second click cannot send a second Stop.
+                match *outcome {
                     Ok(reply) if scripts::is_terminal(reply.state) => {
+                        self.finish_control(reply.state);
                         self.report_control(
                             &what,
                             &reply.command_id,
@@ -996,6 +1017,7 @@ impl DesktopApp {
                     Ok(reply) => {
                         self.set_status(format!("{what} sent; waiting for the Agent…"));
                         let Ok(data_dir) = self.data_dir.clone() else {
+                            self.finish_control(eliot_core::CommandState::Unknown);
                             return;
                         };
                         let _task = context.spawn_background(move |cancel| {
@@ -1009,15 +1031,22 @@ impl DesktopApp {
                             Message::Chat(ChatMsg::ControlSettled(what, Box::new(settled)))
                         });
                     }
-                    Err(error) if crate::state::uncertain(&error) => self.alert(format!(
-                        "{what}: not confirmed (trying again reuses its id): {}",
-                        error.user_message()
-                    )),
-                    Err(error) => self.alert(format!("{what} refused: {}", error.user_message())),
+                    Err(error) if crate::state::uncertain(&error) => {
+                        self.finish_control(eliot_core::CommandState::Unknown);
+                        self.alert(format!(
+                            "{what}: not confirmed (trying again reuses its id): {}",
+                            error.user_message()
+                        ));
+                    }
+                    Err(error) => {
+                        self.finish_control(eliot_core::CommandState::Rejected);
+                        self.alert(format!("{what} refused: {}", error.user_message()));
+                    }
                 }
             }
             ChatMsg::ControlSettled(what, settled) => match *settled {
                 Ok(command) => {
+                    self.finish_control(command.state);
                     self.report_control(
                         &what,
                         &command.id,
@@ -1026,7 +1055,12 @@ impl DesktopApp {
                         context,
                     );
                 }
-                Err(error) => self.alert(format!("{what}: {error}")),
+                // Not settled in time: the same click later reads this
+                // command back instead of sending another.
+                Err(error) => {
+                    self.finish_control(eliot_core::CommandState::Unknown);
+                    self.alert(format!("{what}: {error}"));
+                }
             },
             ChatMsg::AgentMenu(label) => {
                 // Bound now, to the Agent and generation the header shows.
@@ -1048,15 +1082,24 @@ impl DesktopApp {
                     return;
                 }
                 let key = format!("stop:{}:{}:true", bound.agent, bound.generation);
-                self.submit_watched(context, "Force stop", key, move |data_dir, mutation_id| {
-                    client::block_on(client::submit_stop(
-                        data_dir,
-                        mutation_id,
-                        &bound.agent,
-                        bound.generation,
-                        true,
-                    ))
-                });
+                let target = (bound.agent.clone(), bound.generation);
+                let sent = self.submit_watched(
+                    context,
+                    "Force stop",
+                    key,
+                    move |data_dir, mutation_id| {
+                        client::block_on(client::submit_stop(
+                            data_dir,
+                            mutation_id,
+                            &bound.agent,
+                            bound.generation,
+                            true,
+                        ))
+                    },
+                );
+                if sent {
+                    self.chat.stopping = Some(target);
+                }
             }
         }
     }
@@ -1071,7 +1114,7 @@ impl DesktopApp {
     ) {
         let bound = BoundAction::agent_control(agent, generation);
         let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
-        self.submit_watched(context, "Stop Agent", key, move |data_dir, mutation_id| {
+        let sent = self.submit_watched(context, "Stop Agent", key, move |data_dir, mutation_id| {
             client::block_on(client::submit_stop(
                 data_dir,
                 mutation_id,
@@ -1080,6 +1123,46 @@ impl DesktopApp {
                 false,
             ))
         });
+        if sent {
+            self.chat.stopping = Some((agent.to_owned(), generation));
+        }
+    }
+
+    /// How this Agent generation's Stop button shows; `None` once its Stop
+    /// applied, before the next read says so.
+    pub(super) fn stop_button(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Option<monitor_view::StopButton> {
+        use monitor_view::StopButton;
+        if self.chat.stopped.get(agent) == Some(&generation) {
+            return None;
+        }
+        let stopping = self
+            .chat
+            .stopping
+            .as_ref()
+            .is_some_and(|(id, run)| id == agent && *run == generation);
+        Some(if stopping {
+            StopButton::Stopping
+        } else if self.submitting() {
+            StopButton::Waiting
+        } else {
+            StopButton::Ready
+        })
+    }
+
+    /// A watched control reached its end, so the next action may start. An
+    /// unknown result keeps its mutation id: trying again reads it back.
+    fn finish_control(&mut self, state: eliot_core::CommandState) {
+        use eliot_core::CommandState;
+        self.settle_mutation(state != CommandState::Unknown);
+        if let Some((agent, generation)) = self.chat.stopping.take()
+            && state == CommandState::Applied
+        {
+            self.chat.stopped.insert(agent, generation);
+        }
     }
 
     /// A control whose refusal the owner must see: a command can be admitted
@@ -1091,13 +1174,13 @@ impl DesktopApp {
         what: &str,
         key: String,
         work: impl FnOnce(&Path, String) -> eliot_core::Result<CommandSubmitResponse> + Send + 'static,
-    ) {
+    ) -> bool {
         if self.submitting() {
             self.alert("Waiting for the last action to settle.");
-            return;
+            return false;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
-            return;
+            return false;
         };
         let mutation_id = self.ledger.id_for(&key);
         self.in_flight_key = Some(key);
@@ -1110,6 +1193,7 @@ impl DesktopApp {
                 Box::new(work(&data_dir, mutation_id)),
             ))
         });
+        true
     }
 
     /// A Stop the daemon retained as refused, told once while its Agent is
@@ -1132,7 +1216,10 @@ impl DesktopApp {
             } else {
                 "Stop"
             };
-            self.alert(format!("{what} refused: {}", failure.reason));
+            self.alert(format!(
+                "{what} refused: {}",
+                failure_reason(&failure.reason)
+            ));
         }
     }
 
@@ -1150,7 +1237,7 @@ impl DesktopApp {
         let fell_back = outcome
             .and_then(|outcome| outcome.get("reason"))
             .and_then(serde_json::Value::as_str)
-            == Some("interrupt_unconfirmed_agent_stopped");
+            == Some(INTERRUPT_FELL_BACK);
         match state {
             _ if fell_back => {
                 self.alert("The turn did not confirm that it stopped, so Swarm stopped the Agent.")

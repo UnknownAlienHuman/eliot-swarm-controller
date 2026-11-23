@@ -206,7 +206,7 @@ impl DesktopApp {
             pill.push_str(&format!(" · {note}"));
         }
         // Stop Agent stays in view while the Agent can still be stopped,
-        // idle included: enabled unless another action is settling.
+        // idle included; it reads Stopping… until its command settles.
         let stop = detail
             .filter(|detail| {
                 !detail.observe_only
@@ -217,7 +217,7 @@ impl DesktopApp {
                             | eliot_core::AgentState::Lost
                     )
             })
-            .map(|_| !self.submitting());
+            .and_then(|detail| self.stop_button(agent, detail.generation));
         let actions = if stop.is_some() { STOP_WIDTH } else { 0.0 };
         View::component::<Header>(HeaderInput {
             palette,
@@ -317,8 +317,8 @@ pub(super) struct HeaderInput {
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
-    /// Stop Agent while the Agent can be stopped: whether it is enabled.
-    stop: Option<bool>,
+    /// Stop Agent while the Agent can be stopped, as it shows now.
+    stop: Option<crate::monitor_view::StopButton>,
     /// The widest the title takes ([`title_width`]).
     title_width: f64,
     send: Callback<Message>,
@@ -387,11 +387,21 @@ impl Component for Header {
                 .content(m3::icon(m3::glyph::MORE)),
         };
         let stop: View = match input.stop {
-            Some(enabled) => m3::destructive(palette)
-                .is_enabled(enabled)
-                .automation_name("Stop Agent")
-                .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(MENU_STOP.to_owned()))))
-                .content(m3::label("Stop Agent")),
+            Some(state) => {
+                use crate::monitor_view::StopButton;
+                let label = if state == StopButton::Stopping {
+                    "Stopping…"
+                } else {
+                    "Stop Agent"
+                };
+                m3::destructive(palette)
+                    .is_enabled(state == StopButton::Ready)
+                    .automation_name(label)
+                    .on_click(
+                        context.message(Message::Chat(ChatMsg::AgentMenu(MENU_STOP.to_owned()))),
+                    )
+                    .content(m3::label(label))
+            }
             None => View::empty(),
         };
         // The design's header: a full-width 52-DIP bar on a hairline, the

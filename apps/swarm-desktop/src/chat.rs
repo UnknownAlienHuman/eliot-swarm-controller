@@ -136,6 +136,9 @@ pub fn preview(text: &str) -> String {
     format!("{prefix}\n… [display truncated; Copy message copies the retained text]")
 }
 
+/// The turn status the daemon records for a turn the Owner interrupted.
+const OWNER_INTERRUPTED_STATUS: &str = "interrupted_by_owner";
+
 /// Turn status as read back, never guessed from event order alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnStatus {
@@ -1200,7 +1203,7 @@ impl Conversation {
                 TurnState::Completed => TurnStatus::Completed(read.outcome),
                 TurnState::Unknown => TurnStatus::Unknown,
             };
-            turn.stopped_by_owner = read.status.as_deref() == Some("interrupted_by_owner");
+            turn.stopped_by_owner = read.status.as_deref() == Some(OWNER_INTERRUPTED_STATUS);
             turn.final_text = read.final_text.as_deref().map(bound_text);
             turn.failure_reason = read
                 .native_error_message
