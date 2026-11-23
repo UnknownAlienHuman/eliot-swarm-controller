@@ -882,9 +882,13 @@ upper bound: a round commits only while the Agent is idle, so its check lands af
 the turn and covers the turn's final files. A round already in flight also counts,
 because the driver runs on the newest unspent idle key when that round ends. Notes bind to the captured
 Agent and generation. Git snapshots supply scope evidence when Swarm can bind
-the observation to a running turn. An edit note lists only paths not already
-noted for its kind in that generation. Up to four edit notes can be admitted
-for a turn. Outside or unverifiable paths are recorded as a hash and basename.
+the observation to a running turn. A worktree note identifies the reported path
+when a bounded, redacted path is available, explains what worktree tracking
+covers, and asks the Agent to move the change into the worktree or explain why
+it belongs outside. Unavailable paths use the redacted basename and a hash.
+Swarm deduplicates worktree notes by captured Agent, generation, turn and path.
+Goal scope notes deduplicate each path across the generation. Up to four edit
+notes can be admitted for a turn.
 The note worker logs individual fact errors and advances its persisted cursor
 after processing each event. A task card summarizes the retained task brief and Goal in
 at most 600 bytes. Swarm sends it after native compaction, resume, switch or handoff,

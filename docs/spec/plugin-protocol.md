@@ -608,6 +608,18 @@ counters, OpenCode also commits their checked per-call context sum as
 Swarm turn. Its native identity binds thread, turn and item. The manual compact command
 still settles through the existing native lifecycle. The installed app-server favors
 the item lifecycle over the deprecated `thread/compacted` notification.
+OpenCode uses the durable `session.compaction.ended` fact for the exact native
+session. The adapter includes `turn_id` when a Swarm turn is active. An idle
+compaction leaves the task card for the next input through the shared note path.
+OpenCode 2.2.7 repeats the private durable usage record's figures on the
+public compaction terminal. The sequence check accounts for a single skipped
+record at that boundary when the terminal includes those figures.
+Antigravity reports completed system checkpoints from the exact owned native
+conversation transcript. The isolated root supplies the path for private
+profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
+callback for the live conversation. ACP prompt settlement triggers the bounded
+readback. The fact carries the native checkpoint index, and the task card waits
+for the next input. The transcript summary stays in the native store.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a
@@ -821,7 +833,8 @@ Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
 Only a context delivery emits a `hook.after_tool` receipt. A successful file write
 with an empty selection emits a `tool.file.edited` fact. The `edit_path` on both
 events carries a verified worktree-relative path or an outside-or-unverifiable
-SHA-256 and redacted basename. A native `compact_boundary` record yields
+SHA-256 and redacted basename, with a bounded redacted path when available.
+A native `compact_boundary` record yields
 `session.context.compacted` and includes `turn_id` only for a committed active turn.
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 moving pending inserts to the next input at turn end substitutes for the Stop hook.
