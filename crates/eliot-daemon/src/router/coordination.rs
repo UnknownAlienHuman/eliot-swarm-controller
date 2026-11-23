@@ -156,7 +156,7 @@ impl Router {
             self.signal_progress();
         }
         request.validate_response(&change.value)?;
-        if fresh {
+        if fresh && request.wake {
             self.wake_recipients(&change.value).await;
         }
         Ok(change.value)

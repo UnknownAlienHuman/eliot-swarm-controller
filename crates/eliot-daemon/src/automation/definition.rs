@@ -158,7 +158,7 @@ impl RuleDefinition {
         match self.trigger.event.as_deref() {
             Some("project.worktree.check.passed") => fields.worktree = true,
             Some("turn.completed") => {
-                fields.worktree = self.guards_launch_worktree();
+                fields.worktree = self.guards_launch_worktree() || self.includes_patch_digest();
                 completion_fields(&serde_json::to_value(self).ok()?, &mut fields);
             }
             _ => return None,
@@ -236,6 +236,14 @@ impl RuleDefinition {
                 if launch.require_worktree
         )
     }
+
+    pub(super) fn includes_patch_digest(&self) -> bool {
+        matches!(
+            self.actions.first(),
+            Some(ActionDefinition::Agent(AgentActionDefinition::Launch(launch)))
+                if launch.include_patch_digest
+        )
+    }
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
@@ -254,6 +262,8 @@ struct LaunchActionDefinition {
     no_policy: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     require_worktree: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    include_patch_digest: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<Value>,
 }
@@ -1888,6 +1898,28 @@ fn validate_rule(rule: &mut RuleDefinition) -> Result<(), Error> {
         ));
     }
     let action = &rule.actions[0];
+    if let ActionDefinition::Agent(AgentActionDefinition::Launch(launch)) = action
+        && launch.include_patch_digest
+    {
+        let Some(event) = rule.trigger.event.as_deref() else {
+            return Err(Error::invalid_field(
+                "include_patch_digest",
+                "event-triggered launch",
+            ));
+        };
+        if !matches!(event, "turn.completed" | "project.worktree.check.passed") {
+            return Err(Error::invalid_field(
+                "include_patch_digest",
+                "turn.completed or project.worktree.check.passed event",
+            ));
+        }
+        if !launch.require_worktree || launch.text.is_none() {
+            return Err(Error::invalid_field(
+                "include_patch_digest",
+                "launch with require_worktree and review text",
+            ));
+        }
+    }
     if let Some(event) = rule.trigger.event.clone() {
         if rule.trigger.has_timer_fields() {
             return Err(Error::new(
@@ -2534,8 +2566,15 @@ fn timer_action(rule: &RuleDefinition) -> Result<SubmitCommand, Error> {
             goal,
             no_policy,
             require_worktree,
+            include_patch_digest,
             text,
         }) => {
+            if *include_patch_digest {
+                return Err(Error::invalid_field(
+                    "include_patch_digest",
+                    "event-triggered launch",
+                ));
+            }
             if *require_worktree {
                 return Err(Error::invalid_field(
                     "require_worktree",

@@ -22,6 +22,7 @@ action = "launch"
 profile = "reviewer-profile"
 workspace = "C:/src/app"
 require_worktree = true
+include_patch_digest = true
 no_policy = "Read-only review of a separately checked author worktree."
 text = """
 Review the changes by Agent ${event.agent} in turn ${data.turn_id}.
@@ -29,6 +30,8 @@ Author worktree: ${subject.workspace}
 Base commit: ${data.worktree.base}
 Worktree fingerprint: ${data.worktree.fingerprint}
 Inspect the changes against that base, including nonignored untracked files.
+Use the attached bounded agent.patch_digest as an attention filter; inspect the
+captured worktree for the actual changes.
 Use the ordinary drive path on Windows if Git requires it.
 Keep the worktree and Git state unchanged.
 Give your assessment as your final reply, including actionable findings with

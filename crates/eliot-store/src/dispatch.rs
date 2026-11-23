@@ -485,7 +485,7 @@ fn dispatch_send_tx(
     agent_num: i64,
     command_generation: i64,
     now: i64,
-    context_items: Option<&mut Vec<core::ContextItem>>,
+    input: Option<&mut SendInput>,
     events: &mut Vec<Event>,
 ) -> Result<Option<Command>> {
     if command_generation != agent.generation {
@@ -539,10 +539,10 @@ fn dispatch_send_tx(
             .ok_or_else(|| Error::new("internal", "queued command disappeared"))?;
         return Ok(Some(queued.command));
     }
-    let claimed_items = if context_items.is_some() {
+    let claimed_input = if input.is_some() {
         context::claim_next_input_tx(tx, agent_num, agent, &command.command, now, events)?
     } else {
-        Vec::new()
+        SendInput::default()
     };
     // Freeze the revision this send runs under: the latest
     // retained revision at its own dispatch. A retry or
@@ -553,7 +553,10 @@ fn dispatch_send_tx(
         "UPDATE commands SET config_revision = ?1 WHERE id = ?2",
         params![revision, id],
     ));
-    let send_args = context::send_args(&command.command.args, &claimed_items)?;
+    let mut send_args = context::send_args(&command.command.args, &claimed_input.context_items)?;
+    if let Some(text) = &claimed_input.text_with_mail {
+        send_args["text"] = json!(text);
+    }
     check_rpc_frame(
         "agent.command",
         &json!({
@@ -574,8 +577,8 @@ fn dispatch_send_tx(
         id,
         json!({"command_id": id, "verb": "send"}),
     )?);
-    if let Some(output) = context_items {
-        *output = claimed_items;
+    if let Some(output) = input {
+        *output = claimed_input;
     }
     Ok(None)
 }
@@ -1205,7 +1208,7 @@ impl Store {
         id: &str,
         now: i64,
         native_store: Option<(&Agent, &NativeStoreBinding, Option<&Value>)>,
-        context_items: Option<&mut Vec<core::ContextItem>>,
+        input: Option<&mut SendInput>,
     ) -> Result<Change<Command>> {
         let tx = self
             .connection
@@ -1297,7 +1300,7 @@ impl Store {
                 agent_num,
                 command_generation,
                 now,
-                context_items,
+                input,
                 &mut events,
             )?,
             "stop" => {

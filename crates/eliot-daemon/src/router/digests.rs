@@ -282,6 +282,7 @@ impl Router {
                 return Ok(None);
             }
             let mail = MailSendRequest {
+                wake: true,
                 id: row.id.clone(),
                 to: vec![row.parent.clone()],
                 mode: eliot_core::api::MailMode::Queue,

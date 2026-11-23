@@ -892,16 +892,14 @@ manual pass adds no new retention semantics; the contract stays in
 [core](core.md#retention).
 
 `maintenance.purge_legacy_attention_advisories` is owner-only. An empty request
-is a read-only dry-run that returns the exact number of owner-sent messages whose
-thread matches `attention-*-advisory`, including both read and unread rows. To
+is a read-only dry-run that returns the exact number of deliveries matching the
+[legacy advisory provenance](core.md#retention), including both read and unread rows. To
 apply the purge, the owner supplies that number as `expected_message_count`; the
 Store rechecks the count and deletes the matching rows in one immediate
 transaction. A changed count returns a conflict without deleting anything, so
 the owner must run the dry-run again. The CLI command
 `swarm maintenance purge-legacy-attention-advisories` previews by default;
-`--apply --expected-count <COUNT>` explicitly applies the preview. The filter
-preserves regular mail, non-advisory attention escalations, and messages not
-sent by the owner. This operation does not change normal mail retention.
+`--apply --expected-count <COUNT>` explicitly applies the preview.
 
 `project.list` and `project.get` are owner-only readbacks of the owner-registered
 canonical checkout, repository common directory, explicit profile/action allowlists and

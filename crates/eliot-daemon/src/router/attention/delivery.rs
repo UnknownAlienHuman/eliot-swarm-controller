@@ -296,6 +296,7 @@ async fn route_notice(
 ) -> Result<()> {
     if let Some(recipient) = notice_recipient(router, candidate).await? {
         let request = MailSendRequest {
+            wake: true,
             id: mail_id.to_owned(),
             to: vec![recipient],
             mode: MailMode::Queue,

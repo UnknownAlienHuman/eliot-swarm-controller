@@ -395,7 +395,7 @@ pub(super) fn persist_effects(
         "turn.model_observed" | "tool.started" | "tool.completed"
     ) && let Some(turn_id) = native_event.data["turn_id"].as_str()
     {
-        settle_inline_mail(scope, turn_id, true)?;
+        confirm_inline_mail_tx(tx, agent_num, generation, turn_id, now)?;
     }
     Ok((command_events, provider_events))
 }
@@ -560,13 +560,14 @@ fn persist_turn_associated(
         OwnerRulesDeliveryStatus::Delivered,
     )?;
     handoff::refresh_parent_tx(tx, command_id, now)?;
-    // Native acceptance starts the wake-attempt cooldown. It does not
-    // establish that the model received the inline mail.
+    // Native acceptance starts the wake cooldown and acknowledges only
+    // the inline deliveries bound to this input.
     db!(tx.execute(
         "UPDATE mail_notices SET last_notice_at = ?1
          WHERE recipient = ?2 AND open_notice_command = ?3",
         params![now, agent_num, command_id],
     ));
+    ack_inline_mail_tx(tx, agent_num, generation, command_id, now)?;
     let mut command_events = vec![PendingCommandEvent {
         command_id: command_id.to_owned(),
         state: CommandState::Applied,
@@ -987,63 +988,81 @@ fn persist_message_completed(
         ));
     }
     if scope.native_event.data["model_output"].as_bool() != Some(false) {
-        settle_inline_mail(scope, turn_id, true)?;
+        confirm_inline_mail_tx(
+            scope.tx,
+            scope.agent_num,
+            scope.generation,
+            turn_id,
+            scope.now,
+        )?;
     }
     Ok(())
 }
 
-/// Settle the exact wake's inline rows in the same transaction as proof of
-/// model output or a definite terminal. Unknown outcomes retain the binding.
-fn settle_inline_mail(scope: EffectScope<'_, '_>, turn_id: &str, delivered: bool) -> Result<()> {
-    let EffectScope {
-        tx,
-        agent_num,
-        generation,
-        now,
-        ..
-    } = scope;
-    let command: Option<String> = tx
-        .query_row(
-            "SELECT c.id FROM mail_notices n
-             JOIN commands c ON c.id = n.open_notice_command
-             WHERE n.recipient = ?1 AND c.target = n.recipient AND c.generation = ?2
-               AND c.turn_id = ?3 AND c.verb = 'send' AND c.state = 'applied'
-               AND EXISTS (
-                   SELECT 1 FROM messages m WHERE m.recipient = n.recipient
-                     AND m.recipient_generation = c.generation
-                     AND m.presentation_command = c.id AND m.presented_at IS NULL
-               )",
-            params![agent_num, generation, turn_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(sql_error)?;
-    let Some(command) = command else {
+fn ack_inline_mail_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    command_id: &str,
+    now: i64,
+) -> Result<()> {
+    db!(tx.execute(
+        "UPDATE messages SET presented_at = ?1, read_at = ?1, inline_ack_pending = 1
+         WHERE recipient = ?2 AND recipient_generation = ?3
+           AND presentation_command = ?4 AND presented_at IS NULL AND read_at IS NULL",
+        params![now, agent_num, generation, command_id],
+    ));
+    Ok(())
+}
+
+fn confirm_inline_mail_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    turn: &str,
+    now: i64,
+) -> Result<()> {
+    let Some(command) = command_id_for_turn_tx(tx, agent, generation, turn)? else {
         return Ok(());
     };
-    if delivered {
-        db!(tx.execute(
-            "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
-             SELECT DISTINCT recipient, thread, ?1 FROM messages
-             WHERE recipient = ?2 AND recipient_generation = ?3
-               AND presentation_command = ?4 AND presented_at IS NULL
-               AND thread LIKE 'attention-%' AND thread NOT LIKE 'attention-%-advisory'",
-            params![now, agent_num, generation, command],
-        ));
-        db!(tx.execute(
-            "UPDATE messages SET presented_at = ?1, read_at = COALESCE(read_at, ?1)
-             WHERE recipient = ?2 AND recipient_generation = ?3
-               AND presentation_command = ?4 AND presented_at IS NULL",
-            params![now, agent_num, generation, command],
-        ));
-    } else {
-        db!(tx.execute(
-            "UPDATE messages SET presentation_command = NULL
-             WHERE recipient = ?1 AND recipient_generation = ?2
-               AND presentation_command = ?3 AND presented_at IS NULL",
-            params![agent_num, generation, command],
-        ));
-    }
+    // A late exact terminal can establish delivery after an unknown was
+    // recorded, as long as a later input has not claimed these same rows.
+    ack_inline_mail_tx(tx, agent, generation, &command, now)?;
+    db!(tx.execute(
+        "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
+         SELECT DISTINCT recipient, thread, ?1 FROM messages
+         WHERE recipient = ?2 AND recipient_generation = ?3
+           AND presentation_command = ?4 AND presented_at IS NOT NULL AND wake = 1
+           AND thread LIKE 'attention-%' AND thread NOT LIKE 'attention-%-advisory'",
+        params![now, agent, generation, command],
+    ));
+    db!(tx.execute(
+        "UPDATE messages SET inline_ack_pending = 0
+         WHERE recipient = ?1 AND recipient_generation = ?2 AND presentation_command = ?3
+           AND inline_ack_pending = 1",
+        params![agent, generation, command],
+    ));
+    Ok(())
+}
+
+/// Roll back just the acknowledgements made at input association that still
+/// lack model output or an explicit mailbox acknowledgement.
+pub(super) fn rollback_inline_mail_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+    turn: &str,
+) -> Result<()> {
+    let Some(command) = command_id_for_turn_tx(tx, agent, generation, turn)? else {
+        return Ok(());
+    };
+    db!(tx.execute(
+        "UPDATE messages SET presented_at = NULL, read_at = NULL, inline_ack_pending = 0,
+             inline_wake_retries = MIN(2, inline_wake_retries + wake)
+         WHERE recipient = ?1 AND recipient_generation = ?2 AND presentation_command = ?3
+           AND inline_ack_pending = 1",
+        params![agent, generation, command],
+    ));
     Ok(())
 }
 
@@ -1176,11 +1195,13 @@ fn persist_turn_terminal(
             format!("terminal event references missing turn {turn_id}"),
         ));
     }
-    if state == TurnState::Completed {
-        let delivered = outcome == Some("success")
-            || (final_text.is_some_and(|text| !text.trim().is_empty())
-                && native_event.data["model_output"].as_bool() != Some(false));
-        settle_inline_mail(scope, turn_id, delivered)?;
+    let delivered = outcome == Some("success")
+        || (final_text.is_some_and(|text| !text.trim().is_empty())
+            && native_event.data["model_output"].as_bool() != Some(false));
+    if delivered {
+        confirm_inline_mail_tx(tx, agent_num, generation, turn_id, now)?;
+    } else {
+        rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
     }
     if native_event.kind == "turn.unknown" && next_agent.active_turn.as_deref() == Some(turn_id) {
         return Ok(Vec::new());

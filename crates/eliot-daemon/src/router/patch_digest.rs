@@ -6,17 +6,21 @@
 use super::{Principal, Router, hierarchy, principal_name};
 use crate::git_monitor::{GitProbe, PatchRead};
 use eliot_core::{
-    Error, Result,
+    Error, Event, Result, SubmitCommand,
     api::{
         AgentPatchDigestRequest, AgentPatchDigestResponse, ClaimListRequest, ClaimView,
-        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, PatchDigestFile, advisory_claim_matches,
+        MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, PatchDigestFile, ProjectRegistrationView,
+        advisory_claim_matches, is_git_oid,
     },
+    limits::MAX_EVENT_BYTES,
 };
 use serde_json::Value;
 use std::{collections::BTreeSet, path::Path};
 
 /// Most entries one digest list carries; `truncated` says when one was cut.
 const MAX_ENTRIES: usize = 100;
+/// Maximum prompt space reserved for the patch digest and its framing.
+const MAX_REVIEW_PATCH_DIGEST_BYTES: usize = 12 * 1024;
 /// Longest quoted line in a digest entry.
 const MAX_LINE_CHARS: usize = 160;
 /// Most bytes of untracked file text one digest scans.
@@ -67,45 +71,189 @@ impl Router {
         let request: AgentPatchDigestRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        let (agent, base) = {
-            let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(&store, principal, &request.id, request.generation)?;
-            let agent = store.get_agent(&request.id)?.ok_or_else(|| {
-                Error::new("not_found", format!("Agent {} was not found", request.id))
-            })?;
-            let base = match agent.workspace.as_deref() {
-                Some(workspace) => store
-                    .get_workspace_by_path(workspace)?
-                    .map(|row| row.base_oid),
-                None => None,
-            };
-            (agent, base)
-        };
-        if request
-            .generation
-            .is_some_and(|generation| generation != agent.generation)
-        {
+        let (digest, _) = self
+            .build_agent_patch_digest(
+                &request.id,
+                request.generation,
+                None,
+                None,
+                false,
+                principal,
+            )
+            .await?;
+        let mut digest = serde_json::to_value(digest)
+            .map_err(|_| Error::new("internal", "patch digest could not be encoded"))?;
+        self.secret_policy_snapshot().redact_values(&mut digest);
+        Ok(digest)
+    }
+
+    /// Attach the existing patch digest to one rule launch, after binding it
+    /// to the event's exact Agent generation, workspace, base and fingerprint.
+    /// The content is placed only in the review command text, never in the event.
+    pub(crate) async fn attach_rule_patch_digest(
+        &self,
+        rule_principal: &str,
+        project: Option<&ProjectRegistrationView>,
+        event: &Event,
+        request: &mut SubmitCommand,
+    ) -> Result<bool> {
+        if request.verb != "launch" {
             return Err(Error::new(
-                "stale_generation",
-                "the patch digest requires the current Agent generation",
+                "invalid",
+                "patch digest attachment requires a launch action",
             ));
         }
-        let workspace = agent.workspace.as_deref().ok_or_else(|| {
-            Error::new("invalid", "the patch digest requires an admitted workspace")
-        })?;
-        let read = GitProbe::new()?
-            .patch_read(workspace, base.as_deref())
-            .await?;
+        let principal = match project {
+            None if rule_principal == "owner" => Principal::Owner,
+            Some(project) if rule_principal == format!("project:{}", project.id) => {
+                Principal::ProjectRule {
+                    registration: Box::new(project.clone()),
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    "not_allowed",
+                    "patch digest attachment does not match the rule authority",
+                ));
+            }
+        };
+        if let Some(project) = project {
+            self.verify_project_rule_submission_authority(std::slice::from_ref(request), project)
+                .await?;
+        }
+        if !matches!(
+            event.kind.as_str(),
+            "turn.completed" | "project.worktree.check.passed"
+        ) || (event.kind == "turn.completed" && event.data["project_check"] != "off")
+        {
+            return Ok(false);
+        }
+        let (Some(agent), Some(generation), Some(workspace), Some(base), Some(fingerprint)) = (
+            event.agent.as_deref(),
+            event.generation,
+            event
+                .subject
+                .as_ref()
+                .and_then(|subject| subject.workspace.as_deref()),
+            event.data.pointer("/worktree/base").and_then(Value::as_str),
+            event
+                .data
+                .pointer("/worktree/fingerprint")
+                .and_then(Value::as_str),
+        ) else {
+            return Ok(false);
+        };
+        if !is_git_oid(base) {
+            return Ok(false);
+        }
+        let (digest, observed_fingerprint) = match self
+            .build_agent_patch_digest(
+                agent,
+                Some(generation),
+                Some(workspace),
+                Some(base),
+                true,
+                &principal,
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) if matches!(error.code.as_str(), "stale_generation" | "stale_workspace") => {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if observed_fingerprint.as_deref() != Some(fingerprint)
+            || digest.base.as_deref() != Some(base)
+        {
+            return Ok(false);
+        }
+        let text = request
+            .args
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::new("invalid", "patch digest attachment requires launch text"))?;
+        let mut digest = serde_json::to_value(digest)
+            .map_err(|_| Error::new("internal", "patch digest prompt could not be encoded"))?;
+        self.secret_policy_snapshot().redact_values(&mut digest);
+        request.args["text"] =
+            Value::String(append_patch_digest_prompt(text, digest, fingerprint)?);
+        Ok(true)
+    }
+
+    async fn build_agent_patch_digest(
+        &self,
+        id: &str,
+        generation: Option<i64>,
+        expected_workspace: Option<&str>,
+        expected_base: Option<&str>,
+        include_fingerprint: bool,
+        principal: &Principal,
+    ) -> Result<(AgentPatchDigestResponse, Option<String>)> {
+        let (agent, workspace, base) = {
+            let store = self.inner.store.lock().await;
+            let agent = load_patch_agent(&store, principal, id, generation, include_fingerprint)?;
+            if generation.is_some_and(|generation| generation != agent.generation) {
+                return Err(Error::new(
+                    "stale_generation",
+                    "the patch digest requires the current Agent generation",
+                ));
+            }
+            let workspace = agent
+                .workspace
+                .as_deref()
+                .ok_or_else(|| {
+                    Error::new("invalid", "the patch digest requires an admitted workspace")
+                })?
+                .to_owned();
+            if expected_workspace.is_some_and(|expected| expected != workspace)
+                || expected_base.is_some_and(|expected| agent.base_oid.as_deref() != Some(expected))
+            {
+                return Err(Error::new(
+                    "stale_workspace",
+                    "the patch digest Agent workspace or base differs from the event snapshot",
+                ));
+            }
+            let base = match expected_base {
+                Some(base) => Some(base.to_owned()),
+                None => store
+                    .get_workspace_by_path(&workspace)?
+                    .map(|row| row.base_oid),
+            };
+            (agent, workspace, base)
+        };
+        let probe = GitProbe::new()?;
+        let read = if include_fingerprint {
+            probe
+                .patch_read_with_fingerprint(&workspace, base.as_deref())
+                .await?
+        } else {
+            probe.patch_read(&workspace, base.as_deref()).await?
+        };
+        let fingerprint = read.fingerprint.clone();
         let (claims, attributed_paths, attributed_truncated, exclusively_bound) = {
             let store = self.inner.store.lock().await;
-            hierarchy::authorize_agent_read(&store, principal, &agent.id, Some(agent.generation))?;
-            let current = store.get_agent(&agent.id)?.ok_or_else(|| {
-                Error::new("not_found", format!("Agent {} was not found", agent.id))
-            })?;
+            let current = load_patch_agent(
+                &store,
+                principal,
+                &agent.id,
+                Some(agent.generation),
+                include_fingerprint,
+            )?;
             if current.generation != agent.generation {
                 return Err(Error::new(
                     "stale_generation",
                     "the patch digest requires the current Agent generation",
+                ));
+            }
+            if expected_workspace
+                .is_some_and(|expected| current.workspace.as_deref() != Some(expected))
+                || expected_base
+                    .is_some_and(|expected| current.base_oid.as_deref() != Some(expected))
+            {
+                return Err(Error::new(
+                    "stale_workspace",
+                    "the patch digest Agent workspace or base changed during the snapshot",
                 ));
             }
             let claims = store
@@ -177,14 +325,93 @@ impl Router {
         })
         .await
         .map_err(|_| Error::new("internal", "patch digest task failed"))?;
-        serde_json::to_value(AgentPatchDigestResponse {
-            agent: agent.id,
-            generation: agent.generation,
-            outside_claims_declared,
-            ..digest
-        })
-        .map_err(|_| Error::new("internal", "patch digest could not be encoded"))
+        Ok((
+            AgentPatchDigestResponse {
+                agent: agent.id,
+                generation: agent.generation,
+                outside_claims_declared,
+                ..digest
+            },
+            fingerprint,
+        ))
     }
+}
+
+fn load_patch_agent(
+    store: &eliot_store::Store,
+    principal: &Principal,
+    id: &str,
+    generation: Option<i64>,
+    guarded_review: bool,
+) -> Result<eliot_core::Agent> {
+    if guarded_review && let Principal::ProjectRule { registration } = principal {
+        return store
+            .get_agent(id)?
+            .filter(|agent| agent.project == registration.id)
+            .ok_or_else(|| {
+                Error::new(
+                    "not_allowed",
+                    "review author is outside the registered project",
+                )
+            });
+    }
+    hierarchy::authorize_agent_read(store, principal, id, generation)?;
+    store
+        .get_agent(id)?
+        .ok_or_else(|| Error::new("not_found", format!("Agent {id} was not found")))
+}
+
+fn append_patch_digest_prompt(text: &str, mut value: Value, fingerprint: &str) -> Result<String> {
+    let heading = format!(
+        "\n\nBounded `agent.patch_digest` for author snapshot fingerprint {fingerprint}; this is an attention filter, not a quality score:\n"
+    );
+    let attachment_budget =
+        MAX_REVIEW_PATCH_DIGEST_BYTES.min(MAX_EVENT_BYTES.saturating_sub(text.len()));
+    loop {
+        let encoded = serde_json::to_string(&value)
+            .map_err(|_| Error::new("internal", "patch digest prompt could not be encoded"))?
+            .replace('`', "\\u0060");
+        let fenced = eliot_core::fence_untrusted_text(&encoded);
+        let attachment = format!("{heading}{fenced}");
+        if attachment.len() <= attachment_budget {
+            let mut combined = String::with_capacity(text.len() + attachment.len());
+            combined.push_str(text);
+            combined.push_str(&attachment);
+            return Ok(combined);
+        }
+        if !drop_digest_prompt_entries(&mut value) {
+            return Err(Error::new(
+                "frame_too_large",
+                "review text leaves no room for the bounded patch digest",
+            ));
+        }
+        value["truncated"] = Value::Bool(true);
+        value["prompt_truncated"] = Value::Bool(true);
+    }
+}
+
+fn drop_digest_prompt_entries(value: &mut Value) -> bool {
+    for field in [
+        "outside_claims",
+        "suppressions",
+        "checker_changes",
+        "public_interface",
+        "new_dependencies",
+        "packages",
+        "files",
+    ] {
+        if let Some(entries) = value.get_mut(field).and_then(Value::as_array_mut)
+            && !entries.is_empty()
+        {
+            let remove = (entries.len() / 2).max(1);
+            entries.truncate(entries.len() - remove);
+            if field == "outside_claims" {
+                value["outside_claims_complete"] = Value::Bool(false);
+            }
+            return true;
+        }
+    }
+    false
 }
 
 /// Classify one patch read. File reads only resolve packages and the

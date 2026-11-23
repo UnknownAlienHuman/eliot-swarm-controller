@@ -430,8 +430,18 @@ paths and native identity checks. An absent or ambiguous automatic candidate
 returns a typed `unsupported`/`profile_error` naming what was searched. An
 explicit path that no longer exists returns a profile command issue. The refusal
 and `swarm doctor` give the discovered replacement path when available and ask
-the Owner to omit `cmd` to restore automatic discovery. Ad-hoc Claude uses
-`mcp = "minimal"`. See
+the Owner to remove the exact `profiles.<name>.cmd` setting to restore automatic
+discovery. Human `swarm status` identifies the affected profile, harness, missing
+configured path and setting; it does not probe installations, so it points to
+`swarm doctor` for expected-version and installed-candidate findings. `swarm doctor`
+shows the adapter's expected version and either the discovered installed candidate
+path/version or that no candidate was found. A detected install whose replacement path
+is unavailable is reported separately from no install. Repair removes the profile's
+`cmd` key and saves the Profiles section; the next launch follows the installed vendor
+executable, while an existing Agent generation retains its frozen executable. Automatic
+profiles with no installed executable remain visible in doctor's per-harness installed
+inventory; they have no stale `cmd` pin to report. Ad-hoc Claude uses `mcp = "minimal"`.
+See
 [Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
 
 OpenCode's `--auth` is
@@ -815,7 +825,8 @@ settings. An omitted history window disables deletion for that class.
 window in seconds instead of `events_days`. Set at most one of the two. The event
 and exited-child process windows are positive integers. `interval_seconds` allows
 1 through 86,400 seconds. Optional positive `commands_days` and `mail_days` windows
-enable pruning of closed command trees and acknowledged mail, respectively.
+enable pruning of closed command trees and expired acknowledged or legacy
+advisory mail, respectively.
 The [Core retention contract](core.md#retention) defines the protected records.
 Command and write
 bindings always outlive the 24-hour retry window plus the 5-minute allowed
@@ -920,7 +931,8 @@ latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 the diagnostic `VERIFIED_HARNESSES` baseline without blocking launch; those versions
 do not pin executable selection. It also reports every profile whose explicitly
 pinned executable is missing, with the configured path, current replacement
-path/version when available, and instructions to omit `cmd`. The desktop reads
+path/version when available, and the exact `profiles.<name>.cmd` setting to remove.
+The desktop reads
 missing pins through `daemon.status` and displays the repair in Models & presets.
 
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are

@@ -1790,7 +1790,7 @@ async fn process_rule_cursor(
                 continue;
             }
             let (action, once_per_key, rate_key) =
-                match evaluate_event_action(router, &rule.principal, &definition, &event).await {
+                match evaluate_event_action(router, rule, &definition, &event).await {
                     Ok(RuleEvaluation::Command {
                         action,
                         once_per,
@@ -2716,11 +2716,25 @@ fn project_rule_catch_up_binds_agent(verb: &str) -> bool {
 
 async fn evaluate_event_action(
     router: &Router,
-    principal: &str,
+    rule: &ActiveRule,
     definition: &RuleDefinition,
     event: &Event,
 ) -> Result<RuleEvaluation> {
-    match definition::evaluate(definition, event, principal)? {
+    let principal = &rule.principal;
+    let mut evaluation = definition::evaluate(definition, event, principal)?;
+    if definition.includes_patch_digest()
+        && let RuleEvaluation::Command { action, .. } = &mut evaluation
+    {
+        return if router
+            .attach_rule_patch_digest(principal, rule.project.as_ref(), event, action)
+            .await?
+        {
+            Ok(evaluation)
+        } else {
+            Ok(RuleEvaluation::NoMatch)
+        };
+    }
+    match evaluation {
         RuleEvaluation::Command { .. }
             if definition.guards_launch_worktree()
                 && !router.rule_worktree_is_current(principal, event).await? =>

@@ -1454,6 +1454,9 @@ pub(crate) struct MsgSendArgs {
     pub(crate) reply_to: Option<String>,
     #[arg(long, value_parser = ["queue", "send", "steer", "inject"], default_value = "queue")]
     pub(crate) mode: String,
+    /// Deliver with an ordinary recipient turn without waking it.
+    #[arg(long)]
+    pub(crate) no_wake: bool,
 }
 
 #[derive(Args)]

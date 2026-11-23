@@ -29,7 +29,7 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
-pub use context::ContextDispatch;
+pub use context::{ContextDispatch, SendInput};
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
@@ -82,6 +82,13 @@ use ulid::Ulid;
 use workspace::recover_workspaces;
 
 const MAX_PAGE_ENTRIES: usize = 1_000;
+/// Legacy subject copies have the daemon's thread and report or recovery
+/// envelope for this recipient. A matching thread alone can be ordinary mail.
+const LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE: &str =
+    "sender IN ('owner', 'swarm') AND thread GLOB 'attention-*-advisory'
+     AND (text GLOB ('Eliot attention report for Agent a' || recipient || ' generation *. Incident *')
+          OR text GLOB ('Eliot attention recovery for Agent a' || recipient || ' generation *. Incident *'))
+     AND text GLOB '*See the structured x.user.agent.attention event for details.'";
 const MAX_PAGE_BYTES: usize = 900 * 1024;
 const MAX_NATIVE_FAMILIES: i64 = 9;
 const RETRY_WINDOW_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -366,6 +373,8 @@ pub struct Store {
     /// root, so kept roots are not revisited every pass under the Store lock.
     retention_commands_cursor: Option<(i64, String)>,
     retention_processes_cursor: Option<(i64, i64)>,
+    /// Keyset cursor for bounded scans of legacy unread advisory mail.
+    retention_attention_advisory_cursor: Option<(i64, i64)>,
     /// Opaque owner of this handle's Goal round markers. A `running` marker
     /// from another holder is a crashed round: it reads as `unknown`.
     goal_holder: String,
@@ -433,6 +442,7 @@ impl Store {
             write_faulted: Cell::new(false),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
+            retention_attention_advisory_cursor: None,
             goal_holder: String::new(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
             capacity_policy: None,
@@ -515,6 +525,7 @@ impl Store {
             write_faulted: Cell::new(false),
             retention_commands_cursor: None,
             retention_processes_cursor: None,
+            retention_attention_advisory_cursor: None,
             git_observed_at: BTreeMap::new(),
             goal_holder: Ulid::new().to_string(),
             hierarchy_limits: core::api::HierarchyLimits::default(),
@@ -1175,8 +1186,8 @@ impl Store {
         result
     }
 
-    /// Dispatch a normal send and claim its FIFO next_input context in the
-    /// same transaction. The returned command retains its original args.
+    /// Dispatch a send and claim its next-input context and deferred mail in
+    /// the same transaction. The returned command retains its original args.
     pub fn dispatch_with_context(&mut self, id: &str, now: i64) -> Result<Change<ContextDispatch>> {
         self.ensure_writer_healthy()?;
         let command = self
@@ -1188,14 +1199,14 @@ impl Store {
                 "context can be claimed only with a send dispatch",
             ));
         }
-        let mut context_items = Vec::new();
-        let result = self.dispatch_inner(id, now, None, Some(&mut context_items));
+        let mut input = SendInput::default();
+        let result = self.dispatch_inner(id, now, None, Some(&mut input));
         self.fault_on_persistence_error(&result);
         let change = result?;
         Ok(Change {
             value: ContextDispatch {
                 command: change.value,
-                context_items,
+                input,
             },
             events: change.events,
         })

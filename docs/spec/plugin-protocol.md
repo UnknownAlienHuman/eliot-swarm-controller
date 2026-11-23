@@ -964,6 +964,8 @@ model and never runs synthetic/fake executions.
 The repository owns one Agent Skills source, `skills/eliot-swarm/`
 (`SKILL.md` plus at most `reference.md`), embedded in the binaries with
 `include_str!` ([`eliot_plugin::skill`](../../crates/eliot-plugin/src/skill.rs)).
+`SKILL.md` holds the coordination rules in at most 3,000 UTF-8 bytes.
+The sibling reference carries method details for Agents to read as needed.
 The daemon materializes it under the data directory at startup
 (`<data-dir>/skills/`), with a private ACL and atomic replace; the layout
 doubles as a Claude Code plugin directory

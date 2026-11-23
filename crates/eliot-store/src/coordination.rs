@@ -4,8 +4,8 @@
 //! concrete recipients once, inside the admission transaction, and mailbox
 //! bounds are checked for every recipient before any row is written, so an
 //! overfull mailbox rejects without a partial fanout. Reads never mark
-//! state; explicit ack over exact delivery ids is idempotent. Inline wake
-//! mail is acknowledged by committed output from its bound wake turn.
+//! state; explicit ack over exact delivery ids is idempotent. Inline mail
+//! is acknowledged by the committed start of its bound turn.
 //! A notice claim is an atomic check-and-set: at most one notice per
 //! recipient per minute with at most one open (or unknown) notice command.
 //! Variable writes are
@@ -19,6 +19,7 @@ use super::{
     insert_daemon_event_input, load_agent_by_num, load_command_record, provider_holds, sql_error,
     validate_id_age, validate_limit, validate_ulid, write_binding,
 };
+use crate::LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE;
 use eliot_core::{
     Agent, AgentState, CommandState,
     api::{
@@ -243,13 +244,17 @@ impl Store {
                 ));
             }
         }
-        let semantic_payload = json!({
+        let mut semantic_payload = json!({
             "to": request.to,
             "mode": request.mode.as_str(),
             "text": request.text,
             "thread": request.thread,
             "reply_to_delivery": request.reply_to_delivery,
         });
+        // Preserve the digest for retained sends whose wake behavior was implicit.
+        if !request.wake {
+            semantic_payload["wake"] = json!(false);
+        }
         Ok(PreparedMailSend {
             sender,
             payload_digest: canonical::digest(&semantic_payload)?,
@@ -412,12 +417,12 @@ impl Store {
             ));
         }
         self.ensure_committed_reads()?;
-        const LEGACY_ADVISORY: &str =
-            "sender IN ('owner', 'swarm') AND thread GLOB 'attention-*-advisory'";
         let count_matches = |connection: &rusqlite::Connection| {
             connection
                 .query_row(
-                    &format!("SELECT COUNT(*) FROM messages WHERE {LEGACY_ADVISORY}"),
+                    &format!(
+                        "SELECT COUNT(*) FROM messages WHERE {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}"
+                    ),
                     [],
                     |row| row.get::<_, i64>(0),
                 )
@@ -441,7 +446,12 @@ impl Store {
                 ));
             }
             let deleted = tx
-                .execute(&format!("DELETE FROM messages WHERE {LEGACY_ADVISORY}"), [])
+                .execute(
+                    &format!(
+                        "DELETE FROM messages WHERE {LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE}"
+                    ),
+                    [],
+                )
                 .map_err(sql_error)?;
             if i64::try_from(deleted).ok() != Some(matching) {
                 return Err(Error::new(
@@ -841,7 +851,8 @@ impl Store {
                         OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
                    AND EXISTS (
                            SELECT 1 FROM messages m
-                           WHERE m.recipient = a.id AND m.read_at IS NULL
+                           WHERE m.recipient = a.id AND m.read_at IS NULL AND m.wake = 1
+                             AND m.inline_wake_retries < 2
                              AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
                                   OR ({ATTENTION_WAKING_THREAD_SQL}))
                        )
@@ -1235,7 +1246,7 @@ impl Store {
         };
         let (value, events) = Self::mail_effect_tx_with_sender(
             &tx,
-            (sender, service_sender),
+            (sender, service_sender, request.wake),
             &definition,
             limits,
             &request.id,
@@ -1396,8 +1407,9 @@ impl Store {
         }
         for delivery in &request.deliveries {
             db!(tx.execute(
-                "UPDATE messages SET read_at = ?1
-                 WHERE delivery_id = ?2 AND recipient = ?3 AND read_at IS NULL",
+                "UPDATE messages SET read_at = COALESCE(read_at, ?1), inline_ack_pending = 0
+                 WHERE delivery_id = ?2 AND recipient = ?3
+                   AND (read_at IS NULL OR inline_ack_pending = 1)",
                 params![now, delivery, mailbox],
             ));
         }
@@ -1531,7 +1543,7 @@ impl Store {
     ) -> Result<(MailSendResponse, Vec<super::Event>)> {
         Self::mail_effect_tx_with_sender(
             tx,
-            (sender, false),
+            (sender, false, true),
             definition,
             limits,
             delivery_prefix,
@@ -1542,7 +1554,7 @@ impl Store {
 
     fn mail_effect_tx_with_sender(
         tx: &Transaction<'_>,
-        (sender, service_sender): (&Sender, bool),
+        (sender, service_sender, wake): (&Sender, bool, bool),
         definition: &MailDefinitionArgs,
         limits: MailLimits,
         delivery_prefix: &str,
@@ -1584,7 +1596,7 @@ impl Store {
             let bytes: i64 = tx
                 .query_row(
                     "SELECT COALESCE(SUM(LENGTH(CAST(text AS BLOB))), 0) FROM messages
-                     WHERE recipient = ?1 AND read_at IS NULL",
+                     WHERE recipient = ?1 AND (read_at IS NULL OR inline_ack_pending = 1)",
                     params![num],
                     |row| row.get(0),
                 )
@@ -1618,8 +1630,8 @@ impl Store {
             db!(tx.execute(
                 "INSERT INTO messages(delivery_id, sender, sender_generation, recipient,
                                       recipient_generation, thread, reply_to_delivery, mode, text,
-                                      content_digest, admitted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                                      content_digest, admitted_at, wake)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     delivery_id,
                     sender_name,
@@ -1631,7 +1643,8 @@ impl Store {
                     MailMode::Queue.as_str(),
                     text,
                     content_digest,
-                    now
+                    now,
+                    wake,
                 ],
             ));
             // Bodyless wake fact bound to the recipient generation. A rule
@@ -1903,13 +1916,14 @@ impl Store {
                  open_notice_command = excluded.open_notice_command",
             params![num, notice_command],
         ));
-        // Count-only attention still spends its one wake on claim. An inline
-        // attention delivery spends it when the exact turn proves output.
+        // Count-only attention spends its one wake on claim. Inline
+        // attention spends it when the exact turn shows model progress.
         let inline_text = inline_mail_wake_tx(&tx, &agent, num, notice_command, count)?;
         db!(tx.execute(
             "INSERT OR IGNORE INTO attention_wakes(recipient, thread, woken_at)
                  SELECT DISTINCT ?1, m.thread, ?2 FROM messages m
-                 WHERE m.recipient = ?1 AND m.read_at IS NULL
+                 WHERE m.recipient = ?1 AND m.read_at IS NULL AND m.wake = 1
+                   AND m.inline_wake_retries < 2
                    AND m.presentation_command IS NOT ?3
                    AND COALESCE(m.thread, '') LIKE 'attention-%'
                    AND COALESCE(m.thread, '') NOT LIKE 'attention-%-advisory'",
@@ -1982,6 +1996,60 @@ fn inline_mail_wake_tx(
     notice_command: &str,
     total_unread: i64,
 ) -> Result<Option<String>> {
+    let (mut body, presentations, overflow) =
+        render_inline_mail_tx(tx, agent, num, true, |_| Ok(true))?;
+    if overflow || presentations.is_empty() || total_unread < presentations.len() as i64 {
+        return Ok(None);
+    }
+    let remaining_unread = total_unread - presentations.len() as i64;
+    if remaining_unread > 0 {
+        body.push_str(&format!(
+            "\n\n{remaining_unread} other unread: mail.inbox, then mail.ack"
+        ));
+    }
+    let send_params = json!({
+        "id": notice_command,
+        "target": agent.id,
+        "verb": "send",
+        "expected_generation": agent.generation,
+        "args": {
+            "text": &body,
+            "notice_kind": "mail",
+            "inline_digest": true,
+        },
+    });
+    if encode_json(&send_params)?.len() > MAX_EVENT_BYTES {
+        return Ok(None);
+    }
+    bind_inline_mail_tx(tx, num, agent.generation, notice_command, &presentations)?;
+    Ok(Some(body))
+}
+
+/// Fit a prefix of deferred deliveries into the next input's native SEND.
+pub(super) fn claim_deferred_inline_mail_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    num: i64,
+    send: &eliot_core::Command,
+    fits: impl FnMut(&str) -> Result<bool>,
+) -> Result<Option<String>> {
+    let (body, presentations, _) = render_inline_mail_tx(tx, agent, num, false, fits)?;
+    if presentations.is_empty() {
+        return Ok(None);
+    }
+    bind_inline_mail_tx(tx, num, agent.generation, &send.id, &presentations)?;
+    Ok(Some(body))
+}
+
+type InlineMailBinding = (String, Option<String>);
+
+fn render_inline_mail_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    num: i64,
+    wake: bool,
+    mut fits: impl FnMut(&str) -> Result<bool>,
+) -> Result<(String, Vec<InlineMailBinding>, bool)> {
     let expected_requester = format!("agent:{}:{}", agent.id, agent.generation);
     let mut statement = tx
         .prepare(&format!(
@@ -1996,11 +2064,19 @@ fn inline_mail_wake_tx(
                AND m.recipient_generation = ?2
                AND m.read_at IS NULL
                AND m.presented_at IS NULL
+               AND m.wake = ?4
+               AND (?4 = 0 OR m.inline_wake_retries < 2)
                AND (previous.id IS NULL OR (previous.target = m.recipient
                     AND COALESCE(previous.generation, previous.expected_generation) = m.recipient_generation
                     AND previous.verb = 'send'
-                    AND previous.state IN ('rejected', 'failed', 'cancelled')))
-               AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
+                    AND (previous.state IN ('rejected', 'failed', 'cancelled')
+                         OR (previous.state = 'applied' AND EXISTS (
+                             SELECT 1 FROM turns t WHERE t.agent = m.recipient
+                               AND t.generation = m.recipient_generation
+                               AND t.turn_id = previous.turn_id
+                               AND t.state IN ('completed', 'unknown')
+                         )))))
+               AND (?4 = 0 OR COALESCE(m.thread, '') NOT LIKE 'attention-%'
                     OR ({ATTENTION_WAKING_THREAD_SQL}))
                AND (digest.id IS NULL OR (digest.parent = m.recipient
                     AND digest.requester = ?3 AND m.sender IN ('owner', 'swarm')))
@@ -2008,19 +2084,25 @@ fn inline_mail_wake_tx(
         ))
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![num, agent.generation, expected_requester], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
-        })
+        .query_map(
+            params![num, agent.generation, expected_requester, wake],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
         .map_err(sql_error)?;
     let mut presentations = Vec::new();
-    let mut body = String::new();
+    let mut body =
+        "The mail below is complete. Swarm acknowledges these deliveries when this input starts the turn.\n\n"
+            .to_owned();
+    let mut overflow = false;
     for row in rows {
         let (delivery_id, sender, topic, text, previous_command, digest_id) =
             row.map_err(sql_error)?;
@@ -2050,74 +2132,47 @@ fn inline_mail_wake_tx(
                 fence_untrusted_text(&text)
             )
         };
-        let separator = if body.is_empty() { "" } else { "\n\n---\n\n" };
-        if body
-            .len()
-            .saturating_add(separator.len())
-            .saturating_add(mail.len())
-            > MAX_EVENT_BYTES
-        {
-            return Ok(None);
+        let previous_len = body.len();
+        if !presentations.is_empty() {
+            body.push_str("\n\n---\n\n");
         }
-        body.push_str(separator);
         body.push_str(&mail);
+        // A single deferred message can exceed the notice budget after
+        // fencing. The ordinary send's own frame budget still applies.
+        let exceeds_batch = body.len() > MAX_EVENT_BYTES && (wake || !presentations.is_empty());
+        if exceeds_batch || !fits(&body)? {
+            body.truncate(previous_len);
+            overflow = true;
+            break;
+        }
         presentations.push((delivery_id, previous_command));
     }
-    drop(statement);
-    if presentations.is_empty() || total_unread < presentations.len() as i64 {
-        return Ok(None);
-    }
+    Ok((body, presentations, overflow))
+}
 
-    body.insert_str(
-        0,
-        "The bodies below are complete. Handle them here. Swarm acknowledges these deliveries when it observes model output or successful completion.\n\n",
-    );
-    let remaining_unread = total_unread - presentations.len() as i64;
-    if remaining_unread > 0 {
-        let suffix = format!("\n\n{remaining_unread} other unread: mail.inbox, then mail.ack");
-        if body.len().saturating_add(suffix.len()) > MAX_EVENT_BYTES {
-            return Ok(None);
-        }
-        body.push_str(&suffix);
-    }
-
-    let send_params = json!({
-        "id": notice_command,
-        "target": agent.id,
-        "verb": "send",
-        "expected_generation": agent.generation,
-        "args": {
-            "text": &body,
-            "notice_kind": "mail",
-            "inline_digest": true,
-        },
-    });
-    if encode_json(&send_params)?.len() > MAX_EVENT_BYTES {
-        return Ok(None);
-    }
-
-    for (delivery_id, previous_command) in &presentations {
+fn bind_inline_mail_tx(
+    tx: &Transaction<'_>,
+    num: i64,
+    generation: i64,
+    command_id: &str,
+    presentations: &[InlineMailBinding],
+) -> Result<()> {
+    for (delivery_id, previous_command) in presentations {
         let changed = db!(tx.execute(
             "UPDATE messages SET presentation_command = ?1
              WHERE delivery_id = ?2 AND recipient = ?3 AND recipient_generation = ?4
                AND read_at IS NULL AND presented_at IS NULL
                AND presentation_command IS ?5",
-            params![
-                notice_command,
-                delivery_id,
-                num,
-                agent.generation,
-                previous_command,
-            ],
+            params![command_id, delivery_id, num, generation, previous_command,],
         ));
         if changed != 1 {
             return Err(Error::new(
                 "source_integrity",
-                "mail presentation binding changed during notice claim",
+                "mail presentation binding changed during inline claim",
             ));
         }
     }
-    Ok(Some(body))
+    Ok(())
 }
 
 /// Count unread rows that can wake this recipient. Legacy advisory copies
@@ -2127,6 +2182,8 @@ fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<Option<i64>
         .query_row(
             &format!(
                 "SELECT COUNT(*) FROM messages m WHERE m.recipient = ?1 AND m.read_at IS NULL
+                 AND m.wake = 1
+                 AND m.inline_wake_retries < 2
                  AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
                       OR ({ATTENTION_WAKING_THREAD_SQL}))"
             ),
@@ -2146,7 +2203,8 @@ fn fresh_reply_to_own_mail_tx(tx: &Transaction<'_>, agent: &Agent, since: i64) -
         "SELECT EXISTS(
              SELECT 1 FROM messages reply
              JOIN messages asked ON asked.delivery_id = reply.reply_to_delivery
-             WHERE reply.recipient = ?1 AND reply.read_at IS NULL
+             WHERE reply.recipient = ?1 AND reply.read_at IS NULL AND reply.wake = 1
+               AND reply.inline_wake_retries < 2
                AND reply.admitted_at > ?2 AND asked.sender = ?3
          )",
         params![num, since, agent.id],
