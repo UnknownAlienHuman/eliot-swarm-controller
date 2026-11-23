@@ -859,6 +859,7 @@ impl DaemonStatusRequest {
         Ok(())
     }
     pub fn validate_response(&self, reply: &DaemonStatusResponse) -> Result<()> {
+        crate::api::ProfileCommandIssue::validate_list(&reply.profile_command_issues)?;
         let state = match reply.admission.as_str() {
             "open" => "running",
             "draining" => "draining",
@@ -902,10 +903,6 @@ impl DaemonStatusRequest {
                 .plugin_crashes
                 .iter()
                 .any(|crash| crash.code != "plugin.panicked" || crash.validate().is_err())
-            || crate::api::harness::validate_claude_profile_command_issues(
-                &reply.claude_profile_command_issues,
-            )
-            .is_err()
             || reply.provider_probe_attention.len() > 16
             || reply
                 .provider_probe_attention
