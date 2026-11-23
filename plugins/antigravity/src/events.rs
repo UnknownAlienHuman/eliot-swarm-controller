@@ -306,16 +306,10 @@ pub(crate) struct State {
     /// notification write.
     settlement: watch::Sender<Option<(String, bool)>>,
     /// Latest merged session-scoped snapshot from `usage_update`: context
-    /// occupancy/capacity and cumulative session cost. Never turn expenditure;
-    /// committed as `session.usage` when accepted and replaced wholesale on
-    /// newer updates.
+    /// occupancy/capacity and cumulative session cost. Never turn expenditure.
     session_usage: Option<SessionUsage>,
-    /// Last committed session snapshot content. Each accepted update commits
-    /// only when it differs, so repeats commit no extra session fact.
-    session_usage_committed: Option<SessionUsage>,
-    /// Monotonic counter for `session.usage` native ids so each accepted
-    /// update commits under a unique identity.
-    session_usage_seq: u64,
+    /// Exact pending turn that supplied the latest sample, if any.
+    session_usage_turn: Option<String>,
     checkpoints: Option<checkpoints::Checkpoints>,
     checkpoint_root: Option<std::path::PathBuf>,
     checkpoint_resume: bool,
@@ -396,8 +390,7 @@ impl State {
             last_turn: None,
             settlement,
             session_usage: None,
-            session_usage_committed: None,
-            session_usage_seq: 0,
+            session_usage_turn: None,
             checkpoints: None,
             checkpoint_root: None,
             checkpoint_resume: false,
@@ -1617,10 +1610,11 @@ impl State {
                 cost_amount,
                 cost_unit,
             } => {
-                // Fold into the retained session snapshot and commit it as
-                // `session.usage` when accepted, with `observed_at` captured
-                // at acceptance. Session-scoped facts, never per-turn
-                // input/output totals.
+                // A full usage update from the exact session can acknowledge
+                // the pending input before the live sample is published.
+                if used.is_some() && size.is_some() && self.pending.is_some() {
+                    self.associate().await?;
+                }
                 if let Some(merged) = session_usage_from_update(
                     used,
                     size,
@@ -1628,15 +1622,7 @@ impl State {
                     cost_unit,
                     self.session_usage.as_ref(),
                 ) {
-                    self.session_usage = Some(merged.clone());
-                    self.commit_session_usage_now(merged).await?;
-                }
-                // ACP session progress is correlated by the exact session
-                // and its one outstanding input in this uninterrupted process.
-                // Idle/startup usage remains session-only. Require the schema's
-                // two counters; tolerant partial snapshots cannot admit input.
-                if used.is_some() && size.is_some() && self.pending.is_some() {
-                    self.associate().await?;
+                    self.sample_session_usage(merged).await;
                 }
                 Ok(())
             }
@@ -1782,30 +1768,38 @@ impl State {
         Ok(())
     }
 
-    /// Commit one accepted session snapshot as its own `session.usage` fact,
-    /// so session scope and turn scope can never be confused and stream loss
-    /// before the terminal cannot lose an accepted fact. Commits only when
-    /// the snapshot differs from the last committed fact. Occupancy changes
-    /// (compaction can reduce `used`) never read as token expenditure. Uses
-    /// the pending turn when one is prepared, else the idle `session` scope.
-    async fn commit_session_usage_now(&mut self, usage: SessionUsage) -> Result<()> {
-        if self.session_usage_committed.as_ref() == Some(&usage) {
-            return Ok(());
+    async fn sample_session_usage(&mut self, usage: SessionUsage) {
+        let turn = self.pending.as_ref().map(|pending| pending.turn.clone());
+        if self.session_usage.as_ref() == Some(&usage) && self.session_usage_turn == turn {
+            return;
         }
-        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
-        let turn = self
+        self.session_usage = Some(usage.clone());
+        self.session_usage_turn = turn.clone();
+        if self
             .pending
             .as_ref()
-            .map(|pending| pending.turn.clone())
-            .unwrap_or_else(|| "session".to_owned());
-        self.commit(
-            "session.usage",
-            &turn,
-            &format!("session-{}", self.session_usage_seq),
-            json!({"usage": usage}),
-        )
-        .await?;
-        self.session_usage_committed = Some(usage);
+            .is_some_and(|pending| !pending.associated)
+        {
+            // Partial counters cannot acknowledge input. Keep them for this
+            // turn's eventual terminal sample.
+            return;
+        }
+        let _ = self
+            .source()
+            .report_session_usage_sample(usage, turn.as_deref())
+            .await;
+    }
+
+    async fn commit_turn_session_usage(&mut self, turn: &str) -> Result<()> {
+        if self.session_usage_turn.as_deref() != Some(turn) {
+            return Ok(());
+        }
+        let Some(usage) = self.session_usage.clone() else {
+            return Ok(());
+        };
+        self.commit("session.usage", turn, "terminal", json!({"usage": usage}))
+            .await?;
+        self.session_usage_turn = None;
         Ok(())
     }
 
@@ -2238,8 +2232,7 @@ impl State {
         }
         self.commit("turn.completed", &turn, "completed", data.clone())
             .await?;
-        // Session facts already committed when each update was accepted, so
-        // the terminal carries turn scope only.
+        let session_usage = self.commit_turn_session_usage(&turn).await;
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
         );
@@ -2254,7 +2247,7 @@ impl State {
         self.record_settlement(turn, status == "cancelled");
         self.clear_fenced();
         self.pending = None;
-        Ok(())
+        session_usage
     }
 
     /// A correlated ACP validation refusal can withdraw an unassociated
@@ -2361,6 +2354,13 @@ impl State {
             // Reconcile the still-bound tool lifecycle before publishing loss
             // and allowing Store to settle the prompt unknown.
             let _ = self.close_open_tools_at_terminal().await;
+            // A cancel notification can be followed by stream loss without a
+            // prompt terminal. Keep the observed usage without inferring a turn outcome.
+            if self.cancellation_for_pending().is_some()
+                && let Some(turn) = self.pending.as_ref().map(|pending| pending.turn.clone())
+            {
+                let _ = self.commit_turn_session_usage(&turn).await;
+            }
         }
         self.source_unknown = true;
         self.fail_pending_steer(Error::new(

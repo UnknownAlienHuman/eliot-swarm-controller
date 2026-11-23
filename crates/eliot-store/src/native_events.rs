@@ -1236,6 +1236,19 @@ fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Re
         now,
         ..
     } = scope;
+    persist_session_usage_snapshot(tx, agent_num, generation, now, usage)
+}
+
+/// Replace the generation's current session snapshot in the caller's
+/// transaction. Native journal events and live non-journal samples share this
+/// monotonic projection update.
+pub(super) fn persist_session_usage_snapshot(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    now: i64,
+    usage: &SessionUsage,
+) -> Result<()> {
     let snapshot = encode_json(usage)?;
     if snapshot.len() > MAX_EVENT_BYTES {
         return Err(Error::new(

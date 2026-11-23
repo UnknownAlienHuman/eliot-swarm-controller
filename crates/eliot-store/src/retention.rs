@@ -189,8 +189,8 @@ impl Store {
     /// allocator are preserved.
     pub fn prune_retention(
         &mut self,
-        events_seconds: i64,
-        processes_seconds: i64,
+        events_seconds: Option<i64>,
+        processes_seconds: Option<i64>,
         commands_days: Option<i64>,
         mail_days: Option<i64>,
         now: i64,
@@ -209,20 +209,24 @@ impl Store {
 
     fn prune_retention_inner(
         &mut self,
-        events_seconds: i64,
-        processes_seconds: i64,
+        events_seconds: Option<i64>,
+        processes_seconds: Option<i64>,
         commands_days: Option<i64>,
         mail_days: Option<i64>,
         now: i64,
     ) -> Result<RetentionReport> {
-        if events_seconds <= 0 || processes_seconds <= 0 {
+        if events_seconds
+            .into_iter()
+            .chain(processes_seconds)
+            .any(|seconds| seconds <= 0)
+        {
             return Err(Error::new(
                 "invalid",
                 "event and process retention windows must be positive seconds",
             ));
         }
-        let events_cutoff = now.saturating_sub(events_seconds.saturating_mul(MS_PER_SECOND));
-        let processes_cutoff = now.saturating_sub(processes_seconds.saturating_mul(MS_PER_SECOND));
+        let seconds_cutoff =
+            |seconds: i64| now.saturating_sub(seconds.saturating_mul(MS_PER_SECOND));
         let commands_cutoff = match commands_days {
             Some(days) => {
                 if days <= 0 {
@@ -265,7 +269,10 @@ impl Store {
             }
             None => None,
         };
-        let (events_deleted, pruned_through) = self.prune_events(events_cutoff)?;
+        let (events_deleted, pruned_through) = match events_seconds {
+            Some(seconds) => self.prune_events(seconds_cutoff(seconds))?,
+            None => (0, coverage_pruned_through(&self.connection)?),
+        };
         let (commands_deleted, writes_deleted) = match commands_cutoff {
             Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
             None => (0, 0),
@@ -279,8 +286,13 @@ impl Store {
             None => 0,
         };
         // Exited child rows have an independent, shorter age window.
-        let (processes_deleted, processes_examined, process_scan_more) =
-            self.prune_exited_processes(processes_cutoff)?;
+        let (processes_deleted, processes_examined, process_scan_more) = match processes_seconds {
+            Some(seconds) => self.prune_exited_processes(seconds_cutoff(seconds))?,
+            None => {
+                self.retention_processes_cursor = None;
+                (0, 0, false)
+            }
+        };
         let (pages_reclaimed, space) = self.reclaim_retention_space()?;
         Ok(RetentionReport {
             events_deleted,

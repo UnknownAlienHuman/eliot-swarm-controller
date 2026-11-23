@@ -11,7 +11,72 @@ use eliot_core::{
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+use tokio::sync::watch;
+
+const DISK_USAGE_CACHE_TTL: Duration = Duration::from_secs(30);
+const DISK_USAGE_SCAN_WAIT: Duration = Duration::from_millis(500);
+
+static DISK_USAGE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<DiskUsageCacheEntry>>>> =
+    OnceLock::new();
+
+struct DiskUsageCacheEntry {
+    state: Mutex<DiskUsageCacheState>,
+    changed: watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct DiskUsageCacheState {
+    snapshot: Option<DiskUsageSnapshot>,
+    refreshing: bool,
+}
+
+#[derive(Clone)]
+struct DiskUsageSnapshot {
+    completed_at: Instant,
+    artifacts: eliot_core::api::DiskUsageDirectory,
+    worktrees: eliot_core::api::DiskUsageDirectory,
+    plugins: eliot_core::api::DiskUsageDirectory,
+}
+
+impl DiskUsageCacheEntry {
+    fn new() -> Self {
+        let (changed, _receiver) = watch::channel(0);
+        Self {
+            state: Mutex::new(DiskUsageCacheState::default()),
+            changed,
+        }
+    }
+}
+
+impl DiskUsageSnapshot {
+    fn scan(root: &Path) -> Self {
+        let artifacts = disk_usage_directory(&root.join("artifacts"));
+        let worktrees = disk_usage_directory(&root.join("worktrees"));
+        let plugins = disk_usage_directory(&root.join("plugins"));
+        Self {
+            completed_at: Instant::now(),
+            artifacts,
+            worktrees,
+            plugins,
+        }
+    }
+
+    fn view(&self) -> eliot_core::api::DiskUsageView {
+        eliot_core::api::DiskUsageView {
+            artifacts: self.artifacts.clone(),
+            worktrees: self.worktrees.clone(),
+            plugins: self.plugins.clone(),
+            owner_decision_worktrees: None,
+            owner_decision_error_code: Some("unavailable".to_owned()),
+        }
+    }
+}
 
 impl Router {
     pub(super) async fn autonomy(&self, request: AutonomyRequest) -> Result<Value> {
@@ -56,6 +121,11 @@ impl Router {
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
         let retention = Some(self.retention_view().await?);
+        let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();
+        let disk_usage = Some(
+            self.disk_usage_view(&automatic_cleanup, owner_decision_count)
+                .await,
+        );
         let mode = self.mode_name();
         let (
             agent_count,
@@ -131,7 +201,8 @@ impl Router {
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
             automation_tasks: self.inner.worker_tasks.lock_recover().clone(),
-            automatic_cleanup: Some(self.automatic_cleanup_view()),
+            automatic_cleanup: Some(automatic_cleanup),
+            disk_usage,
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
@@ -146,6 +217,89 @@ impl Router {
             previous_crash: self.inner.previous_crash.lock_recover().clone(),
         })
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
+    }
+
+    /// Complete logical-byte scans run off the async executor and serialize
+    /// so concurrent status clients cannot multiply filesystem work. A
+    /// missing bucket is exactly zero; any incomplete walk reports no partial
+    /// total and carries its error code. The worktree scan starts at the root,
+    /// so it includes both legacy `worktrees/<ULID>` paths and current named
+    /// project/Agent worktrees without relying on Store registrations.
+    async fn disk_usage_view(
+        &self,
+        cleanup: &eliot_core::api::AutomaticCleanupView,
+        owner_decision_count: usize,
+    ) -> eliot_core::api::DiskUsageView {
+        let root = self.inner.data_root.clone();
+        let entry = disk_usage_cache_entry(&root);
+        let mut changed = entry.changed.subscribe();
+        let fresh = {
+            let mut state = entry.state.lock_recover();
+            if let Some(snapshot) = state
+                .snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.completed_at.elapsed() <= DISK_USAGE_CACHE_TTL)
+            {
+                Some(snapshot.clone())
+            } else {
+                if !state.refreshing {
+                    state.refreshing = true;
+                    let worker_entry = entry.clone();
+                    let worker_root = root.clone();
+                    drop(tokio::task::spawn_blocking(move || {
+                        let snapshot =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                DiskUsageSnapshot::scan(&worker_root)
+                            }))
+                            .unwrap_or_else(|_| failed_disk_usage_snapshot("unavailable"));
+                        let mut state = worker_entry.state.lock_recover();
+                        state.snapshot = Some(snapshot);
+                        state.refreshing = false;
+                        drop(state);
+                        worker_entry
+                            .changed
+                            .send_modify(|version| *version = version.wrapping_add(1));
+                    }));
+                }
+                None
+            }
+        };
+        let snapshot = if fresh.is_some() {
+            fresh
+        } else {
+            let _ = tokio::time::timeout(DISK_USAGE_SCAN_WAIT, changed.changed()).await;
+            entry
+                .state
+                .lock_recover()
+                .snapshot
+                .clone()
+                .filter(|snapshot| snapshot.completed_at.elapsed() <= DISK_USAGE_CACHE_TTL)
+        };
+        let mut view = snapshot
+            .as_ref()
+            .map(DiskUsageSnapshot::view)
+            .unwrap_or_else(|| failed_disk_usage("busy"));
+        match cleanup.last_sweep.as_ref() {
+            Some(sweep) if sweep.error_code.is_none() => {
+                view.owner_decision_worktrees = Some(owner_decision_count);
+                view.owner_decision_error_code = None;
+            }
+            Some(sweep) => {
+                view.owner_decision_worktrees = None;
+                view.owner_decision_error_code = Some(
+                    sweep
+                        .error_code
+                        .as_deref()
+                        .map(disk_usage_error_code)
+                        .unwrap_or_else(|| "unavailable".to_owned()),
+                );
+            }
+            None => {
+                view.owner_decision_worktrees = None;
+                view.owner_decision_error_code = Some("busy".to_owned());
+            }
+        }
+        view
     }
 
     /// Retention and store-size visibility for `daemon.status`: the effective
@@ -595,16 +749,11 @@ fn retention_view_of(
         }
     };
     let known = config_error.is_none();
-    let events_seconds = known.then(|| retention.events_retention_seconds());
-    let processes_seconds = known.then(|| retention.processes_retention_seconds());
+    let events_seconds = retention.events_retention_seconds();
     let maintenance_interval_seconds =
         known.then(|| retention.maintenance_interval_seconds() as i64);
     let compact_on_start = known.then_some(retention.compact_on_start);
-    let unbounded = known
-        && events_seconds.is_none()
-        && processes_seconds.is_none()
-        && retention.commands_days.is_none()
-        && retention.mail_days.is_none();
+    let unbounded = known && retention.is_unbounded();
     let size_advisory = if unbounded
         && db_bytes.saturating_add(wal_bytes)
             > crate::config::RETENTION_UNBOUNDED_SIZE_ADVISORY_BYTES
@@ -614,11 +763,11 @@ fn retention_view_of(
         None
     };
     RetentionView {
-        events_days: known.then_some(retention.events_retention_days()).flatten(),
+        events_days: retention.events_days,
         commands_days: retention.commands_days,
         mail_days: retention.mail_days,
         events_seconds,
-        processes_seconds,
+        processes_seconds: retention.processes_seconds,
         maintenance_interval_seconds,
         compact_on_start,
         auto_vacuum_mode: space.auto_vacuum_mode,
@@ -631,4 +780,132 @@ fn retention_view_of(
         size_advisory,
         config_error,
     }
+}
+
+fn failed_disk_usage(code: &str) -> eliot_core::api::DiskUsageView {
+    let failed = || eliot_core::api::DiskUsageDirectory {
+        bytes: None,
+        error_code: Some(code.to_owned()),
+    };
+    eliot_core::api::DiskUsageView {
+        artifacts: failed(),
+        worktrees: failed(),
+        plugins: failed(),
+        owner_decision_worktrees: None,
+        owner_decision_error_code: Some(code.to_owned()),
+    }
+}
+
+fn disk_usage_error_code(code: &str) -> String {
+    if !code.trim().is_empty() && code.len() <= 64 {
+        code.to_owned()
+    } else {
+        "unavailable".to_owned()
+    }
+}
+
+fn failed_disk_usage_snapshot(code: &str) -> DiskUsageSnapshot {
+    let failed = || eliot_core::api::DiskUsageDirectory {
+        bytes: None,
+        error_code: Some(code.to_owned()),
+    };
+    DiskUsageSnapshot {
+        completed_at: Instant::now(),
+        artifacts: failed(),
+        worktrees: failed(),
+        plugins: failed(),
+    }
+}
+
+fn disk_usage_cache_entry(root: &Path) -> Arc<DiskUsageCacheEntry> {
+    let cache = DISK_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut entries = cache.lock_recover();
+    entries
+        .entry(root.to_path_buf())
+        .or_insert_with(|| Arc::new(DiskUsageCacheEntry::new()))
+        .clone()
+}
+
+fn disk_usage_directory(path: &Path) -> eliot_core::api::DiskUsageDirectory {
+    match disk_directory_bytes(path, None, None) {
+        Ok(bytes) => eliot_core::api::DiskUsageDirectory {
+            bytes: Some(bytes),
+            error_code: None,
+        },
+        Err(code) => eliot_core::api::DiskUsageDirectory {
+            bytes: None,
+            error_code: Some(code.to_owned()),
+        },
+    }
+}
+
+pub(super) fn disk_directory_bytes(
+    root: &Path,
+    expected_identity: Option<&str>,
+    deadline: Option<Instant>,
+) -> std::result::Result<u64, &'static str> {
+    use std::io::ErrorKind;
+
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound && expected_identity.is_none() => {
+            return Ok(0);
+        }
+        Err(_) => return Err("unavailable"),
+    };
+    if metadata.file_type().is_symlink() || crate::platform::is_reparse_point(&metadata) {
+        return Err("unsafe_path");
+    }
+    if !metadata.is_dir() {
+        return Err("not_directory");
+    }
+
+    let root_identity =
+        crate::platform::script_file::directory_identity(root).map_err(|_| "unavailable")?;
+    if expected_identity.is_some_and(|expected| expected != root_identity) {
+        return Err("identity_changed");
+    }
+    let mut pending = vec![(root.to_path_buf(), root_identity)];
+    let mut bytes = 0_u64;
+    while let Some((directory, expected_identity)) = pending.pop() {
+        let directory_metadata =
+            std::fs::symlink_metadata(&directory).map_err(|_| "unavailable")?;
+        if directory_metadata.file_type().is_symlink()
+            || crate::platform::is_reparse_point(&directory_metadata)
+        {
+            return Err("unsafe_path");
+        }
+        if !directory_metadata.is_dir() {
+            return Err("not_directory");
+        }
+        // Reopen without following links and compare the identity recorded
+        // when this directory was queued. On Windows the pinned chain also
+        // prevents replacement while its entries are enumerated.
+        let pinned =
+            crate::platform::script_file::Directory::open(&directory).map_err(|_| "unavailable")?;
+        if pinned.identity().map_err(|_| "unavailable")? != expected_identity {
+            return Err("identity_changed");
+        }
+        let entries = std::fs::read_dir(&directory).map_err(|_| "unavailable")?;
+        for entry in entries {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err("busy");
+            }
+            let path = entry.map_err(|_| "unavailable")?.path();
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| "unavailable")?;
+            if metadata.file_type().is_symlink() || crate::platform::is_reparse_point(&metadata) {
+                bytes = bytes.checked_add(metadata.len()).ok_or("overflow")?;
+            } else if metadata.is_dir() {
+                let identity = crate::platform::script_file::directory_identity(&path)
+                    .map_err(|_| "unavailable")?;
+                pending.push((path, identity));
+            } else {
+                // Count every non-directory entry, including hidden files and
+                // special files, by its own logical length. Link targets are
+                // never traversed.
+                bytes = bytes.checked_add(metadata.len()).ok_or("overflow")?;
+            }
+        }
+    }
+    Ok(bytes)
 }

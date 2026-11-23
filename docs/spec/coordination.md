@@ -56,8 +56,8 @@ Native stores are never deleted as files. A Codex or OpenCode session of a
 terminal Swarm-created Agent is `safe` with reason `native_archive_pending`.
 Attached or observed sessions and every other harness stay
 `keep(no_native_archive)`.
-Managed worktree cleanup, including direct `worktree.remove` and automatic
-cleanup, accepts clean checkouts on unmerged branches.
+Owner-initiated worktree cleanup and direct `worktree.remove` accept clean
+checkouts on unmerged branches. Age-based cleanup requires the merge proof below.
 After the existing terminal-owner, borrower, assignment, age, reciprocal Git
 identity, cleanliness and filesystem-guard checks pass, Swarm removes only the
 checkout and its private worktree administration directory. The local branch
@@ -223,22 +223,22 @@ confirmation (local deletions only, one mutation id per plan and selection until
 definite reply), and shows removed, kept-with-reason and unknown outcomes. The plan
 has no Owner per-Agent scope, so there is no per-task cleanup entry.
 
-The daemon's automatic sweep pages through recorded owned artifacts of finished
+The daemon's automatic sweep pages through recorded owned directories of finished
 Agent generations and uses the same guarded cleanup path.
 Manual previews can backfill older ownership records. The [Owner settings]
-(configuration.md#daemon-and-automation-settings) control the age and enablement. Both
-the artifact and its exact finished generation must be older than the configured
-window. Archived Agents and their artifacts stay protected from automatic cleanup.
-An omitted `automation.auto_cleanup` runs plan-only pages, retaining no plans for
-apply and reserving no apply. Explicit `true` applies only after the first complete
-plan-only sweep of each daemon startup. Explicit `false` disables automatic
-planning and apply. Each completed paged
+(configuration.md#daemon-and-automation-settings) control the age and enablement.
+Both the directory record and its exact finished generation must be older than
+the configured window. Automatic apply starts after the first complete plan-only
+sweep of each daemon startup. Each completed paged
 sweep updates aggregate status and sends one Owner `notify` with would-remove and
 kept totals and enablement; intermediate pages do not send notices. Per-item
-`cleanup.automatic` reason events remain available. The sweep keeps dirty
-worktrees and their generation's artifacts.
+`cleanup.automatic` reason events remain available.
 Eligible paths include managed worktrees, recorded per-generation plugin directories,
-and artifacts under exact Swarm-created generation roots. A generation root can be
+and artifacts under exact Swarm-created generation roots, including archived terminal
+Agents. Automatic worktree removal requires a clean checkout and a local Git ancestry
+proof that the current base contains the branch. Dirty or unmerged worktrees are
+kept with their sizes for the Owner. Disjoint owned artifacts can age out independently.
+A generation root can be
 removed when its creation identity is still bound, its registered descendants are
 settled, and the guarded scan of its contents succeeds. Branches, project registrations
 and native sessions require an explicit cleanup request. Status reports the policy

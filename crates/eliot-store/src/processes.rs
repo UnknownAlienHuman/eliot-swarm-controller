@@ -5,6 +5,24 @@ use eliot_core::api::process_state_name;
 const CHILD_ROLE: &str = "child";
 
 impl Store {
+    pub fn child_process_counts(&self, owner: &str) -> Result<eliot_core::api::ChildProcessCounts> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) + COALESCE((SELECT observed FROM child_process_counts WHERE owner = ?1), 0),
+                        COALESCE(SUM(state = 'exited'), 0)
+                        + COALESCE((SELECT exited FROM child_process_counts WHERE owner = ?1), 0)
+                 FROM processes WHERE owner = ?1 AND (role = 'child' OR observed_as_child = 1)",
+                [owner],
+                |row| {
+                    Ok(eliot_core::api::ChildProcessCounts {
+                        observed: row.get(0)?,
+                        exited: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(sql_error)
+    }
+
     pub(super) fn observe_processes_inner(
         &mut self,
         agent: &str,
@@ -60,7 +78,8 @@ impl Store {
                 "INSERT INTO processes(host_boot_id, pid, start_time, owner, role, state, exit_code, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(host_boot_id, pid, start_time) DO UPDATE
-                 SET role = excluded.role, state = excluded.state,
+                 SET observed_as_child = observed_as_child OR (processes.role = 'child' AND excluded.role <> 'child'),
+                     role = excluded.role, state = excluded.state,
                      exit_code = excluded.exit_code, updated_at = excluded.updated_at",
                 params![
                     next.identity.host_boot_id, next.identity.pid, start_time, next.owner,

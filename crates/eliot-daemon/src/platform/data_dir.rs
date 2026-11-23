@@ -205,6 +205,43 @@ pub fn read_only_stand_exists(root: &Path) -> Result<bool> {
 }
 
 impl DataDir {
+    pub(crate) fn initialize_retention_config(&self, lock: &DaemonLock) -> Result<()> {
+        if lock.root != self.path {
+            return Err(Error::new(
+                "invalid",
+                "daemon lock belongs to another data directory",
+            ));
+        }
+        for name in ["eliot.db", "config.toml"] {
+            match fs::symlink_metadata(self.path.join(name)) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error("inspect retention configuration", error)),
+            }
+        }
+        let target = self.path.join("config.toml");
+        let temporary = self
+            .path
+            .join(format!(".config.toml.{}.tmp", ulid::Ulid::new()));
+        let mut file = create_new_private_file(&temporary)
+            .map_err(|error| io_error("create retention configuration", error))?;
+        let result = (|| {
+            file.write_all(crate::config::NEW_STORE_RETENTION_CONFIG.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|error| io_error("write retention configuration", error))?;
+            drop(file);
+            // Publish without replacing a config the Owner supplied in the meantime.
+            match fs::hard_link(&temporary, &target) {
+                Ok(()) => sync_directory(&self.path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                Err(error) => Err(io_error("publish retention configuration", error)),
+            }
+        })();
+        let removed = fs::remove_file(temporary)
+            .map_err(|error| io_error("remove temporary retention configuration", error));
+        result.and(removed)
+    }
+
     /// Open or initialize a private data root and its persistent owner token.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = absolute_path(path.as_ref())?;
@@ -1079,9 +1116,8 @@ pub(crate) fn replace_private_file(dir: &Path, name: &str, bytes: &[u8]) -> Resu
     replace_file_atomically(dir, name, bytes, true)
 }
 
-/// The daemon is the only writer of the private MCP handoff. Scan only while
-/// holding its lock and before taking commands, so a live write cannot lose
-/// its temporary file. The plugin receives only the published file.
+/// Clear daemon-owned MCP startup leftovers under the lock and before any
+/// new tunnel or plugin can publish its configuration.
 pub(crate) fn remove_abandoned_mcp_temps(data: &DataDir, lock: &DaemonLock) -> Result<()> {
     if lock.root != data.path {
         return Err(Error::new(
@@ -1089,9 +1125,29 @@ pub(crate) fn remove_abandoned_mcp_temps(data: &DataDir, lock: &DaemonLock) -> R
             "daemon lock belongs to another data directory",
         ));
     }
-    let plugins = fs::canonicalize(data.path())
-        .map_err(|error| io_error("resolve data directory", error))?
-        .join("plugins");
+    let root =
+        fs::canonicalize(data.path()).map_err(|error| io_error("resolve data directory", error))?;
+    for entry in fs::read_dir(&root).map_err(|error| io_error("read data directory", error))? {
+        let entry = entry.map_err(|error| io_error("read data directory entry", error))?;
+        let name = entry.file_name();
+        let is_tunnel_config = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(".cloud-mcp-")?.strip_suffix(".yml"))
+            .is_some_and(|id| ulid::Ulid::from_string(id).is_ok());
+        if is_tunnel_config
+            && entry
+                .file_type()
+                .map_err(|error| io_error("inspect abandoned Cloud MCP config", error))?
+                .is_file()
+        {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(io_error("remove abandoned Cloud MCP config", error)),
+            }
+        }
+    }
+    let plugins = root.join("plugins");
     let metadata = match fs::symlink_metadata(&plugins) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),

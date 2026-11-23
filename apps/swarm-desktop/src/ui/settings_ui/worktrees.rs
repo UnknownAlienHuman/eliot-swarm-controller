@@ -37,6 +37,21 @@ impl DesktopApp {
                     .is_text_selection_enabled(true),
             ));
         }
+        if state.cleanup_plan.is_some() || state.cleanup_result.is_some() {
+            let usage = state
+                .cleanup_disk_usage
+                .as_ref()
+                .map(crate::worktrees::disk_usage_line)
+                .unwrap_or_else(|| {
+                    "Disk totals unavailable; review cleanup again to refresh.".to_owned()
+                });
+            parts.push(KeyedView::new(
+                "disk-usage",
+                m3::secondary(usage)
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true),
+            ));
+        }
         if let Some((plan, reply)) = &state.cleanup_result {
             let lines = crate::worktrees::result_lines(plan, reply, &title);
             let rows: Vec<KeyedView> = lines

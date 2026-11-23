@@ -2069,6 +2069,172 @@ fn remove_empty_instance_dir(path: &Path) {
     let _ = std::fs::remove_dir(path);
 }
 
+/// Remove one registered plugin instance only after its exact generation is
+/// terminal and quiescent.
+/// The filesystem operation remains empty-only and follows both path and inode
+/// custody checks so plugin data and substituted directories are preserved.
+async fn remove_empty_instance_dir_after_generation_end(
+    state: &Weak<HostState>,
+    key: &AgentKey,
+    path: &Path,
+    start_command_id: &str,
+    progress: &mut watch::Receiver<u64>,
+) {
+    let Some(host_state) = state.upgrade() else {
+        return;
+    };
+    let Ok(data_root) = std::fs::canonicalize(&host_state.data_root) else {
+        return;
+    };
+    let plugin_root_path = host_state.data_root.join("plugins");
+    if crate::git_monitor::reject_links(&plugin_root_path).is_err() {
+        return;
+    }
+    let Ok(plugin_root) = std::fs::canonicalize(&plugin_root_path) else {
+        return;
+    };
+    if crate::git_monitor::reject_links(&plugin_root).is_err()
+        || plugin_root.parent() != Some(data_root.as_path())
+        || plugin_root.file_name().and_then(|name| name.to_str()) != Some("plugins")
+    {
+        return;
+    }
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return;
+    };
+    if crate::git_monitor::reject_links(&path).is_err()
+        || path.parent() != Some(plugin_root.as_path())
+    {
+        return;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let prefix = format!("{}-g{}-", key.id, key.generation);
+    let Some(instance_id_text) = name.strip_prefix(&prefix) else {
+        return;
+    };
+    let Ok(instance_id) = Ulid::from_string(instance_id_text) else {
+        return;
+    };
+    if instance_id.to_string() != instance_id_text {
+        return;
+    }
+    let path_text = path.to_string_lossy().into_owned();
+    let Ok(identity) = crate::platform::script_file::directory_identity(&path) else {
+        return;
+    };
+    let settle_deadline = Instant::now() + STOP_GRACE;
+    loop {
+        let Some(host_state) = state.upgrade() else {
+            return;
+        };
+        let mut store = host_state.store.lock().await;
+        let Ok(Some(agent)) = store.get_agent(&key.id) else {
+            return;
+        };
+        if agent.generation != key.generation {
+            return;
+        }
+        let start_pending = store
+            .get_command(start_command_id)
+            .ok()
+            .flatten()
+            .is_some_and(|command| !command.state.is_terminal());
+        let stop_pending = store
+            .generation_has_open_stop(&key.id, key.generation)
+            .unwrap_or(false);
+        let cleanup_terminal = agent.state == eliot_core::AgentState::Stopped
+            || agent.state == eliot_core::AgentState::Failed
+            || (agent.is_automatic_provider_probe() && agent.state == eliot_core::AgentState::Lost);
+        if !cleanup_terminal {
+            if !start_pending && !stop_pending {
+                return;
+            }
+            drop(store);
+            if !matches!(
+                timeout_at(settle_deadline, progress.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            continue;
+        }
+        let Ok(Some(artifact)) = store.known_artifact_path(&path_text) else {
+            return;
+        };
+        if artifact.agent != key.id
+            || artifact.generation != key.generation
+            || artifact.kind != ArtifactKind::Other
+            || artifact.purpose != "Swarm plugin instance directory"
+            || artifact.path != path_text
+            || artifact.identity != identity
+            || artifact.state != "registered"
+        {
+            return;
+        }
+        if !store.cleanup_agent_quiescent(&artifact).unwrap_or(false) {
+            drop(store);
+            if !matches!(
+                timeout_at(settle_deadline, progress.changed()).await,
+                Ok(Ok(()))
+            ) {
+                return;
+            }
+            continue;
+        }
+        if crate::git_monitor::reject_links(&path).is_err()
+            || std::fs::canonicalize(&path).ok().as_deref() != Some(path.as_path())
+            || crate::platform::script_file::directory_identity(&path)
+                .ok()
+                .as_deref()
+                != Some(artifact.identity.as_str())
+        {
+            return;
+        }
+        match std::fs::remove_dir(&path) {
+            Ok(()) => {
+                if let Err(error) = store.settle_empty_plugin_instance_removal(&artifact) {
+                    record_plugin_instance_cleanup_error(&host_state, key, &error);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = store.settle_empty_plugin_instance_removal(&artifact) {
+                    record_plugin_instance_cleanup_error(&host_state, key, &error);
+                }
+            }
+            Err(error) => {
+                let nonempty = std::fs::read_dir(&path)
+                    .ok()
+                    .is_some_and(|mut entries| entries.next().is_some());
+                if !nonempty {
+                    let error = Error::new(
+                        "platform_io",
+                        format!("remove empty plugin instance directory: {error}"),
+                    );
+                    record_plugin_instance_cleanup_error(&host_state, key, &error);
+                }
+            }
+        }
+        return;
+    }
+}
+
+fn record_plugin_instance_cleanup_error(state: &HostState, key: &AgentKey, error: &Error) {
+    let secrets: Vec<_> = state.secrets.lock_recover().iter().cloned().collect();
+    let policy = eliot_core::SecretPolicy::new(secrets);
+    let generation = key.generation.to_string();
+    crate::logging::record(
+        &policy,
+        "daemon.plugin_instance_cleanup_failed",
+        &[
+            ("agent", key.id.as_str()),
+            ("generation", generation.as_str()),
+        ],
+        Some(error),
+    );
+}
+
 async fn run_agent(
     actor: AgentActorConfig,
     child: OwnedChild,
@@ -2080,6 +2246,12 @@ async fn run_agent(
 ) {
     let credentials = Arc::clone(&actor.source_credentials);
     let key = actor.key.clone();
+    let state = actor.state.clone();
+    let instance_dir = PathBuf::from(actor.instance_dir.clone());
+    let start_command_id = actor.start_command.id.clone();
+    let mut progress = state
+        .upgrade()
+        .map(|host_state| host_state.progress.subscribe());
     let stderr = actor.stderr.clone();
     let mut stderr_capture = Some(stderr_capture);
     let mut failure = None;
@@ -2115,6 +2287,16 @@ async fn run_agent(
         if let Some(reply) = failure.reply {
             let _ = reply.send(Err(error));
         }
+    }
+    if let Some(progress) = progress.as_mut() {
+        remove_empty_instance_dir_after_generation_end(
+            &state,
+            &key,
+            &instance_dir,
+            &start_command_id,
+            progress,
+        )
+        .await;
     }
 }
 

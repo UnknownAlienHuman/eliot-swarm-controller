@@ -21,6 +21,7 @@ pub struct TimerSlotCommit {
     pub action: Option<SubmitCommand>,
     pub skip_code: Option<String>,
     pub skip_capacity_message: Option<String>,
+    pub idle_assignment: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -637,7 +638,9 @@ impl Store {
             // The cursor records every slot. A repeated bare outcome adds
             // nothing to the event history, while capacity diagnostics can
             // carry new detail even when their reason code is unchanged.
-            if outcome != stored.view.last_outcome || slot.skip_capacity_message.is_some() {
+            if !slot.idle_assignment
+                && (outcome != stored.view.last_outcome || slot.skip_capacity_message.is_some())
+            {
                 let mut data = json!({
                     "rule": state.id,
                     "schedule_revision": state.schedule_revision,

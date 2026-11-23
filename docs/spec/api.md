@@ -3123,6 +3123,7 @@ swarm stand prune
 swarm status
 swarm autonomy [--since TIME] [--json]
 swarm store compact
+swarm maintenance compact
 swarm cleanup plan [--after TOKEN]
 swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]

@@ -1301,6 +1301,8 @@ pub(crate) struct MaintenanceArgs {
 pub(crate) enum MaintenanceCommand {
     /// Run one bounded retention pass now and report pruned counts.
     Run,
+    /// Compact an existing Store offline and enable incremental vacuum.
+    Compact,
     /// Preview owner-sent legacy attention advisory mail; apply only with the exact preview count.
     PurgeLegacyAttentionAdvisories(PurgeLegacyAttentionAdvisoriesArgs),
 }

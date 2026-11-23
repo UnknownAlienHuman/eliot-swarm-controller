@@ -369,7 +369,13 @@ pub fn write_stand_record(path: &Path, name: &str, bytes: &[u8]) -> Result<()> {
 }
 
 pub fn write_stand_config(root: &Path, bytes: &[u8]) -> Result<()> {
-    crate::platform::data_dir::replace_private_file(root, "config.toml", bytes)
+    let config = [
+        bytes,
+        b"\n",
+        crate::config::NEW_STORE_RETENTION_CONFIG.as_bytes(),
+    ]
+    .concat();
+    crate::platform::data_dir::replace_private_file(root, "config.toml", &config)
 }
 
 pub fn daemon_alive(info: &DaemonInfo) -> Result<bool> {

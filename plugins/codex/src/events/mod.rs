@@ -231,17 +231,11 @@ struct EventProcessor {
     usage_window: ContextWindowTracker,
     /// Latest merged session-scoped snapshot from
     /// `thread/tokenUsage/updated`: the cumulative per-thread `total` and
-    /// `modelContextWindow` capacity. Never turn expenditure; committed as
-    /// `session.usage` when accepted and replaced wholesale on every newer
-    /// update.
+    /// `modelContextWindow` capacity. Never turn expenditure; reported to the
+    /// live projection on every newer update.
     session_usage: Option<SessionUsage>,
-    /// Last committed session snapshot content. Each accepted update commits
-    /// the retained snapshot only when it differs, so repeats commit no
-    /// extra session fact.
-    session_usage_committed: Option<SessionUsage>,
-    /// Monotonic counter for `session.usage` native ids so each accepted
-    /// update commits under a unique identity.
-    session_usage_seq: u64,
+    /// Exact active turn that supplied the latest sample, if any.
+    session_usage_turn: Option<String>,
     /// Unique native id sequence for transient retry/error notices.
     notice_seq: u64,
     native_scope: String,
@@ -452,8 +446,7 @@ impl EventProcessor {
             thread_model: None,
             usage_window: ContextWindowTracker::default(),
             session_usage: None,
-            session_usage_committed: None,
-            session_usage_seq: 0,
+            session_usage_turn: None,
             notice_seq: 0,
             native_scope: config.native_scope.clone(),
             child_bindings: HashMap::new(),
@@ -1941,10 +1934,10 @@ impl EventProcessor {
     /// `total` cannot anchor the robust difference, so it leaves the turn
     /// baseline alone. The cumulative per-thread `total` and
     /// `modelContextWindow` capacity always merge into the retained session
-    /// snapshot after exact thread validation and commit as `session.usage`
-    /// when the snapshot changed: session-scoped facts, never turn
-    /// expenditure. Structural mismatch (wrong thread, malformed body) gaps
-    /// like any other notification arm.
+    /// snapshot after exact thread validation and update the live projection.
+    /// The terminal writes one `session.usage` event; session facts never
+    /// become turn expenditure. Structural mismatch (wrong thread, malformed
+    /// body) gaps like any other notification arm.
     async fn note_token_usage(&mut self, params: &Value) -> Result<()> {
         let notification: NativeThreadTokenUsageUpdatedNotification =
             serde_json::from_value(params.clone()).map_err(|_| {
@@ -1976,6 +1969,13 @@ impl EventProcessor {
                 }
             }
         }
+        let sample_turn = self.status.active_turn_id.clone();
+        if sample_turn
+            .as_deref()
+            .is_some_and(|turn| turn != notification.turn_id)
+        {
+            return Ok(());
+        }
         let Some(merged) = session_usage_from_token_usage(
             &notification.token_usage,
             self.session_usage.as_ref(),
@@ -1984,20 +1984,15 @@ impl EventProcessor {
         ) else {
             return Ok(());
         };
-        self.session_usage = Some(merged.clone());
-        if self.session_usage_committed.as_ref() == Some(&merged) {
+        if self.session_usage.as_ref() == Some(&merged) && self.session_usage_turn == sample_turn {
             return Ok(());
         }
-        self.session_usage_seq = self.session_usage_seq.wrapping_add(1);
-        let native_id = event_id(
-            self.status.thread_id.as_deref().unwrap_or_default(),
-            &notification.turn_id,
-            &format!("session-{}", self.session_usage_seq),
-            "session.usage",
-        )?;
-        self.commit_event("session.usage", native_id, json!({"usage": merged}))
-            .await?;
-        self.session_usage_committed = Some(merged);
+        self.session_usage = Some(merged.clone());
+        self.session_usage_turn = sample_turn.clone();
+        let _ = self
+            .stream_source()
+            .report_session_usage_sample(merged, sample_turn.as_deref())
+            .await;
         Ok(())
     }
 
@@ -2024,6 +2019,7 @@ impl EventProcessor {
             self.record_unclassified_native("codex.native_rpc.turn_status", &native_status)
                 .await?;
         }
+        let completed_turn_id = notification.turn.id.clone();
         self.settle_spawn_window();
         if notification.turn.status == NativeTurnStatus::InProgress {
             return self
@@ -2106,17 +2102,16 @@ impl EventProcessor {
         )?;
         self.close_open_tools(&notification.turn.id, &command_id)
             .await?;
-        if let Err(error) = self.commit_event("turn.completed", native_id, data).await {
-            if error.failure_where.as_deref() != Some("plugin.events.put") {
-                return Err(error);
+        let terminal_committed = match self.commit_event("turn.completed", native_id, data).await {
+            Ok(()) => true,
+            Err(error) if error.failure_where.as_deref() == Some("plugin.events.put") => {
+                // The host owns the gap. The terminal notification still proves
+                // these native handles can be released.
+                self.status.source_unknown = true;
+                false
             }
-            // The host owns the gap. The terminal notification still proves
-            // these native handles can be released.
-            self.status.source_unknown = true;
-        }
-        // Session facts already committed when each update was accepted, so
-        // the terminal carries turn scope only and never re-commits session
-        // scope.
+            Err(error) => return Err(error),
+        };
         let closed_requests = self
             .transport_requests
             .iter()
@@ -2141,6 +2136,20 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        if terminal_committed
+            && self.session_usage_turn.as_deref() == Some(completed_turn_id.as_str())
+            && let Some(usage) = self.session_usage.clone()
+        {
+            let native_id = event_id(
+                self.status.thread_id.as_deref().unwrap_or_default(),
+                &completed_turn_id,
+                "session",
+                "session.usage",
+            )?;
+            self.commit_event("session.usage", native_id, json!({"usage": usage}))
+                .await?;
+            self.session_usage_turn = None;
+        }
         Ok(())
     }
 

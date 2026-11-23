@@ -28,7 +28,8 @@ pub(crate) fn remove_dir_all(path: &Path) -> std::io::Result<()> {
 
 #[derive(Default)]
 pub(super) struct AutomaticCleanupState {
-    kept_reasons: HashMap<String, String>,
+    kept_reasons: HashMap<String, (ArtifactKind, String, Option<u64>)>,
+    owner_decision_worktrees: usize,
     first_sweep_complete: bool,
     active_sweep: Option<AutomaticCleanupProgress>,
     last_sweep: Option<eliot_core::api::AutomaticCleanupSweep>,
@@ -37,6 +38,7 @@ pub(super) struct AutomaticCleanupState {
 #[derive(Default)]
 struct AutomaticCleanupProgress {
     summary: eliot_core::api::AutomaticCleanupSweep,
+    owner_decision_worktrees: usize,
 }
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 const SWARM_ARTIFACT_ROOT_PURPOSE: &str = "Swarm artifact root";
@@ -141,7 +143,7 @@ pub(super) fn swarm_preparation_failure(mut error: Error, where_: &str, evidence
 }
 
 impl Router {
-    pub(super) fn automatic_cleanup_view(&self) -> eliot_core::api::AutomaticCleanupView {
+    pub(super) fn automatic_cleanup_view(&self) -> (eliot_core::api::AutomaticCleanupView, usize) {
         let (policy, enabled, after, config_error) =
             match crate::config::load_automation_config(&self.inner.data_root) {
                 Ok(config) => {
@@ -165,14 +167,15 @@ impl Router {
                 ),
             };
         let state = self.inner.automatic_cleanup.lock_recover();
-        eliot_core::api::AutomaticCleanupView {
+        let view = eliot_core::api::AutomaticCleanupView {
             policy,
             enabled,
             startup_plan_only_pending: !state.first_sweep_complete,
             after,
             config_error,
             last_sweep: state.last_sweep.clone(),
-        }
+        };
+        (view, state.owner_decision_worktrees)
     }
 
     fn automatic_cleanup_failed(&self, error: &Error) {
@@ -239,11 +242,13 @@ impl Router {
                     "removed" => sweep.removed += 1,
                     "kept" => {
                         sweep.kept += 1;
-                        if state
-                            .kept_reasons
-                            .get(&item.artifact.id)
-                            .is_some_and(|prior| prior == reason)
-                        {
+                        if state.kept_reasons.get(&item.artifact.id).is_some_and(
+                            |(prior_kind, prior_reason, prior_bytes)| {
+                                *prior_kind == item.artifact.kind
+                                    && prior_reason == reason
+                                    && prior_bytes == &item.bytes
+                            },
+                        ) {
                             continue;
                         }
                     }
@@ -251,7 +256,8 @@ impl Router {
                 }
                 keep_updates.push((
                     item.artifact.id.clone(),
-                    (outcome == "kept").then(|| reason.to_owned()),
+                    (outcome == "kept")
+                        .then(|| (item.artifact.kind, reason.to_owned(), item.bytes)),
                 ));
                 changed.push(json!({
                     "artifact_id": item.artifact.id,
@@ -261,6 +267,7 @@ impl Router {
                     "path": policy.redact_bounded(&item.artifact.path, 384),
                     "outcome": outcome,
                     "reason": reason,
+                    "bytes": item.bytes,
                     "bytes_reclaimed": bytes,
                 }));
             }
@@ -274,14 +281,14 @@ impl Router {
             self.publish_locked(&[event]);
         }
         let mut state = self.inner.automatic_cleanup.lock_recover();
-        for (id, reason) in keep_updates {
-            if let Some(reason) = reason {
+        for (id, retained) in keep_updates {
+            if let Some(retained) = retained {
                 // Keep only one reason per retained artifact, with a bound
                 // matching the size of the artifact ledger.
                 if state.kept_reasons.len() >= 4096 && !state.kept_reasons.contains_key(&id) {
                     state.kept_reasons.clear();
                 }
-                state.kept_reasons.insert(id, reason);
+                state.kept_reasons.insert(id, retained);
             } else {
                 state.kept_reasons.remove(&id);
             }
@@ -289,11 +296,47 @@ impl Router {
         Ok(sweep)
     }
 
+    fn owner_decision_worktree_page_count(
+        plan: &CleanupPlan,
+        applied: Option<&CleanupApplyResponse>,
+    ) -> usize {
+        plan.items
+            .iter()
+            .filter(|item| {
+                if item.artifact.kind != ArtifactKind::Worktree {
+                    return false;
+                }
+                if item.verdict != "safe" {
+                    return Self::owner_decision_reason(&item.reason);
+                }
+                applied
+                    .and_then(|response| {
+                        response
+                            .items
+                            .iter()
+                            .find(|outcome| outcome.artifact_id == item.artifact.id)
+                    })
+                    .is_some_and(|outcome| {
+                        outcome.outcome == "skipped"
+                            && outcome
+                                .reason
+                                .as_deref()
+                                .is_some_and(Self::owner_decision_reason)
+                    })
+            })
+            .count()
+    }
+
+    fn owner_decision_reason(reason: &str) -> bool {
+        matches!(reason, "dirty" | "unmerged" | "untracked_or_ignored")
+    }
+
     fn accumulate_automatic_cleanup_page(
         &self,
         page: AutomaticCleanupSweep,
         first_page: bool,
         complete: bool,
+        owner_decision_worktrees: usize,
     ) -> Option<AutomaticCleanupSweep> {
         let mut state = self.inner.automatic_cleanup.lock_recover();
         if first_page {
@@ -302,6 +345,7 @@ impl Router {
                     plan_only: true,
                     ..Default::default()
                 },
+                owner_decision_worktrees: 0,
             });
         }
         let progress = state
@@ -311,6 +355,7 @@ impl Router {
                     plan_only: true,
                     ..Default::default()
                 },
+                owner_decision_worktrees: 0,
             });
         progress.summary.finished_at = page.finished_at;
         progress.summary.enabled = page.enabled;
@@ -319,10 +364,14 @@ impl Router {
         progress.summary.removed += page.removed;
         progress.summary.kept += page.kept;
         progress.summary.unknown += page.unknown;
+        progress.owner_decision_worktrees = progress
+            .owner_decision_worktrees
+            .saturating_add(owner_decision_worktrees);
         if !complete {
             return None;
         }
         let summary = progress.summary.clone();
+        state.owner_decision_worktrees = progress.owner_decision_worktrees;
         state.active_sweep = None;
         state.last_sweep = Some(summary.clone());
         Some(summary)
@@ -1044,46 +1093,6 @@ impl Router {
         }
     }
 
-    async fn automatic_cleanup_worktree_keep_reason(
-        &self,
-        agent: &Agent,
-    ) -> Result<Option<String>> {
-        let artifact = {
-            let store = self.inner.store.lock().await;
-            let Some(workspace) = store.get_workspace(&agent.id)? else {
-                return Ok(agent
-                    .workspace_phase
-                    .is_some()
-                    .then(|| "worktree_unverifiable".to_owned()));
-            };
-            if workspace.target_generation != agent.generation {
-                return Ok(Some("worktree_generation_changed".to_owned()));
-            }
-            if workspace.phase == WorkspacePhase::Removed {
-                return Ok(None);
-            }
-            let Some(artifact) = store.known_artifact_path(&workspace.worktree_path)? else {
-                return Ok(Some("worktree_unverifiable".to_owned()));
-            };
-            if artifact.kind != ArtifactKind::Worktree
-                || artifact.agent != agent.id
-                || artifact.generation != agent.generation
-                || artifact.path != workspace.worktree_path
-                || artifact.state != "registered"
-            {
-                return Ok(Some("worktree_unverifiable".to_owned()));
-            }
-            artifact
-        };
-        if let Err(error) = self.current_managed_worktree_path(&artifact.path) {
-            return Ok(Some(error.code));
-        }
-        match self.worktree_cleanup_preflight(&artifact).await {
-            Ok(_) => Ok(None),
-            Err(error) => Ok(Some(error.code)),
-        }
-    }
-
     async fn automatic_cleanup_keep_reason(
         &self,
         artifact: &ArtifactView,
@@ -1098,9 +1107,6 @@ impl Router {
             };
             if agent.generation != artifact.generation {
                 return Ok(Some("stale_generation".to_owned()));
-            }
-            if agent.archived {
-                return Ok(Some("archived".to_owned()));
             }
             if !agent.state.is_terminal() {
                 return Ok(Some("agent_not_terminal".to_owned()));
@@ -1146,13 +1152,6 @@ impl Router {
             ArtifactKind::Branch | ArtifactKind::NativeSession
         ) {
             return Ok(Some("manual_only".to_owned()));
-        }
-        if artifact.kind != ArtifactKind::Worktree {
-            match self.automatic_cleanup_worktree_keep_reason(&agent).await {
-                Ok(Some(reason)) => return Ok(Some(reason)),
-                Err(error) => return Ok(Some(error.code)),
-                Ok(None) => {}
-            }
         }
         match self
             .automatic_cleanup_path_is_managed(&agent, artifact, allow_fenced_root)
@@ -1406,6 +1405,7 @@ impl Router {
             {
                 break;
             }
+            let mut retention_reason = None;
             if let Some(retention_ms) = auto_cleanup_after_ms {
                 match self
                     .automatic_cleanup_keep_reason(
@@ -1417,9 +1417,18 @@ impl Router {
                     .await
                 {
                     Ok(Some(reason)) => {
-                        candidate.reason = reason;
-                        middle.push(candidate);
-                        continue;
+                        if auto_cleanup
+                            && candidate.artifact.kind == ArtifactKind::Worktree
+                            && reason == "retention_age"
+                        {
+                            // Classify age-ineligible worktrees too, so dirty
+                            // and unmerged work remains visible with its size.
+                            retention_reason = Some(reason);
+                        } else {
+                            candidate.reason = reason;
+                            middle.push(candidate);
+                            continue;
+                        }
                     }
                     Err(error) => {
                         candidate.reason = error.code;
@@ -1445,7 +1454,14 @@ impl Router {
                 {
                     break;
                 }
-                self.classify_worktree(&mut candidate).await;
+                self.classify_worktree(&mut candidate, auto_cleanup).await;
+                if candidate.verdict == "safe"
+                    && let Some(reason) = retention_reason
+                {
+                    candidate.verdict = "keep".to_owned();
+                    candidate.reason = reason;
+                    candidate.bytes = self.cleanup_worktree_bytes(&candidate.artifact).await;
+                }
             } else if candidate.artifact.kind == ArtifactKind::Branch {
                 let Some(git) = candidate.artifact.git.as_ref() else {
                     candidate.reason = "source_integrity".to_owned();
@@ -1661,24 +1677,94 @@ impl Router {
         Ok(after)
     }
 
-    async fn classify_worktree(&self, candidate: &mut CleanupCandidate) {
+    async fn classify_worktree(&self, candidate: &mut CleanupCandidate, require_merged: bool) {
         if candidate.artifact.state != "registered" {
             candidate.reason = candidate.artifact.state.clone();
             return;
         }
-        match self.worktree_cleanup_preflight(&candidate.artifact).await {
+        let preflight = if require_merged {
+            self.worktree_cleanup_preflight_with_mode(&candidate.artifact, true)
+                .await
+        } else {
+            self.worktree_cleanup_preflight(&candidate.artifact).await
+        };
+        match preflight {
             Ok(tip) => {
+                if require_merged
+                    && let Err(error) = self
+                        .automatic_cleanup_worktree_merged(&candidate.artifact, &tip)
+                        .await
+                {
+                    candidate.reason = error.code;
+                    candidate.bytes = self.cleanup_worktree_bytes(&candidate.artifact).await;
+                    return;
+                }
                 if let Some(git) = candidate.artifact.git.as_mut() {
                     git.planned_tip = Some(tip);
                 }
                 candidate.verdict = "safe".to_owned();
                 candidate.reason = "clean_worktree".to_owned();
             }
-            Err(error) => candidate.reason = error.code,
+            Err(error) => {
+                candidate.reason = if require_merged
+                    && error.code == "not_allowed"
+                    && error.message.as_ref()
+                        == "untracked or ignored file lies outside allowed scratch"
+                {
+                    "untracked_or_ignored".to_owned()
+                } else {
+                    error.code
+                };
+                candidate.bytes = self.cleanup_worktree_bytes(&candidate.artifact).await;
+            }
         }
     }
 
+    async fn cleanup_worktree_bytes(&self, artifact: &ArtifactView) -> Option<u64> {
+        let path = self.current_managed_worktree_path(&artifact.path).ok()?;
+        let identity = artifact.identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            super::status::disk_directory_bytes(&path, Some(&identity), Some(deadline)).ok()
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// The automatic retention worker requires a fresh merged-branch proof.
+    /// Owner cleanup plans remain governed by the clean-worktree rule alone.
+    async fn automatic_cleanup_worktree_merged(
+        &self,
+        artifact: &ArtifactView,
+        expected_tip: &str,
+    ) -> Result<()> {
+        let preparation = self
+            .inner
+            .store
+            .lock()
+            .await
+            .workspace_removal_eligibility(&artifact.agent, now_ms())?;
+        check_worktree_artifact(artifact, &preparation)?;
+        crate::workspace_git::WorkspaceGit::new()?
+            .require_automatic_removal_merge(
+                &preparation,
+                expected_tip,
+                Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
+            )
+            .await
+    }
+
     async fn worktree_cleanup_preflight(&self, artifact: &ArtifactView) -> Result<String> {
+        self.worktree_cleanup_preflight_with_mode(artifact, false)
+            .await
+    }
+
+    async fn worktree_cleanup_preflight_with_mode(
+        &self,
+        artifact: &ArtifactView,
+        automatic: bool,
+    ) -> Result<String> {
         if !cfg!(windows) {
             return Err(Error::new(
                 "unsupported",
@@ -1701,13 +1787,18 @@ impl Router {
         };
         check_worktree_artifact(artifact, &preparation)?;
         let git = crate::workspace_git::WorkspaceGit::new()?;
+        let removal_profile = if automatic {
+            serde_json::json!({"scratch": []})
+        } else {
+            profile
+        };
         let preflight = self
             .inner
             .workspaces
             .removal_candidates(
                 &git,
                 &preparation,
-                &profile,
+                &removal_profile,
                 None,
                 Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
             )
@@ -1854,10 +1945,15 @@ impl Router {
                 plan_only,
             )
             .await?;
+        let owner_decision_worktrees =
+            Self::owner_decision_worktree_page_count(&plan, applied.as_ref());
         *after = plan.continuation.clone();
-        if let Some(sweep) =
-            self.accumulate_automatic_cleanup_page(page, first_page, plan.continuation.is_none())
-        {
+        if let Some(sweep) = self.accumulate_automatic_cleanup_page(
+            page,
+            first_page,
+            plan.continuation.is_none(),
+            owner_decision_worktrees,
+        ) {
             self.notify_automatic_cleanup_sweep(&sweep).await?;
             self.inner
                 .automatic_cleanup
@@ -1892,6 +1988,17 @@ impl Router {
             .await?
         {
             return Err(Error::new(reason, "automatic cleanup eligibility changed"));
+        }
+        if artifact.kind == ArtifactKind::Worktree {
+            let expected_tip = artifact
+                .git
+                .as_ref()
+                .and_then(|git| git.planned_tip.as_deref())
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "automatic worktree plan has no tip")
+                })?;
+            self.automatic_cleanup_worktree_merged(artifact, expected_tip)
+                .await?;
         }
         Ok(())
     }
@@ -2083,6 +2190,17 @@ impl Router {
                 self.cleanup_remove(name, &item.artifact, request, false)
                     .await
             };
+            if automatic && let Err(error) = &removal {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.auto_cleanup_item_failed",
+                    &[
+                        ("artifact_id", &item.artifact.id),
+                        ("agent", &item.artifact.agent),
+                    ],
+                    Some(error),
+                );
+            }
             let outcome = match removal {
                 Ok(bytes) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
@@ -2270,16 +2388,6 @@ impl Router {
             Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             {
                 let store = self.inner.store.lock().await;
-                if automatic
-                    && store
-                        .get_agent(&artifact.agent)?
-                        .is_some_and(|agent| agent.archived)
-                {
-                    return Err(Error::new(
-                        "archived",
-                        "Archived Agent artifacts are protected",
-                    ));
-                }
                 if !store.cleanup_authorized(principal, artifact)?
                     || !store.cleanup_agent_quiescent(artifact)?
                 {
@@ -2312,16 +2420,6 @@ impl Router {
                 Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             }
             let store = self.inner.store.lock().await;
-            if automatic
-                && store
-                    .get_agent(&artifact.agent)?
-                    .is_some_and(|agent| agent.archived)
-            {
-                return Err(Error::new(
-                    "archived",
-                    "Archived Agent artifacts are protected",
-                ));
-            }
             if artifact.state == "ownership_root" && tree.contains_daemon_lock {
                 return Err(Error::new(
                     "nested_daemon_lock",
@@ -2439,16 +2537,6 @@ impl Router {
         let mut progress = self.progress_receiver();
         let admission = {
             let mut store = self.inner.store.lock().await;
-            if automatic
-                && store
-                    .get_agent(&artifact.agent)?
-                    .is_some_and(|agent| agent.archived)
-            {
-                return Err(Error::new(
-                    "archived",
-                    "Archived Agent worktrees are protected",
-                ));
-            }
             if !store.cleanup_authorized(principal, artifact)?
                 || !store.cleanup_agent_quiescent(artifact)?
             {
@@ -2463,13 +2551,20 @@ impl Router {
             let mut request = SubmitCommand::new(id, "worktree.remove");
             request.target = Some(artifact.agent.clone());
             request.expected_generation = Some(artifact.generation);
-            if let Some(tip) = artifact
+            let tip = artifact
                 .git
                 .as_ref()
                 .and_then(|git| git.planned_tip.as_ref())
-            {
-                request.args = json!({"expected_tip": tip});
-            }
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "worktree cleanup plan has no tip")
+                })?;
+            request.args = if automatic {
+                // The durable command carries the automatic-only safety mode
+                // through the workspace manager's recovery boundary.
+                json!({"expected_tip": tip, "cleanup_mode": "automatic"})
+            } else {
+                json!({"expected_tip": tip})
+            };
             let admission = self.admit_prepared_submission(
                 &mut store,
                 principal,
@@ -3189,7 +3284,7 @@ impl Router {
             reason: "retirement_preflight".to_owned(),
         };
         if candidate.artifact.kind == ArtifactKind::Worktree {
-            self.classify_worktree(&mut candidate).await;
+            self.classify_worktree(&mut candidate, false).await;
             return candidate;
         }
         let gate = self

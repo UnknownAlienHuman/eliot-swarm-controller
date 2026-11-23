@@ -237,8 +237,6 @@ async fn run_retention(
         )
         .await
         .ok();
-        // Keep the legacy unbounded-growth notice for any future policy that
-        // disables both event and process retention; current defaults are finite.
         if unbounded_store_over_threshold(
             &config.retention,
             &data_root,
@@ -258,11 +256,7 @@ pub(crate) fn unbounded_store_over_threshold(
     data_root: &Path,
     threshold_bytes: u64,
 ) -> bool {
-    if retention.events_retention_seconds() > 0
-        || retention.processes_retention_seconds() > 0
-        || retention.commands_days.is_some()
-        || retention.mail_days.is_some()
-    {
+    if !retention.is_unbounded() {
         return false;
     }
     let (db_bytes, wal_bytes) = store_file_sizes(data_root);
@@ -430,7 +424,7 @@ pub(crate) async fn run_once(
         let acquired = Instant::now();
         let pass = guard.prune_retention(
             retention.events_retention_seconds(),
-            retention.processes_retention_seconds(),
+            retention.processes_seconds,
             retention.commands_days,
             retention.mail_days,
             now,

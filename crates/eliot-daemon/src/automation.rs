@@ -2393,6 +2393,7 @@ async fn reconcile_timer(
         return Ok(TimerReconcileOutcome::Continue);
     }
 
+    let mut idle_assignment = false;
     let (scheduled_at_ms, next_due_at_ms, action, skip_code, skip_capacity_message, armed_slot) =
         match timer_decision(timer, now)? {
             TimerDecision::NotDue => return Ok(TimerReconcileOutcome::Continue),
@@ -2466,6 +2467,13 @@ async fn reconcile_timer(
                                 },
                                 Err(error) if error.code == "unavailable" => {
                                     assignment_unavailable = Some(error.code.clone());
+                                    Err(error)
+                                }
+                                Err(error)
+                                    if error.failure_where.as_deref()
+                                        == Some(assignment::EMPTY_FOLDER) =>
+                                {
+                                    idle_assignment = true;
                                     Err(error)
                                 }
                                 Err(error) => Err(error),
@@ -2577,6 +2585,7 @@ async fn reconcile_timer(
         action,
         skip_code,
         skip_capacity_message,
+        idle_assignment,
     };
     let was_arbitrated = arbitration.is_some();
     let prepared_capacity_scope = arbitration

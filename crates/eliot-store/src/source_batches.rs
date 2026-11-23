@@ -30,6 +30,79 @@ impl CompletionWorktreeCapture {
 }
 
 impl Store {
+    /// Validate an exact stream sample. Active-turn samples remain in the
+    /// Monitor cache; only an idle sample can refresh the retained projection.
+    pub fn put_session_usage_sample(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        turn_id: Option<&str>,
+        mut usage: core::SessionUsage,
+        now: i64,
+    ) -> Result<core::SessionUsage> {
+        self.ensure_committed_reads()?;
+        if generation < 1 || now < 0 {
+            return Err(Error::new(
+                "invalid",
+                "invalid session usage sample binding",
+            ));
+        }
+        usage.validate()?;
+        usage.retain_valid_context();
+        usage.observed_at.get_or_insert(now);
+        let agent_num = parse_agent_id(agent)?;
+        let previous = load_agent_by_num(&self.connection, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "session usage Agent was not found"))?;
+        if previous.generation != generation || previous.is_terminal() {
+            return Err(Error::new(
+                "stale_generation",
+                "session usage generation is not live",
+            ));
+        }
+        if previous.active_turn.as_deref() != turn_id {
+            return Err(Error::new(
+                "stale_turn",
+                "session usage sample does not match the active turn",
+            ));
+        }
+        let stream_owns_session: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM source_state s
+                JOIN source_owners o ON o.agent = s.agent AND o.generation = s.generation
+                WHERE s.agent = ?1 AND s.generation = ?2 AND s.source = 'stream'
+                  AND s.state = 'open' AND o.family = 'session' AND o.source = 'stream'
+             )",
+                params![agent_num, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !stream_owns_session {
+            return Err(Error::new(
+                "source_integrity",
+                "session usage sample has no open stream binding",
+            ));
+        }
+        if turn_id.is_some() {
+            return Ok(usage);
+        }
+
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            native_events::persist_session_usage_snapshot(&tx, agent_num, generation, now, &usage)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            self.get_session_usage(agent, generation)?
+                .ok_or_else(|| Error::new("internal", "session usage sample was not retained"))
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn latest_stream_gap(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         let agent_num = parse_agent_id(agent)?;
         self.connection

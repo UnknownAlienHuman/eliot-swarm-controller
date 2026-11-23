@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = 108;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = 109;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -1351,7 +1351,18 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < 56 {
+        // Migration 58 historically could commit before these two steps.
+        // Check their own receipts so a restart can finish an interrupted upgrade.
+        let (has_56, has_57): (bool, bool) = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 56),
+                    EXISTS(SELECT 1 FROM schema_migrations WHERE version = 57)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(sql_error)?;
+        if !has_56 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1391,7 +1402,7 @@ impl Store {
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
         }
-        if current < 57 {
+        if !has_57 {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2521,6 +2532,32 @@ impl Store {
                  CREATE INDEX native_child_parent_turn
                      ON native_child_registrations(parent, parent_generation, parent_turn_id);
                  INSERT INTO schema_migrations(version) VALUES (108);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < 109 {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE processes ADD COLUMN observed_as_child INTEGER
+                     NOT NULL DEFAULT 0 CHECK (observed_as_child IN (0, 1));
+                 CREATE TABLE child_process_counts (
+                     owner TEXT PRIMARY KEY,
+                     observed INTEGER NOT NULL CHECK (observed >= 0),
+                     exited INTEGER NOT NULL CHECK (exited BETWEEN 0 AND observed)
+                 ) WITHOUT ROWID;
+                 CREATE TRIGGER retain_removed_child_process AFTER DELETE ON processes
+                     WHEN OLD.role = 'child' OR OLD.observed_as_child = 1
+                     BEGIN
+                         INSERT INTO child_process_counts (owner, observed, exited)
+                         VALUES (OLD.owner, 1, OLD.state = 'exited')
+                         ON CONFLICT(owner) DO UPDATE SET
+                             observed = observed + 1, exited = exited + excluded.exited;
+                     END;
+                 INSERT INTO schema_migrations(version) VALUES (109);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

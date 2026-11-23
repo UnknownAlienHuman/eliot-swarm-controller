@@ -16,12 +16,14 @@ use std::{ffi::OsString, path::Path, time::Duration};
 
 use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, NativeEvent, PermissionRefusal, ProcessRecord,
-    ProcessState, ProviderRestriction, Result, SecretPolicy, SourceBatch, SourceGap,
+    ProcessState, ProviderRestriction, Result, SecretPolicy, SessionUsage, SourceBatch, SourceGap,
 };
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
-use crate::protocol::{AgentCommandParams, InitializeParams, MAX_CREDENTIAL_BYTES};
+use crate::protocol::{
+    AgentCommandParams, InitializeParams, MAX_CREDENTIAL_BYTES, SessionUsageSampleRequest,
+};
 
 /// Fill only missing origin/location from a machine-owned error code. A
 /// no-effect verdict says nothing about the layer that caused the failure.
@@ -1171,6 +1173,24 @@ impl StreamSource<'_> {
         self.commit_event_with_refusal(kind, native_id, data)
             .await
             .map(|_| ())
+    }
+
+    /// Send a best-effort usage sample. Terminal events use the ordinary
+    /// acknowledged source batch independently of this readback.
+    pub async fn report_session_usage_sample(
+        &self,
+        usage: SessionUsage,
+        turn_id: Option<&str>,
+    ) -> Result<()> {
+        let request = SessionUsageSampleRequest {
+            agent_id: self.agent_id.to_owned(),
+            generation: self.generation,
+            turn_id: turn_id.map(str::to_owned),
+            usage,
+        };
+        self.sink
+            .update_session_usage(request, Instant::now() + Duration::from_millis(250))
+            .await
     }
 
     /// Commit one exact native permission ask and return the daemon refusal,
