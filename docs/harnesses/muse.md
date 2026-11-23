@@ -65,6 +65,20 @@ the `1.4.0` harness baseline. Owned sessions require a non-empty
 
 ## Native mapping
 
+Verified 2026-11-23 against the offline stable schema embedded in installed Muse
+Code `1.4.25-R9361.1`. `turn/started` requires `sessionId`, `commandId`,
+`turnId`, `sourceRange`, and `viewCursor`; `turn/completed` requires
+`sessionId`, `sourceRange`, `terminal`, `turnId`, and `viewCursor`, with
+aggregate `usage` optional. A
+`turn/started.commandId` registered before Eliot dispatches `turn/start` stays
+bound to that exact send and must match its acknowledgement and turn. An
+otherwise unbound start on the owned session is a native trigger: Eliot emits
+`turn.started` with `native_trigger: "muse.turn/started"` and the exact
+`turn_id`, omitting Eliot `command_id`. The Muse command id remains private
+matching evidence. Pre-ack events retain the existing bounded early-event
+buffer and view-cursor replay fence; item facts bind by exact `turnId` and
+`itemId`, without accumulating item updates.
+
 The installed `turn/steer` result must echo the submitted `commandId`, the exact
 `expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported
 MSP schema). A malformed result or contradictory echo is a diagnostic
@@ -179,14 +193,12 @@ summed across the turn's model completions, and maps to `TurnUsage` at
 counters project (`inputTokens`, `outputTokens`, `reasoningTokens`,
 `cacheReadTokens`/`cacheWriteTokens`); `cachedTokens` is
 provider-convention-dependent (inside or beside `inputTokens`) and never
-mapped, and no total is derived. The per-completion `session/tokenUsage`
-events (raw counters plus server-derived counted-once
-`promptTokens`/`totalTokens` and the session `cumulative` block with
-`cost`), and the `session/contextUsage`
-(`usedTokens`/`windowTokens`/`pressure`) occupancy triple, are
-session-scoped facts: not turn expenditure, so repeated
-completions can never inflate the terminal count. The adapter folds them
-into the retained `SessionUsage` snapshot and commits it as `session.usage`
+mapped, and no total is derived. Per-completion `session/tokenUsage` carries
+an exact `turnId` and raw `usage`; its server-derived counted-once
+`promptTokens`/`totalTokens`, cumulative block with `cost`, and the
+`session/contextUsage` (`usedTokens`/`windowTokens`/`pressure`) occupancy
+triple remain session-scoped. The adapter folds those session fields into the
+retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (sources `muse:session/tokenUsage` and
 `muse:session/contextUsage`), with `observed_at` captured at acceptance:
 the `cumulative` counted-once prompt/output/cache counters replace the
@@ -194,10 +206,12 @@ retained cumulative counters. Store projects uncached input by removing
 cache reads from the cumulative prompt total. The server-computed
 estimated `cost.usd` maps with unit `usd_estimate`, and each context
 notification replaces both context counters (absent members become null,
-never keeping the previous window). Missing counters stay
-null. Live 2026-11-14: real turns commit `turn.completed` with no `usage`
-field at all, so these session notifications are the only usage signal for
-this harness; session facts never derive per-turn usage.
+never keeping the previous window). Missing counters stay null. When
+`turn/completed.usage` is absent, the latest valid `session/tokenUsage.usage`
+sample is a turn-usage fallback only when its `turnId` exactly matches that
+active turn. It remains one model-completion sample; samples and session
+cumulative totals are never summed into turn usage. If the exact-turn sample
+is unavailable, turn usage stays null.
 
 ## Observation and recovery
 

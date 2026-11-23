@@ -764,17 +764,19 @@ pub struct NativeTurnUsage {
     pub cache_write_tokens: Option<i64>,
 }
 
-/// `session/tokenUsage` params (installed 1.4.0 schema subset): one event
+/// `session/tokenUsage` params (installed stable schema subset): one event
 /// per model completion that reports usage, carrying the raw counters
 /// verbatim plus the server-derived counted-once `promptTokens`/`totalTokens`
 /// and the session `cumulative` block (running counted-once session totals
 /// with the server-computed estimated `cost`). Subagent/workflow-child usage
-/// is never folded in. Only the session-owned fields below are modelled;
-/// every other member stays unparsed.
+/// is never folded in. The exact `turnId` and raw per-completion `usage` are
+/// retained for the terminal fallback; cumulative fields remain session scoped.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionTokenUsageNotification {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<NativeTurnUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -911,10 +913,14 @@ pub(crate) fn session_usage_from_context_usage(
 /// missing values stay null (never zero, never a sum), and an absent or
 /// wholly unusable block yields no usage at all so completion proceeds.
 /// `cachedTokens` is never mapped (ambiguous convention) and no total is
-/// ever derived: the counted-once derivations live in the per-completion
-/// `session/tokenUsage` session facts, not in the terminal.
+/// ever derived. Session cumulative fields are not terminal usage; the event
+/// actor may use one exact-turn per-completion sample only when aggregate
+/// terminal usage is absent.
 pub(crate) fn turn_usage(notification: &NativeTurnCompletedNotification) -> Option<TurnUsage> {
-    let usage = notification.usage.as_ref()?;
+    turn_usage_from_native(notification.usage.as_ref()?)
+}
+
+pub(crate) fn turn_usage_from_native(usage: &NativeTurnUsage) -> Option<TurnUsage> {
     TurnUsage::from_native(
         "turn",
         TurnUsage {

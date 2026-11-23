@@ -50,14 +50,16 @@ use crate::native::{
         NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
         NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
         NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
-        session_usage_from_token_usage, turn_usage,
+        session_usage_from_token_usage, turn_usage, turn_usage_from_native,
     },
 };
 
 const CONTROL_QUEUE: usize = 16;
 const EARLY_EVENT_LIMIT: usize = 128;
 const EARLY_EVENT_BYTES: usize = 256 * 1024;
+const MAX_PENDING_NATIVE_TURN_STARTS: usize = 1;
 const MAX_PENDING_REQUESTS: usize = 128;
+const MUSE_NATIVE_TURN_TRIGGER: &str = "muse.turn/started";
 const RESOLVED_REQUEST_HISTORY: usize = 128;
 /// Bound on remembered already-applied live view cursors. `view/subscribe`
 /// replays `(after, head]` after live facts already queued past `after`, so a
@@ -260,7 +262,8 @@ pub(crate) fn session_read_proves_idle(value: &Value, session_id: &str) -> bool 
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct TurnFacts {
-    pub command_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
     pub turn_id: String,
     pub status: Option<String>,
     pub final_text: Option<String>,
@@ -296,10 +299,24 @@ enum Control {
     },
     AssociateTurn {
         command_id: String,
+        native_command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
         model: Option<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ExpectTurnStart {
+        command_id: String,
+        native_command_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RejectTurnStart {
+        native_command_id: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    UnknownTurnStart {
+        native_command_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
     ReplyRequest {
@@ -458,6 +475,21 @@ struct BufferedFrame {
     size: usize,
 }
 
+fn buffered_frame_turn_id(frame: &BufferedNativeFrame) -> Option<&str> {
+    let params = match frame {
+        BufferedNativeFrame::Notification { params, .. }
+        | BufferedNativeFrame::Request { params, .. } => params,
+    };
+    native_notification_turn_id(params)
+}
+
+fn native_notification_turn_id(params: &Value) -> Option<&str> {
+    params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or_else(|| params.pointer("/item/turnId").and_then(Value::as_str))
+}
+
 /// Store identities acknowledged during the active turn, independently of
 /// the sink's most recent batch and the bounded view-cursor replay history.
 #[derive(Default)]
@@ -512,6 +544,11 @@ struct EventProcessor {
     status: EventStatus,
     buffer: VecDeque<BufferedFrame>,
     buffer_bytes: usize,
+    pending_native_starts: HashMap<String, String>,
+    uncertain_native_starts: HashSet<String>,
+    uncertain_native_turns: HashSet<String>,
+    active_native_command_id: Option<String>,
+    latest_turn_usage: Option<(String, eliot_core::TurnUsage)>,
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -681,6 +718,7 @@ impl EventHandle {
     pub async fn associate_turn(
         &self,
         command_id: String,
+        native_command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
@@ -688,10 +726,40 @@ impl EventHandle {
     ) -> Result<()> {
         self.send(|reply| Control::AssociateTurn {
             command_id,
+            native_command_id,
             turn_id,
             context,
             effort,
             model,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn expect_turn_start(
+        &self,
+        command_id: String,
+        native_command_id: String,
+    ) -> Result<()> {
+        self.send(|reply| Control::ExpectTurnStart {
+            command_id,
+            native_command_id,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn reject_turn_start(&self, native_command_id: String) -> Result<()> {
+        self.send(|reply| Control::RejectTurnStart {
+            native_command_id,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn unknown_turn_start(&self, native_command_id: String) -> Result<()> {
+        self.send(|reply| Control::UnknownTurnStart {
+            native_command_id,
             reply,
         })
         .await
@@ -813,6 +881,11 @@ impl EventProcessor {
             status: EventStatus::default(),
             buffer: VecDeque::new(),
             buffer_bytes: 0,
+            pending_native_starts: HashMap::new(),
+            uncertain_native_starts: HashSet::new(),
+            uncertain_native_turns: HashSet::new(),
+            active_native_command_id: None,
+            latest_turn_usage: None,
             gap_number: 0,
             accept_frames: true,
             planned_stop: false,
@@ -899,6 +972,7 @@ impl EventProcessor {
             }
             Control::AssociateTurn {
                 command_id,
+                native_command_id,
                 turn_id,
                 context,
                 effort,
@@ -906,8 +980,33 @@ impl EventProcessor {
                 reply,
             } => {
                 let result = self
-                    .associate_turn(command_id, turn_id, context, effort, model)
+                    .associate_turn(command_id, native_command_id, turn_id, context, effort, model)
                     .await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::ExpectTurnStart {
+                command_id,
+                native_command_id,
+                reply,
+            } => {
+                let result = self.expect_turn_start(command_id, native_command_id);
+                let _ = reply.send(result);
+                true
+            }
+            Control::RejectTurnStart {
+                native_command_id,
+                reply,
+            } => {
+                let result = self.reject_turn_start(&native_command_id).await;
+                let _ = reply.send(result);
+                true
+            }
+            Control::UnknownTurnStart {
+                native_command_id,
+                reply,
+            } => {
+                let result = self.unknown_turn_start(&native_command_id).await;
                 let _ = reply.send(result);
                 true
             }
@@ -1044,6 +1143,8 @@ impl EventProcessor {
         }
         let had_turn = self.status.active_turn_id.take().is_some();
         self.status.active_command_id = None;
+        self.active_native_command_id = None;
+        self.latest_turn_usage = None;
         if had_turn {
             self.pending_requests.clear();
             self.observe();
@@ -1120,7 +1221,7 @@ impl EventProcessor {
                     &method,
                     &params,
                 );
-                if !bypass_buffer && self.should_buffer(&method) {
+                if !bypass_buffer && self.should_buffer(&method, &params) {
                     self.buffer_frame(BufferedNativeFrame::Notification { method, params });
                 } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
@@ -1181,14 +1282,27 @@ impl EventProcessor {
         }
     }
 
-    fn should_buffer(&self, method: &str) -> bool {
+    fn should_buffer(&self, method: &str, params: &Value) -> bool {
         if method == "session/viewHealthChanged" {
             return self.status.session_id.is_none();
         }
+        if method == "turn/started" {
+            if !self.status.ready {
+                return true;
+            }
+            let Some(command_id) = params.get("commandId").and_then(Value::as_str) else {
+                return false;
+            };
+            return self.pending_native_starts.contains_key(command_id);
+        }
+        if native_notification_turn_id(params)
+            .is_some_and(|turn_id| self.uncertain_native_turns.contains(turn_id))
+        {
+            return false;
+        }
         matches!(
             method,
-            "turn/started"
-                | "turn/completed"
+            "turn/completed"
                 | "log/record"
                 | "item/started"
                 | "item/updated"
@@ -1197,6 +1311,108 @@ impl EventProcessor {
                 | "approval/updated"
                 | "userInput/settled"
         ) && (!self.status.ready || self.status.active_turn_id.is_none())
+    }
+
+    fn expect_turn_start(&mut self, command_id: String, native_command_id: String) -> Result<()> {
+        if !self.status.ready
+            || self.status.session_id.is_none()
+            || self.status.active_turn_id.is_some()
+            || command_id.trim().is_empty()
+            || native_command_id.trim().is_empty()
+            || self.pending_native_starts.len() >= MAX_PENDING_NATIVE_TURN_STARTS
+            || self.uncertain_native_starts.contains(&native_command_id)
+        {
+            return Err(Error::new(
+                "unknown",
+                "Muse could not fence the exact native turn/start before dispatch",
+            ));
+        }
+        self.pending_native_starts
+            .insert(native_command_id, command_id);
+        Ok(())
+    }
+
+    async fn reject_turn_start(&mut self, native_command_id: &str) -> Result<()> {
+        self.pending_native_starts.remove(native_command_id);
+        let (found, turn_id) = self.discard_buffered_native_start(native_command_id);
+        if found {
+            self.uncertain_native_starts
+                .insert(native_command_id.to_owned());
+            if let Some(turn_id) = turn_id {
+                self.uncertain_native_turns.insert(turn_id);
+            }
+            self.record_gap("Muse emitted the exact turn/start after proving it was not dispatched")
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn unknown_turn_start(&mut self, native_command_id: &str) -> Result<()> {
+        if self.active_native_command_id.as_deref() == Some(native_command_id)
+            && !self.pending_native_starts.contains_key(native_command_id)
+        {
+            return Ok(());
+        }
+        let expected = self.pending_native_starts.remove(native_command_id).is_some();
+        if !expected && !self.uncertain_native_starts.contains(native_command_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse uncertain turn/start did not match its registered native command",
+            ));
+        }
+        self.uncertain_native_starts
+            .insert(native_command_id.to_owned());
+        let (found, turn_id) = self.discard_buffered_native_start(native_command_id);
+        if found {
+            if let Some(turn_id) = turn_id {
+                self.uncertain_native_turns.insert(turn_id);
+            }
+            self.record_gap("Muse turn/start result is unknown; buffered native facts were discarded")
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn discard_buffered_native_start(&mut self, native_command_id: &str) -> (bool, Option<String>) {
+        let turn_id = self.buffer.iter().find_map(|buffered| {
+            let BufferedNativeFrame::Notification { method, params } = &buffered.frame else {
+                return None;
+            };
+            (method == "turn/started"
+                && params.get("commandId").and_then(Value::as_str)
+                    == Some(native_command_id))
+            .then(|| params.get("turnId").and_then(Value::as_str).map(str::to_owned))
+            .flatten()
+        });
+        let found_start = self.buffer.iter().any(|buffered| {
+            matches!(&buffered.frame,
+                BufferedNativeFrame::Notification { method, params }
+                    if method == "turn/started"
+                        && params.get("commandId").and_then(Value::as_str)
+                            == Some(native_command_id))
+        });
+        if !found_start {
+            return (false, None);
+        }
+        let mut retained = VecDeque::with_capacity(self.buffer.len());
+        let mut retained_bytes = 0usize;
+        while let Some(buffered) = self.buffer.pop_front() {
+            let start_matches = matches!(&buffered.frame,
+                BufferedNativeFrame::Notification { method, params }
+                    if method == "turn/started"
+                        && params.get("commandId").and_then(Value::as_str)
+                            == Some(native_command_id));
+            let turn_matches = turn_id.as_deref().is_some_and(|turn_id| {
+                buffered_frame_turn_id(&buffered.frame) == Some(turn_id)
+            });
+            if !start_matches && !turn_matches {
+                retained_bytes = retained_bytes.saturating_add(buffered.size);
+                retained.push_back(buffered);
+            }
+        }
+        self.buffer = retained;
+        self.buffer_bytes = retained_bytes;
+        (true, turn_id)
     }
 
     fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
@@ -1302,6 +1518,7 @@ impl EventProcessor {
     async fn associate_turn(
         &mut self,
         command_id: String,
+        native_command_id: String,
         turn_id: String,
         context: Vec<ContextItem>,
         effort: Option<String>,
@@ -1310,6 +1527,7 @@ impl EventProcessor {
         if !self.status.ready
             || self.status.session_id.is_none()
             || command_id.trim().is_empty()
+            || native_command_id.trim().is_empty()
             || turn_id.trim().is_empty()
         {
             return Err(Error::new(
@@ -1329,8 +1547,22 @@ impl EventProcessor {
                 "Muse event source acknowledgement is unresolved",
             ));
         }
+        if self.pending_native_starts.get(&native_command_id) != Some(&command_id) {
+            return Err(Error::new(
+                "source_integrity",
+                "Muse turn association did not match its registered native command",
+            ));
+        }
         self.status.active_command_id = Some(command_id.clone());
         self.status.active_turn_id = Some(turn_id.clone());
+        self.active_native_command_id = Some(native_command_id.clone());
+        if self
+            .latest_turn_usage
+            .as_ref()
+            .is_none_or(|(sample_turn_id, _)| sample_turn_id != &turn_id)
+        {
+            self.latest_turn_usage = None;
+        }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(session_id, &turn_id, &turn_id, "turn.started")?;
         let mut data = json!({"command_id": command_id, "turn_id": turn_id});
@@ -1350,6 +1582,39 @@ impl EventProcessor {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
         self.commit_event("turn.started", native_id, data).await?;
+        self.pending_native_starts.remove(&native_command_id);
+        self.messages = TurnMessages::default();
+        self.flush_buffer().await?;
+        self.apply_stashed_entries().await?;
+        Ok(())
+    }
+
+    async fn start_native_turn(&mut self, notification: NativeTurnStartedNotification) -> Result<()> {
+        if !self.status.ready
+            || self.status.active_turn_id.is_some()
+            || notification.command_id.trim().is_empty()
+            || notification.turn_id.trim().is_empty()
+        {
+            return self
+                .record_gap("Muse native turn/start did not prove one exact idle-session turn")
+                .await;
+        }
+        let session_id = notification.session_id;
+        let turn_id = notification.turn_id;
+        self.status.active_command_id = None;
+        self.status.active_turn_id = Some(turn_id.clone());
+        self.active_native_command_id = Some(notification.command_id);
+        self.latest_turn_usage = None;
+        let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
+        self.commit_event(
+            "turn.started",
+            native_id,
+            json!({
+                "turn_id": turn_id,
+                "native_trigger": MUSE_NATIVE_TURN_TRIGGER,
+            }),
+        )
+        .await?;
         self.messages = TurnMessages::default();
         self.flush_buffer().await?;
         self.apply_stashed_entries().await?;
@@ -1367,7 +1632,7 @@ impl EventProcessor {
                         self.status.session_id.is_some(),
                         method,
                         params,
-                    ) && self.should_buffer(method)
+                    ) && self.should_buffer(method, params)
                 }
                 BufferedNativeFrame::Request { .. } => {
                     !self.status.ready || self.status.active_turn_id.is_none()
@@ -1615,23 +1880,21 @@ impl EventProcessor {
             self.defer_gap("Muse pending native request bound was exceeded");
             return Ok(());
         }
-        let command_id = self
-            .status
-            .active_command_id
-            .clone()
-            .ok_or_else(|| Error::new("unknown", "Muse request has no Eliot send command"))?;
+        let command_id = self.status.active_command_id.clone();
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let Ok((public_kind, public_details)) = public_request_view(&request) else {
             self.defer_gap("Muse public request view could not be normalized");
             return Ok(());
         };
         let mut data = json!({
-            "command_id": command_id,
             "request_id": request.id,
             "turn_id": request.turn_id,
             "kind": public_kind,
             "details": redact_request_details_for_commit(&public_details, &policy),
         });
+        if let Some(command_id) = command_id {
+            data["command_id"] = json!(command_id);
+        }
         if request.kind == "approval"
             && let Some(raw_args) = params.get("rawArgs").and_then(Value::as_str)
             && let Ok(input) = serde_json::from_str::<Value>(raw_args)
@@ -2316,22 +2579,21 @@ impl EventProcessor {
             self.defer_gap("Muse pending native request bound was exceeded");
             return Ok(());
         }
-        let Some(command_id) = self.status.active_command_id.clone() else {
-            self.defer_gap("Muse pulled request arrived with no active command");
-            return Ok(());
-        };
+        let command_id = self.status.active_command_id.clone();
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let Ok((public_kind, public_details)) = public_request_view(&entry) else {
             self.defer_gap("Muse public request view could not be normalized");
             return Ok(());
         };
-        let data = json!({
-            "command_id": command_id,
+        let mut data = json!({
             "request_id": entry.id,
             "turn_id": entry.turn_id,
             "kind": public_kind,
             "details": redact_request_details_for_commit(&public_details, &policy),
         });
+        if let Some(command_id) = command_id {
+            data["command_id"] = json!(command_id);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse pulled request exceeded the persisted-event bound");
             return Ok(());
@@ -2425,6 +2687,11 @@ impl EventProcessor {
     }
 
     async fn apply_notification(&mut self, method: String, params: Value) -> Result<()> {
+        if native_notification_turn_id(&params)
+            .is_some_and(|turn_id| self.uncertain_native_turns.contains(turn_id))
+        {
+            return Ok(());
+        }
         if is_workflow_item_frame(&method, &params) {
             return self.observe_workflow_item(params).await;
         }
@@ -2509,10 +2776,30 @@ impl EventProcessor {
                     &notification.session_id,
                     &notification.turn_id,
                 )?;
-                if self.status.active_turn_id.as_deref() != Some(notification.turn_id.as_str()) {
+                if self
+                    .uncertain_native_starts
+                    .contains(&notification.command_id)
+                {
+                    self.uncertain_native_turns
+                        .insert(notification.turn_id.clone());
                     return self
-                        .record_gap("Muse turn/started did not match the exact submitted turn")
+                        .record_gap("Muse turn/start matched a command with an unknown outcome")
                         .await;
+                }
+                match self.status.active_turn_id.as_deref() {
+                    Some(active_turn)
+                        if active_turn == notification.turn_id
+                            && self.active_native_command_id.as_deref()
+                                == Some(notification.command_id.as_str()) =>
+                    {
+                        return Ok(());
+                    }
+                    Some(_) => {
+                        return self
+                            .record_gap("Muse turn/started did not match the exact active turn")
+                            .await;
+                    }
+                    None => self.start_native_turn(notification).await?,
                 }
             }
             "item/started" => {
@@ -2733,11 +3020,13 @@ impl EventProcessor {
                 .await;
         }
         let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(text);
-        let data = json!({
-            "command_id": self.status.active_command_id.as_deref().unwrap_or_default(),
+        let mut data = json!({
             "turn_id": turn_id,
             "text": text,
         });
+        if let Some(command_id) = self.status.active_command_id.as_deref() {
+            data["command_id"] = json!(command_id);
+        }
         let native_id = event_id(
             self.status.session_id.as_deref().unwrap_or_default(),
             turn_id,
@@ -2850,11 +3139,10 @@ impl EventProcessor {
         self.flush_observed_messages(signal.turn_id).await
     }
 
-    /// Fold one `session/tokenUsage` event into the session snapshot: cumulative
-    /// counted-once session totals plus the estimated session cost, with
-    /// `observed_at` captured at acceptance. Session-scoped facts, never turn
-    /// expenditure, so repeated completions can never inflate the terminal
-    /// count. Unchanged merges commit nothing.
+    /// Fold session cumulative counters and estimated cost from one
+    /// `session/tokenUsage` event into the session snapshot. Retain only its
+    /// latest exact-turn raw sample separately for a terminal fallback; never
+    /// sum per-completion samples into turn usage.
     async fn observe_session_token_usage(&mut self, params: Value) -> Result<()> {
         let notification: NativeSessionTokenUsageNotification = serde_json::from_value(params)
             .map_err(|_| {
@@ -2864,6 +3152,16 @@ impl EventProcessor {
                 )
             })?;
         self.check_session_signal(&notification.session_id)?;
+        if let Some(turn_id) = notification.turn_id.as_deref()
+            && (self.status.active_turn_id.as_deref() == Some(turn_id)
+                || self.pending_native_starts.contains_key(turn_id))
+        {
+            self.latest_turn_usage = notification
+                .usage
+                .as_ref()
+                .and_then(turn_usage_from_native)
+                .map(|usage| (turn_id.to_owned(), usage));
+        }
         let Some(merged) =
             session_usage_from_token_usage(&notification, self.session_usage.as_ref())
         else {
@@ -2961,12 +3259,14 @@ impl EventProcessor {
                 .record_gap("Muse tool start omitted its exact item id")
                 .await;
         }
-        let data = json!({
-            "command_id": command_id,
+        let mut data = json!({
             "turn_id": turn_id,
             "item_id": item.item_id,
             "tool": tool,
         });
+        if let Some(command_id) = command_id {
+            data["command_id"] = json!(command_id);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             return self
                 .record_gap("Muse tool start exceeded the persisted-event bound")
@@ -3019,12 +3319,14 @@ impl EventProcessor {
         }
         let completed_file_change = completed_file_change(item);
         let mut data = json!({
-            "command_id": command_id,
             "turn_id": turn_id,
             "item_id": item.item_id,
             "tool": tool,
             "status": item.status,
         });
+        if let Some(command_id) = command_id {
+            data["command_id"] = json!(command_id);
+        }
         if completed_file_change {
             // Installed Codex 0.161 `fileChange` budgeting, mirrored
             // exactly: reserve the complete envelope, then admit inline
@@ -3149,7 +3451,7 @@ impl EventProcessor {
     /// turn-less `userShell` (the one kind outside any turn), which stays
     /// unmapped. `validate_item_turn` already proved the session and the
     /// exact active turn; anything else here is a binding failure.
-    fn tool_binding(&self, item: &NativeItem) -> Result<Option<(String, String)>> {
+    fn tool_binding(&self, item: &NativeItem) -> Result<Option<(Option<String>, String)>> {
         let turn_id = item.turn_id.as_deref().filter(|turn| !turn.is_empty());
         let Some(turn_id) = turn_id else {
             if item.kind == "userShell" {
@@ -3166,11 +3468,10 @@ impl EventProcessor {
                 "Muse tool item was outside the exact active turn",
             ));
         }
-        let command_id =
-            self.status.active_command_id.clone().ok_or_else(|| {
-                Error::new("unknown", "Muse tool item has no exact Eliot command")
-            })?;
-        Ok(Some((command_id, turn_id.to_owned())))
+        Ok(Some((
+            self.status.active_command_id.clone(),
+            turn_id.to_owned(),
+        )))
     }
 
     /// Commit one natively observed turn terminal.
@@ -3232,15 +3533,10 @@ impl EventProcessor {
         } else {
             turn_status(&notification.terminal).unwrap_or("other")
         };
-        let command_id = self
-            .status
-            .active_command_id
-            .clone()
-            .ok_or_else(|| Error::new("unknown", "Muse terminal turn has no Eliot command"))?;
+        let command_id = self.status.active_command_id.clone();
         let provider_restriction = terminal_provider_restriction(&self.status, &notification);
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
-            "command_id": command_id.clone(),
             "turn_id": notification.turn_id,
             "status": status_text,
             "outcome": if model_error.is_some() {
@@ -3255,6 +3551,9 @@ impl EventProcessor {
             && notification.terminal == NativeTurnTerminal::Completed
         {
             data["model_unverified_reason"] = json!(eliot_core::PROVIDER_MODEL_UNNAMED);
+        }
+        if let Some(command_id) = command_id.as_deref() {
+            data["command_id"] = json!(command_id);
         }
         // The semantic hold signal gets first claim on the bounded terminal data.
         if notification.terminal == NativeTurnTerminal::Failed {
@@ -3284,7 +3583,15 @@ impl EventProcessor {
         // text so the existing bounded terminal-text accounting includes the
         // usage bytes. Absent/malformed usage never blocks or gaps this
         // terminal; it simply leaves `data.usage` unset.
-        if let Some(usage) = turn_usage(&notification) {
+        let usage = if notification.usage.is_none() {
+            self.latest_turn_usage
+                .as_ref()
+                .filter(|(turn_id, _)| turn_id == &notification.turn_id)
+                .map(|(_, usage)| usage.clone())
+        } else {
+            turn_usage(&notification)
+        };
+        if let Some(usage) = usage {
             data["usage"] = serde_json::to_value(&usage).unwrap_or(Value::Null);
         }
         // The durable terminal record keeps the structured error message,
@@ -3332,6 +3639,8 @@ impl EventProcessor {
         if committed {
             self.status.model_stop_at = None;
         }
+        self.active_native_command_id = None;
+        self.latest_turn_usage = None;
         self.messages = TurnMessages::default();
         self.status.clear_stale_idle_latch();
         // A definite Store rejection leaves degraded coverage and requires a
@@ -3727,12 +4036,9 @@ impl EventProcessor {
         );
         self.commit_event("session.ended", native_id, json!({}))
             .await?;
-        if let (Some(command_id), Some(turn_id)) = (
-            self.status.active_command_id.clone(),
-            self.status.active_turn_id.clone(),
-        ) {
+        if let Some(turn_id) = self.status.active_turn_id.clone() {
             self.status.last_turn = Some(TurnFacts {
-                command_id,
+                command_id: self.status.active_command_id.clone(),
                 turn_id,
                 status: None,
                 final_text: None,
@@ -3744,6 +4050,8 @@ impl EventProcessor {
         self.status.ready = false;
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
+        self.active_native_command_id = None;
+        self.latest_turn_usage = None;
         self.messages = TurnMessages::default();
         Ok(())
     }
@@ -4226,11 +4534,7 @@ impl EventProcessor {
     /// an oversized envelope was deferred); `Err` carries the write failure.
     /// Callers that need persistence proof must require `Ok(true)`.
     async fn commit_offer_update(&mut self, refreshed: &CorePending) -> Result<bool> {
-        let Some(command_id) = self.status.active_command_id.clone() else {
-            self.record_gap("Muse refreshed offer arrived with no active command")
-                .await?;
-            return Ok(false);
-        };
+        let command_id = self.status.active_command_id.clone();
         let (Some(seq), Some(cursor)) = (
             refreshed.details.get("offer_seq").and_then(Value::as_i64),
             refreshed.details.get("view_cursor").and_then(Value::as_str),
@@ -4256,13 +4560,15 @@ impl EventProcessor {
                 .await?;
             return Ok(false);
         };
-        let data = json!({
-            "command_id": command_id,
+        let mut data = json!({
             "request_id": refreshed.id,
             "turn_id": refreshed.turn_id,
             "kind": public_kind,
             "details": redact_request_details_for_commit(&public_details, &policy),
         });
+        if let Some(command_id) = command_id {
+            data["command_id"] = json!(command_id);
+        }
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             self.defer_gap("Muse refreshed offer exceeded the persisted-event bound");
             return Ok(false);
@@ -4862,7 +5168,6 @@ fn terminal_provider_restriction(
 ) -> Option<ProviderRestriction> {
     if status.session_id.as_deref() != Some(notification.session_id.as_str())
         || status.active_turn_id.as_deref() != Some(notification.turn_id.as_str())
-        || status.active_command_id.is_none()
     {
         return None;
     }
