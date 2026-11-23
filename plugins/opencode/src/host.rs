@@ -3180,31 +3180,41 @@ impl OpenCodePlugin {
     /// turn on the stream); `false` re-checks the gate — a finished turn is
     /// stale, a still-active one contradicts the server and stays unknown.
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
-        let session = ready_session(&mut self.session, &params)?;
-        let command_id = params.command_id;
-        let turn_id = params.turn_id;
-        let Some(turn_id) = turn_id else {
-            return Err(Error::new(
-                "stale_turn",
-                "OpenCode interrupt requires the exact turn id",
-            ));
-        };
-        let live = match session.events.check_turn(&turn_id).await {
-            Ok(live) => live,
-            // The gate itself is unresolved (the event task is gone): the
-            // turn may still be live, so this is unknown, never stale.
-            Err(_) => {
+        let session = if params.owner_control {
+            let session = retained_session(
+                &mut self.session,
+                &params.agent_id,
+                params.generation,
+                &params.command_id,
+            )?;
+            if session.phase == SessionPhase::Stopped || native_io_blocked(session) {
                 return Err(Error::new(
-                    "unknown",
-                    "OpenCode interrupt turn check is unresolved",
+                    "native_not_dispatched",
+                    "OpenCode native session is closed",
                 ));
             }
+            session
+        } else {
+            ready_session(&mut self.session, &params)?
         };
-        if !live {
-            return Err(Error::new(
-                "native_not_dispatched",
-                "OpenCode interrupt named a finished turn",
-            ));
+        let command_id = params.command_id;
+        let turn_id = params.turn_id.as_deref();
+        if !params.owner_control {
+            let turn_id = turn_id.ok_or_else(|| {
+                Error::new(
+                    "stale_turn",
+                    "OpenCode interrupt requires the exact turn id",
+                )
+            })?;
+            let live = session.events.check_turn(turn_id).await.map_err(|_| {
+                Error::new("unknown", "OpenCode interrupt turn check is unresolved")
+            })?;
+            if !live {
+                return Err(Error::new(
+                    "native_not_dispatched",
+                    "OpenCode interrupt named a finished turn",
+                ));
+            }
         }
         let session_id = session
             .session_id
@@ -3214,7 +3224,7 @@ impl OpenCodePlugin {
             .http
             .interrupt(&session_id, Instant::now() + RPC_TIMEOUT)
             .await;
-        Self::finish_interrupt(session, &command_id, &turn_id, outcome).await
+        Self::finish_interrupt(session, &command_id, turn_id, outcome).await
     }
 
     /// Settle an interrupt after its one write: applied on
@@ -3225,7 +3235,7 @@ impl OpenCodePlugin {
     async fn finish_interrupt(
         session: &mut AgentSession,
         command_id: &str,
-        turn_id: &str,
+        turn_id: Option<&str>,
         outcome: std::result::Result<bool, HttpOutcome>,
     ) -> Result<Value> {
         match outcome {
@@ -3238,6 +3248,12 @@ impl OpenCodePlugin {
                 Ok(result)
             }
             Ok(false) => {
+                let Some(turn_id) = turn_id else {
+                    return Ok(json!({
+                        "state": "applied", "command_id": command_id, "turn_id": null,
+                        "interrupt_confirmed": true,
+                    }));
+                };
                 let live = match session.events.check_turn(turn_id).await {
                     Ok(live) => live,
                     // The write went out but the gate is unresolved (the

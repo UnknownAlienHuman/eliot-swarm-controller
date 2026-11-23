@@ -6,15 +6,19 @@ use super::{
         RunWorkerStart, classify_start_result, coordination_commit_error_state,
         validate_observer_command_result,
     },
+    plugin_host::{OWNER_INTERRUPT_TIMEOUT, PendingCommand},
 };
 use crate::common::now_ms;
 use eliot_core::{
-    Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnState,
+    Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnOutcome, TurnState,
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
-use tokio::{sync::broadcast, time::timeout};
+use tokio::{
+    sync::broadcast,
+    time::{Instant, timeout, timeout_at},
+};
 
 const STOP_TURN_GRACE: Duration = Duration::from_secs(5);
 
@@ -785,6 +789,169 @@ impl Router {
         true
     }
 
+    pub(super) async fn execute_owner_interrupt(
+        &self,
+        command: &Command,
+        pending: Result<(Agent, PendingCommand)>,
+    ) {
+        let mut events = self.inner.bus.subscribe();
+        let until = pending
+            .as_ref()
+            .ok()
+            .and_then(|(_, pending)| pending.interrupt_deadline)
+            .unwrap_or_else(|| Instant::now() + OWNER_INTERRUPT_TIMEOUT);
+        let native = match pending {
+            Ok((_, pending)) => timeout_at(until, pending.wait()).await.unwrap_or_else(|_| {
+                Err(Error::new(
+                    "unknown",
+                    "Harness did not acknowledge interrupt within 10 seconds",
+                ))
+            }),
+            Err(error) => Err(error),
+        };
+        let ack = native.as_ref().is_ok_and(|value| {
+            value["state"] == "applied"
+                && value["command_id"].as_str() == Some(command.id.as_str())
+                && value["turn_id"].as_str() == command.turn_id.as_deref()
+        });
+        let confirmed = ack
+            && native
+                .as_ref()
+                .is_ok_and(|value| value["interrupt_confirmed"] == true);
+        let read_terminal = || self.owner_interrupt_terminal(command);
+        let wait_terminal = async {
+            loop {
+                if let Some(outcome) = read_terminal().await? {
+                    return Ok::<_, Error>(Some(outcome));
+                }
+                if confirmed {
+                    return Ok(None);
+                }
+                loop {
+                    match events.recv().await {
+                        Ok(event)
+                            if event.agent == command.target
+                                && event.generation == command.generation
+                                && (event.kind.starts_with("turn.")
+                                    || event.kind.starts_with("agent.")
+                                    || event.kind == "session.ended") =>
+                        {
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(broadcast::error::RecvError::Closed) => return Ok(None),
+                    }
+                }
+            }
+        };
+        // Read once after expiry even if the native reply used the whole budget.
+        let evidence = match timeout_at(until, wait_terminal).await {
+            Ok(result) => result,
+            Err(_) => read_terminal().await,
+        };
+        if let Err(error) = evidence.as_ref() {
+            self.settle_plugin_error(&command.id, error).await;
+            return;
+        }
+        let terminal = evidence.ok().flatten();
+        if terminal.is_some() || confirmed {
+            let reason = match terminal {
+                Some(TurnOutcome::Interrupted) if ack => "interrupted_by_owner",
+                None if command.turn_id.is_none() => "session_interrupt_confirmed",
+                None => "interrupted_by_owner",
+                _ => "turn_ended",
+            };
+            let _ = self
+                .settle(
+                    &command.id,
+                    CommandState::Applied,
+                    Some(json!({
+                        "command_id": command.id, "turn_id": command.turn_id, "reason": reason,
+                    })),
+                )
+                .await;
+            return;
+        }
+        let dispatched_stop = {
+            let mut store = self.inner.store.lock().await;
+            store
+                .dispatch_interrupt_stop(&command.id, now_ms())
+                .map(|change| {
+                    change.map(|change| {
+                        self.publish_locked(&change.events);
+                        change.value
+                    })
+                })
+        };
+        let fallback = match dispatched_stop {
+            Ok(Some((agent, stop))) => {
+                let id = stop.id.clone();
+                self.execute_stop_command(&id, &agent, stop).await;
+                Some(id)
+            }
+            Ok(None) => {
+                if read_terminal()
+                    .await
+                    .is_ok_and(|terminal| terminal.is_some())
+                {
+                    let _ = self.settle(&command.id, CommandState::Applied, Some(json!({
+                        "command_id": command.id, "turn_id": command.turn_id, "reason": "turn_ended",
+                    }))).await;
+                    return;
+                }
+                None
+            }
+            Err(error) => {
+                self.settle_plugin_error(&command.id, &error).await;
+                return;
+            }
+        };
+        let native_message = match &native {
+            Err(error) => error.message.as_str(),
+            Ok(value) if !ack => value["message"]
+                .as_str()
+                .or(value["reason"].as_str())
+                .unwrap_or("Harness declined to confirm the interrupt"),
+            Ok(_) => "Harness did not confirm that the turn ended within 10 seconds",
+        };
+        let message = match fallback.as_deref() {
+            Some(_) => format!(
+                "{native_message}. Swarm could not prove that the fallback stopped the Agent."
+            ),
+            None => format!(
+                "{native_message}. The captured Agent or turn changed before fallback stop."
+            ),
+        };
+        let mut outcome = json!({
+            "reason": "interrupt_unconfirmed",
+            "message": message,
+            "fallback_stop_id": fallback,
+        });
+        self.redact_native_value(&mut outcome);
+        // The linked stop applies this interrupt atomically if custody proof
+        // commits. Otherwise the unconfirmed native outcome remains visible.
+        let _ = self
+            .settle(&command.id, CommandState::Unknown, Some(outcome))
+            .await;
+    }
+
+    async fn owner_interrupt_terminal(&self, command: &Command) -> Result<Option<TurnOutcome>> {
+        let (Some(agent), Some(generation), Some(turn_id)) = (
+            command.target.as_deref(),
+            command.generation,
+            command.turn_id.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let store = self.inner.store.lock().await;
+        store.ensure_committed_reads()?;
+        Ok(store
+            .get_turn(agent, generation, turn_id)?
+            .filter(|turn| turn.state == TurnState::Completed)
+            .and_then(|turn| turn.outcome))
+    }
+
     /// Apply a dispatched `configure`: store the model/effort overlay, then
     /// settle applied with the requested and effective values, the assigned
     /// revision and the application point. Codex stays Store-only here (no
@@ -1042,8 +1209,8 @@ impl Router {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !force && let Some(turn_id) = agent.active_turn.as_deref() {
-            self.interrupt_before_stop(agent, turn_id, id).await;
+        if !force && (dispatched.principal == "owner" || agent.active_turn.is_some()) {
+            self.interrupt_before_stop(agent, id).await;
         }
         match self
             .inner
@@ -1104,25 +1271,26 @@ impl Router {
         true
     }
 
-    async fn interrupt_before_stop(&self, agent: &Agent, turn_id: &str, stop_id: &str) {
+    async fn interrupt_before_stop(&self, agent: &Agent, stop_id: &str) {
         let events = self.inner.bus.subscribe();
-        let (id, pending) = {
+        let (id, turn_id, pending) = {
             let mut store = self.inner.store.lock().await;
             if self.check_command_admission_mode("interrupt").is_err() {
                 return;
             }
             // A missing prelude (including a turn that ended after capture)
             // leaves the dispatched stop responsible for session closure.
-            let Ok(change) = store.dispatch_stop_interrupt(stop_id, turn_id, now_ms()) else {
+            let Ok(change) = store.dispatch_stop_interrupt(stop_id, now_ms()) else {
                 return;
             };
             self.publish_locked(&change.events);
             let id = change.value.id.clone();
+            let turn_id = change.value.turn_id.clone();
             let pending = self
                 .inner
                 .plugin_host
                 .enqueue_command(agent, change.value, Vec::new());
-            (id, pending)
+            (id, turn_id, pending)
         };
         let response = match pending {
             Ok(pending) => pending.wait().await,
@@ -1137,7 +1305,7 @@ impl Router {
         if self.execute_control_command(&id, agent, response).await {
             self.signal_progress();
         }
-        if !refused {
+        if !refused && let Some(turn_id) = turn_id.as_deref() {
             let _ = self.wait_for_stop_turn(agent, turn_id, events).await;
         }
     }

@@ -704,12 +704,10 @@ pub(crate) async fn run_interrupt(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    let (generation, turn, capture) =
-        resolve_exact_turn_target(&data_dir, "interrupt", &agent, generation, turn).await?;
     let mut params = submit_request(id, Some(agent), "interrupt", json!({}))?;
     params.expected_generation = generation;
     params.expected_turn_id = turn;
-    submit_exact_turn_command(&data_dir, &params, json_output, capture.as_ref()).await
+    submit_exact_turn_command(&data_dir, &params, json_output, None).await
 }
 
 pub(crate) async fn run_approve(

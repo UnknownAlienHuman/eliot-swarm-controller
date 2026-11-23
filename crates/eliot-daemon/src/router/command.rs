@@ -1425,6 +1425,13 @@ impl Router {
             plugin,
         } = dispatched;
         let id = dispatched.id.clone();
+        if dispatched.is_owner_interrupt()
+            && let Some(plugin) = plugin
+        {
+            self.execute_owner_interrupt(&dispatched, plugin).await;
+            self.signal_progress();
+            return;
+        }
         if let Some(plugin) = plugin {
             let (agent, pending) = match plugin {
                 Ok(dispatched) => dispatched,

@@ -995,6 +995,16 @@ query and resolves native notices in one page-scoped query over the existing eve
 index. `agent.get` uses the same projection for its single Agent. Neither read adds a
 polling source. `AgentView.policy_opt_out_reason` retains an explicit project-policy
 opt-out reason; `swarm show` includes it in human output and JSON keeps the view field.
+`AgentGetResponse.last_control_failure` is the latest retained Owner `stop` or
+`interrupt` command in `rejected`, `failed` or `unknown` state for the current generation.
+It carries the command id, verb, state, generation, and a bounded reason from the retained
+command outcome. It is omitted when no such result is visible to the
+caller; Router applies the same command-read visibility check used by `command.get`.
+For a valid Owner control refused at Store admission due to the Agent's current state
+or a stale binding, the daemon returns a retained `rejected` result with `outcome.message`.
+Request validation and authorization errors are reported directly by the API.
+The Store selects one row through the control failure index.
+Older `agent.get` responses may omit this trailing field.
 The Agent `effective` settings are the last
 natively admitted values, never a prediction: the launch `session.ready`
 readback sets them, and a `configure` revision's turn refreshes them when the
@@ -3179,7 +3189,7 @@ on stderr so stdout stays pure response JSON; Windows PowerShell 5.1 turns that 
 line into an error record when merged with `2>&1`, so callers must read the raw process
 exit code (`$LASTEXITCODE` / `%ERRORLEVEL%`) rather than `$?`.
 
-`steer` and `interrupt` do not require `--generation`/`--turn`. When either flag
+`steer` does not require `--generation`/`--turn`. When either flag
 is omitted the CLI reads the Agent's current generation and active turn, prints
 the exact target it captured (`<verb> target: agent=A generation=N turn=T` on
 stderr), and submits exactly that binding; an explicit flag always wins over the
@@ -3188,6 +3198,15 @@ with no extra read. A missing active turn fails clearly (exit 3) before any
 submit. A captured submit that the Store rejects as `stale_generation` is
 reported as a race (exit 3, `race:` message naming the submitted binding) and is
 never retried against the new turn.
+
+`interrupt` submits explicit generation and turn constraints unchanged.
+When either is omitted the daemon captures the current binding during admission.
+For the Owner, a controlled live native session is sufficient even when its turn
+is uncertain. The result of a proven fallback stop carries
+`outcome.reason=interrupt_unconfirmed_agent_stopped` and
+`outcome.fallback_stop_id`. A confirmed Owner interruption is visible on the
+bound turn as `status=interrupted_by_owner`, `outcome=interrupted` and
+`resolution_source=owner`.
 
 Prompted waits (`send --wait`, and `launch --wait` / `resume --wait` with a
 prompt) return 0 only for a positively recognized `success` outcome. Lifecycle

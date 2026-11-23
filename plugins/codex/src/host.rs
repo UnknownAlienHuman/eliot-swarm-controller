@@ -2512,15 +2512,11 @@ impl CodexPlugin {
                 "turn/interrupt does not accept request_id",
             ));
         }
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                Error::new("stale_turn", "turn/interrupt requires a captured turn id")
-            })?;
+        let event_status = session.events.status();
+        let bound_turn = params.turn_id.as_deref().filter(|id| !id.is_empty());
         if session.phase == SessionPhase::Stopped
-            || session.events.status().active_turn_id.as_deref() != Some(turn_id)
+            || (!params.owner_control
+                && (bound_turn.is_none() || event_status.active_turn_id.as_deref() != bound_turn))
         {
             return Ok(rejected_control(
                 "turn/interrupt does not match the exact active native turn",
@@ -2530,9 +2526,40 @@ impl CodexPlugin {
             let result = unknown_control("Codex thread identity is unresolved");
             return Ok(result);
         };
+        let turn_id = match bound_turn {
+            Some(turn_id) => turn_id.to_owned(),
+            None => {
+                let thread = read_owned_thread(&session.native_client, &thread_id).await?;
+                if thread_state(&thread) == "idle" {
+                    return Ok(json!({
+                        "state": "applied", "command_id": params.command_id, "turn_id": null,
+                        "interrupt_confirmed": true,
+                    }));
+                }
+                let response = session
+                    .native_client
+                    .call(
+                        "thread/turns/list",
+                        json!({"threadId": thread_id, "limit": 1, "sortDirection": "desc",
+                            "itemsView": "notLoaded"}),
+                        Instant::now() + RPC_TIMEOUT,
+                    )
+                    .await?;
+                response["data"]
+                    .as_array()
+                    .and_then(|turns| turns.first())
+                    .filter(|turn| turn["status"] == "inProgress")
+                    .and_then(|turn| turn["id"].as_str())
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        Error::new("unknown", "Codex did not identify an active native turn")
+                    })?
+                    .to_owned()
+            }
+        };
         let interrupt_params = NativeTurnInterruptParams {
-            thread_id,
-            turn_id: turn_id.to_owned(),
+            thread_id: thread_id.clone(),
+            turn_id,
         };
         let encoded = serde_json::to_value(interrupt_params).map_err(|_| {
             Error::new(
@@ -2562,10 +2589,15 @@ impl CodexPlugin {
                 Ok(result)
             }
             Ok(_) => {
+                let idle = bound_turn.is_none()
+                    && read_owned_thread(&session.native_client, &thread_id)
+                        .await
+                        .is_ok_and(|thread| thread_state(&thread) == "idle");
                 let result = json!({
                     "state": "applied",
                     "command_id": params.command_id,
-                    "turn_id": turn_id,
+                    "turn_id": params.turn_id,
+                    "interrupt_confirmed": idle,
                 });
                 Ok(result)
             }

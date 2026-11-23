@@ -230,13 +230,14 @@ active-turn pointer; do not erase or fabricate its result. Dispatched/unknown co
 remain historical and are never reissued.
 
 A dispatched stop captures the generation's active turn, including when the
-caller omits `expected_turn_id`. A graceful stop makes one interrupt attempt
+caller omits `expected_turn_id`. Owner control can also bind the latest turn
+in the generation when its projection became unknown. A graceful stop makes one interrupt attempt
 under the stop's authority and binds it to that captured turn. After the
 attempt, wait up to five seconds for committed readback that the turn is no
 longer running or the generation has ended. A cancellation terminal settles
 `interrupted`, while natural completion/failure keeps its actual outcome. A
 pre-native refusal skips the wait and proceeds to process custody closure. An
-interrupt acknowledgement or timeout supplies no turn result.
+interrupt acknowledgement or timeout supplies no turn result by itself.
 
 Stop is `applied` only after two independent, bounded facts are committed for
 the exact generation: its owned process custody is empty and its authoritative
@@ -250,10 +251,14 @@ An actor that retires control without proof of exit records the Agent as lost
 and keeps the custody reservation for reconciliation.
 
 When an Owner-requested stop proves both facts, its captured turn becomes
-`interrupted` with `resolution_source=owner` and reason `stopped_by_owner` if no
-terminal native result arrived. A SEND dispatched before the stop can supply
-its exact turn binding while the Owner stop is in flight. A drained native terminal result, including its
-status, outcome, text and usage, remains authoritative. A turn not captured by
+`interrupted` with status `interrupted_by_owner`, `resolution_source=owner`
+and reason `stopped_by_owner` if the
+turn was unresolved or its native outcome was interrupted. An acknowledged
+Owner interrupt with an exact native interruption also sets
+that status and resolution source and emits `turn.resolved` with
+`reason=interrupted_by_owner`. A SEND dispatched before the stop can supply
+its exact turn binding while the Owner stop is in flight. Preserve natural
+completion and failure, and retain native status, text and usage. A turn not captured by
 that stop, or a non-Owner stop without terminal evidence, stays `unknown`.
 Force stop skips the cooperative interrupt window and uses the same process and
 source proof requirement.
@@ -518,7 +523,7 @@ retry a lost acknowledgement and must report a gap/reconcile current state inste
 | launch | Agent/session start; optional prompt is a linked send |
 | attach / detach | exact subject control/observation transition, generation-fenced |
 | send | input-to-turn association; terminal result is separate |
-| steer / interrupt | exact captured active turn, no implicit fallback; an uncertain `steer` claimed at a `turn_safe_point` hook does not mask its turn's native completion |
+| steer / interrupt | exact captured active turn for steer and non-Owner interrupt; Owner interrupt uses the captured controlled generation and a turn when known, with the [bounded stop escalation](monitoring.md#process-identity-and-custody); an uncertain `steer` claimed at a `turn_safe_point` hook does not mask its turn's native completion |
 | inject | context at its requested next-input or exact-turn safe point; report the actual application point |
 | stop | end the controlled generation/session; not merely stop watching it |
 | resume | reopen the retained native subject as a new generation; new text only when explicitly supplied |

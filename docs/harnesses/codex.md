@@ -440,7 +440,7 @@ write. A lost Eliot event acknowledgement follows the common last-batch rule.
 | send | `turn/start`; bind command to exact turn, then track completion separately |
 | steer | `turn/steer` with `expectedTurnId`; stale turn rejects |
 | inject | next_input via the next SEND prepend; active_turn via `turn/steer` on the exact captured turn, mechanism `codex.turn/steer`; other points unsupported, never a weaker SEND |
-| interrupt | `turn/interrupt` for the captured turn; no blind retry |
+| interrupt | `turn/interrupt` for the captured native turn. For a session-bound Owner interrupt with no turn ID, read the current thread and identify its active native turn. The [shared interrupt policy](../spec/plugin-protocol.md#host-requests) owns confirmation and escalation |
 | stop | for a captured busy turn, send exact-thread/turn `turn/interrupt` once and wait up to the core stop interrupt bound for native `turn/completed`; only the terminal status proves interruption. Then end this Agent's owned session/process; missing evidence retains an unknown turn. Force skips the cooperative window |
 | resume | new Eliot generation/app-server plus `thread/resume` of retained thread; no old input replay |
 | approve/deny/answer | reply to the exact offered native request; public details are the shared ApprovalRequest/QuestionRequest, answers are the universal answers map |

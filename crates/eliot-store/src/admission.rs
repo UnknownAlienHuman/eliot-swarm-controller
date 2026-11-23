@@ -1360,13 +1360,18 @@ fn admit_send_stop_tx(
             ),
         ));
     }
-    if let Some(expected_turn) = request.expected_turn_id.as_deref()
-        && agent.active_turn.as_deref() != Some(expected_turn)
-    {
-        return Err(Error::new(
-            "stale_generation",
-            "expected turn does not match the current Agent turn",
-        ));
+    if let Some(expected_turn) = request.expected_turn_id.as_deref() {
+        let turn = if principal == "owner" && request.verb == "stop" {
+            owner_control_turn(tx, &agent)?
+        } else {
+            agent.active_turn.clone()
+        };
+        if turn.as_deref() != Some(expected_turn) {
+            return Err(Error::new(
+                "stale_generation",
+                "expected turn does not match the current Agent turn",
+            ));
+        }
     }
     if request.verb == "send" {
         admit_send_member(tx, principal, request, payload_digest, &agent, now, events)?;
@@ -1794,6 +1799,72 @@ pub(super) fn require_reply_authority(principal: &str, verb: &str, agent: &Agent
     Ok(())
 }
 
+/// A source may retire the active projection while the native turn is still
+/// running. Only the most recent turn in this generation can be such a target.
+pub(super) fn owner_control_turn(tx: &Transaction<'_>, agent: &Agent) -> Result<Option<String>> {
+    if agent.active_turn.is_some() {
+        return Ok(agent.active_turn.clone());
+    }
+    let latest: Option<(String, String)> = tx
+        .query_row(
+            "SELECT turn_id, state FROM turns WHERE agent = ?1 AND generation = ?2
+             ORDER BY insertion_seq DESC LIMIT 1",
+            params![parse_agent_id(&agent.id)?, agent.generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(latest
+        .filter(|(_, state)| state == "unknown")
+        .map(|(id, _)| id))
+}
+
+/// Retain state refusals for validated Owner controls so the command result
+/// and Agent view can report the same reason, including on an exact retry.
+fn retain_owner_control_refusal(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    payload_digest: &[u8],
+    result: Result<()>,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    if principal != "owner"
+        || !matches!(request.verb.as_str(), "interrupt" | "stop")
+        || !matches!(error.code.as_str(), "bad_state" | "stale_generation")
+    {
+        return Err(error);
+    }
+    let Some(target) = request.target.as_deref() else {
+        return Err(error);
+    };
+    let agent_num = parse_agent_id(target)?;
+    let Some(agent) = load_agent_by_num(tx, agent_num)? else {
+        return Err(error);
+    };
+    let outcome = json!({"code": error.code, "message": error.message});
+    events.push(admit_command(
+        tx,
+        &CommandInsert {
+            state: CommandState::Rejected,
+            outcome: Some(&outcome),
+            ..CommandInsert::admitted(
+                principal,
+                request,
+                payload_digest,
+                (agent_num, agent.generation),
+                now,
+            )
+        },
+        json!({"command_id": request.id, "verb": request.verb, "state": "rejected", "outcome": outcome}),
+    )?);
+    Ok(())
+}
+
 /// Admit one turn-control command: authority, generation, state, turn and request.
 pub(super) fn admit_control_tx(
     tx: &Transaction<'_>,
@@ -1826,20 +1897,30 @@ pub(super) fn admit_control_tx(
             ),
         ));
     }
-    if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
-        return Err(Error::new(
-            "bad_state",
-            "turn controls require a busy or waiting Agent",
-        ));
-    }
-    let turn_id = agent
-        .active_turn
-        .clone()
-        .ok_or_else(|| Error::new("bad_state", "turn control requires an exact active turn"))?;
+    let turn_id =
+        if principal == "owner" && request.verb == "interrupt" {
+            if agent.native_ref.is_none() || agent.is_terminal() {
+                return Err(Error::new(
+                    "bad_state",
+                    "interrupt requires a live controlled native session",
+                ));
+            }
+            owner_control_turn(tx, &agent)?
+        } else {
+            if !matches!(agent.state, AgentState::Busy | AgentState::Waiting) {
+                return Err(Error::new(
+                    "bad_state",
+                    "turn controls require a busy or waiting Agent",
+                ));
+            }
+            Some(agent.active_turn.clone().ok_or_else(|| {
+                Error::new("bad_state", "turn control requires an exact active turn")
+            })?)
+        };
     if request
         .expected_turn_id
         .as_deref()
-        .is_some_and(|expected| expected != turn_id.as_str())
+        .is_some_and(|expected| turn_id.as_deref() != Some(expected))
     {
         return Err(Error::new(
             "stale_generation",
@@ -1879,7 +1960,7 @@ pub(super) fn admit_control_tx(
             } else {
                 capture_single_pending_request(tx, agent_num, agent.generation)?
             };
-            if pending.turn_id.as_str() != turn_id.as_str()
+            if turn_id.as_deref() != Some(pending.turn_id.as_str())
                 || request
                     .expected_turn_id
                     .as_deref()
@@ -1974,7 +2055,7 @@ pub(super) fn admit_control_tx(
     events.push(admit_command(
         tx,
         &CommandInsert {
-            turn_id: Some(&turn_id),
+            turn_id: turn_id.as_deref(),
             request_id: request_id.as_deref(),
             parent_command: stop_id,
             link_kind: stop_id.map(|_| "stop_interrupt"),
@@ -2246,7 +2327,17 @@ fn submit_tx_mode(
             &mut events,
         )?,
         "send" | "stop" => {
-            admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
+            let result =
+                admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events);
+            retain_owner_control_refusal(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                result,
+                now,
+                &mut events,
+            )?;
             None
         }
         "worktree.remove" => {
@@ -2263,12 +2354,21 @@ fn submit_tx_mode(
             None
         }
         "steer" | "interrupt" | "approve" | "deny" | "answer" => {
-            admit_control_tx(
+            let result = admit_control_tx(
                 tx,
                 principal,
                 &request,
                 &payload_digest,
                 None,
+                now,
+                &mut events,
+            );
+            retain_owner_control_refusal(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                result,
                 now,
                 &mut events,
             )?;

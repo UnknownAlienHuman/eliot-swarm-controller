@@ -6,7 +6,7 @@ use super::{
     StatsCoverage, WorkSummaryView,
 };
 use crate::{
-    Agent, AgentEdit, AgentState, CommandState, Error, NativeChildActivity,
+    Agent, AgentEdit, AgentState, Command, CommandState, Error, NativeChildActivity,
     NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState,
     ProviderRestrictionKind, Result, SessionUsage, StderrSnapshot, TurnOutcome,
     TurnResolutionSource, TurnUsage,
@@ -940,6 +940,92 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub pending_background_wake: Option<AgentBackgroundWakeView>,
+    /// Latest retained visible Owner stop/interrupt failure for this generation.
+    /// Omitted when there is no visible failure or unconfirmed outcome.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_object"
+    )]
+    pub last_control_failure: Option<AgentControlFailure>,
+}
+
+/// A retained Owner stop or interrupt failure visible to this caller.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentControlFailure {
+    pub command_id: String,
+    pub verb: String,
+    pub state: CommandState,
+    /// Human-readable detail from the retained command outcome.
+    pub reason: String,
+    pub generation: i64,
+}
+
+impl AgentControlFailure {
+    const REASON_MAX_BYTES: usize = 1024;
+
+    /// Project a Store-retained failure command without replacing its concrete result.
+    pub fn from_command(command: &Command) -> Result<Self> {
+        if command.principal != "owner"
+            || !matches!(command.verb.as_str(), "stop" | "interrupt")
+            || !matches!(
+                command.state,
+                CommandState::Rejected | CommandState::Failed | CommandState::Unknown
+            )
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "retained control failure does not match its command scope",
+            ));
+        }
+        let generation = command.generation.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "retained control failure has no generation binding",
+            )
+        })?;
+        let reason = command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| {
+                ["message", "reason", "cause", "code"]
+                    .into_iter()
+                    .find_map(|field| {
+                        outcome[field]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+            })
+            .unwrap_or("Swarm did not record a reason for this control result");
+        let failure = Self {
+            command_id: command.id.clone(),
+            verb: command.verb.clone(),
+            state: command.state,
+            reason: crate::bound_chars(reason, Self::REASON_MAX_BYTES),
+            generation,
+        };
+        failure.validate()?;
+        Ok(failure)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.command_id.trim().is_empty()
+            || self.command_id.len() > 256
+            || !matches!(self.verb.as_str(), "stop" | "interrupt")
+            || !matches!(
+                self.state,
+                CommandState::Rejected | CommandState::Failed | CommandState::Unknown
+            )
+            || self.reason.trim().is_empty()
+            || self.reason.len() > Self::REASON_MAX_BYTES
+            || self.generation < 0
+        {
+            return Err(Error::new("invalid", "Agent control failure is malformed"));
+        }
+        Ok(())
+    }
 }
 
 /// Pending automatic background-process wake surfaced in `agent.get` (`swarm show`).

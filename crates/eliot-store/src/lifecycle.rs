@@ -152,6 +152,23 @@ impl Store {
             id,
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
+        if state == CommandState::Applied
+            && record.command.is_owner_interrupt()
+            && outcome
+                .as_ref()
+                .is_some_and(|value| value["reason"] == "interrupted_by_owner")
+            && let (Some(agent), Some(generation), Some(turn_id)) =
+                (target, generation, record.command.turn_id.as_deref())
+        {
+            settle_owner_interrupted_turn_tx(
+                &tx,
+                (agent, generation, turn_id),
+                id,
+                "interrupted_by_owner",
+                now,
+                &mut events,
+            )?;
+        }
 
         if record.command.verb == "send" && state != CommandState::Applied {
             context::settle_send_claims_tx(&tx, &record, state, now, &mut events)?;
@@ -754,6 +771,18 @@ impl Store {
             fields.insert("process_custody_exit_proven".into(), json!(true));
             fields.insert("native_source_drain_proven".into(), json!(true));
             fields.insert("native_session_end_observed".into(), json!(native_ended));
+            let interrupt_id: Option<String> = tx
+                .query_row(
+                    "SELECT parent_command FROM commands WHERE id = ?1 AND link_kind = 'interrupt_stop'",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            if let Some(interrupt_id) = interrupt_id.as_deref() {
+                fields.insert("reason".into(), json!("interrupt_unconfirmed"));
+                fields.insert("interrupt_command_id".into(), json!(interrupt_id));
+            }
             if native_ended {
                 fields.remove("native_stop_reason");
             } else {
@@ -788,6 +817,17 @@ impl Store {
                 id,
                 json!({"command_id": id, "state": "applied", "outcome": outcome}),
             )?];
+            if let Some(interrupt_id) = interrupt_id.as_deref() {
+                settle_interrupt_after_fallback_tx(
+                    &tx,
+                    interrupt_id,
+                    id,
+                    agent_num,
+                    generation,
+                    now,
+                    &mut events,
+                )?;
+            }
             release_settle_capacity(
                 &tx,
                 &record,
@@ -1463,10 +1503,8 @@ fn validate_control_applied_outcome(
     let reported_turn = outcome.get("turn_id").and_then(Value::as_str);
     let reported_request = outcome.get("request_id").and_then(Value::as_str);
     if reported_command != Some(command_id)
-        || command
-            .turn_id
-            .as_deref()
-            .is_none_or(|turn_id| reported_turn != Some(turn_id))
+        || (!command.is_owner_interrupt() && command.turn_id.is_none())
+        || reported_turn != command.turn_id.as_deref()
         || reported_request != command.request_id.as_deref()
     {
         return Err(Error::new(
@@ -1474,6 +1512,56 @@ fn validate_control_applied_outcome(
             "control result does not match its exact command, turn, and request binding",
         ));
     }
+    Ok(())
+}
+
+fn settle_interrupt_after_fallback_tx(
+    tx: &Transaction<'_>,
+    interrupt_id: &str,
+    stop_id: &str,
+    agent: i64,
+    generation: i64,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<()> {
+    let interrupt = load_command_record(tx, interrupt_id)?
+        .ok_or_else(|| Error::new("source_integrity", "stop's linked interrupt disappeared"))?;
+    if !interrupt.command.is_owner_interrupt()
+        || interrupt.target != Some(agent)
+        || interrupt.command.generation != Some(generation)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "stop's linked interrupt binding changed",
+        ));
+    }
+    if interrupt.state.is_terminal() {
+        return Ok(());
+    }
+    let outcome = json!({
+        "command_id": interrupt_id,
+        "turn_id": interrupt.command.turn_id,
+        "reason": "interrupt_unconfirmed_agent_stopped",
+        "message": "Harness did not confirm the interrupt within 10 seconds. Swarm stopped the Agent.",
+        "fallback_stop_id": stop_id,
+    });
+    update_command_state(
+        tx,
+        interrupt_id,
+        CommandState::Applied,
+        Some(&outcome),
+        None,
+        now,
+    )?;
+    events.push(insert_daemon_command_event(
+        tx,
+        now,
+        "command.applied",
+        Some(agent),
+        Some(generation),
+        interrupt_id,
+        json!({"command_id": interrupt_id, "state": "applied", "outcome": outcome}),
+    )?);
     Ok(())
 }
 
@@ -1883,7 +1971,14 @@ fn stop_agent_tx(
         .or(agent.active_turn.as_deref());
     let owner_stop = interrupt_owner_turn && stop.command.principal == "owner";
     if owner_stop && let Some(turn_id) = captured_turn {
-        settle_owner_stopped_turn_tx(tx, agent_num, generation, command_id, turn_id, now, events)?;
+        settle_owner_interrupted_turn_tx(
+            tx,
+            (agent_num, generation, turn_id),
+            command_id,
+            "stopped_by_owner",
+            now,
+            events,
+        )?;
     }
     if matches!(agent.state, AgentState::Stopped | AgentState::Failed) {
         return Ok(());
@@ -1970,31 +2065,31 @@ fn stop_agent_tx(
     )
 }
 
-fn settle_owner_stopped_turn_tx(
+fn settle_owner_interrupted_turn_tx(
     tx: &Transaction<'_>,
-    agent_num: i64,
-    generation: i64,
+    (agent_num, generation, turn_id): (i64, i64, &str),
     command_id: &str,
-    turn_id: &str,
+    reason: &str,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let Some(turn) = load_turn(tx, agent_num, generation, turn_id)? else {
         return Ok(());
     };
-    if !matches!(
-        turn.state,
-        eliot_core::TurnState::Running | eliot_core::TurnState::Unknown
-    ) {
-        // The drained native terminal result is authoritative and remains as
-        // written, including its status, text, usage and outcome.
+    if turn.resolution_source == Some(eliot_core::TurnResolutionSource::Owner)
+        || (reason == "interrupted_by_owner"
+            && turn.state != eliot_core::TurnState::Unknown
+            && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))
+        || (turn.state == eliot_core::TurnState::Completed
+            && turn.outcome != Some(eliot_core::TurnOutcome::Interrupted))
+    {
         return Ok(());
     }
     let changed = db!(tx.execute(
-        "UPDATE turns SET state = 'completed', status = 'interrupted', outcome = 'interrupted',
-                          completed_at = ?1, resolution_source = 'owner'
+        "UPDATE turns SET state = 'completed', status = 'interrupted_by_owner', outcome = 'interrupted',
+                          completed_at = COALESCE(completed_at, ?1), resolution_source = 'owner'
          WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
-           AND state IN ('running', 'unknown')",
+           AND (state IN ('running', 'unknown') OR outcome = 'interrupted')",
         params![now, agent_num, generation, turn_id],
     ));
     if changed != 1 {
@@ -2017,7 +2112,7 @@ fn settle_owner_stopped_turn_tx(
                 "turn_id": turn_id,
                 "status": "interrupted",
                 "resolution_source": "owner",
-                "reason": "stopped_by_owner",
+                "reason": reason,
             }),
         ),
     )?);

@@ -1360,17 +1360,20 @@ impl ClaudePlugin {
             params.generation,
             "Claude",
         )?;
-        if session.phase != SessionPhase::Ready {
+        if session.phase == SessionPhase::Stopped
+            || (!params.owner_control && session.phase != SessionPhase::Ready)
+        {
             return Err(Error::new(
                 "unknown",
                 "Claude session or event source outcome is unresolved",
             ));
         }
-        let turn_id = params
-            .turn_id
-            .as_deref()
-            .filter(|turn_id| !turn_id.trim().is_empty())
-            .ok_or_else(|| Error::new("invalid", "Claude interrupt requires the exact turn id"))?;
+        if session.session_id.is_none() {
+            return Err(Error::new(
+                "unknown",
+                "Claude native session identity is unresolved",
+            ));
+        }
         if params.request_id.is_some() {
             return Err(Error::new(
                 "invalid",
@@ -1378,23 +1381,31 @@ impl ClaudePlugin {
             ));
         }
         let command_id = params.command_id.clone();
-        if let Some(reason) = session.events.status().failure {
-            return Err(Error::new("unknown", reason));
-        }
-        // The event task answers behind any queued terminal frame, so an
-        // interrupt racing completion refuses instead of writing twice.
-        let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await? else {
-            return Err(Error::new(
-                "stale_turn",
-                "Claude turn is not the active turn",
-            ));
-        };
-        if already_interrupted {
-            return Ok(json!({
-                "state": "applied",
-                "command_id": command_id,
-                "turn_id": turn_id,
-            }));
+        let status = session.events.status();
+        let native_turn = params
+            .turn_id
+            .as_deref()
+            .or(status.active_turn_id.as_deref());
+        if !params.owner_control {
+            if let Some(reason) = status.failure {
+                return Err(Error::new("unknown", reason));
+            }
+            let turn_id = params.turn_id.as_deref().ok_or_else(|| {
+                Error::new("invalid", "Claude interrupt requires the exact turn id")
+            })?;
+            // The event task answers behind any queued terminal frame.
+            let Some(already_interrupted) = session.events.turn_interrupt_status(turn_id).await?
+            else {
+                return Err(Error::new(
+                    "stale_turn",
+                    "Claude turn is not the active turn",
+                ));
+            };
+            if already_interrupted {
+                return Ok(json!({
+                    "state": "applied", "command_id": command_id, "turn_id": turn_id,
+                }));
+            }
         }
         let response = match session
             .native_client
@@ -1405,7 +1416,7 @@ impl ClaudePlugin {
             Err(error) if native_no_write(&error.code) => {
                 return Ok(json!({
                     "state": "rejected",
-                    "reason": "Claude interrupt was not dispatched",
+                    "reason": format!("Claude interrupt was not dispatched: {}", error.message),
                 }));
             }
             Err(_) => {
@@ -1416,11 +1427,23 @@ impl ClaudePlugin {
                 ));
             }
         };
-        session.events.mark_interrupted(turn_id).await;
+        if let Some(turn_id) = native_turn {
+            session.events.mark_interrupted(turn_id).await;
+        }
+        let status = session.events.status();
+        let idle = params.owner_control
+            && params.turn_id.is_none()
+            && status.ready
+            && status.active_turn_id.is_none()
+            && !status.source_unknown
+            && !status.batch_unknown
+            && status.failure.is_none()
+            && !status.stopped;
         let mut applied = json!({
             "state": "applied",
             "command_id": command_id,
-            "turn_id": turn_id,
+            "turn_id": params.turn_id,
+            "interrupt_confirmed": idle,
         });
         if let Some(still_queued) = response.get("still_queued").cloned() {
             applied["still_queued"] = still_queued;

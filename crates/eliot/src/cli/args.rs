@@ -127,7 +127,7 @@ pub(crate) enum CliCommand {
     Steer(SteerArgs),
     /// Add context at the soonest available point or at a specified point.
     Inject(InjectCliArgs),
-    /// Interrupt the exact active turn. `abort` is an alias.
+    /// Interrupt the controlled session or bind to a specific turn. `abort` is an alias.
     #[command(alias = "abort")]
     Interrupt(InterruptArgs),
     /// Approve a pending native request.
