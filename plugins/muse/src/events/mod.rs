@@ -3241,24 +3241,22 @@ impl EventProcessor {
                 .view_cursor
                 .as_deref()
                 .is_some_and(|cursor| !cursor.trim().is_empty())
+            && let Some(sample) = notification.usage.as_ref().and_then(turn_usage_from_native)
         {
-            if let Some(sample) = notification.usage.as_ref().and_then(turn_usage_from_native) {
-                match self.turn_completion_usage.as_mut() {
-                    Some((id, total)) if id == turn_id => {
-                        let add = |previous: Option<i64>, next: Option<i64>| {
-                            previous.zip(next).and_then(|(a, b)| a.checked_add(b))
-                        };
-                        total.input_tokens = add(total.input_tokens, sample.input_tokens);
-                        total.output_tokens = add(total.output_tokens, sample.output_tokens);
-                        total.reasoning_tokens =
-                            add(total.reasoning_tokens, sample.reasoning_tokens);
-                        total.cache_read_tokens =
-                            add(total.cache_read_tokens, sample.cache_read_tokens);
-                        total.cache_write_tokens =
-                            add(total.cache_write_tokens, sample.cache_write_tokens);
-                    }
-                    _ => self.turn_completion_usage = Some((turn_id.to_owned(), sample)),
+            match self.turn_completion_usage.as_mut() {
+                Some((id, total)) if id == turn_id => {
+                    let add = |previous: Option<i64>, next: Option<i64>| {
+                        previous.zip(next).and_then(|(a, b)| a.checked_add(b))
+                    };
+                    total.input_tokens = add(total.input_tokens, sample.input_tokens);
+                    total.output_tokens = add(total.output_tokens, sample.output_tokens);
+                    total.reasoning_tokens = add(total.reasoning_tokens, sample.reasoning_tokens);
+                    total.cache_read_tokens =
+                        add(total.cache_read_tokens, sample.cache_read_tokens);
+                    total.cache_write_tokens =
+                        add(total.cache_write_tokens, sample.cache_write_tokens);
                 }
+                _ => self.turn_completion_usage = Some((turn_id.to_owned(), sample)),
             }
         }
         let Some(merged) =

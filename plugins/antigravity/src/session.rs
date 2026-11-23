@@ -1112,9 +1112,11 @@ impl Session {
         let result_known = last.is_some_and(|last| last.terminal);
         let mut status = if state.stopped {
             "stopped"
-        } else if state.source_unknown || process_exited || !self.ready {
-            "unknown"
-        } else if turn.is_some_and(|turn| state.native_unknown_turn_is(turn)) {
+        } else if state.source_unknown
+            || process_exited
+            || !self.ready
+            || turn.is_some_and(|turn| state.native_unknown_turn_is(turn))
+        {
             "unknown"
         } else if state.active_turn().is_some() {
             "busy"

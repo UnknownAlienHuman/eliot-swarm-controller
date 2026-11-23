@@ -3008,18 +3008,17 @@ pub(crate) fn spawn(
                     }
                     drop(state_guard);
                     let stop_pending = state.lock().await.stop_order_pending();
-                    if deferred.is_some() && !stop_pending {
-                        if let Some(callback) = deferred.take()
-                            && let Err(error) = handle_hook_callback(
-                                callback.callback,
-                                callback.binding,
-                                &state,
-                                &client,
-                            )
-                            .await
-                        {
-                            state.lock().await.lose_observation(&error).await;
-                        }
+                    if !stop_pending
+                        && let Some(callback) = deferred.take()
+                        && let Err(error) = handle_hook_callback(
+                            callback.callback,
+                            callback.binding,
+                            &state,
+                            &client,
+                        )
+                        .await
+                    {
+                        state.lock().await.lose_observation(&error).await;
                     }
                     let current = *stream.borrow();
                     if frames.is_empty() {
