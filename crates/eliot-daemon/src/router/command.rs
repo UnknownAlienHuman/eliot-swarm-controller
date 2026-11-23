@@ -13,7 +13,7 @@ use crate::common::now_ms;
 use crate::router::plugin_host::PendingCommand;
 use eliot_core::{
     Agent, AgentState, Command, CommandState, ContextItem, Error, Event, FailureOrigin,
-    FrozenScriptRun, InjectPoint, Result, SecretPolicy,
+    FrozenScriptRun, InjectPoint, Result, SecretPolicy, WorkspacePhase,
     api::{
         FrozenGitFetch, FrozenGitPublish, ProjectRegistrationView, configure_uses_native_session,
     },
@@ -701,8 +701,7 @@ impl Router {
         if is_start_verb(command.verb.as_str())
             && let Err(error) = self.inner.workspaces.prepare(id).await
         {
-            self.settle_workspace_prepare_error(id, &error).await;
-            self.signal_progress();
+            self.settle_workspace_prepare_error(command, &error).await;
             return false;
         }
         if command.verb == "launch" && !self.capture_launch_instruction_delivery(id, command).await
@@ -2034,19 +2033,55 @@ impl Router {
         let _ = self.settle(id, state, Some(outcome)).await;
     }
 
-    pub(super) async fn settle_workspace_prepare_error(&self, id: &str, error: &Error) {
-        // Typed creation/setup failures settle in WorkspaceManager. Pre-effect
-        // revision or identity refusals settle as Rejected here; if the final
-        // pre-native identity read is uncertain, Store rechecks the pending
-        // command and workspace phase before recording it.
-        if matches!(error.code.as_str(), "stale_assignment" | "not_allowed") {
+    async fn settle_workspace_prepare_error(&self, start: &Command, error: &Error) {
+        let id = start.id.as_str();
+        let workspace = if let Some(target) = start.target.as_deref() {
+            let store = self.inner.store.lock().await;
+            store
+                .get_workspace(target)
+                .ok()
+                .flatten()
+                .filter(|workspace| {
+                    workspace.start_command_id == id
+                        && start
+                            .generation
+                            .and_then(|generation| generation.checked_add(1))
+                            == Some(workspace.target_generation)
+                })
+        } else {
+            None
+        };
+        let ready_resume = start.verb == "resume"
+            && workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.phase == WorkspacePhase::Ready);
+        // A raw error can be rejected regardless of code when the exact
+        // creation marker rules out a write and cancellation has not latched.
+        let before_git_write = workspace.as_ref().is_some_and(|workspace| {
+            workspace.outcome.as_ref().is_some_and(|outcome| {
+                outcome["stage"] == "creation"
+                    && outcome["native_git_write_dispatched"] == false
+                    && outcome["cancel_requested"] != true
+                    && (workspace.phase == WorkspacePhase::Creating
+                        || ready_resume
+                            && outcome["reuse"] == true
+                            && outcome["resume_previous"].is_object())
+            })
+        });
+        if before_git_write
+            || !ready_resume && matches!(error.code.as_str(), "stale_assignment" | "not_allowed")
+        {
             self.reject_undispatched_error(id, error).await;
+            self.signal_progress();
             return;
         }
+        let error = self.sanitized_failure(error, "store.dispatch.workspace_gate");
         let command = {
             let mut store = self.inner.store.lock().await;
             let command = store.get_command(id).ok().flatten();
-            if error.code == "unknown"
+            // Older Ready rows can carry reuse evidence without the write
+            // marker. Preserve the failure and fence that exact pending resume.
+            if (ready_resume || error.code == "unknown")
                 && let Some(command) = &command
                 && is_start_verb(command.verb.as_str())
                 && matches!(command.state, CommandState::Accepted | CommandState::Queued)
@@ -2057,8 +2092,16 @@ impl Router {
                     id,
                     target_generation,
                     eliot_core::WorkspaceCreationOutcome::Unknown {
-                        code: "workspace_identity_unknown".to_owned(),
-                        message: "retained workspace identity could not be confirmed".to_owned(),
+                        code: if ready_resume {
+                            error.code.clone()
+                        } else {
+                            "workspace_identity_unknown".to_owned()
+                        },
+                        message: if ready_resume {
+                            (*error.message).clone()
+                        } else {
+                            "retained workspace identity could not be confirmed".to_owned()
+                        },
                         failure_where: Some("store.dispatch.workspace_gate".to_owned()),
                         origin: Some(eliot_core::FailureOrigin::Unknown),
                         origin_evidence: Some(
@@ -2073,7 +2116,6 @@ impl Router {
             }
             command
         };
-        let error = self.sanitized_failure(error, "store.dispatch.workspace_gate");
         self.log_command_error(id, command.as_ref(), &error);
         self.signal_progress();
     }

@@ -1216,12 +1216,20 @@ fn restore_resume_workspace_marker_tx(
         .get("resume_previous")
         .ok_or_else(|| Error::new("source_integrity", "resume workspace lost its prior marker"))?;
     let current_reuse = current_outcome.get("reuse").and_then(Value::as_bool) == Some(true);
+    let unknown_no_write_cancel = allow_workspace_cancel
+        && current.phase == WorkspacePhase::Unknown
+        && current_outcome.get("stage").and_then(Value::as_str) == Some("creation")
+        && current_outcome
+            .get("native_git_write_dispatched")
+            .and_then(Value::as_bool)
+            == Some(false)
+        && workspace::workspace_cancel_requested(current);
     if current.start_command_id != command_id
         || current.target_generation != next_generation
-        || !matches!(
+        || !(matches!(
             current.phase,
             WorkspacePhase::Creating | WorkspacePhase::Ready
-        )
+        ) || unknown_no_write_cancel)
         || current.setup_index != current.frozen_setup.len()
         || !current_reuse
         || workspace::workspace_cancel_requested(current) && !allow_workspace_cancel

@@ -1869,7 +1869,14 @@ Agent transition is inconsistent. Resolving a managed `launch` that became unkno
 during workspace preparation requires quiescent workspace custody and fresh Git
 readback proving the reserved path, registration and branch are absent. The same
 transaction marks the created Agent and preparation `failed`, cancels the linked
-initial input and closes its drained workspace process source. A workspace-stage
+initial input and closes its drained workspace process source. For a cancelled
+creation with a possible Git write, the Owner can inspect the exact start and stop
+with `swarm cmd show`, the preparation with `workspace.list`, and target-generation
+custody with `swarm processes A --scope workspace --generation N`. Once custody is
+quiescent and any remaining Git artifacts are accounted for and absent, the Owner
+can run `swarm cmd resolve LAUNCH_ID --status failed --reason TEXT`. Swarm rechecks
+absence and requires the bound stop to be unknown or terminal. The Owner can
+resolve the unknown stop separately. A workspace-stage
 outcome reports Git dispatch from the workspace's
 retained write marker. An unknown native configure resolves as `applied`
 only when the owned session proves the requested configuration and the
@@ -2950,7 +2957,9 @@ RPCs (`daemon.status`, `agent.list`, `agent.get`, `swarm.wait`, `command.get`,
 `daemon.shutdown`, and `command.submit` with `verb == "stop"`), leaving
 server-side `#846`/`#886` owner boundaries unchanged. A retry uses the recorded removal phase. After a crash without
 exit proof, start the registered stand again so boot can reconcile custody,
-then retry teardown.
+then retry teardown. [Workspace cancellation recovery](monitoring.md#workspace-preparation)
+settles exact pre-effect cancellations before drain. Stand cleanup still requires
+its own proof for any remaining Git artifacts.
 
 After proving the stand daemon stopped, `stand down`, `stand prune`, and parent
 `cleanup` remove stand files owned by the stand, including its scratch

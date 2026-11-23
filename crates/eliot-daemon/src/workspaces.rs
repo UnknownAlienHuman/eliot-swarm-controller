@@ -304,8 +304,9 @@ impl WorkspaceManager {
             {
                 return Ok(value);
             }
-            self.require_current(preparation, WorkspacePhase::Unknown)
-                .await?;
+            if preparation.phase != WorkspacePhase::Unknown {
+                return Err(problem("bad_state", "workspace preparation is not unknown"));
+            }
             if !workspace_git_effect_quiescent(&slot) {
                 return Err(problem(
                     "bad_state",
@@ -356,7 +357,10 @@ impl WorkspaceManager {
             match current.phase {
                 WorkspacePhase::Ready => {
                     let readback = git.inspect_retained(&current).await;
-                    if !matches!(readback, WorkspaceCreationOutcome::Verified { .. }) {
+                    if let Some(error) = workspace_creation_error(&readback) {
+                        if agent.generation > 0 {
+                            return Err(error);
+                        }
                         return Err(problem(
                             "unknown",
                             "ready workspace identity is unavailable",
@@ -465,6 +469,11 @@ impl WorkspaceManager {
                     self.require_current(&current, WorkspacePhase::Creating)
                         .await?;
                     let failure = workspace_creation_error(&outcome);
+                    // A resume only reads the retained checkout. Its failed
+                    // readback refuses this attempt before any write or setup.
+                    if reuse && let Some(error) = failure {
+                        return Err(error);
+                    }
                     let mut store = self.inner.store.lock().await;
                     let change = store.settle_workspace_creation(
                         command_id,
@@ -1433,7 +1442,18 @@ impl WorkspaceManager {
                     self.publish(&admission.events);
                     id
                 };
-                let _ = self.cancel(&id).await;
+                let (code, error) = match self.cancel(&id).await {
+                    Ok(true) => continue,
+                    Ok(false) => ("daemon.workspace_shutdown_cancel_not_applied", None),
+                    Err(error) => ("daemon.workspace_shutdown_cancel_failed", Some(error)),
+                };
+                let secrets: Vec<_> = self.inner.secrets.lock_recover().iter().cloned().collect();
+                crate::logging::record(
+                    &SecretPolicy::new(secrets),
+                    code,
+                    &[("agent", &preparation.agent), ("command", &id)],
+                    error.as_ref(),
+                );
             }
         }
         // Removal cancellation also waits for the owner, without replaying a signal.
@@ -1731,7 +1751,7 @@ impl WorkspaceManager {
     ) -> Result<bool> {
         let slot = self.slot(preparation);
         let gate = slot.gate.clone().lock_owned().await;
-        let phase = {
+        let current = {
             let mut store = self.inner.store.lock().await;
             let current = store
                 .get_workspace(&preparation.agent)?
@@ -1753,8 +1773,16 @@ impl WorkspaceManager {
                 )?;
                 self.publish(&change.events);
             }
-            current.phase
+            current
         };
+        let creation = current.outcome.as_ref().filter(|outcome| {
+            matches!(
+                current.phase,
+                WorkspacePhase::Creating | WorkspacePhase::Unknown
+            ) && outcome["stage"] == "creation"
+        });
+        let no_git_write =
+            creation.is_some_and(|outcome| outcome["native_git_write_dispatched"] == false);
         // The durable marker is committed before any cancellation signal is sent.
         let active = slot.active.lock_recover().clone();
         if let Some(active) = &active {
@@ -1783,9 +1811,10 @@ impl WorkspaceManager {
                 // cancellation below withdraws the start, never succeeds/replays setup.
                 // A retained failed current run above cannot use this prior-custody rule.
                 None => {
-                    cfg!(windows)
+                    no_git_write
+                        || cfg!(windows)
                         || !matches!(
-                            phase,
+                            current.phase,
                             WorkspacePhase::Unknown | WorkspacePhase::SetupRunning
                         )
                 }
@@ -1793,7 +1822,14 @@ impl WorkspaceManager {
         };
         let _gate = slot.gate.clone().lock_owned().await;
         let mut store = self.inner.store.lock().await;
-        let outcome = if quiescent {
+        // Empty custody proves the process stopped, but cannot resolve whether
+        // an interrupted Git write left a worktree or branch behind.
+        let outcome = if creation.is_some() && !no_git_write {
+            WorkspaceCancelOutcome::Unknown {
+                code: "workspace_git_write_unknown".to_owned(),
+                message: "Git creation may have run. Verify the reserved path, registration and branch before resolving the start and stop commands.".to_owned(),
+            }
+        } else if quiescent {
             WorkspaceCancelOutcome::Stopped
         } else {
             WorkspaceCancelOutcome::Unknown {
@@ -2198,24 +2234,24 @@ fn creation_rollback_failed(subject: &str, reason: &str) -> WorkspaceCreationOut
 }
 
 fn workspace_creation_error(outcome: &WorkspaceCreationOutcome) -> Option<Error> {
-    let (status, message, failure_where, origin, origin_evidence) = match outcome {
+    let (code, message, failure_where, origin, origin_evidence) = match outcome {
         WorkspaceCreationOutcome::Verified { .. } => return None,
         WorkspaceCreationOutcome::Failed {
+            code,
             message,
             failure_where,
             origin,
             origin_evidence,
-            ..
-        } => ("failed", message, failure_where, origin, origin_evidence),
-        WorkspaceCreationOutcome::Unknown {
+        }
+        | WorkspaceCreationOutcome::Unknown {
+            code,
             message,
             failure_where,
             origin,
             origin_evidence,
-            ..
-        } => ("unknown", message, failure_where, origin, origin_evidence),
+        } => (code, message, failure_where, origin, origin_evidence),
     };
-    let mut error = problem(status, message).with_where(
+    let mut error = problem(code, message).with_where(
         failure_where
             .as_deref()
             .unwrap_or("store.dispatch.workspace_gate"),
