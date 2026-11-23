@@ -1594,9 +1594,12 @@ pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>>
         )
     };
     let guard = Directory::open(parent).map_err(unreadable)?;
-    fs::read_dir(parent)
-        .and_then(|mut entries| entries.next().transpose())
-        .map_err(|_| problem("unavailable", "worktree parent directory cannot be listed"))?;
+    let list_error = |_| problem("unavailable", "worktree parent directory cannot be listed");
+    for entry in fs::read_dir(parent).map_err(list_error)? {
+        if git_path_matches(&entry.map_err(list_error)?.path(), path) {
+            return Ok(None);
+        }
+    }
     Ok(absent(path)?.then_some(guard))
 }
 
