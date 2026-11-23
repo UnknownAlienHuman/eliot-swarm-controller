@@ -1354,11 +1354,14 @@ pub(crate) fn needs_commit_roots(harness: &str, profile: &Value) -> bool {
 }
 
 /// Git metadata roots needed by a sandboxed Codex Agent in a managed worktree.
-/// The worktree admin directory and shared objects remain writable. A branch
-/// ref and reflog parent is added only for the managed branch's `<project>/<aN>`
-/// parent, after confirming that both contain no sibling refs/logs. Successors
-/// keep that grant when they inherit the worktree. Hooks, repository config
-/// and packed-refs stay out.
+/// The worktree admin directory and shared objects remain writable. Branches
+/// in the default `<project>/<aN>/<name>` form get ref and reflog parents only
+/// when their parent is exclusive. Explicit one-component branches,
+/// `fix/<name>`, and legacy `<project>/<agent>-<task>` branches get shared ref
+/// and reflog parents;
+/// the root grant can write sibling loose refs and logs below those parents.
+/// Successors keep the same grant when they inherit the worktree. Hooks,
+/// repository config and packed-refs stay out.
 pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<String>> {
     let git = GitProbe::new().ok()?;
     let root = canonical_root(workspace).ok()?;
@@ -1420,15 +1423,38 @@ pub(crate) async fn commit_roots(workspace: &str, branch: &str) -> Option<Vec<St
     // remains a shared integrity boundary; a broker would be needed to make
     // these writes per-Agent.
     let mut paths = vec![admin, objects];
-    if let Some((parent, leaf)) = exclusive_agent_ref_parent(branch) {
-        let refs = common.join("refs").join("heads").join(parent);
-        let logs = common.join("logs").join("refs").join("heads").join(parent);
-        if branch_ref_parent_is_exclusive(&git, &root, parent, &full_ref, deadline).await
-            && ensure_plain_directory_tree(&common, &refs)
+    let ref_parent = exclusive_agent_ref_parent(branch)
+        .map(|(parent, leaf)| (Some(parent), leaf, true))
+        .or_else(|| explicit_shared_ref_parent(branch).map(|(parent, leaf)| (parent, leaf, false)));
+    if let Some((parent, leaf, exclusive)) = ref_parent {
+        let (refs, logs) = match parent {
+            Some(parent) => (
+                common.join("refs").join("heads").join(parent),
+                common.join("logs").join("refs").join("heads").join(parent),
+            ),
+            None => (
+                common.join("refs").join("heads"),
+                common.join("logs").join("refs").join("heads"),
+            ),
+        };
+        let branch_is_safe = match (exclusive, parent) {
+            (true, Some(parent)) => {
+                branch_ref_parent_is_exclusive(&git, &root, parent, &full_ref, deadline).await
+            }
+            (true, None) => false,
+            (false, parent) => {
+                branch_ref_is_unambiguous(&git, &root, parent, &full_ref, deadline).await
+            }
+        };
+        let directories_are_safe = ensure_plain_directory_tree(&common, &refs)
             && ensure_plain_directory_tree(&common, &logs)
-            && contains_only_optional_file(&refs, leaf)
-            && contains_only_optional_file(&logs, leaf)
-        {
+            && if exclusive {
+                contains_only_optional_file(&refs, leaf) && contains_only_optional_file(&logs, leaf)
+            } else {
+                contains_only_plain_entries(&refs, Some(leaf))
+                    && contains_only_plain_entries(&logs, Some(leaf))
+            };
+        if branch_is_safe && directories_are_safe {
             paths.push(refs);
             paths.push(logs);
         }
@@ -1459,6 +1485,24 @@ fn exclusive_agent_ref_parent(branch: &str) -> Option<(&str, &str)> {
     }
     let (parent, _) = branch.rsplit_once('/')?;
     Some((parent, leaf))
+}
+
+fn explicit_shared_ref_parent(branch: &str) -> Option<(Option<&str>, &str)> {
+    let mut components = branch.split('/');
+    let first = components.next()?;
+    let Some(leaf) = components.next() else {
+        return (!first.is_empty()).then_some((None, first));
+    };
+    if first.is_empty() || leaf.is_empty() || components.next().is_some() {
+        return None;
+    }
+    (first == "fix" || is_legacy_agent_task_component(leaf)).then_some((Some(first), leaf))
+}
+
+fn is_legacy_agent_task_component(component: &str) -> bool {
+    component
+        .split_once('-')
+        .is_some_and(|(agent, task)| is_agent_id_component(agent) && !task.is_empty())
 }
 
 fn is_agent_id_component(agent: &str) -> bool {
@@ -1505,6 +1549,51 @@ async fn branch_ref_parent_is_exclusive(
             // This also catches packed sibling refs, which are absent from
             // the loose refs directory but would share the granted parent.
             // Windows path comparison also catches case-only ref collisions.
+            return false;
+        }
+    }
+    current_found
+}
+
+async fn branch_ref_is_unambiguous(
+    git: &GitProbe,
+    root: &Path,
+    parent: Option<&str>,
+    full_ref: &str,
+    deadline: Instant,
+) -> bool {
+    let Ok(refs) = git
+        .workspace_command(root, &["for-each-ref", "--format=%(refname)"], deadline)
+        .await
+    else {
+        return false;
+    };
+    if refs.code != 0 {
+        return false;
+    }
+    let Ok(refs) = String::from_utf8(refs.stdout) else {
+        return false;
+    };
+    let full_ref_key = workspace_path_key(full_ref);
+    let parent_ref = parent.map(|parent| format!("refs/heads/{parent}"));
+    let parent_ref_key = parent_ref.as_deref().map(workspace_path_key);
+    let nested_prefix = format!("{full_ref}/");
+    let nested_prefix_key = workspace_path_key(&nested_prefix);
+    let mut current_found = false;
+    for name in refs.lines() {
+        if name == full_ref {
+            current_found = true;
+            continue;
+        }
+        let name_key = workspace_path_key(name);
+        if name_key.as_ref() == full_ref_key.as_ref()
+            || parent_ref_key
+                .as_ref()
+                .is_some_and(|parent_key| name_key.as_ref() == parent_key.as_ref())
+            || name_key.starts_with(nested_prefix_key.as_ref())
+        {
+            // Shared parents permit sibling branches, but the selected ref
+            // must remain distinct from case-only, parent, or nested refs.
             return false;
         }
     }
@@ -1558,6 +1647,45 @@ fn contains_only_optional_file(directory: &Path, expected: &str) -> bool {
             return false;
         }
         found = true;
+    }
+    true
+}
+
+fn contains_only_plain_entries(directory: &Path, expected: Option<&str>) -> bool {
+    let expected_key = expected.map(workspace_path_key);
+    let mut directories = vec![(directory.to_path_buf(), true)];
+    while let Some((current, is_root)) = directories.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            return false;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                return false;
+            };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return false;
+            };
+            let is_expected = is_root && expected == Some(name);
+            if is_root
+                && expected_key.as_ref().is_some_and(|expected_key| {
+                    workspace_path_key(name).as_ref() == expected_key.as_ref() && !is_expected
+                })
+            {
+                return false;
+            }
+            let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+                return false;
+            };
+            if plain_directory_metadata(&metadata) {
+                if is_expected {
+                    return false;
+                }
+                directories.push((entry.path(), false));
+            } else if !metadata.is_file() || is_reparse_point(&metadata) {
+                return false;
+            }
+        }
     }
     true
 }

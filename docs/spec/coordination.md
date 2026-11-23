@@ -1210,26 +1210,32 @@ transfer closes any lost or failed `owner.inbox` item for the source. A busy sou
 refused with the remedy: run `swarm interrupt <agent>`, then retry.
 
 A Codex `workspace-write` Agent in a managed worktree gets its worktree admin directory
-and the repository's common object directory as extra writable roots. Branch ref and
-reflog parent directories are added only when the managed branch parent is
-`<project>/<aN>`, and Git's full ref inventory and the on-disk directories show no sibling
-refs or logs. Generated branches use
-`<project>/<agent>/work`, giving each worktree its own parent; Store admission prevents
-another managed worktree from sharing that parent. A successor inherits the same roots
-from its managed worktree branch even though it has a different Agent ID.
-Explicit branch names remain unchanged. A legacy branch such as
-`<project>/<agent>-<task>` has a shared project parent and receives no ref or reflog
-roots. Such an Agent can stage files and write objects; it can also make detached commits
-in its worktree admin directory, but it cannot advance the named branch through the
-sandbox roots. Unmanaged
-workspaces and top-level branches remain ineligible for a successor that needs to commit,
-unless it is the source's own profile.
+and the repository's common `objects` directory as writable roots. Generated branches
+use `<project>/<aN>/work`; the daemon adds that branch's ref and reflog parent only after
+Git's full ref inventory and the on-disk directories show no sibling refs or logs. Store
+admission prevents another managed worktree from sharing the `<project>/<aN>` parent,
+and a successor inherits the same roots from its managed branch despite having a different
+Agent ID.
 
-The common object directory remains writable and is shared by every worktree. A sandboxed
-Agent can create objects and can corrupt or remove repository objects used by other refs.
-Per-Agent object brokering would need to mediate Git object writes and is outside this
-increment; writable ref and reflog parents do not isolate object integrity. Hooks,
-repository config, `packed-refs`, tags and other agents' ref directories stay denied.
+Explicit one-component branch names receive the shared `refs/heads` and
+`logs/refs/heads` roots. Explicit `fix/<name>` branches receive the `fix` ref and reflog
+parents, and legacy `<project>/<agent>-<task>` branches receive their project ref and
+reflog parents, even when those parents contain sibling branches. These recursive
+directory grants allow writes to every loose branch ref and reflog beneath each granted
+parent, including siblings; they do not isolate writes to the selected branch. Before
+granting them, the daemon verifies that the selected branch is the worktree's current
+HEAD branch, exists in Git's ref inventory without a case-only alias or parent/child ref
+conflict, and that each granted directory tree contains only regular files and plain
+directories, with no reparse points or special entries. Other explicit multi-component
+branch shapes receive those roots only when they match the existing exclusive
+`<project>/<aN>/<name>` parent rule. Unmanaged workspaces remain ineligible for these
+roots.
+
+The writable object root is the repository-wide common `objects` tree. A sandboxed Agent
+can create, replace, remove or corrupt object data visible through that tree, including
+loose objects and pack data, and can affect objects used by other refs. Eliot does not
+broker object writes or provide per-Agent object integrity. The branch grants exclude
+`packed-refs`, tags, refs outside `refs/heads`, repository config and hooks.
 
 A may be idle, or lost, failed or stopped with its process tree proven gone, in any
 generation. The switch first admits and executes an exact-generation source stop. Git

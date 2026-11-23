@@ -228,19 +228,29 @@ the cancel and readback into a removal fact. The shared settlement returns
 `unknown` and latches the session unless that fact proves removal.
 
 `commit_roots` lists the Git directories the daemon computed for a sandboxed Agent on a
-managed worktree. The adapter only maps them to native writable roots and verifies them
-in the readback. Roots include the worktree's admin directory and the repository's shared
-object directory. The daemon adds branch-ref and reflog parent directories only after
-confirming that the managed branch parent is `<project>/<aN>` and contains no sibling
-ref or log; otherwise those directories are withheld. Store
-admission prevents another managed worktree from sharing that parent, and successors
-inherit the roots from the retained branch even with a different Agent ID. Explicit and
-legacy branch names remain unchanged, but a shared legacy parent gets no ref or reflog
-roots. A requested branch under a reserved parent is refused rather than allowed to add
-a future sibling. The common object directory remains a repository-wide integrity
-exposure: the sandbox can create,
-remove, or corrupt objects used by other refs. A per-Agent object broker would need to
-mediate all Git object writes and is outside this increment.
+managed worktree. The adapter maps them to native writable roots and verifies them in the
+readback. Roots include the worktree's admin directory and the repository's common
+`objects` directory. Generated `<project>/<aN>/work` branches receive ref and reflog
+parents only when the branch parent is exclusive; Store admission prevents another
+managed worktree from sharing it, and successors inherit the roots from the retained
+branch even with a different Agent ID.
+
+Explicit one-component branches receive the shared `refs/heads` and
+`logs/refs/heads` roots. Explicit `fix/<name>` and legacy
+`<project>/<agent>-<task>` branches receive their respective shared ref and reflog
+parents. These recursive roots permit writes to every loose branch ref and reflog below
+the granted parent, including siblings. The daemon still verifies the selected branch
+against the worktree's symbolic `HEAD` and Git's ref inventory, rejects case-only aliases
+and parent/child ref conflicts, and checks that each granted directory tree contains only
+regular files and plain directories, with no reparse points or special entries. Other
+multi-component branch names receive ref and reflog roots only when they satisfy the
+existing exclusive `<project>/<aN>/<name>` parent rule. `packed-refs`, tags, refs outside
+`refs/heads`, repository config and hooks remain outside these roots.
+
+The writable object root covers the repository's entire common `objects` tree, so the
+sandbox can create, replace, remove or corrupt object data used by any ref, including
+loose objects and pack data. Object writes are not isolated per Agent; a broker would
+need to mediate Git object writes and is outside this increment.
 
 `eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
 preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional
