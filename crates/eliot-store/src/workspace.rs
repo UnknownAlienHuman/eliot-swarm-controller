@@ -855,6 +855,139 @@ pub(super) fn preserve_native_git_write_marker(previous: Option<&Value>, outcome
     }
 }
 
+fn removal_marker(
+    tx: &Transaction<'_>,
+    agent: i64,
+    workspace: &WorkspacePreparation,
+    command_id: &str,
+    outcome: &WorkspaceRemovalOutcome,
+) -> Result<Value> {
+    let previous = workspace.outcome.as_ref();
+    let mut marker = json!({
+        "stage": "removal", "command_id": command_id, "result": outcome,
+        "previous_phase": previous.and_then(|value| value.get("previous_phase"))
+    });
+    if let Some(tip) = previous.and_then(|value| value.get("branch_tip_before_remove")) {
+        marker["branch_tip_before_remove"] = tip.clone();
+    }
+    if matches!(
+        outcome,
+        WorkspaceRemovalOutcome::Removed {
+            directory_absent_before_remove: true,
+            ..
+        }
+    ) {
+        marker["last_available_git_observation"] =
+            last_available_git_observation(tx, agent, workspace)?;
+    }
+    preserve_native_git_write_marker(previous, &mut marker);
+    Ok(marker)
+}
+
+fn apply_removed_workspace(
+    tx: &Transaction<'_>,
+    workspace: &mut WorkspacePreparation,
+    outcome: &WorkspaceRemovalOutcome,
+) -> Result<()> {
+    let WorkspaceRemovalOutcome::Removed {
+        repo_common_dir,
+        worktree_path,
+        branch,
+        branch_retained,
+        directory_absent_before_remove,
+        branch_absent_before_remove,
+    } = outcome
+    else {
+        return Err(Error::new(
+            "bad_state",
+            "workspace removal has no definite readback",
+        ));
+    };
+    let absent_before_remove = !branch_retained
+        && *directory_absent_before_remove
+        && *branch_absent_before_remove
+        && workspace
+            .outcome
+            .as_ref()
+            .is_some_and(|marker| marker["native_git_write_dispatched"].as_bool() == Some(false));
+    if repo_common_dir != &workspace.repo_common_dir
+        || worktree_path != &workspace.worktree_path
+        || branch != &workspace.requested_branch
+        || !(*branch_retained && !branch_absent_before_remove || absent_before_remove)
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "removal readback must prove exact absence and either retain the branch or prove its prior absence without a Git write",
+        ));
+    }
+    workspace.phase = WorkspacePhase::Removed;
+    db!(tx.execute(
+        "DELETE FROM agent_edits WHERE workspace = ?1",
+        [&workspace.worktree_path]
+    ));
+    Ok(())
+}
+
+impl Store {
+    pub fn is_legacy_missing_branch_removal(outcome: &Value, command_id: &str) -> bool {
+        outcome["stage"] == "removal"
+            && outcome["command_id"].as_str() == Some(command_id)
+            && outcome["native_git_write_dispatched"].as_bool() == Some(false)
+            && outcome.get("removal_write_guard").is_none()
+            && outcome["result"]["state"] == "unknown"
+            && outcome["result"]["code"] == "source_integrity"
+            && outcome["result"]["message"] == "removed workspace branch was not retained"
+    }
+}
+
+pub(super) fn resolve_legacy_removal_tx(
+    tx: &Transaction<'_>,
+    command: &CommandRecord,
+    proof: &WorkspacePreparation,
+    outcome: &WorkspaceRemovalOutcome,
+    now: i64,
+    events: &mut Vec<Event>,
+) -> Result<Value> {
+    let agent_num = parse_agent_id(&proof.agent)?;
+    let id = &command.command.id;
+    let eligible = |marker: &Value| Store::is_legacy_missing_branch_removal(marker, id);
+    if command.target != Some(agent_num)
+        || command.command.generation != Some(proof.target_generation)
+        || proof.phase != WorkspacePhase::Unknown
+        || !command.command.outcome.as_ref().is_some_and(eligible)
+        || !proof.outcome.as_ref().is_some_and(eligible)
+        || !matches!(
+            outcome,
+            WorkspaceRemovalOutcome::Removed {
+                branch_retained: false,
+                directory_absent_before_remove: true,
+                branch_absent_before_remove: true,
+                ..
+            }
+        )
+        || load_workspace(tx, agent_num)?.as_ref() != Some(proof)
+        || !load_agent_by_num(tx, agent_num)?.is_some_and(|agent| {
+            agent.generation == proof.target_generation
+                && agent.is_terminal()
+                && agent.active_turn.is_none()
+        })
+    {
+        return Err(Error::new(
+            "bad_state",
+            "legacy removal no longer matches its exact no-write absence readback",
+        ));
+    }
+    let marker = removal_marker(tx, agent_num, proof, id, outcome)?;
+    let mut workspace = proof.clone();
+    apply_removed_workspace(tx, &mut workspace, outcome)?;
+    workspace.outcome = Some(marker.clone());
+    workspace.updated_at = now;
+    persist_workspace(tx, proof, &workspace)?;
+    events.push(workspace_event(tx, &workspace, now)?);
+    close_finished_workspace_process_source(tx, agent_num, proof.target_generation, now, events)?;
+    Ok(marker)
+}
+
 pub(super) fn admit_workspace_preparation(
     tx: &Transaction<'_>,
     request: &SubmitCommand,
@@ -1633,10 +1766,11 @@ impl Store {
         &mut self,
         command_id: &str,
         expected: &WorkspacePreparation,
+        removal_tip: Option<&str>,
         now: i64,
     ) -> Result<WorkspaceGitReservation> {
         self.ensure_writer_healthy()?;
-        let result = self.begin_workspace_git_effect_inner(command_id, expected, now);
+        let result = self.begin_workspace_git_effect_inner(command_id, expected, removal_tip, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -1645,6 +1779,7 @@ impl Store {
         &mut self,
         command_id: &str,
         expected: &WorkspacePreparation,
+        removal_tip: Option<&str>,
         now: i64,
     ) -> Result<WorkspaceGitReservation> {
         require_nonempty(command_id, "command_id")?;
@@ -1703,6 +1838,15 @@ impl Store {
                 "bad_state",
                 "native Git reservation requires its exact workspace create or remove",
             ));
+        }
+        if removal_identity != removal_tip.is_some() {
+            return Err(Error::new(
+                "invalid",
+                "only a removal requires its verified branch tip",
+            ));
+        }
+        if let Some(tip) = removal_tip {
+            validate_git_oid(tip)?;
         }
 
         if removal_identity {
@@ -1781,6 +1925,9 @@ impl Store {
             .and_then(Value::as_object_mut)
             .ok_or_else(|| Error::new("source_integrity", "workspace outcome is not an object"))?;
         marker.insert("native_git_write_dispatched".to_owned(), Value::Bool(true));
+        if let Some(tip) = removal_tip {
+            marker.insert("branch_tip_before_remove".to_owned(), json!(tip));
+        }
         workspace.updated_at = now;
         persist_workspace(&tx, &old, &workspace)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -2072,19 +2219,7 @@ impl Store {
                 workspace_cancel_marker(&workspace, stop, outcome)?
             }
             WorkspaceAction::Removal(outcome) => {
-                let mut marker = json!({"stage": "removal", "command_id": command_id, "result": outcome,
-                    "previous_phase": workspace.outcome.as_ref().and_then(|value| value.get("previous_phase"))});
-                if matches!(
-                    outcome,
-                    WorkspaceRemovalOutcome::Removed {
-                        directory_absent_before_remove: true,
-                        ..
-                    }
-                ) {
-                    marker["last_available_git_observation"] =
-                        last_available_git_observation(&tx, agent_num, &workspace)?;
-                }
-                marker
+                removal_marker(&tx, agent_num, &workspace, command_id, outcome)?
             }
         };
         preserve_native_git_write_marker(old.outcome.as_ref(), &mut marker);
@@ -2399,28 +2534,8 @@ impl Store {
                     ));
                 }
                 let state = match outcome {
-                    WorkspaceRemovalOutcome::Removed {
-                        repo_common_dir,
-                        worktree_path,
-                        branch,
-                        branch_retained,
-                        ..
-                    } => {
-                        if repo_common_dir != workspace.repo_common_dir
-                            || worktree_path != workspace.worktree_path
-                            || branch != workspace.requested_branch
-                            || !branch_retained
-                        {
-                            return Err(Error::new(
-                                "source_integrity",
-                                "removal readback must prove exact absence and retain the branch",
-                            ));
-                        }
-                        workspace.phase = WorkspacePhase::Removed;
-                        db!(tx.execute(
-                            "DELETE FROM agent_edits WHERE workspace = ?1",
-                            [&workspace.worktree_path],
-                        ));
+                    WorkspaceRemovalOutcome::Removed { .. } => {
+                        apply_removed_workspace(&tx, &mut workspace, &outcome)?;
                         CommandState::Applied
                     }
                     WorkspaceRemovalOutcome::Failed { .. } => {

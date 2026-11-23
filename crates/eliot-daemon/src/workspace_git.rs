@@ -78,11 +78,18 @@ struct WorktreeEntry {
 
 pub(crate) struct MissingWorktreeRemoval {
     pub(crate) parent: Directory,
+    pub(crate) branch_tip: Option<String>,
     #[expect(
         clippy::disallowed_types,
         reason = "The worktree owner dispatches the prepared exact Git removal command."
     )]
     pub(crate) command: Option<Command>,
+}
+
+pub(crate) enum RemovalBranch<'a> {
+    Retained,
+    At(&'a str),
+    Absent,
 }
 
 struct Subject {
@@ -956,15 +963,6 @@ impl WorkspaceGit {
         let Some(parent) = observe_worktree_absence(path)? else {
             return Ok(None);
         };
-        timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
-            .await
-            .map_err(|_| {
-                problem(
-                    "unavailable",
-                    "worktree absence observation deadline elapsed",
-                )
-            })?;
-        confirm_worktree_absence(path, &parent)?;
         let target = destination_path(&preparation.worktree_path)?;
         if !git_path_matches(path, &target) {
             return Err(problem(
@@ -974,11 +972,22 @@ impl WorkspaceGit {
         }
         let source = self.source(preparation, deadline).await?;
         separate_target(&source, &target)?;
+        let branch_tip = self
+            .branch_oid(&source.root, &preparation.requested_branch, deadline)
+            .await?;
+        if expected_tip.is_some_and(|tip| branch_tip.as_deref() != Some(tip)) {
+            return Err(problem(
+                "identity_changed",
+                "missing worktree branch tip moved since the plan",
+            ));
+        }
+        confirm_worktree_absence_after_grace(path, &parent, deadline).await?;
         let entries = self.entries(&source.root, deadline).await?;
         let mut matches = entries.iter().filter(|entry| entry.path == target);
         let Some(entry) = matches.next() else {
             return Ok(Some(MissingWorktreeRemoval {
                 parent,
+                branch_tip,
                 command: None,
             }));
         };
@@ -999,17 +1008,7 @@ impl WorkspaceGit {
                 "missing worktree's Git registration does not match its managed path and branch",
             ));
         }
-        if expected_tip.is_some_and(|tip| entry.head.as_deref() != Some(tip)) {
-            return Err(problem(
-                "identity_changed",
-                "missing worktree branch tip moved since the plan",
-            ));
-        }
-        if self
-            .branch_oid(&source.root, &preparation.requested_branch, deadline)
-            .await?
-            != entry.head
-        {
+        if branch_tip != entry.head {
             return Err(problem(
                 "source_integrity",
                 "missing worktree registration and retained branch tip disagree",
@@ -1032,6 +1031,7 @@ impl WorkspaceGit {
         confirm_worktree_absence(path, &parent)?;
         Ok(Some(MissingWorktreeRemoval {
             parent,
+            branch_tip,
             command: Some(command),
         }))
     }
@@ -1092,8 +1092,9 @@ impl WorkspaceGit {
     pub(crate) async fn inspect_removal(
         &self,
         preparation: &WorkspacePreparation,
+        branch: RemovalBranch<'_>,
     ) -> WorkspaceRemovalOutcome {
-        match self.inspect_removed(preparation).await {
+        match self.inspect_removed(preparation, branch).await {
             Ok(outcome) => outcome,
             Err(error) => WorkspaceRemovalOutcome::Unknown {
                 code: error.code,
@@ -1102,9 +1103,35 @@ impl WorkspaceGit {
         }
     }
 
+    /// Owner readback of a legacy removal that never dispatched Git.
+    pub(crate) async fn verify_absent_removal(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> Result<WorkspaceRemovalOutcome> {
+        let path = Path::new(&preparation.worktree_path);
+        let Some(parent) = observe_worktree_absence(path)? else {
+            return Err(problem(
+                "bad_state",
+                "the managed worktree directory exists",
+            ));
+        };
+        confirm_worktree_absence_after_grace(
+            path,
+            &parent,
+            Instant::now() + READ_TIME + ABSENCE_GRACE,
+        )
+        .await?;
+        let outcome = self
+            .inspect_removed(preparation, RemovalBranch::Absent)
+            .await?;
+        confirm_worktree_absence(path, &parent)?;
+        Ok(outcome)
+    }
+
     async fn inspect_removed(
         &self,
         preparation: &WorkspacePreparation,
+        branch: RemovalBranch<'_>,
     ) -> Result<WorkspaceRemovalOutcome> {
         let deadline = Instant::now() + READ_TIME;
         let source = self.source(preparation, deadline).await?;
@@ -1127,14 +1154,18 @@ impl WorkspaceGit {
                 "workspace removal is incomplete; no repair or replay was attempted",
             ));
         }
-        if self
+        let branch_tip = self
             .branch_oid(&source.root, &preparation.requested_branch, deadline)
-            .await?
-            .is_none()
-        {
+            .await?;
+        let branch_matches = match branch {
+            RemovalBranch::Retained => branch_tip.is_some(),
+            RemovalBranch::At(tip) => branch_tip.as_deref() == Some(tip),
+            RemovalBranch::Absent => branch_tip.is_none(),
+        };
+        if !branch_matches {
             return Err(problem(
-                "source_integrity",
-                "removed workspace branch was not retained",
+                "identity_changed",
+                "removed workspace branch does not match its expected state",
             ));
         }
         confirm_worktree_absence(&target, &parent)?;
@@ -1142,8 +1173,9 @@ impl WorkspaceGit {
             repo_common_dir: path_text(&source.common_dir)?,
             worktree_path: path_text(&target)?,
             branch: preparation.requested_branch.clone(),
-            branch_retained: true,
-            directory_absent_before_remove: false,
+            branch_retained: branch_tip.is_some(),
+            directory_absent_before_remove: matches!(branch, RemovalBranch::Absent),
+            branch_absent_before_remove: matches!(branch, RemovalBranch::Absent),
         })
     }
 
@@ -1577,6 +1609,22 @@ fn absent(path: &Path) -> Result<bool> {
 
 /// Observe a missing leaf from a readable parent. Windows keeps that parent
 /// and its ancestors pinned while the caller retains the returned guard.
+async fn confirm_worktree_absence_after_grace(
+    path: &Path,
+    parent: &Directory,
+    deadline: Instant,
+) -> Result<()> {
+    timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
+        .await
+        .map_err(|_| {
+            problem(
+                "unavailable",
+                "worktree absence observation deadline elapsed",
+            )
+        })?;
+    confirm_worktree_absence(path, parent)
+}
+
 pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>> {
     if !absent(path)? {
         return Ok(None);

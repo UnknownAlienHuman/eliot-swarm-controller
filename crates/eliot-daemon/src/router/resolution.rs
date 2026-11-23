@@ -133,34 +133,39 @@ impl Router {
             }
             store.get_command(&request.command_id)?
         };
-        if request.resolution == eliot_core::api::CommandResolution::Failed
-            && let Some(command) = command.as_ref().filter(|command| {
-                command.verb == "launch"
+        if let Some(command) = command.as_ref().filter(|command| {
+            command.state == eliot_core::CommandState::Unknown
+                && ((request.resolution == eliot_core::api::CommandResolution::Failed
+                    && command.verb == "launch"
                     && command.generation == Some(0)
-                    && command.state == eliot_core::CommandState::Unknown
                     && command
                         .outcome
                         .as_ref()
-                        .is_some_and(|outcome| outcome["stage"] == "workspace")
-            })
-        {
+                        .is_some_and(|outcome| outcome["stage"] == "workspace"))
+                    || (request.resolution == eliot_core::api::CommandResolution::Applied
+                        && command.verb == "worktree.remove"
+                        && command.outcome.as_ref().is_some_and(|outcome| {
+                            eliot_store::Store::is_legacy_missing_branch_removal(
+                                outcome,
+                                &command.id,
+                            )
+                        })))
+        }) {
             let target = command
                 .target
                 .as_deref()
-                .ok_or_else(|| Error::new("bad_state", "managed launch has no Agent"))?;
+                .ok_or_else(|| Error::new("bad_state", "workspace command has no Agent"))?;
             let preparation = self
                 .inner
                 .store
                 .lock()
                 .await
                 .get_workspace(target)?
-                .ok_or_else(|| {
-                    Error::new("bad_state", "managed launch has no workspace to read back")
-                })?;
+                .ok_or_else(|| Error::new("bad_state", "command has no workspace to read back"))?;
             let value = self
                 .inner
                 .workspaces
-                .resolve_failed_launch(&request, &preparation)
+                .resolve_absent_workspace(&request, &preparation)
                 .await?;
             self.signal_progress();
             return serde_json::to_value(value)

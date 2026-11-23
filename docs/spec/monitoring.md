@@ -479,12 +479,26 @@ the write guard keeps the checkout. On Windows the existing removal row retains
 the original directory permissions before the guard changes them. Recovery
 restores those permissions for remaining directories using their retained identities.
 Exact path and registration absence plus the retained branch settle `removed`.
+Before dispatching Git removal, Swarm records the branch tip and requires the
+same tip in the final readback, including after restart.
 For an already missing checkout, Swarm requires two absence observations at
 least 15 seconds apart from the same readable parent before removing the
 stale Git registration or settling the row. An unavailable parent keeps the
-row unsettled. A confirmed disappearance commits `workspace.removed` with
-`directory_absent_before_remove` and the last available retained Git observation.
-That observation can show that the checkout had changes before it vanished.
+row unsettled. When the registration and branch are already absent, verified
+absence settles `removed` without dispatching Git writes. The outcome records
+`directory_absent_before_remove`, `branch_absent_before_remove` and
+`branch_retained: false`. A confirmed disappearance also includes the last
+available retained Git observation, which can show that the checkout had
+changes before it vanished. The daemon's missing-worktree reconciliation
+admits one removal at a time and advances after the command settles.
+
+The Owner can settle a legacy `worktree.remove` that is still unknown with
+`source_integrity: removed workspace branch was not retained` using
+`swarm cmd resolve ID --status completed --reason TEXT`. Swarm requires the
+exact workspace and command to record that no Git write was dispatched.
+It verifies the directory, registration and branch are absent, then settles
+the command and workspace in one transaction.
+
 Keep the row so a later resume cannot treat the deleted checkout as an
 ordinary shared workspace. A deadline or failure after
 possible mutation is `unknown` until exact readback proves removal. No effect is
