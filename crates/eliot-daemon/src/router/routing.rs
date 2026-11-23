@@ -10,6 +10,7 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) arbitrated: bool,
     pub(super) owner_automation: bool,
     pub(super) provider_source: Option<&'a Value>,
+    pub(super) preview: bool,
 }
 
 impl LaunchRouting<'_> {
@@ -82,6 +83,7 @@ struct RoutePreflight {
     arbitrated: bool,
     automatic: bool,
     provider_switch: bool,
+    offer_due_probe: bool,
     provider_authority: Option<[u8; 32]>,
     provider_source: Option<Value>,
     held_accounts: HashMap<String, Value>,
@@ -127,7 +129,14 @@ impl Router {
             probe.args = json!({ "role": role });
         }
         let decision = match self
-            .route_launch_profile(principal, &mut probe, LaunchRouting::default())
+            .route_launch_profile(
+                principal,
+                &mut probe,
+                LaunchRouting {
+                    preview: true,
+                    ..Default::default()
+                },
+            )
             .await
         {
             Ok(_) => serde_json::from_value(probe.args["profile_choice"].take())
@@ -204,6 +213,10 @@ impl Router {
         let mut preflight = RoutePreflight {
             arbitrated: mode.arbitrated,
             automatic: mode.automatic(principal),
+            offer_due_probe: mode.preview
+                || request.args["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty()),
             ..RoutePreflight::default()
         };
         if preflight.automatic {
@@ -557,7 +570,8 @@ impl Router {
         }
         if preflight.check_candidate_holds() {
             let store = self.inner.store.lock().await;
-            if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
+            let probe_at = preflight.offer_due_probe.then(now_ms);
+            if let Some(error) = store.routing_refusal(name, &harness, &snapshot, probe_at)? {
                 return Ok(Err(preflight.record(error, harness, account)));
             }
         }
@@ -627,7 +641,8 @@ impl Router {
         // Passive reads can take time. Recheck live state before freezing.
         if preflight.check_candidate_holds() {
             let store = self.inner.store.lock().await;
-            if let Some(error) = store.routing_refusal(name, &harness, &snapshot)? {
+            let probe_at = preflight.offer_due_probe.then(now_ms);
+            if let Some(error) = store.routing_refusal(name, &harness, &snapshot, probe_at)? {
                 return Ok(Err(preflight.record(error, harness, account)));
             }
         }

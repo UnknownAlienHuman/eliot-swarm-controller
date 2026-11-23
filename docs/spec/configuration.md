@@ -1540,8 +1540,10 @@ when `--profile` is omitted; omission stays absent on the wire and means
 An explicit profile with a missing pin refuses with the replacement guidance.
 Role routing records a missing pin as `missing_profile_command` in the ordered
 skips shown by `swarm why`.
-At first admission, candidates must be installed, outside provider holds, not known
-quota-exhausted where passive readback is supported, and within configured capacity.
+At first admission, candidates must be installed, eligible under the
+[provider hold gate](monitoring.md#provider-holds), not known quota-exhausted
+where passive readback is supported, and within configured capacity. A fresh
+launch with input can claim a due probe for an unknown-reset hold.
 Unknown quota is reported as unknown rather than fabricated availability. Freeze the
 chosen profile and selection reason on the launch command/event before dispatch.
 The retained [`RoutingDecision` and `RouteSkip` DTOs](../../crates/eliot-core/src/routing.rs)

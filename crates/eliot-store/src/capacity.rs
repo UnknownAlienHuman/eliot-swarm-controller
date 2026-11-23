@@ -893,15 +893,17 @@ impl Store {
         profile: &str,
         harness: &str,
         snapshot: &Value,
+        probe_at: Option<i64>,
     ) -> Result<Option<Error>> {
         self.ensure_committed_reads()?;
         let mut candidate = Agent::new("a1", "routing", harness, profile, 0);
         candidate.profile_snapshot = snapshot.clone();
-        if provider_holds::profile_held(&self.connection, &candidate)? {
-            return Ok(Some(Error::new(
-                "provider_held",
-                "routing candidate is under a provider hold",
-            )));
+        if let Err(error) = provider_holds::launch_probe(&self.connection, &candidate, probe_at) {
+            return if error.code == "provider_held" {
+                Ok(Some(error))
+            } else {
+                Err(error)
+            };
         }
         match require_free(&self.connection, &candidate, 0) {
             Ok(()) => Ok(None),

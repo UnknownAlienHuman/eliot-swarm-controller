@@ -1205,7 +1205,7 @@ fn admit_launch_tx(
     let agent_id = format_agent_id(agent_num);
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("internal", "new launch Agent disappeared"))?;
-    if provider_probe {
+    let probe_linked_send = if provider_probe {
         let scope = core::frozen_provider_scope(&agent)?;
         if principal != "owner"
             || !chat
@@ -1224,9 +1224,10 @@ fn admit_launch_tx(
             ));
         }
         provider_holds::require_automatic_probe_due_tx(tx, &agent, now)?;
+        true
     } else {
-        provider_holds::require_unheld_tx(tx, &agent)?;
-    }
+        provider_holds::launch_probe(tx, &agent, text.as_ref().map(|_| now))?
+    };
     if request
         .args
         .get(project_assignment::MANAGER_LAUNCH_ARG)
@@ -1305,11 +1306,11 @@ fn admit_launch_tx(
             &request.id,
             (agent_num, 1),
             &text,
-            provider_probe,
+            probe_linked_send,
             now,
         )?;
         events.push(event);
-        if provider_probe {
+        if probe_linked_send {
             events.extend(provider_holds::admit_send_tx(
                 tx,
                 &agent,
