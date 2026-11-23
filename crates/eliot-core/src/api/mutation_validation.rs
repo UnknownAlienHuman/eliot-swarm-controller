@@ -49,16 +49,21 @@ impl CommandSubmitRequest {
         {
             return Err(binding_mismatch());
         }
-        let has_linked_input = is_start_verb(self.verb.as_str())
-            && self
-                .args
-                .get("text")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| !text.trim().is_empty());
+        let has_text = self
+            .args
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty());
+        let requires_linked_input = is_start_verb(self.verb.as_str()) && has_text;
+        let may_continue_with_linked_input =
+            self.verb == "send" && has_text && !self.probe && self.expected_turn_id.is_none();
         // Store creates this child in the parent's admission transaction and
-        // retains it even when cancelled. Valid input cannot lose its link.
-        match (&response.linked_command, has_linked_input) {
-            (Some(linked), true) if linked.strip_suffix("/send") == Some(self.id.as_str()) => {}
+        // retains it even when cancelled. A direct send can instead run on
+        // the existing generation, in which case there is no child command.
+        match (&response.linked_command, requires_linked_input) {
+            (Some(linked), required)
+                if (required || may_continue_with_linked_input)
+                    && linked.strip_suffix("/send") == Some(self.id.as_str()) => {}
             (None, false) => {}
             _ => return Err(binding_mismatch()),
         }

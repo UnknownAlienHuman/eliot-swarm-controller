@@ -178,6 +178,7 @@ fn dispatch_resume_tx(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let old_generation = command_generation;
+    let restart_resume = super::result_page::is_restart_resume_intent_tx(tx, id)?;
     cleanup::require_no_cleanup_attempt(tx, agent)?;
     if !matches!(command.state, CommandState::Accepted | CommandState::Queued)
         || command_generation != agent.generation
@@ -209,6 +210,15 @@ fn dispatch_resume_tx(
         return Err(Error::new(
             "bad_state",
             "a dispatched Stop, or an unknown Stop without proven owned exit, still targets this Agent generation",
+        ));
+    }
+    if restart_resume
+        && (capacity::owner_stop_fences_restart_resume_tx(tx, agent_num, old_generation)?
+            || capacity::restart_ancestor_fences_resume_tx(tx, agent_num)?)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "restart Resume is fenced by an Owner Stop or an unresolved ancestor",
         ));
     }
     let native_scope = agent
@@ -285,7 +295,7 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
-    let reason = if super::result_page::is_restart_resume_intent_tx(tx, id)? {
+    let reason = if restart_resume {
         eliot_core::api::GenerationReason::RestartResume
     } else if command.command.principal == "owner" {
         eliot_core::api::GenerationReason::OwnerResume
@@ -329,7 +339,15 @@ fn dispatch_resume_tx(
         ));
     }
     project_assignment::advance_resume(tx, agent, agent_num, next_generation, id)?;
-    super::goals::advance_resume_tx(tx, agent_num, old_generation, next_generation, now, events)?;
+    super::goals::advance_resume_tx(
+        tx,
+        agent_num,
+        old_generation,
+        next_generation,
+        reason,
+        now,
+        events,
+    )?;
     install_initial_source_plan(tx, agent_num, next_generation, now)?;
     update_command_state(
         tx,

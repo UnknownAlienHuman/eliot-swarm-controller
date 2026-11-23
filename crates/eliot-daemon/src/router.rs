@@ -141,7 +141,7 @@ const RESTART_RESUME_BATCH_SIZE: usize = 4;
 struct BootResumeWorker {
     id: String,
     task: tokio::task::JoinHandle<()>,
-    candidate: Option<RestartResumeCandidate>,
+    target: Option<(String, i64)>,
 }
 
 type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
@@ -1084,16 +1084,12 @@ impl Router {
                     && command_needs_worker(&admission.command)
                 {
                     if admission.command.verb == "resume" {
-                        let candidate = admission
+                        let target = admission
                             .command
                             .target
                             .clone()
-                            .zip(admission.command.generation)
-                            .map(|(agent, generation)| RestartResumeCandidate {
-                                agent,
-                                generation,
-                            });
-                        self.queue_boot_resume(&mut resumes, &admission, candidate)
+                            .zip(admission.command.generation);
+                        self.queue_boot_resume(&mut resumes, &admission, target)
                             .await?;
                     } else {
                         self.schedule_admission(&admission);
@@ -1105,50 +1101,52 @@ impl Router {
         }
     }
 
-    /// Reopen only retained generations that were idle at restart and whose
-    /// exact custody and work state now permit a promptless Resume. Candidates
-    /// are derived durably by Store, so this can run after the initial custody
-    /// pass and again after a later recheck without replaying old input.
-    pub(crate) async fn recover_restart_idle_agents(&self, on_restart: OnRestart) -> Result<usize> {
-        if on_restart == OnRestart::Hold || !self.inner.attention.agent_lost.enabled {
-            return Ok(0);
+    /// Reopen eligible retained sessions in bounded, depth-ordered batches.
+    /// Wait for each shallower batch before attempting deeper Agents. Store
+    /// admission also holds descendants of an unresolved restart Resume.
+    pub(crate) async fn recover_restart_agents(&self, on_restart: OnRestart) -> Result<()> {
+        if on_restart == OnRestart::Hold {
+            return Ok(());
         }
-        let mut after: Option<String> = None;
-        let mut admitted_count = 0;
+        let mut after = None;
         loop {
             let candidates = {
                 let store = self.inner.store.lock().await;
-                store.restart_idle_resume_candidates(after.as_deref())?
+                store.restart_resume_candidates(after.as_ref())?
             };
-            if candidates.is_empty() {
+            let Some(last) = candidates.last() else {
                 break;
-            }
-            after = candidates.last().map(|candidate| candidate.agent.clone());
+            };
+            after = Some(last.clone());
             let mut workers = Vec::with_capacity(RESTART_RESUME_BATCH_SIZE);
+            let mut depth = candidates[0].depth;
             for candidate in candidates {
-                if let Some(admission) = self.prepare_restart_idle_resume(&candidate).await
+                if candidate.depth != depth {
+                    self.wait_restart_resume_workers(std::mem::take(&mut workers))
+                        .await?;
+                    depth = candidate.depth;
+                }
+                if let Some(admission) = self.prepare_restart_resume(&candidate).await
                     && admission.is_new
                     && command_needs_worker(&admission.command)
                 {
-                    self.queue_boot_resume(&mut workers, &admission, Some(candidate))
+                    let target = Some((candidate.agent, candidate.generation));
+                    self.queue_boot_resume(&mut workers, &admission, target)
                         .await?;
-                    admitted_count += 1;
                 }
             }
             self.wait_restart_resume_workers(workers).await?;
             tokio::task::yield_now().await;
         }
-        if admitted_count > 0 {
-            self.signal_progress();
-        }
-        Ok(admitted_count)
+        self.signal_progress();
+        Ok(())
     }
 
     async fn queue_boot_resume(
         &self,
         workers: &mut Vec<BootResumeWorker>,
         admission: &Admission,
-        candidate: Option<RestartResumeCandidate>,
+        target: Option<(String, i64)>,
     ) -> Result<()> {
         let id = admission.command.id.clone();
         let linked = admission
@@ -1156,11 +1154,7 @@ impl Router {
             .as_ref()
             .map(|command| command.id.clone());
         let task = tokio::spawn(self.clone().process_command(id.clone(), linked));
-        workers.push(BootResumeWorker {
-            id,
-            task,
-            candidate,
-        });
+        workers.push(BootResumeWorker { id, task, target });
         if workers.len() == RESTART_RESUME_BATCH_SIZE {
             self.wait_restart_resume_workers(std::mem::take(workers))
                 .await?;
@@ -1172,12 +1166,7 @@ impl Router {
     /// returns without durably settling its command stops further recovery.
     async fn wait_restart_resume_workers(&self, workers: Vec<BootResumeWorker>) -> Result<()> {
         let mut first_error = None;
-        for BootResumeWorker {
-            id,
-            task,
-            candidate,
-        } in workers
-        {
+        for BootResumeWorker { id, task, target } in workers {
             if task.await.is_err() {
                 first_error.get_or_insert_with(|| {
                     Error::new(
@@ -1189,19 +1178,27 @@ impl Router {
             }
             let result = self.inner.store.lock().await.get_command(&id);
             match result {
-                Ok(Some(command)) if command.state == CommandState::Rejected => {
-                    if let Some(candidate) = candidate
+                Ok(Some(command))
+                    if matches!(command.state, CommandState::Rejected | CommandState::Failed) =>
+                {
+                    if let Some((agent, source_generation)) = target
                         && let Some(outcome) = command.outcome
                     {
                         let code = outcome
-                            .get("reason")
+                            .get("code")
+                            .or_else(|| outcome.get("reason"))
                             .and_then(Value::as_str)
                             .unwrap_or("resume_rejected");
-                        let message = outcome.get("message").and_then(Value::as_str).unwrap_or(
-                            "The resume command was rejected before starting a native process.",
-                        );
-                        self.report_restart_resume_blocked(&candidate, Error::new(code, message))
-                            .await;
+                        let message = outcome
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("The native session could not be reopened.");
+                        self.report_restart_resume_blocked(
+                            &agent,
+                            command.generation.unwrap_or(source_generation),
+                            Error::new(code, message),
+                        )
+                        .await;
                     }
                 }
                 Ok(Some(command))
@@ -1222,16 +1219,26 @@ impl Router {
         first_error.map_or(Ok(()), Err)
     }
 
-    async fn prepare_restart_idle_resume(
+    async fn prepare_restart_resume(
         &self,
         candidate: &RestartResumeCandidate,
     ) -> Option<Admission> {
+        let args = if candidate.interrupted {
+            let body = eliot_core::format_restart_interrupted_turn_note_body(
+                &candidate.agent,
+                candidate.generation,
+                candidate.turn_id.as_deref(),
+            );
+            json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+        } else {
+            json!({})
+        };
         let request = SubmitCommand {
             id: ulid::Ulid::new().to_string(),
             target: Some(candidate.agent.clone()),
             selector: None,
             verb: "resume".to_owned(),
-            args: json!({}),
+            args,
             expected_generation: Some(candidate.generation),
             expected_turn_id: None,
             request_id: None,
@@ -1241,7 +1248,8 @@ impl Router {
         let prepared = match self.prepare_submission(request, &Principal::Owner).await {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.report_restart_resume_blocked(candidate, error).await;
+                self.report_restart_resume_blocked(&candidate.agent, candidate.generation, error)
+                    .await;
                 return None;
             }
         };
@@ -1249,9 +1257,10 @@ impl Router {
         if workspace.is_some() {
             let error = Error::new(
                 "unsupported",
-                "promptless restart Resume cannot prepare a workspace",
+                "automatic restart Resume cannot prepare a workspace",
             );
-            self.report_restart_resume_blocked(candidate, error).await;
+            self.report_restart_resume_blocked(&candidate.agent, candidate.generation, error)
+                .await;
             return None;
         }
         let result = {
@@ -1272,52 +1281,43 @@ impl Router {
         match result {
             Ok(admission) => Some(admission),
             Err(error) => {
-                self.report_restart_resume_blocked(candidate, error).await;
+                self.report_restart_resume_blocked(&candidate.agent, candidate.generation, error)
+                    .await;
                 None
             }
         }
     }
 
-    async fn report_restart_resume_blocked(
-        &self,
-        candidate: &RestartResumeCandidate,
-        error: Error,
-    ) {
+    async fn report_restart_resume_blocked(&self, agent: &str, generation: i64, error: Error) {
         let error = self.sanitized_failure(&error, "daemon.restart.resume");
         let policy = self.secret_policy_snapshot();
-        let generation = candidate.generation.to_string();
-        let fields = [
-            ("agent", candidate.agent.as_str()),
-            ("generation", generation.as_str()),
-        ];
+        let generation_field = generation.to_string();
+        let fields = [("agent", agent), ("generation", generation_field.as_str())];
         let message = format!(
             "Automatic resume for {} generation {} was blocked ({}). {}. When resolved, run swarm resume {}.",
-            candidate.agent,
-            candidate.generation,
+            agent,
+            generation,
             eliot_core::bound_chars(&error.code, 128),
             eliot_core::bound_chars(&error.message, 360).trim_end_matches('.'),
-            candidate.agent
+            agent
         );
         let data = json!({"message": &message});
         let record: Result<bool> = {
             let mut store = self.inner.store.lock().await;
             (|| {
-                let Some(current) = store.get_agent(&candidate.agent)? else {
+                let Some(current) = store.get_agent(agent)? else {
                     return Ok(false);
                 };
-                if current.generation != candidate.generation
+                if current.generation != generation
                     || !current.is_terminal()
                     || current.archived
-                    || store
-                        .restart_resume_blocked(&candidate.agent, candidate.generation)?
-                        .as_ref()
-                        == Some(&data)
+                    || store.restart_resume_blocked(agent, generation)?.as_ref() == Some(&data)
                 {
                     return Ok(false);
                 }
                 let event = store.commit_observe_event(
-                    Some(&candidate.agent),
-                    Some(candidate.generation),
+                    Some(agent),
+                    Some(generation),
                     "agent.restart_resume_blocked",
                     data,
                     now_ms(),

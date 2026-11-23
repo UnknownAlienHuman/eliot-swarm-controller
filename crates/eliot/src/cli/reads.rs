@@ -1870,6 +1870,23 @@ fn why_heading(response: &DiagnoseResponse) -> String {
     format!("{label}: {}", step.user_message())
 }
 
+fn restart_lost_agent_hint(response: &DiagnoseResponse) -> Option<&str> {
+    if response.target.contains(':') {
+        return None;
+    }
+    response
+        .steps
+        .iter()
+        .any(|step| {
+            step.kind == "process"
+                && step.code.as_deref() == Some("agent.lost")
+                && step.message.as_deref().is_some_and(|message| {
+                    message.contains("Swarm restarted and disconnected the session")
+                })
+        })
+        .then_some(response.target.as_str())
+}
+
 fn print_why_diagnosis(response: &DiagnoseResponse) {
     println!("{}", why_heading(response));
     for step in &response.steps {
@@ -1888,6 +1905,12 @@ fn print_why_diagnosis(response: &DiagnoseResponse) {
         if let Some(origin) = step.origin.as_deref() {
             println!("    {}", eliot_core::origin_words(origin));
         }
+    }
+    if let Some(agent) = restart_lost_agent_hint(response) {
+        println!("  next input: swarm send {agent} \"<text>\" (resumes automatically when safe)");
+        println!(
+            "  explicit form: swarm resume {agent} \"<text>\"; the interrupted prompt is never replayed"
+        );
     }
     if let Some(preceded_by) = response.preceded_by.as_deref() {
         println!("  preceded by: {preceded_by}");

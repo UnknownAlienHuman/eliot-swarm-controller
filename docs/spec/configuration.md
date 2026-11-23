@@ -877,8 +877,8 @@ recovery for an unhealthy source ([plugin protocol](plugin-protocol.md)).
 `repeated_command_failure` each have an `enabled` setting under
 `[daemon.attention.<kind>]`. Repeated-command detection uses three matching
 failures in one turn. Provider eligibility and budgets still follow
-[routing](#routing) and provider holds. The `agent_lost` setting and `on_restart`
-govern automatic promptless resume.
+[routing](#routing) and provider holds. `on_restart` governs daemon restart
+continuation independently of the `agent_lost` attention setting.
 
 ### Observation thresholds
 
@@ -1954,10 +1954,17 @@ streams disconnected.
 
 `[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
 at daemon startup. Continue reopens eligible retained idle sessions without
-input, in batches of up to four resume commands within configured capacity.
-Hold leaves those sessions for explicit resume. Previously admitted commands
-still follow durable command recovery. Interrupted turns and uncertain effects
-stay `unknown` under either policy.
+input and resumes eligible retained generations that were live, in batches
+of up to four resume commands within configured capacity. Roots resume
+before their children. An unresolved restart Resume holds its descendants.
+A resumed live session opens with a framed Swarm note
+naming the interrupted turn. Resume uses the Agent's frozen profile and
+any inherited effective configuration from the retained generation. Goals
+and project assignments follow the Agent to its new generation. A Goal with
+unresolved prior work remains paused until that work is settled. Hold leaves those sessions for explicit resume. Previously
+admitted commands still follow durable command recovery. Interrupted turns
+and uncertain effects stay `unknown` under either policy: they are named,
+never replayed.
 
 A refused automatic resume leaves an Owner notice and a reason in
 `swarm why AGENT`. Address that reason before explicitly resuming the Agent.

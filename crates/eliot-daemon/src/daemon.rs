@@ -832,7 +832,7 @@ async fn spawn_workers(
         }
         if let Err(error) = capacity
             .router
-            .recover_restart_idle_agents(capacity.on_restart)
+            .recover_restart_agents(capacity.on_restart)
             .await
         {
             logging::record(

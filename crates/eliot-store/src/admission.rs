@@ -1381,6 +1381,62 @@ fn admit_send_stop_tx(
     Ok(())
 }
 
+/// Reuse ordinary Resume admission for a direct send to an eligible retained
+/// terminal session. The original send digest and ID stay bound to the caller's
+/// request; the persisted command becomes a Resume with one linked fresh SEND.
+fn prepare_implicit_resume_send_tx(
+    tx: &Transaction<'_>,
+    request: &mut SubmitCommand,
+) -> Result<bool> {
+    if request.verb != "send" || request.selector.is_some() {
+        return Ok(false);
+    }
+    let Some(target) = request.target.as_deref() else {
+        return Ok(false);
+    };
+    let agent_num = parse_agent_id(target)?;
+    let Some(agent) = load_agent_by_num(tx, agent_num)? else {
+        return Ok(false);
+    };
+    if !matches!(agent.state, AgentState::Lost | AgentState::Stopped)
+        || request.args.get("notice_kind").is_some()
+    {
+        return Ok(false);
+    }
+
+    if request.probe {
+        return Err(implicit_resume_guidance(
+            Error::new(
+                "unsupported",
+                "provider probes cannot be combined with implicit resume",
+            ),
+            &agent.id,
+        ));
+    }
+    if !super::pending_command_ids(tx, agent_num, agent.generation)?.is_empty()
+        || super::has_unknown_gate(tx, agent_num)?
+    {
+        return Err(implicit_resume_guidance(
+            Error::new(
+                "bad_state",
+                "unresolved command or turn work blocks automatic resume",
+            ),
+            &agent.id,
+        ));
+    }
+
+    request.verb = "resume".to_owned();
+    Ok(true)
+}
+
+fn implicit_resume_guidance(mut error: Error, agent: &str) -> Error {
+    error.message = Box::new(format!(
+        "cannot continue terminal Agent {agent} for this send: {}; inspect `swarm why {agent}` and, once the retained session and work gates are clear, run `swarm resume {agent} \"<text>\"` or retry `swarm send {agent} \"<text>\"`; the interrupted prompt is never replayed",
+        error.message
+    ));
+    error
+}
+
 /// Admit one `worktree.remove`: binding and removability checks, then the
 /// frozen removal args.
 fn admit_worktree_remove_tx(
@@ -2170,13 +2226,13 @@ pub(super) fn submit_restart_resume_tx(
 fn submit_tx_mode(
     tx: &Transaction<'_>,
     principal: &str,
-    request: SubmitCommand,
+    mut request: SubmitCommand,
     preparation: Option<WorkspacePreparationInput>,
     now: i64,
     derived_rule: bool,
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
-    restart_idle_resume: bool,
+    restart_resume: bool,
 ) -> Result<Admission> {
     if request.trusted_review_labels.is_some() && !derived_rule {
         return Err(Error::new(
@@ -2188,7 +2244,7 @@ fn submit_tx_mode(
     if let Some(admission) = replay {
         return Ok(admission);
     }
-    if restart_idle_resume {
+    if restart_resume {
         let target = request
             .target
             .as_deref()
@@ -2196,7 +2252,7 @@ fn submit_tx_mode(
         let generation = request.expected_generation.ok_or_else(|| {
             Error::new("invalid", "restart Resume has no captured Agent generation")
         })?;
-        if !capacity::restart_idle_resume_candidate_tx(tx, target, generation)? {
+        if !capacity::restart_resume_candidate_tx(tx, target, generation)? {
             return Err(Error::new(
                 "bad_state",
                 "restart Resume eligibility changed before admission",
@@ -2234,6 +2290,8 @@ fn submit_tx_mode(
             .ok_or_else(|| Error::new("not_found", "command target was not found"))?;
         hierarchy::caller_may_command(tx, &caller, &agent)?;
     }
+
+    let implicit_resume = prepare_implicit_resume_send_tx(tx, &mut request)?;
 
     let mut events = Vec::new();
     let linked = match request.verb.as_str() {
@@ -2344,7 +2402,17 @@ fn submit_tx_mode(
             admit_worktree_remove_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "resume" => admit_resume_tx(tx, principal, &request, &payload_digest, now, &mut events)?,
+        "resume" => admit_resume_tx(tx, principal, &request, &payload_digest, now, &mut events)
+            .map_err(|error| {
+                if implicit_resume {
+                    implicit_resume_guidance(
+                        error,
+                        request.target.as_deref().unwrap_or("unknown Agent"),
+                    )
+                } else {
+                    error
+                }
+            })?,
         "configure" => {
             admit_configure_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
@@ -2390,7 +2458,14 @@ fn submit_tx_mode(
         now,
         &mut events,
         policy,
-    )?;
+    )
+    .map_err(|error| {
+        if implicit_resume {
+            implicit_resume_guidance(error, request.target.as_deref().unwrap_or("unknown Agent"))
+        } else {
+            error
+        }
+    })?;
     Ok(Admission {
         command,
         linked_command,

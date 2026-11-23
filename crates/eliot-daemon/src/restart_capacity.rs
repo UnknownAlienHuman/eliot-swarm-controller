@@ -142,11 +142,10 @@ pub(crate) async fn recheck(context: Reconcile) {
         tokio::time::sleep(RECHECK).await;
         match reconcile_pass(&context, false).await {
             Ok(report) => {
-                if context.on_restart == OnRestart::Continue
-                    && report.processed > report.retained
+                if report.processed > report.retained
                     && let Err(error) = context
                         .router
-                        .recover_restart_idle_agents(context.on_restart)
+                        .recover_restart_agents(context.on_restart)
                         .await
                 {
                     logging::record(

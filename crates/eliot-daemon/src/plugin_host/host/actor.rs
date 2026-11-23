@@ -882,7 +882,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         let terminated = child.terminate().is_ok();
                         let exited = wait_child(&mut *child, STOP_GRACE, monitoring, agent).await;
                         if restart && terminated && exited {
-                            // Preserve the idle projection and its custody reservation.
+                            // Preserve the generation projection and its custody reservation.
                             // Boot recovery proves the prior generation's exit before
                             // it decides whether this session can continue.
                             planned_exit = true;
