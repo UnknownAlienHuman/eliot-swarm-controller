@@ -4818,13 +4818,10 @@ impl Router {
                 crate::adhoc::harness_installation_async(verified.harness).await,
             ));
         }
-        let claude_installation = probes
-            .iter()
-            .find(|(harness, _)| *harness == "claude")
-            .map(|(_, installation)| installation);
-        let claude_profile_command_issues = self
-            .claude_profile_command_issues(claude_installation)
-            .await;
+        let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
+        let profile_command_issues = self.profile_command_issues(missing_commands, &probes);
+        let claude_profile_command_issues =
+            self.legacy_claude_command_issues(&profile_command_issues);
         let store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
@@ -4867,6 +4864,7 @@ impl Router {
         };
         let response = HarnessDoctorResponse {
             harnesses,
+            profile_command_issues,
             claude_profile_command_issues,
             profile_first_calls,
             profile_first_calls_truncated,

@@ -722,6 +722,21 @@ pub(crate) fn find_on_path(file: &str) -> Option<PathBuf> {
     None
 }
 
+/// Check the presence of an explicit command without probing or executing it.
+pub(crate) fn profile_command_exists(cmd: &str) -> bool {
+    let path = Path::new(cmd);
+    if path.is_absolute() || path.components().count() != 1 {
+        return path.is_file();
+    }
+    let windows_exe = (cfg!(windows) && path.extension().is_none()).then(|| native_exe_name(cmd));
+    path_search_dirs().iter().any(|dir| {
+        dir.join(path).is_file()
+            || windows_exe
+                .as_ref()
+                .is_some_and(|exe| dir.join(exe).is_file())
+    })
+}
+
 fn user_profile() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))

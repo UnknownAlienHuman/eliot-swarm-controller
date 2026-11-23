@@ -1954,7 +1954,7 @@ pub(crate) fn load_routing_config(data_root: &Path) -> core::Result<RoutingConfi
         .unwrap_or_default())
 }
 
-pub(crate) fn missing_claude_profile_commands(data_root: &Path) -> Vec<(String, String)> {
+pub(crate) fn missing_profile_commands(data_root: &Path) -> Vec<(String, String, String)> {
     let Ok(Some(source)) = read_config_source(data_root) else {
         return Vec::new();
     };
@@ -1968,27 +1968,27 @@ pub(crate) fn missing_claude_profile_commands(data_root: &Path) -> Vec<(String, 
     let mut missing = profiles
         .iter()
         .filter_map(|(name, entry)| {
-            if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            if name.trim().is_empty()
+                || name.len() > MAX_PROFILE_NAME_LEN
+                || name.chars().any(char::is_control)
+            {
                 return None;
             }
             let profile = entry.as_table()?;
-            if profile
-                .get("harness")
-                .and_then(toml::Value::as_str)
-                .is_none_or(|harness| harness.trim() != "claude")
-            {
+            let harness = profile.get("harness")?.as_str()?.trim();
+            if !core::api::is_supported_harness(harness) {
                 return None;
             }
-            let cmd = profile.get("cmd").and_then(toml::Value::as_str)?;
-            if cmd.trim().is_empty()
+            let cmd = profile.get("cmd")?.as_str()?.trim();
+            if cmd.is_empty()
                 || cmd.len() > 4096
                 || cmd.chars().any(char::is_control)
-                || cmd.trim().eq_ignore_ascii_case("latest")
-                || Path::new(cmd).is_file()
+                || (harness == "claude" && cmd.eq_ignore_ascii_case("latest"))
+                || crate::adhoc::profile_command_exists(cmd)
             {
                 return None;
             }
-            Some((name.clone(), cmd.to_owned()))
+            Some((name.clone(), harness.to_owned(), cmd.to_owned()))
         })
         .collect::<Vec<_>>();
     missing.sort_by(|left, right| left.0.cmp(&right.0));

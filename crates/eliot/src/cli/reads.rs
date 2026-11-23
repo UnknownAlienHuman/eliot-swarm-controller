@@ -602,25 +602,26 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             println!("  contract mismatch: {mismatch}");
         }
     }
-    for issue in &response.claude_profile_command_issues {
-        println!(
-            "Claude profile {}: configured executable is missing: {}",
-            issue.profile, issue.configured_cmd
-        );
-        if let Some(cmd) = &issue.replacement_cmd {
-            println!(
-                "  installed replacement: {} ({})",
-                issue
-                    .replacement_version
-                    .as_deref()
-                    .unwrap_or("version unknown"),
-                cmd
+    if response.profile_command_issues.is_empty() {
+        for issue in &response.claude_profile_command_issues {
+            print_missing_profile_command(
+                &issue.profile,
+                "claude",
+                &issue.configured_cmd,
+                issue.replacement_cmd.as_deref(),
+                issue.replacement_version.as_deref(),
             );
-            if let Some(command) = &issue.repair_command {
-                println!("  repair: {command}");
-            }
-        } else {
-            println!("  no installed Claude replacement was discovered");
+        }
+    } else {
+        for issue in &response.profile_command_issues {
+            let replacement = issue.replacement.as_ref();
+            print_missing_profile_command(
+                &issue.profile,
+                &issue.harness,
+                &issue.configured_cmd,
+                replacement.map(|candidate| candidate.cmd.as_str()),
+                replacement.and_then(|candidate| candidate.version.as_deref()),
+            );
         }
     }
     if response.owner_rules_check_unavailable {
@@ -698,6 +699,23 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             println!("  Additional profile/project pairs omitted");
         }
     }
+}
+
+fn print_missing_profile_command(
+    profile: &str,
+    harness: &str,
+    configured_cmd: &str,
+    replacement_cmd: Option<&str>,
+    replacement_version: Option<&str>,
+) {
+    println!("Profile {profile} ({harness}): configured executable is missing: {configured_cmd}");
+    if let Some(cmd) = replacement_cmd {
+        let version = replacement_version.unwrap_or("version unknown");
+        println!("  installed replacement: {cmd} ({version})");
+    } else {
+        println!("  no installed replacement was discovered");
+    }
+    println!("  repair: omit cmd from this profile to follow the vendor installation");
 }
 
 pub(crate) async fn run_heavy(

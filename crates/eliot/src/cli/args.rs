@@ -101,7 +101,7 @@ pub(crate) enum CliCommand {
     /// List installed harness executables with versions. Starts no model
     /// turn and performs no inference.
     Harnesses,
-    /// Read the per-harness installed-vs-verified drift report. Read-only;
+    /// Report harness drift and missing profile executables. Read-only;
     /// starts no model turn and performs no inference.
     Doctor,
     /// Read heavy child-process episodes with per-Agent totals over a window.

@@ -44,7 +44,7 @@ impl Router {
         for item in inbox {
             *owner_inbox.entry(item.kind).or_default() += 1;
         }
-        let claude_profile_command_issues = self.claude_profile_command_issues(None).await;
+        let claude_profile_command_issues = self.claude_profile_command_issues().await;
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
         let retention = Some(self.retention_view().await?);

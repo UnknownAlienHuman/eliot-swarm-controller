@@ -183,7 +183,8 @@ pub use observe::{
     DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessDoctorRequest, HarnessDoctorResponse,
     HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView, MAX_DOCTOR_HARNESSES, MAX_HEAVY_EPISODES,
     MAX_OBSERVE_WINDOW_SECS, ObserveHeavyRequest, ObserveHeavyResponse, OwnerRulesGlobalFile,
-    OwnerRulesGlobalFileStatus, SessionGrowthView, WorkSummaryView, is_read_only_or_audit_profile,
+    OwnerRulesGlobalFileStatus, ProfileCommandIssue, SessionGrowthView, WorkSummaryView,
+    is_read_only_or_audit_profile,
 };
 pub use organization::{
     ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
