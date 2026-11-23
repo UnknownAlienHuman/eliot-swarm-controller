@@ -769,7 +769,10 @@ records the reason, releases only its claim and persists the next backoff while
 budget remains. Startup sweeps ended
 maintenance Agents. Once the exact Agent's custody drains, an unresolved automatic
 probe releases its claim, records `provider.hold_probe_outcome_unknown` and pauses
-automation for Owner review. An uncertain probe is never replayed.
+automation for Owner review. Maintenance also pauses a task-bearing launch's exact
+unresolved probe once the bound generation ends and its native custody drains, or
+after the Owner resolves the exact inactive turn. It preserves the Agent, turn and
+workspace. An uncertain probe is never replayed.
 If a minimal request cannot be prepared safely for the frozen profile, the daemon
 paces background preparation with a five-minute defer. The persisted deadline
 for a fresh launch and the admission budget stay available. A maintenance probe

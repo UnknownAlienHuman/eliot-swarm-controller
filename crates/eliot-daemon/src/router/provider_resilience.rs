@@ -52,6 +52,11 @@ impl Router {
                 self.signal_progress();
                 self.signal_launch_arbitration();
             }
+            let paused = store.pause_unresolved_launch_probes(now)?;
+            self.publish_locked(&paused);
+            if !paused.is_empty() {
+                self.signal_progress();
+            }
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(Vec::new());
             }

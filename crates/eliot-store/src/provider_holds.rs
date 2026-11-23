@@ -187,26 +187,78 @@ impl Store {
                     )?;
                 }
                 let scope = core::frozen_provider_scope(&agent)?;
-                let changed = tx
-                    .execute(
-                        "UPDATE provider_holds SET probe_command=NULL, state='held',
-                         probe_outcome_unknown=1, next_probe_at=NULL, updated_at=?1
-                     WHERE scope=?2 AND state='probing' AND probe_command=?3",
-                        params![now, scope, id],
+                events.extend(pause_unknown_probe_tx(
+                    &tx, &scope, &id, agent_id, generation, now,
+                )?);
+            }
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    /// Pause only the exact linked probe after its generation has ended and
+    /// its native custody has drained, or after Owner-proven turn inactivity.
+    /// A task-bearing Agent and its commands, turn and workspace stay intact.
+    pub fn pause_unresolved_launch_probes(&mut self, now: i64) -> Result<Vec<core::Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self.connection.transaction().map_err(sql_error)?;
+            let candidates = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT h.scope, c.id, c.target, c.generation
+                     FROM provider_holds h
+                     JOIN commands c ON c.id = h.probe_command
+                     JOIN commands p ON p.id = c.parent_command AND p.target = c.target
+                     JOIN agents a ON a.id = c.target
+                     WHERE h.state = 'probing' AND c.verb = 'send' AND c.probe = 1
+                       AND c.link_kind = 'send' AND c.ordinal = 0 AND c.generation = 1
+                       AND p.verb = 'launch' AND p.generation = 0
+                       AND json_type(p.args, '$._provider_probe') IS NULL
+                       AND a.observe_only = 0
+                       AND c.state IN ('dispatched','unknown','applied')
+                       AND (
+                           EXISTS (SELECT 1 FROM turns t WHERE t.agent = a.id
+                             AND t.generation = c.generation AND t.turn_id = c.turn_id
+                             AND t.state = 'completed' AND t.resolution_source = 'owner')
+                           OR (
+                               (a.generation > c.generation OR
+                                (a.generation = c.generation AND a.active_turn IS NULL
+                                 AND a.state IN ('stopped','failed','lost')))
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM processes o WHERE o.state IN ('running','unknown')
+                                   AND o.owner IN ('agent:a'||a.id||'#'||c.generation,
+                                                   'workspace:a'||a.id||'#'||c.generation))
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM source_state s WHERE s.agent = a.id
+                                   AND s.generation = c.generation AND s.state = 'open'
+                                   AND s.source NOT IN ('daemon','os','git','workspace_process'))
+                           )
+                       )
+                     ORDER BY h.scope LIMIT 64",
                     )
                     .map_err(sql_error)?;
-                if changed == 1 {
-                    events.push(super::insert_daemon_event(
-                        &tx,
-                        now,
-                        "provider.hold_probe_outcome_unknown",
-                        "provider",
-                        None,
-                        None,
-                        json!({"scope":scope, "probe_command":id, "agent":agent_id,
-                               "generation":generation, "owner_attention":true}),
-                    )?);
-                }
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })
+                    .map_err(sql_error)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            let mut events = Vec::with_capacity(candidates.len());
+            for (scope, id, target, generation) in candidates {
+                let agent = super::format_agent_id(target);
+                events.extend(pause_unknown_probe_tx(
+                    &tx, &scope, &id, &agent, generation, now,
+                )?);
             }
             commit_transaction(tx, &self.write_faulted)?;
             Ok(events)
@@ -1225,6 +1277,38 @@ fn release_probe_claim_tx(tx: &Transaction<'_>, command_id: &str, now: i64) -> R
         )
         .map_err(sql_error)?;
     Ok(changed == 1)
+}
+
+fn pause_unknown_probe_tx(
+    tx: &Transaction<'_>,
+    scope: &str,
+    command_id: &str,
+    agent_id: &str,
+    generation: i64,
+    now: i64,
+) -> Result<Option<core::Event>> {
+    let changed = tx
+        .execute(
+            "UPDATE provider_holds SET probe_command=NULL, state='held',
+             probe_outcome_unknown=1, next_probe_at=NULL, updated_at=?1
+             WHERE scope=?2 AND state='probing' AND probe_command=?3",
+            params![now, scope, command_id],
+        )
+        .map_err(sql_error)?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    super::insert_daemon_event(
+        tx,
+        now,
+        "provider.hold_probe_outcome_unknown",
+        "provider",
+        None,
+        None,
+        json!({"scope":scope, "probe_command":command_id, "agent":agent_id,
+               "generation":generation, "owner_attention":true}),
+    )
+    .map(Some)
 }
 
 fn reschedule_failed_probe_tx(tx: &Transaction<'_>, scope: &str, now: i64) -> Result<Option<i64>> {
