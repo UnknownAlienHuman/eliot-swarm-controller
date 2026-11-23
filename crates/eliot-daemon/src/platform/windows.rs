@@ -155,7 +155,7 @@ pub(crate) fn acquire_operator_event(data_dir: &Path) -> Result<OwnedHandle> {
 }
 
 pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &Path) -> Result<()> {
-    let mut command_line = windows_command_line(&[
+    let command_line = windows_command_line(&[
         executable.as_os_str(),
         OsStr::new("--data-dir"),
         data_dir.as_os_str(),
@@ -167,38 +167,48 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..STARTUPINFOW::default()
     };
-    let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: application and the writable command line are NUL-terminated UTF-16.
-    // All structures live through the call. FALSE disables ALL handle inheritance,
-    // including otherwise-unused capture-pipe writers held by the CLI. No standard
-    // handles are supplied; DETACHED_PROCESS prevents console inheritance/creation.
-    // A new process group separates console signaling where a console is attached.
-    // BREAKAWAY prevents a caller in a kill-on-close Job from lending that Job's
-    // lifetime to the independently owned daemon. A Job that forbids
-    // breakaway causes an explicit start failure instead of a short-lived daemon.
-    // Null environment/current-directory pointers preserve the caller's values.
-    if unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB,
-            null(),
-            null(),
-            &startup,
-            &mut process,
-        )
-    } == 0
-    {
-        return Err(io_error(
-            "start background daemon",
-            std::io::Error::last_os_error(),
-        ));
-    }
+    let create = |job_flags| {
+        // CreateProcessW may modify argv. Supply a fresh buffer on each attempt.
+        let mut command_line = command_line.clone();
+        let mut process = PROCESS_INFORMATION::default();
+        // SAFETY: both UTF-16 buffers are NUL-terminated and all structures live
+        // through the call. Handle inheritance is disabled, including capture pipes.
+        // Null environment/current-directory pointers preserve the caller's values.
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | job_flags,
+                null(),
+                null(),
+                &startup,
+                &mut process,
+            )
+        };
+        if created == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(process)
+    };
+    let process = create(CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|error| {
+            let mut in_job = 0;
+            // SAFETY: the pseudo-handle is valid and the output flag is writable.
+            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+                && unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } != 0
+                && in_job != 0
+            {
+                // An Agent's stand can run inside the caller's non-breakaway Job.
+                return create(0);
+            }
+            Err(error)
+        })
+        .map_err(|error| io_error("start background daemon", error))?;
     // SAFETY: successful CreateProcessW returned these two uniquely owned handles.
-    // Closing them neither waits for nor terminates the independent daemon. No PID
+    // Closing them neither waits for nor terminates the detached daemon. No PID
     // is retained or adopted as later control authority.
     unsafe {
         CloseHandle(process.hThread);

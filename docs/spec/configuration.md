@@ -1944,8 +1944,9 @@ XML or the complete systemd unit and systemctl commands. Uninstall previews
 identify the task or unit selected for removal. Dry-run performs no scheduler, systemd, or
 filesystem mutations. Installing, uninstalling and dry-run require an Owner
 CLI outside an Agent session. The daemon lock admits one instance per data
-directory. Windows demand-start uses the existing detached process owner with
-Job breakaway and reports a start error when the caller's Job forbids it.
+directory. Windows demand-start detaches from the console and requests Job
+breakaway. When a caller in a Job gets access denied with breakaway, demand-start
+retries inside that Job. The daemon then shares the caller Job's lifetime.
 Unix demand-start starts the daemon in a separate session with standard
 streams disconnected.
 
