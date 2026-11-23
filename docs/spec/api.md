@@ -482,6 +482,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `agent.list/get/result` | scoped, paginated Agent state and exact results; `agent.get` includes metadata-only owner-rules revision/digest/delivery evidence |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot with complete work line counts when available, and paginated native-attributed edits |
+| `checkpoint.restore` | Owner-only restoration of a retained checkpoint's separate staged and worktree layers into a clean worktree at its captured HEAD and repository |
 | `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes, suppressions and paths outside active claim globs, each list bounded; an attention filter, not a quality score |
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
@@ -780,6 +781,13 @@ A stale item returns `stale_item`. A snooze lasts until
 the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
+
+For a missing worktree with a retained checkpoint, the inbox instructions include
+`git worktree prune`, `git worktree add`, and the exact
+`swarm --data-dir <daemon-data> checkpoint restore --agent A --generation N
+--checkpoint-ref REF --workspace PATH` command. Restore refuses a dirty or active
+target, a changed HEAD, a different Git common directory, and any unsafe or withheld
+checkpoint path.
 
 Each stuck command has its own `command:<id>` subject, revision, snooze and
 decision receipt. It offers `command.get` (`inspect`). The available corrections
@@ -3146,6 +3154,7 @@ swarm settings read
 swarm settings save FILE [--dry-run]
 swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
 swarm worktree remove AGENT [--generation N]
+swarm checkpoint restore --agent A --generation N --checkpoint-ref REF --workspace PATH
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm usage [A] [--generation N] [--project P] [--root A]
 swarm heavy [A] [--generation N] [--window-secs N]

@@ -3,6 +3,7 @@ mod attribution;
 mod auth;
 mod background_wake;
 mod catalog;
+mod checkpoint_restore;
 mod child_run;
 mod cleanup;
 mod command;
@@ -778,6 +779,7 @@ impl Router {
             "usage.summary" => self.usage_summary(&params, &principal).await,
             "observe.heavy" => self.observe_heavy(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
+            "checkpoint.restore" => self.checkpoint_restore(&params, &principal).await,
             "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,

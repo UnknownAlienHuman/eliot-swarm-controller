@@ -673,6 +673,8 @@ fn project_work_not_in_git(
             &eliot_core::display_path(&repo),
             &eliot_core::display_path(&worktree),
             &branch,
+            &format!("a{agent}"),
+            generation,
             checkpoint.as_deref(),
         ));
         items.push(missing);
@@ -681,16 +683,33 @@ fn project_work_not_in_git(
 }
 
 /// The commands that bring a missing worktree and its saved files back.
-fn restore_commands(repo: &str, worktree: &str, branch: &str, checkpoint: Option<&str>) -> String {
+fn restore_commands(
+    repo: &str,
+    worktree: &str,
+    branch: &str,
+    agent: &str,
+    generation: i64,
+    checkpoint: Option<&str>,
+) -> String {
     let mut commands = format!(
-        "git -C \"{repo}\" worktree prune\ngit -C \"{repo}\" worktree add \"{worktree}\" \"{branch}\""
+        "git -C {} worktree prune\ngit -C {} worktree add {} {}",
+        powershell_quote(repo),
+        powershell_quote(repo),
+        powershell_quote(worktree),
+        powershell_quote(branch),
     );
     if let Some(checkpoint) = checkpoint {
         commands.push_str(&format!(
-            "\ngit -C \"{worktree}\" restore --source=\"{checkpoint}\" --worktree -- ."
+            "\nswarm checkpoint restore --agent {agent} --generation {generation} --checkpoint-ref {} --workspace {}",
+            powershell_quote(checkpoint),
+            powershell_quote(worktree),
         ));
     }
     commands
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn project_holds(

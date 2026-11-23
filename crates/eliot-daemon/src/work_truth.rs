@@ -28,6 +28,9 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod restore;
+pub(crate) use restore::{CheckpointRestoreOutcome, restore_checkpoint};
+
 const GIT_TIME: Duration = Duration::from_secs(30);
 /// Owner decision on #922: the newest 20 checkpoints per generation.
 pub(crate) const KEEP_CHECKPOINTS: usize = 20;

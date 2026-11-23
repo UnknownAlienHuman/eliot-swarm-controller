@@ -152,6 +152,8 @@ pub(crate) enum CliCommand {
     Usage(UsageArgs),
     /// Run local Git operations through the daemon.
     Git(GitArgs),
+    /// Restore a retained private work-truth checkpoint.
+    Checkpoint(CheckpointArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
     /// Digest an Agent's patch for review: files, packages, new
@@ -763,6 +765,27 @@ pub(crate) struct UsageArgs {
 pub(crate) struct GitArgs {
     #[command(subcommand)]
     pub(crate) command: GitCommand,
+}
+
+#[derive(Args)]
+pub(crate) struct CheckpointArgs {
+    #[command(subcommand)]
+    pub(crate) command: CheckpointCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CheckpointCommand {
+    /// Restore staged and unstaged layers into a clean worktree at the captured HEAD.
+    Restore {
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: i64,
+        #[arg(long = "checkpoint-ref", value_name = "REF")]
+        checkpoint_ref: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -1566,6 +1566,30 @@ impl Store {
         load_workspace_by_path(&self.connection, path)
     }
 
+    /// Refuse a checkpoint restore while any live Agent owns this path or a
+    /// nested workspace below it.
+    pub fn workspace_has_active_agents(&self, path: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        require_absolute_workspace_path(path)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT workspace FROM agents WHERE workspace IS NOT NULL
+                 AND state IN ('created','starting','idle','busy','waiting','unknown')",
+            )
+            .map_err(sql_error)?;
+        let workspaces = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql_error)?;
+        for workspace in workspaces {
+            let workspace = workspace.map_err(sql_error)?;
+            if managed_path_contains(path, &workspace) || managed_path_contains(&workspace, path) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Physical cleanup must wait for every containing workspace's Git source to drain.
     pub fn has_open_git_sources_within(&self, worktree_path: &str) -> Result<bool> {
         require_absolute_workspace_path(worktree_path)?;

@@ -46,6 +46,15 @@ const METHODS: &[Method] = &[
         "Read the Owner decision queue and offered actions.",
         {}
     ),
+    method!(
+        "checkpoint.restore",
+        CheckpointRestoreRequest,
+        CheckpointRestoreResponse,
+        true,
+        true,
+        "Restore both staged and worktree checkpoint layers into a clean worktree at the captured HEAD.",
+        {"id":EXAMPLE_ID,"agent":"a1","generation":1,"checkpoint_ref":"refs/eliot/checkpoints/a1/g1/0000000000000001-01ARZ3NDEKTSV4RRFFQ69G5FAV","workspace":"C:/work"}
+    ),
     method!("owner.decide", OwnerDecideRequest, OwnerDecideResponse, true, true, "Execute a revision-bound choice or snooze the item until its subject changes.", {"id":EXAMPLE_ID,"item":{"kind":"agent","subject":"a1","revision":"example"},"choice":"snooze"}),
     method!("owner.decide.bulk", OwnerBulkDecideRequest, OwnerBulkDecideResponse, true, true, "Apply recommended actions for explicit revision-bound Owner inbox refs.", {"id":EXAMPLE_ID,"items":[{"kind":"agent","subject":"a1","revision":"example"}]}),
     method!("launch.enqueue", LaunchQueueRequest, LaunchIntentView, false, true, "Enqueue an interactive launch intent for fair admission.", {"id":EXAMPLE_ID,"args":{"profile":"worker","workspace":"C:/work"}}),
@@ -603,6 +612,7 @@ impl Router {
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
             "owner.inbox" => &["swarm inbox"],
+            "checkpoint.restore" => &["swarm checkpoint restore"],
             "owner.decide.bulk" => &["swarm inbox apply"],
             "mail.read" => &["swarm msg show"],
             "mail.ack" => &["swarm msg ack"],
@@ -999,6 +1009,9 @@ fn method_limits(name: &str) -> &'static str {
     match name {
         "owner.inbox" => {
             "Owner only. Page at most 100 current items. Continue with next, when present."
+        }
+        "checkpoint.restore" => {
+            "Owner only. Restore only the exact retained Agent-generation checkpoint into a clean worktree at the checkpoint's original HEAD and Git common directory. Refuses an active Agent workspace, dirty target, secret path/content, changed HEAD or repository mismatch."
         }
         "owner.decide" => {
             "Owner only. Use the displayed kind, subject and revision with an offered choice, recommended, or snooze. Arguments fill only the chosen action's input fields."

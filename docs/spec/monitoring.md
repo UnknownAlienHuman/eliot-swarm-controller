@@ -753,21 +753,35 @@ through its own durable cursor.
 
 **Checkpoint.** At each turn end and session end, and before a switch, handoff or
 worktree removal, the daemon captures changed and new files, except ignored ones, under
-`refs/eliot/checkpoints/<agent>/g<generation>/<time>`. It uses a private index,
-`commit-tree` and `update-ref`, so the Agent's branch, index and files are untouched. An
-unchanged worktree writes no Git object. The newest 20 refs per generation are kept.
-A failed capture is recorded and never blocks a turn, stop, handoff or removal.
+`refs/eliot/checkpoints/<agent>/g<generation>/<time>` in the daemon-owned bare repository
+at `<data_root>/work-truth.git`, outside the project checkout and Git common directory.
+Project branch pushes and mirror pushes cannot export these refs. The snapshot commit
+contains a manifest and the exact safe blobs. Its manifest binds the project Git common
+directory and captured HEAD, then records separate staged-index and worktree layers.
+Capture constructs the commit and returns its proposed ref and OID; the Router publishes
+the ref after it reserves and stores the checkpoint intent. Restart reconciles that
+intent against the exact ref and OID. The newest 20 published refs per generation are
+kept. An unchanged worktree writes no Git object. A failed capture is recorded and never
+blocks a turn, stop, handoff or removal.
 
-Each file is read once, and those exact bytes are scanned and stored. A checkpoint does
-not copy a file over `daemon.checkpoint_max_file_bytes` (default 16 MiB), past
+Before writing an object, the daemon scans every candidate path and the exact bytes for
+both layers. It writes those bytes with Git filters and encoding conversion disabled.
+Credential paths (including `.env`, private-key files and authentication directories),
+content holding a value Swarm knows is secret, nested repositories, unmerged index paths,
+and anything it cannot safely read are withheld. A checkpoint does not copy a file over
+`daemon.checkpoint_max_file_bytes` (default 16 MiB), past
 `daemon.checkpoint_max_total_bytes` per checkpoint (default 64 MiB), past 512 changed
 files, or past a generation budget of eight checkpoint totals of newly written bytes.
-Retention deletes refs and Git keeps their objects until it collects them, so that
-budget is what bounds repository growth. It also leaves out a file holding a value Swarm
-knows is a secret, a nested repository, and anything else it cannot read as a file.
-Each such file is recorded with its path, size and reason in the checkpoint, `swarm show`
-and the handoff brief as not captured. It exists only in the worktree, and the turn
-counts as not fully in Git. A checkpoint that could capture nothing is a failed one.
+Each withheld file is recorded with its path, size and reason in the checkpoint,
+`swarm show` and the handoff brief. It exists only in the worktree, and the turn counts
+as not fully in Git. A checkpoint that could capture nothing is a failed one.
+
+An Owner restores a retained checkpoint with `swarm checkpoint restore` after recreating
+the worktree. Restore requires a clean target at the captured HEAD and in the same Git
+common directory, and refuses while an Agent uses the target. It revalidates every path
+and stored blob before writing, restores the captured staged layer to the index, and
+restores the disk layer to the files. It imports only the needed file blobs into the
+project object store; checkpoint refs remain in the daemon-owned repository.
 
 The final checkpoint of a session waits for the
 [owned exit proof](#process-identity-and-custody): the process family has exited and the
@@ -776,21 +790,22 @@ harness child could still be writing. A lost or failed source qualifies for a su
 in its worktree under the same proof. On Windows the Job proves the whole family. Unix
 custody is degraded and proves what its process-group drain can.
 
-**Task record.** `refs/eliot/tasks/<input digest>` holds `task.md` (the full task),
-`card.json` (branch, base, Agent, profile, Goal and check) and `journal.md`. Known
+**Task record.** `refs/eliot/tasks/<input digest>` in the daemon-owned repository
+holds `task.md` (the full task), `card.json` (branch, base, Agent, profile, Goal and
+check) and `journal.md`. Known
 secrets and text shaped like a credential are redacted in all three. For a task the
 Owner wrote directly, the card lists the path, size and SHA-256 of up to eight absolute
 `.md`/`.txt` files the task names. When that task text is only a pointer (at most 512
 bytes outside any delivered source block), the named file is the task, so a regular
 UTF-8 file of at most 256 KiB is also saved, redacted, under `sources/`, and the brief
 names it next to the original task. A file holding a known secret is neither hashed nor
-saved. Other files stay out of Git, because every Agent with access to the repository
-can read its refs. To keep such a file with the task, deliver it with `--source`. The
-journal gains each finished turn's report when work changes or
-the session ends, and keeps its newest 128 KiB. The digest identifies the exact
-original SEND. Switch and Resume carry its binding through their Store transactions
-so a successor can find the record after command retention. Agents sharing a branch
-can hold different task records.
+saved. Other files stay out of this repository. To keep such a file with the task,
+deliver it with `--source`. The journal gains each finished turn's report when work
+changes or the session ends, and keeps its newest 128 KiB. The digest identifies the
+exact original SEND. Switch and Resume carry its binding through their Store
+transactions so a successor can find the record after command retention. Agents
+sharing a branch can hold different task records. The daemon keeps these refs outside
+the project repository, including for mirror pushes.
 
 **Signals.** A turn-end note, or a note during a turn older than ten minutes, reminds the
 Agent to commit. That long turn also takes a checkpoint, at most once per ten minutes.
@@ -798,8 +813,9 @@ Agent to commit. That long turn also takes a checkpoint, at most once per ten mi
 that ended with uncommitted work and no successor, or a managed worktree that
 [missing-folder reconciliation](coordination.md#registered-artifacts-and-cleanup-k69) settled while its last
 checkpoint or Git observation held uncommitted work. That item carries the exact commands
-that restore it: `git worktree prune`, `git worktree add <dir> <branch>` and
-`git restore --source=<checkpoint> --worktree -- .`.
+that restore it: `git worktree prune`, `git worktree add <dir> <branch>`, and
+`swarm --data-dir <daemon-data> checkpoint restore --agent <agent> --generation <N>
+--checkpoint-ref <ref> --workspace <dir>`. Restore preserves staged and unstaged layers.
 A failed capture keeps the reference to the last good checkpoint.
 
 Checkpoint capture and accounting share the repository write lane with managed Git
