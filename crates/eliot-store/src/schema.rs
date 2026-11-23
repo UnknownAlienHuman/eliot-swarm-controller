@@ -2435,7 +2435,7 @@ impl Store {
                      ON commands(target, generation, updated_at DESC)
                      WHERE principal = 'owner'
                        AND verb IN ('stop', 'interrupt')
-                       AND state IN ('rejected', 'failed');
+                       AND state IN ('rejected', 'failed', 'unknown');
                  INSERT INTO schema_migrations(version) VALUES (103);",
             )
             .map_err(sql_error)?;

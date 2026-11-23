@@ -5,7 +5,6 @@ use super::{
     GitView, HeavySummaryView, ObservationView, ScriptInterpreter, SessionGrowthView,
     StatsCoverage, WorkSummaryView,
 };
-use crate::limits::MAX_EVENT_BYTES;
 use crate::{
     Agent, AgentEdit, AgentState, Command, CommandState, Error, NativeChildActivity,
     NativeChildActivityState, ProcessIdentity, ProcessRecord, ProcessState, ProviderHoldState,
@@ -942,7 +941,7 @@ pub struct AgentGetResponse {
     )]
     pub pending_background_wake: Option<AgentBackgroundWakeView>,
     /// Latest retained visible Owner stop/interrupt failure for this generation.
-    /// Omitted when there is no visible settled failure.
+    /// Omitted when there is no visible failure or unconfirmed outcome.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -951,24 +950,29 @@ pub struct AgentGetResponse {
     pub last_control_failure: Option<AgentControlFailure>,
 }
 
-/// A retained, settled Owner stop or interrupt failure visible to this caller.
+/// A retained Owner stop or interrupt failure visible to this caller.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentControlFailure {
     pub command_id: String,
     pub verb: String,
     pub state: CommandState,
-    /// Preserves the concrete code, reason and/or message recorded by settlement.
+    /// Human-readable detail from the retained command outcome.
     pub reason: String,
     pub generation: i64,
 }
 
 impl AgentControlFailure {
+    const REASON_MAX_BYTES: usize = 1024;
+
     /// Project a Store-retained failure command without replacing its concrete result.
     pub fn from_command(command: &Command) -> Result<Self> {
         if command.principal != "owner"
             || !matches!(command.verb.as_str(), "stop" | "interrupt")
-            || !matches!(command.state, CommandState::Rejected | CommandState::Failed)
+            || !matches!(
+                command.state,
+                CommandState::Rejected | CommandState::Failed | CommandState::Unknown
+            )
         {
             return Err(Error::new(
                 "source_integrity",
@@ -981,35 +985,25 @@ impl AgentControlFailure {
                 "retained control failure has no generation binding",
             )
         })?;
-        let outcome = command.outcome.as_ref().ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "retained control failure has no result outcome",
-            )
-        })?;
-        let mut parts: Vec<&str> = Vec::new();
-        for field in ["code", "reason", "message"] {
-            if let Some(value) = outcome
-                .get(field)
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                && !parts.contains(&value)
-            {
-                parts.push(value);
-            }
-        }
-        if parts.is_empty() {
-            return Err(Error::new(
-                "source_integrity",
-                "retained control failure has no concrete reason",
-            ));
-        }
-        let reason = parts.join(": ");
+        let reason = command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| {
+                ["message", "reason", "cause", "code"]
+                    .into_iter()
+                    .find_map(|field| {
+                        outcome[field]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                    })
+            })
+            .unwrap_or("Swarm did not record a reason for this control result");
         let failure = Self {
             command_id: command.id.clone(),
             verb: command.verb.clone(),
             state: command.state,
-            reason,
+            reason: crate::bound_chars(reason, Self::REASON_MAX_BYTES),
             generation,
         };
         failure.validate()?;
@@ -1020,9 +1014,12 @@ impl AgentControlFailure {
         if self.command_id.trim().is_empty()
             || self.command_id.len() > 256
             || !matches!(self.verb.as_str(), "stop" | "interrupt")
-            || !matches!(self.state, CommandState::Rejected | CommandState::Failed)
+            || !matches!(
+                self.state,
+                CommandState::Rejected | CommandState::Failed | CommandState::Unknown
+            )
             || self.reason.trim().is_empty()
-            || self.reason.len() > MAX_EVENT_BYTES
+            || self.reason.len() > Self::REASON_MAX_BYTES
             || self.generation < 0
         {
             return Err(Error::new("invalid", "Agent control failure is malformed"));

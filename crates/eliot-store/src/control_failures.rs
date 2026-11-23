@@ -1,10 +1,10 @@
-//! Indexed readback of the latest settled Owner stop/interrupt failure.
+//! Indexed readback of the latest Owner stop/interrupt failure.
 
 use super::*;
 use rusqlite::{OptionalExtension, params};
 
 impl Store {
-    /// Read one terminal Owner control failure for the Agent's exact generation.
+    /// Read the latest failed or unconfirmed Owner control for this generation.
     pub fn latest_owner_control_failure(&self, agent: &Agent) -> Result<Option<Command>> {
         let agent_num = parse_agent_id(&agent.id)?;
         let command_id = self
@@ -13,7 +13,7 @@ impl Store {
                 "SELECT id FROM commands
                  WHERE target = ?1 AND generation = ?2 AND principal = 'owner'
                    AND verb IN ('stop', 'interrupt')
-                   AND state IN ('rejected', 'failed')
+                   AND state IN ('rejected', 'failed', 'unknown')
                  ORDER BY updated_at DESC, rowid DESC LIMIT 1",
                 params![agent_num, agent.generation],
                 |row| row.get::<_, String>(0),
