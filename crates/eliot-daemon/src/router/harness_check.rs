@@ -82,7 +82,11 @@ impl Router {
             // Fetch every due harness: ones without a configured profile are
             // skipped below, and must not consume the run batch.
             let due = store.due_harness_checks(now, usize::MAX)?;
-            let orphans = self.orphaned_harness_check_agents(&store)?;
+            let orphans = if available > 0 {
+                self.orphaned_harness_check_agents(&store)?
+            } else {
+                Vec::new()
+            };
             (due, orphans)
         };
         let mut started = Vec::with_capacity(due.len());
@@ -537,7 +541,6 @@ impl Router {
             .submit_check_steer(work, shutdown)
             .await?
             .ok_or(CheckEnd::Shutdown)?;
-        let mut generation: i64;
         // The scenario turn must succeed and actually use a tool.
         let (_, turn) = self
             .wait_for_check_command(
@@ -573,73 +576,57 @@ impl Router {
             ));
         }
         // The steer must have applied to the live turn.
-        let (steer, _) = self
-            .wait_for_check_command(&steer_id, "steer", true, shutdown, work.deadline)
+        self.wait_for_check_command(&steer_id, "steer", true, shutdown, work.deadline)
             .await?
             .ok_or(CheckEnd::Shutdown)?;
-        if steer.state != CommandState::Applied {
-            return Err(CheckEnd::fail(
-                "steer",
-                "harness_vendor",
-                format!("the harness settled the steer as {:?}", steer.state),
-            ));
-        }
         // Stop the scenario Agent, then resume it for a final turn.
         let agent = self.check_agent(&work.agent_id).await?;
-        generation = agent.generation;
-        if !agent.state.is_terminal() {
-            let stop_id = self
-                .submit_check_control(
-                    "stop",
-                    &work.agent_id,
-                    generation,
-                    None,
-                    shutdown,
-                    work.deadline,
-                )
-                .await?
-                .ok_or(CheckEnd::Shutdown)?;
-            let (stop, _) = self
-                .wait_for_check_command(&stop_id, "stop", true, shutdown, work.deadline)
-                .await?
-                .ok_or(CheckEnd::Shutdown)?;
-            if stop.state != CommandState::Applied {
-                return Err(CheckEnd::fail(
-                    "stop",
-                    "harness_vendor",
-                    format!("the harness settled the stop as {:?}", stop.state),
-                ));
-            }
-        }
-        let agent = self.check_agent(&work.agent_id).await?;
-        generation = agent.generation;
-        let known_turns = self.known_turn_ids(&work.agent_id, generation).await?;
-        let resume_id = self
+        let stop = self
+            .submit_check_control(
+                "stop",
+                &work.agent_id,
+                agent.generation,
+                None,
+                shutdown,
+                work.deadline,
+            )
+            .await?
+            .ok_or(CheckEnd::Shutdown)?;
+        self.wait_for_check_command(&stop.command.id, "stop", true, shutdown, work.deadline)
+            .await?
+            .ok_or(CheckEnd::Shutdown)?;
+        let resume = self
             .submit_check_control(
                 "resume",
                 &work.agent_id,
-                generation,
+                agent.generation,
                 Some(eliot_core::HARNESS_CHECK_RESUME_TEXT),
                 shutdown,
                 work.deadline,
             )
             .await?
             .ok_or(CheckEnd::Shutdown)?;
-        let (resume, _) = self
-            .wait_for_check_command(&resume_id, "resume", true, shutdown, work.deadline)
+        self.wait_for_check_command(&resume.command.id, "resume", true, shutdown, work.deadline)
             .await?
             .ok_or(CheckEnd::Shutdown)?;
-        if resume.state != CommandState::Applied {
-            return Err(CheckEnd::fail(
+        let send = resume.linked_command.ok_or_else(|| {
+            CheckEnd::fail(
                 "resume",
-                "harness_vendor",
-                format!("the harness settled the resume as {:?}", resume.state),
-            ));
-        }
-        let resumed = self
-            .wait_for_resumed_turn(&work.agent_id, &known_turns, shutdown, work.deadline)
+                "source_integrity",
+                "harness check resume did not admit its linked SEND",
+            )
+        })?;
+        let (_, resumed) = self
+            .wait_for_check_command(&send.id, "resume", false, shutdown, work.deadline)
             .await?
             .ok_or(CheckEnd::Shutdown)?;
+        let resumed = resumed.ok_or_else(|| {
+            CheckEnd::fail(
+                "resume",
+                "unknown",
+                "harness check resume left no provable turn outcome",
+            )
+        })?;
         check_turn_verdict(&resumed, "resume")?;
         Ok(())
     }
@@ -657,20 +644,6 @@ impl Router {
             })
     }
 
-    /// Turn ids already seen on one generation, so the resume wait only
-    /// accepts the resumed turn.
-    async fn known_turn_ids(
-        &self,
-        agent_id: &str,
-        generation: i64,
-    ) -> CheckResult<std::collections::HashSet<String>> {
-        let store = self.inner.store.lock().await;
-        store
-            .list_turns(agent_id, generation, 64)
-            .map(|turns| turns.into_iter().map(|turn| turn.turn_id).collect())
-            .map_err(|error| CheckEnd::fail("resume", error.code, *error.message))
-    }
-
     /// Submit one targeted control (steer, stop, resume) for the check Agent.
     /// Returns `None` on daemon shutdown before admission.
     async fn submit_check_control(
@@ -681,7 +654,7 @@ impl Router {
         text: Option<&str>,
         shutdown: &mut watch::Receiver<bool>,
         deadline: Instant,
-    ) -> CheckResult<Option<String>> {
+    ) -> CheckResult<Option<Admission>> {
         let step = verb_step(verb);
         if *shutdown.borrow() {
             return Ok(None);
@@ -710,7 +683,7 @@ impl Router {
             .admit_check_command(prepared)
             .await
             .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?;
-        Ok(Some(admission.command.id))
+        Ok(Some(admission))
     }
 
     /// Submit the scenario steer as soon as the SEND binds a live turn.
@@ -800,7 +773,7 @@ impl Router {
                     )
                     .await
                 {
-                    Ok(Some(id)) => return Ok(Some(id)),
+                    Ok(Some(admission)) => return Ok(Some(admission.command.id)),
                     // Shutdown, or the turn ended between the sighting and
                     // admission: re-read on the next pass instead of matching
                     // message text.
@@ -929,65 +902,6 @@ impl Router {
                 changed = progress.changed() => {
                     if changed.is_err() {
                         return Err(CheckEnd::fail(step, "unavailable", "harness check progress closed"));
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Wait for the resumed turn: the first completed turn the resume did not
-    /// start from. Returns `None` on shutdown.
-    async fn wait_for_resumed_turn(
-        &self,
-        agent_id: &str,
-        known: &std::collections::HashSet<String>,
-        shutdown: &mut watch::Receiver<bool>,
-        deadline: Instant,
-    ) -> CheckResult<Option<Turn>> {
-        let mut progress = self.inner.progress.subscribe();
-        loop {
-            if *shutdown.borrow() {
-                return Ok(None);
-            }
-            let _ = *progress.borrow_and_update();
-            {
-                let store = self.inner.store.lock().await;
-                let agent = store
-                    .get_agent(agent_id)
-                    .map_err(|error| CheckEnd::fail("resume", error.code, *error.message))?;
-                let Some(agent) = agent else {
-                    return Err(CheckEnd::fail(
-                        "resume",
-                        "unknown",
-                        "harness check Agent disappeared",
-                    ));
-                };
-                let turns = store
-                    .list_turns(agent_id, agent.generation, 64)
-                    .map_err(|error| CheckEnd::fail("resume", error.code, *error.message))?;
-                for turn in turns {
-                    if turn.state == TurnState::Completed && !known.contains(&turn.turn_id) {
-                        return Ok(Some(turn));
-                    }
-                }
-            }
-            if Instant::now() >= deadline {
-                return Err(CheckEnd::fail(
-                    "resume",
-                    "timeout",
-                    "harness check exceeded its time budget",
-                ));
-            }
-            tokio::select! {
-                _ = tokio::time::sleep_until(deadline) => {}
-                changed = progress.changed() => {
-                    if changed.is_err() {
-                        return Err(CheckEnd::fail("resume", "unavailable", "harness check progress closed"));
                     }
                 }
                 changed = shutdown.changed() => {

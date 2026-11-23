@@ -1791,9 +1791,17 @@ impl EventProcessor {
             };
         }
         let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
+        let text = assistant_text(record);
         if main_thread {
             let native_error_kind = record.get("error").and_then(Value::as_str);
             self.native_failure = native_error_kind.and_then(claude_api_failure);
+            if let Some(failure) = self.native_failure.as_mut()
+                && record.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+                && !is_blank_native_text(&text)
+            {
+                let policy = SecretPolicy::new(self.secrets.iter().cloned());
+                failure.message = Error::new("native_failure", policy.redact_text(&text)).message;
+            }
             self.native_provider_restriction =
                 native_error_kind.and_then(claude_provider_restriction);
             if has_tool_uses {
@@ -1803,7 +1811,6 @@ impl EventProcessor {
             self.observe_tool_uses(record).await?;
         }
         let observed_model = model.filter(|_| model_output);
-        let text = assistant_text(record);
         if is_blank_native_text(&text) {
             if let Some(model) = observed_model {
                 self.message_seq = self.message_seq.saturating_add(1);
@@ -3388,6 +3395,8 @@ impl EventProcessor {
             {
                 data["native_error"] =
                     json!({"code":"quota_exhausted", "message":"provider billing/quota refusal"});
+            } else if let Some(error) = &error {
+                attach_native_error(&mut data, Some(error.message.as_str()), &secrets);
             }
             let failure_origin = error
                 .as_ref()
