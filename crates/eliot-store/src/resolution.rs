@@ -517,6 +517,7 @@ impl Store {
                 id: request.id.clone(),
                 command_id: request.command_id.clone(),
                 state,
+                workspace_cleanup: None,
             };
             insert_resolution_write(
                 &tx,
