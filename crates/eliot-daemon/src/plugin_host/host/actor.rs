@@ -665,14 +665,17 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                         client.reader_closed(),
                                     );
                                 } else {
-                                    match client.begin_call("agent.command", params, deadline()).await {
+                                    let steer_deadline = deadline();
+                                    match client
+                                        .begin_call("agent.command", params, steer_deadline)
+                                        .await
+                                    {
                                         Ok(pending_call) => {
-                                            let response_deadline = deadline();
                                             pending_steers.push(Box::pin(async move {
                                                 // Dispatch is already confirmed. Expiry is unknown,
                                                 // and PendingCall releases the correlation slot; this
                                                 // command must never be sent again.
-                                                let result = pending_call.finish(response_deadline).await;
+                                                let result = pending_call.finish(steer_deadline).await;
                                                 PluginCommandCompletion {
                                                     command,
                                                     reply,

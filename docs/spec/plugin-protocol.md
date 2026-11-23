@@ -155,12 +155,12 @@ steps. Antigravity waits for notification of its exact turn's settlement after
 dispatching cancellation. Only an observed cancellation terminal confirms it.
 
 Steer on harnesses with a direct native steer RPC uses an ordered, bounded write followed
-by a correlated response wait: the host writes its `agent.command` frame in dispatch order
-under the writer deadline. The host then waits up to the plugin RPC response deadline
-while continuing to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle messages.
-A timeout releases the correlation slot and settles the command as `unknown` with the
-elapsed deadline as its reason. An unresolved transport or generation teardown also settles
-as `unknown`. The host never replays the steer.
+by a correlated response wait. The host establishes one absolute plugin RPC deadline
+immediately before dispatch and uses it for both the `agent.command` write and response
+wait, while continuing to process `interrupt`, `stop`, `agent.snapshot`, and lifecycle
+messages. A timeout after dispatch releases the correlation slot and settles the command
+as `unknown` with the elapsed deadline as its reason. An unresolved transport or generation
+teardown also settles as `unknown`. The host never replays the steer.
 
 A plugin with no native steer declares `steer_delivery: "turn_safe_point"` in its
 `session.ready` effective settings (Claude does); absent means a direct native steer, and
