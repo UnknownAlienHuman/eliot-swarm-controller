@@ -2862,6 +2862,9 @@ impl EventProcessor {
                             "Muse model attempt had no exact turn binding",
                         )
                     })?;
+                if self.status.session_id.as_deref() != Some(notification.session_id.as_str()) {
+                    return Ok(());
+                }
                 validate_session_and_turn(
                     &self.status,
                     &notification.session_id,
