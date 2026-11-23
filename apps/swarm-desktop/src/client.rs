@@ -648,16 +648,22 @@ pub async fn owner_inbox(
     eliot_daemon::client_call_typed(data_dir, "owner.inbox", &request).await
 }
 
-/// The visible inbox items by kind (`daemon.status` `owner_inbox`).
-pub async fn owner_inbox_counts(
-    data_dir: &Path,
-) -> Result<std::collections::BTreeMap<eliot_core::api::OwnerInboxKind, usize>> {
+#[derive(Clone, Debug)]
+pub struct SidebarStatus {
+    pub owner_inbox: std::collections::BTreeMap<eliot_core::api::OwnerInboxKind, usize>,
+    pub profile_command_issues: Vec<eliot_core::api::ProfileCommandIssue>,
+}
+
+pub async fn sidebar_status(data_dir: &Path) -> Result<SidebarStatus> {
     let request = eliot_core::api::DaemonStatusRequest::default();
     request.validate()?;
     let status: eliot_core::api::DaemonStatusResponse =
         eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
     request.validate_response(&status)?;
-    Ok(status.owner_inbox)
+    Ok(SidebarStatus {
+        owner_inbox: status.owner_inbox,
+        profile_command_issues: status.profile_command_issues,
+    })
 }
 
 /// Decide one inbox item (`owner.decide`): an offered choice, `recommended`

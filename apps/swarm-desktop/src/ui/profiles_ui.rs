@@ -526,6 +526,11 @@ impl DesktopApp {
             status: &self.editor.status,
             busy: self.settings.reading,
             summaries: &self.launch.profile_summaries,
+            command_issue: self
+                .inbox
+                .profile_command_issues
+                .iter()
+                .find(|issue| self.editor.selected.as_deref() == Some(issue.profile.as_str())),
             detail: &|profile| self.preset_detail(profile),
             source_open: self.editor.source_open,
             fields,

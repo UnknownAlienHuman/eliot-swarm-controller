@@ -818,8 +818,7 @@ When a previous daemon panic marker was consumed once at startup or plugin panic
 For a missing pinned executable, `harness.doctor` returns `profile_command_issues`
 with the profile, harness, configured path and optional `replacement` path and
 version. `swarm doctor` tells the Owner to omit `cmd` to restore automatic discovery.
-`daemon.status` and `harness.doctor` also retain `claude_profile_command_issues`
-for existing clients.
+`daemon.status` uses the same field for missing pins without running installation probes.
 
 On Windows, `swarm doctor` lists non-baseline ACEs on the selected data root. It
 reports SID, ACE type, rights mask, and flags and identifies the capability ACEs
@@ -2861,8 +2860,7 @@ including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
 `build_identity`, and the retention view with store sizes, configured windows,
 SQLite page counts
 and `pruned_through`. It also reports the automatic cleanup policy and latest
-sweep outcome, and `claude_profile_command_issues` for missing explicitly pinned Claude
-executables. `swarm doctor` reports missing pins across all harnesses.
+sweep outcome, and `profile_command_issues` for missing explicitly pinned executables.
 
 Local IPC accept failures are logged and retried with bounded backoff.
 During the delay, admitted work and existing connections continue, and the

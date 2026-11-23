@@ -913,8 +913,8 @@ latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 the diagnostic `VERIFIED_HARNESSES` baseline without blocking launch; those versions
 do not pin executable selection. It also reports every profile whose explicitly
 pinned executable is missing, with the configured path, current replacement
-path/version when available, and instructions to omit `cmd`. `swarm status`
-retains its Claude-specific preflight report.
+path/version when available, and instructions to omit `cmd`. The desktop reads
+missing pins through `daemon.status` and displays the repair in Models & presets.
 
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);

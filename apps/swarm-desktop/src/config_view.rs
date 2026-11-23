@@ -12,7 +12,7 @@ use windows_reactor::*;
 use crate::profiles::{self, FormField};
 use crate::theme::winui::Palette;
 use crate::ui::tokens;
-use eliot_core::api::{ProfileSummary, RuleListEntry, TimerSchedule};
+use eliot_core::api::{ProfileCommandIssue, ProfileSummary, RuleListEntry, TimerSchedule};
 
 /// A note: secondary text, wrapped and selectable.
 fn small(text: impl Into<String>) -> TextBlock {
@@ -43,6 +43,7 @@ pub struct ProfilesData<'a> {
     pub status: &'a str,
     pub busy: bool,
     pub summaries: &'a [ProfileSummary],
+    pub command_issue: Option<&'a ProfileCommandIssue>,
     /// A saved preset's line: its app, model name and effort.
     pub detail: &'a dyn Fn(&ProfileSummary) -> String,
     /// The TOML source editor is shown.
@@ -348,6 +349,17 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
             form.push(KeyedView::new(
                 "error",
                 error_note(format!("Cannot launch now: {error}"), palette),
+            ));
+        } else if let Some(issue) = data.command_issue {
+            form.push(KeyedView::new(
+                "error",
+                error_note(
+                    format!(
+                        "Executable is missing at {}. Omit cmd in the profile source to follow the installed version.",
+                        issue.configured_cmd
+                    ),
+                    palette,
+                ),
             ));
         }
         if let Some(harness) = data.harness {

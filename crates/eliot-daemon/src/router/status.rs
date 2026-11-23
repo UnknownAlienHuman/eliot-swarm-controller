@@ -44,7 +44,8 @@ impl Router {
         for item in inbox {
             *owner_inbox.entry(item.kind).or_default() += 1;
         }
-        let claude_profile_command_issues = self.claude_profile_command_issues().await;
+        let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
+        let profile_command_issues = self.profile_command_issues(missing_commands, &[]);
         let blockers = self.status_blockers().await?;
         let drain = self.drain_report().await?;
         let retention = Some(self.retention_view().await?);
@@ -113,7 +114,7 @@ impl Router {
             owned_plugins: self.inner.plugin_host.live_count(),
             observer_readers: self.inner.plugin_host.observer_count(),
             discovery_readers: self.inner.plugin_host.reader_count(),
-            claude_profile_command_issues,
+            profile_command_issues,
             workspace_custody,
             workspace_recovery_error: self.inner.workspace_recovery_error.lock_recover().clone(),
             cloud_mcp: crate::cloud_mcp::service_snapshot(),

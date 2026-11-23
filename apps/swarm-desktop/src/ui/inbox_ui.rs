@@ -15,7 +15,7 @@ use super::*;
 use crate::theme::winui::Palette;
 use eliot_core::api::{
     OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxKind,
-    OwnerInboxResponse,
+    OwnerInboxResponse, ProfileCommandIssue,
 };
 
 /// The choice that asks the daemon for its recommended action.
@@ -26,8 +26,8 @@ const MAX_RESULT_CHARS: usize = 4_000;
 
 #[derive(Clone, Debug)]
 pub(super) enum InboxMsg {
-    /// The per-kind counts (`daemon.status`), read with the sidebar.
-    Counts(Fallible<BTreeMap<OwnerInboxKind, usize>>),
+    /// Owner counts and executable diagnostics from the sidebar's status read.
+    Status(Fallible<client::SidebarStatus>),
     /// One `owner.inbox` read (its sequence).
     Loaded(u64, Fallible<OwnerInboxResponse>),
     /// Decide an item: its reference as shown, the choice (`recommended`,
@@ -57,6 +57,7 @@ struct Outcome {
 pub(super) struct InboxState {
     /// Visible items by kind (`daemon.status`).
     pub(super) counts: BTreeMap<OwnerInboxKind, usize>,
+    pub(super) profile_command_issues: Vec<ProfileCommandIssue>,
     items: Vec<OwnerInboxItem>,
     /// More items than the first page.
     more: bool,
@@ -152,13 +153,12 @@ fn cursor(item: &OwnerInboxItemRef) -> String {
 impl DesktopApp {
     pub(super) fn inbox_update(&mut self, msg: InboxMsg, context: &ComponentContext<Self>) {
         match msg {
-            InboxMsg::Counts(Ok(counts)) => {
-                if counts != self.inbox.counts {
-                    self.inbox.counts = counts;
-                }
+            InboxMsg::Status(Ok(status)) => {
+                self.inbox.counts = status.owner_inbox;
+                self.inbox.profile_command_issues = status.profile_command_issues;
             }
             // The last counts stay; the daemon's own notice speaks for it.
-            InboxMsg::Counts(Err(_)) => {}
+            InboxMsg::Status(Err(_)) => {}
             InboxMsg::Loaded(seq, read) => {
                 if seq != self.inbox.seq {
                     return;
@@ -300,9 +300,9 @@ impl DesktopApp {
             return;
         };
         self.spawn_read(context, move || {
-            let read = client::block_on(client::owner_inbox_counts(&data_dir))
+            let read = client::block_on(client::sidebar_status(&data_dir))
                 .map_err(|error| error.user_message());
-            ShellMsg::Inbox(InboxMsg::Counts(read))
+            ShellMsg::Inbox(InboxMsg::Status(read))
         });
     }
 

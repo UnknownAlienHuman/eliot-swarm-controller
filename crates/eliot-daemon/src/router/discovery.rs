@@ -515,54 +515,6 @@ impl Router {
             .collect()
     }
 
-    pub(super) async fn claude_profile_command_issues(
-        &self,
-    ) -> Vec<eliot_core::api::harness::ClaudeProfileCommandIssue> {
-        let missing = crate::config::missing_profile_commands(&self.inner.data_root)
-            .into_iter()
-            .filter(|(_, harness, _)| harness == "claude")
-            .collect::<Vec<_>>();
-        if missing.is_empty() {
-            return Vec::new();
-        }
-        let installation = crate::adhoc::harness_installation_async("claude").await;
-        let issues = self.profile_command_issues(missing, &[("claude", installation)]);
-        self.legacy_claude_command_issues(&issues)
-    }
-
-    pub(super) fn legacy_claude_command_issues(
-        &self,
-        issues: &[ProfileCommandIssue],
-    ) -> Vec<eliot_core::api::harness::ClaudeProfileCommandIssue> {
-        use eliot_core::api::harness::ClaudeProfileCommandIssue;
-
-        let policy = self.secret_policy_snapshot();
-        issues
-            .iter()
-            .filter(|issue| issue.harness == "claude")
-            .filter_map(|issue| {
-                let issue = ClaudeProfileCommandIssue {
-                    profile: issue.profile.clone(),
-                    configured_cmd: issue.configured_cmd.clone(),
-                    replacement_cmd: issue
-                        .replacement
-                        .as_ref()
-                        .map(|candidate| candidate.cmd.clone()),
-                    replacement_version: issue
-                        .replacement
-                        .as_ref()
-                        .and_then(|candidate| candidate.version.clone()),
-                    repair_command: issue
-                        .replacement
-                        .as_ref()
-                        .map(|_| crate::adhoc::claude_latest_settings_command(&issue.profile)),
-                };
-                let data = serde_json::to_value(&issue).ok()?;
-                (issue.validate().is_ok() && !policy.contains_value(&data)).then_some(issue)
-            })
-            .collect()
-    }
-
     pub(super) async fn methods(&self, params: &Value, principal: &Principal) -> Result<Value> {
         let request: MethodsRequest = decode_params(params.clone())?;
         request.validate()?;

@@ -4850,8 +4850,6 @@ impl Router {
         }
         let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
         let profile_command_issues = self.profile_command_issues(missing_commands, &probes);
-        let claude_profile_command_issues =
-            self.legacy_claude_command_issues(&profile_command_issues);
         let store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
@@ -4895,7 +4893,6 @@ impl Router {
         let response = HarnessDoctorResponse {
             harnesses,
             profile_command_issues,
-            claude_profile_command_issues,
             profile_first_calls,
             profile_first_calls_truncated,
             goal_check_deadlines: self.goal_check_deadlines().await?,
