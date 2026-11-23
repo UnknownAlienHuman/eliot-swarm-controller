@@ -94,19 +94,7 @@ impl DesktopApp {
                     .map(|reply| submit_note(&reply))
                 });
             }
-            MENU_STOP => {
-                let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
-                self.submit_control(context, "Stop", key, move |data_dir, mutation_id| {
-                    client::block_on(client::submit_stop(
-                        data_dir,
-                        mutation_id,
-                        &bound.agent,
-                        bound.generation,
-                        false,
-                    ))
-                    .map(|reply| submit_note(&reply))
-                });
-            }
+            MENU_STOP => self.stop_agent(&bound.agent, bound.generation, context),
             MENU_FORCE => {
                 let title = self.agent_title(&binding.agent);
                 self.chat.confirm_force = Some((bound, title));
@@ -217,15 +205,32 @@ impl DesktopApp {
         if !note.is_empty() {
             pill.push_str(&format!(" · {note}"));
         }
+        // Stop Agent stays in view while the Agent can still be stopped,
+        // idle included; it reads Stopping… until its command settles.
+        let stop = detail
+            .filter(|detail| {
+                !detail.observe_only
+                    && !matches!(
+                        detail.state,
+                        eliot_core::AgentState::Stopped
+                            | eliot_core::AgentState::Failed
+                            | eliot_core::AgentState::Lost
+                    )
+            })
+            .and_then(|detail| self.stop_button(agent, detail.generation));
+        let actions = if stop.is_some() { STOP_WIDTH } else { 0.0 };
         View::component::<Header>(HeaderInput {
             palette,
             title,
             tone,
             pill,
             menu,
+            stop,
             title_width: self
                 .main_width()
-                .map_or(tokens::layout::READING_WIDTH, title_width),
+                .map_or(tokens::layout::READING_WIDTH, |main| {
+                    title_width(main - actions)
+                }),
             send: context.forward(),
         })
     }
@@ -312,10 +317,15 @@ pub(super) struct HeaderInput {
     /// The "…" entries; `None` while the detail is read (the button is
     /// shown, not active).
     menu: Option<Vec<MenuItem>>,
+    /// Stop Agent while the Agent can be stopped, as it shows now.
+    stop: Option<crate::monitor_view::StopButton>,
     /// The widest the title takes ([`title_width`]).
     title_width: f64,
     send: Callback<Message>,
 }
+
+/// The room the header's Stop Agent button takes beside the other actions.
+const STOP_WIDTH: f64 = 104.0;
 
 /// The widest the header's title takes in a main area `main` DIPs wide:
 /// everything but the actions and the status pill at its shortest (its
@@ -376,6 +386,24 @@ impl Component for Header {
                 .automation_name("More actions")
                 .content(m3::icon(m3::glyph::MORE)),
         };
+        let stop: View = match input.stop {
+            Some(state) => {
+                use crate::monitor_view::StopButton;
+                let label = if state == StopButton::Stopping {
+                    "Stopping…"
+                } else {
+                    "Stop Agent"
+                };
+                m3::destructive(palette)
+                    .is_enabled(state == StopButton::Ready)
+                    .automation_name(label)
+                    .on_click(
+                        context.message(Message::Chat(ChatMsg::AgentMenu(MENU_STOP.to_owned()))),
+                    )
+                    .content(m3::label(label))
+            }
+            None => View::empty(),
+        };
         // The design's header: a full-width 52-DIP bar on a hairline, the
         // title at 15/500, the status pill right after it, then Details and
         // More. The actions take their own column. In the left-aligned
@@ -426,6 +454,7 @@ impl Component for Header {
                             .spacing(tokens::spacing::ROW_GAP)
                             .vertical_alignment(VerticalAlignment::Center)
                             .children((
+                                stop,
                                 // Opens (or keeps) the Details tab; only the
                                 // pane's X closes the pane.
                                 m3::icon_button(palette)

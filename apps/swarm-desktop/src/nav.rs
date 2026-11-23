@@ -123,6 +123,45 @@ impl UiAgent {
         }
     }
 
+    /// A row for an Agent read by id (`agent.get`): its listed row when the
+    /// search found one, with the identity and state of this read. Back and
+    /// Forward reach Agents no loaded page holds.
+    pub fn from_read(agent: &eliot_core::Agent, listed: Option<Self>) -> Self {
+        let mut row = listed.unwrap_or_else(|| Self {
+            id: agent.id.clone(),
+            generation: agent.generation,
+            harness: agent.harness.clone(),
+            state: agent.state,
+            status_line: None,
+            project_id: agent.project.clone(),
+            project_scope: agent.project_scope.clone(),
+            repo_common_dir: None,
+            workspace: agent.workspace.clone(),
+            parent: agent.parent.clone(),
+            updated_at: agent.updated_at,
+            title: agent
+                .name
+                .as_deref()
+                .and_then(title)
+                .unwrap_or_else(|| format!("{} · {}", agent.harness, agent.profile)),
+            native_child: agent.activity.is_some(),
+            tokens: None,
+            chat: agent.chat,
+            archived: agent.archived,
+            pending: false,
+            organization: None,
+            tags: Vec::new(),
+            organization_revision: None,
+            model: None,
+            work: None,
+        });
+        row.generation = agent.generation;
+        row.state = agent.state;
+        row.chat = agent.chat;
+        row.archived = agent.archived;
+        row
+    }
+
     /// The authorization scope the server compares for same-project moves
     /// and handoffs: the retained scope when it differs, else the project
     /// ID. None while the row is pending: the daemon row has not arrived,

@@ -19,6 +19,8 @@ pub(super) enum MonitorMsg {
     /// A lost or failed row's Resume, bound to the generation shown: open
     /// its conversation and resume it there.
     ResumeRequested(String, i64),
+    /// A live row's Stop, bound to the generation shown.
+    StopRequested(String, i64),
     /// Show or hide the children (workers and subagents) of one row.
     ChildrenToggled(String),
     /// Show or hide Recently stopped.
@@ -174,6 +176,9 @@ impl DesktopApp {
                     }),
                     context,
                 );
+            }
+            MonitorMsg::StopRequested(id, generation) => {
+                self.stop_agent(&id, generation, context);
             }
             MonitorMsg::ChildrenToggled(id) => {
                 if !self.monitor.expanded.remove(&id) {
@@ -631,6 +636,9 @@ impl DesktopApp {
                 line,
                 note,
                 resume: row.resumable().then(|| !self.submitting()),
+                stop: (!row.native_child && !row.ended())
+                    .then(|| self.stop_button(&row.id, row.generation))
+                    .flatten(),
                 indent,
             },
         )));
@@ -793,6 +801,9 @@ impl DesktopApp {
                 open: context.callback(|id| Message::Monitor(MonitorMsg::RowOpened(id))),
                 resume: context.callback(|(id, generation)| {
                     Message::Monitor(MonitorMsg::ResumeRequested(id, generation))
+                }),
+                stop: context.callback(|(id, generation)| {
+                    Message::Monitor(MonitorMsg::StopRequested(id, generation))
                 }),
                 children: context.callback(|id| Message::Monitor(MonitorMsg::ChildrenToggled(id))),
                 stopped: context.callback(|()| Message::Monitor(MonitorMsg::StoppedToggled)),

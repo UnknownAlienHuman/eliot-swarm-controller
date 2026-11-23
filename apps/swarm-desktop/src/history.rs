@@ -58,6 +58,16 @@ impl<T: Clone + PartialEq> History<T> {
         Some(place)
     }
 
+    /// The place one step back (or forward), without moving there: a task
+    /// is read from the daemon before the step is taken.
+    pub fn peek(&self, forward: bool) -> Option<&T> {
+        if forward {
+            self.forward.last()
+        } else {
+            self.back.last()
+        }
+    }
+
     pub fn can_back(&self) -> bool {
         !self.back.is_empty()
     }

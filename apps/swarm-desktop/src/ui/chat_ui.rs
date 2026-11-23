@@ -49,6 +49,10 @@ pub(super) enum ChatMsg {
     SendSubmitted(Result<SendOutcome, SendFailure>),
     /// Interrupt the turn shown on the button (Agent, generation, turn).
     InterruptRequested(BoundAction),
+    /// A Stop or interrupt was submitted; its final state is watched.
+    ControlWatched(String, Box<MutationResult<CommandSubmitResponse>>),
+    /// The final state of a watched control, or why it was not read.
+    ControlSettled(String, Box<Fallible<Command>>),
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, eliot_core::Result<String>),
@@ -99,6 +103,48 @@ const MENU_HANDOFF: &str = "Hand off or switch…";
 const MENU_MOVE: &str = "Move under another task…";
 const MENU_RESUME: &str = "Resume";
 const MENU_DETACH: &str = "Detach";
+/// How long the desktop waits for a Stop's final state before saying so.
+const CONTROL_SETTLE_SECONDS: u64 = 10;
+
+/// The outcome reason of an interrupt the daemon replaced with a proven stop.
+const INTERRUPT_FELL_BACK: &str = "interrupt_unconfirmed_agent_stopped";
+
+/// A retained failure's `code: reason: message` in [`command_reason`]'s
+/// words: its message when it has one, else its last code in words.
+fn failure_reason(reason: &str) -> String {
+    let mut rest = reason.trim();
+    while let Some((head, tail)) = rest.split_once(": ") {
+        if head.contains(char::is_whitespace) {
+            break;
+        }
+        rest = tail;
+    }
+    if rest.contains(char::is_whitespace) {
+        rest.to_owned()
+    } else {
+        eliot_core::reason_words(rest)
+    }
+}
+
+/// Why a command did not apply, in the daemon's words.
+fn command_reason(outcome: Option<&serde_json::Value>) -> String {
+    let field = |name: &str| {
+        outcome
+            .and_then(|outcome| outcome.get(name))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    };
+    field("message")
+        .or_else(|| field("cause"))
+        .map(str::to_owned)
+        .or_else(|| {
+            field("reason")
+                .or_else(|| field("code"))
+                .map(eliot_core::reason_words)
+        })
+        .unwrap_or_else(|| "No reason was reported.".to_owned())
+}
+
 const MENU_STOP: &str = "Stop";
 const MENU_FORCE: &str = "Force stop…";
 
@@ -359,6 +405,13 @@ pub(super) struct ChatState {
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
     pub(super) confirm_force: Option<(BoundAction, String)>,
+    /// Refused Stop commands already told to the owner in this window.
+    pub(super) control_failures: HashSet<String>,
+    /// The Agent and generation whose Stop was sent and has not settled.
+    pub(super) stopping: Option<(String, i64)>,
+    /// The last generation of each Agent whose Stop applied (its row can
+    /// lag behind until the next read).
+    pub(super) stopped: HashMap<String, i64>,
     /// The open lost Agent's loss in words, read once per generation from
     /// `diagnose` (`None` inside: nothing to say beyond Lost).
     pub(super) loss: Option<(String, i64, Option<String>)>,
@@ -487,6 +540,7 @@ impl DesktopApp {
                         self.chat.failures = 0;
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
+                        self.show_control_failure();
                         self.check_loss(context);
                         self.sync_open_agent();
                         self.ensure_catalog(context);
@@ -604,6 +658,7 @@ impl DesktopApp {
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
+                            self.show_control_failure();
                             self.check_loss(context);
                             self.sync_open_agent();
                             self.ensure_catalog(context);
@@ -855,7 +910,7 @@ impl DesktopApp {
             ChatMsg::InterruptRequested(bound) => {
                 let turn = bound.turn.clone().unwrap_or_default();
                 let key = format!("interrupt:{}:{}:{turn}", bound.agent, bound.generation);
-                self.submit_control(context, "Interrupt", key, move |data_dir, mutation_id| {
+                self.submit_watched(context, "Stop", key, move |data_dir, mutation_id| {
                     client::block_on(client::submit_interrupt(
                         data_dir,
                         mutation_id,
@@ -863,7 +918,6 @@ impl DesktopApp {
                         bound.generation,
                         turn,
                     ))
-                    .map(|reply| submit_note(&reply))
                 });
             }
             ChatMsg::ApprovalRequested(request, approve) => {
@@ -946,6 +1000,68 @@ impl DesktopApp {
                     );
                 }
             }
+            ChatMsg::ControlWatched(what, outcome) => {
+                // The action stays in flight until its command settles, so a
+                // second click cannot send a second Stop.
+                match *outcome {
+                    Ok(reply) if scripts::is_terminal(reply.state) => {
+                        self.finish_control(reply.state);
+                        self.report_control(
+                            &what,
+                            &reply.command_id,
+                            reply.state,
+                            reply.outcome.as_ref(),
+                            context,
+                        );
+                    }
+                    Ok(reply) => {
+                        self.set_status(format!("{what} sent; waiting for the Agent…"));
+                        let Ok(data_dir) = self.data_dir.clone() else {
+                            self.finish_control(eliot_core::CommandState::Unknown);
+                            return;
+                        };
+                        let _task = context.spawn_background(move |cancel| {
+                            let cancelled = || cancel.is_cancelled();
+                            let settled = settle_command(
+                                &data_dir,
+                                &reply.command_id,
+                                CONTROL_SETTLE_SECONDS,
+                                &cancelled,
+                            );
+                            Message::Chat(ChatMsg::ControlSettled(what, Box::new(settled)))
+                        });
+                    }
+                    Err(error) if crate::state::uncertain(&error) => {
+                        self.finish_control(eliot_core::CommandState::Unknown);
+                        self.alert(format!(
+                            "{what}: not confirmed (trying again reuses its id): {}",
+                            error.user_message()
+                        ));
+                    }
+                    Err(error) => {
+                        self.finish_control(eliot_core::CommandState::Rejected);
+                        self.alert(format!("{what} refused: {}", error.user_message()));
+                    }
+                }
+            }
+            ChatMsg::ControlSettled(what, settled) => match *settled {
+                Ok(command) => {
+                    self.finish_control(command.state);
+                    self.report_control(
+                        &what,
+                        &command.id,
+                        command.state,
+                        command.outcome.as_ref(),
+                        context,
+                    );
+                }
+                // Not settled in time: the same click later reads this
+                // command back instead of sending another.
+                Err(error) => {
+                    self.finish_control(eliot_core::CommandState::Unknown);
+                    self.alert(format!("{what}: {error}"));
+                }
+            },
             ChatMsg::AgentMenu(label) => {
                 // Bound now, to the Agent and generation the header shows.
                 let binding = self.selected_agent_id().zip(self.chat.detail.as_ref()).map(
@@ -966,17 +1082,189 @@ impl DesktopApp {
                     return;
                 }
                 let key = format!("stop:{}:{}:true", bound.agent, bound.generation);
-                self.submit_control(context, "Force stop", key, move |data_dir, mutation_id| {
-                    client::block_on(client::submit_stop(
-                        data_dir,
-                        mutation_id,
-                        &bound.agent,
-                        bound.generation,
-                        true,
-                    ))
-                    .map(|reply| submit_note(&reply))
-                });
+                let target = (bound.agent.clone(), bound.generation);
+                let sent = self.submit_watched(
+                    context,
+                    "Force stop",
+                    key,
+                    move |data_dir, mutation_id| {
+                        client::block_on(client::submit_stop(
+                            data_dir,
+                            mutation_id,
+                            &bound.agent,
+                            bound.generation,
+                            true,
+                        ))
+                    },
+                );
+                if sent {
+                    self.chat.stopping = Some(target);
+                }
             }
+        }
+    }
+
+    /// Stop this Agent generation (its process and session), from the
+    /// header, the Monitor or a menu; the outcome is reported when it settles.
+    pub(super) fn stop_agent(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        context: &ComponentContext<Self>,
+    ) {
+        let bound = BoundAction::agent_control(agent, generation);
+        let key = format!("stop:{}:{}:false", bound.agent, bound.generation);
+        let sent = self.submit_watched(context, "Stop Agent", key, move |data_dir, mutation_id| {
+            client::block_on(client::submit_stop(
+                data_dir,
+                mutation_id,
+                &bound.agent,
+                bound.generation,
+                false,
+            ))
+        });
+        if sent {
+            self.chat.stopping = Some((agent.to_owned(), generation));
+        }
+    }
+
+    /// How this Agent generation's Stop button shows; `None` once its Stop
+    /// applied, before the next read says so.
+    pub(super) fn stop_button(
+        &self,
+        agent: &str,
+        generation: i64,
+    ) -> Option<monitor_view::StopButton> {
+        use monitor_view::StopButton;
+        if self.chat.stopped.get(agent) == Some(&generation) {
+            return None;
+        }
+        let stopping = self
+            .chat
+            .stopping
+            .as_ref()
+            .is_some_and(|(id, run)| id == agent && *run == generation);
+        Some(if stopping {
+            StopButton::Stopping
+        } else if self.submitting() {
+            StopButton::Waiting
+        } else {
+            StopButton::Ready
+        })
+    }
+
+    /// A watched control reached its end, so the next action may start. An
+    /// unknown result keeps its mutation id: trying again reads it back.
+    fn finish_control(&mut self, state: eliot_core::CommandState) {
+        use eliot_core::CommandState;
+        self.settle_mutation(state != CommandState::Unknown);
+        if let Some((agent, generation)) = self.chat.stopping.take()
+            && state == CommandState::Applied
+        {
+            self.chat.stopped.insert(agent, generation);
+        }
+    }
+
+    /// A control whose refusal the owner must see: a command can be admitted
+    /// and refused by the harness afterwards, so its final state is watched
+    /// ([`ChatMsg::ControlWatched`]).
+    fn submit_watched(
+        &mut self,
+        context: &ComponentContext<Self>,
+        what: &str,
+        key: String,
+        work: impl FnOnce(&Path, String) -> eliot_core::Result<CommandSubmitResponse> + Send + 'static,
+    ) -> bool {
+        if self.submitting() {
+            self.alert("Waiting for the last action to settle.");
+            return false;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return false;
+        };
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        self.alert = None;
+        self.set_status(format!("{what} ({mutation_id})…"));
+        let what = what.to_owned();
+        let _task = context.spawn_background(move |_| {
+            Message::Chat(ChatMsg::ControlWatched(
+                what,
+                Box::new(work(&data_dir, mutation_id)),
+            ))
+        });
+        true
+    }
+
+    /// A Stop the daemon retained as refused, told once while its Agent is
+    /// still live (also after a restart of this window).
+    fn show_control_failure(&mut self) {
+        let Some(failure) = self.chat.detail.as_ref().and_then(|detail| {
+            let ended = matches!(
+                detail.state,
+                eliot_core::AgentState::Stopped
+                    | eliot_core::AgentState::Failed
+                    | eliot_core::AgentState::Lost
+            );
+            detail.control_failure.clone().filter(|_| !ended)
+        }) else {
+            return;
+        };
+        if self.chat.control_failures.insert(failure.command_id) {
+            let what = if failure.verb == "stop" {
+                "Stop Agent"
+            } else {
+                "Stop"
+            };
+            self.alert(format!(
+                "{what} refused: {}",
+                failure_reason(&failure.reason)
+            ));
+        }
+    }
+
+    /// The final state of a watched control, in words.
+    fn report_control(
+        &mut self,
+        what: &str,
+        command: &str,
+        state: eliot_core::CommandState,
+        outcome: Option<&serde_json::Value>,
+        context: &ComponentContext<Self>,
+    ) {
+        use eliot_core::CommandState;
+        self.chat.control_failures.insert(command.to_owned());
+        let fell_back = outcome
+            .and_then(|outcome| outcome.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            == Some(INTERRUPT_FELL_BACK);
+        match state {
+            _ if fell_back => {
+                self.alert("The turn did not confirm that it stopped, so Swarm stopped the Agent.")
+            }
+            CommandState::Applied => self.set_status(format!("{what}: done.")),
+            CommandState::Unknown => self.alert(format!(
+                "{what}: the result is not confirmed. {}",
+                command_reason(outcome)
+            )),
+            _ => self.alert(format!("{what} refused: {}", command_reason(outcome))),
+        }
+        if self.chat.convo.is_some() {
+            self.queue_reread(
+                Invalidation {
+                    detail: true,
+                    ..Invalidation::default()
+                },
+                context,
+            );
+        }
+        // The sidebar, Monitor and project page show the new state now, not
+        // at their next poll.
+        if !self.nav.agents_loading {
+            self.refresh_head(context);
+        }
+        if self.main == Main::Project {
+            self.read_project(context);
         }
     }
 
@@ -1105,11 +1393,16 @@ impl DesktopApp {
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let column = self.reading_width();
         let transcript = self.transcript_view(column, context, palette);
-        if self.main == Main::Settings {
+        if self.main != Main::Conversation {
+            let content = if self.main == Main::Project {
+                self.project_view(context, palette)
+            } else {
+                self.settings_view(context, palette)
+            };
             let page = Border::new()
                 .grid_row(1)
                 .background(palette.surface())
-                .content(self.settings_view(context, palette));
+                .content(content);
             return Grid::new()
                 .rows([
                     GridLength::Auto,

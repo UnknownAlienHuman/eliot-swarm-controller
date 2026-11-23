@@ -116,11 +116,24 @@ pub enum RowNote {
     Under(String),
 }
 
+/// How a Stop Agent button shows now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopButton {
+    /// It can be pressed.
+    Ready,
+    /// Another action is settling first.
+    Waiting,
+    /// This Agent's Stop was sent and has not settled.
+    Stopping,
+}
+
 /// What a row does: the row itself opens the conversation; a resumable
 /// one also offers Resume (its callback and whether it is enabled).
 pub struct RowActions {
     pub open: Callback<()>,
     pub resume: Option<(Callback<()>, bool)>,
+    /// Stop for a live controlled row, idle included.
+    pub stop: Option<(Callback<()>, StopButton)>,
 }
 
 /// What one list row shows besides its Agent.
@@ -254,23 +267,50 @@ pub fn list_row(
         .on_click(actions.open)
         .content(content)
         .tooltip(tooltip);
-    let Some((resume, enabled)) = actions.resume else {
+    // Resume and Stop are their own buttons beside the row (a button inside
+    // a button would swallow the click).
+    let mut beside: Vec<KeyedView> = Vec::new();
+    if let Some((resume, enabled)) = actions.resume {
+        beside.push(KeyedView::new(
+            "resume",
+            crate::m3::text_button(palette)
+                .is_enabled(enabled)
+                .automation_name(format!("Resume {} (run {})", look.title, row.generation))
+                .on_click(resume)
+                .content(crate::m3::label("Resume")),
+        ));
+    }
+    if let Some((stop, state)) = actions.stop {
+        let view: View = if state == StopButton::Stopping {
+            crate::m3::text_button(palette)
+                .is_enabled(false)
+                .automation_name(format!("Stopping {}", look.title))
+                .content(crate::m3::label("Stopping…"))
+        } else {
+            crate::m3::icon_button(palette)
+                .is_enabled(state == StopButton::Ready)
+                .automation_name(format!(
+                    "Stop Agent {} (run {})",
+                    look.title, row.generation
+                ))
+                .on_click(stop)
+                .content(crate::m3::icon(crate::m3::glyph::STOP))
+        };
+        beside.push(KeyedView::new("stop", view));
+    }
+    if beside.is_empty() {
         return button;
-    };
-    // Resume is its own button beside the row (a button inside a button
-    // would swallow the click).
+    }
     Grid::new()
         .columns([GridLength::STAR, GridLength::Auto])
         .column_spacing(tokens::spacing::XS)
         .children((
             button,
-            crate::m3::text_button(palette)
+            StackPanel::new()
                 .grid_column(1)
+                .orientation(Orientation::Horizontal)
                 .vertical_alignment(VerticalAlignment::Center)
-                .is_enabled(enabled)
-                .automation_name(format!("Resume {} (run {})", look.title, row.generation))
-                .on_click(resume)
-                .content(crate::m3::label("Resume")),
+                .keyed_children(beside),
         ))
 }
 
@@ -730,6 +770,8 @@ pub struct RowEntry {
     pub note: Option<RowNote>,
     /// Resume for a resumable row: whether it is enabled.
     pub resume: Option<bool>,
+    /// Stop for a live controlled row, as it shows now.
+    pub stop: Option<StopButton>,
     pub indent: f64,
 }
 
@@ -743,6 +785,8 @@ pub struct MonitorListInput {
     pub open: Callback<String>,
     /// Resume a row (its Agent and the generation shown).
     pub resume: Callback<(String, i64)>,
+    /// Stop a row's Agent (its id and the generation shown).
+    pub stop: Callback<(String, i64)>,
     /// Show or hide a row's children.
     pub children: Callback<String>,
     /// Show or hide Recently stopped.
@@ -823,6 +867,15 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                     enabled,
                 )
             });
+            let stop = entry.stop.map(|state| {
+                let (stop, id, generation) = (input.stop.clone(), id.clone(), entry.row.generation);
+                (
+                    Callback::new(move |()| {
+                        let _ = stop.call((id.clone(), generation));
+                    }),
+                    state,
+                )
+            });
             let open_id = id.clone();
             KeyedView::new(
                 format!("row:{id}:{}", entry.selected),
@@ -845,6 +898,7 @@ fn entry_view(entry: &MonitorEntry, input: &MonitorListInput) -> KeyedView {
                                 let _ = open.call(open_id.clone());
                             }),
                             resume,
+                            stop,
                         },
                         palette,
                     )),

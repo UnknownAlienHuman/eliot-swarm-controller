@@ -136,6 +136,9 @@ pub fn preview(text: &str) -> String {
     format!("{prefix}\n… [display truncated; Copy message copies the retained text]")
 }
 
+/// The turn status the daemon records for a turn the Owner interrupted.
+const OWNER_INTERRUPTED_STATUS: &str = "interrupted_by_owner";
+
 /// Turn status as read back, never guessed from event order alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TurnStatus {
@@ -225,6 +228,9 @@ struct TurnEntry {
     /// Effective model the failed turn ran under, from its retained
     /// configuration; named in the failure so a denied default says so.
     failure_model: Option<String>,
+    /// The daemon confirmed the Owner interrupted this turn
+    /// (`status = interrupted_by_owner`).
+    stopped_by_owner: bool,
     read_back: bool,
     activity: Vec<Activity>,
     messages: usize,
@@ -248,6 +254,7 @@ impl TurnEntry {
             event_final: None,
             failure_reason: None,
             failure_model: None,
+            stopped_by_owner: false,
             read_back: false,
             activity: Vec::new(),
             messages: 0,
@@ -1196,6 +1203,7 @@ impl Conversation {
                 TurnState::Completed => TurnStatus::Completed(read.outcome),
                 TurnState::Unknown => TurnStatus::Unknown,
             };
+            turn.stopped_by_owner = read.status.as_deref() == Some(OWNER_INTERRUPTED_STATUS);
             turn.final_text = read.final_text.as_deref().map(bound_text);
             turn.failure_reason = read
                 .native_error_message
@@ -1670,7 +1678,11 @@ impl Conversation {
                         let status = match (row.done, row.status.as_deref(), &turn.status) {
                             (false, _, TurnStatus::Running) => "Running",
                             (false, _, TurnStatus::Completed(Some(TurnOutcome::Interrupted))) => {
-                                "Interrupted"
+                                if turn.stopped_by_owner {
+                                    "Stopped by you"
+                                } else {
+                                    "Interrupted"
+                                }
                             }
                             (false, _, _) => "Ended · result not reported",
                             (true, Some(status), _) if is_success(status) => "Completed",
@@ -1773,6 +1785,9 @@ impl Conversation {
                 "Assistant".to_owned()
             }
             TurnStatus::Completed(Some(TurnOutcome::Failure)) => "Assistant · failed".to_owned(),
+            TurnStatus::Completed(Some(TurnOutcome::Interrupted)) if turn.stopped_by_owner => {
+                "Assistant · stopped by you".to_owned()
+            }
             TurnStatus::Completed(Some(TurnOutcome::Interrupted)) => {
                 "Assistant · interrupted".to_owned()
             }
@@ -1801,7 +1816,11 @@ impl Conversation {
                 final_key,
                 PartKind::Notice,
                 label,
-                "No public final text for this turn.".to_owned(),
+                if turn.stopped_by_owner {
+                    "Stopped by you.".to_owned()
+                } else {
+                    "No public final text for this turn.".to_owned()
+                },
                 Vec::new(),
             )),
         }

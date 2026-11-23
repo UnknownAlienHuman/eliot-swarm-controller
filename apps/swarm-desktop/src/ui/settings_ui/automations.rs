@@ -40,6 +40,33 @@ impl DesktopApp {
             .collect()
     }
 
+    /// The names of one project's automations: assignments that work in its
+    /// checkout and the rules of its namespace.
+    pub(in crate::ui) fn project_automations(&self, id: &str, checkout: &str) -> Vec<String> {
+        let automation = self.settings.base(Section::Automation);
+        let key = nav::path_key(checkout);
+        let mut names: Vec<String> = model::assignment_keys(&automation)
+            .into_iter()
+            .filter(|name| {
+                nav::path_key(&model::assignment_text(
+                    &automation,
+                    name,
+                    AssignmentField::Workspace,
+                )) == key
+            })
+            .collect();
+        names.extend(
+            self.automation
+                .rules
+                .iter()
+                .filter(|namespace| namespace.project.as_deref() == Some(id))
+                .filter_map(|namespace| namespace.rules.as_ref().ok())
+                .flatten()
+                .map(|entry| entry.state.id.clone()),
+        );
+        names
+    }
+
     /// Registered projects: (id, checkout, label).
     fn automation_projects(&self) -> Vec<(String, String, String)> {
         self.nav
