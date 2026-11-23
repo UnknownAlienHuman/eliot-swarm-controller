@@ -841,6 +841,9 @@ Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
 Only a context delivery emits a `hook.after_tool` receipt. A successful file write
 with an empty selection emits a `tool.file.edited` fact. OpenCode and Antigravity
 also emit this fact for successful native edits with an attributable edit path.
+Antigravity checks a supplied tool name against its file mutation tools. With
+an omitted name, a native edit kind and structured diff establish the edit.
+Exceeding the diff-path capture bound records a tool coverage gap.
 The `edit_path` carries a verified worktree-relative path or an outside-or-unverifiable
 SHA-256 and redacted basename, with a bounded redacted path when available.
 Outside paths replace the user-profile prefix with `%USERPROFILE%` before persistence.

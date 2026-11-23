@@ -982,19 +982,18 @@ impl State {
                 .await;
         }
         publication?;
-        if !self.tools.contains_key(&ask.tool_call_id) {
-            if self.tools.len() < MAX_LIVE_TOOLS {
-                self.merge_tool(
-                    &ask.tool_call_id,
-                    &ask.title,
-                    "pending",
-                    None,
-                    None,
-                    &ToolDiffPaths::default(),
-                );
-            } else {
-                self.record_unattributed_tool().await?;
-            }
+        let known_tool = self.tools.contains_key(&ask.tool_call_id);
+        if known_tool || self.tools.len() < MAX_LIVE_TOOLS {
+            self.merge_tool(
+                &ask.tool_call_id,
+                &ask.title,
+                if known_tool { "" } else { "pending" },
+                ask.tool_kind.as_deref(),
+                ask.tool_name.as_deref(),
+                &ToolDiffPaths::default(),
+            );
+        } else {
+            self.record_unattributed_tool().await?;
         }
         if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
             self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
