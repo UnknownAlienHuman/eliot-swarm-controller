@@ -91,10 +91,7 @@ terminal turn result or answer a retained input submission.
 
 Verified read-only 2026-11-13 against installed Muse 1.4.0-R4161.1
 (`muse schema generate-json-schema`, stable surface), and schema-checked
-read-only 2026-11-14 against 1.4.20-R8619.1 (whose export carries no bundle
-fingerprint field). Schema checks are not runtime proof: a live 1.4.20
-launch refuses before any session (see below), so the profile stays on
-1.4.0:
+read-only 2026-11-14 against 1.4.20-R8619.1.
 `turn/completed.usage` (`TokenUsage`) is the turn's aggregate token usage,
 summed across the turn's model completions, and maps to `TurnUsage` at
 `turn` scope bound to the exact session/generation/turn. Only the explicit
@@ -158,18 +155,16 @@ Verified 2026-11-13 using the installed host's offline stable and experimental
 JSON/TypeScript exports: Muse Code `1.4.0-R4161.1`, executable SHA-256
 `B33B493069A2593E97CC63F9A4063FEB64269BF7F07A233F5DB2DB681AD5D950`, stable
 bundle fingerprint `sha256:36466f634c8c78a812462ec941187fd4547b232ee06153e5feb2a1482f0d3d7f`.
-Re-verified read-only 2026-11-14 against Muse Code `1.4.20-R8619.1`
-(`muse schema generate-json-schema`, stable and experimental surfaces, no
-model calls): every shape the adapter models or calls is unchanged or
-additive-optional (new methods, notifications, `ItemKind` values, error
-kinds, and optional fields only; no removals except the orphaned
-`SessionDelete*` defs the adapter never referenced). Schema-level safety did
-not hold at runtime: a live 1.4.20 stdio probe sending the same
-`initialize` and `model/list` calls the plugin sends gets an empty
-`bundledCatalog` (`models: []`) where 1.4.0 serves the provider catalogue,
-so the exact-model lookup fails before any `session/start` is dispatched
-and the launch is refused. Do not switch the profile to 1.4.20 while its
-catalogue serves no models. Pre-session-effect refusals (profile, spawn,
+Verified on 2026-11-23 with Muse Code `1.4.25-R9361.1`. The installed stable
+and experimental schemas both allow `model/list` immediately after the
+`initialize` / `initialized` handshake. Its only parameter, `sessionId`,
+marks the active row for an existing session. The result is a snapshot and
+MSP v1 publishes no catalogue subscription.
+[Model listing](https://meta-models.github.io/muse-code-sdk/1.4/generated/msp/methods/model-list/)
+and [host operations](https://meta-models.github.io/muse-code-sdk/1.4/guides/host-operations/)
+describe the query and the host's startup provider and XDG roots.
+
+Pre-session-effect refusals (profile, spawn,
 initialize, `model/list`, resume preflight) return a failed-state start
 result carrying a short non-secret reason, and the launch settles failed,
 never unknown; any failure after a native session effect stays unknown.
@@ -639,14 +634,13 @@ No adapter-specific journal, proof receipts or secondary workflow model is impor
 --workspace W "prompt"` is Owner-only and freezes a profile-equivalent
 snapshot from safe defaults (`workspace-write`, `never`, explicit MCP `inherit`) plus
 flags. An omitted `--model` defers to the server default whether or not the
-catalogue marks a row with `isDefault` (an empty catalogue,
-e.g. Muse 1.4.20's `bundledCatalog` with zero models, fails honestly); the
+catalogue marks a row with `isDefault` (an empty catalogue refuses launch); the
 effective id is read back from the session. An unavailable requested model
 fails without substitution. `cmd` is discovered from the launcher dir version
 the launcher marks current (`muse.cmd` wrappers are never frozen); omitted
 profile `cmd` uses this same discovery. The selected native executable is
 frozen only in the launch generation. `--cmd` is the Owner's one-launch
-override and profile `cmd` is an explicit saved pin. On Linux the native payload
+override. On Linux the native payload
 installs directly (`muse`
 on `PATH`, `/usr/local/bin/muse`) with no launcher selection; the
 extensionless binary counts as native only after an ELF or Mach-O header
@@ -654,9 +648,7 @@ check, and a script is never a hot-start candidate.
 `swarm models --harness muse` returns the live native catalogue; its note
 names the `isDefault`-marked row when the server marks one, and an omitted
 `--model` still launches with the server default. An empty native read
-reports
-`catalogue: "empty"` with a note naming the binary and the `--cmd` / profile
-remedy.
+reports `catalogue: "empty"`.
 ## Agent skill delivery (`eliot-swarm`)
 
 `muse serve` offers no per-session skill flag: it loads each session
