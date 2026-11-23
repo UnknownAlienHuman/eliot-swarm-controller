@@ -407,7 +407,13 @@ fn dispatch_worktree_remove_tx(
 ) -> Result<Option<Command>> {
     let mut workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "managed worktree was not found"))?;
-    workspace::require_workspace_removable(tx, agent, &workspace, now)?;
+    workspace::require_workspace_removable(
+        tx,
+        agent,
+        &workspace,
+        now,
+        command.command.args["refused_launch_command"].is_string(),
+    )?;
     if command_generation != agent.generation
         || command
             .command
@@ -599,6 +605,7 @@ fn dispatch_stop_tx(
         ));
     }
     super::switch::require_unused_switch_successor(tx, id, agent)?;
+    super::launch_refusal::require_refused_launch_stop(tx, &command.command, agent)?;
     let turn = if command.command.principal == "owner" {
         admission::owner_control_turn(tx, agent)?
     } else {

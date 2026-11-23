@@ -180,6 +180,12 @@ impl Plan {
                 "Antigravity received another harness profile",
             ));
         }
+        if profile.get("native_subagents").and_then(Value::as_str) != Some("allow") {
+            return Err(Error::new(
+                "unsupported",
+                "Antigravity cannot disable native subagents; set native_subagents = \"allow\" explicitly to launch",
+            ));
+        }
         if profile.get("effort").is_some_and(|value| !value.is_null()) {
             return Err(Error::new(
                 "unsupported",

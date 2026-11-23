@@ -91,6 +91,12 @@ pub(super) fn prepare_profile(
             "Muse plugin received a profile for another harness",
         ));
     }
+    if profile.get("native_subagents").and_then(Value::as_str) != Some("allow") {
+        return Err(Error::new(
+            "unsupported",
+            "Muse cannot disable native subagents; set native_subagents = \"allow\" explicitly to launch",
+        ));
+    }
     // An omitted model selects the harness native default: the catalogue
     // must still prove reachable and non-empty (an empty catalogue serves
     // no default), and the effective server-selected model is read back.

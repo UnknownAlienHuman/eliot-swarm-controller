@@ -434,6 +434,16 @@ removes it with ordinary Git removal before compare-deleting the exact ref.
 With quiescent custody, a rollback refusal or failed readback settles the launch
 as failed. The launch diagnostic retains the verification failure and any
 separate rollback failure. Unremoved artifacts remain available for cleanup.
+A definite native start refusal uses the same guarded rollback once the owned
+generation has exited and drained. A native refusal can also arrive on the
+launch's linked first input. OpenCode's
+native model-unavailable terminal schedules a generation-bound stop when the
+linked turn did no work, the newly managed checkout ran no setup, and no other
+command or turn used the generation. The daemon logs the native refusal reason.
+After proved process exit and source drain, it removes the clean checkout at
+the original branch tip. The branch remains available for guarded branch
+cleanup. Concurrent use, changed files or refs, and uncertain custody leave the
+checkout available for inspection.
 A failed checkout reports its exit code once readback proves that the checkout and
 branch are absent. A setup entry
 has no generic readback: after restart or lost process result, `setup_running` becomes
@@ -1174,6 +1184,11 @@ has no usage. A subtotal missing any component is marked partial. Agent
 usage summaries include usage from observed native descendants of the
 requested generations within the caller's read scope. Child rows retain
 their own usage and the project and tree summaries count each turn once.
+Usage marks retained parent turns with a bound native-child registration.
+When older or unbound registrations prevent per-turn attribution, the marker
+is unknown. Doctor compares completed parent turns by current profile and
+shows observed child incidence and the median of reported parent-turn tokens
+for each group. The sample size and missing attribution remain visible.
 
 The authenticated Swarm MCP tool boundary records semantic tool.started and
 tool.completed events with the exact RPC method, call ID, origin, and exact

@@ -78,6 +78,7 @@ impl Router {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
+        self.reconcile_launch_refusal(event).await?;
         if matches!(
             event.kind.as_str(),
             "turn.completed" | "tool.background_ended"

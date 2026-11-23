@@ -376,10 +376,10 @@ impl CodexRoute {
         native_subagents: Option<&str>,
     ) -> Result<Vec<OsString>> {
         let args = self.args()?;
-        if native_subagents != Some("deny") {
+        let deny = native_subagents_argv(native_subagents);
+        if deny.is_empty() {
             return Ok(args);
         }
-        let deny = native_subagents_argv(Some("deny"));
         let pos = args
             .iter()
             .position(|arg| arg == OsStr::new("app-server"))
@@ -413,7 +413,7 @@ fn push_override(args: &mut Vec<OsString>, key: &str, value: String) {
 /// deny also needs agents.enabled=false and multi_agent_v2=false. The host
 /// repeats this mapping in each thread's config overlay. Allow adds nothing.
 pub(super) fn native_subagents_argv(native_subagents: Option<&str>) -> Vec<OsString> {
-    if native_subagents != Some("deny") {
+    if native_subagents == Some("allow") {
         return Vec::new();
     }
     let mut args = Vec::with_capacity(6);

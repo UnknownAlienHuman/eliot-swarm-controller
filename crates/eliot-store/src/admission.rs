@@ -352,6 +352,11 @@ pub(super) fn admit_send_member(
 ) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
     super::switch::require_switch_successor_accepting_input(tx, agent_num, agent.generation)?;
+    super::launch_refusal::require_no_refused_launch_stop_in_flight(
+        tx,
+        agent_num,
+        agent.generation,
+    )?;
     if agent.generation == 0 || agent.state == AgentState::Created {
         return Err(Error::new(
             "bad_state",
@@ -1460,15 +1465,22 @@ fn admit_worktree_remove_tx(
         .ok_or_else(|| Error::new("invalid", "worktree.remove arguments must be an object"))?;
     let expected_tip = args.get("expected_tip");
     let observe_missing = args.get("observe_missing");
+    let refused_launch = args.get("refused_launch_command");
     if request.request_id.is_some()
         || request.expected_turn_id.is_some()
         || request
             .expected_generation
             .is_some_and(|expected| expected != agent.generation)
-        || args
-            .keys()
-            .any(|key| key != "expected_tip" && key != "observe_missing")
+        || args.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "expected_tip" | "observe_missing" | "refused_launch_command"
+            )
+        })
         || observe_missing.is_some_and(|value| value != &Value::Bool(true) || principal != "owner")
+        || refused_launch.is_some_and(|value| {
+            !value.is_string() || principal != "owner" || observe_missing.is_some()
+        })
         || expected_tip.is_some_and(|tip| !tip.as_str().is_some_and(eliot_core::api::is_git_oid))
     {
         return Err(Error::new(
@@ -1478,6 +1490,14 @@ fn admit_worktree_remove_tx(
     }
     let workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", "Agent has no managed worktree"))?;
+    if let Some(command_id) = refused_launch.and_then(Value::as_str) {
+        super::launch_refusal::require_refused_launch_removal(
+            tx,
+            &agent,
+            command_id,
+            expected_tip.and_then(Value::as_str),
+        )?;
+    }
     if observe_missing.is_some()
         && tx
             .query_row(
@@ -1495,13 +1515,16 @@ fn admit_worktree_remove_tx(
             "worktree removal is pending or missing-directory reconciliation was attempted recently",
         ));
     }
-    workspace::require_workspace_removable(tx, &agent, &workspace, now)?;
+    workspace::require_workspace_removable(tx, &agent, &workspace, now, refused_launch.is_some())?;
     let mut args = json!({"target_generation": workspace.target_generation});
     if let Some(tip) = expected_tip {
         args["expected_tip"] = tip.clone();
     }
     if observe_missing.is_some() {
         args["observe_missing"] = Value::Bool(true);
+    }
+    if let Some(command_id) = refused_launch {
+        args["refused_launch_command"] = command_id.clone();
     }
     events.push(admit_command(
         tx,

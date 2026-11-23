@@ -164,7 +164,7 @@ impl NativeThreadConfigOverrides {
         native_subagents: Option<&str>,
         pass_agent_identity_to_shell: bool,
     ) -> Option<Self> {
-        let deny = (native_subagents == Some("deny")).then_some(false);
+        let deny = (native_subagents != Some("allow")).then_some(false);
         let shell_environment_policy = (!pass_agent_identity_to_shell).then(|| {
             serde_json::json!({
                 "filters": {

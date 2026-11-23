@@ -894,50 +894,47 @@ impl OpenCodePlugin {
         } else {
             None
         };
-        let isolated = auth.is_some() || fragment.is_some();
-        if isolated {
-            let empty_config = base.join("auth-config");
-            let config_dir = config_home.join("opencode");
-            for dir in [&empty_config, &config_dir, &data_home] {
-                std::fs::create_dir_all(dir).map_err(|_| {
-                    Error::new(
-                        "native_spawn",
-                        "OpenCode model reader could not prepare its private stores",
-                    )
-                })?;
-            }
-            std::fs::write(
-                config_dir.join("opencode.jsonc"),
-                provider_config(model.as_deref(), fragment.as_ref()).to_string(),
-            )
-            .map_err(|_| {
+        let empty_config = base.join("auth-config");
+        let config_dir = config_home.join("opencode");
+        for dir in [&empty_config, &config_dir, &data_home] {
+            std::fs::create_dir_all(dir).map_err(|_| {
                 Error::new(
                     "native_spawn",
-                    "OpenCode model reader could not write its provider config",
+                    "OpenCode model reader could not prepare its private stores",
                 )
             })?;
-            if let Some(selector) = auth.as_ref() {
-                transfer_selected_integration(
-                    &AuthTransfer {
-                        program,
-                        selector,
-                        workspace,
-                        export_environment: &[],
-                        canonical_config_home: &empty_config,
-                        import_environment: &environment,
-                        isolated_config_home: &config_home,
-                        isolated_data_home: &data_home,
-                        reuse_existing: false,
-                    },
-                    until,
-                )
-                .await?;
-            }
+        }
+        std::fs::write(
+            config_dir.join("opencode.jsonc"),
+            provider_config(model.as_deref(), fragment.as_ref()).to_string(),
+        )
+        .map_err(|_| {
+            Error::new(
+                "native_spawn",
+                "OpenCode model reader could not write its provider config",
+            )
+        })?;
+        if let Some(selector) = auth.as_ref() {
+            transfer_selected_integration(
+                &AuthTransfer {
+                    program,
+                    selector,
+                    workspace,
+                    export_environment: &[],
+                    canonical_config_home: &empty_config,
+                    import_environment: &environment,
+                    isolated_config_home: &config_home,
+                    isolated_data_home: &data_home,
+                    reuse_existing: false,
+                },
+                until,
+            )
+            .await?;
         }
         let context = ReaderContext {
             workspace,
             environment: &environment,
-            xdg: isolated.then_some((config_home.as_path(), data_home.as_path())),
+            xdg: Some((config_home.as_path(), data_home.as_path())),
             local_provider: fragment.is_some(),
         };
         let models: Vec<Value> = match params.part {
@@ -954,8 +951,7 @@ impl OpenCodePlugin {
                 })
                 .collect(),
         };
-        let provenance = if isolated { "preview" } else { "canonical" };
-        Ok(json!({"models": models, "default": Value::Null, "provenance": provenance}))
+        Ok(json!({"models": models, "default": Value::Null, "provenance": "preview"}))
     }
 
     /// Retain a proven-no-effect start failure and build its failed-state
@@ -1434,7 +1430,7 @@ impl OpenCodePlugin {
         // `deny` profiles establish the subagent denial as the session's own
         // ruleset, where it outranks every agent/project rule; `allow`
         // profiles create the session unchanged.
-        let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
+        let deny_native_subagents = parsed.native_subagents.as_deref() != Some("allow");
         let deny_permissions = deny_native_subagents.then(Self::subagent_deny_permissions);
         let cutoff = create_cutoff(envelope);
         // The location default is only a preview. Look it up before create,
@@ -1699,12 +1695,11 @@ impl OpenCodePlugin {
         } else {
             true
         };
-        effective["native_subagents"] = json!(
-            parsed
-                .native_subagents
-                .clone()
-                .unwrap_or_else(|| "allow".to_owned())
-        );
+        effective["native_subagents"] = json!(if deny_native_subagents {
+            "deny"
+        } else {
+            "allow"
+        });
         effective["native_subagents_verified"] = json!(subagents_verified);
         let hook_timing = crate::native::startup::Step::new("context_bind");
         let context_bound = bind_context_hooks(
@@ -2237,7 +2232,7 @@ impl OpenCodePlugin {
         // reports true without a repair. An unrepairable, unreadable or
         // contradicted denial fails the resume: the session must not run
         // without it.
-        let deny_native_subagents = parsed.native_subagents.as_deref() == Some("deny");
+        let deny_native_subagents = parsed.native_subagents.as_deref() != Some("allow");
         if deny_native_subagents && !OpenCodeHttp::session_subagent_deny_verified(&current) {
             let existing = current.permissions.clone().unwrap_or_default();
             Self::resume_repair_subagent_deny(&session.http, session_id, &existing, deadline)
@@ -2430,12 +2425,11 @@ impl OpenCodePlugin {
             "cwd": effective.location.as_ref().map(|location| location.directory.clone()),
         });
         effective_value = model_catalogue.attach(effective_value);
-        effective_value["native_subagents"] = json!(
-            parsed
-                .native_subagents
-                .clone()
-                .unwrap_or_else(|| "allow".to_owned())
-        );
+        effective_value["native_subagents"] = json!(if deny_native_subagents {
+            "deny"
+        } else {
+            "allow"
+        });
         effective_value["native_subagents_verified"] = json!(subagents_verified);
         // The regenerated provider fragment still bounds the retained model.
         if let Some(provider) = parsed.local_provider.as_ref()

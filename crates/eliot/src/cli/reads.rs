@@ -651,6 +651,27 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             eliot_core::api::PROFILE_FIRST_CALL_WINDOW
         );
     }
+    for sample in &response.profile_native_child_usage {
+        println!(
+            "  {} ({}, MCP {}) native children on {}/{} turns with known attribution ({} unknown). Median parent tokens with children {} (n={}), without children {} (n={})",
+            sample.profile,
+            sample.harness,
+            sample.mcp_policy.as_deref().unwrap_or("unknown"),
+            sample.turns_with_children,
+            sample.turns_with_children + sample.turns_without_children,
+            sample.turns_with_unknown_children,
+            counter_cell(sample.median_parent_tokens_with_children),
+            sample.token_samples_with_children,
+            counter_cell(sample.median_parent_tokens_without_children),
+            sample.token_samples_without_children,
+        );
+    }
+    if response.profile_native_child_usage_truncated {
+        println!(
+            "  Native child comparison uses the newest {} retained turn rows",
+            eliot_core::api::PROFILE_FIRST_CALL_WINDOW
+        );
+    }
     if !response.goal_check_deadlines.is_empty() {
         println!("Goal check deadlines");
     }
@@ -1681,6 +1702,26 @@ pub(crate) fn print_usage_table(response: &UsageSummaryResponse) {
         println!(
             "    Limited to the newest {} measured turns",
             eliot_core::api::MAX_FIRST_CALL_TURNS
+        );
+    }
+    if !response.native_child_turns.is_empty() {
+        println!("  native children by turn");
+        for turn in &response.native_child_turns {
+            let children = match turn.has_native_children {
+                Some(true) => "yes",
+                Some(false) => "none observed",
+                None => "unbound",
+            };
+            println!(
+                "    {}#{} turn {} {children}",
+                turn.agent, turn.generation, turn.turn_id
+            );
+        }
+    }
+    if response.native_child_turns_truncated {
+        println!(
+            "    Limited to the newest {} retained turns",
+            eliot_core::api::MAX_NATIVE_CHILD_TURN_MARKERS
         );
     }
     println!(

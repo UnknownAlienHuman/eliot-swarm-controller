@@ -21,7 +21,9 @@ use eliot_core::{
     ContextItem, ContextOutcome, Error, InjectPoint, ProviderRestriction, ProviderRestrictionKind,
     Result, SecretPolicy, SessionUsage, TurnUsage,
     api::{AGENT_NOTICE_MESSAGE_CHARS, NativeNotice, NativeNoticeKind},
-    limits::{MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON},
+    limits::{
+        MAX_NATIVE_INBOUND_FRAME_BYTES, MAX_TOOL_COMMAND_BYTES, NATIVE_TERMINAL_DEADLINE_REASON,
+    },
 };
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
@@ -1037,6 +1039,30 @@ impl EventProcessor {
             Some(SseFrame::Malformed) => {
                 // Unreachable: the pump converts this marker into the
                 // stream state and ends instead of forwarding it.
+            }
+            Some(SseFrame::Oversized { size, method }) => {
+                let method = method.as_deref().unwrap_or("unknown");
+                let reason = format!(
+                    "OpenCode SSE notification oversized (frame_oversized len={size} limit={MAX_NATIVE_INBOUND_FRAME_BYTES} kind=notification method={method})"
+                );
+                let result = self
+                    .stream_source()
+                    .record_coverage_gap(
+                        &reason,
+                        &["session", "turn", "message", "tool", "request"],
+                    )
+                    .await;
+                if let Err(error) = result {
+                    self.status.source_unknown = true;
+                    if self.status.failure.is_none() {
+                        self.status.failure = Some(*error.message);
+                    }
+                } else {
+                    // The dropped notification may itself carry a durable
+                    // position. Adopt the next retained position after the
+                    // recorded hole, then resume contiguous checks.
+                    self.expected_seq = None;
+                }
             }
             None => {
                 self.frames_drained = true;
@@ -3679,6 +3705,14 @@ fn terminal_turn_data(
         native_error.map(|error| error.message.as_str()),
         secrets,
     );
+    // OpenCode 2.2.7 resolves the requested model before the first inference
+    // step. Its no-route class also covers unrelated setup errors, so require
+    // the model resolver's specific error on the execution terminal itself.
+    if terminal.error.as_ref().is_some_and(|error| {
+        error.error_type == "provider.no-route" && error.message.starts_with("Model unavailable: ")
+    }) {
+        data["model_unavailable"] = Value::Bool(true);
+    }
     if status == "failed" {
         let origin = native_error
             .map(|error| error.failure_origin())

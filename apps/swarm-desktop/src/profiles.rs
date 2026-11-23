@@ -490,23 +490,12 @@ pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> 
     Ok(out)
 }
 
-/// Why a harness's own subagents cannot be turned off, when it has no
-/// per-session switch (`native_subagents = "deny"` is unsupported there;
-/// see `docs/spec/configuration.md`).
-pub fn native_subagents_fixed(harness: &str) -> Option<&'static str> {
-    matches!(harness, "muse" | "antigravity")
-        .then_some("this app has no switch to turn them off, so they stay allowed")
-}
-
 /// The effective `native_subagents` of a profile: its own value, else
-/// `deny` with child presets and `allow` without (the daemon's default).
+/// `deny` (the daemon's default for every supported harness).
 pub fn native_subagents_allowed(draft: &str, name: &str) -> bool {
     match field(draft, name, "native_subagents") {
-        Field::Simple(value) => value.trim() != "deny",
-        _ => !matches!(
-            list_field(draft, name, "child_profiles"),
-            ListField::Items(items) if !items.is_empty()
-        ),
+        Field::Simple(value) => value.trim() == "allow",
+        _ => false,
     }
 }
 
@@ -521,9 +510,6 @@ pub fn field_error(message: &str) -> Option<(String, String, String)> {
     let key = key.trim();
     let reason = reason.trim();
     let words = match (key, reason) {
-        (_, "native_subagents deny has no mapping on this harness") => {
-            "This app cannot turn its own subagents off.".to_owned()
-        }
         ("child_profiles", reason) if reason.starts_with("unknown child profile ") => format!(
             "There is no preset named {}.",
             reason.trim_start_matches("unknown child profile ")

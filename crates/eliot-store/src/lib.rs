@@ -9,6 +9,7 @@ mod canonical;
 mod capacity;
 mod control_failures;
 mod launch_queue;
+mod launch_refusal;
 mod launch_result;
 mod online_backup;
 pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};

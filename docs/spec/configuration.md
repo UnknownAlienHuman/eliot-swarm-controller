@@ -232,9 +232,8 @@ the managers are the installed ones of `codex`, `claude` and `opencode` in that
 order (the harnesses that can disable native subagents per session), otherwise the
 first installed profile in name order. Each manager has `control = "tree"` and
 `child_profiles` listing the other installed bootstrap profiles. Bootstrap writes
-`native_subagents = "deny"` for Codex, Claude and OpenCode managers, and writes
-`native_subagents = "allow"` for a Muse or Antigravity fallback manager, which has
-no per-session switch. The `default`
+`native_subagents = "deny"` for every manager. A Muse or Antigravity
+fallback requires the Owner to opt in before its first launch. The `default`
 routing role lists the managers followed by the other installed profiles in name
 order, so routing passes over one whose quota is used up or whose provider is on
 hold and starts the task on the next. The `worker` routing role and each manager's
@@ -511,17 +510,18 @@ A profile selects its harness-native subagent surface in `native_subagents`:
 `deny` asks the harness plugin to disable its native subagent tool for the
 session so delegation goes through Swarm (`launch` with `role` or an allowed
 profile, claims, mail, `wait`/`digest`). When omitted, it defaults to `deny`
-on Codex, Claude and OpenCode, whether or not `child_profiles` is set. An
+on every supported harness, independent of `child_profiles`. An
 explicit `native_subagents = "allow"` opts that profile into native subagents
 and remains valid for audit or other profiles that rely on them. The frozen
 value is captured in the profile snapshot and reported truthfully in effective
-settings. Ad-hoc Owner launches use the same per-harness defaults.
+settings. Ad-hoc Owner launches use the same default. Resume uses the
+retained snapshot, so adapters require explicit `allow` even for snapshots
+saved before the setting was frozen.
 
-Muse and Antigravity have no verified per-session switch and resolve to
-`allow` when the field is omitted or explicitly set to `allow`. Explicit
-`native_subagents = "deny"` is `unsupported` at config load on those harnesses;
-the daemon does not claim to disable a capability it cannot control. `deny`
-has a per-session mapping on Codex, Claude and OpenCode only.
+Muse and Antigravity have no verified per-session switch. A launch with
+`deny` on either harness returns `unsupported` before native process start,
+with a message showing how to opt in on a named profile. Codex, Claude, and
+OpenCode enforce `deny` on the session.
 On OpenCode the denial is a per-session `subagent` wildcard deny stored as
 the final entry in the session's entire ruleset and verified by readback of that
 exact session on create and resume: the server merges session rules after
@@ -590,7 +590,11 @@ substitutions are refused. `api_key_env` must be listed in `pass_env`, and
 `auth_integration` must be absent, so no unrelated canonical credential is
 imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
 `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the
-server and both preview readers. The live `GET /api/model` catalogue supplies
+server and the preview reader. OpenCode previews query the same native model
+inventory in a fresh launch-shaped store. A named profile uses its frozen
+provider settings and selected integration. A general ad-hoc preview combines
+inventories read with separate available integrations. Each launch uses one
+integration and the vendor makes the final model selection. The live `GET /api/model` catalogue supplies
 limits and variants for an exact model entry. An unreachable endpoint can still be
 listed and reports its failure on the native turn. Each named profile is a
 separate picker preset with its frozen model and effort. OpenCode catalogue

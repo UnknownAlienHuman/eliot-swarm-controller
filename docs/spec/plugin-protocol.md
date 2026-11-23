@@ -593,6 +593,12 @@ Conflicting identity rejects; overflow becomes a child gap. Independent child to
 exist only when the plugin can install an isolated environment before its tools run.
 Otherwise native child calls inherit the parent principal and that limitation is shown.
 A fanout guard never hides an already-created native child.
+When the producer can prove the exact spawn turn, registration also binds that
+turn to the parent generation. A delayed registration without that evidence
+retains the child with unbound turn attribution.
+On retirement of the bound producer generation, a child with a committed
+terminal turn and no active or unresolved turns becomes `stopped`. An unfinished turn
+remains `unknown` if the producer retired without its terminal fact.
 
 ## Translation and normalization
 
@@ -868,6 +874,12 @@ with `native_update_gap`. An oversized frame is fatal when the reader cannot pro
 it is a discardable notification. Discard ends in a fatal oversized-frame fault
 if the newline never arrives before the discard deadline. `swarm why` shows the
 retained reason for the Agent.
+
+OpenCode counts SSE bytes through the terminating blank line. Once the shared
+bound is exceeded, it drains the notification to that boundary, records one
+coverage gap with the byte count, limit and retained envelope type, and
+continues reading. The next retained durable position re-establishes the
+sequence boundary. A later exact execution terminal remains authoritative.
 
 Native reader faults split by proven line boundary. Fatal reader end (EOF,
 codec/UTF-8/IO fault, a required oversized record, exit-drain

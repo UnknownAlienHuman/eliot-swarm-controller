@@ -99,9 +99,10 @@ of the same live controller may preserve it.
 
 ## Transport
 
-Subscribe before session create/input. The SSE reader bounds each raw line and each
-assembled payload at 256 KiB, including the newline between successive data fields
-in the payload. An oversized or malformed frame ends the stream. Route SSE by exact
+Subscribe before session create/input. The SSE reader uses the shared
+[8 MiB inbound frame limit](../spec/plugin-protocol.md#lifecycle-hooks-and-qualification).
+It records a coverage gap and continues after an oversized notification.
+A malformed envelope ends the reader. Route SSE by exact
 session/directory, never
 cwd/title/time heuristics. Missing identity is a visible gap. Session routes bind their
 location from the session; requests outside a session pass the installed API's workspace

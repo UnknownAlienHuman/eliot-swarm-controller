@@ -75,13 +75,22 @@ pub(super) fn activity(
     child: i64,
     generation: i64,
 ) -> Result<NativeChildActivity> {
+    let stopped = connection
+        .query_row(
+            "SELECT state = 'stopped' FROM agents WHERE id = ?1 AND generation = ?2",
+            params![child, generation],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(sql_error)?;
     let has_open_turn = connection
         .query_row(OPEN_TURN_SQL, params![child, generation], |_| Ok(()))
         .optional()
         .map_err(sql_error)?
         .is_some();
     let last_progress_at = native_progress(connection, child, generation)?;
-    let state = if has_open_turn {
+    let state = if stopped {
+        NativeChildActivityState::Stopped
+    } else if has_open_turn {
         let binding: Option<(i64, i64, i64, i64)> = connection
             .query_row(
                 "SELECT producer, producer_generation, parent, parent_generation
@@ -378,6 +387,20 @@ impl Store {
                 "native child subject is already registered",
             ));
         }
+        // A delayed registration can cross turn boundaries. Only the
+        // producer's exact spawn-turn binding may attribute this child.
+        let parent_turn_id: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+                params![
+                    parent_num,
+                    request.parent_generation,
+                    request.parent_turn_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
         let root_num = parse_agent_id(&parent.root)?;
         let depth = parent
             .depth
@@ -429,8 +452,8 @@ impl Store {
         db!(tx.execute(
             "INSERT INTO native_child_registrations
                  (producer, producer_generation, parent, parent_generation,
-                  registration_id, child, request, ack)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  registration_id, child, request, ack, parent_turn_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 producer_num,
                 producer_generation,
@@ -439,7 +462,8 @@ impl Store {
                 request.registration_id,
                 child_num,
                 request_json,
-                ack_json
+                ack_json,
+                parent_turn_id
             ],
         ));
         let event = insert_daemon_event(
@@ -598,14 +622,11 @@ impl Store {
 /// The typed reason a native child settles with when its producer generation ends.
 pub const ENDED_WITH_PARENT: &str = "ended_with_parent";
 
-/// Settle every still-`unknown` observed native child whose exact controlled
-/// producer generation has ended: the producer is stopped, failed or lost, or
-/// its generation moved on. Such a child can never receive another fact (its
-/// grant requires that live producer generation), so it becomes `stopped` with
-/// `agent.stopped {reason: ended_with_parent}` in the same transaction. Turn
-/// facts stay as they are, except a still-running turn, which is retained
-/// `unknown`, never completed. Source rows are untouched here. `producer`
-/// narrows the sweep to one producer generation; `None` sweeps every
+/// Settle an observed native child only when its exact producer generation has
+/// ended and the registered child generation has a committed completed turn
+/// with no unresolved turns. Running turns become `unknown`; a child without
+/// such terminal evidence remains `unknown`. Source rows are untouched here.
+/// `producer` narrows the sweep to one producer generation; `None` sweeps every
 /// retained registration (restart recovery).
 pub(crate) fn end_native_children_with_parent_tx(
     tx: &Transaction<'_>,
@@ -617,7 +638,7 @@ pub(crate) fn end_native_children_with_parent_tx(
     let rows = {
         let mut statement = tx
             .prepare(
-                "SELECT r.child, c.generation, r.producer, r.producer_generation, p.generation, p.state
+                "SELECT r.child, r.ack, c.generation, r.producer, r.producer_generation, p.generation, p.state
                  FROM native_child_registrations r
                  JOIN agents c ON c.id = r.child
                  JOIN agents p ON p.id = r.producer
@@ -632,21 +653,45 @@ pub(crate) fn end_native_children_with_parent_tx(
             .query_map(params![producer_num, producer_generation], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })
             .map_err(sql_error)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?
     };
-    for (child, generation, producer, producer_generation, current, state) in rows {
+    for (
+        child,
+        ack_json,
+        current_child_generation,
+        producer,
+        producer_generation,
+        current_producer_generation,
+        state,
+    ) in rows
+    {
+        let ack = decode_child_registration_ack(&ack_json)?;
+        let registered_child = parse_agent_id(&ack.agent.id)?;
+        if registered_child != child || ack.agent.generation <= 0 {
+            return Err(Error::new(
+                "source_integrity",
+                "native child retirement registration binding changed",
+            ));
+        }
+        let generation = ack.agent.generation;
+        // A retained registration must never settle a later generation that
+        // happens to reuse the same Agent row.
+        if current_child_generation != generation {
+            continue;
+        }
         // The producer's end of exactly this generation; a later generation
         // says only that this one is over.
-        let producer_state = if current == producer_generation {
+        let producer_state = if current_producer_generation == producer_generation {
             state
         } else {
             "superseded".to_owned()
@@ -680,9 +725,32 @@ pub(crate) fn end_native_children_with_parent_tx(
                 json!({"turn_id": turn_id, "reason": ENDED_WITH_PARENT}),
             )?);
         }
+        let completed_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM turns
+                 WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
+                   AND EXISTS (
+                       SELECT 1 FROM agents
+                       WHERE id = ?1 AND generation = ?2 AND active_turn IS NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM turns
+                       WHERE agent = ?1 AND generation = ?2
+                         AND state IN ('running', 'unknown')
+                   )
+                 ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC
+                 LIMIT 1",
+                params![child, generation],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if completed_turn.is_none() {
+            continue;
+        }
         let changed = db!(tx.execute(
-            "UPDATE agents SET state = 'stopped', active_turn = NULL, pending = '[]', updated_at = ?1
-             WHERE id = ?2 AND generation = ?3 AND state = 'unknown'",
+            "UPDATE agents SET state = 'stopped', pending = '[]', updated_at = ?1
+             WHERE id = ?2 AND generation = ?3 AND state = 'unknown' AND active_turn IS NULL",
             params![now, child, generation],
         ));
         if changed != 1 {

@@ -673,6 +673,7 @@ pub fn activity_state_name(state: NativeChildActivityState) -> &'static str {
         NativeChildActivityState::Running => "running",
         NativeChildActivityState::Idle => "idle",
         NativeChildActivityState::Interrupted => "interrupted",
+        NativeChildActivityState::Stopped => "stopped",
         NativeChildActivityState::Lost => "lost",
         NativeChildActivityState::Unknown => "unknown",
     }

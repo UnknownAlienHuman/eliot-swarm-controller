@@ -1184,6 +1184,12 @@ impl WorkspaceManager {
         deadline: Instant,
     ) -> WorkspaceRemovalOutcome {
         let expected_tip = command.args.get("expected_tip").and_then(Value::as_str);
+        let clean_only = json!({"scratch": []});
+        let profile = if command.args.get("refused_launch_command").is_some() {
+            &clean_only
+        } else {
+            profile
+        };
         let preflight = match timeout_at(
             deadline,
             self.removal_candidates(git, preparation, profile, expected_tip, deadline),

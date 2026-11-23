@@ -649,6 +649,7 @@ impl Router {
                         &mut value,
                         &format!("plugin.{harness}.command.start"),
                     );
+                    value["native_start_refused"] = Value::Bool(true);
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
                     let artifact_snapshot =

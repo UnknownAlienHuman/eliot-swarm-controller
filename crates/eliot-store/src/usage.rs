@@ -26,10 +26,11 @@ use eliot_core::api::harness::{
     QuotaWindowBounds, QuotaWindowUsage,
 };
 use eliot_core::api::{
-    FirstCallInput, MAX_FIRST_CALL_TURNS, PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput,
-    SessionCostTotal, SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal,
-    TurnCounterMissing, TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView,
-    UsageSummaryRequest, UsageSummaryResponse,
+    FirstCallInput, MAX_FIRST_CALL_TURNS, MAX_NATIVE_CHILD_TURN_MARKERS, NativeChildTurnMarker,
+    PROFILE_FIRST_CALL_WINDOW, ProfileFirstCallInput, ProfileNativeChildUsage, SessionCostTotal,
+    SessionCumulativeTotals, SessionFacts, SessionTokenSubtotal, TurnCounterMissing,
+    TurnCounterTotals, TurnExpenditure, TurnScopeTotals, UsageScopeView, UsageSummaryRequest,
+    UsageSummaryResponse,
 };
 use rusqlite::{Connection, params, params_from_iter};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -40,6 +41,38 @@ pub struct ResolvedUsageScope {
     pub pairs: Vec<(i64, i64)>,
     pub agents_included: usize,
     pub truncated: bool,
+}
+
+type NativeChildTurnKey = (i64, i64, String);
+
+#[derive(Default)]
+struct NativeChildBindings {
+    by_turn: HashMap<NativeChildTurnKey, usize>,
+    unbound_by_generation: HashMap<(i64, i64), usize>,
+    unbound_total: usize,
+}
+
+#[derive(Default)]
+struct ProfileNativeChildAccum {
+    sampled_turns: usize,
+    turns_with_children: usize,
+    turns_without_children: usize,
+    turns_with_unknown_children: usize,
+    tokens_with_children: Vec<i64>,
+    tokens_without_children: Vec<i64>,
+}
+
+fn median_tokens(tokens: &mut [i64]) -> Option<i64> {
+    if tokens.is_empty() {
+        return None;
+    }
+    tokens.sort_unstable();
+    let middle = tokens.len() / 2;
+    if tokens.len().is_multiple_of(2) {
+        Some(((i128::from(tokens[middle - 1]) + i128::from(tokens[middle])) / 2) as i64)
+    } else {
+        Some(tokens[middle])
+    }
 }
 
 /// Counter positions shared by the turn aggregation below.
@@ -248,6 +281,58 @@ fn normalize_turn_scope(scope: &Option<String>) -> String {
 }
 
 impl Store {
+    /// Read only registrations whose parent generation is already in the
+    /// caller-authorized usage scope.
+    fn native_child_bindings(&self, pairs: &[(i64, i64)]) -> Result<NativeChildBindings> {
+        if pairs.is_empty() {
+            return Ok(NativeChildBindings::default());
+        }
+        let pairs = encode_json(&pairs)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT r.parent, r.parent_generation, r.parent_turn_id, COUNT(DISTINCT r.child)
+                 FROM native_child_registrations r
+                 JOIN (
+                     SELECT DISTINCT
+                         CAST(json_extract(value, '$[0]') AS INTEGER) AS parent,
+                         CAST(json_extract(value, '$[1]') AS INTEGER) AS generation
+                     FROM json_each(?1)
+                 ) scope ON scope.parent = r.parent
+                       AND scope.generation = r.parent_generation
+                 GROUP BY r.parent, r.parent_generation, r.parent_turn_id",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([pairs], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(sql_error)?;
+        let mut bindings = NativeChildBindings::default();
+        for row in rows {
+            let (parent, generation, turn_id, child_count) = row.map_err(sql_error)?;
+            let child_count = usize::try_from(child_count)
+                .map_err(|_| Error::new("internal", "native-child count is invalid"))?;
+            if let Some(turn_id) = turn_id {
+                bindings
+                    .by_turn
+                    .insert((parent, generation, turn_id), child_count);
+            } else {
+                *bindings
+                    .unbound_by_generation
+                    .entry((parent, generation))
+                    .or_default() += child_count;
+                bindings.unbound_total = bindings.unbound_total.saturating_add(child_count);
+            }
+        }
+        Ok(bindings)
+    }
+
     /// Resolve one usage scope to its retained (agent, generation) pairs.
     /// Agent scope covers every retained generation unless the request names
     /// one, and the native descendants observed under those generations.
@@ -429,6 +514,7 @@ impl Store {
             )
         };
         let wanted: std::collections::HashSet<(i64, i64)> = pairs.iter().copied().collect();
+        let native_child_bindings = self.native_child_bindings(pairs)?;
         let agent_ids: BTreeSet<i64> = wanted.iter().map(|(agent, _)| *agent).collect();
         let mut role_usage = RoleUsage::default();
         let mut turns_counted = 0_usize;
@@ -440,6 +526,8 @@ impl Store {
         let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
         let mut first_calls = BTreeMap::new();
         let mut first_calls_truncated = false;
+        let mut native_child_turns = BTreeMap::new();
+        let mut native_child_turns_truncated = false;
         let mut observed_native_agents = 0i64;
         if !agent_ids.is_empty() {
             let placeholders = agent_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -482,6 +570,28 @@ impl Store {
                     row.map_err(sql_error)?;
                 if !wanted.contains(&(agent, generation)) {
                     continue;
+                }
+                let has_native_children = if native_child_bindings.by_turn.contains_key(&(
+                    agent,
+                    generation,
+                    turn_id.clone(),
+                )) {
+                    Some(true)
+                } else if native_child_bindings
+                    .unbound_by_generation
+                    .contains_key(&(agent, generation))
+                {
+                    None
+                } else {
+                    Some(false)
+                };
+                native_child_turns.insert(
+                    (settled_at, agent, generation, turn_id.clone()),
+                    has_native_children,
+                );
+                if native_child_turns.len() > MAX_NATIVE_CHILD_TURN_MARKERS {
+                    native_child_turns.pop_first();
+                    native_child_turns_truncated = true;
                 }
                 if state != "completed" {
                     // Sums stay over completed turns only, but the skipped
@@ -568,6 +678,20 @@ impl Store {
                 )
                 .collect(),
             first_calls_truncated,
+            native_child_turns: native_child_turns
+                .into_iter()
+                .rev()
+                .map(|((_, agent, generation, turn_id), has_native_children)| {
+                    NativeChildTurnMarker {
+                        agent: format_agent_id(agent),
+                        generation,
+                        turn_id,
+                        has_native_children,
+                    }
+                })
+                .collect(),
+            native_child_turns_truncated,
+            native_child_registrations_unbound: native_child_bindings.unbound_total,
             swarm_mcp,
             swarm_mcp_truncated,
         })
@@ -892,6 +1016,131 @@ impl Store {
                     average_input_tokens: (sum / count as i128) as i64,
                 },
             )
+            .collect();
+        Ok((profiles, truncated))
+    }
+
+    /// Compare current-profile completed parent turns over the same bounded
+    /// window as `profile_first_calls`. Unknown legacy child attribution is
+    /// counted separately; medians use only the parent's turn-level usage.
+    pub fn profile_native_child_usage(&self) -> Result<(Vec<ProfileNativeChildUsage>, bool)> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT a.profile, a.harness, json_extract(a.profile_snapshot, '$.mcp'),
+                        t.agent, t.generation, t.turn_id, t.usage, t.state
+                 FROM (
+                     SELECT rowid AS sequence, agent, generation, turn_id, usage, state
+                     FROM turns ORDER BY rowid DESC LIMIT ?1
+                 ) t
+                 LEFT JOIN agents a ON a.id = t.agent AND a.generation = t.generation
+                      AND a.origin = 'eliot'
+                 ORDER BY t.sequence DESC",
+            )
+            .map_err(sql_error)?;
+        let mut rows = statement
+            .query(params![PROFILE_FIRST_CALL_WINDOW as i64 + 1])
+            .map_err(sql_error)?;
+        let mut examined = 0;
+        let mut truncated = false;
+        let mut samples = Vec::new();
+        let mut pairs = BTreeSet::new();
+        while let Some(row) = rows.next().map_err(sql_error)? {
+            if examined == PROFILE_FIRST_CALL_WINDOW {
+                truncated = true;
+                break;
+            }
+            examined += 1;
+            if row.get::<_, String>(7).map_err(sql_error)? != "completed" {
+                continue;
+            }
+            let (Some(profile), Some(harness)) = (
+                row.get::<_, Option<String>>(0).map_err(sql_error)?,
+                row.get::<_, Option<String>>(1).map_err(sql_error)?,
+            ) else {
+                continue;
+            };
+            let agent = row.get::<_, i64>(3).map_err(sql_error)?;
+            let generation = row.get::<_, i64>(4).map_err(sql_error)?;
+            pairs.insert((agent, generation));
+            samples.push((
+                profile,
+                harness,
+                row.get::<_, Option<String>>(2).map_err(sql_error)?,
+                agent,
+                generation,
+                row.get::<_, String>(5).map_err(sql_error)?,
+                row.get::<_, Option<String>>(6).map_err(sql_error)?,
+            ));
+        }
+        drop(rows);
+        drop(statement);
+
+        let pairs: Vec<_> = pairs.into_iter().collect();
+        let bindings = self.native_child_bindings(&pairs)?;
+        let mut by_profile = BTreeMap::new();
+        for (profile, harness, mcp_policy, agent, generation, turn_id, usage) in samples {
+            let decode_harness = harness.clone();
+            let has_children =
+                if bindings
+                    .by_turn
+                    .contains_key(&(agent, generation, turn_id.clone()))
+                {
+                    Some(true)
+                } else if bindings
+                    .unbound_by_generation
+                    .contains_key(&(agent, generation))
+                {
+                    None
+                } else {
+                    Some(false)
+                };
+            let sample = by_profile
+                .entry((profile, harness, mcp_policy))
+                .or_insert_with(ProfileNativeChildAccum::default);
+            sample.sampled_turns += 1;
+            match has_children {
+                Some(true) => sample.turns_with_children += 1,
+                Some(false) => sample.turns_without_children += 1,
+                None => sample.turns_with_unknown_children += 1,
+            }
+            let Some(usage) = usage else {
+                continue;
+            };
+            let usage = decode_turn_usage(&usage, &decode_harness)?;
+            if !matches!(usage.scope.as_deref(), Some("turn" | "main_loop_turn")) {
+                continue;
+            }
+            let Some(tokens) = usage.reported_total() else {
+                continue;
+            };
+            match has_children {
+                Some(true) => sample.tokens_with_children.push(tokens),
+                Some(false) => sample.tokens_without_children.push(tokens),
+                None => {}
+            }
+        }
+        let profiles = by_profile
+            .into_iter()
+            .map(|((profile, harness, mcp_policy), mut sample)| {
+                let median_parent_tokens_with_children =
+                    median_tokens(&mut sample.tokens_with_children);
+                let median_parent_tokens_without_children =
+                    median_tokens(&mut sample.tokens_without_children);
+                ProfileNativeChildUsage {
+                    profile,
+                    harness,
+                    mcp_policy,
+                    sampled_turns: sample.sampled_turns,
+                    turns_with_children: sample.turns_with_children,
+                    turns_without_children: sample.turns_without_children,
+                    turns_with_unknown_children: sample.turns_with_unknown_children,
+                    token_samples_with_children: sample.tokens_with_children.len(),
+                    median_parent_tokens_with_children,
+                    token_samples_without_children: sample.tokens_without_children.len(),
+                    median_parent_tokens_without_children,
+                }
+            })
             .collect();
         Ok((profiles, truncated))
     }
