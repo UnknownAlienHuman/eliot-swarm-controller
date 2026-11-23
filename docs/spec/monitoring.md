@@ -1148,11 +1148,35 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 The attention worker samples liveness on startup and every three minutes.
 An unchanged Stuck candidate becomes reportable after two consecutive sweeps
 and produces one `daemon.liveness_stuck` log line for the episode.
-`daemon.status` and `owner.inbox` project current Store facts on read.
+`daemon.status` and `owner.inbox` project current Store facts on read. Parked is
+separate from Moving and Long: only a current idle or waiting Agent with an
+unexpired `agent_wakes` row bound to its exact generation and turn is Parked.
+An idle Agent's bound turn must be completed; a waiting Agent's exact active
+turn must still be running with its owned native source or process observed.
+Seconds wakes are Parked only until their retained due time; other self-wakes
+remain Parked until they settle or expire. A pending Owner request remains
+Asked ahead of wake evidence. Unbound timers, stale or expired wakes, and a
+waiting turn without an active wake keep their existing Moving/Long/Stuck
+classification.
+
+Stuck inbox rows keep `recommended` absent when Store facts do not prove a safe
+correction; available inspection choices remain executable. For a Stuck busy or
+waiting Agent, the Owner-only `stop` recommendation is present only when its
+current generation has no active-turn pointer, pending request, running or
+unknown turn, or unsettled command, and Store has both an open native source and
+a running owned plugin. The action carries that exact generation, and normal
+command admission rechecks the inbox subject revision before admitting Stop;
+Stop uses the existing native and process-custody path. Other direct Agent
+Stuck cases offer `agent.get` only.
+
 For a stuck active Goal (`active_goal_without_round_or_timer`, #871, #904),
-`owner.inbox` offers a ready `goal.round` (`round`) action as the recommended
-choice alongside `goal.get` (`inspect`) when the Agent is cleanly idle with an
-unconsumed key or due cadence slot.
+`owner.inbox` offers a ready `goal.round` (`round`) recommendation alongside
+`goal.get` (`inspect`) only when Store proves the current Goal is active and
+the Agent is cleanly idle with an unconsumed idle key or due cadence slot.
+Otherwise `recommended` remains absent and inspection stays available. Other
+Stuck kinds expose only their existing readback choice when no safe corrective
+action is available. The selected action is bound into the item's revision;
+`owner.decide` reprojects that exact subject and revision before admitting it.
 Snooze hides the current inbox revision until its subject changes. The sweep
 prunes snoozes for subjects that no longer project.
 

@@ -47,6 +47,7 @@ const METHODS: &[Method] = &[
         {}
     ),
     method!("owner.decide", OwnerDecideRequest, OwnerDecideResponse, true, true, "Execute a revision-bound choice or snooze the item until its subject changes.", {"id":EXAMPLE_ID,"item":{"kind":"agent","subject":"a1","revision":"example"},"choice":"snooze"}),
+    method!("owner.decide.bulk", OwnerBulkDecideRequest, OwnerBulkDecideResponse, true, true, "Apply recommended actions for explicit revision-bound Owner inbox refs.", {"id":EXAMPLE_ID,"items":[{"kind":"agent","subject":"a1","revision":"example"}]}),
     method!("launch.enqueue", LaunchQueueRequest, LaunchIntentView, false, true, "Enqueue an interactive launch intent for fair admission.", {"id":EXAMPLE_ID,"args":{"profile":"worker","workspace":"C:/work"}}),
     method!("launch.intent.get", LaunchIntentGetRequest, LaunchIntentView, false, false, "Read the current state of a queued interactive launch intent.", {"id":EXAMPLE_ID}),
     method!(
@@ -614,6 +615,7 @@ impl Router {
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
             "owner.inbox" => &["swarm inbox"],
+            "owner.decide.bulk" => &["swarm inbox apply"],
             "mail.read" => &["swarm msg show"],
             "mail.ack" => &["swarm msg ack"],
             "var.set" => &["swarm var set"],
@@ -1012,6 +1014,9 @@ fn method_limits(name: &str) -> &'static str {
         }
         "owner.decide" => {
             "Owner only. Use the displayed kind, subject and revision with an offered choice, recommended, or snooze. Arguments fill only the chosen action's input fields."
+        }
+        "owner.decide.bulk" => {
+            "Owner only. Apply recommended actions for 1 to 100 explicit refs, including each displayed revision. The batch ID binds the exact ordered refs; each item uses a deterministic owner.decide ID. Changed or unavailable recommendations are skipped, while per-item failures preserve their error and uncertainty."
         }
         "chat.attach" | "chat.detach" | "chat.tag" => {
             "Owner only. Placement and tags only; execution scope is untouched. At most 16 Agents per call. Retry the same id for the retained readback."

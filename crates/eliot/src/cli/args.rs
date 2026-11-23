@@ -1161,6 +1161,16 @@ pub(crate) enum OwnerInboxCommand {
     },
     /// Hide this revision until its subject changes.
     Snooze { item: String },
+    /// Apply recommended actions for all current items of a kind or explicit reviewed refs.
+    Apply {
+        #[arg(long, value_name = "KIND")]
+        kind: Option<String>,
+        #[arg(long = "item", value_name = "KIND/SUBJECT@REVISION")]
+        items: Vec<String>,
+        /// Confirm a kind-wide apply that includes Stop recommendations.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Args)]

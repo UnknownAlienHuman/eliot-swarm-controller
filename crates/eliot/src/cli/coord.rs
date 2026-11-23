@@ -17,15 +17,17 @@ use eliot_core::api::{
     ClaimListRequest, ClaimListResponse, ClaimReleaseRequest, ClaimReleaseResponse,
     ClaimSetRequest, ClaimSetResponse, CommandChildrenRequest, CommandChildrenResponse,
     CommandGetRequest, CommandResolution, CommandResolveRequest, CommandResolveResponse,
-    MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery, MailInboxRequest,
-    MailInboxResponse, MailMode, MailReadRequest, MailSendRequest, MailSendResponse,
-    OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest,
-    OwnerInboxResponse, SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest,
-    TurnResolveResponse, TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest,
-    VarSetResponse, WhoRequest, WhoResponse,
+    MAX_BULK_OWNER_DECISIONS, MAX_VAR_VALUE_BYTES, MailAckRequest, MailAckResponse, MailDelivery,
+    MailInboxRequest, MailInboxResponse, MailMode, MailReadRequest, MailSendRequest,
+    MailSendResponse, OwnerBulkDecideRequest, OwnerBulkDecideResponse, OwnerDecideRequest,
+    OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest, OwnerInboxResponse,
+    SettleStoppedRequest, SettleStoppedResponse, TurnResolveRequest, TurnResolveResponse,
+    TurnResolveStatus, VarGetRequest, VarGetResponse, VarSetRequest, VarSetResponse, WhoRequest,
+    WhoResponse,
 };
 use serde_json::Value;
 use std::{
+    collections::{BTreeMap, HashSet},
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -363,11 +365,48 @@ pub(crate) async fn run_inbox(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     if let Some(command) = command {
-        let (item, choice, args) = match command {
-            OwnerInboxCommand::Decide { item, choice, args } => (item, choice, args),
-            OwnerInboxCommand::Snooze { item } => (item, "snooze".to_owned(), Vec::new()),
-        };
-        return decide_inbox(&data_dir, &item, choice, args, json_output, id).await;
+        match command {
+            OwnerInboxCommand::Decide { item, choice, args } => {
+                return decide_inbox(&data_dir, &item, choice, args, json_output, id).await;
+            }
+            OwnerInboxCommand::Snooze { item } => {
+                return decide_inbox(
+                    &data_dir,
+                    &item,
+                    "snooze".to_owned(),
+                    Vec::new(),
+                    json_output,
+                    id,
+                )
+                .await;
+            }
+            OwnerInboxCommand::Apply { kind, items, yes } => {
+                let InboxArgs {
+                    agent,
+                    limit,
+                    after,
+                    thread,
+                    reply_to,
+                    wait,
+                } = page;
+                if agent.is_some() || thread.is_some() || reply_to.is_some() || wait.is_some() {
+                    return Err(Failure::new(
+                        2,
+                        "inbox apply accepts Owner inbox paging only",
+                    ));
+                }
+                return bulk_decide_inbox(
+                    &data_dir,
+                    kind,
+                    items,
+                    yes,
+                    OwnerInboxRequest { after, limit },
+                    json_output,
+                    id,
+                )
+                .await;
+            }
+        }
     }
     let InboxArgs {
         agent,
@@ -416,14 +455,7 @@ async fn decide_inbox(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    let invalid_item =
-        || Failure::new(2, "expected the inbox item reference KIND/SUBJECT@REVISION");
-    let (cursor, revision) = item.rsplit_once('@').ok_or_else(invalid_item)?;
-    let (kind, subject) = cursor.split_once('/').ok_or_else(invalid_item)?;
-    let kind = OwnerInboxKind::ALL
-        .into_iter()
-        .find(|candidate| candidate.as_str() == kind)
-        .ok_or_else(invalid_item)?;
+    let item = parse_owner_inbox_item_ref(item)?;
     let mut fields = serde_json::Map::new();
     for arg in args {
         let (key, value) = arg
@@ -442,11 +474,7 @@ async fn decide_inbox(
     }
     let request = OwnerDecideRequest {
         id: mutation_id(id)?,
-        item: OwnerInboxItemRef {
-            kind,
-            subject: subject.to_owned(),
-            revision: revision.to_owned(),
-        },
+        item,
         choice,
         args: (!fields.is_empty()).then_some(Value::Object(fields)),
     };
@@ -459,6 +487,191 @@ async fn decide_inbox(
         .map_err(|_| Failure::new(4, "owner.decide response is invalid"))?;
     print_value(&value, json_output);
     Ok(0)
+}
+
+async fn bulk_decide_inbox(
+    data_dir: &Path,
+    kind: Option<String>,
+    items: Vec<String>,
+    yes: bool,
+    page: OwnerInboxRequest,
+    json_output: bool,
+    id: Option<String>,
+) -> Result<u8, Failure> {
+    let OwnerInboxRequest { after, limit } = page;
+    let refs = match kind {
+        Some(kind) if items.is_empty() => {
+            if !(1..=MAX_BULK_OWNER_DECISIONS).contains(&limit.unwrap_or(100)) {
+                return Err(Failure::new(2, "--limit must be between 1 and 100"));
+            }
+            let kind = parse_owner_inbox_kind(&kind)
+                .ok_or_else(|| Failure::new(2, "unknown Owner inbox item kind"))?;
+            let mut refs = BTreeMap::new();
+            let mut cursor = after;
+            let mut seen = HashSet::new();
+            loop {
+                let request = OwnerInboxRequest {
+                    after: cursor.clone(),
+                    limit: Some(limit.unwrap_or(100)),
+                };
+                request.effective_limit().map_err(Failure::for_read)?;
+                let response: OwnerInboxResponse =
+                    eliot_daemon::client_call_typed(data_dir, "owner.inbox", &request)
+                        .await
+                        .map_err(Failure::for_read)?;
+                for item in response.items.into_iter().filter(|item| item.kind == kind) {
+                    if !yes
+                        && item.recommended.as_ref().is_some_and(|action| {
+                            action.method == "command.submit"
+                                && action.args["verb"].as_str() == Some("stop")
+                        })
+                    {
+                        return Err(Failure::new(
+                            2,
+                            "kind-wide apply includes Stop recommendations; pass --yes or use reviewed --item refs",
+                        ));
+                    }
+                    refs.insert(
+                        (item.kind, item.subject.clone()),
+                        OwnerInboxItemRef {
+                            kind: item.kind,
+                            subject: item.subject,
+                            revision: item.revision,
+                        },
+                    );
+                }
+                if refs.len() > MAX_BULK_OWNER_DECISIONS {
+                    return Err(Failure::new(
+                        2,
+                        "this kind has more than 100 current items; narrow with --after or pass reviewed --item refs",
+                    ));
+                }
+                match response.next {
+                    Some(next) => {
+                        if !seen.insert(next.clone()) {
+                            return Err(Failure::new(
+                                4,
+                                "owner.inbox repeated a page cursor while collecting current items",
+                            ));
+                        }
+                        cursor = Some(next);
+                    }
+                    None => break,
+                }
+            }
+            refs.into_values().collect()
+        }
+        None if !items.is_empty() => {
+            if after.is_some() || limit.is_some() {
+                return Err(Failure::new(
+                    2,
+                    "--after and --limit apply only with --kind",
+                ));
+            }
+            items
+                .iter()
+                .map(|item| parse_owner_inbox_item_ref(item))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Some(_) => {
+            return Err(Failure::new(2, "choose --kind or repeat --item, not both"));
+        }
+        None => {
+            return Err(Failure::new(
+                2,
+                "inbox apply requires --kind or at least one --item",
+            ));
+        }
+    };
+    if refs.is_empty() {
+        return print_owner_bulk_decisions(&OwnerBulkDecideResponse::default(), json_output);
+    }
+    let request = OwnerBulkDecideRequest {
+        id: mutation_id(id)?,
+        items: refs,
+    };
+    request.validate().map_err(Failure::for_mutation)?;
+    let response: OwnerBulkDecideResponse =
+        eliot_daemon::client_call_typed(data_dir, "owner.decide.bulk", &request)
+            .await
+            .map_err(Failure::for_mutation)?;
+    print_owner_bulk_decisions(&response, json_output)
+}
+
+fn parse_owner_inbox_item_ref(item: &str) -> Result<OwnerInboxItemRef, Failure> {
+    let invalid_item =
+        || Failure::new(2, "expected the inbox item reference KIND/SUBJECT@REVISION");
+    let (cursor, revision) = item.rsplit_once('@').ok_or_else(invalid_item)?;
+    let (kind, subject) = cursor.split_once('/').ok_or_else(invalid_item)?;
+    let kind = parse_owner_inbox_kind(kind).ok_or_else(invalid_item)?;
+    Ok(OwnerInboxItemRef {
+        kind,
+        subject: subject.to_owned(),
+        revision: revision.to_owned(),
+    })
+}
+
+fn parse_owner_inbox_kind(value: &str) -> Option<OwnerInboxKind> {
+    OwnerInboxKind::ALL
+        .into_iter()
+        .find(|candidate| candidate.as_str() == value)
+}
+
+fn print_owner_bulk_decisions(
+    response: &OwnerBulkDecideResponse,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let value = serde_json::to_value(response)
+        .map_err(|_| Failure::new(4, "owner.decide.bulk response is invalid"))?;
+    if json_output {
+        print_value(&value, true);
+    } else {
+        println!(
+            "Bulk owner decisions: {} applied, {} skipped, {} failed.",
+            response.applied.len(),
+            response.skipped.len(),
+            response.failed.len()
+        );
+        for item in &response.applied {
+            println!(
+                "  Applied {}/{}@{} · {} · id={}",
+                item.item.kind.as_str(),
+                item.item.subject,
+                item.item.revision,
+                item.outcome,
+                item.mutation_id
+            );
+        }
+        for item in &response.skipped {
+            println!(
+                "  Skipped {}/{}@{} · {} · id={}",
+                item.item.kind.as_str(),
+                item.item.subject,
+                item.item.revision,
+                item.reason,
+                item.mutation_id
+            );
+        }
+        for item in &response.failed {
+            let certainty = if item.uncertain { "unknown" } else { "failed" };
+            println!(
+                "  {certainty} {}/{}@{} · {}: {} · id={}",
+                item.item.kind.as_str(),
+                item.item.subject,
+                item.item.revision,
+                item.code,
+                item.message,
+                item.mutation_id
+            );
+        }
+    }
+    if response.failed.iter().any(|item| item.uncertain) {
+        Ok(4)
+    } else if !response.failed.is_empty() {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
 }
 
 async fn run_mail_inbox(
@@ -584,6 +797,8 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
             println!("  {}", item.reason);
             if let Some(action) = &item.recommended {
                 println!("  Recommended: {} {}", action.method, action.args);
+            } else if item.kind == OwnerInboxKind::Stuck {
+                println!("  No safe recommended action.");
             }
             for action in &item.choices {
                 if item.recommended.as_ref() == Some(action) {

@@ -2,7 +2,7 @@ use crate::{Error, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(
     JsonSchema, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
@@ -138,10 +138,90 @@ pub struct OwnerDecideResponse {
     pub result: Option<Value>,
 }
 
+/// Maximum number of explicitly reviewed inbox snapshots in one bulk decision.
+pub const MAX_BULK_OWNER_DECISIONS: usize = 100;
+/// Keep a full bounded batch request and its aggregate response below one frame.
+const MAX_BULK_OWNER_DECISION_REFS_BYTES: usize = 16 * 1024;
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerBulkDecideRequest {
+    /// Stable batch identity. The daemon binds it to the exact ordered refs.
+    pub id: String,
+    pub items: Vec<OwnerInboxItemRef>,
+}
+
+impl OwnerBulkDecideRequest {
+    pub fn validate(&self) -> Result<()> {
+        super::launch_queue::validate_id(&self.id)?;
+        if self.items.is_empty() || self.items.len() > MAX_BULK_OWNER_DECISIONS {
+            return Err(Error::new(
+                "invalid",
+                "owner decision batch must contain 1 to 100 item refs",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for item in &self.items {
+            if !valid_key(&item.subject)
+                || !valid_key(&item.revision)
+                || !seen.insert((item.kind, item.subject.as_str(), item.revision.as_str()))
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "owner decision batch contains an invalid or duplicate item ref",
+                ));
+            }
+        }
+        let refs_bytes = serde_json::to_vec(&self.items)
+            .map_err(|_| Error::new("invalid", "owner decision refs could not be encoded"))?;
+        if refs_bytes.len() > MAX_BULK_OWNER_DECISION_REFS_BYTES {
+            return Err(Error::new(
+                "invalid",
+                "owner decision refs exceed the 16 KiB batch bound",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+pub struct OwnerBulkDecisionApplied {
+    pub item: OwnerInboxItemRef,
+    pub mutation_id: String,
+    /// Preserves the admitted/completed state for actions which finish later.
+    pub outcome: String,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+pub struct OwnerBulkDecisionSkipped {
+    pub item: OwnerInboxItemRef,
+    pub mutation_id: String,
+    pub reason: String,
+}
+
+#[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]
+pub struct OwnerBulkDecisionFailed {
+    pub item: OwnerInboxItemRef,
+    pub mutation_id: String,
+    pub code: String,
+    pub message: String,
+    /// True when the action may have taken effect but has no settled readback.
+    pub uncertain: bool,
+}
+
+#[derive(JsonSchema, Clone, Debug, Default, Deserialize, Serialize)]
+pub struct OwnerBulkDecideResponse {
+    pub applied: Vec<OwnerBulkDecisionApplied>,
+    pub skipped: Vec<OwnerBulkDecisionSkipped>,
+    pub failed: Vec<OwnerBulkDecisionFailed>,
+}
+
 #[derive(JsonSchema, Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SwarmLiveness {
     pub moving: usize,
     pub asked: usize,
+    #[serde(default)]
+    pub parked: usize,
     pub stuck: usize,
     pub long: usize,
     pub reasons: BTreeMap<String, usize>,

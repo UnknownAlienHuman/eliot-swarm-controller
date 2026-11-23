@@ -5,7 +5,7 @@ use eliot_core::api::{
     GoalMode, GoalStatus, LaunchIntentState, LaunchIntentView, OwnerAction, OwnerInboxItem,
     OwnerInboxKind, SwarmLiveness,
 };
-use eliot_core::liveness::{self, LivenessObject, Mover};
+use eliot_core::liveness::{self, AgentWaitEvidence, LivenessObject, Mover};
 use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
 
@@ -342,15 +342,16 @@ fn project_unknown_commands(
         tally(stats, &result);
         if !unknown {
             if let Mover::Stuck { reason } = result {
+                let inspect = action("inspect", "command.get", json!({"id":id}));
                 items.push(item(
                     OwnerInboxKind::Stuck,
                     format!("command:{id}"),
-                    format!("event:{seq}"),
+                    format!("state:{raw_state}:updated:{since}:event:{seq}"),
                     now,
                     since,
                     reason,
                     None,
-                    Vec::new(),
+                    vec![inspect],
                 ));
             }
             continue;
@@ -594,7 +595,7 @@ fn project_holds(
                 now,
                 since,
                 reason,
-                Some(inspect.clone()),
+                None,
                 vec![inspect],
             ));
         }
@@ -625,8 +626,34 @@ fn project_agents(
                 EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
                   AND t.turn_id=a.active_turn AND t.state='running'),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
-                  AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process'))
-         FROM agents a WHERE a.observe_only=0 AND a.archived=0
+                  AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process')),
+                EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+                  AND t.state IN ('running','unknown')),
+                EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id
+                  AND (c.generation=a.generation OR c.expected_generation=a.generation)
+                  AND c.state IN ('accepted','queued','dispatched','unknown')),
+                CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
+                  SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
+                    AND p.role='plugin' AND p.state='running') ELSE 0 END,
+                aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
+                json_extract(aw.condition,'$.seconds')
+         FROM agents a
+         LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
+            AND aw.state='waiting' AND EXISTS(
+                SELECT 1 FROM turns wt
+                WHERE wt.agent=aw.agent AND wt.generation=aw.generation AND wt.turn_id=aw.turn_id
+                  AND (
+                    (a.state='idle' AND wt.state='completed'
+                      AND (a.active_turn IS NULL OR a.active_turn=aw.turn_id))
+                    OR (a.state='waiting' AND a.active_turn=aw.turn_id AND wt.state='running'
+                      AND (EXISTS(SELECT 1 FROM processes wp WHERE wp.owner IN (
+                             'agent:a'||a.id||'#'||a.generation,
+                             'workspace:a'||a.id||'#'||a.generation) AND wp.state='running')
+                        OR EXISTS(SELECT 1 FROM source_state ws WHERE ws.agent=a.id
+                             AND ws.generation=a.generation AND ws.state='open'
+                             AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
+                  ))
+         WHERE a.observe_only=0 AND a.archived=0
             AND a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -647,6 +674,13 @@ fn project_agents(
                 r.get::<_, bool>(13)?,
                 r.get::<_, bool>(14)?,
                 r.get::<_, bool>(15)?,
+                r.get::<_, bool>(16)?,
+                r.get::<_, bool>(17)?,
+                r.get::<_, bool>(18)?,
+                r.get::<_, Option<i64>>(19)?,
+                r.get::<_, Option<i64>>(20)?,
+                r.get::<_, Option<String>>(21)?,
+                r.get::<_, Option<i64>>(22)?,
             ))
         })
         .map_err(sql_error)?;
@@ -668,6 +702,13 @@ fn project_agents(
             has_request,
             observed_turn,
             source_open,
+            unsettled_turn,
+            unsettled_command,
+            owned_plugin_running,
+            wake_expires_at,
+            wake_created_at,
+            wake_kind,
+            wake_seconds,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "created" => eliot_core::AgentState::Created,
@@ -732,6 +773,7 @@ fn project_agents(
                     owner_item: true,
                     launch_queued: false,
                     active_turn: false,
+                    wait_evidence: None,
                 },
                 now,
             );
@@ -755,26 +797,87 @@ fn project_agents(
                     launch_queued: launch_queued
                         || (state == eliot_core::AgentState::Starting && process_running),
                     active_turn: observed_turn && (source_open || process_running),
+                    wait_evidence: agent_wait_evidence(
+                        wake_expires_at,
+                        wake_created_at,
+                        wake_kind.as_deref(),
+                        wake_seconds,
+                        now,
+                    ),
                 },
                 now,
             );
             tally(stats, &result);
             if let Mover::Stuck { reason } = result {
+                let stop_safe = matches!(
+                    state,
+                    eliot_core::AgentState::Busy | eliot_core::AgentState::Waiting
+                ) && active_turn.is_none()
+                    && !has_request
+                    && !unsettled_turn
+                    && !unsettled_command
+                    && source_open
+                    && owned_plugin_running
+                    && !observe_only;
+                let mut choices = Vec::new();
+                let recommended = if stop_safe {
+                    let stop = action(
+                        "stop",
+                        "command.submit",
+                        json!({
+                            "verb":"stop",
+                            "target":format!("a{id}"),
+                            "expected_generation":generation,
+                            "args":{}
+                        }),
+                    );
+                    choices.push(stop.clone());
+                    Some(stop)
+                } else {
+                    None
+                };
                 let inspect = action("inspect", "agent.get", json!({"id":format!("a{id}")}));
+                choices.push(inspect);
                 items.push(item(
                     OwnerInboxKind::Stuck,
                     format!("a{id}:g{generation}"),
-                    format!("event:{event_seq}"),
+                    format!("state:{raw_state}:updated:{since}:event:{event_seq}"),
                     now,
                     since,
                     reason,
-                    Some(inspect.clone()),
-                    vec![inspect],
+                    recommended,
+                    choices,
                 ));
             }
         }
     }
     Ok(())
+}
+
+fn agent_wait_evidence(
+    expires_at: Option<i64>,
+    created_at: Option<i64>,
+    kind: Option<&str>,
+    seconds: Option<i64>,
+    now: i64,
+) -> Option<AgentWaitEvidence> {
+    if expires_at? <= now {
+        return None;
+    }
+    match kind? {
+        "seconds" => {
+            let wait_ms = u64::try_from(seconds?)
+                .ok()?
+                .checked_mul(1_000)
+                .and_then(|millis| i64::try_from(millis).ok())?;
+            let due_at = created_at?.checked_add(wait_ms)?;
+            (due_at > now).then_some(AgentWaitEvidence::Timer)
+        }
+        "file_appears" | "process_exit" | "argv_exit0" | "child_completion" => {
+            Some(AgentWaitEvidence::SelfWake)
+        }
+        _ => None,
+    }
 }
 
 fn project_goals(
@@ -878,7 +981,7 @@ fn project_goals(
             let (recommended, choices) = if let Some(round) = round {
                 (Some(round.clone()), vec![round, inspect])
             } else {
-                (Some(inspect.clone()), vec![inspect])
+                (None, vec![inspect])
             };
             items.push(item(
                 OwnerInboxKind::Stuck,
@@ -964,6 +1067,7 @@ fn project_launch_intents(
                 Mover::Stuck { reason } => reason,
                 _ => unreachable!(),
             };
+            let inspect = action("inspect", "launch.intent.get", json!({"id":id}));
             items.push(item(
                 OwnerInboxKind::Stuck,
                 format!("launch:{id}"),
@@ -972,7 +1076,7 @@ fn project_launch_intents(
                 since,
                 reason,
                 None,
-                Vec::new(),
+                vec![inspect],
             ));
         }
     }
@@ -1060,6 +1164,11 @@ fn project_assignment_waits(
                 vec![read],
             ));
         } else if let Mover::Stuck { reason } = result {
+            let inspect = action(
+                "inspect",
+                "launch.queue",
+                json!({"project":project,"after":format!("a:{timer}")}),
+            );
             items.push(item(
                 OwnerInboxKind::Stuck,
                 format!("assignment:{timer}"),
@@ -1068,7 +1177,7 @@ fn project_assignment_waits(
                 due,
                 reason,
                 None,
-                Vec::new(),
+                vec![inspect],
             ));
         }
     }
@@ -1118,6 +1227,11 @@ fn project_timers(
         tally(stats, &result);
         if let Mover::Stuck { reason } = result {
             let subject = format!("{principal}:{rule}");
+            let mut inspect_args = json!({"id":rule});
+            if let Some(project) = principal.strip_prefix("project:") {
+                inspect_args["project"] = json!(project);
+            }
+            let inspect = action("inspect", "timer.get", inspect_args);
             items.push(item(
                 OwnerInboxKind::Stuck,
                 format!("timer:{subject}"),
@@ -1126,7 +1240,7 @@ fn project_timers(
                 due,
                 reason,
                 None,
-                Vec::new(),
+                vec![inspect],
             ));
         }
     }
@@ -1142,6 +1256,10 @@ fn tally(stats: &mut SwarmLiveness, result: &Mover) {
         Mover::Asked { .. } => {
             stats.asked += 1;
             return;
+        }
+        Mover::Parked { reason } => {
+            stats.parked += 1;
+            *reason
         }
         Mover::Stuck { reason } => {
             stats.stuck += 1;
@@ -1168,14 +1286,16 @@ fn action(choice: &str, method: &str, args: Value) -> OwnerAction {
 fn item(
     kind: OwnerInboxKind,
     subject: String,
-    revision: String,
+    subject_revision: String,
     now: i64,
     since: i64,
     reason: &str,
     recommended: Option<OwnerAction>,
     choices: Vec<OwnerAction>,
 ) -> OwnerInboxItem {
-    let binding = json!([revision, reason, &recommended, &choices]);
+    // The caller supplies a subject revision. Bind every projected choice and
+    // recommendation here, including each action's method and arguments.
+    let binding = json!([subject_revision, reason, &recommended, &choices]);
     let revision = eliot_core::api::inference::sha256_hex(binding.to_string().as_bytes());
     OwnerInboxItem {
         kind,

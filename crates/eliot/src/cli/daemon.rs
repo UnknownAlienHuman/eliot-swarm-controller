@@ -291,6 +291,11 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         "Commands: {} unknown · {} unsettled",
         response.unknown_commands_count, response.unsettled_commands_count
     );
+    let liveness = &response.liveness;
+    println!(
+        "Liveness: {} moving · {} asked · {} parked · {} stuck · {} long",
+        liveness.moving, liveness.asked, liveness.parked, liveness.stuck, liveness.long
+    );
     if response.blockers.is_empty() {
         println!("Blocking work: none");
     } else {

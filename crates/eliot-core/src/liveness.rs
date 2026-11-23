@@ -1,5 +1,6 @@
 //! Pure classification of retained work: an engine is moving it, an owner was
-//! asked, it is stuck, or it is live but has remained in one state too long.
+//! asked, it is parked on purpose, it is stuck, or it has remained live in one
+//! state too long.
 
 use crate::api::{GoalStatus, LaunchIntentState, OwnerInboxKind};
 use crate::{AgentState, CommandState, ProviderHoldState, ProviderRestrictionKind, TurnState};
@@ -15,6 +16,7 @@ pub enum LivenessObject {
         owner_item: bool,
         launch_queued: bool,
         active_turn: bool,
+        wait_evidence: Option<AgentWaitEvidence>,
     },
     Command {
         state: CommandState,
@@ -66,6 +68,21 @@ pub enum LivenessObject {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentWaitEvidence {
+    SelfWake,
+    Timer,
+}
+
+impl AgentWaitEvidence {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::SelfWake => "armed_agent_wake",
+            Self::Timer => "agent_wake_timer",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mover {
     Moving {
@@ -75,6 +92,9 @@ pub enum Mover {
     Asked {
         reason: &'static str,
         item: OwnerInboxKind,
+    },
+    Parked {
+        reason: &'static str,
     },
     Stuck {
         reason: &'static str,
@@ -94,6 +114,7 @@ pub fn mover(object: &LivenessObject, now: i64) -> Mover {
             owner_item,
             launch_queued,
             active_turn,
+            wait_evidence,
         } => match state {
             AgentState::Created => {
                 if *launch_queued {
@@ -124,6 +145,10 @@ pub fn mover(object: &LivenessObject, now: i64) -> Mover {
                         reason: "idle_agent_owner_question",
                         item: OwnerInboxKind::HarnessRequest,
                     }
+                } else if let Some(evidence) = wait_evidence {
+                    Mover::Parked {
+                        reason: evidence.reason(),
+                    }
                 } else {
                     moving_or_long(
                         *since,
@@ -153,6 +178,10 @@ pub fn mover(object: &LivenessObject, now: i64) -> Mover {
                     Mover::Asked {
                         reason: "waiting_agent_owner_question",
                         item: OwnerInboxKind::HarnessRequest,
+                    }
+                } else if let Some(evidence) = wait_evidence {
+                    Mover::Parked {
+                        reason: evidence.reason(),
                     }
                 } else if *active_turn {
                     moving_or_long(*since, now, DAY_MS, "active_waiting_turn", None)
