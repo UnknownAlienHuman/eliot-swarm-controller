@@ -2408,13 +2408,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.model_observed" => {
             require_live_turn(agent, event)?;
-            record_serving_model(&mut next, required_text(event, "model")?);
+            let model = required_text(event, "model")?;
             if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
                 && let Some(reason) = optional_text(event, "model_mismatch")?
                 && let Some(Value::Object(effective)) = next.effective.as_mut()
             {
+                effective.insert("model".to_owned(), Value::Null);
                 effective.insert("model_verified".to_owned(), Value::Bool(false));
                 effective.insert("model_mismatch".to_owned(), Value::String(reason));
+            } else {
+                record_serving_model(&mut next, model);
             }
         }
         "turn.notice" => {

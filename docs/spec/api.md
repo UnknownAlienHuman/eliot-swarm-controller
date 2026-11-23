@@ -1030,8 +1030,8 @@ carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
 `effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
 record on the bound turn. Muse clears model verification on each turn and
-sets it only on a matching provider response. A mismatch exposes the reported
-model with `model_verified: false` and names both IDs in the Owner inbox and
+sets it only on a matching provider response. A mismatch keeps the effective
+model unset and names both IDs in the Owner inbox and
 `diagnose` (`swarm why`). Values no turn
 re-proves stay at their admission readback; no value is ever presented as
 verified without that admission.
