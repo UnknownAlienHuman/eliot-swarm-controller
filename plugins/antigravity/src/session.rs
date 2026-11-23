@@ -434,7 +434,11 @@ impl Session {
         {
             let mut state = self.state.lock().await;
             state.bind_conversation(&self.conversation).await?;
-            state.bind_checkpoint_transcript(plan.mcp_root.as_deref(), plan.resume().is_some());
+            state.bind_checkpoint_transcript(
+                plan.mcp_root.as_deref(),
+                plan.checkpoint_root.as_deref(),
+                plan.resume().is_some(),
+            );
         }
         // Verify each required config write by its echoed current value.
         for (config_id, value) in plan.config_writes() {

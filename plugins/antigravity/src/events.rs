@@ -293,6 +293,7 @@ pub(crate) struct State {
     /// update commits under a unique identity.
     session_usage_seq: u64,
     checkpoints: Option<checkpoints::Checkpoints>,
+    checkpoint_root: Option<std::path::PathBuf>,
     checkpoint_resume: bool,
 }
 
@@ -369,6 +370,7 @@ impl State {
             session_usage_committed: None,
             session_usage_seq: 0,
             checkpoints: None,
+            checkpoint_root: None,
             checkpoint_resume: false,
         }
     }
@@ -418,8 +420,14 @@ impl State {
         Ok(())
     }
 
-    pub fn bind_checkpoint_transcript(&mut self, root: Option<&std::path::Path>, resumed: bool) {
+    pub fn bind_checkpoint_transcript(
+        &mut self,
+        root: Option<&std::path::Path>,
+        checkpoint_root: Option<&std::path::Path>,
+        resumed: bool,
+    ) {
         self.checkpoint_resume = resumed;
+        self.checkpoint_root = checkpoint_root.map(std::path::Path::to_path_buf);
         self.checkpoints =
             root.and_then(|root| checkpoints::Checkpoints::bind(root, &self.conversation, resumed));
     }
@@ -2330,11 +2338,14 @@ async fn handle_hook_callback(
             if state.checkpoints.is_none()
                 && let Some(path) = callback.input().transcript_path.as_deref()
             {
-                state.checkpoints = checkpoints::Checkpoints::from_hook(
-                    std::path::Path::new(path),
-                    &state.conversation,
-                    state.checkpoint_resume,
-                );
+                if let Some(root) = state.checkpoint_root.clone() {
+                    state.checkpoints = checkpoints::Checkpoints::from_hook(
+                        std::path::Path::new(path),
+                        &root,
+                        &state.conversation,
+                        state.checkpoint_resume,
+                    );
+                }
             }
             Some((
                 state.take_pending_steer(&binding.turn),
