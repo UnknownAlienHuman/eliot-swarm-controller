@@ -815,9 +815,11 @@ Stuck, and Long objects by reason. See the [monitoring spec](monitoring.md#liven
 for the evidence used to classify a wait.
 Absent source cursors and sequence/acknowledgement values remain null.
 When a previous daemon panic marker was consumed once at startup or plugin panic markers exist, `daemon.status` exposes `previous_crash` and `plugin_crashes`, and human `swarm status` renders one summary line for each.
-When explicit Claude profile cmd paths no longer exist, status and doctor return
-`claude_profile_command_issues` with the configured path, discovered replacement
-path/version, and one-command repair when a replacement is installed.
+When an explicitly pinned profile executable no longer exists, status and doctor
+return `profile_command_issues` with its profile, harness, configured path,
+discovered replacement path/version when available, and one-command Owner repair.
+The missing pin remains an error at launch until the Owner repairs it or clears
+the pin to restore automatic discovery.
 
 On Windows, `swarm doctor` lists non-baseline ACEs on the selected data root. It
 reports SID, ACE type, rights mask, and flags and identifies the capability ACEs
@@ -1506,10 +1508,13 @@ command.submit {id, verb:"launch",
         workspace, worktree?:BRANCH, base?:REF, parent?:AGENT, text?, sources?:[PATH]}}
 ```
 
-For Claude, omitted `cmd` or the selector `latest` chooses the newest discovered native
-installation, with versioned vendor roots considered before PATH. Admission freezes
-the selected executable path and reported version in the Agent snapshot. Another
-explicit path remains pinned.
+For each of the five harnesses, omitted `cmd` uses the same harness-specific discovery
+for stored profiles and ad-hoc launches. Discovery runs at launch dispatch, not while
+loading settings, and freezes the selected native executable and available version in
+that generation's snapshot. An explicit Owner `--cmd PATH` overrides discovery for an
+ad-hoc launch; an explicit profile `cmd` remains pinned. A missing pin fails without
+fallback, and status/doctor report the missing profile path and discovered replacement
+when available.
 
 `sources` (launch and `send`, CLI `--source PATH`, at most 16 distinct paths) names
 files the Agent must read. Before admission the daemon reads each one from the launch
@@ -2856,8 +2861,8 @@ including `blockers`, `unsettled_commands`, `unknown_commands`, `drain` and
 `build_identity`, and the retention view with store sizes, configured windows,
 SQLite page counts
 and `pruned_through`. It also reports the automatic cleanup policy and latest
-sweep outcome, and `claude_profile_command_issues` for missing explicit Claude
-profile executables.
+sweep outcome, and `profile_command_issues` for missing explicitly pinned profile
+executables across all harnesses.
 
 Local IPC accept failures are logged and retried with bounded backoff.
 During the delay, admitted work and existing connections continue, and the
@@ -3046,7 +3051,7 @@ swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm settings read
 swarm settings save FILE [--dry-run]
-swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
+swarm settings harness-cmd PROFILE (--cmd PATH|--auto)
 swarm worktree remove AGENT [--generation N]
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm usage [A] [--generation N] [--project P] [--root A]

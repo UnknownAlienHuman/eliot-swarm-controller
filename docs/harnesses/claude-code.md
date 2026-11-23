@@ -393,18 +393,20 @@ and the native launcher `~/.local/bin/claude`, plus absolute PATH entries and
 Candidates must be absolute native executables; `.cmd`, `.bat` and `.ps1`
 wrappers are refused, and Unix binaries must have an ELF or Mach-O header.
 Versioned roots are probed before PATH so a stale PATH copy cannot hide a
-newer installation. Automatic selection for an omitted `cmd` or `cmd =
-"latest"` requires the bounded `--version` probe to exit successfully and
-report a parseable numeric version. It selects the newest verified candidate.
+newer installation. Automatic selection for an omitted profile `cmd` or an
+omitted ad-hoc `--cmd` requires the bounded `--version` probe to exit successfully
+and report a parseable numeric version. It selects the newest verified candidate.
 A timeout on a newer versioned installation refuses automatic selection. Unverified
 executables remain in the installation inventory, with the raw `--version`
 first line when available, but do not qualify for automatic selection. The
-Agent snapshot freezes the selected absolute `cmd` and verified `cmd_version`.
+launch generation freezes the selected absolute `cmd` and verified `cmd_version`;
+the saved profile stays unset and a later launch discovers again.
 An explicit path remains pinned even when its optional version probe fails or
 is not parseable. A missing pin names the installed replacement and a
-`swarm settings claude-cmd PROFILE --cmd PATH`
+`swarm settings harness-cmd PROFILE --cmd PATH`
 repair command. First-use profiles leave `cmd` unset so later launches follow
-updates. The setup documentation was checked on 2026-11-21 (last modified
+installed updates. Use `swarm settings harness-cmd PROFILE --auto` to clear a
+pin. The setup documentation was checked on 2026-11-21 (last modified
 2026-11-20).
 [Claude Code setup](https://code.claude.com/docs/en/setup).
 `swarm harnesses` shows the selected absolute `cmd` and lists discovered

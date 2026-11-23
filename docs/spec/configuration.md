@@ -222,10 +222,12 @@ change command settlement, source acknowledgement or process cleanup.
 
 The current product has five native adapters: Codex, Claude, OpenCode, Muse
 and Antigravity. Each profile selects one `harness` explicitly and may pin an exact
-`model` or preserve the native default. Only Codex may omit `cmd`, in which case it launches `codex` by name;
-the other four adapters require an explicit native executable in `cmd` in a
-stored profile. First use writes visible, editable native-default profiles for
-installed harnesses through the settings writer as `bootstrap`. On a fresh root,
+`model` or preserve the native default. `cmd` is optional for every adapter. When
+omitted, a launch uses that harness's normal native executable discovery, shared
+with its ad-hoc launch. An explicit `cmd` is an Owner-selected native executable
+pin. First use writes visible, editable native-default profiles for installed
+harnesses through the settings writer as `bootstrap`, leaving `cmd` unset. On a
+fresh root,
 the managers are the installed ones of `codex`, `claude` and `opencode` in that
 order (the harnesses that can disable native subagents per session), otherwise the
 first installed profile in name order. Each manager has `control = "tree"` and
@@ -241,26 +243,20 @@ the first default when it is the only installed harness). This makes Swarm deleg
 profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
-For Muse hot-start profiles the daemon enumerates installed `muse-bin-*.exe`
-builds newest-first and probes with the existing read-only `model/list`
-catalogue path (no session, turn or inference); it freezes the newest build whose
-catalogue is non-empty and records skipped empty-catalogue builds
-(`bootstrap.muse_empty_catalogue_skipped`). Selection stops at the first nonempty
-catalogue, with an 8-second per-build probe and one 20-second selection budget.
-When that budget expires, `bootstrap.muse_catalogue_budget_exhausted` is recorded
-and startup continues without a Muse default. Each probe uses scoped process
-custody and kill-on-drop, with at most 100 inbound frames. It uses the
-[shared 8 MiB inbound frame cap](plugin-protocol.md#lifecycle-hooks-and-qualification)
-and a total byte budget of one full frame plus 4 MiB. The launcher-marked 1.4.20 build serves
-an empty `bundledCatalog` and is skipped in favor of the 1.4.0 build with a live
-catalogue; `--cmd` still pins an explicit binary for ad-hoc launch.
+Bootstrap does not select or persist a native executable. Muse catalogue reads
+are previews; an empty catalogue from the launch-selected binary is reported to
+the Owner, who can pin another installed binary explicitly. The same Muse
+discovery and empty-catalogue behavior applies to named and ad-hoc launches.
 Before admission, an omitted profile selects the first available ordered role candidate.
 The [routing policy](#routing-policy-s3) governs continuation after a confirmed provider
 refusal. Uncertain outcomes retain their original command bindings.
 Profiles stay the durable
 explicit record: ad-hoc Owner launch (`swarm launch --harness ...`) freezes an
 equivalent snapshot from built-in per-harness safe defaults plus flags (see
-below). The harness pages
+below). For both forms, executable discovery runs for the launch and records the
+selected absolute native path and available version metadata in that generation's
+snapshot; it never writes the result back into the saved profile. A later launch
+from an omitted-`cmd` profile discovers again. The harness pages
 ([Codex](../harnesses/codex.md), [Claude](../harnesses/claude-code.md),
 [OpenCode](../harnesses/opencode.md), [Muse](../harnesses/muse.md),
 [Antigravity](../harnesses/antigravity.md)) own their native mappings.
@@ -414,32 +410,36 @@ omitted and effective read back), never a
 silent substitution: an unavailable requested model fails honestly. Authority
 fields default to the safe posture (Codex `workspace-write` + `never`,
 Claude CLI-default permission mode, Muse current conservative
-defaults); broader authority stays profile-only, owner-written choice. When
-`--cmd` is not given, the daemon resolves the installed native executable
-deterministically and freezes the absolute path. Ad-hoc Claude uses `mcp = "minimal"`. Claude profiles may omit `cmd` or set
-`cmd = "latest"`; both automatic forms select only an executable whose bounded
-`--version` probe exits successfully and reports a parseable numeric version.
-Among verified installations, the newest numeric version wins. A timeout on a
-newer versioned installation refuses automatic selection. The absolute path and verified `cmd_version` are
-frozen in the Agent snapshot. Versioned vendor roots are considered before
-PATH. Unverified executables remain visible in the installation inventory,
-with the raw `--version` first line when available, but cannot be selected
-automatically. Explicit executable paths remain pinned even when their
-optional version probe fails or is not parseable. First-use profiles omit
-`cmd` so they keep following vendor
-updates. A missing pin is reported with the discovered
-replacement and the `swarm settings claude-cmd PROFILE --cmd PATH` repair
-command; use `swarm settings claude-cmd PROFILE --latest` to return a profile
-to automatic selection. See [Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
-OpenCode resolves the npm shim to the
-native `opencode.exe` inside the package (consulting the
-`USERPROFILE`-derived roaming root when `APPDATA` is stripped), Muse via the
-launcher dir version the launcher marks current, Codex via the existing
-`codex` resolution, Antigravity via the installed app path (or `unsupported`
-when the harness needs a different binary). `--cmd` pins one explicit native
-executable instead (e.g. a Muse binary version the launcher no longer marks
-current). A missing or ambiguous executable is a clear
-`unsupported`/`profile_error` naming what was searched. `--auth` is
+defaults); broader authority stays profile-only, owner-written choice. A missing
+`--cmd` uses the same harness-specific discovery as a profile with omitted `cmd`.
+Discovery runs when the launch is dispatched, after admission, and freezes the
+absolute selected path and available `cmd_version` in that generation's snapshot.
+It does not rewrite the profile. `swarm models`, `swarm harnesses`, and `swarm
+doctor` may inspect installed candidates but do not freeze a launch selection.
+An explicit `--cmd PATH` overrides discovery for this Owner launch; an explicit
+profile `cmd` is the saved-profile equivalent. These are exact native executable
+pins, not shell commands or version selectors. A missing pin refuses launch and
+never falls back silently. A new launch from an omitted-`cmd` profile discovers
+again; an existing generation keeps its captured executable.
+
+The shared resolver applies adapter-specific rules: Codex uses its installed
+`codex` resolution; Claude considers native versioned roots and selects the
+newest candidate that passes its bounded version check; OpenCode resolves its
+package shim to the native executable; Muse follows the installed launcher
+selection (or the native Unix payload); Antigravity selects the `agy` CLI and
+never substitutes its IDE executable. Each harness page owns the candidate
+paths and native identity checks. An absent or ambiguous automatic candidate
+returns a typed `unsupported`/`profile_error` naming what was searched. An
+explicit path that no longer exists returns a profile command issue; discovery
+does not replace it. `swarm doctor` and `swarm status` report every affected
+profile, its configured path, and the discovered replacement path/version when
+available, with an Owner repair command. Use
+`swarm settings harness-cmd PROFILE (--cmd PATH|--auto)` to pin that replacement
+or clear the pin and return to automatic discovery. Ad-hoc Claude uses
+`mcp = "minimal"`. See
+[Claude Code discovery](../harnesses/claude-code.md#ad-hoc-launch).
+
+OpenCode's `--auth` is
 OpenCode-only (other harnesses reject it as `unsupported`): an explicit
 selector freezes verbatim like the profile's `auth_integration`, while an
 omitted one defaults to the model provider prefix only when the native
@@ -553,7 +553,7 @@ uses the installed experimental `turn/start.collaborationMode` field, so only pr
 that explicitly select a mode opt into `initialize.capabilities.experimentalApi`.
 No global Codex configuration is changed.
 
-An Antigravity profile selects `harness = "antigravity"` with an explicit native
+An Antigravity profile selects `harness = "antigravity"` with optional native
 `cmd`, an optional exact `model`, an optional `mode` (`plan`, `auto` or `accept-edits`)
 and an optional `dangerously_skip_permissions` flag (default false). `effort`,
 `approval`, `collaboration_mode`, `permissions` and `approval_policy` presets have
@@ -561,7 +561,8 @@ no mapping and are rejected. The effective permission mode and effective model c
 from native init facts; init does not establish the served model. See the
 [Antigravity page](../harnesses/antigravity.md).
 
-A Muse profile selects `harness = "muse"` with an explicit native `cmd`, an optional exact `model`,
+A Muse profile selects `harness = "muse"` with optional `cmd` and an optional
+exact `model`,
 optional `effort`, optional `approval`, and `permissions` (`workspace-write`, the default,
 or `danger-full-access`; `read-only` remains unsupported). Sandbox posture is fixed at
 host birth (`--disable-sandbox` for `danger-full-access`); the MSP session wire has no
@@ -570,13 +571,12 @@ permissions stay unknown (`null` / unverified) until a real native tool probe co
 posture. `collaboration_mode` and `approval_policy`
 presets stay rejected. See the [Muse page](../harnesses/muse.md).
 
-An OpenCode custom-provider profile points one frozen profile at a local
+An OpenCode custom-provider profile points one profile at a local
 OpenAI-compatible endpoint instead of a canonical integration:
 
 ```toml
 [profiles.opencode-local]
 harness = "opencode"
-cmd = "C:/Tools/OpenCode/opencode.exe"
 model = "k173d-fixture/test-model"
 pass_env = ["LOCAL_LLM_KEY"]
 
@@ -914,10 +914,12 @@ switch keeps the prior task command as its handoff anchor and includes the
 latest turn's report. `background_wake_max_wait_secs` (1 to 86,400) bounds an
 [automatic background-process wake](automation.md#automatic-background-process-wake).
 `swarm doctor` compares live installed harness versions and contract markers against
-the pinned `VERIFIED_HARNESSES` table without blocking launch. It also reports
-Claude profiles whose explicitly pinned executable is missing, with the current
-replacement path/version and a one-command repair. `swarm status` includes the same
-profile issues when present.
+the diagnostic `VERIFIED_HARNESSES` baseline without blocking launch; those versions
+do not pin executable selection. It also reports every profile whose explicitly
+pinned executable is missing, with the configured path, current replacement
+path/version when available, and a one-command Owner repair. A missing pin still
+refuses that profile's launch until the Owner repairs or clears it. `swarm status`
+includes the same profile issues when present.
 
 Cloud MCP is disabled when `[cloud_mcp]` is absent. When present, all fields are
 required. The HTTP MCP executable is the running daemon executable (`current_exe`);
@@ -1621,11 +1623,10 @@ with `swarm settings save request.json` (add `--dry-run` to validate only):
 Each named section is a complete replacement; leave unmodified sections out of the
 request. The desktop Settings screen uses the same read/save contract and follows the
 stale-revision rule of [unified settings](#unified-settings).
-`swarm settings claude-cmd PROFILE --cmd PATH` replaces one Claude profile's
-executable through the existing revision-checked settings writer. Use
-`swarm settings claude-cmd PROFILE --latest` to restore automatic version
-selection. These forms are mutually exclusive; the CLI rejects an invocation
-that supplies both `--cmd` and `--latest` during argument parsing. The command
+`swarm settings harness-cmd PROFILE --cmd PATH` replaces one profile's
+executable through the revision-checked settings writer. Use
+`swarm settings harness-cmd PROFILE --auto` to clear the pin and restore the
+harness's default discovery. These forms are mutually exclusive. The command
 uses revision compare-and-swap and refuses a profile section containing
 redacted values rather than overwriting hidden settings. Repair suggestions
 are shell-quoted for PowerShell on Windows and POSIX shells elsewhere.
