@@ -46,6 +46,7 @@ fn restart_resume_eligibility() -> String {
         r#"
     a.observe_only = 0 AND a.archived = 0
     AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
+    AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
     AND a.state IN ('lost', 'stopped')
     AND (({interrupted_work}) OR ({undelivered_input}))
     AND a.capacity_generation IS NULL

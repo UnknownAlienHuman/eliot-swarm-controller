@@ -344,6 +344,11 @@ impl Router {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<()> {
         let result = self.run_check_scenario(&work, &mut shutdown).await;
+        let result = if *shutdown.borrow() || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+            Err(CheckEnd::Shutdown)
+        } else {
+            result
+        };
         let now = now_ms();
         match &result {
             Ok(()) => {
@@ -910,6 +915,23 @@ impl Router {
         loop {
             let inspected = {
                 let mut store = self.inner.store.lock().await;
+                if let Some(current) = store.get_agent(agent)?
+                    && current.is_harness_check()
+                    && current.state.is_terminal()
+                    && store
+                        .list_source_states(agent, current.generation)?
+                        .iter()
+                        .any(|source| source["source"] == "git" && source["state"] == "open")
+                {
+                    let closed = store.set_git_source_status(
+                        agent,
+                        current.generation,
+                        "stale",
+                        true,
+                        now_ms(),
+                    )?;
+                    self.publish_locked(&closed);
+                }
                 store.inspect_agent_delete(id, agent, now_ms())
             };
             match inspected {

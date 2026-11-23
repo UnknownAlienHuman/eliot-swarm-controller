@@ -148,6 +148,7 @@ fn current_agent_tree_tx(
             && row.origin == core::AgentOrigin::External
             && row.state == AgentState::Unknown;
         let probe_cleanup = archived.is_none() && row.is_automatic_provider_probe();
+        let check_cleanup = archived.is_none() && row.is_harness_check();
         let allowed = if archived.is_some() {
             matches!(
                 row.state,
@@ -155,7 +156,7 @@ fn current_agent_tree_tx(
             ) || detached_observer
         } else {
             matches!(row.state, AgentState::Stopped | AgentState::Failed)
-                || (probe_cleanup && row.state == AgentState::Lost)
+                || ((probe_cleanup || check_cleanup) && row.state == AgentState::Lost)
                 || detached_observer
         };
         if !allowed {
@@ -208,7 +209,7 @@ fn current_agent_tree_tx(
                 ),
             ));
         }
-        let keep_drained_unknowns = archived.is_some()
+        let allow_drained_unknowns = (archived.is_some() || check_cleanup)
             && !row.observe_only
             && row.state.is_terminal()
             && unknown_generations_drained(tx, *num)?;
@@ -218,7 +219,7 @@ fn current_agent_tree_tx(
                AND (state IN ('accepted','queued','dispatched') OR (state='unknown' AND NOT ?2))
                  AND NOT (?3 AND state='unknown' AND (verb IN ('launch','stop') OR (verb='send' AND probe=1)))
              ORDER BY created_at,id LIMIT 1",
-                params![num, keep_drained_unknowns, probe_cleanup],
+                params![num, allow_drained_unknowns, probe_cleanup],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -242,7 +243,7 @@ fn current_agent_tree_tx(
                  SELECT 1 FROM commands c WHERE c.target=t.agent AND c.generation=t.generation
                    AND c.turn_id=t.turn_id AND c.verb='send' AND c.probe=1))
              ORDER BY t.generation,t.turn_id LIMIT 1",
-                params![num, probe_cleanup, keep_drained_unknowns],
+                params![num, probe_cleanup, allow_drained_unknowns],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
@@ -311,9 +312,8 @@ fn current_agent_tree_tx(
     Ok((members, agents))
 }
 
-/// Archive may preserve unknown history of an ended Agent whose exact
-/// generations have committed process exit and reader drain. Deletion still
-/// uses its own stricter guards.
+/// Archive preserves unknown history after exact process exit and reader drain.
+/// Daemon-owned harness checks can also be discarded after that same proof.
 fn unknown_generations_drained(tx: &Transaction<'_>, agent: i64) -> Result<bool> {
     let mut statement = tx
         .prepare(

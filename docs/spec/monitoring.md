@@ -1437,6 +1437,8 @@ harness self-check fact.
    block while the new version awaits its check. Swarm restores the recorded
    outcome and routing eligibility when a previously checked version returns.
    A daemon interruption releases the claim for a fresh check after cleanup.
+   Boot recovery leaves the interrupted check session closed. Cleanup requires
+   committed process exit and source drain for any uncertain steps.
    Maintenance retries and logs incomplete cleanup before admitting new checks.
    Installation inventory runs at daemon start and at most hourly. It compares
    resolved executable paths, sizes and modification times before probing.
