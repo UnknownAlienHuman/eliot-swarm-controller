@@ -51,8 +51,8 @@ pub use command::{
 };
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
-    InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, STEER_DELIVERY_FIELD,
-    TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
+    InjectArgs, InjectPoint, MAX_CONTEXT_EDIT_PATH_BYTES, RetainedInjectArgs, ReviewWorktreeState,
+    STEER_DELIVERY_FIELD, TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,

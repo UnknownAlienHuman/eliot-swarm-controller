@@ -34,25 +34,54 @@ pub(crate) fn validate_steer_delivery(effective: &Value) -> crate::Result<()> {
     }
 }
 
-/// Persisted file edit evidence never includes an absolute path.
+/// Bound for the optional sanitized path attached to outside edit evidence.
+pub const MAX_CONTEXT_EDIT_PATH_BYTES: usize = 2048;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContextEditPath {
-    Relative { path: String },
-    OutsideOrUnverifiable { sha256: String, basename: String },
+    Relative {
+        path: String,
+    },
+    OutsideOrUnverifiable {
+        sha256: String,
+        basename: String,
+        /// Daemon-computed identity for a path verified outside its workspace.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canonical_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// True when the secret policy changed the displayed path.
+        #[serde(default)]
+        path_redacted: bool,
+    },
 }
 
 impl ContextEditPath {
     pub fn outside(path: &str, policy: &crate::SecretPolicy) -> Self {
+        let sha256 = crate::api::inference::sha256_hex(path.as_bytes());
+        let display_path = crate::display_path(path);
         let basename = path
             .rsplit(['/', '\\'])
             .find(|part| !part.is_empty())
             .filter(|name| !name.chars().any(char::is_control))
             .unwrap_or("unavailable");
         let basename = policy.redact_text(basename);
+        let redacted_path = policy.redact_text(&display_path);
+        let path_redacted = redacted_path != display_path;
+        let path = (!display_path.chars().any(char::is_control))
+            .then_some(redacted_path)
+            .filter(|path| {
+                !path.is_empty()
+                    && path.len() <= MAX_CONTEXT_EDIT_PATH_BYTES
+                    && !path.chars().any(char::is_control)
+            });
         Self::OutsideOrUnverifiable {
-            sha256: crate::api::inference::sha256_hex(path.as_bytes()),
+            sha256,
             basename: crate::api::truncate_bytes(&basename, 240).0.to_owned(),
+            canonical_sha256: None,
+            path,
+            path_redacted,
         }
     }
 }

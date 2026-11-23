@@ -3,7 +3,7 @@
 mod facts;
 pub(super) mod notes;
 
-use facts::{edit_note_text, edit_path_key, new_note_paths};
+use facts::{edit_note_text, new_note_paths, stored_edit_path_key};
 
 use super::*;
 use eliot_core::{
@@ -430,7 +430,14 @@ impl Store {
             for path in &paths {
                 db!(tx.execute(
                     "INSERT INTO context_noted_paths(agent,generation,kind,path_key,turn_id,note_id) VALUES(?1,?2,?3,?4,?5,?6)",
-                    params![agent_num, generation, kind, edit_path_key(path), turn, request.id],
+                    params![
+                        agent_num,
+                        generation,
+                        kind,
+                        stored_edit_path_key(kind, turn, path),
+                        turn,
+                        request.id
+                    ],
                 ));
             }
         }
