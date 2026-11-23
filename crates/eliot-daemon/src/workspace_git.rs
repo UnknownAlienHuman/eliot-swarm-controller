@@ -1109,7 +1109,9 @@ impl WorkspaceGit {
         }
         confirm_worktree_absence_after_grace(path, &parent, deadline).await?;
         let entries = self.entries(&source.root, deadline).await?;
-        let mut matches = entries.iter().filter(|entry| entry.path == target);
+        let mut matches = entries
+            .iter()
+            .filter(|entry| git_path_matches(&entry.path, &target));
         let Some(entry) = matches.next() else {
             confirm_missing_source(preparation, missing_source_parent.as_ref())?;
             confirm_worktree_absence(path, &parent)?;
@@ -1142,7 +1144,7 @@ impl WorkspaceGit {
                 "missing worktree registration and retained branch tip disagree",
             ));
         }
-        let target_arg = git_path_argument(&target)?;
+        let target_arg = git_path_argument(&entry.path)?;
         let command = self
             .git
             .prepare_workspace_command_with_config_roots(
@@ -1276,7 +1278,7 @@ impl WorkspaceGit {
             .entries(&source.root, deadline)
             .await?
             .iter()
-            .any(|entry| entry.path == target)
+            .any(|entry| git_path_matches(&entry.path, &target))
         {
             return Err(problem(
                 "unknown",

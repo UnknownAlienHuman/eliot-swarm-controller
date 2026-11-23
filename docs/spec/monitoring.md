@@ -534,8 +534,9 @@ the same readable, pinned parent and that checkout resolves to the frozen
 repository common directory. The source path is rechecked after Git readback.
 Unverifiable source or target absence, or a changed common-directory identity,
 keeps removal unsettled. An already absent target registration settles without
-a Git write; branch readback still follows the retained-tip or prior-absence
-rules above.
+a Git write. Both the removal probe and its final readback compare Git paths
+using the platform's workspace identity rules. Branch readback still follows
+the retained-tip or prior-absence rules above.
 A `worktree.remove` that a previous daemon left `queued` behind the
 repository write lane is re-admitted by restart recovery, so it is
 dispatched in order and never strands later launches in the same
