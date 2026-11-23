@@ -66,8 +66,9 @@ The ACP `model` selector carries base family ids only; the requested CLI
 model (`gemini-3.8-flash-high`) translates to base `gemini-3.8-flash` plus
 `thought_level = high` via `session/set_config_option` (documented suffixes
 `-low`/`-medium`/`-high`/`-xhigh`, observed against agy 1.5.9), and both
-writes are verified against the server's advertised options and echoed
-values — an unadvertised id fails startup instead of being guessed. Session mode
+writes are verified by the server's echoed current values. An omitted model
+option produces the advisory catalogue diagnostic. The advertised thought
+levels gate effort for a listed model. Session mode
 is applied only when the profile mode names an actually advertised ACP
 mode; any other requested mode (including CLI `auto`, which has no ACP
 mode id) fails startup with a clear `unsupported` instead of being
@@ -531,7 +532,7 @@ kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,
 cached per scope with freshness and credential identity. The documented
 effort suffixes (`-low`/`-medium`/`-high`/`-xhigh`) map to the ACP
 `thought_level` selector at launch; any other suffix stays part of the base
-id and is verified against the advertised session options instead of guessed.
+id and is passed to the ACP model setter for native acceptance and readback.
 A failing `agy models` child reports an honest typed error naming `models`.
 ## Agent skill delivery (`eliot-swarm`)
 

@@ -472,15 +472,10 @@ native effort wire fields (`thread/start`/`thread/resume` config and
 the effective native readback separately; when a collaboration mode is
 requested, its replacement settings carry the actual native readback effort
 so the native selection is not cleared to the model default, while the
-requested effort stays absent; no effort value is fabricated. A present effort is enforced exactly and a
-missing model catalog entry on the direct route still fails startup
-explicitly. On the direct ChatGPT Codex route, the Codex plugin uses native
-`model/list` to look up that exact model and its supported reasoning efforts;
-on an explicitly configured Responses route, the plugin skips that lookup and
-passes through the explicit effort unchanged; provider rejection is surfaced
-when the native operation reports it. Neither route issues a separate
-inference or entitlement probe, or selects another model, route or account
-automatically.
+requested effort stays absent. The direct ChatGPT route uses `model/list` for
+the selected model's advertised efforts. The Responses route passes the
+explicit effort through to the native operation. The [plugin protocol](plugin-protocol.md)
+owns catalogue omissions and verification.
 [`Codex`](../harnesses/codex.md#first-useful-path) owns native bring-up steps. Existing
 workspace and owner login suffice; no proxy/account registry is mandatory.
 
@@ -595,8 +590,8 @@ substitutions are refused. `api_key_env` must be listed in `pass_env`, and
 `auth_integration` must be absent, so no unrelated canonical credential is
 imported. The adapter sets `OPENCODE_CONFIG_PROJECT_DISABLE` and strips
 `OPENCODE_CONFIG`, `OPENCODE_CONFIG_CONTENT`, and `OPENCODE_CONFIG_DIR` for the
-server and both preview readers. The plugin checks the exact model pair through the live `GET /api/model`
-catalogue before creating a session. An unreachable endpoint can still be
+server and both preview readers. The live `GET /api/model` catalogue supplies
+limits and variants for an exact model entry. An unreachable endpoint can still be
 listed and reports its failure on the native turn. Each named profile is a
 separate picker preset with its frozen model and effort. OpenCode catalogue
 failures share one bounded entry.
@@ -1338,11 +1333,10 @@ the stream-json `set_model` control request between turns, with a native
 permission-mode check before and after the setter. Effort is launch-only.
 Other omitted fields use the frozen original. OpenCode switches the
 retained session model at configure time (`POST /api/session/{id}/model`
-with a `session.get` proof; the requested model must be in the live model
-catalogue or the command rejects before any write, and effort has no native
-knob and is refused). Antigravity switches `model` and `thought_level` at
-configure time (`session/set_config_option` with echo proof; unadvertised
-values reject before any write). A mid-turn configure refuses before any
+with a `session.get` proof) and applies effort through `Model.Ref.variant`.
+Antigravity switches `model` and `thought_level` through
+`session/set_config_option` with echo proof. Catalogue omissions follow the
+[plugin protocol](plugin-protocol.md). A mid-turn configure refuses before any
 write. A catalog or quota failure at the next turn fails that
 turn honestly; it never selects another model or account. The cached
 readback behind that rule is

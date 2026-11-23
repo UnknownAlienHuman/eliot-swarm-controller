@@ -1588,52 +1588,6 @@ pub fn with_model_catalogue_diagnostic(mut value: Value, catalogue_omits_model: 
     value
 }
 
-pub enum LaunchModelRequest<'a> {
-    Explicit(&'a str),
-    Frozen(&'a str),
-    CatalogueDefault,
-    VendorDefault,
-}
-
-pub enum LaunchModelMissing {
-    Explicit,
-    Frozen,
-    Default,
-}
-
-/// Select the exact explicit or frozen model. An omitted selection can
-/// delegate to a vendor that reports its default at session creation.
-pub fn choose_launch_model<'a, T>(
-    entries: &'a [T],
-    request: LaunchModelRequest<'_>,
-    id: impl Fn(&T) -> &str,
-    exact: impl Fn(&T, &str) -> bool,
-    is_default: impl Fn(&T) -> bool,
-) -> std::result::Result<Option<&'a T>, LaunchModelMissing> {
-    let selected = match request {
-        LaunchModelRequest::Explicit(requested) => entries
-            .iter()
-            .find(|entry| id(entry) == requested && exact(entry, requested))
-            .ok_or(LaunchModelMissing::Explicit)?,
-        LaunchModelRequest::Frozen(frozen) => entries
-            .iter()
-            .find(|entry| id(entry) == frozen)
-            .ok_or(LaunchModelMissing::Frozen)?,
-        LaunchModelRequest::CatalogueDefault => entries
-            .iter()
-            .find(|entry| is_default(entry))
-            .ok_or(LaunchModelMissing::Default)?,
-        LaunchModelRequest::VendorDefault => {
-            return if entries.is_empty() {
-                Err(LaunchModelMissing::Default)
-            } else {
-                Ok(None)
-            };
-        }
-    };
-    Ok(Some(selected))
-}
-
 /// Close the owned event task after stop. Teardown after a transport loss
 /// still closes the task if its stop reply could not be proved.
 pub async fn shutdown_session<S>(

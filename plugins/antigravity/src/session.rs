@@ -6,14 +6,15 @@ use std::{
     time::Duration,
 };
 
-use eliot_core::{Error, InjectPoint, Result};
+use eliot_core::{Error, FailureOrigin, InjectPoint, Result};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, MAX_FRAME_BYTES,
     MAX_TEXT_BYTES, PeerClient,
     event_actor::wait_for_status,
     session::{
-        interrupt_settlement_outcome, native_no_write, register_native_process, unknown_snapshot,
-        with_claimed_context, with_context_points,
+        ModelSelection, interrupt_settlement_outcome, native_no_write, register_native_process,
+        unknown_snapshot, with_claimed_context, with_context_points,
+        with_model_catalogue_diagnostic,
     },
     skill,
 };
@@ -426,11 +427,28 @@ impl Session {
             .get("thought_level")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        // Refresh the advertised sets from this open (fresh or resumed):
-        // every required write must name one of these values.
+        // Keep the advertised values as metadata for the observed selectors.
         self.advertised_models = advertised_option_values(session.config_options.as_ref(), "model");
         self.advertised_levels =
             advertised_option_values(session.config_options.as_ref(), "thought_level");
+        let selection = ModelSelection::new(
+            &self.current_base,
+            self.advertised_models
+                .iter()
+                .find(|id| *id == &self.current_base),
+        );
+        let config_writes = plan.config_writes();
+        let catalogue_omits_model = !config_writes.is_empty() && selection.catalogue_omits_model();
+        if !config_writes.is_empty()
+            && self.current_level.as_deref().is_some_and(|level| {
+                !selection.allows_effort(|_| self.advertised_levels.iter().any(|id| id == level))
+            })
+        {
+            return Err(Error::new(
+                "profile_error",
+                "Antigravity thought level is not advertised by the ACP session",
+            ));
+        }
         self.conversation = session.session_id.clone();
         {
             let mut state = self.state.lock().await;
@@ -442,7 +460,7 @@ impl Session {
             );
         }
         // Verify each required config write by its echoed current value.
-        for (config_id, value) in plan.config_writes() {
+        for (config_id, value) in config_writes {
             self.write_config_option(&config_id, &value, deadline)
                 .await?;
         }
@@ -473,6 +491,8 @@ impl Session {
                 object.insert("mode".to_owned(), json!(mode));
             }
         }
+        effective["model_verified"] = Value::Bool(true);
+        let effective = with_model_catalogue_diagnostic(effective, catalogue_omits_model);
         let effective = with_context_points(
             effective,
             &[InjectPoint::NextInput, InjectPoint::TurnSafePoint],
@@ -610,9 +630,8 @@ impl Session {
 
     /// Native `configure`: switch the live session's `model` and
     /// `thought_level` selectors through `session/set_config_option` and
-    /// prove each write with its echoed current value. A requested value
-    /// the session did not advertise rejects before any write, never
-    /// guessing; anything ambiguous after a write is unknown, and nothing
+    /// prove each write with its echoed current value. A missing model
+    /// option is advisory. Anything ambiguous after a write is unknown, and nothing
     /// is stored by this layer (the Router stores the overlay only after
     /// this proof). Always writes the resolved selectors, so a retried
     /// configure after an uncertain outcome is idempotent.
@@ -653,21 +672,12 @@ impl Session {
             }
             Err(error) => return Err(error),
         };
-        if !self
-            .advertised_models
-            .iter()
-            .any(|model| model == &target.base)
-        {
-            return Ok(json!({
-                "state": "rejected",
-                "reason": format!("Antigravity model {} is not advertised by the ACP session", target.base),
-            }));
-        }
+        let selection = ModelSelection::new(
+            &target.base,
+            self.advertised_models.iter().find(|id| *id == &target.base),
+        );
         if target.level.as_deref().is_some_and(|level| {
-            !self
-                .advertised_levels
-                .iter()
-                .any(|advertised| advertised == level)
+            !selection.allows_effort(|_| self.advertised_levels.iter().any(|id| id == level))
         }) {
             return Ok(json!({
                 "state": "rejected",
@@ -675,21 +685,42 @@ impl Session {
             }));
         }
         let deadline = Instant::now() + TIMEOUT;
-        self.write_config_option("model", &target.base, deadline)
-            .await?;
+        if let Err(error) = self
+            .write_config_option("model", selection.id, deadline)
+            .await
+        {
+            if error.code == "native_rejected" {
+                return Ok(with_model_catalogue_diagnostic(
+                    json!({
+                        "state": "rejected",
+                        "reason": error.message,
+                        "origin": FailureOrigin::Harness,
+                        "origin_evidence": "ACP model setter returned a native error",
+                        "where": "plugin.antigravity.configure.set_model",
+                    }),
+                    selection.catalogue_omits_model(),
+                ));
+            }
+            return Err(error);
+        }
         if let Some(level) = target.level.as_deref() {
             self.write_config_option("thought_level", level, deadline)
-                .await?;
+                .await
+                .map_err(|error| error.with_code("unknown"))?;
         }
+        let catalogue_omits_model = selection.catalogue_omits_model();
         self.current_base = target.base.clone();
         self.current_level = target.level.clone();
-        Ok(json!({
-            "state": "applied",
-            "model": target.effective_model,
-            "effort": target.level.clone(),
-            "model_verified": true,
-            "effort_verified": target.level.is_some(),
-        }))
+        Ok(with_model_catalogue_diagnostic(
+            json!({
+                "state": "applied",
+                "model": target.effective_model,
+                "effort": target.level.clone(),
+                "model_verified": true,
+                "effort_verified": target.level.is_some(),
+            }),
+            catalogue_omits_model,
+        ))
     }
 
     pub async fn send(&mut self, params: AgentCommandParams) -> Result<Value> {

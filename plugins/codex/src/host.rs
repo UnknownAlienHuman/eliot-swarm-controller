@@ -34,13 +34,13 @@ use eliot_plugin::{
     ObserverSnapshotParams, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{ProfileStoreParams, stream_sources},
     session::{
-        attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
+        ModelSelection, attach_reply_diagnostics, begin_stop, decode, ensure_dedicated_reader,
         ensure_reader_harness, initialize_fields_valid, is_passed_env, is_secret_name,
         native_no_write, not_initialized, parse_resume_subject, paths_equal,
         register_native_process, rejected_control, request_reply_ids,
         target_environment as shared_target_environment, unknown_control, unknown_snapshot,
         validate_binding, validate_identity, validate_source_plan, with_claimed_context,
-        with_context_points,
+        with_context_points, with_model_catalogue_diagnostic,
     },
     skill,
 };
@@ -183,9 +183,14 @@ struct ValidatedStartPlan {
 /// takes over from here.
 struct DispatchedThread {
     session: AgentSession,
-    selected_model: String,
-    selected_effort: Option<String>,
+    selected: SelectedModel,
     readback: ThreadStartReadback,
+}
+
+struct SelectedModel {
+    id: String,
+    effort: Option<String>,
+    catalogue_omits_model: bool,
 }
 
 /// Outcome of the dispatch phase: either a live dispatched thread ready for
@@ -967,8 +972,7 @@ impl CodexPlugin {
                     &params,
                     &plan,
                     thread.readback,
-                    thread.selected_model,
-                    thread.selected_effort,
+                    thread.selected,
                 )
                 .await
             }
@@ -1188,7 +1192,7 @@ impl CodexPlugin {
         params: &AgentStartParams,
         plan: &ValidatedStartPlan,
     ) -> Result<DispatchOutcome> {
-        let (selected_model, selected_effort, native_scope) = match Self::initialize_native(
+        let (selected, native_scope) = match Self::initialize_native(
             &session.native_client,
             &plan.workspace,
             plan.requested_model.as_deref(),
@@ -1203,7 +1207,7 @@ impl CodexPlugin {
         )
         .await
         {
-            Ok((model, effort, scope)) => (model, effort, scope),
+            Ok(selected) => selected,
             Err(error) => {
                 let error = discard_failed_start(&mut session, error).await;
                 return self
@@ -1216,8 +1220,8 @@ impl CodexPlugin {
                     .map(DispatchOutcome::Settled);
             }
         };
-        session.selected_model = selected_model.clone();
-        session.selected_effort = selected_effort.clone();
+        session.selected_model = selected.id.clone();
+        session.selected_effort = selected.effort.clone();
         session.native_scope = native_scope;
 
         if let Some(subject) = &plan.resume_subject {
@@ -1270,7 +1274,7 @@ impl CodexPlugin {
         // Apply the documented dotted config overrides to every start and resume,
         // including profiles that preserve the native reasoning-effort default.
         let thread_config = NativeThreadConfigOverrides::from_profile(
-            selected_effort.clone(),
+            selected.effort.clone(),
             plan.native_subagents.as_deref(),
             params.pass_agent_identity_to_shell.unwrap_or(true),
         );
@@ -1278,7 +1282,7 @@ impl CodexPlugin {
             let params = NativeThreadResumeParams {
                 thread_id: subject.native_ref.clone(),
                 exclude_turns: true,
-                model: Some(selected_model.clone()),
+                model: Some(selected.id.clone()),
                 model_provider: Some(plan.route.provider().to_owned()),
                 cwd: Some(plan.workspace.to_string_lossy().into_owned()),
                 sandbox: Some(plan.sandbox_mode),
@@ -1298,7 +1302,7 @@ impl CodexPlugin {
         } else {
             let params = NativeThreadStartParams {
                 cwd: Some(plan.workspace.to_string_lossy().into_owned()),
-                model: Some(selected_model.clone()),
+                model: Some(selected.id.clone()),
                 model_provider: Some(plan.route.provider().to_owned()),
                 sandbox: Some(plan.sandbox_mode),
                 approval_policy: Some(json!(plan.approval_policy.clone())),
@@ -1321,18 +1325,6 @@ impl CodexPlugin {
         {
             Ok(value) => value,
             Err(error) if error.code == "native_rejected" => {
-                let (code, message) = if plan.resume_subject.is_some() {
-                    (
-                        "not_found",
-                        "Codex rejected resume of the exact retained thread",
-                    )
-                } else {
-                    (
-                        "profile_error",
-                        "Codex rejected thread/start for the selected profile",
-                    )
-                };
-                let error = contextual_error(error, code, message);
                 let error = discard_failed_start(&mut session, error).await;
                 self.failed_start = Some(FailedStart);
                 return Err(error);
@@ -1403,8 +1395,7 @@ impl CodexPlugin {
         }
         Ok(DispatchOutcome::Dispatched(Box::new(DispatchedThread {
             session,
-            selected_model,
-            selected_effort,
+            selected,
             readback,
         })))
     }
@@ -1418,9 +1409,13 @@ impl CodexPlugin {
         params: &AgentStartParams,
         plan: &ValidatedStartPlan,
         readback: ThreadStartReadback,
-        selected_model: String,
-        selected_effort: Option<String>,
+        selected: SelectedModel,
     ) -> Result<Value> {
+        let SelectedModel {
+            id: selected_model,
+            effort: selected_effort,
+            catalogue_omits_model,
+        } = selected;
         // Expose the daemon-materialized coordination skill before any
         // input is sent: without it the Agent would start believing it has
         // no skill. The roots replace nothing on disk; a failed delivery
@@ -1498,6 +1493,7 @@ impl CodexPlugin {
             "mcp_servers": mcp_servers,
             "mcp_servers_verified": mcp_readback.verified,
         });
+        let effective = with_model_catalogue_diagnostic(effective, catalogue_omits_model);
         let effective = with_context_points(
             effective,
             &[InjectPoint::NextInput, InjectPoint::ActiveTurn],
@@ -1620,7 +1616,7 @@ impl CodexPlugin {
         requested_effort: Option<&str>,
         experimental_api: bool,
         context: NativeStartContext<'_>,
-    ) -> Result<(String, Option<String>, String)> {
+    ) -> Result<(SelectedModel, String)> {
         let init_params = NativeInitializeParams {
             client_info: NativeClientInfo {
                 name: "eliot".to_owned(),
@@ -1770,39 +1766,59 @@ impl CodexPlugin {
                 )
             })?;
             return Ok((
-                requested.to_owned(),
-                context.route.optional_effort(requested_effort)?,
+                SelectedModel {
+                    id: requested.to_owned(),
+                    effort: context.route.optional_effort(requested_effort)?,
+                    catalogue_omits_model: false,
+                },
                 native_scope,
             ));
         }
 
-        // The daemon freezes the native default in `daemon_model` before any
-        // session spawns; an omitted model with no frozen value means the
-        // daemon's live read failed, so fall back to the native `isDefault`
-        // entry exactly as a daemon freeze would. `requested` stays null in
-        // readback; the frozen id selects by `id` only.
-        let model = discover_model(client, requested_model, daemon_model).await?;
-        let effort = match requested_effort {
-            Some(effort)
-                if model
+        let entries = discover_models(client).await?;
+        let frozen = daemon_model.filter(|id| !id.trim().is_empty());
+        let selection = if let Some(id) = requested_model.or(frozen) {
+            ModelSelection::new(
+                id,
+                entries.iter().find(|entry| {
+                    entry.id == id
+                        && requested_model.is_none_or(|requested| entry.model == requested)
+                }),
+            )
+        } else {
+            let default = entries
+                .iter()
+                .find(|entry| entry.is_default)
+                .ok_or_else(|| {
+                    eliot_plugin::start_classification::harness_unavailable_model(
+                        "codex",
+                        "model_list",
+                        "Codex model/list reported no default model; use an explicit model",
+                    )
+                })?;
+            ModelSelection::new(&default.id, Some(default))
+        };
+        if let Some(effort) = requested_effort
+            && !selection.allows_effort(|entry| {
+                entry
                     .supported_reasoning_efforts
                     .iter()
-                    .any(|supported| supported.reasoning_effort == effort) =>
-            {
-                Some(effort.to_owned())
-            }
-            Some(_) => {
-                return Err(Error::new(
-                    "profile_error",
-                    "Codex profile effort is not supported by the exact selected model",
-                ));
-            }
-            // Omitted effort: preserve the native default by omitting the
-            // wire field. The catalog lookup above still proves the
-            // selected model exists; no medium/xhigh value is fabricated.
-            None => None,
-        };
-        Ok((model.id.clone(), effort, native_scope))
+                    .any(|supported| supported.reasoning_effort == effort)
+            })
+        {
+            return Err(Error::new(
+                "profile_error",
+                "Codex profile effort is not supported by the exact selected model",
+            ));
+        }
+        Ok((
+            SelectedModel {
+                id: selection.id.to_owned(),
+                effort: requested_effort.map(str::to_owned),
+                catalogue_omits_model: selection.catalogue_omits_model(),
+            },
+            native_scope,
+        ))
     }
 
     /// Read the native MCP inventory for requested-vs-observed reporting,
@@ -2903,69 +2919,11 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
     session.native_client.diagnostic_error(error)
 }
 
-/// Pure native catalogue selection shared by start and `model.list`.
-/// An explicit request matches exactly (`id` and `model`) or fails
-/// honestly with no substitution; a daemon-frozen model-less launch matches
-/// by `id` only, preserving the native `isDefault` acceptance (no
-/// `model ==` check); a cold omitted request uses the native `isDefault`
-/// entry or fails honestly when the catalogue names none.
-fn select_launch_model(
-    entries: &[NativeModelEntry],
-    requested_model: Option<&str>,
-    daemon_model: Option<&str>,
-) -> Result<NativeModelEntry> {
-    use eliot_plugin::session::{LaunchModelMissing, LaunchModelRequest};
-
-    let request = match requested_model {
-        Some(requested) => LaunchModelRequest::Explicit(requested),
-        None => match daemon_model.filter(|frozen| !frozen.trim().is_empty()) {
-            Some(frozen) => LaunchModelRequest::Frozen(frozen),
-            None => LaunchModelRequest::CatalogueDefault,
-        },
-    };
-    let missing = |reason: LaunchModelMissing| match reason {
-        LaunchModelMissing::Explicit => {
-            "The exact requested Codex model is unavailable in this account catalogue"
-        }
-        LaunchModelMissing::Frozen => {
-            "Codex model/list no longer contains the daemon-frozen default model; use an explicit model"
-        }
-        LaunchModelMissing::Default => {
-            "Codex model/list reported no default model; use an explicit model"
-        }
-    };
-    let selected = eliot_plugin::session::choose_launch_model(
-        entries,
-        request,
-        |model| model.id.as_str(),
-        |model, requested| model.model == requested,
-        |model| model.is_default,
-    )
-    .map_err(|reason| {
-        eliot_plugin::start_classification::harness_unavailable_model(
-            "codex",
-            "model_list",
-            missing(reason),
-        )
-    })?;
-    selected.cloned().ok_or_else(|| {
-        eliot_plugin::start_classification::harness_unavailable_model(
-            "codex",
-            "model_list",
-            missing(LaunchModelMissing::Default),
-        )
-    })
-}
-
 /// Bounded launch catalogue: per-page `RPC_TIMEOUT` capped by an overall
 /// launch budget, so two slow pages fit their individual budgets.
 const LAUNCH_CATALOGUE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
-async fn discover_model(
-    client: &NativeClient,
-    requested_model: Option<&str>,
-    daemon_model: Option<&str>,
-) -> Result<NativeModelEntry> {
+async fn discover_models(client: &NativeClient) -> Result<Vec<NativeModelEntry>> {
     // Only prerequisite reads ran; no thread or input was dispatched.
     let (entries, truncated) = crate::discovery::collect_model_pages(
         client,
@@ -2999,10 +2957,7 @@ async fn discover_model(
             "Codex model/list exceeded the bounded pagination limit",
         ));
     }
-    // End of catalogue: select from all pages at once so an omitted
-    // request sees the default wherever it is paged. Requested
-    // selection still fails honestly with no substitution.
-    select_launch_model(&entries, requested_model, daemon_model)
+    Ok(entries)
 }
 
 async fn read_owned_thread(client: &NativeClient, thread_id: &str) -> Result<Value> {

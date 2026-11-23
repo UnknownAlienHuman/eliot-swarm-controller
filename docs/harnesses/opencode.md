@@ -104,15 +104,10 @@ cwd/title/time heuristics. Missing identity is a visible gap. Session routes bin
 location from the session; requests outside a session pass the installed API's workspace
 parameter. Read complete error bodies; only authoritative
 rejection proves no effect. Timeout/ambiguous server response after a write is unknown.
-Catalogue preflight may retry only before any session/input may have been admitted.
 OpenCode 2.2.7 can serve its bundled model snapshot while a fresh store fetches
-the current catalogue and reloads its integrations and providers. An already
-populated native store can return newer models immediately. The native refresh
-notification precedes the provider reload, which can publish a model before
-its variants. Launch uses the exact live `GET /api/model` match to establish
-readiness. If the model or requested variant is missing, it rechecks every
-250 ms for up to 12 seconds within the existing start budget. Session creation
-requires the model and any requested variant to be present.
+the current catalogue and reloads its integrations and providers. An exact
+`GET /api/model` row provides effort variants. An omitted model row produces
+the advisory diagnostic defined in the [plugin protocol](../spec/plugin-protocol.md).
 
 The native `x-opencode-directory` header is URI component encoded, including literal
 percent signs, using the same encoder as query values. Installed OpenCode 2.2.7
@@ -123,16 +118,16 @@ fail readiness with location-not-found (observed in the Linux Docker image).
 
 | Eliot operation | Mechanism / settlement |
 | --- | --- |
-| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`; an explicit model must also prove live `GET /api/model` catalogue membership as an exact `provider/model` pair — both native fields compared independently without trimming, exactly like the installed resolver — before create (the installed `Session.create` publishes its input unchanged and resolves availability lazily at inference, so the echo alone never proves a provider/model exists), and a requested effort must prove variant membership in that same catalogue row. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. Any failure before a native session or prompt exists is a definite failed start with a short typed reason and its processes reaped through the generation Job, except an uncertain auth import (the isolated credential store may already have been written and reconciliation failed), which stays `unknown`; `unknown` otherwise stays reserved for real uncertainty after a session or prompt may have been admitted |
+| launch | installed `POST /api/session` with the workspace directory, no input; per-Agent `serve` on loopback with a generated `OPENCODE_PASSWORD` and per-Agent `XDG_CONFIG_HOME`/`XDG_DATA_HOME`; before `serve`, the frozen nonsecret `auth_integration` selector's canonical credential transfers opaquely into the isolated store as described under [Authentication](#authentication), with no modification of owner global auth; exact session/model/directory echo required before Eliot `session.ready`; an exact `GET /api/model` row supplies model limits and allowed effort variants; a missing row is advisory. The installed server resolves inference availability on the turn. Readiness is the installed `GET /api/config` proving the live server honors the per-Agent roots (password plus our config document path), polled to a 60 s bound inside one 75 s start envelope shared with the transfer, spawn, subscribe, registration, and create phases, with every failure cleanup (event close plus owned-server terminate and diagnostics) clamped to the same envelope and 15 s reserved for the daemon's Job retirement and settlement, so a loaded cold start never outlives the daemon `agent.start` budget. Any failure before a native session or prompt exists is a definite failed start with a short typed reason and its processes reaped through the generation Job, except an uncertain auth import (the isolated credential store may already have been written and reconciliation failed), which stays `unknown`; `unknown` otherwise stays reserved for real uncertainty after a session or prompt may have been admitted |
 | send | installed `POST /api/session/{id}/prompt`; the 200 inbox id is intermediate, applied needs the exact input-to-execution association on SSE (`session.inbox.enqueued`/`delivered` plus `session.execution.started`; turn id is the exact `started` event id) |
 | steer | exact-turn `POST /api/session/{id}/prompt` with explicit `delivery: steer` (v2.2.7 `Session.Inbox.Delivery`); the exact-turn gate refuses a finished turn as stale without a write, applied needs the input delivered on SSE while the exact turn stays active (native joins it at a step boundary, never a new turn here); terminal-first, cancelled, unwatched, or timed-out consumption is unknown with an exact `DELETE .../inbox/{inboxID}` whose removal must then be proven by inbox-list absence plus a stream-observed cancel — anything unproven latches the session unknown so no later send/Goal dispatches behind the unresolved input (the native 204 also covers the no-op, so it proves nothing alone) |
 | inject | `next_input` prepends inside the next `POST /api/session/{id}/prompt`; `turn_safe_point` claims through the authenticated `hook.event` channel (`hook=before_model`) and resolves to the vendor-native `context` hook (RPC `eliot-context` v1 `bind`/`next`/`resolve` over the existing authenticated HTTP transport) only after a verified v1 session binding; a hook never binds by copying its last-user message id without proving actual inbox delivery to the current turn, and only a confirmed `applied`/`empty` resolve emits a `hook.before_model` receipt; the poll paces repeat `next` offers of one still-pending hook with bounded backoff instead of hot-polling, and the first offer always forwards immediately |
 | interrupt | installed `POST /api/session/{id}/interrupt` (`{"interrupted": bool}`); the exact-turn gate refuses a finished turn as stale without a write, `interrupted:true` applies and the terminal pair settles the turn |
 | stop | ordinary busy Stop: one installed exact-session interrupt guarded by the captured turn, then a bounded wait for that turn's SSE terminal; interrupt acknowledgement alone is not evidence. Read-only idle-leg checks and `GET /api/session/{id}` prove retention, then the owned server ends through generation custody. Missing terminal evidence retains an unknown turn; failed idle/retention readback still proceeds to bounded owned-server cleanup and makes the stop unknown. Idle Stop retains the native quiesce preflight. Force skips the cooperative wait and retention readback. Neither stop deletes the retained native session or touches another Agent |
 | detach | explicitly stop controlling/observing as defined, leaving native service/session alive |
-| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the live catalogue proves an explicit realignment target with proven no effect before any native interrupt or setter (a miss fails the resume without touching the retained turn), then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
+| resume | installed exact native session reattachment: `GET /api/session/{id}` proves the retained session, then the live catalogue supplies metadata for the realignment target before any native interrupt or setter, then the interrupt-quiesce (`POST .../interrupt`, which aborts a running retained execution — refusing would wedge crash-recovery resume) plus the empty `inbox`/`permission`/`form` lists prove it idle (anything still pending refuses the resume); never replays the prompt |
 | approve/deny/answer | installed `POST .../permission/{id}/reply` (`once`/`always`/`reject`; approve must name `once` or `always`, there is no default choice), `POST .../form/{id}/reply` (`answer` map), `DELETE .../form/{id}` for deny; the public request id is the native id, request.opened details are the shared ApprovalRequest/QuestionRequest, answers are the shared AnswerArgs converted to the field-typed native value (string, string array, number, boolean), choices stage against the offered schema (a miss rejects before any write), a lost reply is unknown and never rewritten |
-| configure | mid-run model and/or effort switch at configure time: the requested `provider/model` must be in the live `GET /api/model` catalogue or the command rejects before any write, and a requested effort must be one of that model's installed `variants` ids (the TUI "Variant" switch; the installed server validates nothing and echoes even bogus switches, so the catalogue gate is the honest failure); the switch runs installed `POST /api/session/{id}/model` with the documented `Model.Ref.variant` and a fresh `session.get` effective readback (`model_verified` and, when an effort was requested, `effort_verified` only from that readback), then the Router stores the overlay — a refused or unproven switch stores nothing and never claims applied. A model switch without an effort runs the server default variant. Resume-time realign proves live catalogue membership for an explicit target model (plus variant membership when an effort is carried) before any installed `POST .../model` / `POST .../agent` setter against the retained session, then verifies with `session.get` effective readback (a refused switch fails the resume as unknown; the catalogue gate already ran before the interrupt-quiesce, so an unreadable catalogue that early and a catalogue miss both fail the resume with proven no effect), targeting the inherited overlay revision when a resume carries one. The Agent-scoped `harness.models` catalogue is that same live set, so the picker and this gate never disagree |
+| configure | Model and/or effort switch through `POST /api/session/{id}/model` with `Model.Ref.variant`. The catalogue supplies variants for the matching model row, and a missing row is advisory. Fresh `session.get` readback establishes `model_verified` and requested `effort_verified` before the Router commits the overlay. A model switch without effort uses the server default variant. Resume realigns the inherited or frozen settings before the same effective readback. Inference can still reject the selection on a turn. |
 | compact | idle session `POST /api/session/{id}/compact` with queue delivery. Applied requires completion for the exact inbox receipt, verified through the native stream or the retained compaction message and idle readback. |
 | fork/background | installed native method and exact resulting identity/state |
 | goal | explicitly selected Eliot Goal; no assumed native Goal |
@@ -226,14 +221,17 @@ never replayed.
 Page all native history/child lists and retain exact parent ids. Parent idle does not
 finish children. Native database discovery, if needed, is read-only and not a parallel
 publisher. Generate per-Agent/server provider config; never edit owner global settings.
-The profile model is the exact catalog string `provider/model-id`. Split only its first
+The profile model is the exact native string `provider/model-id`. Split only its first
 slash: `opencode/deepseek-v4.1-flash-free` selects provider `opencode` and model id
 `deepseek-v4.1-flash-free`, without shortening or substituting it. This follows
 [v2.2.7 `Model.Ref.parse`](https://github.com/anomalyco/opencode/blob/v2.2.7/packages/schema/src/model.ts#L27).
 Empty slash segments, backslash separators, whitespace and control characters reject.
 The native `#variant` suffix is not mapped by this slice and rejects; the frozen
 profile `effort` (or ad-hoc `--effort`) selects the documented `Model.Ref.variant`
-instead. An explicit model must prove live `GET /api/model` catalogue membership as an exact `provider/model` pair — both native fields compared independently without trimming — before the session exists (the create echo alone never proves it); a requested effort must additionally prove variant membership in that exact catalogue row. Effective output reports native `ModelRef.variant` as `model_variant` and,
+instead. `GET /api/model` compares both native fields independently without
+trimming. A matching row supplies effort variants. The create echo verifies the
+session selection, and the turn determines inference availability. Effective
+output reports native `ModelRef.variant` as `model_variant` and,
 mirroring that readback, as `effort` with `effort_verified` (an omitted effort
 accepts the server default variant); `model_variant` alone stays readback-only and
 does not change `model_verified` (provider/id), while a requested effort joins the
@@ -280,21 +278,11 @@ boundary. Both native paths also strip `OPENCODE_CONFIG`,
 Local-provider sessions skip the project MCP file scan and still check the
 effective MCP inventory. Cloud sessions keep the workspace project layers.
 
-Effective settings are read back, not assumed. Before inference the plugin
-checks that the generated provider defines the requested model. It then selects the
-exact frozen provider/model pair locally from the live `GET /api/model`
-catalogue (the endpoint answers an object with a `data` array) and carries
-that row's context and output limits into the ready result (omitted values
-stay unknown). This verification runs before `POST /api/session` creates any
-native session: no session or prompt has been dispatched yet, so every
-verification failure - a known mismatch or an unreadable readback - settles
-the launch as a definite failure with a short safe reason (failed-state start
-result, never unknown), and the daemon retires the plugin and releases capacity
-on proven exit instead of pinning an unknown Agent. Unknown is reserved for
-failures after a session or prompt may have been admitted. An unreachable
-custom endpoint is not a start failure: the catalogue still lists the model,
-the start succeeds, and the native turn surfaces the refusal. The readback is
-a snapshot, not a guarantee about every request.
+The generated provider defines the models available to this frozen profile.
+The live `GET /api/model` row for the exact provider/model pair contributes
+context and output limits before session create. Missing limits stay unknown.
+A missing row produces `catalogue_omits_model`. The session readback confirms
+the selected identity, and inference reports any provider refusal.
 
 Profile-scoped picker rows advertise only the profile's configured selection:
 choosing the row launches the profile as configured. Named-preview failures
@@ -387,8 +375,8 @@ when the native `opencode auth list` holds an entry with exactly that id.
 Anything else refuses before spawning with a typed `profile_error` naming
 `--auth` and listing the available integration ids — another provider's
 credential is never picked silently. `--effort` freezes the installed
-per-model variant id verbatim (the live catalogue proves membership at
-launch). Omitted profile `cmd` uses this same discovery. The selected native
+per-model variant id verbatim. Launch validates it against an exact
+catalogue row when available. Omitted profile `cmd` uses this same discovery. The selected native
 executable is frozen in the launch generation; explicit `--cmd PATH` is an
 Owner-only override for that launch and a profile `cmd` is a saved pin. `cmd`
 is discovered by following the npm shim to the native
@@ -422,8 +410,8 @@ after process-family closure on success, timeout and cancellation. Unconfirmed
 removal returns `unknown`.
 
 `swarm models --harness opencode --agent <id>` reads the owned generation's
-`GET /api/model` through `agent.models`. It applies the same exact model and
-variant identity rules as configure. Missing or unready sessions and failed
+`GET /api/model` through `agent.models`. It offers the model and
+variant IDs the server reported. Missing or unready sessions and failed
 or preempted reads return errors. The desktop fetches this catalogue whenever
 the Agent picker opens. This read performs no inference.
 
