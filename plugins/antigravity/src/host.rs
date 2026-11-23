@@ -403,7 +403,6 @@ impl Plugin {
         let manifest = PluginManifest::per_agent(
             "antigravity",
             env!("CARGO_PKG_VERSION"),
-            "1.5.2",
             &[
                 "launch",
                 "resume",

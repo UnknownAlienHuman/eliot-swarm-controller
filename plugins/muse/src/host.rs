@@ -2987,7 +2987,6 @@ fn muse_manifest() -> PluginManifest {
     PluginManifest::per_agent(
         "muse",
         env!("CARGO_PKG_VERSION"),
-        "1.4.0",
         &[
             "launch",
             "resume",

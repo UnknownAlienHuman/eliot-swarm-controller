@@ -5,8 +5,7 @@
 //! never refused. At most one recorded run exists per harness and version: a
 //! terminal `passed`/`failed` outcome binds its version and never runs again,
 //! while a quota refusal stays "not checked" and may run again after the hold
-//! ends. Only a `failed` outcome for the current installed version removes
-//! the harness from automatic routing; explicit Owner launches still work.
+//! ends. A failure blocks automatic routing until a subsequent pass.
 
 use super::{Error, Result, Store, commit_transaction, sql_error};
 use eliot_core::{
@@ -42,12 +41,6 @@ impl HarnessCheckRow {
         };
         core::is_terminal_outcome(&self.outcome)
             && core::same_harness_version(&self.harness, installed, checked)
-    }
-
-    /// True when automatic routing must skip this harness: its current
-    /// installed version failed the check and no later version passed.
-    pub fn blocks_automatic(&self) -> bool {
-        self.outcome == OUTCOME_FAILED && self.version_checked()
     }
 
     /// True when a check run is due for the current installed version.
@@ -192,18 +185,37 @@ impl Store {
             let previous = current
                 .as_ref()
                 .and_then(|row| row.installed_version.clone());
-            let changed = match (&previous, &version) {
-                (None, None) => false,
-                (Some(_), None) | (None, Some(_)) => true,
-                (Some(before), Some(after)) => !core::same_harness_version(harness, before, after),
-            };
-            if current.is_some() {
-                if changed {
-                    // A new installed surface drops the previous version's
-                    // record entirely: stale checked/failure facts must never
-                    // read as the new version's state.
+            if let Some(current) = current {
+                // A missing probe does not invalidate a completed run.
+                if let Some(version) = &version
+                    && previous
+                        .as_deref()
+                        .is_none_or(|before| !core::same_harness_version(harness, before, version))
+                {
+                    if current.version_checked()
+                        && let Some(checked) = current.checked_version.as_deref()
+                    {
+                        tx.execute(
+                            "INSERT INTO harness_check_history
+                                 (harness, version_key, checked_version, checked_at, outcome,
+                                  check_profile, failure_step, failure_error)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                             ON CONFLICT (harness, version_key) DO NOTHING",
+                            params![
+                                harness,
+                                core::normalize_harness_version(harness, checked),
+                                checked,
+                                current.checked_at,
+                                current.outcome,
+                                current.check_profile,
+                                current.failure_step,
+                                current.failure_error,
+                            ],
+                        )
+                        .map_err(sql_error)?;
+                    }
                     tx.execute(
-                        "UPDATE harness_checks SET installed_version = COALESCE(?2, ''),
+                        "UPDATE harness_checks SET installed_version = ?2,
                              outcome = ?3, not_checked_reason = ?4,
                              checked_version = '', checked_at = 0, check_profile = NULL,
                              failure_step = NULL, failure_error = NULL,
@@ -218,11 +230,16 @@ impl Store {
                         ],
                     )
                     .map_err(sql_error)?;
-                } else if version != previous {
                     tx.execute(
-                        "UPDATE harness_checks SET installed_version = COALESCE(?2, ''),
-                             updated_at = ?3 WHERE harness = ?1",
-                        params![harness, version, now],
+                        "UPDATE harness_checks
+                         SET (checked_version, checked_at, outcome, check_profile,
+                              failure_step, failure_error, not_checked_reason) =
+                             (history.checked_version, history.checked_at, history.outcome,
+                              history.check_profile, history.failure_step, history.failure_error, NULL)
+                         FROM harness_check_history AS history
+                         WHERE harness_checks.harness = ?1 AND history.harness = ?1
+                           AND history.version_key = ?2",
+                        params![harness, core::normalize_harness_version(harness, version)],
                     )
                     .map_err(sql_error)?;
                 }
@@ -303,10 +320,12 @@ impl Store {
                 .as_deref()
                 .is_some_and(|attempted| core::same_harness_version(harness, attempted, &version));
             if current.version_checked()
-                && current
-                    .checked_version
+                || current
+                    .installed_version
                     .as_deref()
-                    .is_some_and(|checked| core::same_harness_version(harness, checked, &version))
+                    .is_none_or(|installed| {
+                        !core::same_harness_version(harness, installed, &version)
+                    })
             {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(false);
@@ -363,7 +382,9 @@ impl Store {
                     "UPDATE harness_checks SET outcome = ?2, not_checked_reason = ?3,
                          checked_version = ?4, checked_at = ?5, check_profile = ?6,
                          failure_step = ?7, failure_error = ?8,
-                         attempted_version = NULL, attempted_at = 0, updated_at = ?5
+                         attempted_version = NULL, attempted_at = 0, updated_at = ?5,
+                         automatic_blocked = CASE ?2 WHEN 'failed' THEN 1 WHEN 'passed' THEN 0
+                                                 ELSE automatic_blocked END
                      WHERE harness = ?1 AND attempted_version IS NOT NULL
                        AND attempted_version = ?9",
                     params![
@@ -521,13 +542,19 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// True when automatic routing must skip this harness: its current
-    /// installed version failed the check. Explicit Owner launches bypass
-    /// this gate. Unknown harnesses and unchecked versions never block.
+    /// True after a failed check, until a later run passes.
     pub fn harness_check_blocks_automatic(&self, harness: &str) -> Result<bool> {
-        Ok(self
-            .get_harness_check(harness)?
-            .is_some_and(|row| row.blocks_automatic()))
+        check_harness(harness)?;
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT automatic_blocked FROM harness_checks WHERE harness = ?1",
+                [harness],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+            .map(Option::unwrap_or_default)
     }
 
     /// Installed versions with a check run due, ordered by harness, at most

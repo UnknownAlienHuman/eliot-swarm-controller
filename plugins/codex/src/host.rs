@@ -3342,7 +3342,6 @@ fn codex_manifest() -> PluginManifest {
     PluginManifest::per_agent(
         "codex",
         env!("CARGO_PKG_VERSION"),
-        "0.161.0",
         &[
             "launch",
             "resume",

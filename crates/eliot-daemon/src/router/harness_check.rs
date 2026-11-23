@@ -28,6 +28,7 @@ pub(crate) struct HarnessCheckWork {
     harness: String,
     version: String,
     profile: String,
+    launch_command_id: String,
     send_command_id: String,
     deadline: Instant,
 }
@@ -251,15 +252,26 @@ impl Router {
         // directory. Hermetic like a provider probe, except the scenario
         // needs one native tool call, so MCP stays minimal while native
         // tools stay available.
-        let mut prepared = self
-            .prepare_submission(request, &Principal::Owner)
+        authorize_command(&Principal::Owner, &mut request)
+            .map_err(|error| (Box::new(error), "launch"))?;
+        let prepared = self
+            .prepare_submission_with_routing(
+                request,
+                &Principal::Owner,
+                false,
+                false,
+                routing::LaunchRouting {
+                    harness_check_version: Some(version),
+                    ..Default::default()
+                },
+                true,
+            )
             .await
             .map_err(|error| (Box::new(error), "launch"))?;
         let snapshot = prepared
             .request
             .args
-            .get_mut("profile_snapshot")
-            .and_then(Value::as_object_mut)
+            .get("profile_snapshot")
             .ok_or_else(|| {
                 (
                     Box::new(Error::new(
@@ -278,25 +290,18 @@ impl Router {
                 "launch",
             ));
         }
-        snapshot.insert(
-            eliot_core::HARNESS_CHECK_LAUNCH_ARG.to_owned(),
-            json!({"harness": harness, "version": version}),
-        );
-        snapshot.remove("collaboration_mode");
-        snapshot.insert(
-            "permissions".to_owned(),
-            Value::String("read-only".to_owned()),
-        );
-        snapshot.insert(
-            "approval_policy".to_owned(),
-            Value::String("never".to_owned()),
-        );
-        snapshot.insert(
-            "native_subagents".to_owned(),
-            Value::String("deny".to_owned()),
-        );
-        snapshot.insert("mcp".to_owned(), Value::String("minimal".to_owned()));
-        snapshot.insert("mcp_allow".to_owned(), json!([]));
+        let refusal = self
+            .inner
+            .store
+            .lock()
+            .await
+            .routing_refusal(profile, harness, snapshot, None)
+            .map_err(|error| (Box::new(error), "launch"))?;
+        if let Some(error) = refusal
+            && error.code == "provider_held"
+        {
+            return Err((Box::new(error), "launch"));
+        }
         let admission = self
             .admit_check_command(prepared)
             .await
@@ -324,6 +329,7 @@ impl Router {
             harness: harness.to_owned(),
             version: version.to_owned(),
             profile: profile.to_owned(),
+            launch_command_id: admission.command.id,
             send_command_id: send.id.clone(),
             deadline: Instant::now() + Duration::from_secs(eliot_core::HARNESS_CHECK_TIMEOUT_SECS),
         })
@@ -517,6 +523,15 @@ impl Router {
         work: &HarnessCheckWork,
         shutdown: &mut watch::Receiver<bool>,
     ) -> CheckResult<()> {
+        self.wait_for_check_command(
+            &work.launch_command_id,
+            "launch",
+            true,
+            shutdown,
+            work.deadline,
+        )
+        .await?
+        .ok_or(CheckEnd::Shutdown)?;
         // Steer needs a live turn: submit the steer as soon as the scenario
         // turn starts, while the Agent is still busy or waiting.
         let steer_id = self
@@ -752,6 +767,19 @@ impl Router {
                 if agent.active_turn.is_some() {
                     true
                 } else if send.state.is_terminal() {
+                    if send.state != CommandState::Applied {
+                        return Err(check_command_failure(&send, "turn_with_tool_call"));
+                    }
+                    if let (Some(generation), Some(turn_id)) =
+                        (send.generation, send.turn_id.as_deref())
+                        && let Some(turn) = store
+                            .get_turn(&work.agent_id, generation, turn_id)
+                            .map_err(|error| {
+                                CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
+                            })?
+                    {
+                        check_turn_verdict(&turn, "turn_with_tool_call")?;
+                    }
                     return Err(CheckEnd::fail(
                         "steer",
                         "harness_vendor",
@@ -824,11 +852,10 @@ impl Router {
                 };
                 if command.state == CommandState::Unknown || marks.causes.contains_key(&command.id)
                 {
-                    return Err(CheckEnd::fail(
-                        step,
-                        "unknown",
-                        "harness check command is unknown",
-                    ));
+                    return Err(check_command_failure(&command, step));
+                }
+                if command.state.is_terminal() && command.state != CommandState::Applied {
+                    return Err(check_command_failure(&command, step));
                 }
                 if command_settles && command.state.is_terminal() {
                     (command, None)
@@ -1062,6 +1089,34 @@ impl Router {
         self.signal_progress();
         Ok(admission)
     }
+}
+
+pub(super) fn configure_check_snapshot(snapshot: &mut Value, harness: &str, version: &str) {
+    if let Some(fields) = snapshot.as_object_mut() {
+        fields.remove("collaboration_mode");
+        fields.remove("setup");
+    }
+    snapshot[eliot_core::HARNESS_CHECK_LAUNCH_ARG] =
+        json!({"harness": harness, "version": version});
+    snapshot["permissions"] = json!("read-only");
+    snapshot["approval_policy"] = json!("never");
+    snapshot["native_subagents"] = json!("deny");
+    snapshot["mcp"] = json!("minimal");
+    snapshot["mcp_allow"] = json!([]);
+}
+
+fn check_command_failure(command: &Command, step: &'static str) -> CheckEnd {
+    let outcome = command.outcome.as_ref();
+    let text = |field| {
+        outcome
+            .and_then(|outcome| outcome.get(field))
+            .and_then(Value::as_str)
+    };
+    CheckEnd::fail(
+        step,
+        text("code").or_else(|| text("reason")).unwrap_or("unknown"),
+        text("message").unwrap_or("harness check command ended without a proven result"),
+    )
 }
 
 /// How a driven scenario ends: clean shutdown (record nothing), or a step

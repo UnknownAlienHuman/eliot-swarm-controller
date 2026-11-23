@@ -3320,7 +3320,6 @@ fn manifest_source_plan(manifest: &PluginManifest, harness: &str) -> Result<Valu
         || !manifest.available
         || manifest.mode != "per_agent"
         || manifest.version.trim().is_empty()
-        || manifest.harness_version.trim().is_empty()
     {
         return Err(unsupported_manifest());
     }

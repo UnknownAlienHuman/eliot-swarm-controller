@@ -2617,8 +2617,21 @@ impl Store {
                      failure_error TEXT,
                      attempted_version TEXT,
                      attempted_at INTEGER NOT NULL DEFAULT 0 CHECK(attempted_at >= 0),
+                     automatic_blocked INTEGER NOT NULL DEFAULT 0
+                         CHECK(automatic_blocked IN (0, 1)),
                      updated_at INTEGER NOT NULL DEFAULT 0 CHECK(updated_at >= 0)
-                 );",
+                 );
+                 CREATE TABLE harness_check_history (
+                     harness TEXT NOT NULL,
+                     version_key TEXT NOT NULL,
+                     checked_version TEXT NOT NULL,
+                     checked_at INTEGER NOT NULL,
+                     outcome TEXT NOT NULL CHECK(outcome IN ('passed', 'failed')),
+                     check_profile TEXT,
+                     failure_step TEXT,
+                     failure_error TEXT,
+                     PRIMARY KEY (harness, version_key)
+                 ) WITHOUT ROWID;",
             )
             .map_err(sql_error)?;
             tx.execute(

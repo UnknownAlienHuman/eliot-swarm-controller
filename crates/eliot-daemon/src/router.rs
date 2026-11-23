@@ -4091,12 +4091,25 @@ impl Router {
                 ));
             }
         } else {
-            let candidate = crate::adhoc::resolve_profile_command(
-                &profile_name,
-                &harness,
-                snapshot.get("cmd").and_then(Value::as_str),
-            )
-            .await?;
+            let check_version = routing.harness_check_version;
+            let selector = if check_version.is_some() {
+                None
+            } else {
+                snapshot.get("cmd").and_then(Value::as_str)
+            };
+            let candidate =
+                crate::adhoc::resolve_profile_command(&profile_name, &harness, selector).await?;
+            if let Some(version) = check_version {
+                if !candidate.version.as_deref().is_some_and(|actual| {
+                    eliot_core::same_harness_version(&harness, actual, version)
+                }) {
+                    return Err(Error::new(
+                        "unavailable",
+                        "installation version changed before the harness check launch",
+                    ));
+                }
+                harness_check::configure_check_snapshot(&mut snapshot, &harness, version);
+            }
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
         }
         // Reused parent snapshots already carry their frozen default; only
