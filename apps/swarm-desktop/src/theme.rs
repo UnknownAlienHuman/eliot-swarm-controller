@@ -501,6 +501,7 @@ impl StatusTone {
 /// attention color.
 pub const QUOTA_LOW: f64 = 20.0;
 
+#[cfg(windows)]
 pub mod winui {
     //! The roles as WinUI brushes, and as theme resource overrides for real
     //! `Button`s, the one control that takes Reactor `ResourceOverrides` in
