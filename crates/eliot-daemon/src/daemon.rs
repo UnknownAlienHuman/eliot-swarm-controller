@@ -1131,32 +1131,29 @@ async fn supervise(
                 }
             }
             accepted = listener.accept(), if accept_retry_at.is_none() => {
-                let (stream, error) = match accepted {
-                    Ok(stream) => (Some(stream), listener.take_replacement_error()),
-                    Err(error) => (None, Some(error)),
-                };
-                if let Some(error) = error {
-                    if router.is_force_requested() {
-                        break Ok(());
+                match accepted {
+                    Ok(stream) => {
+                        accept_failures = 0;
+                        if connections.len() < MAX_CLIENTS {
+                            let router = router.clone();
+                            let policy = Arc::clone(&policy);
+                            connections.spawn(async move {
+                                serve_connection(stream, router, policy).await;
+                            });
+                        } else {
+                            // At the connection limit the request was never read or routed.
+                            tokio::spawn(reply_overloaded(stream));
+                        }
                     }
-                    accept_failures = accept_failures.saturating_add(1);
-                    if accept_failures >= ACCEPT_FAILURE_LIMIT {
-                        break Err(report_accept_exhausted(&router, &policy, accept_failures, &error).await);
-                    }
-                    accept_retry_at = Some(note_accept_retry(&policy, accept_failures, &error));
-                } else {
-                    accept_failures = 0;
-                }
-                if let Some(stream) = stream {
-                    if connections.len() < MAX_CLIENTS {
-                        let router = router.clone();
-                        let policy = Arc::clone(&policy);
-                        connections.spawn(async move {
-                            serve_connection(stream, router, policy).await;
-                        });
-                    } else {
-                        // At the connection limit the request was never read or routed.
-                        tokio::spawn(reply_overloaded(stream));
+                    Err(error) => {
+                        if router.is_force_requested() {
+                            break Ok(());
+                        }
+                        accept_failures = accept_failures.saturating_add(1);
+                        if accept_failures >= ACCEPT_FAILURE_LIMIT {
+                            break Err(report_accept_exhausted(&router, &policy, accept_failures, &error).await);
+                        }
+                        accept_retry_at = Some(note_accept_retry(&policy, accept_failures, &error));
                     }
                 }
             }

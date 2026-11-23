@@ -2883,10 +2883,14 @@ and `pruned_through`. It also reports the automatic cleanup policy and latest
 sweep outcome, and `profile_command_issues` for missing explicitly pinned executables.
 
 Local IPC accept failures are logged and retried with bounded backoff.
-During the delay, admitted work and existing connections continue, and the
-daemon still honors shutdown. A successful accept with a usable listener
-clears the failure count. After 20 consecutive failures, the daemon records
-Owner attention and exits with `ipc_accept_exhausted`.
+On Windows, the listener creates a standby pipe instance before awaiting a
+connection on either instance. Failure to create the standby leaves the
+current instance in place for the retry. A failed connection retires the
+affected instance. Cancelling the connection wait preserves both instances.
+During waits and backoff, admitted work and existing connections continue,
+and the daemon still honors shutdown. A
+successful accept clears the failure count. After 20 consecutive failures,
+the daemon records Owner attention and exits with `ipc_accept_exhausted`.
 
 Drain rejects new turn-producing work and new automation, while continuing pre-admitted
 work and allowing exact stop/interrupt/request replies/cancel/detach/readback. Unknown
