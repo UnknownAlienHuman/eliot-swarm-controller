@@ -76,9 +76,11 @@ pub(super) fn new_note_paths(
         .map_err(sql_error)?;
     for path in paths {
         let key = stored_edit_path_key(kind, turn, path);
-        if !seen.insert(key.clone()) {
+        let keys = stored_edit_path_keys(kind, turn, path);
+        if keys.iter().any(|key| seen.contains(key)) {
             continue;
         }
+        seen.extend(keys);
         let legacy_key = stored_edit_path_legacy_key(kind, turn, path);
         let noted: bool = if turn_scoped {
             lookup_turn
@@ -162,9 +164,20 @@ pub(super) fn stored_edit_path_legacy_key(
     }
 }
 
+/// Keep canonical and raw aliases so a later unverified observation of the
+/// same path still matches the turn's original note.
+pub(super) fn stored_edit_path_keys(kind: &str, turn: &str, path: &ContextEditPath) -> Vec<String> {
+    let primary = stored_edit_path_key(kind, turn, path);
+    let legacy = stored_edit_path_legacy_key(kind, turn, path);
+    if primary == legacy {
+        vec![primary]
+    } else {
+        vec![primary, legacy]
+    }
+}
+
 fn turn_scoped_path_key(turn: &str, path_key: &str) -> String {
-    // The existing primary key stays bounded; only outside-worktree identity
-    // includes the turn. Other fact kinds retain generation-level dedup.
+    // Length-framed inputs produce one fixed-width per-turn path identity.
     let mut identity = Vec::with_capacity(16 + turn.len() + path_key.len());
     identity.extend_from_slice(&(turn.len() as u64).to_be_bytes());
     identity.extend_from_slice(turn.as_bytes());

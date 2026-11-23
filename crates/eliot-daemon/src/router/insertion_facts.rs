@@ -1,5 +1,5 @@
 use super::{Router, goal_scope::outside_scope};
-use crate::git_monitor::normalize_hint;
+use crate::git_monitor::{canonical_root, normalize_hint, reject_links};
 use eliot_core::{ContextEditPath, Event, MAX_CONTEXT_EDIT_PATH_BYTES, Result};
 use serde_json::Value;
 use std::{collections::BTreeSet, fs, path::Path};
@@ -302,7 +302,7 @@ fn verified_outside_path_key(workspace: &str, candidate: &str) -> Option<String>
     {
         return None;
     }
-    let Ok(root) = eliot_plugin::edit_path::canonical_root(workspace) else {
+    let Ok(root) = canonical_root(workspace) else {
         return None;
     };
     let candidate_path = if candidate_path.is_absolute() {
@@ -310,7 +310,7 @@ fn verified_outside_path_key(workspace: &str, candidate: &str) -> Option<String>
     } else {
         root.join(candidate_path)
     };
-    if eliot_plugin::edit_path::reject_links(&candidate_path).is_err() {
+    if reject_links(&candidate_path).is_err() {
         return None;
     }
     let Ok(candidate) = fs::canonicalize(candidate_path) else {
