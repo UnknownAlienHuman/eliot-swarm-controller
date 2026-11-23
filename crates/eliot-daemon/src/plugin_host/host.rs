@@ -2491,6 +2491,12 @@ async fn record_source_gap(
     credentials: &[String],
     until: Instant,
 ) -> Result<Value> {
+    let boundary: Option<eliot_core::CompactionGapBoundary> = params
+        .get("compaction_boundary")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| Error::new("invalid", "source.gap compaction boundary is malformed"))?;
     let mut gap: SourceGap = serde_json::from_value(params)
         .map_err(|_| Error::new("invalid", "source.gap params are malformed"))?;
     if gap.agent_id != binding.agent_id || gap.generation != binding.generation {
@@ -2502,10 +2508,15 @@ async fn record_source_gap(
     // Redaction changes only reason; immutable binding validation stays above.
     redact_source_gap(&mut gap, credentials)?;
     let subject = binding.expected_subject()?;
-    let (result, write_faulted) = {
+    let (result, write_faulted, can_continue) = {
         let mut store = timeout_at(until, store.lock())
             .await
             .map_err(|_| Error::new("busy", "Store lock deadline elapsed for source.gap"))?;
+        let can_continue = subject.is_none()
+            && match &boundary {
+                Some(boundary) => allow_compaction_gap(&store, &gap, boundary)?,
+                None => false,
+            };
         let result = match subject {
             Some(subject) => store.record_observed_source_gap(gap, subject, now_ms()),
             None => store.record_source_gap(gap, now_ms()),
@@ -2513,20 +2524,84 @@ async fn record_source_gap(
         if let Ok(change) = &result {
             bus.publish(&change.events);
         }
-        (result, store.is_write_faulted())
+        (result, store.is_write_faulted(), can_continue)
     };
     match result {
         Ok(change) => {
             let ack: SourceGapAck = change.value;
-            serde_json::to_value(ack).map_err(|_| {
+            let mut encoded = serde_json::to_value(ack).map_err(|_| {
                 Error::new(
                     "internal",
                     "source.gap acknowledgement could not be encoded",
                 )
-            })
+            })?;
+            if boundary.is_some() {
+                encoded["can_continue"] = json!(can_continue);
+            }
+            Ok(encoded)
         }
         Err(_) if write_faulted => Err(Error::new("unknown", "source.gap outcome is unknown")),
         Err(error) => Err(redact_native_error(error, credentials)),
+    }
+}
+
+fn allow_compaction_gap(
+    store: &eliot_store::Store,
+    gap: &SourceGap,
+    boundary: &eliot_core::CompactionGapBoundary,
+) -> Result<bool> {
+    let from = gap
+        .from
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok());
+    let to = gap
+        .to
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok());
+    if gap.source != "stream"
+        || to.is_none()
+        || from.and_then(|seq| seq.checked_add(1)) != to
+        || !boundary
+            .start_seq
+            .zip(from)
+            .is_some_and(|(start, missing)| start < missing)
+        || !boundary.usage.as_ref().is_some_and(|usage| {
+            [
+                usage.cost,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+            ]
+            .into_iter()
+            .all(|value| value.is_finite() && value >= 0.0)
+        })
+    {
+        return Ok(false);
+    }
+    let Some(agent) = store.get_agent(&gap.agent_id)?.filter(|agent| {
+        agent.harness == "opencode"
+            && agent.generation == gap.generation
+            && agent.native_ref.as_deref() == Some(boundary.native_ref.as_str())
+    }) else {
+        return Ok(false);
+    };
+    match &boundary.activity {
+        Some(eliot_core::CompactionActivity::Turn { turn_id }) => {
+            Ok(agent.active_turn.as_deref() == Some(turn_id.as_str()))
+        }
+        Some(eliot_core::CompactionActivity::Command { command_id })
+            if agent.state == eliot_core::AgentState::Idle && agent.active_turn.is_none() =>
+        {
+            Ok(store.get_command(command_id)?.is_some_and(|command| {
+                command.verb == "compact"
+                    && command.target.as_deref() == Some(gap.agent_id.as_str())
+                    && command.generation == Some(gap.generation)
+                    && command.state == eliot_core::CommandState::Dispatched
+            }))
+        }
+        _ => Ok(false),
     }
 }
 

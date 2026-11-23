@@ -608,6 +608,26 @@ counters, OpenCode also commits their checked per-call context sum as
 Swarm turn. Its native identity binds thread, turn and item. The manual compact command
 still settles through the existing native lifecycle. The installed app-server favors
 the item lifecycle over the deprecated `thread/compacted` notification.
+OpenCode uses the durable `session.compaction.ended` fact for the exact native
+session. The adapter includes `turn_id` when a Swarm turn is active. An idle
+compaction leaves the task card for the next input through the shared note path.
+The OpenCode public feed can omit durable records. The adapter reports a forward
+sequence gap with its native bounds. Before authorizing continuation, the daemon
+records the gap and checks that one cursor is missing after a matching native
+compaction start. The terminal must echo the provider's usage figures and bind
+to the current turn or an exact dispatched idle compaction command. This applies
+to both automatic and manual compaction. The source history stays incomplete
+at the recorded gap. Other unverified gaps fence the stream.
+Antigravity reports completed system checkpoints from the exact owned native
+conversation transcript. The isolated root supplies the path for private
+profiles. Inherited profiles can bind it from an authenticated `PreInvocation`
+callback that names the exact conversation transcript under the profile root.
+ACP prompt settlement reads complete rows forward from the retained byte offset.
+Resume establishes a baseline before reporting new checkpoints. The fact carries
+the native checkpoint index, and the task card waits for the next input.
+When the transcript is replaced, Swarm resets the offset and step watermark
+and uses the completed record digest to avoid replaying retained checkpoints.
+The transcript summary stays in the native store.
 An exactly associated OpenCode SSE execution terminal proves its status even when
 HTTP transcript enrichment is unavailable, including after the native server exits.
 Commit that status without final text or usage; unavailable enrichment is not a
@@ -819,9 +839,15 @@ callback and reports `claude.PreToolUse.additionalContext` or
 Both Claude tool hooks have a three-second native timeout and matching adapter deadlines.
 Empty responses contribute to `empty_after_tool_hooks` on the turn terminal.
 Only a context delivery emits a `hook.after_tool` receipt. A successful file write
-with an empty selection emits a `tool.file.edited` fact. The `edit_path` on both
-events carries a verified worktree-relative path or an outside-or-unverifiable
-SHA-256 and redacted basename. A native `compact_boundary` record yields
+with an empty selection emits a `tool.file.edited` fact. OpenCode and Antigravity
+also emit this fact for successful native edits with an attributable edit path.
+Antigravity checks a supplied tool name against its file mutation tools. With
+an omitted name, a native edit kind and structured diff establish the edit.
+Exceeding the diff-path capture bound records a tool coverage gap.
+The `edit_path` carries a verified worktree-relative path or an outside-or-unverifiable
+SHA-256 and redacted basename, with a bounded redacted path when available.
+Outside paths replace the user-profile prefix with `%USERPROFILE%` before persistence.
+A native `compact_boundary` record yields
 `session.context.compacted` and includes `turn_id` only for a committed active turn.
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 moving pending inserts to the next input at turn end substitutes for the Stop hook.

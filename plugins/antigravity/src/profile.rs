@@ -41,6 +41,7 @@ pub(crate) struct Plan {
     pub mcp_policy: eliot_core::McpPolicy,
     pub mcp_allow: Vec<String>,
     pub mcp_root: Option<PathBuf>,
+    pub checkpoint_root: Option<PathBuf>,
     mode: Option<String>,
     skip_permissions: bool,
 }
@@ -291,6 +292,9 @@ impl Plan {
         } else {
             None
         };
+        let checkpoint_root = mcp_root
+            .clone()
+            .or_else(|| default_native_data_root(&environment.variables));
         if let Some(root) = &mcp_root {
             let root = root.to_string_lossy();
             scope.push_str(&format!(
@@ -386,6 +390,7 @@ impl Plan {
             mcp_policy,
             mcp_allow,
             mcp_root,
+            checkpoint_root,
             mode,
             skip_permissions,
         })
@@ -569,6 +574,35 @@ impl Plan {
     fn native_roots(&self) -> Value {
         json!({"workspace": self.launch.cwd, "hook_discovery": self.hook_discovery})
     }
+}
+
+fn default_native_data_root(environment: &[(OsString, OsString)]) -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME"]
+    };
+    for name in names {
+        let selected = environment
+            .iter()
+            .find(|(key, _)| {
+                if cfg!(windows) {
+                    key.to_string_lossy().eq_ignore_ascii_case(name)
+                } else {
+                    key.as_os_str() == std::ffi::OsStr::new(name)
+                }
+            })
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os(name));
+        if let Some(home) = selected {
+            if home.is_empty() {
+                return None;
+            }
+            let home = PathBuf::from(home);
+            return home.is_absolute().then(|| home.join(".gemini"));
+        }
+    }
+    None
 }
 
 /// Bind the actual inherited/overridden config namespace. This names the

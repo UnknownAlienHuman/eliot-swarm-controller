@@ -1,5 +1,5 @@
 //! Filesystem containment for native edit observations.
-use eliot_core::{Error, Result};
+use eliot_core::{ContextEditPath, Error, Result, SecretPolicy};
 use std::{
     ffi::OsString,
     fs,
@@ -19,6 +19,73 @@ fn is_reparse_point(_: &fs::Metadata) -> bool {
 
 fn unavailable(message: &str) -> Error {
     Error::new("unavailable", message)
+}
+
+const USER_PROFILE: &str = "%USERPROFILE%";
+
+/// Prepare native edit evidence before it crosses the persisted event boundary.
+pub fn evidence(workspace: &str, path: &str, policy: &SecretPolicy) -> Option<ContextEditPath> {
+    if path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control) {
+        return None;
+    }
+    match normalize(workspace, path) {
+        Ok(path) => {
+            (policy.redact_text(&path) == path).then_some(ContextEditPath::Relative { path })
+        }
+        Err(_) => Some(outside_evidence(
+            &Path::new(workspace).join(path).to_string_lossy(),
+            policy,
+        )),
+    }
+}
+
+pub fn outside_evidence(path: &str, policy: &SecretPolicy) -> ContextEditPath {
+    ContextEditPath::outside(path, &display_outside(path), policy)
+}
+
+/// Mask the native user-profile prefix only on a component boundary.
+pub fn display_outside(path: &str) -> String {
+    let display = plain_path(path);
+    let Some(profile) = std::env::home_dir() else {
+        return display;
+    };
+    let profile = plain_path(&profile.to_string_lossy());
+    if !Path::new(&profile).is_absolute() {
+        return display;
+    }
+    let mut components = Path::new(&display).components();
+    for expected in Path::new(&profile).components() {
+        let matches = components.next().is_some_and(|found| {
+            if cfg!(windows) {
+                found.as_os_str().to_string_lossy().to_lowercase()
+                    == expected.as_os_str().to_string_lossy().to_lowercase()
+            } else {
+                found == expected
+            }
+        });
+        if !matches {
+            return display;
+        }
+    }
+    Path::new(USER_PROFILE)
+        .join(components.as_path())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Resolve a display alias solely for daemon verification, before redaction.
+pub fn resolve_display(workspace: &str, path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    match path.strip_prefix(USER_PROFILE) {
+        Ok(suffix) => Some(std::env::home_dir()?.join(suffix)),
+        Err(_) => Some(Path::new(workspace).join(path)),
+    }
+}
+
+fn plain_path(path: &str) -> String {
+    #[cfg(windows)]
+    let path = &path.replace('/', "\\");
+    eliot_core::display_path(path)
 }
 
 /// Normalize verified native file-change hints, including deleted files, without

@@ -51,8 +51,8 @@ pub use command::{
 };
 pub use context::{
     ContextEditPath, ContextItem, ContextNoteCounters, ContextOutcome, ContextWaitRequest,
-    InjectArgs, InjectPoint, RetainedInjectArgs, ReviewWorktreeState, STEER_DELIVERY_FIELD,
-    TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
+    InjectArgs, InjectPoint, MAX_CONTEXT_EDIT_PATH_BYTES, RetainedInjectArgs, ReviewWorktreeState,
+    STEER_DELIVERY_FIELD, TrustedReviewLabels, decode_retained_inject_args, turn_started_data,
 };
 pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
@@ -1459,6 +1459,35 @@ pub struct SourceGap {
 pub struct SourceGapAck {
     pub gap_id: String,
     pub seq: i64,
+}
+
+/// Native observations for a reported cursor gap at a compaction terminal.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionGapBoundary {
+    pub native_ref: String,
+    pub start_seq: Option<u64>,
+    pub activity: Option<CompactionActivity>,
+    pub usage: Option<CompactionUsageEcho>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CompactionActivity {
+    Turn { turn_id: String },
+    Command { command_id: String },
+}
+
+/// The provider figures echoed by the native terminal, without its summary.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionUsageEcho {
+    pub cost: f64,
+    pub input_tokens: f64,
+    pub output_tokens: f64,
+    pub reasoning_tokens: f64,
+    pub cache_read_tokens: f64,
+    pub cache_write_tokens: f64,
 }
 
 /// Bounded machine signal for Muse native view-health episodes. The Muse

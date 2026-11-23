@@ -1,8 +1,8 @@
 use super::{Router, goal_scope::outside_scope};
-use crate::git_monitor::normalize_hint;
-use eliot_core::{ContextEditPath, Event, Result};
+use crate::git_monitor::{canonical_root, normalize_hint, reject_links};
+use eliot_core::{ContextEditPath, Event, MAX_CONTEXT_EDIT_PATH_BYTES, Result};
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 const MAX_AGENT_EDITS_READ: usize = 1_000;
 
@@ -80,18 +80,45 @@ impl Router {
             if event.source == "stream"
                 && event.native_id.is_some()
                 && matches!(event.kind.as_str(), "hook.after_tool" | "tool.file.edited")
-                && let Ok(ContextEditPath::OutsideOrUnverifiable { sha256, basename }) =
-                    serde_json::from_value(event.data["edit_path"].clone())
-                && sha256.len() == 64
-                && sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && let Ok(ContextEditPath::OutsideOrUnverifiable {
+                    sha256,
+                    canonical_sha256: _,
+                    basename,
+                    path,
+                    path_redacted,
+                    ..
+                }) = serde_json::from_value(event.data["edit_path"].clone())
+                && valid_sha256(&sha256)
                 && !basename.contains(['/', '\\'])
                 && !basename.chars().any(char::is_control)
             {
+                let path = path.map(|path| eliot_plugin::edit_path::display_outside(&path));
+                let path_redacted = path_redacted
+                    || path
+                        .as_deref()
+                        .is_some_and(|path| policy.redact_text(path) != path);
+                let path = path.map(|path| policy.redact_text(&path)).filter(|path| {
+                    !path.is_empty()
+                        && path.len() <= MAX_CONTEXT_EDIT_PATH_BYTES
+                        && !path.chars().any(char::is_control)
+                });
+                let canonical_sha256 = if path_redacted {
+                    None
+                } else {
+                    path.as_deref()
+                        .and_then(|path| eliot_plugin::edit_path::resolve_display(workspace, path))
+                        .and_then(|path| {
+                            verified_outside_path_key(workspace, &path.to_string_lossy())
+                        })
+                };
                 outside_worktree.insert(ContextEditPath::OutsideOrUnverifiable {
                     sha256,
+                    canonical_sha256,
                     basename: eliot_core::api::truncate_bytes(&policy.redact_text(&basename), 240)
                         .0
                         .to_owned(),
+                    path,
+                    path_redacted,
                 });
             }
             for raw_path in event_edit_paths(event) {
@@ -104,8 +131,21 @@ impl Router {
                     changed_paths.insert(path);
                 } else {
                     let path = Path::new(workspace).join(raw_path);
-                    outside_worktree
-                        .insert(ContextEditPath::outside(&path.to_string_lossy(), &policy));
+                    let path_text = path.to_string_lossy();
+                    let mut edit = eliot_plugin::edit_path::outside_evidence(&path_text, &policy);
+                    if let ContextEditPath::OutsideOrUnverifiable {
+                        canonical_sha256,
+                        path_redacted,
+                        ..
+                    } = &mut edit
+                    {
+                        *canonical_sha256 = if *path_redacted {
+                            None
+                        } else {
+                            verified_outside_path_key(workspace, &path_text)
+                        };
+                    }
+                    outside_worktree.insert(edit);
                 }
             }
 
@@ -250,4 +290,55 @@ fn git_event_paths<'a>(event: &'a Event, workspace: &str) -> Vec<&'a str> {
                 .or_else(|| entry.as_str())
         })
         .collect()
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn verified_outside_path_key(workspace: &str, candidate: &str) -> Option<String> {
+    let candidate_path = Path::new(candidate);
+    if candidate.contains('\0')
+        || candidate_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let Ok(root) = canonical_root(workspace) else {
+        return None;
+    };
+    let candidate_path = if candidate_path.is_absolute() {
+        candidate_path.to_path_buf()
+    } else {
+        root.join(candidate_path)
+    };
+    if reject_links(&candidate_path).is_err() {
+        return None;
+    }
+    let Ok(candidate) = fs::canonicalize(candidate_path) else {
+        return None;
+    };
+    let root = root.to_string_lossy();
+    let candidate = candidate.to_string_lossy();
+    let root_key = eliot_core::workspace_path_key(root.as_ref());
+    let candidate_key = eliot_core::workspace_path_key(candidate.as_ref());
+    if path_key_is_within(root_key.as_ref(), candidate_key.as_ref()) {
+        None
+    } else {
+        Some(eliot_core::api::inference::sha256_hex(
+            candidate_key.as_bytes(),
+        ))
+    }
+}
+
+fn path_key_is_within(root: &str, candidate: &str) -> bool {
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return candidate.starts_with('/');
+    }
+    candidate == root
+        || candidate
+            .strip_prefix(root)
+            .is_some_and(|remainder| remainder.starts_with('/'))
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
@@ -34,10 +34,12 @@ use crate::{
     },
     native::{
         AcpUpdate, AgyClient, AgyFrame, FencedGuard, PermissionAsk, PermissionOption, PromptResult,
-        classify_update, default_permission_option, parse_permission_request,
+        ToolDiffPaths, classify_update, default_permission_option, parse_permission_request,
         permission_option_grants, prompt_turn_usage, session_usage_from_update,
     },
 };
+
+mod checkpoints;
 use ulid::Ulid;
 
 pub(crate) const FAMILIES: &[&str] = &["session", "turn", "message", "tool", "request"];
@@ -74,6 +76,22 @@ impl ToolStatus {
         }
     }
 }
+
+struct NativeToolState {
+    title: String,
+    status: ToolStatus,
+    native_file_edit_tool: Option<bool>,
+    edit_kind: bool,
+    diff_paths: ToolDiffPaths,
+}
+
+/// Native file mutation tool names documented by the AGY CLI.
+const NATIVE_FILE_EDIT_TOOLS: &[&str] = &[
+    "write_file",
+    "write_to_file",
+    "replace_file_content",
+    "multi_replace_file_content",
+];
 
 pub(crate) type LoadOutcome = (String, Result<Value>);
 
@@ -223,16 +241,22 @@ pub(crate) struct State {
     generation: i64,
     policy: SecretPolicy,
     pub conversation: String,
+    workspace: String,
     pending: Option<Pending>,
     pending_steer: Option<PendingSteer>,
     /// Lifecycle transitions already emitted per tool call, keyed
     /// `"{tool_call_id}:{kind}"`. Each transition is emitted once;
     /// later metadata deltas never re-emit.
-    tool_emitted: std::collections::HashSet<String>,
+    tool_emitted: HashSet<String>,
+    /// Tool calls whose successful terminal event was committed in this turn.
+    tool_completed_successfully: HashSet<String>,
+    tool_edit_gap_reported: bool,
+    /// Exact native diff paths already represented by a committed edit fact.
+    tool_file_edit_emitted: HashSet<(String, String)>,
     /// Partial tool-call deltas merged per vendor id before any event is
-    /// derived: `(title, status)` as last known. Updates may omit either
-    /// field, so absence alone is never a protocol gap.
-    tools: HashMap<String, (String, ToolStatus)>,
+    /// derived. Updates may omit any field, so absence alone is never a
+    /// protocol gap.
+    tools: HashMap<String, NativeToolState>,
     /// RAII registration of the outstanding fenced prompt call. Exactly
     /// one owner (this state); clearing it retires both transport maps.
     /// Held until the actual in-band terminal reply, an error, a stream
@@ -290,6 +314,9 @@ pub(crate) struct State {
     /// Monotonic counter for `session.usage` native ids so each accepted
     /// update commits under a unique identity.
     session_usage_seq: u64,
+    checkpoints: Option<checkpoints::Checkpoints>,
+    checkpoint_root: Option<std::path::PathBuf>,
+    checkpoint_resume: bool,
 }
 
 impl State {
@@ -320,6 +347,7 @@ impl State {
         generation: i64,
         policy: SecretPolicy,
         conversation: String,
+        workspace: String,
     ) -> Self {
         let (load_tx, _) = watch::channel(None);
         let (settlement, _) = watch::channel(None);
@@ -331,9 +359,13 @@ impl State {
             generation,
             policy,
             conversation,
+            workspace,
             pending: None,
             pending_steer: None,
-            tool_emitted: std::collections::HashSet::new(),
+            tool_emitted: HashSet::new(),
+            tool_completed_successfully: HashSet::new(),
+            tool_edit_gap_reported: false,
+            tool_file_edit_emitted: HashSet::new(),
             tools: HashMap::new(),
             fenced_guard: None,
             load_request_id: None,
@@ -364,6 +396,9 @@ impl State {
             session_usage: None,
             session_usage_committed: None,
             session_usage_seq: 0,
+            checkpoints: None,
+            checkpoint_root: None,
+            checkpoint_resume: false,
         }
     }
 
@@ -410,6 +445,18 @@ impl State {
             self.apply_update(queued.session_id, queued.update).await?;
         }
         Ok(())
+    }
+
+    pub fn bind_checkpoint_transcript(
+        &mut self,
+        root: Option<&std::path::Path>,
+        checkpoint_root: Option<&std::path::Path>,
+        resumed: bool,
+    ) {
+        self.checkpoint_resume = resumed;
+        self.checkpoint_root = checkpoint_root.map(std::path::Path::to_path_buf);
+        self.checkpoints =
+            root.and_then(|root| checkpoints::Checkpoints::bind(root, &self.conversation, resumed));
     }
 
     /// Bind the retained session and arm both the exact load filter and
@@ -678,6 +725,9 @@ impl State {
         self.idle_tool_gap_reported = false;
         self.cancellation = None;
         self.tool_emitted.clear();
+        self.tool_completed_successfully.clear();
+        self.tool_edit_gap_reported = false;
+        self.tool_file_edit_emitted.clear();
         self.tools.clear();
         self.clear_fenced();
         self.reset_assistant_text();
@@ -932,12 +982,18 @@ impl State {
                 .await;
         }
         publication?;
-        if !self.tools.contains_key(&ask.tool_call_id) {
-            if self.tools.len() < MAX_LIVE_TOOLS {
-                self.merge_tool(&ask.tool_call_id, &ask.title, "pending");
-            } else {
-                self.record_unattributed_tool().await?;
-            }
+        let known_tool = self.tools.contains_key(&ask.tool_call_id);
+        if known_tool || self.tools.len() < MAX_LIVE_TOOLS {
+            self.merge_tool(
+                &ask.tool_call_id,
+                &ask.title,
+                if known_tool { "" } else { "pending" },
+                ask.tool_kind.as_deref(),
+                ask.tool_name.as_deref(),
+                &ToolDiffPaths::default(),
+            );
+        } else {
+            self.record_unattributed_tool().await?;
         }
         if let Some(command_id) = self.cancellation_for_pending().map(str::to_owned) {
             self.answer_pending_cancelled(client, &command_id, Some(&turn_id))
@@ -1554,6 +1610,9 @@ impl State {
             AcpUpdate::ToolCall {
                 tool_call_id,
                 title,
+                tool_kind,
+                tool_name,
+                diff_paths,
                 status,
             } => {
                 let turn = &self.pending.as_ref().expect("prepared tool call").turn;
@@ -1566,13 +1625,22 @@ impl State {
                 if !self.tools.contains_key(&tool_call_id) {
                     self.finish_message_before_tool().await?;
                 }
-                self.merge_tool(&tool_call_id, &title, &status);
-                self.tool_event(&tool_call_id, "tool.started", "running")
-                    .await
+                self.merge_tool(
+                    &tool_call_id,
+                    &title,
+                    &status,
+                    tool_kind.as_deref(),
+                    tool_name.as_deref(),
+                    &diff_paths,
+                );
+                self.publish_tool_status(&tool_call_id).await
             }
             AcpUpdate::ToolCallUpdate {
                 tool_call_id,
                 title,
+                tool_kind,
+                tool_name,
+                diff_paths,
                 status,
             } => {
                 if tool_call_id.trim().is_empty() {
@@ -1588,26 +1656,15 @@ impl State {
                 if self.pending.is_none() || !self.tools.contains_key(&tool_call_id) {
                     return self.record_unattributed_tool().await;
                 }
-                self.merge_tool(&tool_call_id, title.as_deref().unwrap_or(""), &status);
-                match self.tools[&tool_call_id].1 {
-                    ToolStatus::Pending => Ok(()),
-                    ToolStatus::InProgress => {
-                        self.tool_event(&tool_call_id, "tool.started", "running")
-                            .await
-                    }
-                    ToolStatus::Completed => {
-                        self.tool_event(&tool_call_id, "tool.completed", "completed")
-                            .await
-                    }
-                    ToolStatus::Failed => {
-                        self.tool_event(&tool_call_id, "tool.completed", "failed")
-                            .await
-                    }
-                    _ => Err(Error::new(
-                        "native_protocol",
-                        "Antigravity tool call status is unknown",
-                    )),
-                }
+                self.merge_tool(
+                    &tool_call_id,
+                    title.as_deref().unwrap_or(""),
+                    &status,
+                    tool_kind.as_deref(),
+                    tool_name.as_deref(),
+                    &diff_paths,
+                );
+                self.publish_tool_status(&tool_call_id).await
             }
             AcpUpdate::Unknown(kind) => Err(Error::new(
                 "native_protocol",
@@ -1640,6 +1697,33 @@ impl State {
             self.idle_tool_gap_reported = true;
         }
         Ok(())
+    }
+
+    async fn publish_tool_status(&mut self, tool_call_id: &str) -> Result<()> {
+        match self
+            .tools
+            .get(tool_call_id)
+            .map(|tool| tool.status)
+            .unwrap_or(ToolStatus::Unknown)
+        {
+            ToolStatus::Pending | ToolStatus::InProgress => {
+                self.tool_event(tool_call_id, "tool.started", "running")
+                    .await
+            }
+            ToolStatus::Completed => {
+                self.tool_event(tool_call_id, "tool.completed", "completed")
+                    .await?;
+                self.tool_file_edited(tool_call_id).await
+            }
+            ToolStatus::Failed => {
+                self.tool_event(tool_call_id, "tool.completed", "failed")
+                    .await
+            }
+            ToolStatus::Unknown => Err(Error::new(
+                "native_protocol",
+                "Antigravity tool call status is unknown",
+            )),
+        }
     }
 
     /// Commit one accepted session snapshot as its own `session.usage` fact,
@@ -1779,20 +1863,46 @@ impl State {
         self.text_accum.push_str(text);
     }
 
-    /// Merge one partial tool-call delta into the known per-id state.
-    /// Empty title/status mean "unchanged", never "cleared": an update
-    /// that omits a field inherits the last known value, so only a delta
-    /// that still has no known status is a real protocol gap.
-    fn merge_tool(&mut self, tool_call_id: &str, title: &str, status: &str) {
+    /// Merge partial tool-call facts into the known per-id state. Empty
+    /// title/status and omitted name/kind inherit their last known values;
+    /// exact diff paths accumulate until the turn is cleared.
+    fn merge_tool(
+        &mut self,
+        tool_call_id: &str,
+        title: &str,
+        status: &str,
+        tool_kind: Option<&str>,
+        tool_name: Option<&str>,
+        diff_paths: &ToolDiffPaths,
+    ) {
         let known = self
             .tools
             .entry(tool_call_id.to_owned())
-            .or_insert_with(|| (String::new(), ToolStatus::Unknown));
+            .or_insert_with(|| NativeToolState {
+                title: String::new(),
+                status: ToolStatus::Unknown,
+                native_file_edit_tool: None,
+                edit_kind: false,
+                diff_paths: ToolDiffPaths::default(),
+            });
         if !title.is_empty() {
-            known.0 = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
+            known.title = self.policy.redact_bounded(title, MAX_TOOL_TITLE_BYTES);
         }
         if !status.is_empty() {
-            known.1 = ToolStatus::parse(status);
+            known.status = ToolStatus::parse(status);
+        }
+        if let Some(name) = tool_name {
+            known.native_file_edit_tool = Some(
+                known.native_file_edit_tool.unwrap_or(true)
+                    && NATIVE_FILE_EDIT_TOOLS.contains(&name),
+            );
+        }
+        if let Some(tool_kind) = tool_kind {
+            known.edit_kind = tool_kind == "edit";
+        }
+        known.diff_paths.overflowed |= diff_paths.overflowed;
+        for path in &diff_paths.paths {
+            known.diff_paths.insert(path);
         }
     }
 
@@ -1830,12 +1940,68 @@ impl State {
         let title = self
             .tools
             .get(tool_call_id)
-            .map(|(title, _)| title.clone())
+            .map(|tool| tool.title.clone())
             .unwrap_or_default();
         let mut data = json!({"command_id": pending.command, "turn_id": turn,
             "item_id": item, "tool": title, "status": status});
         self.policy.redact_values(&mut data);
-        self.commit(kind, &turn, &item, data).await
+        self.commit(kind, &turn, &item, data).await?;
+        if kind == "tool.completed" && status == "completed" {
+            self.tool_completed_successfully
+                .insert(tool_call_id.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn tool_file_edited(&mut self, tool_call_id: &str) -> Result<()> {
+        if !self.tool_completed_successfully.contains(tool_call_id) {
+            return Ok(());
+        }
+        let Some(tool) = self.tools.get(tool_call_id) else {
+            return Ok(());
+        };
+        // AGY can classify the mutation by ACP kind without sending a tool name.
+        if !tool.native_file_edit_tool.unwrap_or(tool.edit_kind) {
+            return Ok(());
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return Ok(());
+        };
+        let command = pending.command.clone();
+        let turn = pending.turn.clone();
+        let diff_paths = tool.diff_paths.paths.clone();
+        if tool.diff_paths.overflowed && !self.tool_edit_gap_reported {
+            self.record_coverage_gap(
+                "Antigravity native edit paths overflowed the per-tool bound",
+                &["tool"],
+            )
+            .await?;
+            self.tool_edit_gap_reported = true;
+        }
+
+        for (index, path) in diff_paths.into_iter().enumerate() {
+            let emitted_key = (tool_call_id.to_owned(), path.clone());
+            if self.tool_file_edit_emitted.contains(&emitted_key) {
+                continue;
+            }
+            let Some(edit_path) =
+                eliot_plugin::edit_path::evidence(&self.workspace, &path, &self.policy)
+            else {
+                continue;
+            };
+            let base_item = format!("tool-{tool_call_id}");
+            let item = format!("{base_item}:edit:{index}");
+            let data = json!({
+                "command_id": command,
+                "turn_id": turn,
+                "item_id": base_item,
+                "status": "completed",
+                "edit_path": edit_path,
+            });
+            self.commit("tool.file.edited", &turn, &item, data).await?;
+            self.tool_file_edit_emitted.insert(emitted_key);
+        }
+        Ok(())
     }
 
     /// Settle the prepared turn from the terminal `session/prompt`
@@ -1904,6 +2070,27 @@ impl State {
             .as_ref()
             .ok_or_else(|| Error::new("unknown", "Antigravity turn is absent"))?;
         let (command, turn) = (pending.command.clone(), pending.turn.clone());
+        if let Some(checkpoints) = &mut self.checkpoints {
+            let records = checkpoints.read_new();
+            if checkpoints.take_identity_gap() {
+                self.record_coverage_gap(
+                    "Antigravity transcript exceeded the checkpoint identity bound",
+                    &["session"],
+                )
+                .await?;
+            }
+            for checkpoint in records {
+                // The transcript proves a session checkpoint, even if its
+                // write reached disk after an earlier prompt settled.
+                self.commit(
+                    "session.context.compacted",
+                    "session",
+                    &format!("checkpoint-{}", checkpoint.identity),
+                    json!({"step_index": checkpoint.step_index}),
+                )
+                .await?;
+            }
+        }
         let failed = status == "failed";
         // Canonical outcome decided here at the plugin boundary from the
         // Antigravity terminal vocabulary (`completed` | `failed` |
@@ -2302,6 +2489,17 @@ async fn handle_hook_callback(
     let live_binding = {
         let mut state = state.lock().await;
         if origin_is_live && state.hook_binding_is_live(&binding) {
+            if state.checkpoints.is_none()
+                && let Some(path) = callback.input().transcript_path.as_deref()
+                && let Some(root) = state.checkpoint_root.as_deref()
+            {
+                state.checkpoints = checkpoints::Checkpoints::from_hook(
+                    std::path::Path::new(path),
+                    root,
+                    &state.conversation,
+                    state.checkpoint_resume,
+                );
+            }
             Some((
                 state.take_pending_steer(&binding.turn),
                 state.host.clone(),

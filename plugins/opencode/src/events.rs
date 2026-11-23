@@ -116,6 +116,7 @@ const REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 #[derive(Default)]
 struct ToolPart {
     name: Option<String>,
+    write_path: Option<String>,
     started: bool,
     completed: bool,
 }
@@ -214,6 +215,7 @@ enum Control {
         reply: oneshot::Sender<InboxRecord>,
     },
     BeginCompact {
+        command_id: String,
         terminal: oneshot::Sender<(String, bool)>,
         reply: oneshot::Sender<Result<()>>,
     },
@@ -286,9 +288,16 @@ struct PendingInbox {
 }
 
 struct CompactWatch {
+    command_id: String,
     input: Option<String>,
     result: Option<bool>,
     terminal: oneshot::Sender<(String, bool)>,
+}
+
+struct CompactionStart {
+    seq: u64,
+    reason: &'static str,
+    activity: Option<eliot_core::CompactionActivity>,
 }
 
 /// Verdict for one steered input watched against its exact turn.
@@ -358,6 +367,7 @@ struct EventProcessor {
     gap_reported: bool,
     pending: Option<PendingInbox>,
     compaction: Option<CompactWatch>,
+    compaction_start: Option<CompactionStart>,
     last_compaction_terminal: Option<String>,
     /// Inbox id of the currently open turn: the prompt response id, which
     /// is the user message id the terminal readback bounds against.
@@ -444,10 +454,17 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
-    pub async fn begin_compaction(&self) -> Result<oneshot::Receiver<(String, bool)>> {
+    pub async fn begin_compaction(
+        &self,
+        command_id: &str,
+    ) -> Result<oneshot::Receiver<(String, bool)>> {
         let (terminal, result) = oneshot::channel();
         self.actor
-            .call(|reply| Control::BeginCompact { terminal, reply })
+            .call(|reply| Control::BeginCompact {
+                command_id: command_id.to_owned(),
+                terminal,
+                reply,
+            })
             .await??;
         Ok(result)
     }
@@ -699,6 +716,7 @@ impl EventProcessor {
             gap_reported: false,
             pending: None,
             compaction: None,
+            compaction_start: None,
             last_compaction_terminal: None,
             active_model: None,
             tool_parts: HashMap::new(),
@@ -807,7 +825,11 @@ impl EventProcessor {
                 });
                 true
             }
-            Control::BeginCompact { terminal, reply } => {
+            Control::BeginCompact {
+                command_id,
+                terminal,
+                reply,
+            } => {
                 let result = if self.status.active_turn_id.is_some()
                     || self.pending.is_some()
                     || self.stashed_started.is_some()
@@ -825,6 +847,7 @@ impl EventProcessor {
                 } else {
                     self.status.compaction_in_flight = true;
                     self.compaction = Some(CompactWatch {
+                        command_id,
                         input: None,
                         result: None,
                         terminal,
@@ -991,6 +1014,11 @@ impl EventProcessor {
     fn should_buffer(&self, event_type: &str) -> bool {
         if !self.status.ready {
             return event_type != "server.connected";
+        }
+        // Idle compaction has no pending send. Its execution terminal must
+        // reach the watcher while the native start is still stashed.
+        if self.compaction.is_some() {
+            return false;
         }
         if matches!(
             event_type,
@@ -1646,6 +1674,16 @@ impl EventProcessor {
     }
 
     async fn process_envelope(&mut self, envelope: SseEnvelope) -> Result<()> {
+        if matches!(
+            envelope.event_type.as_str(),
+            "session.compaction.started" | "session.compaction.ended" | "session.compaction.failed"
+        ) && envelope.durable.as_ref().is_some_and(|durable| {
+            self.status.session_id.as_deref() == Some(durable.aggregate_id.as_str())
+                && self.expected_seq.is_some_and(|next| durable.seq < next)
+        }) {
+            // Keep a replay bound to the original observation, even after its turn ends.
+            return Ok(());
+        }
         let next_retry = envelope.event_type == "session.retry.scheduled"
             && envelope.durable.as_ref().is_some_and(|durable| {
                 self.expected_seq == Some(durable.seq)
@@ -1665,10 +1703,7 @@ impl EventProcessor {
             "session.execution.started" => self.observe_execution_started(&envelope).await,
             "session.compaction.started"
             | "session.compaction.ended"
-            | "session.compaction.failed" => {
-                self.observe_compaction(&envelope);
-                Ok(())
-            }
+            | "session.compaction.failed" => self.observe_compaction(&envelope).await,
             "session.retry.scheduled" if next_retry => {
                 self.observe_retry_scheduled(&envelope).await
             }
@@ -1703,24 +1738,120 @@ impl EventProcessor {
         }
     }
 
-    fn observe_compaction(&mut self, envelope: &SseEnvelope) {
-        if self.status.session_id.as_deref() != envelope.data["sessionID"].as_str()
-            || envelope.data["reason"] != "manual"
-            || self.stashed_started.is_none()
-        {
-            return;
-        }
-        let Some(watch) = self.compaction.as_mut() else {
-            return;
+    async fn observe_compaction(&mut self, envelope: &SseEnvelope) -> Result<()> {
+        let Some(session_id) = self.status.session_id.clone() else {
+            return Ok(());
         };
-        match envelope.event_type.as_str() {
-            "session.compaction.started" if watch.input.is_none() => {
-                watch.input = envelope.data["inputID"].as_str().map(str::to_owned);
+        if envelope.data["sessionID"].as_str() != Some(session_id.as_str()) {
+            if envelope
+                .durable
+                .as_ref()
+                .is_some_and(|durable| durable.aggregate_id.as_str() == session_id.as_str())
+            {
+                self.record_source_gap_once(
+                    "OpenCode compaction event session identity disagreed with its durable aggregate",
+                )
+                .await?;
             }
-            "session.compaction.ended" if watch.input.is_some() => watch.result = Some(true),
-            "session.compaction.failed" if watch.input.is_some() => watch.result = Some(false),
+            return Ok(());
+        }
+        if envelope
+            .durable
+            .as_ref()
+            .is_some_and(|durable| durable.aggregate_id.as_str() != session_id.as_str())
+        {
+            self.record_source_gap_once(
+                "OpenCode compaction event durability disagreed with its session",
+            )
+            .await?;
+            return Ok(());
+        }
+        if envelope.id.trim().is_empty() {
+            self.record_source_gap_once("OpenCode compaction event omitted its native identity")
+                .await?;
+            return Ok(());
+        }
+
+        let reason = match envelope.data["reason"].as_str() {
+            Some("auto") => "auto",
+            Some("manual") => "manual",
+            _ => "unknown",
+        };
+        let input_id = envelope.data["inputID"]
+            .as_str()
+            .filter(|input| !input.trim().is_empty());
+
+        if self.stashed_started.is_some()
+            && reason == "manual"
+            && envelope.durable.is_some()
+            && let Some(watch) = self.compaction.as_mut()
+        {
+            match envelope.event_type.as_str() {
+                "session.compaction.started" if watch.input.is_none() => {
+                    watch.input = input_id.map(str::to_owned);
+                }
+                "session.compaction.ended"
+                    if watch.input.is_some()
+                        && (input_id.is_none() || watch.input.as_deref() == input_id) =>
+                {
+                    watch.result = Some(true);
+                }
+                "session.compaction.failed"
+                    if watch.input.as_deref().is_some() && watch.input.as_deref() == input_id =>
+                {
+                    watch.result = Some(false);
+                }
+                _ => {}
+            }
+        }
+
+        match envelope.event_type.as_str() {
+            "session.compaction.started" => {
+                self.compaction_start = envelope.durable.as_ref().map(|durable| CompactionStart {
+                    seq: durable.seq,
+                    reason,
+                    activity: self.compaction_activity(),
+                });
+            }
+            "session.compaction.ended" | "session.compaction.failed" => {
+                self.compaction_start = None;
+            }
             _ => {}
         }
+
+        if envelope.event_type == "session.compaction.ended" {
+            let native_id = event_id(
+                &session_id,
+                "session",
+                &envelope.id,
+                "session.context.compacted",
+                "opencode",
+                "OpenCode",
+            )?;
+            let mut data = json!({"reason": reason});
+            if envelope.durable.is_none() {
+                data["durability"] = json!("unknown");
+            } else if let Some(turn_id) = self.status.active_turn_id.as_deref() {
+                data["turn_id"] = json!(turn_id);
+            }
+            self.commit_event("session.context.compacted", native_id, data)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn compaction_activity(&self) -> Option<eliot_core::CompactionActivity> {
+        if let Some(turn_id) = &self.status.active_turn_id {
+            return Some(eliot_core::CompactionActivity::Turn {
+                turn_id: turn_id.clone(),
+            });
+        }
+        let watch = self.compaction.as_ref()?;
+        (self.stashed_started.is_some() && watch.input.is_some()).then(|| {
+            eliot_core::CompactionActivity::Command {
+                command_id: watch.command_id.clone(),
+            }
+        })
     }
 
     async fn observe_retry_scheduled(&mut self, envelope: &SseEnvelope) -> Result<()> {
@@ -1791,9 +1922,64 @@ impl EventProcessor {
                 // A duplicate replay of an already-seen record: ignore.
                 Ok(())
             }
-            _ => {
-                self.record_gap("OpenCode event stream skipped durable sequence numbers")
-                    .await?;
+            Some(expected) => {
+                let kind = envelope.event_type.as_str();
+                let kind = if kind.len() <= 96
+                    && kind.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    }) {
+                    kind
+                } else {
+                    "unknown"
+                };
+                let reason = format!(
+                    "OpenCode event stream skipped durable sequence numbers: expected {expected}, saw {} ({kind})",
+                    durable.seq
+                );
+                if self.gap_reported {
+                    return Err(Error::new(
+                        "unknown",
+                        "OpenCode native source already has a gap",
+                    ));
+                }
+                if matches!(
+                    kind,
+                    "session.compaction.ended" | "session.compaction.failed"
+                ) && envelope.data["sessionID"].as_str() == Some(session_id.as_str())
+                {
+                    let activity = self.compaction_activity();
+                    let start_seq = self
+                        .compaction_start
+                        .as_ref()
+                        .filter(|start| {
+                            envelope.data["reason"].as_str() == Some(start.reason)
+                                && start.activity == activity
+                        })
+                        .map(|start| start.seq);
+                    let boundary = eliot_core::CompactionGapBoundary {
+                        native_ref: session_id,
+                        start_seq,
+                        activity,
+                        usage: compaction_usage_echo(&envelope.data),
+                    };
+                    if self
+                        .stream_source()
+                        .record_compaction_gap(&reason, expected, durable.seq, boundary)
+                        .await?
+                    {
+                        self.expected_seq = Some(durable.seq.saturating_add(1));
+                        return Ok(());
+                    }
+                } else {
+                    self.stream_source()
+                        .record_gap_range_until(
+                            &reason,
+                            Some(expected.to_string()),
+                            Some(durable.seq.to_string()),
+                            Instant::now() + REPLY_DEADLINE,
+                        )
+                        .await?;
+                }
                 Err(Error::new(
                     "unknown",
                     "OpenCode native facts were lost in transport",
@@ -2004,6 +2190,12 @@ impl EventProcessor {
             return Ok(());
         }
         let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
+        if matches!(tool.as_str(), "write" | "edit") {
+            part.write_path = envelope.data["input"]["path"]
+                .as_str()
+                .filter(|path| path.len() <= 4096)
+                .map(str::to_owned);
+        }
         let mut data = json!({
             "command_id": command_id,
             "turn_id": turn_id,
@@ -2118,6 +2310,7 @@ impl EventProcessor {
                 .await;
         }
         let tool = part.name.clone().unwrap_or_else(|| "tool".to_owned());
+        let write_path = part.write_path.take();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id,
@@ -2144,8 +2337,68 @@ impl EventProcessor {
             "OpenCode",
         )?;
         self.commit_event("tool.completed", native_id, data).await?;
+        if !failed && envelope.data["executed"] != true {
+            self.commit_file_edits(
+                &terminal,
+                &turn_id,
+                &tool,
+                write_path.as_deref(),
+                &envelope.data,
+                &secrets,
+            )
+            .await?;
+        }
         if let Some(part) = self.tool_parts.get_mut(&terminal.id) {
             part.completed = true;
+        }
+        Ok(())
+    }
+
+    async fn commit_file_edits(
+        &mut self,
+        terminal: &ToolEventData,
+        turn_id: &str,
+        tool: &str,
+        write_path: Option<&str>,
+        data: &Value,
+        policy: &SecretPolicy,
+    ) -> Result<()> {
+        let files = data["metadata"]["files"].as_array();
+        let paths: Vec<_> = match (tool, files) {
+            ("edit" | "patch", Some(files)) => files
+                .iter()
+                .filter_map(|file| file["file"].as_str())
+                .collect(),
+            ("write" | "edit", _) => write_path.into_iter().collect(),
+            _ => return Ok(()),
+        };
+        for (index, path) in paths.iter().take(MAX_TOOL_PARTS).enumerate() {
+            if let Some(edit_path) =
+                eliot_plugin::edit_path::evidence(self.http.directory(), path, policy)
+            {
+                let id = event_id(
+                    &terminal.session_id,
+                    turn_id,
+                    &format!("{}:{index}", terminal.id),
+                    "tool.file.edited",
+                    "opencode",
+                    "OpenCode",
+                )?;
+                self.commit_event(
+                    "tool.file.edited",
+                    id,
+                    json!({"turn_id":turn_id,"edit_path":edit_path}),
+                )
+                .await?;
+            }
+        }
+        if paths.len() > MAX_TOOL_PARTS {
+            self.stream_source()
+                .record_coverage_gap(
+                    "OpenCode file edits overflowed the tool fact bound",
+                    &["tool"],
+                )
+                .await?;
         }
         Ok(())
     }
@@ -3076,6 +3329,13 @@ impl EventProcessor {
         self.stream_source().record_gap(reason).await
     }
 
+    async fn record_source_gap_once(&mut self, reason: &str) -> Result<()> {
+        if !self.gap_reported {
+            self.record_gap(reason).await?;
+        }
+        Ok(())
+    }
+
     /// The shared stream-commit half of this processor.
     fn stream_source(&mut self) -> StreamSource<'_> {
         StreamSource {
@@ -3095,6 +3355,18 @@ impl EventProcessor {
             failure: &mut self.status.failure,
         }
     }
+}
+
+fn compaction_usage_echo(data: &Value) -> Option<eliot_core::CompactionUsageEcho> {
+    let tokens = &data["tokens"];
+    Some(eliot_core::CompactionUsageEcho {
+        cost: data["cost"].as_f64()?,
+        input_tokens: tokens["input"].as_f64()?,
+        output_tokens: tokens["output"].as_f64()?,
+        reasoning_tokens: tokens["reasoning"].as_f64()?,
+        cache_read_tokens: tokens["cache"]["read"].as_f64()?,
+        cache_write_tokens: tokens["cache"]["write"].as_f64()?,
+    })
 }
 
 fn optional_terminal_readback(result: Result<TurnReadback>) -> Result<Option<TerminalReadback>> {
