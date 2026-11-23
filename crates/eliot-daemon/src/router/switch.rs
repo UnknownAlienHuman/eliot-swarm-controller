@@ -5,7 +5,7 @@ use eliot_core::api::{
     HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchRequest,
 };
 
-async fn canonical_checkout_identity(workspace: &str) -> Result<(String, String)> {
+async fn canonical_checkout_identity(workspace: &str) -> (String, String) {
     let root = match crate::workspace_git::WorkspaceGit::new() {
         Ok(git) => match git.discover_repository_identity(workspace).await {
             Ok((root, _, _)) => root,
@@ -14,7 +14,7 @@ async fn canonical_checkout_identity(workspace: &str) -> Result<(String, String)
         Err(_) => canonical_directory_or_input(workspace),
     };
     let key = eliot_core::workspace_path_key(&root).into_owned();
-    Ok((root, key))
+    (root, key)
 }
 
 fn canonical_directory_or_input(path: &str) -> String {
@@ -62,7 +62,7 @@ impl Router {
         };
         let mut snapshot = Vec::with_capacity(inputs.len());
         for (agent, generation, workspace) in inputs {
-            let (_, key) = canonical_checkout_identity(&workspace).await?;
+            let (_, key) = canonical_checkout_identity(&workspace).await;
             snapshot.push((agent, generation, workspace, key));
         }
         Ok(snapshot)
@@ -165,7 +165,7 @@ impl Router {
             return Err(Error::new("stale_generation", "source generation moved"));
         }
         let source_identity = match source.workspace.as_deref() {
-            Some(workspace) => Some(canonical_checkout_identity(workspace).await?),
+            Some(workspace) => Some(canonical_checkout_identity(workspace).await),
             None => None,
         };
         let live_checkout_snapshot = self.switch_live_checkout_snapshot().await?;
@@ -507,7 +507,7 @@ impl Router {
                         .get("workspace")
                         .and_then(Value::as_str)
                         .ok_or_else(|| Error::new("invalid", "switch launch has no checkout"))?;
-                    canonical_checkout_identity(workspace).await?
+                    canonical_checkout_identity(workspace).await
                 }
             };
             let same_checkout = source_checkout_key

@@ -15,6 +15,71 @@ const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 const OWNER_AUTOMATION: &str = "owner_automation";
 const CONTINUATION: &str = "continuation";
 const REQUESTED_BY: &str = "requested_by";
+
+/// A resumed source must not race the successor after the switch has stopped it.
+pub(super) fn require_no_active_checkout_switch(connection: &Connection, agent: i64) -> Result<()> {
+    let active: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM switch_checkout_owners
+         WHERE agent = ?1 AND switch_command IS NOT NULL)",
+            [agent],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if active {
+        return Err(Error::new(
+            "busy",
+            "checkout is fenced by an unsettled switch",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_checkout_launch_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+    workspace: Option<&str>,
+) -> Result<()> {
+    let Some(workspace) = workspace else {
+        return Ok(());
+    };
+    let key = core::workspace_path_key(workspace);
+    let parent: Option<String> = tx
+        .query_row(
+            "SELECT parent_command FROM commands
+         WHERE id = ?1 AND link_kind = 'switch' AND ordinal = 0",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let mut statement = tx
+        .prepare_cached(
+            "SELECT checkout_key, switch_command FROM switch_checkout_owners
+         WHERE switch_command IS NOT NULL",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (checkout, switch) = row.map_err(sql_error)?;
+        if parent.as_deref() != Some(&switch)
+            && (checkout == key
+                || key
+                    .strip_prefix(checkout.as_str())
+                    .is_some_and(|suffix| suffix.starts_with('/')))
+        {
+            return Err(Error::new(
+                "busy",
+                "checkout is fenced by an unsettled switch",
+            ));
+        }
+    }
+    Ok(())
+}
 const SOURCE_STOP_COMMAND: &str = "switch_source_stop_command";
 const SOURCE_CHECKOUT: &str = "switch_source_checkout";
 const SOURCE_CHECKOUT_ROOT: &str = "switch_source_checkout_root";
@@ -1442,7 +1507,7 @@ impl Store {
                 let root = target_agent.workspace.clone().ok_or_else(|| {
                     Error::new("source_integrity", "generated switch checkout is missing")
                 })?;
-                let key = core::workspace_path_key(&root);
+                let key = core::workspace_path_key(&root).into_owned();
                 (root, key)
             } else {
                 (

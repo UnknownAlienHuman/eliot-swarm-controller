@@ -1585,6 +1585,8 @@ fn admit_resume_tx(
             "archived Agents cannot be resumed; unarchive the Agent first",
         ));
     }
+    handoff::require_not_handed_off(tx, agent_num)?;
+    switch::require_no_active_checkout_switch(tx, agent_num)?;
     cleanup::require_no_cleanup_attempt(tx, &agent)?;
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;

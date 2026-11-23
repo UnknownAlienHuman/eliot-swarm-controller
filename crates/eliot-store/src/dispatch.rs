@@ -42,6 +42,12 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     if matches!(command.command.verb.as_str(), "send" | "steer" | "resume") {
         handoff::require_not_handed_off(tx, agent_num)?;
     }
+    if command.command.verb == "resume" {
+        switch::require_no_active_checkout_switch(tx, agent_num)?;
+    }
+    if command.command.verb == "launch" {
+        switch::require_checkout_launch_tx(tx, &command.command.id, agent.workspace.as_deref())?;
+    }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;
     }
