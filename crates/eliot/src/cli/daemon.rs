@@ -15,14 +15,6 @@ use eliot_core::api::{
 use eliot_core::{ProviderHold, ProviderHoldState};
 use serde_json::Value;
 use serde_json::json;
-#[cfg(not(windows))]
-#[expect(
-    clippy::disallowed_types,
-    reason = "Unix daemon lifecycle owns the process command used for detached startup."
-)]
-use std::process::Command as ProcessCommand;
-#[cfg(not(windows))]
-use std::process::Stdio;
 use std::{
     path::{Path, PathBuf},
     time::{Duration, UNIX_EPOCH},
@@ -38,7 +30,7 @@ pub(crate) async fn run_daemon(
     let foreground = args.foreground;
     if matches!(
         &args.action,
-        Some(DaemonAction::Install | DaemonAction::Uninstall)
+        Some(DaemonAction::Install { .. } | DaemonAction::Uninstall { .. })
     ) && (agent_credentials_inherited() || std::env::var_os("ELIOT_AGENT_DATA_DIR").is_some())
     {
         return Err(Failure::for_mutation(eliot_core::Error::new(
@@ -81,23 +73,23 @@ pub(crate) async fn run_daemon(
             print_value(&value, json_output);
             Ok(response_exit_code(result.state))
         }
-        Some(DaemonAction::Install) => {
+        Some(DaemonAction::Install { dry_run }) => {
             if foreground {
                 return Err(Failure::new(
                     2,
                     "--foreground is only valid when starting the daemon",
                 ));
             }
-            super::autostart::install(&data_dir, json_output).await
+            super::autostart::install(&data_dir, json_output, dry_run).await
         }
-        Some(DaemonAction::Uninstall) => {
+        Some(DaemonAction::Uninstall { dry_run }) => {
             if foreground {
                 return Err(Failure::new(
                     2,
                     "--foreground is only valid when starting the daemon",
                 ));
             }
-            super::autostart::uninstall(&data_dir, json_output).await
+            super::autostart::uninstall(&data_dir, json_output, dry_run).await
         }
         None if foreground => {
             let result = match args.upgrade_attempt.as_deref() {
@@ -502,32 +494,7 @@ pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u
     {
         let executable = std::env::current_exe()
             .map_err(|error| Failure::new(1, format!("cannot locate Eliot executable: {error}")))?;
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "This statement constructs a process owned by this module."
-        )]
-        #[expect(
-            clippy::disallowed_types,
-            reason = "This starts the detached daemon executable from the Unix CLI."
-        )]
-        let mut command = ProcessCommand::new(executable);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-        command
-            .arg("--data-dir")
-            .arg(data_dir)
-            .arg("daemon")
-            .arg("--foreground")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            // The daemon opens its authoritative private logs/daemon.log only
-            // after validating the root and holding its single-owner lock.
-            .stderr(Stdio::null());
-        command
-            .spawn()
+        eliot_daemon::operator::start_detached_daemon(&executable, data_dir)
             .map_err(|error| Failure::new(1, format!("cannot start daemon: {error}")))?;
     }
     let log_path = data_dir.join("logs").join("daemon.log");

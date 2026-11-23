@@ -22,6 +22,46 @@ pub use crate::update_backup::{
 };
 pub const STORE_SCHEMA_VERSION: i64 = eliot_store::Store::SCHEMA_VERSION;
 
+/// Start a daemon process that is independent of the caller's Unix
+/// session, with standard streams disconnected.
+#[cfg(not(windows))]
+#[allow(
+    unsafe_code,
+    reason = "The child calls async-signal-safe setsid before exec to leave the caller's session."
+)]
+pub fn start_detached_daemon(executable: &Path, data_dir: &Path) -> std::io::Result<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "This statement constructs the Unix daemon process owned by this helper."
+    )]
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("--data-dir")
+        .arg(data_dir)
+        .arg("daemon")
+        .arg("--foreground")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: this pre-exec hook only invokes setsid, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    command.spawn().map(drop)
+}
+
 /// Returns the issuing parent daemon data directory when running inside a
 /// managed Agent session with complete inherited credentials.
 pub fn inherited_agent_parent_data_dir() -> Option<PathBuf> {

@@ -73,6 +73,52 @@ function Write-Result($State, $Name) {
     }))
 }
 
+function Write-Plan($Operation, $Would, $Action, $Xml) {
+    [Console]::Out.WriteLine((ConvertTo-Json -Compress -InputObject @{
+        state = 'dry_run'
+        operation = $Operation
+        would = $Would
+        task = $taskName
+        description = $description
+        scope = 'current_user'
+        trigger = 'logon'
+        restart_on_failure = @{ interval_seconds = 60; max_restarts = 3 }
+        action = $Action
+        task_xml = $Xml
+        os_mutations = $false
+    }))
+}
+
+function New-DaemonTask($Service, $Description, $Sid, $Executable, $Arguments) {
+    if ([string]::IsNullOrWhiteSpace($Executable) -or -not [IO.Path]::IsPathRooted($Executable)) { throw 'canonical executable is missing' }
+    if ($null -eq $Arguments) { throw 'daemon arguments are missing' }
+    $definition = $Service.NewTask(0)
+    $definition.RegistrationInfo.Author = 'Eliot'
+    $definition.RegistrationInfo.Description = $Description
+    $definition.Principal.UserId = $Sid
+    $definition.Principal.LogonType = 3
+    $definition.Principal.RunLevel = 0
+
+    $trigger = $definition.Triggers.Create(9)
+    $trigger.Enabled = $true
+    $trigger.UserId = $Sid
+
+    $settings = $definition.Settings
+    $settings.Enabled = $true
+    $settings.StartWhenAvailable = $true
+    $settings.DisallowStartIfOnBatteries = $false
+    $settings.StopIfGoingOnBatteries = $false
+    $settings.MultipleInstances = 2
+    $settings.RestartCount = 3
+    $settings.RestartInterval = 'PT1M'
+    $settings.ExecutionTimeLimit = 'PT0S'
+
+    $action = $definition.Actions.Create(0)
+    $action.Path = $Executable
+    $action.Arguments = $Arguments
+    return $definition
+}
+
 try {
     $taskName = $null
     $root = $env:SWARM_AUTOSTART_DATA_DIR
@@ -93,8 +139,18 @@ try {
     $taskName = 'Eliot Swarm Daemon ' + $hash
     $description = 'Eliot per-user daemon autostart v1:' + $hash
 
+    if ($env:SWARM_AUTOSTART_OPERATION -eq 'dry_run_uninstall') {
+        Write-Plan 'uninstall' 'remove_owned_task_if_present' $null $null
+        exit 0
+    }
+
     $service = New-Object -ComObject 'Schedule.Service'
     $null = $service.Connect()
+    if ($env:SWARM_AUTOSTART_OPERATION -eq 'dry_run_install') {
+        $definition = New-DaemonTask $service $description $sid $executable $arguments
+        Write-Plan 'install' 'create_or_update_owned_task' @{ path = $executable; arguments = $arguments } $definition.XmlText
+        exit 0
+    }
     $folder = $service.GetFolder('\')
     $task = $null
     try {
@@ -121,31 +177,7 @@ try {
             $result = 'updated'
         }
 
-        $definition = $service.NewTask(0)
-        $definition.RegistrationInfo.Author = 'Eliot'
-        $definition.RegistrationInfo.Description = $description
-        $definition.Principal.UserId = $sid
-        $definition.Principal.LogonType = 3
-        $definition.Principal.RunLevel = 0
-
-        $trigger = $definition.Triggers.Create(9)
-        $trigger.Enabled = $true
-        $trigger.UserId = $sid
-
-        $settings = $definition.Settings
-        $settings.Enabled = $true
-        $settings.StartWhenAvailable = $true
-        $settings.DisallowStartIfOnBatteries = $false
-        $settings.StopIfGoingOnBatteries = $false
-        $settings.MultipleInstances = 2
-        $settings.RestartCount = 3
-        $settings.RestartInterval = 'PT1M'
-        $settings.ExecutionTimeLimit = 'PT0S'
-
-        $action = $definition.Actions.Create(0)
-        $action.Path = $executable
-        $action.Arguments = $arguments
-
+        $definition = New-DaemonTask $service $description $sid $executable $arguments
         $null = $folder.RegisterTaskDefinition($taskName, $definition, $registration, $sid, $null, 3, $null)
         $task = $folder.GetTask($taskName)
         if (-not (Test-ExpectedTask $task $taskName $description $sid $executable $arguments)) {
@@ -180,16 +212,34 @@ try {
 }
 "##;
 
-pub(super) async fn install(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {
-    let (root, executable, arguments) = canonical_action(data_dir)?;
-    let result = run_task_scheduler("install", &root, Some((&executable, &arguments))).await?;
+pub(super) async fn install(
+    data_dir: &Path,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<u8, Failure> {
+    let (root, executable, arguments) = canonical_action(data_dir, !dry_run)?;
+    let operation = if dry_run {
+        "dry_run_install"
+    } else {
+        "install"
+    };
+    let result = run_task_scheduler(operation, &root, Some((&executable, &arguments))).await?;
     report_result(&result, json_output);
     Ok(0)
 }
 
-pub(super) async fn uninstall(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {
+pub(super) async fn uninstall(
+    data_dir: &Path,
+    json_output: bool,
+    dry_run: bool,
+) -> Result<u8, Failure> {
     let root = uninstall_data_root(data_dir)?;
-    let result = run_task_scheduler("uninstall", &root, None).await?;
+    let operation = if dry_run {
+        "dry_run_uninstall"
+    } else {
+        "uninstall"
+    };
+    let result = run_task_scheduler(operation, &root, None).await?;
     report_result(&result, json_output);
     Ok(0)
 }
@@ -269,17 +319,25 @@ fn canonical_missing_path(path: &Path) -> Result<PathBuf, Failure> {
     }
 }
 
-fn canonical_action(data_dir: &Path) -> Result<(PathBuf, PathBuf, String), Failure> {
-    let private_dir = DataDir::open(data_dir).map_err(|error| {
-        Failure::new(
-            1,
-            format!(
-                "cannot open the private data directory for autostart: {} ({})",
-                error.message, error.code
-            ),
-        )
-    })?;
-    let root = canonical_path(private_dir.path(), "data directory")?;
+fn canonical_action(
+    data_dir: &Path,
+    create_data_dir: bool,
+) -> Result<(PathBuf, PathBuf, String), Failure> {
+    let root = if create_data_dir {
+        let private_dir = DataDir::open(data_dir).map_err(data_dir_failure)?;
+        canonical_path(private_dir.path(), "data directory")?
+    } else {
+        match fs::symlink_metadata(data_dir) {
+            Ok(_) => {
+                let private_dir = DataDir::open_existing(data_dir).map_err(data_dir_failure)?;
+                canonical_path(private_dir.path(), "data directory")?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                canonical_missing_path(data_dir)?
+            }
+            Err(error) => return Err(io_failure("inspect the private data directory", error)),
+        }
+    };
     let current_executable =
         std::env::current_exe().map_err(|error| io_failure("locate Swarm executable", error))?;
     let executable = canonical_path(&current_executable, "Swarm executable")?;
@@ -291,6 +349,16 @@ fn canonical_action(data_dir: &Path) -> Result<(PathBuf, PathBuf, String), Failu
     }
     let arguments = daemon_arguments(&root)?;
     Ok((root, executable, arguments))
+}
+
+fn data_dir_failure(error: eliot_core::Error) -> Failure {
+    Failure::new(
+        1,
+        format!(
+            "cannot open the private data directory for autostart: {} ({})",
+            error.message, error.code
+        ),
+    )
 }
 
 fn canonical_path(path: &Path, label: &str) -> Result<PathBuf, Failure> {
@@ -479,6 +547,26 @@ fn report_result(result: &Value, json_output: bool) {
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
     match state {
+        "dry_run" => {
+            let operation = result
+                .get("operation")
+                .and_then(Value::as_str)
+                .unwrap_or("autostart");
+            let task = result
+                .get("task")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let would = result
+                .get("would")
+                .and_then(Value::as_str)
+                .unwrap_or("review the verified task");
+            println!(
+                "dry run: would {operation} Task Scheduler task {task} ({would}); no OS mutations performed"
+            );
+            if let Some(xml) = result.get("task_xml").and_then(Value::as_str) {
+                println!("{xml}");
+            }
+        }
         "installed" => println!(
             "installed current-user logon task {task}; retries up to {RESTART_COUNT} failures at one-minute intervals"
         ),

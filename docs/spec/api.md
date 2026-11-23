@@ -3057,7 +3057,7 @@ The synopsis is target grammar; later-layer forms are not an inventory of curren
 
 ```text
 swarm daemon [--foreground]
-swarm daemon install | uninstall
+swarm daemon install [--dry-run] | uninstall [--dry-run]
 swarm daemon stop [--drain|--force]
 swarm daemon update <RELEASE> [--wait-seconds N]
 swarm stand up [--root PATH] [--profile FILE] [--binary PATH] [--ttl DURATION]

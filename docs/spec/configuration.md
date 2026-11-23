@@ -1920,19 +1920,34 @@ becomes implemented; absent later features return `unsupported`, not a hidden su
 
 ### Daemon autostart
 
-On Windows, use `swarm --data-dir DIR daemon install` to register a Task
-Scheduler entry for the current OS user and the selected private data directory.
-It runs the installed executable at user logon and restarts it after a failed
-exit. After moving the executable, run `daemon install` from its new location
-to refresh the verified task. `swarm --data-dir DIR daemon uninstall` removes
-the verified task even when the original data directory is absent. Scheduler
-refusals identify the task by name when available.
-Run these commands from an Owner CLI. The daemon lock admits one instance per
-data directory. Windows demand-start uses a detached process group with Job
-breakaway and reports a start error when the caller's Job forbids it.
+On Windows, `swarm --data-dir DIR daemon install` registers a Task Scheduler
+entry for the current OS user and selected private data directory. It starts at
+user logon and restarts after failure up to three times at 60-second intervals.
+After moving the executable, run `daemon install` from its new location to
+refresh the verified task. `daemon uninstall` removes the verified task even
+when the data directory is absent.
 
-The supported Linux image uses the [Docker restart policy](../../docker/README.md)
-for unattended startup.
+On Linux, `daemon install` writes a per-user unit under
+`${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user` and enables it for the user's
+`default.target`. The unit starts with the user systemd manager, runs the
+canonical Swarm executable against the selected data directory, and restarts
+after failure with a 60-second delay and a limit of four starts per four minutes.
+The unit passes the
+executable and data directory as literal arguments, including `$` and `%` in
+paths. `daemon uninstall`
+disables and removes only a unit carrying Eliot's ownership marker for that
+data directory; it does not stop an already-running daemon. The user systemd
+manager must be available when these commands are run.
+
+Both commands accept `--dry-run`. Install previews include the Task Scheduler
+XML or the complete systemd unit and systemctl commands. Uninstall previews
+identify the task or unit selected for removal. Dry-run performs no scheduler, systemd, or
+filesystem mutations. Installing, uninstalling and dry-run require an Owner
+CLI outside an Agent session. The daemon lock admits one instance per data
+directory. Windows demand-start uses the existing detached process owner with
+Job breakaway and reports a start error when the caller's Job forbids it.
+Unix demand-start starts the daemon in a separate session with standard
+streams disconnected.
 
 ### Agent restart policy
 
