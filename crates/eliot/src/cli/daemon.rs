@@ -458,21 +458,15 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
         println!("Previous crash: {}", crash.summary());
     }
     if !response.plugin_crashes.is_empty() {
-        let latest = response
-            .plugin_crashes
-            .last()
-            .map(eliot_core::api::CrashMarker::summary)
-            .unwrap_or_default();
         let suffix = if response.plugin_crashes_truncated {
             " (truncated)"
         } else {
             ""
         };
-        println!(
-            "Plugin crashes: {}{} (latest: {latest})",
-            response.plugin_crashes.len(),
-            suffix
-        );
+        println!("Plugin crashes: {}{suffix}", response.plugin_crashes.len());
+        for crash in &response.plugin_crashes {
+            println!("  {}", crash.summary());
+        }
     }
     println!("Data directory: {}", data_dir.display());
 }

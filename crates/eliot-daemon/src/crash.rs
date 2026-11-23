@@ -27,9 +27,10 @@ use eliot_core::{
     SecretPolicy,
     api::{CrashMarker, truncate_bytes},
 };
+use eliot_plugin::sync::LockExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -38,6 +39,10 @@ static PLUGIN_CRASH_NONCE: OnceLock<String> = OnceLock::new();
 /// Stderr line tag of a crash report.
 pub const PLUGIN_CRASH_LINE: &str = "eliot_crash";
 const MAX_MARKERS_PER_CODE: usize = 64;
+const MAX_MARKER_BYTES: usize = 64 * 1024;
+static DAEMON_MARKER_WRITER: Mutex<()> = Mutex::new(());
+static PLUGIN_MARKER_WRITER: Mutex<()> = Mutex::new(());
+static MARKER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// In-process crash directory, set once at startup by the owning binary.
 /// The panic hook reads only this explicit directory; no environment
@@ -182,6 +187,15 @@ fn capture(code: &str, info: &std::panic::PanicHookInfo<'_>, policy: &SecretPoli
 /// code has its own file cap so plugin panics cannot starve daemon markers.
 /// Never fails the panicking process further.
 pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
+    let _writer = if marker.code == "daemon.panicked" {
+        // A nested or concurrent daemon panic must not wait inside its hook.
+        let Ok(writer) = DAEMON_MARKER_WRITER.try_lock() else {
+            return;
+        };
+        writer
+    } else {
+        PLUGIN_MARKER_WRITER.lock_recover()
+    };
     #[cfg(windows)]
     let private = crate::platform::windows::ensure_private_root(dir);
     #[cfg(unix)]
@@ -201,6 +215,7 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
             let name = entry.file_name();
             name.to_str()
                 .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".json"))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
         })
         .take(MAX_MARKERS_PER_CODE)
         .count();
@@ -208,10 +223,11 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
         return;
     }
     let name = format!(
-        "{}-{}-{}.json",
+        "{}-{}-{}-{}.json",
         marker.code,
         std::process::id(),
-        marker.timestamp
+        marker.timestamp,
+        MARKER_SEQUENCE.fetch_add(1, Ordering::Relaxed),
     );
     if !name
         .bytes()
@@ -220,7 +236,7 @@ pub(crate) fn write_marker(dir: &Path, marker: &CrashMarker) {
         return;
     }
     if let Ok(bytes) = serde_json::to_vec(marker)
-        && bytes.len() <= 64 * 1024
+        && bytes.len() <= MAX_MARKER_BYTES
     {
         // Reuse the existing private create/write/sync/atomic-rename owner.
         let _ = crate::platform::data_dir::replace_private_file(dir, &name, &bytes);
@@ -245,14 +261,13 @@ pub(crate) fn take_markers(dir: &Path, code: &str) -> Vec<CrashMarker> {
         .collect();
     paths.sort();
     for path in paths {
-        let parsed = std::fs::metadata(&path)
+        let parsed = crate::platform::data_dir::read_private_bytes(&path, MAX_MARKER_BYTES)
             .ok()
-            .filter(|metadata| metadata.len() <= 64 * 1024 && metadata.is_file())
-            .and_then(|_| std::fs::read(&path).ok())
             .and_then(|bytes| serde_json::from_slice::<CrashMarker>(&bytes).ok())
             .filter(|marker| marker.code == code && marker.validate().is_ok());
-        if let Some(marker) = parsed {
-            let _ = std::fs::remove_file(path);
+        if let Some(marker) = parsed
+            && std::fs::remove_file(path).is_ok()
+        {
             markers.push(marker);
         }
     }

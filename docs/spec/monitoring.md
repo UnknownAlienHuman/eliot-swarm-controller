@@ -1151,8 +1151,13 @@ across the harness adapters. Remote StreamableHTTP calls carry authenticated
 remote Owner context but no local Agent generation or turn; their events remain
 unbound and are excluded from per-turn usage.
 
-`daemon.status` also exposes crash markers (`previous_crash` consumed once on
-restart, plus `plugin_crashes`) and retention and drain honesty in one place. Compact
+The private crash directory holds up to 64 marker files of each kind.
+Daemon startup consumes the previous `daemon.panicked` files and exposes the latest
+as `previous_crash`. `daemon.status` consumes validated `plugin.panicked` files by
+deleting them and keeps the latest eight consumed plugin markers for the current
+daemon run. `swarm status` shows a summary for each.
+
+`daemon.status` also exposes retention and drain information. Compact
 `agent.list` reads and history-derived attention thresholds use SQLite read
 snapshots outside the Store writer lock. Compact list requests wait for a reader
 slot before scheduling blocking work, with up to four snapshots active at once.
