@@ -1620,8 +1620,11 @@ switch keeps the executable bound to the source generation.
 #### Owner quota reserve (#872)
 
 Set `quota_reserve_percent` on a named profile to an integer from 0 through 100.
-It defaults to 0. The recommended reserve is 20, which keeps the final 20
-percentage points of each applicable provider window for the Owner. A new
+Newly resolved direct named profiles whose adapter declares quota readback
+default to 20, keeping the final 20 percentage points of each applicable
+provider window for the Owner. Adopted proxies and adapters without quota
+readback default to 0. Set `quota_reserve_percent = 0` to opt out explicitly.
+A new
 automatic launch skips the route with `quota_reserve` when current usage of any
 applicable window is strictly greater than `100 - quota_reserve_percent`.
 `quota_unknown = "admit"` is the default. Set it to `"hold"` to skip with

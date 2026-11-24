@@ -1793,7 +1793,16 @@ fn freeze_profile_quota_policy(
     site: ProfileSite<'_>,
     entry: &ProfileEntry,
 ) -> core::Result<()> {
-    let reserve_percent = entry.quota_reserve_percent.unwrap_or_default();
+    let default_reserve = if entry.proxy.is_none()
+        && core::api::HarnessCapabilities::of(entry.harness.trim())
+            .quota_readback
+            .is_some()
+    {
+        20
+    } else {
+        0
+    };
+    let reserve_percent = entry.quota_reserve_percent.unwrap_or(default_reserve);
     if !(0..=100).contains(&reserve_percent) {
         return Err(site.error(
             "quota_reserve_percent",
