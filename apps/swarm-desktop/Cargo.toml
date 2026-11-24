@@ -35,8 +35,10 @@ pulldown-cmark = { version = "=0.13.1", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-toml.workspace = true
 tokio = { version = "1.53.2", features = ["rt", "net", "sync", "time", "macros"] }
+# First direct use of toml_edit 0.25.20 (MIT OR Apache-2.0, rust-version 1.85);
+# its format-preserving parser/editor retains source comments; no source copied.
+toml_edit = "=0.25.20"
 ulid.workspace = true
 url.workspace = true
 
