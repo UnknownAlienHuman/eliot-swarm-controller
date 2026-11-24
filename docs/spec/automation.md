@@ -2040,8 +2040,17 @@ exact turn and native session and reports the cost baseline as pending.
 The budget starts with the first turn that begins after the Goal is set.
 The Store binds the baseline atomically when it commits a fresh cumulative
 cost snapshot for the exact completed turn, session and unit. An observation
-stamped during that turn can establish the baseline when it carries the turn's
-terminal usage binding. Rounds wait for this boundary. If the turn ends without
+carrying the turn's terminal usage binding can establish the baseline when its
+native timestamp is at or after the recorded turn start; it may be observed
+after the terminal commits. If that authenticated snapshot arrives while the turn is
+still running, the Store retains the exact snapshot in the pending Goal state
+without changing its revision. When the verified `turn.completed` commits, the
+same transaction settles the pending baseline from that retained snapshot. A
+later exact-bound snapshot resolves it as before. Both paths require the Goal's
+generation, native reference, turn id, recorded start timestamp, cost unit and
+nonempty source to match; a snapshot without an explicit observation timestamp
+cannot establish the boundary. A newer unrelated session snapshot cannot replace
+the captured turn boundary. Rounds wait for this boundary. If the turn ends without
 verified cost or its completion becomes unknown, the Goal's cost status and
 round refusal identify the unresolved turn. The Owner can set the Goal again
 at a verified idle boundary.

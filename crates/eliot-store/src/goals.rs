@@ -3322,6 +3322,15 @@ struct GoalCostBase {
     pending_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_native_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_usage: Option<GoalCostObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GoalCostObservation {
+    source: String,
+    amount_micros: i64,
+    observed_at: i64,
 }
 
 fn cost_base_pending(base: Option<&GoalCostBase>) -> bool {
@@ -3511,26 +3520,21 @@ pub(super) fn resolve_pending_goal_cost_base_tx(
     agent_num: i64,
     agent: &Agent,
     boundary_turn_id: &str,
-    usage: &SessionUsage,
+    usage: Option<&SessionUsage>,
     now: i64,
 ) -> Result<()> {
-    let (Some((amount, unit)), Some(source)) = (snapshot_cost(usage), usage.source.as_ref()) else {
-        return Ok(());
-    };
     let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
         return Ok(());
     };
     if row.generation != agent.generation
         || !matches!(row.state.status, GoalStatus::Active | GoalStatus::Paused)
-        || row
-            .definition
-            .max_cost
-            .as_ref()
-            .is_none_or(|limit| limit.unit != unit)
     {
         return Ok(());
     }
-    let Some(base) = row.state.cost_base.as_mut() else {
+    let (Some(base), Some(limit)) = (
+        row.state.cost_base.as_mut(),
+        row.definition.max_cost.as_ref(),
+    ) else {
         return Ok(());
     };
     if base.pending_turn_id.as_deref() != Some(boundary_turn_id)
@@ -3539,30 +3543,67 @@ pub(super) fn resolve_pending_goal_cost_base_tx(
     {
         return Ok(());
     }
-    let observed_at = usage.observed_at.unwrap_or(now);
-    // The authenticated boundary marker binds the cumulative observation to
-    // the terminal. Its native timestamp can precede the terminal's Store time.
-    let completed_at: Option<i64> = tx
+    let observation = if let Some(usage) = usage {
+        let (Some((amount, unit)), Some(source)) = (snapshot_cost(usage), usage.source.as_ref())
+        else {
+            return Ok(());
+        };
+        if unit != limit.unit || source.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(observed_at) = usage.observed_at else {
+            return Ok(());
+        };
+        GoalCostObservation {
+            source: source.clone(),
+            amount_micros: cost_micros(amount),
+            observed_at,
+        }
+    } else if let Some(observation) = base.pending_usage.as_ref() {
+        observation.clone()
+    } else {
+        return Ok(());
+    };
+
+    let boundary: Option<(String, Option<i64>, Option<i64>)> = tx
         .query_row(
-            "SELECT completed_at FROM turns WHERE agent = ?1 AND generation = ?2
-             AND turn_id = ?3 AND state = 'completed' AND started_at <= ?4
-             AND completed_at IS NOT NULL",
-            params![agent_num, agent.generation, boundary_turn_id, observed_at],
-            |row| row.get(0),
+            "SELECT state, started_at, completed_at FROM turns
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![agent_num, agent.generation, boundary_turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let Some(completed_at) = completed_at else {
+    let Some((state, Some(started_at), completed_at)) = boundary else {
         return Ok(());
     };
-    *base = GoalCostBase {
-        source: Some(source.clone()),
-        amount_micros: cost_micros(amount),
-        observed_at: Some(observed_at),
-        boundary_completed_at: Some(completed_at),
-        boundary_turn_id: Some(boundary_turn_id.to_owned()),
-        ..GoalCostBase::default()
-    };
+    if observation.observed_at < started_at {
+        return Ok(());
+    }
+    match (state.as_str(), completed_at) {
+        ("running", None) if usage.is_some() && base.pending_usage.is_none() => {
+            // Preserve the first accepted bound observation until the same turn's
+            // terminal record commits, without advancing the visible Goal revision.
+            base.pending_usage = Some(observation);
+            tx.execute(
+                "UPDATE goals SET state = ?1 WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5",
+                params![encode_json(&row.state)?, agent_num, row.mode, row.generation, row.revision],
+            )
+            .map_err(sql_error)?;
+            return Ok(());
+        }
+        ("completed", Some(completed_at)) => {
+            *base = GoalCostBase {
+                source: Some(observation.source),
+                amount_micros: observation.amount_micros,
+                observed_at: Some(observation.observed_at),
+                boundary_completed_at: Some(completed_at),
+                boundary_turn_id: Some(boundary_turn_id.to_owned()),
+                ..GoalCostBase::default()
+            };
+        }
+        _ => return Ok(()),
+    }
     row.state.counters.cost_spent_micros = Some(0);
     row.state.counters.cost_unverified = None;
     update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)
