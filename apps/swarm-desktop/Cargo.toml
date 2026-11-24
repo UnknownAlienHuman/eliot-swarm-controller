@@ -13,6 +13,10 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[build-dependencies]
+# `build_brand.rs` reads the brand book's tokens (`design/tokens.json`).
+serde_json.workspace = true
+
 [dependencies]
 # Local time for the sidebar's "older than today" fold; the workspace
 # chrono already resolves with `clock` (no new crate in the lockfile).

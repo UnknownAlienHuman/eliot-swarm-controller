@@ -264,7 +264,7 @@
         <controls:AnimatedIcon x:Name="DropDownGlyph" controls:AnimatedIcon.State="Normal" MinHeight="{ThemeResource ComboBoxMinHeight}" Grid.Row="1" Grid.Column="1" IsHitTestVisible="False" Margin="0,0,14,0" Foreground="{ThemeResource ComboBoxDropDownGlyphForeground}" HorizontalAlignment="Right" VerticalAlignment="Center" AutomationProperties.AccessibilityView="Raw" Width="@CHEVRON@" Height="@CHEVRON@">
             <animatedvisuals:AnimatedChevronDownSmallVisualSource xmlns:animatedVisuals="using:Microsoft.UI.Xaml.Controls.AnimatedVisuals" />
             <controls:AnimatedIcon.FallbackIconSource>
-                <controls:FontIconSource Foreground="{ThemeResource ComboBoxDropDownGlyphForeground}" FontFamily="{ThemeResource SymbolThemeFontFamily}" FontSize="@CHEVRON@" Glyph="&#xE70D;" />
+                <controls:FontIconSource Foreground="{ThemeResource ComboBoxDropDownGlyphForeground}" FontFamily="{ThemeResource SymbolThemeFontFamily}" FontSize="@CHEVRON@" Glyph="&#xE5CF;" />
             </controls:AnimatedIcon.FallbackIconSource>
         </controls:AnimatedIcon>
         <ContentPresenter x:Name="DescriptionPresenter" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Foreground="{ThemeResource SystemControlDescriptionTextForegroundBrush}" Content="{TemplateBinding Description}" x:Load="False" />

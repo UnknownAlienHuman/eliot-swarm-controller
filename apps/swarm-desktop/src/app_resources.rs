@@ -94,6 +94,19 @@ fn layer(color: Rgb8, opacity: f64) -> Value {
     Value::Brush(color, alpha(opacity))
 }
 
+use crate::theme::rgb;
+
+/// A menu's or popup's edge: `overlay-border` in the dark themes, none in
+/// the light ones.
+fn edge(s: &Roles) -> Value {
+    let v = s.scheme.overlay_border;
+    if v >> 24 == 0 {
+        clear(s)
+    } else {
+        opaque(rgb(v))
+    }
+}
+
 /// A brush WinUI draws as nothing.
 fn clear(s: &Roles) -> Value {
     Value::Brush(s.surface, 0)
@@ -134,18 +147,20 @@ fn lift(s: &Roles) -> Vec<(&'static str, Value)> {
     use crate::theme::Lift;
     let (key, ambient, ring) = match s.lift {
         Lift::Shadow { key, ambient } => (
-            layer(SHADOW_COLOR, key),
-            layer(SHADOW_COLOR, ambient),
+            key.map(|opacity| layer(SHADOW_COLOR, opacity)),
+            ambient.map(|opacity| layer(SHADOW_COLOR, opacity)),
             clear(s),
         ),
-        Lift::Ring(color) => (clear(s), clear(s), opaque(color)),
+        Lift::Ring(color) => ([clear(s); 2], [clear(s); 2], opaque(color)),
     };
     let glow = s
         .glow
         .map_or(clear(s), |glow| layer(glow.color, glow.alpha));
     vec![
-        (templates::LIFT_KEY, key),
-        (templates::LIFT_AMBIENT, ambient),
+        (templates::LIFT_KEY[0], key[0]),
+        (templates::LIFT_KEY[1], key[1]),
+        (templates::LIFT_AMBIENT[0], ambient[0]),
+        (templates::LIFT_AMBIENT[1], ambient[1]),
         (templates::LIFT_RING, ring),
         (templates::GLOW, glow),
     ]
@@ -293,7 +308,7 @@ fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
             "ListViewItemForegroundSelectedPointerOver",
             "ListViewItemForegroundSelectedPressed",
         ],
-        opaque(s.text),
+        opaque(s.on_selected),
     ));
     all.extend(every(
         &[
@@ -310,14 +325,14 @@ fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
 /// darkens on hover and becomes a 2-DIP primary line when focused.
 fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("TextControlBorderBrush", opaque(s.border)),
+        ("TextControlBorderBrush", opaque(s.field_outline)),
         ("TextControlBorderBrushPointerOver", opaque(s.text)),
         ("TextControlBorderBrushFocused", opaque(s.primary)),
         (
             "TextControlBorderBrushDisabled",
             layer(s.text, state::DISABLED_CONTAINER),
         ),
-        ("TextControlElevationBorderBrush", opaque(s.border)),
+        ("TextControlElevationBorderBrush", opaque(s.field_outline)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
         (
             "TextControlBackgroundPointerOver",
@@ -388,7 +403,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
     let selected_hover = s.selected.mix(s.text, state::HOVER);
     let selected_pressed = s.selected.mix(s.text, state::PRESSED);
     let mut all = vec![
-        ("ComboBoxBorderBrush", opaque(s.border)),
+        ("ComboBoxBorderBrush", opaque(s.field_outline)),
         ("ComboBoxBorderBrushPointerOver", opaque(s.text)),
         ("ComboBoxBorderBrushPressed", opaque(s.primary)),
         (
@@ -396,7 +411,10 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             layer(s.text, state::DISABLED_CONTAINER),
         ),
         ("ComboBoxBackgroundBorderBrushFocused", opaque(s.primary)),
-        ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.border)),
+        (
+            "ComboBoxBackgroundBorderBrushUnfocused",
+            opaque(s.field_outline),
+        ),
         ("ComboBoxBorderThemeThickness", uniform(layout::HAIRLINE)),
         ("ComboBoxForegroundDisabled", opaque(s.secondary_text)),
         (
@@ -421,7 +439,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             "ComboBoxFocusedDropDownBackgroundPointerPressed",
             layer(s.text, state::PRESSED),
         ),
-        ("ComboBoxDropDownBackground", opaque(s.tonal)),
+        ("ComboBoxDropDownBackground", opaque(s.menu)),
         ("ComboBoxDropDownForeground", opaque(s.text)),
         (
             "ComboBoxItemBackgroundPointerOver",
@@ -510,7 +528,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             "ComboBoxItemForegroundSelectedPressed",
             "ComboBoxItemForegroundSelectedPointerOver",
         ],
-        opaque(s.text),
+        opaque(s.on_selected),
     ));
     all
 }
@@ -704,7 +722,10 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
         opaque(s.on_primary),
     ));
     all.extend([
-        ("ToggleSwitchFillOff", opaque(s.container)),
+        (
+            "ToggleSwitchFillOff",
+            opaque(rgb(s.scheme.surface_container_highest)),
+        ),
         (
             "ToggleSwitchFillOnPointerOver",
             opaque(s.primary.mix(s.on_primary, state::HOVER)),
@@ -767,16 +788,13 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
 /// that read `OverlayCornerRadius` (flyouts, the combo-box list).
 fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("MenuFlyoutPresenterBackground", opaque(s.tonal)),
-        ("NumberBoxPopupBackground", opaque(s.tonal)),
-        ("NumberBoxPopupBorderBrush", opaque(s.outline)),
+        ("MenuFlyoutPresenterBackground", opaque(s.menu)),
+        ("NumberBoxPopupBackground", opaque(s.menu)),
+        ("NumberBoxPopupBorderBrush", edge(s)),
         ("NumberBoxPopupIndicatorForeground", opaque(s.variant)),
-        ("AutoSuggestBoxSuggestionsListBackground", opaque(s.tonal)),
-        (
-            "AutoSuggestBoxSuggestionsListBorderBrush",
-            opaque(s.outline),
-        ),
-        ("MenuFlyoutPresenterBorderBrush", opaque(s.outline)),
+        ("AutoSuggestBoxSuggestionsListBackground", opaque(s.menu)),
+        ("AutoSuggestBoxSuggestionsListBorderBrush", edge(s)),
+        ("MenuFlyoutPresenterBorderBrush", edge(s)),
         ("MenuFlyoutSeparatorBackground", opaque(s.outline)),
         (
             "MenuFlyoutItemBackgroundPointerOver",
@@ -815,8 +833,11 @@ fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
         // The M3 scrim: black at 32%.
         ("ContentDialogSmokeFill", layer(SHADOW_COLOR, state::SCRIM)),
         ("ContentDialogBorderWidth", uniform(0.0)),
-        ("ToolTipBackground", opaque(s.text)),
-        ("ToolTipForeground", opaque(s.surface)),
+        ("ToolTipBackground", opaque(rgb(s.scheme.inverse_surface))),
+        (
+            "ToolTipForeground",
+            opaque(rgb(s.scheme.inverse_on_surface)),
+        ),
         ("ControlCornerRadius", Value::Radius(radius::FIELD)),
         ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];
@@ -932,7 +953,7 @@ pub fn styles_xaml() -> String {
     let font = format!(
         "<Setter Property=\"FontFamily\" Value=\"{}\"/>\
          <Setter Property=\"FontSize\" Value=\"{}\"/>",
-        text::FAMILY,
+        crate::fonts::families().text,
         text::BODY.size,
     );
     let min_height = format!("<Setter Property=\"MinHeight\" Value=\"{min}\"/>");
@@ -1095,7 +1116,7 @@ pub fn styles_xaml() -> String {
            </Setter.Value></Setter>\
          </Style>\
          </ResourceDictionary>",
-        family = text::FAMILY,
+        family = crate::fonts::families().text,
         font_size = text::BODY.size,
         switch_width = layout::SWITCH_WIDTH,
         combo_box = templates::combo_box(),
@@ -1133,7 +1154,27 @@ fn native(work: impl FnOnce(&OwnEntries) -> windows_core::Result<()>) -> Result<
     run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
 }
 
+/// The icon font for a scheme: Eliot Symbols at grade -25 on dark themes,
+/// grade 0 otherwise (and under High Contrast). WinUI's `FontIcon` does
+/// not read `SymbolThemeFontFamily` from the application's own entries
+/// (observed live), so an implicit `FontIcon` style sets the family; the
+/// key still serves the templates that name it (the combo box chevron).
+fn symbols_xaml(scheme: Option<&Roles>) -> String {
+    let fonts = crate::fonts::families();
+    let family = match scheme {
+        Some(scheme) if scheme.dark => &fonts.symbols_dark,
+        _ => &fonts.symbols,
+    };
+    format!(
+        "{XAML_ROOT}\
+         <FontFamily x:Key=\"SymbolThemeFontFamily\">{family}</FontFamily>\
+         <Style TargetType=\"FontIcon\"><Setter Property=\"FontFamily\" Value=\"{family}\"/></Style>\
+         </ResourceDictionary>"
+    )
+}
+
 fn write_scheme(own: &OwnEntries, scheme: Option<&Roles>) -> windows_core::Result<()> {
+    insert_parsed(own, &symbols_xaml(scheme))?;
     match scheme {
         Some(scheme) => insert_parsed(own, &dictionary_xaml(scheme)),
         None => {

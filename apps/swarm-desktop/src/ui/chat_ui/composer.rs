@@ -923,7 +923,7 @@ fn composer_actions(
             .is_enabled(false)
             .automation_name("Resume")
             .content(m3::label("Resume")),
-        Primary::ReadingRunning => m3::send_button(palette)
+        Primary::ReadingRunning => m3::stop_button(palette)
             .is_enabled(false)
             .automation_name("Stop the running turn")
             .content(m3::stop_mark(palette)),
@@ -931,7 +931,7 @@ fn composer_actions(
         // empty field (it interrupts that turn) and Steer once there is
         // text; otherwise Send.
         Primary::Turn { agent, running } => match running {
-            Some(bound) if draft_blank => m3::send_button(palette)
+            Some(bound) if draft_blank => m3::stop_button(palette)
                 .is_enabled(enabled)
                 .automation_name("Stop the running turn")
                 .on_click(
@@ -939,7 +939,7 @@ fn composer_actions(
                 )
                 .content(m3::stop_mark(palette))
                 .tooltip("Stop"),
-            Some(bound) => m3::send_button(palette)
+            Some(bound) => m3::steer_button(palette)
                 .is_enabled(enabled)
                 .automation_name("Steer the running turn (Enter)")
                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(

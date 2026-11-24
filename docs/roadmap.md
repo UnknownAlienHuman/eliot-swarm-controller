@@ -998,6 +998,30 @@ of the explicitly selected release scope.
       the recommended action, other choices and Snooze through `owner.decide`,
       the daemon's refusal of a stale choice, and per-kind counts in the sidebar.
 
+- [ ] **D11 Material 3 Expressive on the Codex skeleton (owner-approved
+      2026-11-24).** The approved interface skeleton, brand book "Eliot Swarm
+      Material" and design canvas, built into the desktop. Reactor 0.100 limits
+      are worked around as the brand book's WinUI page states; nothing is drawn
+      to imitate a control.
+  - [x] **Foundation.** The brand book's tokens (`apps/swarm-desktop/design/
+    tokens.json`) generate the desktop's color roles for the six themes and its
+    size, shape, type, state and motion constants. Roboto, Roboto Mono and
+    Material Symbols Rounded ship inside the executable and load from `fonts`
+    beside it.
+  - [ ] **Real flyouts.** Popovers through Reactor's `Flyout::rich`, menus
+    through `.menu()`, a native module for hide, show at a point and closed;
+    the in-window menus and popovers are removed.
+  - [ ] **Styles, shapes, motion, shadows, wave.** Carrier control types with
+    implicit styles and styles set by key; spring-sampled template key frames;
+    composition-host shadows; the wave as a re-templated `ProgressBar`.
+  - [ ] **Screens.** Sidebar, Home, conversation (header, composer action with
+    Add as a note, decision panel, states), right pane (Changes with the review
+    digest, Agents, Details, Terminal), project page, Inbox, Agents, Automations,
+    Settings, dialogs and the daemon screen, per the skeleton.
+  - [ ] **Owner-level review.** All six themes on a private stand, side by side
+    with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
+    type and shadows checked.
+
 - [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
       readers, durable archive/delete, settings project removal and private chats.
       Private Windows Owner proof covers real Codex/Claude desktop launch/send,

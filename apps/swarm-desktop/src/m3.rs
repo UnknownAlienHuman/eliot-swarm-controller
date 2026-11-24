@@ -44,74 +44,128 @@ fn palette() -> Palette {
         .unwrap_or_else(|| Palette::new(theme::Theme::Light, false))
 }
 
-/// Segoe Fluent Icons code points (the system icon font, one stroke family;
-/// no icon pack).
+/// Material Symbols Rounded code points in the shipped Eliot Symbols font
+/// (`crate::fonts`): the outline glyph at its own code point; [`filled`]
+/// gives the filled one (a selected or toggled icon).
+#[allow(
+    dead_code,
+    reason = "the brand book's icon set; the screens adopt them one by one"
+)]
 pub mod glyph {
-    /// New task: the design's plus.
-    pub const NEW_TASK: &str = "\u{E710}";
-    pub const SEARCH: &str = "\u{E721}";
-    pub const FOLDER: &str = "\u{E8B7}";
-    /// A file (an attachment, a file the answer names): Segoe Fluent
-    /// Document.
-    pub const FILE: &str = "\u{F000}";
-    /// A worktree (New worktree, Settings › Worktrees): Segoe Fluent's
-    /// fork.
-    pub const WORKTREE: &str = "\u{EA3C}";
-    pub const SETTINGS: &str = "\u{E713}";
-    /// A filled square (Segoe Fluent E978): the outline Stop glyph read as
-    /// a check box (owner review 2026-11-19).
-    pub const STOP: &str = "\u{E978}";
-    pub const MORE: &str = "\u{E712}";
-    pub const INFO: &str = "\u{E946}";
-    /// The Owner inbox: Segoe Fluent Mail.
-    pub const INBOX: &str = "\u{E715}";
-    pub const CLOSE: &str = "\u{E711}";
-    pub const BACK: &str = "\u{E76B}";
-    pub const FORWARD: &str = "\u{E76C}";
-    /// Segoe Fluent ClosePane and OpenPane: hide and show the sidebar.
-    pub const HIDE_SIDEBAR: &str = "\u{E89F}";
-    pub const SHOW_SIDEBAR: &str = "\u{E8A0}";
-    pub const CHEVRON_RIGHT: &str = "\u{E76C}";
-    pub const CHEVRON_DOWN: &str = "\u{E70D}";
-    pub const ARROW_DOWN: &str = "\u{E74B}";
-    pub const ARROW_UP: &str = "\u{E74A}";
-    pub const COPY: &str = "\u{E8C8}";
-    pub const MODEL: &str = "\u{E945}";
-    pub const SHIELD: &str = "\u{EA18}";
-    pub const PULSE: &str = "\u{E9D9}";
-    pub const TOOLS: &str = "\u{E90F}";
-    /// A command run: Segoe Fluent CommandPrompt.
-    pub const TERMINAL: &str = "\u{E756}";
-    /// Edited files: Segoe Fluent Edit.
-    pub const EDIT: &str = "\u{E70F}";
-    pub const CHECK: &str = "\u{E73E}";
-    pub const STAR: &str = "\u{E734}";
-    pub const STAR_FILLED: &str = "\u{E735}";
-    pub const LOCK: &str = "\u{E72E}";
-    pub const WARNING: &str = "\u{E7BA}";
-    pub const AUTO: &str = "\u{E99A}";
-    pub const AUTOMATION: &str = "\u{E823}";
-    pub const USAGE: &str = "\u{E9D2}";
-    pub const EXTERNAL: &str = "\u{E8A7}";
-    pub const OPEN_FOLDER: &str = "\u{E838}";
-    pub const KEYBOARD: &str = "\u{E765}";
-    pub const ROUTING: &str = "\u{E8AB}";
-    pub const CLOUD: &str = "\u{E753}";
-    pub const CODE: &str = "\u{E943}";
-    /// Manage models (OpenCode's sliders button): Segoe Fluent Equalizer.
-    pub const SLIDERS: &str = "\u{E9E9}";
-    pub const CHAT: &str = "\u{E8BD}";
-    pub const ARCHIVE: &str = "\u{E7B8}";
-    pub const DELETE: &str = "\u{E74D}";
-    /// Move under another task: Segoe Fluent MoveToFolder.
-    pub const MOVE: &str = "\u{E8DE}";
-    /// Resume a lost task: Segoe Fluent Play.
-    pub const RESUME: &str = "\u{E768}";
-    pub const RENAME: &str = "\u{E8AC}";
-    /// Tags: Segoe Fluent Tag.
-    pub const TAG: &str = "\u{E8EC}";
-    /// Review: Segoe Fluent BulletedList.
-    pub const LIST: &str = "\u{E8FD}";
+    /// The filled form of an outline glyph: `0xF0000 + code - 0xE000`.
+    pub fn filled(outline: &str) -> String {
+        outline
+            .chars()
+            .map(|c| {
+                u32::from(c)
+                    .checked_sub(0xE000)
+                    .and_then(|offset| char::from_u32(0xF0000 + offset))
+                    .unwrap_or(c)
+            })
+            .collect()
+    }
+
+    /// New task: add.
+    pub const NEW_TASK: &str = "\u{E145}";
+    pub const SEARCH: &str = "\u{EF7A}";
+    pub const FOLDER: &str = "\u{E2C7}";
+    /// A file (an attachment, a file the answer names): description.
+    pub const FILE: &str = "\u{E873}";
+    /// A worktree (New worktree, Settings › Worktrees): alt_route.
+    pub const WORKTREE: &str = "\u{F184}";
+    pub const SETTINGS: &str = "\u{E8B8}";
+    /// Stop: the filled square.
+    pub const STOP: &str = "\u{F0047}";
+    pub const MORE: &str = "\u{E5D3}";
+    pub const MORE_VERTICAL: &str = "\u{E5D4}";
+    pub const INFO: &str = "\u{E88E}";
+    /// The Owner inbox.
+    pub const INBOX: &str = "\u{E156}";
+    pub const CLOSE: &str = "\u{E5CD}";
+    pub const BACK: &str = "\u{E5C4}";
+    pub const FORWARD: &str = "\u{E5C8}";
+    /// Hide and show the sidebar: left_panel_close and left_panel_open.
+    pub const HIDE_SIDEBAR: &str = "\u{F717}";
+    pub const SHOW_SIDEBAR: &str = "\u{F716}";
+    pub const CHEVRON_RIGHT: &str = "\u{E5CC}";
+    pub const CHEVRON_DOWN: &str = "\u{E5CF}";
+    pub const CHEVRON_UP: &str = "\u{E5CE}";
+    pub const ARROW_DOWN: &str = "\u{E5DB}";
+    pub const ARROW_UP: &str = "\u{E5D8}";
+    pub const COPY: &str = "\u{E14D}";
+    /// A model: memory.
+    pub const MODEL: &str = "\u{E322}";
+    pub const SHIELD: &str = "\u{E9E0}";
+    /// The fleet monitor: monitoring.
+    pub const PULSE: &str = "\u{F190}";
+    pub const TOOLS: &str = "\u{F8CD}";
+    /// A command run.
+    pub const TERMINAL: &str = "\u{EB8E}";
+    /// Edited files: edit_document.
+    pub const EDIT: &str = "\u{F88C}";
+    pub const CHECK: &str = "\u{E668}";
+    pub const STAR: &str = "\u{F09A}";
+    pub const STAR_FILLED: &str = "\u{F109A}";
+    pub const LOCK: &str = "\u{E899}";
+    pub const WARNING: &str = "\u{F083}";
+    /// Auto routing: auto_awesome.
+    pub const AUTO: &str = "\u{E65F}";
+    /// Automations: bolt.
+    pub const AUTOMATION: &str = "\u{EA0B}";
+    pub const USAGE: &str = "\u{EFF2}";
+    pub const EXTERNAL: &str = "\u{E89E}";
+    pub const OPEN_FOLDER: &str = "\u{E2C8}";
+    pub const KEYBOARD: &str = "\u{E312}";
+    pub const ROUTING: &str = "\u{EACD}";
+    pub const CLOUD: &str = "\u{F15C}";
+    pub const CODE: &str = "\u{E86F}";
+    /// Manage models: tune.
+    pub const SLIDERS: &str = "\u{E429}";
+    pub const CHAT: &str = "\u{E0C9}";
+    pub const ARCHIVE: &str = "\u{E149}";
+    pub const DELETE: &str = "\u{E92E}";
+    /// Move under another task: drive_file_move.
+    pub const MOVE: &str = "\u{E9A1}";
+    /// Resume a lost task: play_arrow.
+    pub const RESUME: &str = "\u{E037}";
+    pub const RENAME: &str = "\u{F097}";
+    /// Tags: sell.
+    pub const TAG: &str = "\u{F05B}";
+    /// Review: list.
+    pub const LIST: &str = "\u{E896}";
+    /// Workers and the fleet: hub.
+    pub const HUB: &str = "\u{E9F4}";
+    /// Queued: schedule.
+    pub const SCHEDULE: &str = "\u{EFD6}";
+    /// Failed, lost, unknown: error.
+    pub const ERROR: &str = "\u{F8B6}";
+    pub const CHECK_CIRCLE: &str = "\u{F0BE}";
+    pub const PENDING: &str = "\u{EF64}";
+    /// Steer: subdirectory_arrow_right.
+    pub const STEER: &str = "\u{E5DA}";
+    /// A provider hold: hourglass_top.
+    pub const HOLD: &str = "\u{EA5B}";
+    /// A goal: flag.
+    pub const GOAL: &str = "\u{F0C6}";
+    pub const MERGE: &str = "\u{EB98}";
+    pub const REFRESH: &str = "\u{E5D5}";
+    pub const SNOOZE: &str = "\u{E046}";
+    pub const FILTER: &str = "\u{E152}";
+    pub const WRAP: &str = "\u{E25B}";
+    pub const FULL_VIEW: &str = "\u{F1CE}";
+    pub const WIDTH: &str = "\u{F730}";
+    pub const NEW_FILE: &str = "\u{E89C}";
+    /// Archive and checkpoints: inventory_2.
+    pub const INVENTORY: &str = "\u{E1A1}";
+    pub const RESTART: &str = "\u{F053}";
+    pub const PAUSE: &str = "\u{E1A2}";
+    pub const ATTACH: &str = "\u{E226}";
+    /// Review the changes: difference.
+    pub const DIFF: &str = "\u{EB7D}";
+    pub const HISTORY: &str = "\u{E8B3}";
+    pub const STOP_CIRCLE: &str = "\u{EF71}";
+    pub const GROUP: &str = "\u{EA21}";
+    pub const PERSON_SEARCH: &str = "\u{F106}";
 }
 
 pub fn weight(style: TypeStyle) -> FontWeight {
@@ -336,6 +390,7 @@ pub fn lifted(
     };
     let bands: Vec<Border> = match roles.lift {
         crate::theme::Lift::Shadow { key, ambient } => {
+            let (key, ambient) = (key[level.index()], ambient[level.index()]);
             let [key_bands, ambient_bands] = elevation::level_bands(level);
             let shadow = |bands: &'static [Band], opacity| {
                 bands
@@ -402,7 +457,8 @@ pub fn icon_button(palette: Palette) -> Button {
         .style(ButtonStyle::Subtle)
 }
 
-/// The composer's FAB (Send, Stop, Steer): a raised 36-DIP circle.
+/// The composer's main action (Send; Stop and Steer recolor it): a raised
+/// 40-DIP square at the medium corner.
 pub fn send_button(palette: Palette) -> Button {
     Button::new()
         .resource_overrides(palette.filled())
@@ -416,13 +472,30 @@ pub fn send_icon() -> View {
     icon(glyph::ARROW_UP)
 }
 
-/// Stop's mark: a filled 12-DIP square in the on-primary role.
+/// The composer's Stop turn: the 40-DIP action in `error`.
+pub fn stop_button(palette: Palette) -> Button {
+    send_button(palette).resource_overrides(palette.stop_fab())
+}
+
+/// The composer's Steer: the 40-DIP action in `tertiary`.
+pub fn steer_button(palette: Palette) -> Button {
+    send_button(palette).resource_overrides(palette.steer_fab())
+}
+
+/// The New task button: `primary-container`, 40 DIPs.
+pub fn new_task_button(palette: Palette) -> Button {
+    row(palette, false)
+        .resource_overrides(palette.new_task())
+        .min_height(height::NEW_TASK)
+}
+
+/// Stop's mark: a filled 12-DIP square in `on-error`.
 pub fn stop_mark(palette: Palette) -> View {
     Border::new()
         .width(icon_size::STOP)
         .height(icon_size::STOP)
         .corner_radius(radius::STOP)
-        .background(palette.on_primary())
+        .background(palette.on_error())
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
@@ -901,11 +974,13 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
 pub fn composer_card(palette: Palette, place: Grid, content: impl Into<View>) -> View {
     lifted(
         palette,
-        crate::theme::elevation::Level::Three,
+        crate::theme::elevation::Level::One,
         radius::COMPOSER,
         place,
         Border::new()
             .background(palette.composer())
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::uniform(layout::HAIRLINE))
             .corner_radius(radius::COMPOSER)
             .padding(Thickness::new(
                 spacing::MD,
@@ -1170,12 +1245,13 @@ pub fn link_content(label: &str) -> View {
         ))
 }
 
-/// A popover or in-window menu: the composer role, the container corner,
-/// a 4-DIP inset (lift it with [`lifted`] at level 2).
+/// A popover or in-window menu: the menu role (`surface-container`), the
+/// container corner, the dark themes' overlay border, a 4-DIP inset (lift
+/// it with [`lifted`] at level 2).
 pub fn popover(palette: Palette) -> Border {
     Border::new()
-        .background(palette.composer())
-        .border_brush(palette.outline())
+        .background(palette.menu())
+        .border_brush(palette.overlay_border())
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::uniform(spacing::XS))

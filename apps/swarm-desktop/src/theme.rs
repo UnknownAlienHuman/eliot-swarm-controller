@@ -1,22 +1,19 @@
-//! Color, type, elevation and state for the desktop: the approved design
-//! (owner, 2026-11-19), `System.dc.html` and `Themes.dc.html` of the
-//! eliot-design board.
+//! Color, elevation and state for the desktop: the brand book "Eliot
+//! Swarm Material" (Material 3 Expressive, owner-approved 2026-11-24).
 //!
-//! A theme only swaps the palette roles ([`Roles`]): surface, sidebar,
-//! container, composer, selected, primary, on-primary, text, muted,
-//! outline, attention, and the lift and glow of raised things. Every
-//! component reads roles, never a raw color; the few in-between tones the
-//! design draws (a chip's outline or a tool row's tint) use the reference
-//! tones in Light and derive the corresponding tones for the other themes.
-//! Layout, density and motion never change with the theme.
-//! [`winui`] resolves the roles to WinUI brushes and to the theme
-//! resource keys of the real controls; under Windows High Contrast it maps
-//! nothing, so the system colors apply.
+//! A theme only swaps the color roles ([`Roles`]), which are the brand
+//! book's tokens for that theme ([`crate::brand::SCHEMES`], generated from
+//! `design/tokens.json`) under the names the views use. Every component
+//! reads roles, never a raw color. Layout, density and motion never change
+//! with the theme. [`winui`] resolves the roles to WinUI brushes and to
+//! the theme resource keys of the real controls; under Windows High
+//! Contrast it maps nothing, so the system colors apply.
 
 pub use crate::tokens::state;
 
-/// The design's elevation: level 1 (a pressable under the pointer), 2
-/// (menus, popovers, the FAB under the pointer) and 3 (the composer), each
+/// The design's elevation: level 1 (the main card, the composer, a
+/// pressable under the pointer) and 2 (menus, popovers, the composer's
+/// action under the pointer), each
 /// Material Components' key and ambient shadow (offset, blur, spread, as
 /// CSS `box-shadow`). WinUI's `ThemeShadow` draws nothing outside a popup
 /// without receivers, so each shadow is drawn as the blur CSS renders: a
@@ -30,7 +27,6 @@ pub mod elevation {
     pub enum Level {
         One,
         Two,
-        Three,
     }
 
     /// One shadow in DIPs, as CSS `box-shadow` takes it (no x offset).
@@ -41,42 +37,62 @@ pub mod elevation {
         pub spread: f64,
     }
 
-    impl Shadow {
-        const fn new(offset: f64, blur: f64, spread: f64) -> Self {
-            Self {
-                offset,
-                blur,
-                spread,
+    impl Level {
+        /// 0 for level 1, 1 for level 2.
+        pub const fn index(self) -> usize {
+            match self {
+                Level::One => 0,
+                Level::Two => 1,
+            }
+        }
+
+        /// The brand book's layers of this level in each theme (key first,
+        /// then ambient; one ring in the true-black themes).
+        pub const fn layers(self) -> [&'static [crate::brand::Shadow]; 6] {
+            match self {
+                Level::One => crate::brand::ELEVATION_1,
+                Level::Two => crate::brand::ELEVATION_2,
             }
         }
     }
 
-    /// The key and the ambient shadow of `level` (material-web
-    /// `elevation/internal/_elevation.scss`, the design's System board).
-    pub const fn shadows(level: Level) -> [Shadow; 2] {
-        match level {
-            Level::One => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(1.0, 3.0, 1.0)],
-            Level::Two => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(2.0, 6.0, 2.0)],
-            Level::Three => [Shadow::new(1.0, 3.0, 0.0), Shadow::new(4.0, 8.0, 3.0)],
+    /// The key and the ambient shadow of `level`, as the brand book draws
+    /// them in the Light theme (every shadowed theme shares the geometry;
+    /// only the opacity differs, see [`super::Lift`]).
+    pub fn shadows(level: Level) -> [Shadow; 2] {
+        let geometry = |layer: &crate::brand::Shadow| Shadow {
+            offset: layer.y,
+            blur: layer.blur,
+            spread: layer.spread,
+        };
+        match level.layers()[0] {
+            [key, ambient, ..] => [geometry(key), geometry(ambient)],
+            _ => {
+                [Shadow {
+                    offset: 0.0,
+                    blur: 0.0,
+                    spread: 0.0,
+                }; 2]
+            }
         }
     }
 
     /// The bands of `level`'s key and ambient shadows ([`bands`]), worked
     /// out once per level: the in-tree lifts draw them on every render.
     pub fn level_bands(level: Level) -> &'static [Vec<Band>; 2] {
-        static CACHE: [std::sync::OnceLock<[Vec<Band>; 2]>; 3] =
-            [const { std::sync::OnceLock::new() }; 3];
-        let index = match level {
-            Level::One => 0,
-            Level::Two => 1,
-            Level::Three => 2,
-        };
-        CACHE[index].get_or_init(|| shadows(level).map(bands))
+        static CACHE: [std::sync::OnceLock<[Vec<Band>; 2]>; 2] =
+            [const { std::sync::OnceLock::new() }; 2];
+        CACHE[level.index()].get_or_init(|| shadows(level).map(bands))
     }
 
-    /// The night themes' glow around the FAB: a centred blur of `radius`.
+    /// The night themes' glow around the composer's action: a centred blur
+    /// of `radius`.
     pub const fn glow(radius: f64) -> Shadow {
-        Shadow::new(0.0, radius, 0.0)
+        Shadow {
+            offset: 0.0,
+            blur: radius,
+            spread: 0.0,
+        }
     }
 
     /// One drawn band of a shadow: its outer edge `reach` DIPs past the
@@ -168,34 +184,6 @@ impl Rgb8 {
     }
 }
 
-fn luminance(color: Rgb8) -> f64 {
-    let linear = |channel: u8| {
-        let srgb = f64::from(channel) / 255.0;
-        if srgb <= 0.04045 {
-            srgb / 12.92
-        } else {
-            ((srgb + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * linear(color.r) + 0.7152 * linear(color.g) + 0.0722 * linear(color.b)
-}
-
-/// Keep the approved hue where it is readable as text. Otherwise move it
-/// toward on-surface until it also works beneath a pressed row.
-fn readable(color: Rgb8, on_surface: Rgb8, backgrounds: &[f64]) -> Rgb8 {
-    const MIN_TEXT_CONTRAST: f64 = 4.5;
-    (0..=100)
-        .map(|step| color.mix(on_surface, f64::from(step) / 100.0))
-        .find(|foreground| {
-            let foreground = luminance(*foreground) + 0.05;
-            backgrounds.iter().all(|&background| {
-                let background = background + 0.05;
-                foreground.max(background) / foreground.min(background) >= MIN_TEXT_CONTRAST
-            })
-        })
-        .expect("desktop palette must provide 4.5:1 text contrast")
-}
-
 const BLACK: Rgb8 = Rgb8::new(0, 0, 0);
 const WHITE: Rgb8 = Rgb8::new(255, 255, 255);
 pub const SHADOW_COLOR: Rgb8 = BLACK;
@@ -238,11 +226,12 @@ impl Theme {
     }
 }
 
-/// How raised things lift off their surface: Material's shadows at a key
-/// and an ambient opacity, or (true-black themes) a hairline ring.
+/// How raised things lift off their surface: the brand book's shadows at
+/// each level's key and ambient opacity (index 0 is level 1), or
+/// (true-black themes) a hairline ring.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lift {
-    Shadow { key: f64, ambient: f64 },
+    Shadow { key: [f64; 2], ambient: [f64; 2] },
     Ring(Rgb8),
 }
 
@@ -255,131 +244,115 @@ pub struct Glow {
     pub radius: f64,
 }
 
-/// One theme's palette roles, exactly as the Themes board lists them, and
-/// the tones the design draws between two roles.
+/// One theme's roles: the brand book's color tokens ([`crate::brand::Scheme`])
+/// under the names the views use, and how raised things lift.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Roles {
     pub theme: Theme,
     pub dark: bool,
+    /// Every color token of the theme, as the brand book lists them.
+    pub scheme: crate::brand::Scheme,
+    /// The main card: conversation, pages, Settings (`surface`).
     pub surface: Rgb8,
+    /// The window ground and the sidebar (`surface-container`).
     pub sidebar: Rgb8,
+    /// Menus and popovers (`surface-container`, with `overlay_border` in
+    /// dark themes).
+    pub menu: Rgb8,
+    /// Dialogs, right-pane cards, segmented tracks, filled fields, plot
+    /// wells (`surface-container-high`).
     pub container: Rgb8,
+    /// The composer card, code blocks, tool rows and suggestion cards
+    /// (`surface-container-low`).
     pub composer: Rgb8,
+    /// Selection: a selected row, chip or toggled icon button, tonal
+    /// buttons, the user's message bubble (`secondary-container`).
     pub selected: Rgb8,
+    /// Content on the selection (`on-secondary-container`).
+    pub on_selected: Rgb8,
     pub primary: Rgb8,
-    /// Primary as text on a neutral or selected surface.
+    /// Primary as text: text buttons, links, a selected icon.
     pub primary_text: Rgb8,
     pub on_primary: Rgb8,
+    /// The New task button (`primary-container`, `on-primary-container`).
+    pub primary_container: Rgb8,
+    pub on_primary_container: Rgb8,
+    /// Primary text (`on-surface`).
     pub text: Rgb8,
+    /// Secondary text, captions, inactive icons (`on-surface-variant`).
     pub muted: Rgb8,
-    /// Muted text, adjusted to clear 4.5:1 on app surfaces.
     pub secondary_text: Rgb8,
+    /// Chips, icon buttons, an ended task's title (`on-surface-variant`).
+    pub variant: Rgb8,
+    /// Hairlines and dividers (`outline-variant`).
     pub outline: Rgb8,
+    /// A chip's or outlined button's outline (`outline-variant`).
+    pub border: Rgb8,
+    /// A field's outline and the idle dot (`outline`).
+    pub field_outline: Rgb8,
+    /// Waiting for you: the attention dot, the Inbox counter, the
+    /// attention strip, Steer (`tertiary`, `tertiary-container`).
+    pub waiting: Rgb8,
+    pub waiting_container: Rgb8,
+    pub on_waiting_container: Rgb8,
+    /// Stop turn, danger, Failed, Lost, Unknown (`error`).
     pub attention: Rgb8,
     pub attention_text: Rgb8,
+    pub attention_container: Rgb8,
+    pub on_attention_container: Rgb8,
     pub lift: Lift,
     pub glow: Option<Glow>,
-    /// Text between `text` and `muted`: chips, icon buttons, an ended
-    /// task's title (the design's #46464F in Light).
-    pub variant: Rgb8,
-    /// A chip's, segment's and field's outline (#C6C5D0 in Light).
-    pub border: Rgb8,
-    /// A tool row, suggestion card or search field: halfway from surface to
-    /// container (#F0EFF7 in Light).
+    /// A tool row or suggestion card (`surface-container-low`).
     pub tonal: Rgb8,
-    /// A running tool row (#E8E9FF in Light).
+    /// A running tool row (`surface-container-high`).
     pub running: Rgb8,
-    /// The surface of an error or warning banner.
-    pub attention_container: Rgb8,
     /// WinUI's accent ramp (`SystemAccentColorDark3`…`Light3`). WinUI fills
     /// with Dark1 in Light and Light2 in Dark, which are the primary.
     pub accent_ramp: [Rgb8; 6],
 }
 
+/// A brand-book color token (`0xAARRGGBB`) without its alpha.
+pub(crate) const fn rgb(argb: u32) -> Rgb8 {
+    Rgb8::hex(argb & 0x00ff_ffff)
+}
+
+/// The alpha of a brand-book color token (`0xAARRGGBB`), 0–1.
+pub(crate) fn alpha(argb: u32) -> f64 {
+    f64::from(argb >> 24) / 255.0
+}
+
 impl Roles {
     fn new(theme: Theme) -> Self {
-        let soft = Lift::Shadow {
-            key: 0.30,
-            ambient: 0.15,
-        };
-        let deep = Lift::Shadow {
-            key: 0.60,
-            ambient: 0.40,
-        };
-        // surface, sidebar, container, composer, selected, primary,
-        // on-primary, text, muted, outline, attention.
-        let (c, lift, glow): ([u32; 11], Lift, Option<Glow>) = match theme {
-            Theme::Light => (
-                [
-                    0xfbf8ff, 0xf5f2fa, 0xe9e8f1, 0xffffff, 0xdfe0ff, 0x4c58b0, 0xffffff, 0x1b1b21,
-                    0x767680, 0xe4e1ec, 0xb3261e,
-                ],
-                soft,
-                None,
-            ),
-            Theme::Dark => (
-                [
-                    0x131318, 0x1b1b21, 0x2a292f, 0x1f1f25, 0x353a66, 0xbac3ff, 0x1a2478, 0xe4e1e9,
-                    0xc6c5d0, 0x35343b, 0xffb4ab,
-                ],
-                deep,
-                None,
-            ),
-            Theme::Amoled => (
-                [
-                    0x000000, 0x0a0a0c, 0x16161a, 0x0f0f12, 0x23253f, 0x9fa8ff, 0x0b1240, 0xf2f0f7,
-                    0xa3a2ad, 0x1f1f25, 0xff8a80,
-                ],
-                Lift::Ring(Rgb8::hex(0x1f1f25)),
-                None,
-            ),
-            Theme::Purple => (
-                [
-                    0xfef7ff, 0xf7f0fb, 0xece6f0, 0xffffff, 0xe8def8, 0x6750a4, 0xffffff, 0x1d1b20,
-                    0x79747e, 0xe7e0ec, 0xb3261e,
-                ],
-                soft,
-                None,
-            ),
-            Theme::Neon => (
-                [
-                    0x0b0d17, 0x10131f, 0x1a1e30, 0x141828, 0x1f2b45, 0x00e5ff, 0x00141a, 0xe6f7ff,
-                    0x8aa0b8, 0x24304a, 0xff4d8d,
-                ],
-                deep,
-                Some(Glow {
-                    color: Rgb8::hex(0x00e5ff),
-                    alpha: 0.55,
-                    radius: 12.0,
-                }),
-            ),
-            Theme::Matrix => (
-                [
-                    0x050805, 0x070b07, 0x0d150d, 0x0a110a, 0x10301a, 0x00ff66, 0x001a0a, 0xc8ffd8,
-                    0x5fa874, 0x133a1f, 0xff5c5c,
-                ],
-                Lift::Ring(Rgb8::hex(0x133a1f)),
-                Some(Glow {
-                    color: Rgb8::hex(0x00ff66),
-                    alpha: 0.45,
-                    radius: 10.0,
-                }),
-            ),
-        };
-        let [
-            surface,
-            sidebar,
-            container,
-            composer,
-            selected,
-            primary,
-            on_primary,
-            text,
-            muted,
-            outline,
-            attention,
-        ] = c.map(Rgb8::hex);
+        let index = Theme::ALL
+            .iter()
+            .position(|t| *t == theme)
+            .unwrap_or_default();
+        let s = crate::brand::SCHEMES[index];
+        let primary = rgb(s.primary);
         let dark = theme.dark();
+        // A hairline ring in the true-black themes, else each level's key
+        // and ambient shadow opacities.
+        let opacities = |layers: &[crate::brand::Shadow]| match layers {
+            [key, ambient, ..] => Some((alpha(key.color), alpha(ambient.color))),
+            _ => None,
+        };
+        let lift = match (
+            crate::brand::ELEVATION_1[index],
+            opacities(crate::brand::ELEVATION_1[index]),
+            opacities(crate::brand::ELEVATION_2[index]),
+        ) {
+            (_, Some((key1, ambient1)), Some((key2, ambient2))) => Lift::Shadow {
+                key: [key1, key2],
+                ambient: [ambient1, ambient2],
+            },
+            ([ring, ..], ..) => Lift::Ring(rgb(ring.color)),
+            _ => Lift::Ring(rgb(s.outline_variant)),
+        };
+        let glow = crate::brand::GLOW_SHADOW[index].first().map(|shadow| Glow {
+            color: rgb(shadow.color),
+            alpha: alpha(shadow.color),
+            radius: shadow.blur,
+        });
         let accent_ramp = if dark {
             [
                 primary.mix(BLACK, 0.8),
@@ -399,53 +372,40 @@ impl Roles {
                 primary.mix(WHITE, 0.6),
             ]
         };
-        let [variant, border, tonal, running] = match theme {
-            Theme::Light => crate::tokens::color::LIGHT_SUPPORTING.map(Rgb8::hex),
-            Theme::Dark => crate::tokens::color::DARK_SUPPORTING.map(Rgb8::hex),
-            _ => [
-                text.mix(muted, 0.5),
-                outline.mix(muted, 0.25),
-                surface.mix(container, 0.5),
-                surface.mix(selected, 0.6),
-            ],
-        };
-        let attention_container = surface.mix(attention, 0.12);
-        let backgrounds = [
-            surface,
-            sidebar,
-            container,
-            composer,
-            selected,
-            tonal,
-            running,
-            attention_container,
-        ]
-        .map(|background| luminance(background.mix(text, state::PRESSED)));
-        let readable_text = |color| readable(color, text, &backgrounds);
         Self {
             theme,
             dark,
-            surface,
-            sidebar,
-            container,
-            composer,
-            selected,
+            scheme: s,
+            surface: rgb(s.surface),
+            sidebar: rgb(s.surface_container),
+            menu: rgb(s.surface_container),
+            container: rgb(s.surface_container_high),
+            composer: rgb(s.surface_container_low),
+            selected: rgb(s.secondary_container),
+            on_selected: rgb(s.on_secondary_container),
             primary,
-            primary_text: readable_text(primary),
-            on_primary,
-            text,
-            muted,
-            secondary_text: readable_text(muted),
-            outline,
-            attention,
-            attention_text: readable_text(attention),
+            primary_text: rgb(s.primary_text),
+            on_primary: rgb(s.on_primary),
+            primary_container: rgb(s.primary_container),
+            on_primary_container: rgb(s.on_primary_container),
+            text: rgb(s.on_surface),
+            muted: rgb(s.on_surface_variant),
+            secondary_text: rgb(s.on_surface_variant),
+            variant: rgb(s.on_surface_variant),
+            outline: rgb(s.outline_variant),
+            border: rgb(s.outline_variant),
+            field_outline: rgb(s.outline),
+            waiting: rgb(s.tertiary),
+            waiting_container: rgb(s.tertiary_container),
+            on_waiting_container: rgb(s.on_tertiary_container),
+            attention: rgb(s.error),
+            attention_text: rgb(s.error),
+            attention_container: rgb(s.error_container),
+            on_attention_container: rgb(s.on_error_container),
             lift,
             glow,
-            variant: readable_text(variant),
-            border,
-            tonal,
-            running,
-            attention_container,
+            tonal: rgb(s.surface_container_low),
+            running: rgb(s.surface_container_high),
             accent_ramp,
         }
     }
@@ -453,9 +413,10 @@ impl Roles {
     /// Container and content of a status chip.
     pub fn status(&self, tone: StatusTone) -> (Rgb8, Rgb8) {
         match tone {
-            StatusTone::Active | StatusTone::Pending => (self.selected, self.text),
-            StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => {
-                (self.attention_container, self.attention_text)
+            StatusTone::Active | StatusTone::Pending => (self.selected, self.on_selected),
+            StatusTone::Attention => (self.waiting_container, self.on_waiting_container),
+            StatusTone::Failed | StatusTone::Unknown => {
+                (self.attention_container, self.on_attention_container)
             }
             StatusTone::Ready | StatusTone::Neutral => (self.container, self.variant),
         }
@@ -570,9 +531,14 @@ pub mod winui {
             self.role(|r| r.container, ThemeBrush::CardBackground)
         }
 
-        /// The composer, menus and popovers.
+        /// The composer card, code blocks, tool rows.
         pub fn composer(self) -> Brush {
             self.role(|r| r.composer, ThemeBrush::SolidBackground)
+        }
+
+        /// Menus and popovers.
+        pub fn menu(self) -> Brush {
+            self.role(|r| r.menu, ThemeBrush::SolidBackground)
         }
 
         /// The selection: a selected row, segment or pane tab, a status
@@ -609,11 +575,6 @@ pub mod winui {
             self.role(|r| r.primary, ThemeBrush::AccentText)
         }
 
-        /// Content on primary: the FAB's glyph and Stop square.
-        pub fn on_primary(self) -> Brush {
-            self.role(|r| r.on_primary, ThemeBrush::PrimaryText)
-        }
-
         /// Errors, failures, low quota, Full access.
         pub fn attention(self) -> Brush {
             self.role(|r| r.attention_text, ThemeBrush::SystemCritical)
@@ -632,7 +593,8 @@ pub mod winui {
         pub fn dot(self, tone: StatusTone) -> Option<Brush> {
             let pick: fn(&Roles) -> Rgb8 = match tone {
                 StatusTone::Active => |r| r.primary,
-                StatusTone::Attention | StatusTone::Failed | StatusTone::Unknown => |r| r.attention,
+                StatusTone::Attention => |r| r.waiting,
+                StatusTone::Failed | StatusTone::Unknown => |r| r.attention,
                 StatusTone::Pending => |r| r.muted,
                 StatusTone::Ready | StatusTone::Neutral => return None,
             };
@@ -689,7 +651,7 @@ pub mod winui {
         pub fn row(self, selected: bool) -> ResourceOverrides {
             self.with(|r| {
                 if selected {
-                    Family::new(Some(r.selected), r.text)
+                    Family::new(Some(r.selected), r.on_selected)
                 } else {
                     Family::new(None, r.text)
                 }
@@ -730,7 +692,7 @@ pub mod winui {
                 Family {
                     outline: Some(r.border),
                     ..if on {
-                        Family::new(Some(r.selected), r.text)
+                        Family::new(Some(r.selected), r.on_selected)
                     } else {
                         Family::new(None, r.variant)
                     }
@@ -764,7 +726,7 @@ pub mod winui {
         pub fn segment(self, selected: bool) -> ResourceOverrides {
             self.with(|r| {
                 if selected {
-                    Family::new(Some(r.selected), r.text)
+                    Family::new(Some(r.selected), r.on_selected)
                 } else {
                     Family::new(None, r.variant)
                 }
@@ -800,6 +762,54 @@ pub mod winui {
                 }
                 .overrides(r)
             })
+        }
+
+        /// The composer's Stop turn: `error` with `on-error`.
+        pub fn stop_fab(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(
+                    Some(super::rgb(r.scheme.error)),
+                    super::rgb(r.scheme.on_error),
+                )
+                .overrides(r)
+            })
+        }
+
+        /// The composer's Steer: `tertiary` with `on-tertiary`.
+        pub fn steer_fab(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(
+                    Some(super::rgb(r.scheme.tertiary)),
+                    super::rgb(r.scheme.on_tertiary),
+                )
+                .overrides(r)
+            })
+        }
+
+        /// Content on `error`: Stop's square.
+        pub fn on_error(self) -> Brush {
+            self.role(|r| super::rgb(r.scheme.on_error), ThemeBrush::PrimaryText)
+        }
+
+        /// The New task button: `primary-container` with
+        /// `on-primary-container`.
+        pub fn new_task(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(Some(r.primary_container), r.on_primary_container).overrides(r)
+            })
+        }
+
+        /// A menu's or popover's 1-DIP edge: `overlay-border` (dark themes
+        /// only; transparent in light ones).
+        pub fn overlay_border(self) -> Brush {
+            match self.roles {
+                Some(r) => {
+                    let v = r.scheme.overlay_border;
+                    let c = super::rgb(v);
+                    Brush::Solid(Color::argb((v >> 24) as u8, c.r, c.g, c.b))
+                }
+                None => Brush::Theme(ThemeBrush::CardStroke),
+            }
         }
 
         /// Settings usage status for a reported percentage remaining.
