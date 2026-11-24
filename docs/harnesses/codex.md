@@ -63,11 +63,13 @@ loop or make its unstable types part of `eliot-core`.
 In installed Codex 0.167.1 (`rust-v0.167.1`, revision `0a94398fa60c`),
 `thread/start` attempts to save `[projects.'<path>']` with `trust_level = "trusted"`
 when the request supplies a `cwd`, the project has no explicit trust level, and
-the effective config has a project. The write targets the resolved Git trust
+the effective config has a project. An explicit `untrusted` level also suppresses
+the automatic write. The write targets the resolved Git trust
 root or the effective `cwd`, using `CODEX_HOME/config.toml`. Effective disabled
 (`danger-full-access`) and external sandboxes qualify. A managed sandbox qualifies
 when it can write `cwd`, as with effective `workspace-write`. Effective read-only
-does not qualify, and approval policy is independent. [Trust decision and reload](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/request_processors/thread_processor.rs#L1455-L1530) · [Config write](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/config/edit.rs#L743-L786)
+does not qualify. Approval policy is independent, so `never` with a writable
+`cwd` still permits the write. [Trust decision and reload](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/request_processors/thread_processor.rs#L1455-L1530) · [Config write](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/config/edit.rs#L743-L786)
 
 An explicit trust entry can be supplied without persistence using a process
 `-c` override for the `projects` table or a `projects` map in `thread/start.config`.

@@ -3131,7 +3131,8 @@ on first use. Named and ad-hoc Codex profiles use it for `CODEX_HOME` and
 `CODEX_SQLITE_HOME`, including native metadata readers. A linked home or config,
 or a retained binding to a different native store, refuses before starting a
 workspace setup command or app-server. Agents frozen without a stand home
-require a fresh launch. Stand setup copies no Codex configuration or credential files. An adopted
+require a fresh launch. Stand setup copies no Codex configuration or credential
+files. An adopted
 [OpenCodex route](../harnesses/opencodex.md) can use the running proxy's credentials.
 The stand removes the private Codex files with its root after daemon exit.
 Ordinary daemons continue using their configured Codex home and authentication.
