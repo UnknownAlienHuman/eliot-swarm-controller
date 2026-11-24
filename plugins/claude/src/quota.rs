@@ -78,15 +78,28 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
         "Claude",
     )
     .map_err(|_| q::environment("Claude quota could not resolve the profile environment"))?;
-    tokio::time::timeout(
+    let status = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         crate::native::auth_status(OsStr::new(program), &cwd, &environment.variables),
     )
     .await
     .ok()
-    .and_then(Result::ok)
-    .filter(subscription_status)
-    .ok_or_else(|| q::environment("Claude CLI did not confirm a first-party subscription route"))?;
+    .and_then(Result::ok);
+    if status
+        .as_ref()
+        .and_then(|value| value["loggedIn"].as_bool())
+        == Some(false)
+    {
+        return Err(eliot_core::Error::new(
+            "auth_required",
+            "Claude CLI is signed out.",
+        ));
+    }
+    if !status.as_ref().is_some_and(subscription_status) {
+        return Err(q::environment(
+            "Claude CLI did not confirm a first-party subscription route",
+        ));
+    }
 
     let credentials;
     let token = if let Some(token) =

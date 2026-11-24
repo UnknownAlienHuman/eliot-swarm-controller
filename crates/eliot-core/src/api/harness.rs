@@ -236,12 +236,40 @@ impl NativeRoute {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeAuthState {
+    SignedIn,
+    SignedOut,
+    Unknown,
+}
+
+pub type NativeAuthInvocation = (std::path::PathBuf, Vec<std::ffi::OsString>);
+
+/// Resolve the current Owner installation and its fixed vendor argv in the caller's session.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAuthCommand {
+    pub resolve: fn() -> Option<NativeAuthInvocation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAuthCheck {
+    pub command: NativeAuthCommand,
+    pub classify: fn(Option<i32>, &[u8], &[u8]) -> NativeAuthState,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeAuthCapability {
+    pub login: Option<NativeAuthCommand>,
+    pub signed_in_check: Option<NativeAuthCheck>,
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
     /// Native profile vocabulary supplied by this adapter.
     pub profile: ProfileCapabilities,
     pub native_route: NativeRoute,
+    pub native_auth: Option<NativeAuthCapability>,
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// `None` when the adapter has no ad-hoc effort mapping.
