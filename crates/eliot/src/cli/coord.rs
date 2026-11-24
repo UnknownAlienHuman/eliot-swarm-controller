@@ -490,11 +490,15 @@ async fn decide_inbox(
             .split_once('=')
             .filter(|(key, _)| !key.is_empty())
             .ok_or_else(|| Failure::new(2, "--arg must use KEY=VALUE"))?;
-        let value = if key == "answers" {
-            serde_json::from_str(value)
-                .map_err(|_| Failure::new(2, "--arg answers must be valid JSON"))?
-        } else {
-            Value::String(value.to_owned())
+        let value = match key {
+            "answers" => serde_json::from_str(value)
+                .map_err(|_| Failure::new(2, "--arg answers must be valid JSON"))?,
+            "confirm" => Value::Bool(
+                value
+                    .parse()
+                    .map_err(|_| Failure::new(2, "--arg confirm must be true or false"))?,
+            ),
+            _ => Value::String(value.to_owned()),
         };
         if fields.insert(key.to_owned(), value).is_some() {
             return Err(Failure::new(2, "duplicate --arg key"));

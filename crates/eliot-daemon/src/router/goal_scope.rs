@@ -446,7 +446,6 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
     }
     let mut args = args.iter();
     let mut local_modules = true;
-    let mut ambiguous = false;
     while let Some(arg) = args.next() {
         let folded = arg.to_ascii_lowercase();
         let option = if powershell || cmd {
@@ -454,99 +453,132 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
         } else {
             arg.as_str()
         };
+        let option_name = option.split_once('=').map_or(option, |(name, _)| name);
         match option {
-            "--" if !cmd && !ambiguous => return args.next().map_or(Unverified, |arg| Script(arg)),
-            "-file" | "-f" if powershell && !ambiguous => {
+            "--" if !cmd => return args.next().map_or(Unverified, |arg| Script(arg)),
+            "-file" | "-f" if powershell || name == "php" => {
                 return args.next().map_or(Unverified, |arg| Script(arg));
             }
             "/c" | "/k" if cmd => {
                 return args
                     .next()
-                    .filter(|arg| !ambiguous && simple_cmd_script(arg))
+                    .filter(|arg| simple_cmd_script(arg))
                     .map_or(Unverified, |arg| Script(arg));
             }
-            "-m" if python => {
-                return args
-                    .next()
-                    .filter(|_| local_modules && !ambiguous)
-                    .map_or(Unverified, |arg| PythonModule(arg));
-            }
-            "-" => return Unverified,
-            "-c" if python || shell => return Unverified,
-            "-e" | "--eval" | "-p" | "--print" if node => return Unverified,
-            "-e" | "-E" | "-r" if matches!(name, "ruby" | "perl" | "php") => return Unverified,
-            "-command" | "-c" | "-encodedcommand" | "-enc" if powershell => return Unverified,
-            "-I" | "-P" if python => local_modules = false,
-            "-W" | "-X" if python => {
-                if args.next().is_none() {
-                    return Unverified;
+            "-" | "-h" | "--help" | "--version" => return Unverified,
+            "-0" | "-0p" | "--list" | "--list-paths" if name == "py" => return Unverified,
+            option if python && option.starts_with('-') && !option.starts_with("--") => {
+                if name == "py" && option.starts_with("-V:") {
+                    continue;
+                }
+                // CPython permits clustered flags and attached option values.
+                for (offset, flag) in option[1..].char_indices() {
+                    match flag {
+                        'I' | 'P' => local_modules = false,
+                        'c' | 'h' | 'V' => return Unverified,
+                        'm' | 'W' | 'X' => {
+                            let attached = &arg[offset + 2..];
+                            let value = if attached.is_empty() {
+                                args.next().map(String::as_str)
+                            } else {
+                                Some(attached)
+                            };
+                            let Some(value) = value else {
+                                return Unverified;
+                            };
+                            if flag == 'm' {
+                                return if local_modules {
+                                    PythonModule(value)
+                                } else {
+                                    Unverified
+                                };
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
             }
-            "-executionpolicy" | "-inputformat" | "-outputformat" | "-workingdirectory"
-            | "-windowstyle" | "-configurationname" | "-settingsfile" | "-version"
+            "-command" | "-c" | "-commandwithargs" | "-cwa" | "-encodedcommand" | "-enc" | "-e"
+            | "-ec" | "-workingdirectory" | "-configurationname" | "-settingsfile"
+                if powershell =>
+            {
+                return Unverified;
+            }
+            "-executionpolicy" | "-inputformat" | "-outputformat" | "-windowstyle" | "-version"
+            | "-configurationfile" | "-custompipename"
                 if powershell =>
             {
                 if args.next().is_none() {
                     return Unverified;
                 }
-                if matches!(
-                    option,
-                    "-workingdirectory" | "-configurationname" | "-settingsfile"
-                ) {
-                    ambiguous = true;
-                }
             }
-            "-r" | "--require" | "--import" | "--loader" | "--conditions" if node => {
+            _ if node
+                && matches!(
+                    option_name,
+                    "-e" | "--eval" | "-p" | "--print" | "-i" | "--interactive" | "--run" | "-v"
+                ) =>
+            {
+                return Unverified;
+            }
+            "-r"
+            | "--require"
+            | "--import"
+            | "--loader"
+            | "--experimental-loader"
+            | "-C"
+            | "--conditions"
+            | "--env-file"
+            | "--env-file-if-exists"
+            | "--experimental-config-file"
+            | "--redirect-warnings"
+            | "--input-type"
+                if node =>
+            {
                 if args.next().is_none() {
                     return Unverified;
                 }
             }
-            "-o" | "-O" | "--rcfile" | "--init-file" if shell => {
+            "--rcfile" | "--init-file" if shell => {
                 if args.next().is_none() {
                     return Unverified;
                 }
             }
-            option if python && python_switch(name, option) => {}
-            "-noprofile" | "-nologo" | "-noninteractive" | "-sta" | "-mta" if powershell => {}
-            "/d" | "/s" | "/q" | "/a" | "/u" | "/e:on" | "/e:off" | "/v:on" | "/v:off" if cmd => {}
-            "--noprofile" | "--norc" | "--posix" if shell => {}
-            flags
-                if shell
-                    && flags.strip_prefix('-').is_some_and(|flags| {
-                        !flags.is_empty() && flags.bytes().all(|flag| b"eufvxabn".contains(&flag))
-                    }) => {}
-            "--enable-source-maps" | "--no-warnings" | "--trace-warnings" | "--no-deprecation"
-                if node => {}
-            option if option.starts_with("--") && option.contains('=') && !powershell => {
-                if option.starts_with("--eval=") || option.starts_with("--print=") {
+            option if shell && option.starts_with(['-', '+']) && !option.starts_with("--") => {
+                let mut flags = option[1..].chars();
+                if let Some(mode) = flags.find(|flag| matches!(flag, 'c' | 's' | 'o' | 'O'))
+                    && (matches!(mode, 'c' | 's')
+                        || (flags.as_str().is_empty() && args.next().is_none()))
+                {
                     return Unverified;
                 }
             }
-            option if option.starts_with('-') || (cmd && option.starts_with('/')) => {
-                ambiguous = true;
+            option
+                if matches!(name, "ruby" | "perl")
+                    && ["-e", "-E", "-S"]
+                        .iter()
+                        .any(|prefix| option.starts_with(prefix)) =>
+            {
+                return Unverified;
             }
-            _ if ambiguous || cmd => return Unverified,
+            "-I" | "-r" | "-M" | "-m" if matches!(name, "ruby" | "perl") => {
+                if args.next().is_none() {
+                    return Unverified;
+                }
+            }
+            "-r" | "-B" | "-R" | "-F" | "-E" | "-a" if name == "php" => return Unverified,
+            "-d" | "-c" | "-z" if name == "php" => {
+                if args.next().is_none() {
+                    return Unverified;
+                }
+            }
+            option if option.starts_with('-') || (cmd && option.starts_with('/')) => {}
+            _ if cmd => return Unverified,
             _ if powershell && !arg.to_ascii_lowercase().ends_with(".ps1") => return Unverified,
             _ => return Script(arg),
         }
     }
     Unverified
-}
-
-fn python_switch(name: &str, option: &str) -> bool {
-    option.starts_with("-W")
-        || option.starts_with("-X")
-        || (name == "py"
-            && (option.starts_with("-V:")
-                || option.strip_prefix('-').is_some_and(|version| {
-                    version.starts_with(['2', '3'])
-                        && version
-                            .bytes()
-                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
-                })))
-        || option.strip_prefix('-').is_some_and(|flags| {
-            !flags.is_empty() && flags.bytes().all(|flag| b"bBdEiqORsSuvx".contains(&flag))
-        })
 }
 
 fn simple_cmd_script(arg: &str) -> bool {

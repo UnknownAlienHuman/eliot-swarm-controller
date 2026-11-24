@@ -836,7 +836,8 @@ inspecting the worktree and index, the Owner can choose
 releasing the reservation. The original receipt remains available for exact retry.
 For an armed writer, the inbox can also offer `stop_writer` to stop the
 verified family or `abandon_reservation` with `confirm=true` and a recorded
-`reason` when the Owner accepts the risk of an unproven exit.
+`reason` when the Owner accepts the risk of an unproven exit. In the CLI, use
+`swarm inbox decide <item-ref> abandon_reservation --arg confirm=true --arg "reason=<reason>"`.
 
 Each stuck command has its own `command:<id>` subject, revision, snooze and
 decision receipt. It offers `command.get` (`inspect`). The available corrections
