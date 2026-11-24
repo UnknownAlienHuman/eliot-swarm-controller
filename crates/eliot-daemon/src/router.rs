@@ -6866,37 +6866,38 @@ impl Router {
             None
         };
         let result = json!({"state": "applied", "mode": action});
-        if action == ShutdownMode::Restart {
-            // This Store lock is the source-input cutoff: writes already holding
-            // it committed before these cursor-bound gaps; pending or later
-            // frames are covered from the last committed native cursor onward.
-            // Keep the cutoff and optional backup ahead of the seal in one
-            // writer critical section.
-            for (agent, generation) in self.inner.plugin_host.live_source_generations() {
-                let events =
-                    store.record_native_restart_gaps(&agent, generation, &request.id, now_ms())?;
-                self.publish_locked(&events);
-            }
-        }
         if request.backup {
             crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
         }
         let owner = principal_name(principal);
         let payload =
             json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup});
-        let admission = if request.backup {
-            store.record_restart_and_seal(&request.id, &owner, &payload, &result, now_ms())
-        } else {
-            store.record_write(
+        let outcome = if action == ShutdownMode::Restart {
+            store.record_restart_and_seal(
                 &request.id,
                 &owner,
-                "daemon.shutdown",
                 &payload,
                 &result,
                 now_ms(),
+                &self.inner.plugin_host.live_source_generations(),
             )
+        } else if request.backup {
+            store
+                .record_restart_and_seal(&request.id, &owner, &payload, &result, now_ms(), &[])
+                .map(|admission| (admission.0, Vec::new()))
+        } else {
+            store
+                .record_write(
+                    &request.id,
+                    &owner,
+                    "daemon.shutdown",
+                    &payload,
+                    &result,
+                    now_ms(),
+                )
+                .map(|admission| (admission, Vec::new()))
         };
-        let admission = match admission {
+        let (admission, restart_events) = match outcome {
             Ok(admission) => admission,
             Err(error) => {
                 if action == ShutdownMode::Restart && store.is_write_faulted() {
@@ -6919,6 +6920,7 @@ impl Router {
                 return Err(error);
             }
         };
+        self.publish_locked(&restart_events);
         if admission.is_new {
             match action {
                 ShutdownMode::PrepareRestart => {

@@ -377,61 +377,6 @@ impl Store {
         result
     }
 
-    /// Record the exact native input cutoff for a planned daemon restart.
-    /// The restart mutation id makes the boundary stable across retries; each
-    /// gap starts at the source's last committed cursor and covers any native
-    /// bytes that were still buffered when the Store writer was sealed.
-    pub fn record_native_restart_gaps(
-        &mut self,
-        agent: &str,
-        generation: i64,
-        restart_id: &str,
-        now: i64,
-    ) -> Result<Vec<Event>> {
-        self.ensure_writer_healthy()?;
-        let result = self.record_native_restart_gaps_inner(agent, generation, restart_id, now);
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
-    fn record_native_restart_gaps_inner(
-        &mut self,
-        agent: &str,
-        generation: i64,
-        restart_id: &str,
-        now: i64,
-    ) -> Result<Vec<Event>> {
-        validate_ulid(restart_id)?;
-        let agent_num = parse_agent_id(agent)?;
-        let tx = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(sql_error)?;
-        let current = load_agent_by_num(&tx, agent_num)?
-            .ok_or_else(|| Error::new("not_found", "restart gap Agent was not found"))?;
-        if generation <= 0 || current.generation != generation {
-            return Err(Error::new(
-                "stale_generation",
-                "restart gap generation is no longer current",
-            ));
-        }
-        observer::require_controlled(&current)?;
-        if current.is_terminal() {
-            commit_transaction(tx, &self.write_faulted)?;
-            return Ok(Vec::new());
-        }
-        let events = native_exit_gaps_tx(
-            &tx,
-            &current,
-            "planned_restart_native_input_cutoff",
-            now,
-            &format!("host-planned-restart:{restart_id}"),
-            true,
-        )?;
-        commit_transaction(tx, &self.write_faulted)?;
-        Ok(events)
-    }
-
     fn record_native_exit_gaps_inner(
         &mut self,
         agent: &str,
@@ -682,6 +627,22 @@ pub(super) fn native_unavailable_tx(
         }
     }
     Ok(events)
+}
+
+pub(super) fn native_restart_gaps_tx(
+    tx: &Transaction<'_>,
+    current: &Agent,
+    restart_id: &str,
+    now: i64,
+) -> Result<Vec<Event>> {
+    native_exit_gaps_tx(
+        tx,
+        current,
+        "planned_restart_native_input_cutoff",
+        now,
+        &format!("host-planned-restart:{restart_id}"),
+        true,
+    )
 }
 
 fn native_exit_gaps_tx(

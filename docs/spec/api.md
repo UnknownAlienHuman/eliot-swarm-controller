@@ -3162,15 +3162,19 @@ connection has been sealed. Confirmed cancellation discards its backup.
 
 Immediately before a planned `restart`, under the Store writer lock, the
 daemon records one generation-bound native `source.gap` per currently
-controlled source, from its last committed cursor with no asserted end cursor.
-This records the boundary of confirmed coverage and leaves any later input and
-turn or tool outcomes uncertain. The online backup includes the gap events.
+controlled source in the same SQLite transaction as the restart receipt and
+Store seal, from its last committed cursor with no asserted end cursor. This
+records the boundary of confirmed coverage and leaves any later input and
+turn or tool outcomes uncertain. The online backup is created before this
+transaction and represents the prior committed Store state.
 After the restart receipt commits, a late `events.put` receives an `unavailable`
 response with a log entry tied to the gap reference. The frame remains
-unacknowledged. A definite failure before seal leaves native intake open and
-uses the existing backup cleanup path. Any recorded gap remains as historical
-coverage evidence. A Store write fault fences intake while the seal outcome
-is uncertain.
+unacknowledged. A definite failure before seal rolls back both gaps and receipt,
+leaves native intake open, and uses the existing backup cleanup path. A Store
+write fault fences intake while the seal outcome is uncertain. The backup may
+be restored only before a replacement can admit writes; after admission, rollback
+uses the current Store and retains its writes rather than restoring the older
+backup over them.
 
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback

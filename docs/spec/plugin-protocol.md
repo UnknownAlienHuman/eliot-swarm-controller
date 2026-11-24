@@ -544,9 +544,10 @@ kind/family, timestamp, exact correlations and bounded data. The daemon computes
 canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
-For a planned daemon restart, while holding the same Store writer lock used to
-seal the restart receipt, the daemon records a generation-bound `source.gap` for
-each currently controlled native source. Its `from` is that source's last
+For a planned daemon restart, while holding the Store writer lock, the daemon
+records a generation-bound `source.gap` for each currently controlled native
+source in the same SQLite transaction as the restart receipt and connection
+seal. Its `from` is that source's last
 committed cursor and `to` is absent: the boundary covers any buffered native
 bytes that do not commit before the cutoff. It is conservative coverage
 evidence, not proof that bytes were lost. A batch committed before the cutoff
@@ -556,7 +557,9 @@ explicit `unavailable` response without a new write attempt and a bounded
 the frame remains unacknowledged and is not replayed. This does not assert
 whether the same batch had committed before its acknowledgement was lost.
 These gaps do not settle a turn, request, or tool outcome. The old reader is
-retired after the receipt.
+retired after the receipt. A definite transaction failure commits neither the
+gaps nor the receipt, so native intake remains open. If the Store reports a
+write fault, the seal outcome is uncertain and intake is fenced.
 
 Codex, Claude, Muse and OpenCode also hold early native facts pending exact
 association in the shared [early-event buffer](../../crates/eliot-plugin/src/event_buffer.rs).

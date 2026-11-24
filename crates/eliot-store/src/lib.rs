@@ -1057,9 +1057,10 @@ impl Store {
             semantic_payload,
             result,
             now,
+            &[],
         );
         self.fault_on_persistence_error(&outcome);
-        outcome
+        outcome.map(|(admission, _)| admission)
     }
 
     /// Publish the restart receipt only if the same transaction can seal the
@@ -1071,7 +1072,8 @@ impl Store {
         semantic_payload: &Value,
         result: &Value,
         now: i64,
-    ) -> Result<WriteAdmission> {
+        native_sources: &[(String, i64)],
+    ) -> Result<(WriteAdmission, Vec<Event>)> {
         self.ensure_writer_healthy()?;
         let outcome = self.record_write_inner(
             id,
@@ -1080,6 +1082,7 @@ impl Store {
             semantic_payload,
             result,
             now,
+            native_sources,
         );
         self.fault_on_persistence_error(&outcome);
         outcome
@@ -1093,7 +1096,8 @@ impl Store {
         semantic_payload: &Value,
         result: &Value,
         now: i64,
-    ) -> Result<WriteAdmission> {
+        native_sources: &[(String, i64)],
+    ) -> Result<(WriteAdmission, Vec<Event>)> {
         let (method, seal) = match intent {
             ReceiptWrite::Ordinary(method) => (method, false),
             ReceiptWrite::SealedRestart => ("daemon.shutdown", true),
@@ -1110,6 +1114,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
+        let mut restart_events = Vec::new();
         if command_binding(&tx, id)?.is_some() {
             return Err(Error::new(
                 "id_conflict",
@@ -1144,10 +1149,32 @@ impl Store {
             }
             let result = decode_json(&old_result)?;
             commit_transaction(tx, &self.write_faulted)?;
-            return Ok(WriteAdmission {
-                result,
-                is_new: false,
-            });
+            return Ok((
+                WriteAdmission {
+                    result,
+                    is_new: false,
+                },
+                Vec::new(),
+            ));
+        }
+        if seal {
+            for (agent, generation) in native_sources {
+                let agent_num = parse_agent_id(agent)?;
+                let current = load_agent_by_num(&tx, agent_num)?
+                    .ok_or_else(|| Error::new("not_found", "restart gap Agent was not found"))?;
+                if *generation <= 0 || current.generation != *generation {
+                    return Err(Error::new(
+                        "stale_generation",
+                        "restart gap generation is no longer current",
+                    ));
+                }
+                observer::require_controlled(&current)?;
+                if !current.is_terminal() {
+                    restart_events.extend(source_handoff::native_restart_gaps_tx(
+                        &tx, &current, id, now,
+                    )?);
+                }
+            }
         }
         validate_id_age(id, now)?;
         insert_write_tx(&tx, id, principal, method, &digest, &result_json, now)
@@ -1171,10 +1198,13 @@ impl Store {
             ));
         }
         committed?;
-        Ok(WriteAdmission {
-            result: result.clone(),
-            is_new: true,
-        })
+        Ok((
+            WriteAdmission {
+                result: result.clone(),
+                is_new: true,
+            },
+            restart_events,
+        ))
     }
 
     /// Record a dispatch decision before the caller performs native I/O. A
