@@ -1759,7 +1759,7 @@ impl Router {
                 let (path, error) = match result {
                     Ok(Ok(None)) => continue,
                     Ok(Ok(Some((path, error)))) => (Some(path), error),
-                    Ok(Err(error)) => return Err(error),
+                    Ok(Err(error)) => (agent.workspace.clone(), error),
                     Err(_) => (
                         agent.workspace.clone(),
                         Error::new("inventory_timeout", "artifact inventory probe timed out"),
