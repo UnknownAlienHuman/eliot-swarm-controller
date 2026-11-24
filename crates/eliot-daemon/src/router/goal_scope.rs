@@ -516,7 +516,14 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
             _ if node
                 && matches!(
                     option_name,
-                    "-e" | "--eval" | "-p" | "--print" | "-i" | "--interactive" | "--run" | "-v"
+                    "-e" | "--eval"
+                        | "-p"
+                        | "-pe"
+                        | "--print"
+                        | "-i"
+                        | "--interactive"
+                        | "--run"
+                        | "-v"
                 ) =>
             {
                 return Unverified;
