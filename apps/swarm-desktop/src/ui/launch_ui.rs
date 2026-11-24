@@ -192,6 +192,10 @@ pub(super) struct Submission {
 /// Tries to open a popover's flyout after its render, one frame apart.
 const SHOW_TRIES: u8 = 10;
 const SHOW_RETRY_MS: u64 = 16;
+/// A press outside a popover that lands on its own chip closes it (light
+/// dismiss) and then clicks the chip: a toggle of that chip this soon after
+/// is that same press and must not open it again.
+const DISMISS_PRESS_MS: u128 = 300;
 
 /// The new-task draft and its context.
 #[derive(Default)]
@@ -201,6 +205,8 @@ pub(super) struct LaunchState {
     /// Renders composed when the popover was asked for: its flyout opens
     /// after the render that attaches it to its chip.
     pub(super) show_after: u64,
+    /// The chip whose popover a light dismiss closed last, and when.
+    pub(super) dismissed: Option<(u8, std::time::Instant)>,
     /// Files attached in the composer, for the composer they were attached
     /// in (`NEW_TASK` or the open Agent's id).
     pub(super) attachments: Option<(String, Vec<String>)>,
@@ -581,6 +587,12 @@ impl DesktopApp {
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
+                } else if self.launch.dismissed.take().is_some_and(|(chip, at)| {
+                    self.launch.open.is_none()
+                        && chip == chip_of(pop)
+                        && at.elapsed().as_millis() < DISMISS_PRESS_MS
+                }) {
+                    // The press that light-dismissed this chip's popover.
                 } else {
                     self.open_popover(pop, context);
                 }
@@ -608,11 +620,17 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::Closed(epoch) => {
-                if epoch != self.launch.flyout_epoch {
+                // After a choice, Esc, Tab or a dialog opening the state is
+                // closed already (`close_popover`), and focus is where that
+                // put it: only a light dismiss of an open popover moves on.
+                let Some(open) = self
+                    .launch
+                    .open
+                    .filter(|_| epoch == self.launch.flyout_epoch)
+                else {
                     return;
-                }
-                // A light dismiss closes the state too; after a choice it
-                // is closed already.
+                };
+                self.launch.dismissed = Some((chip_of(open), std::time::Instant::now()));
                 let preset = self.launch.preset.is_some();
                 self.close_popover();
                 // WinUI puts focus back where it was as the flyout closes:
