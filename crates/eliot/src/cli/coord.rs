@@ -7,6 +7,7 @@ use super::args::{
     VarGetArgs, VarSetArgs, WhoArgs,
 };
 use super::reads::resolve_agent_target;
+use super::support::read_and_print;
 use super::support::{
     Failure, command_value, mutation_id, print_value, print_value_or_human, sleep_before_deadline,
     validate_limit, wait_deadline,
@@ -225,18 +226,13 @@ pub(crate) async fn run_cmd(
                 after,
                 limit,
             };
-            request.validate().map_err(Failure::for_read)?;
-            let response: CommandChildrenResponse =
-                eliot_daemon::client_call_typed(&data_dir, "command.children", &request)
-                    .await
-                    .map_err(Failure::for_read)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "command.children response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            read_and_print!(
+                &data_dir,
+                json_output,
+                "command.children",
+                request,
+                CommandChildrenResponse
+            )
         }
         CmdCommand::Resolve(CmdResolveArgs {
             command_id,
@@ -1188,18 +1184,13 @@ pub(crate) async fn run_claim_command(
         }) => {
             let agent = resolve_agent_target(agent_positional, legacy_agent)?;
             let request = ClaimListRequest { project, agent };
-            request.validate().map_err(Failure::for_read)?;
-            let response: ClaimListResponse =
-                eliot_daemon::client_call_typed(data_dir, "claim.list", &request)
-                    .await
-                    .map_err(Failure::for_read)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            let value = serde_json::to_value(response)
-                .map_err(|_| Failure::new(4, "claim.list response is invalid"))?;
-            print_value(&value, json_output);
-            Ok(0)
+            read_and_print!(
+                data_dir,
+                json_output,
+                "claim.list",
+                request,
+                ClaimListResponse
+            )
         }
         ClaimCommand::Release(ClaimReleaseArgs {
             glob,

@@ -11,17 +11,14 @@
 
 use super::*;
 
-const LIST_COMMAND_CHILDREN_FIRST_SQL: &str =
-    "SELECT id, principal, method, target, expected_generation,
-            generation, expected_turn_id, turn_id, request_id, verb, args,
-            state, outcome, created_at, updated_at, probe, selector, config_revision
-     FROM commands WHERE parent_command = ?1 ORDER BY ordinal LIMIT ?2";
-const LIST_COMMAND_CHILDREN_CURSOR_SQL: &str =
-    "SELECT id, principal, method, target, expected_generation,
-            generation, expected_turn_id, turn_id, request_id, verb, args,
-            state, outcome, created_at, updated_at, probe, selector, config_revision
-     FROM commands WHERE parent_command = ?1 AND ordinal > ?2
-     ORDER BY ordinal LIMIT ?3";
+const LIST_COMMAND_CHILDREN_FIRST_SQL: &str = concat!(
+    command_record_select!(),
+    " WHERE parent_command = ?1 ORDER BY ordinal LIMIT ?2"
+);
+const LIST_COMMAND_CHILDREN_CURSOR_SQL: &str = concat!(
+    command_record_select!(),
+    " WHERE parent_command = ?1 AND ordinal > ?2 ORDER BY ordinal LIMIT ?3"
+);
 
 /// One bounded page of a retained expansion: the parent for authorization,
 /// its direct children in fixed ordinal order, and the continuation cursor.
