@@ -1330,11 +1330,12 @@ impl PinnedProcess {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
-    if pid == 0 {
+pub(crate) fn inspect_process_node(pid: u32, start_time: u64) -> Option<super::ProcessNodeInfo> {
+    let stat = read_linux_process_stat(pid).ok()?;
+    if stat.start_ticks != start_time || stat.state != ProcessState::Running {
         return None;
     }
-    let parent_pid = proc_parent_pid(pid);
+    let parent_pid = (stat.parent != 0).then_some(stat.parent);
     let argv = proc_argv(pid).unwrap_or_default();
     let image_path = fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
@@ -1345,6 +1346,7 @@ pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
     let command_line = (!argv.is_empty()).then(|| argv.join(" "));
     Some(super::ProcessNodeInfo {
         parent_pid,
+        process_group: Some(stat.pgid),
         image_path,
         command_line,
         argv,

@@ -119,7 +119,6 @@ struct ObserveTracker {
     emitted_heavy: HashSet<String>,
     harness: Option<String>,
     session_usage: Option<SessionUsage>,
-    ancestry: HashMap<u32, (u64, Option<u32>)>,
 }
 
 #[derive(Debug, Default)]
@@ -575,8 +574,7 @@ impl Monitoring {
     }
 
     /// Fresh-sample `agent`'s custody tree and pick the first running
-    /// non-server descendant of the newest native tool call of the completing
-    /// turn that contains a process start.
+    /// non-server process still attached to a tool launch of the completing turn.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
@@ -605,7 +603,7 @@ impl Monitoring {
 
         let mut harness_pids: HashMap<u32, u64> = HashMap::new();
         let mut plugin_pids: HashMap<u32, u64> = HashMap::new();
-        let mut live_pids: Vec<u32> = Vec::new();
+        let mut live_processes = Vec::new();
         let mut sample_starts: HashMap<u32, u64> = HashMap::new();
         for sample in &snapshot.samples {
             if sample.record.state != ProcessState::Running {
@@ -630,8 +628,11 @@ impl Monitoring {
                 }
                 _ => {}
             }
-            if live_pids.len() < 256 {
-                live_pids.push(sample.record.identity.pid);
+            if live_processes.len() < 256 {
+                live_processes.push((
+                    sample.record.identity.pid,
+                    sample.record.identity.start_time,
+                ));
             }
         }
         if harness_pids.is_empty() {
@@ -642,17 +643,20 @@ impl Monitoring {
                 if record.role == "harness" && record.state == ProcessState::Running {
                     harness_pids.insert(record.identity.pid, record.identity.start_time);
                     sample_starts.insert(record.identity.pid, record.identity.start_time);
+                    if live_processes.len() < 256 {
+                        live_processes.push((record.identity.pid, record.identity.start_time));
+                    }
                 }
             }
         }
-        if harness_pids.is_empty() || live_pids.is_empty() {
+        if harness_pids.is_empty() || live_processes.is_empty() {
             return Ok(None);
         }
 
         let nodes = tokio::task::spawn_blocking(move || {
-            let mut inspected = HashMap::with_capacity(live_pids.len());
-            for pid in live_pids {
-                if let Some(info) = crate::platform::inspect_process_node(pid) {
+            let mut inspected = HashMap::with_capacity(live_processes.len());
+            for (pid, start_time) in live_processes {
+                if let Some(info) = crate::platform::inspect_process_node(pid, start_time) {
                     inspected.insert(pid, info);
                 }
             }
@@ -660,27 +664,6 @@ impl Monitoring {
         })
         .await
         .map_err(|_| Error::new("process_observation", "background process inspect failed"))?;
-
-        let ancestry = {
-            let mut tracker = target.observe.lock_recover();
-            for sample in &snapshot.samples {
-                if let Some(node) = nodes.get(&sample.record.identity.pid) {
-                    tracker.ancestry.insert(
-                        sample.record.identity.pid,
-                        (sample.record.identity.start_time, node.parent_pid),
-                    );
-                }
-            }
-            if tracker.ancestry.len() > 1_024 {
-                let current_pids: HashSet<u32> = snapshot
-                    .samples
-                    .iter()
-                    .map(|sample| sample.record.identity.pid)
-                    .collect();
-                tracker.ancestry.retain(|pid, _| current_pids.contains(pid));
-            }
-            tracker.ancestry.clone()
-        };
 
         struct QualifiedCandidate<'a> {
             sample: &'a ProcessSample,
@@ -716,14 +699,13 @@ impl Monitoring {
                 harness_tree_pids.insert(sample.record.identity.pid);
                 continue;
             }
-            let Some(binding) = tool_binding(&containing) else {
+            if containing.iter().any(|window| window.harness_waiting) {
                 continue;
-            };
+            }
             let Some(chain) = harness_descendant_chain(
                 sample.record.identity.pid,
                 sample.record.identity.start_time,
                 &nodes,
-                &ancestry,
                 &sample_starts,
                 &harness_pids,
                 &plugin_pids,
@@ -747,6 +729,24 @@ impl Monitoring {
                 server_ancestor_pids.extend(chain);
                 continue;
             }
+            let launching: Vec<_> = context
+                .tool_windows
+                .iter()
+                .filter(|window| {
+                    window.command.as_deref().is_some_and(|command| {
+                        (tool_window_contains(proc_start_ms, window)
+                            && process_matches_tool_launch(node, command))
+                            || chain.iter().any(|pid| {
+                                crate::platform::process_start_unix_ms(sample_starts[pid])
+                                    .is_some_and(|start| tool_window_contains(start, window))
+                                    && process_matches_tool_launch(&nodes[pid], command)
+                            })
+                    })
+                })
+                .collect();
+            let Some(binding) = tool_binding(&launching) else {
+                continue;
+            };
             let (command_line, command_truncated) =
                 format_process_command_line(node, sample.record.identity.pid, secrets);
             qualifying.push(QualifiedCandidate {
@@ -776,7 +776,7 @@ impl Monitoring {
                 .any(|pid| qualifying_pids.contains(pid))
         });
 
-        // The newest tool call's first surviving process is the job root even
+        // Prefer the oldest attached survivor of the newest call
         // when a shell runtime (Git Bash) does not keep Windows parent links.
         let Some(winner) = qualifying.into_iter().max_by_key(|candidate| {
             (
@@ -2691,7 +2691,6 @@ fn harness_descendant_chain(
     pid: u32,
     start_time: u64,
     nodes: &HashMap<u32, crate::platform::ProcessNodeInfo>,
-    ancestry: &HashMap<u32, (u64, Option<u32>)>,
     sample_starts: &HashMap<u32, u64>,
     harness_pids: &HashMap<u32, u64>,
     plugin_pids: &HashMap<u32, u64>,
@@ -2703,16 +2702,10 @@ fn harness_descendant_chain(
     let mut current_pid = pid;
     let mut current_start = start_time;
     for _ in 0..16 {
-        let Some(parent_pid) = nodes
-            .get(&current_pid)
-            .and_then(|node| node.parent_pid)
-            .or_else(|| {
-                ancestry
-                    .get(&current_pid)
-                    .filter(|(st, _)| *st == current_start)
-                    .and_then(|(_, pp)| *pp)
-            })
-        else {
+        let Some(node) = nodes.get(&current_pid) else {
+            return after_harness.then_some(chain);
+        };
+        let Some(parent_pid) = node.parent_pid else {
             return after_harness.then_some(chain);
         };
         if parent_pid == 0 || !seen.insert(parent_pid) {
@@ -2724,21 +2717,20 @@ fn harness_descendant_chain(
         {
             return None;
         }
-        if harness_pids
+        let Some(&parent_start) = sample_starts
             .get(&parent_pid)
-            .is_some_and(|st| *st <= current_start)
-        {
-            return Some(chain);
-        }
-        let Some(parent_start) = sample_starts
-            .get(&parent_pid)
-            .copied()
-            .or_else(|| ancestry.get(&parent_pid).map(|(st, _)| *st))
+            .filter(|start| **start <= current_start)
         else {
             return after_harness.then_some(chain);
         };
-        if parent_start > current_start {
+        if !nodes
+            .get(&parent_pid)
+            .is_some_and(|parent| parent.process_group == node.process_group)
+        {
             return after_harness.then_some(chain);
+        }
+        if harness_pids.contains_key(&parent_pid) {
+            return Some(chain);
         }
         chain.push(parent_pid);
         current_pid = parent_pid;
@@ -2768,6 +2760,134 @@ fn matches_declared_command(
     })
 }
 
+fn process_matches_tool_launch(node: &crate::platform::ProcessNodeInfo, mut command: &str) -> bool {
+    let payload = node.command_line.as_deref().and_then(shell_command_payload);
+    let payload_argv = payload
+        .filter(|body| tool_command_head(body) == *body)
+        .map(eliot_core::split_windows_command_line);
+    for _ in 0..8 {
+        if payload == Some(command.trim())
+            || matches_direct_invocation(command, &node.argv)
+            || payload_argv
+                .as_deref()
+                .is_some_and(|argv| matches_direct_invocation(command, argv))
+        {
+            return true;
+        }
+        let Some(inner) = shell_command_payload(tool_command_head(command)) else {
+            break;
+        };
+        command = inner;
+    }
+    false
+}
+
+fn process_program(path: &str) -> &str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if cfg!(windows)
+        && let Some((stem, extension)) = name.rsplit_once('.')
+        && ["exe", "cmd", "bat"]
+            .iter()
+            .any(|kind| extension.eq_ignore_ascii_case(kind))
+    {
+        return stem;
+    }
+    name
+}
+
+/// The inline script is the full command-line remainder after the shell flag.
+/// In particular, `cmd /c cargo build` does not quote the script as one argument.
+fn shell_command_payload(command: &str) -> Option<&str> {
+    let command = command.trim();
+    let (program, mut rest) = match command.chars().next()? {
+        quote @ ('\'' | '"') => command[1..].split_once(quote)?,
+        _ => command.split_once(char::is_whitespace)?,
+    };
+    let program = process_program(program).to_ascii_lowercase();
+    if !eliot_core::SHELL_WRAPPER_PROGRAMS.contains(&program.as_str())
+        && !matches!(program.as_str(), "sh" | "bash" | "dash" | "zsh")
+    {
+        return None;
+    }
+    while let Some((flag, remaining)) = rest.trim_start().split_once(char::is_whitespace) {
+        rest = remaining.trim_start();
+        match flag.to_ascii_lowercase().as_str() {
+            "-c" | "-lc" | "-command" | "/c" => {
+                let quote = rest.chars().next()?;
+                if matches!(quote, '\'' | '"')
+                    && let Some(body) = rest
+                        .strip_prefix(quote)
+                        .and_then(|body| body.strip_suffix(quote))
+                    && (!body.contains(quote)
+                        || (program == "cmd" && quote == '"' && body.starts_with('"')))
+                {
+                    return Some(body.trim());
+                }
+                return Some(rest.trim_end());
+            }
+            "-executionpolicy" | "-windowstyle" => {
+                rest = rest.split_once(char::is_whitespace)?.1;
+            }
+            flag if flag.starts_with('-') || (program == "cmd" && flag.starts_with('/')) => {}
+            _ => break,
+        }
+    }
+    None
+}
+
+/// Recognize a literal leading invocation with optional shell redirection or
+/// backgrounding. A program mentioned in a tool argument is not launch evidence.
+fn matches_direct_invocation(command: &str, argv: &[String]) -> bool {
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let parsed = eliot_core::split_windows_command_line(tool_command_head(command));
+    let Some((invocation, words)) = parsed.split_first() else {
+        return false;
+    };
+    let invoked_program = process_program(invocation.trim_matches('\''));
+    let observed_program = process_program(program);
+    let same_program = if cfg!(windows) {
+        invoked_program.eq_ignore_ascii_case(observed_program)
+    } else {
+        invoked_program == observed_program
+    };
+    same_program
+        && words.len() == args.len()
+        && args
+            .iter()
+            .zip(words)
+            .all(|(arg, word)| arg == word.trim_matches('\''))
+}
+
+fn tool_command_head(command: &str) -> &str {
+    let command = command
+        .trim_start()
+        .trim_start_matches(['(', '&'])
+        .trim_start();
+    let mut quote = None;
+    for (offset, ch) in command.char_indices() {
+        match quote {
+            Some(delimiter) if ch == delimiter => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if matches!(ch, '<' | '>' | '&' | ';' | '|' | ')' | '\n') => {
+                let invocation = &command[..offset];
+                if matches!(ch, '<' | '>')
+                    && let Some((before_fd, fd)) = invocation.rsplit_once(char::is_whitespace)
+                    && fd.len() == 1
+                    && fd.as_bytes()[0].is_ascii_digit()
+                {
+                    return before_fd;
+                }
+                return invocation;
+            }
+            None => {}
+        }
+    }
+    command
+}
+
 /// The tool call binding of a process start.
 struct ToolBinding {
     /// The item id when exactly one call contains the start.
@@ -2788,28 +2908,29 @@ fn containing_tool_windows(
 ) -> Vec<&eliot_store::BackgroundWakeToolWindow> {
     tool_windows
         .iter()
-        .filter(|window| {
-            let margin = if window.native_clock {
-                PROCESS_START_ROUNDING_MS
-            } else {
-                PROCESS_START_ROUNDING_MS + TOOL_COMMIT_LAG_MS
-            };
-            let end = window
-                .completed_at
-                .unwrap_or_else(|| window.started_at.saturating_add(OPEN_CALL_SPAWN_MS));
-            proc_start_ms >= window.started_at.saturating_sub(margin) && proc_start_ms <= end
-        })
+        .filter(|window| tool_window_contains(proc_start_ms, window))
         .collect()
 }
 
-/// The binding of a process from its containing calls. While the harness
-/// still runs a call as its own background task, a process bound only to that
-/// call is skipped: the harness wakes itself. Once a `tool_process` task ends,
-/// its survivors are ordinary candidates.
-fn tool_binding(containing: &[&eliot_store::BackgroundWakeToolWindow]) -> Option<ToolBinding> {
-    match containing {
+fn tool_window_contains(start: i64, window: &eliot_store::BackgroundWakeToolWindow) -> bool {
+    let margin = if window.native_clock {
+        PROCESS_START_ROUNDING_MS
+    } else {
+        PROCESS_START_ROUNDING_MS + TOOL_COMMIT_LAG_MS
+    };
+    let end = window
+        .completed_at
+        .unwrap_or_else(|| window.started_at.saturating_add(OPEN_CALL_SPAWN_MS));
+    start >= window.started_at.saturating_sub(margin) && start <= end
+}
+
+/// A binding uses the calls that provided launch evidence.
+fn tool_binding(launching: &[&eliot_store::BackgroundWakeToolWindow]) -> Option<ToolBinding> {
+    if launching.iter().any(|window| window.harness_waiting) {
+        return None;
+    }
+    match launching {
         [] => None,
-        [window] if window.harness_waiting => None,
         [window] => Some(ToolBinding {
             item_id: Some(window.item_id.clone()),
             started_at: window.started_at,
