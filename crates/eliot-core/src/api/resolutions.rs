@@ -136,6 +136,10 @@ pub struct SettleStoppedResponse {
     pub review: String,
     pub applied: bool,
     pub stops: Vec<StoppedCommandSettlement>,
+    /// Request replies with an exact committed native resolution receipt.
+    /// Older stored responses predate this field.
+    #[serde(default)]
+    pub request_replies: Vec<RequestReplySettlement>,
     /// Reviewed candidates still missing process or reader proof.
     #[serde(default)]
     pub awaiting_proof: Vec<String>,
@@ -149,6 +153,19 @@ pub struct StoppedCommandSettlement {
     pub command_id: String,
     pub mark_stopped: bool,
     pub interrupted_turn: Option<String>,
+}
+
+/// An unknown permission or user-input reply whose exact native receipt was
+/// committed for the same command, request, and turn.
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct RequestReplySettlement {
+    pub agent: String,
+    pub generation: i64,
+    pub command_id: String,
+    pub verb: String,
+    pub request_id: String,
+    pub turn_id: String,
+    pub receipt_seq: i64,
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
