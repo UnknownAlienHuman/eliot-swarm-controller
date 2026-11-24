@@ -1604,6 +1604,8 @@ pub(super) fn stop_exited_idle_on_restart_tx(
     if !capacity::has_owned_exit_and_reader_drain_tx(tx, agent, generation)? {
         return Ok(false);
     }
+    // Snapshot mail eligibility so arrivals after restart cannot reopen this idle Agent.
+    let undelivered_input = super::coordination::notice_pending_count_tx(tx, agent)?.is_some();
     let stopped = db!(tx.execute(
         "UPDATE agents AS a SET state = 'stopped', updated_at = ?1
          WHERE a.id = ?2 AND a.generation = ?3 AND a.state = 'idle' AND a.observe_only = 0
@@ -1627,10 +1629,40 @@ pub(super) fn stop_exited_idle_on_restart_tx(
         "agent",
         Some(agent),
         Some(generation),
-        json!({"agent_id": format_agent_id(agent), "reason": "owned_exit_before_restart"}),
+        json!({
+            "agent_id": format_agent_id(agent),
+            "reason": "owned_exit_before_restart",
+            "undelivered_input": undelivered_input,
+        }),
     )?);
     super::goals::pause_for_restart_tx(tx, agent, generation, "daemon_restart", now, events)?;
     Ok(true)
+}
+
+fn undelivered_launch_send_id_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+) -> Result<Option<String>> {
+    tx.query_row(
+        "SELECT send.id
+         FROM commands send
+         JOIN commands launch ON launch.id = send.parent_command
+         WHERE send.id = launch.id || '/send'
+           AND launch.verb = 'launch'
+           AND send.verb = 'send'
+           AND send.link_kind = 'send'
+           AND send.ordinal = 0
+           AND send.target = ?1
+           AND send.generation = ?2
+           AND send.state IN ('accepted', 'queued')
+         ORDER BY send.created_at, send.rowid
+         LIMIT 1",
+        params![agent, generation],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)
 }
 
 pub(super) fn transition_lost_tx(
@@ -1655,6 +1687,25 @@ pub(super) fn transition_lost_tx(
     if agent.is_terminal() {
         return Ok(());
     }
+
+    // Persist this before loss settlement changes commands and turn state.
+    let undelivered_launch_send_id = if reason == core::DAEMON_RESTART_REASON {
+        undelivered_launch_send_id_tx(tx, agent_num, generation)?
+    } else {
+        None
+    };
+    let restart_undelivered_input = reason == core::DAEMON_RESTART_REASON
+        && (super::coordination::notice_pending_count_tx(tx, agent_num)?.is_some()
+            || undelivered_launch_send_id.is_some()
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM commands
+                     WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+                       AND parent_command IS NULL AND state IN ('accepted', 'queued'))",
+                    params![agent_num, generation],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?);
 
     let dispatched = command_ids_in_state(tx, agent_num, generation, "dispatched")?;
     for command_id in dispatched {
@@ -1725,6 +1776,12 @@ pub(super) fn transition_lost_tx(
         core::DAEMON_RESTART_REASON | core::PLUGIN_ROOT_EXITED_REASON
     ) {
         data["previous_state"] = json!(agent.state);
+    }
+    if reason == core::DAEMON_RESTART_REASON {
+        data["undelivered_input"] = json!(restart_undelivered_input);
+        if let Some(send_id) = undelivered_launch_send_id {
+            data["undelivered_send_id"] = json!(send_id);
+        }
     }
     if let Some(turn_id) = &agent.active_turn {
         data["turn_id"] = json!(turn_id);

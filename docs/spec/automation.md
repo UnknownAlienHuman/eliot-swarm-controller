@@ -1237,7 +1237,12 @@ that branch's check unconfirmed. Unconfirmed effects retain their `unknown` stat
 
 Store commits the integration's scratch and process custody before mutation. Startup and
 the next integration request reconcile interrupted scratch after process exit is proven.
-Reconciliation removes only the recorded checkout, private index, and Git registration.
+The integration check receives no `ELIOT_ARTIFACT_ROOT`; `build/check.py` therefore puts
+Cargo output in `target/project-check` under the temporary checkout. That checkout is
+inside the unique integration scratch root, which reconciliation removes only after
+integration process custody is proven closed. A pending cleanup retains the scratch and
+the command's `unknown` outcome. Reconciliation removes the recorded scratch root,
+including the checkout, private index and build output, plus the unique Git registration.
 It retains the interrupted command's outcome. A cleaned scratch-only interruption
 releases the repository write gate. A possibly modified target ref keeps that gate.
 
@@ -1812,7 +1817,14 @@ interpreter such as `cmd.exe /d /c npm test`. The same lookup runs immediately
 before the check, so a changed or removed program can still block a round.
 Goal and project checks receive the managed worktree's frozen base commit as
 `ELIOT_TASK_BASE` when available. The integration check receives its frozen
-integration base. The variable is supplied to the check process only.
+integration base. The variable is supplied to the check process only. Goal and fast
+project checks also receive `ELIOT_ARTIFACT_ROOT` from the exact Agent generation's
+Store-owned artifact root when present. The integration check runs in its own private
+checkout and receives no Agent artifact root.
+The build check script places Cargo output under that root and clears `RUSTC_WRAPPER`,
+so parent Cargo configuration cannot select a shared target or wrapper. With no artifact
+root (including a direct manual run), it uses the check worktree's ignored
+`target/project-check/`.
 An explicit check deadline
 of 1–600 seconds in the Goal or its project policy takes precedence. With at
 least three successful runs with the same argv and working-directory

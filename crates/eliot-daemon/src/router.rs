@@ -1270,6 +1270,18 @@ impl Router {
         &self,
         candidate: &RestartResumeCandidate,
     ) -> Option<Admission> {
+        if candidate.interrupted && candidate.undelivered_send_text.is_some() {
+            self.report_restart_resume_blocked(
+                &candidate.agent,
+                candidate.generation,
+                Error::new(
+                    "bad_state",
+                    "restart has both an interrupted turn and an undelivered launch input",
+                ),
+            )
+            .await;
+            return None;
+        }
         let args = if candidate.interrupted {
             let body = eliot_core::format_restart_interrupted_turn_note_body(
                 &candidate.agent,
@@ -1277,6 +1289,8 @@ impl Router {
                 candidate.turn_id.as_deref(),
             );
             json!({"text": eliot_core::swarm_note(&body, eliot_core::RESTART_PRINCIPAL)})
+        } else if let Some(text) = candidate.undelivered_send_text.as_deref() {
+            json!({"text": text})
         } else {
             json!({})
         };

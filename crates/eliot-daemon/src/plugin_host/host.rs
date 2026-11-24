@@ -613,7 +613,27 @@ impl PluginHost {
                 "Agent profile snapshot must be a JSON object",
             ));
         }
-        let resume_from = if command.verb == "resume" {
+        // Only Store dispatch can mark the new generation as a fresh native
+        // start after proving the initial launch input never dispatched.
+        let restart_fresh_native = command
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("restart_fresh_native"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        if restart_fresh_native {
+            if command.verb != "resume"
+                || agent.native_scope.is_some()
+                || agent.native_ref.is_some()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "fresh restart has a conflicting native subject",
+                ));
+            }
+            source_state = None;
+        }
+        let resume_from = if command.verb == "resume" && !restart_fresh_native {
             let retained_generation = source_state
                 .as_ref()
                 .and_then(|state| state.get("retained_generation"))

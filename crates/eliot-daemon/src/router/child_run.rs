@@ -571,7 +571,7 @@ fn status_from_wait(entry: &WaitEntryResult) -> Result<ChildRunStatus> {
     }
 }
 
-fn child_run_digest_id(id: &str) -> Result<String> {
+pub(super) fn child_run_digest_id(id: &str) -> Result<String> {
     let value = ulid::Ulid::from_string(id).map_err(|_| Error::invalid_mutation_id())?;
     let original = value.to_bytes();
     let mut hash = Sha256::new();

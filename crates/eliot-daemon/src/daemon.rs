@@ -796,14 +796,21 @@ async fn spawn_workers(
         worker_stop.subscribe(),
         wake_factory,
     ));
+    let (restart_ready, digest_restart_ready) = watch::channel(false);
     let digest_router = router.clone();
     let digest_reporter = worker_reporter.clone();
     let digest_factory = move |shutdown: watch::Receiver<bool>| {
         let router = digest_router.clone();
         let reporter = digest_reporter.clone();
+        let restart_ready = digest_restart_ready.clone();
         async move {
-            let result =
-                crate::router::run_completion_digest(router, shutdown.clone(), reporter).await;
+            let result = crate::router::run_completion_digest(
+                router,
+                shutdown.clone(),
+                reporter,
+                restart_ready,
+            )
+            .await;
             crate::daemon::workers::from_result(result, &shutdown)
         }
     };
@@ -848,6 +855,7 @@ async fn spawn_workers(
                 Some(&error),
             );
         }
+        restart_ready.send_replace(true);
         if capacity_retained > 0 {
             restart_capacity::recheck(capacity).await;
         }

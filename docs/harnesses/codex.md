@@ -701,7 +701,8 @@ Verified against installed Codex 0.167.1's generated `ThreadStartParams`
 and `ThreadResumeParams` schemas and upstream tag `rust-v0.167.1`
 (`0a94398fa60c4fac0e7659e4213a0a36e613dd46`), 2026-11-16.
 When the frozen profile carries `native_subagents = "deny"` (the default
-with non-empty `child_profiles`), every `thread/start` and `thread/resume`
+when the setting is omitted, independent of `child_profiles`), every
+`thread/start` and `thread/resume`
 sends dotted keys `agents.enabled=false`, `features.multi_agent=false`
 and `features.multi_agent_v2=false` in its `config` object. The same three
 overrides precede `app-server` as process `-c` flags, including enumeration

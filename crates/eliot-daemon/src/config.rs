@@ -1718,7 +1718,8 @@ fn freeze_child_profiles(
 }
 /// Default native subagent policy for each supported harness.
 pub(crate) fn native_subagents_default(harness: &str) -> Option<&'static str> {
-    ProfileCapabilities::for_harness(harness)?.native_subagents_default
+    crate::harness_capabilities::native_subagents_policy(harness)
+        .map(|policy| policy.default_value())
 }
 
 /// Capabilities of a profile's `harness` field; a missing or unknown harness has none.
@@ -1728,11 +1729,10 @@ fn profile_capabilities(profile: &Value) -> ProfileCapabilities {
 
 /// Freeze the harness-native subagent switch for this profile: `allow` is an
 /// explicit opt-in, while `deny` asks the harness plugin to disable its
-/// native subagent surface for the session. When omitted, use the harness
-/// default `deny` for all five supported harnesses. The frozen value is
-/// reported in the snapshot so effective settings stay truthful. Adapters
-/// without a native denial mechanism must fail closed before launching unless
-/// the profile explicitly opts in with `allow`.
+/// native subagent surface for the session. When omitted, use the
+/// harness-specific capability default. The frozen value is reported in the
+/// snapshot so effective settings stay truthful. Adapters without a native
+/// denial mechanism continue to refuse an explicit `deny` before native start.
 fn freeze_native_subagents(
     profile_name: &str,
     entry: &ProfileEntry,

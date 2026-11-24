@@ -550,7 +550,13 @@ async fn run_policy_check(
         configured_timeout_ms.min(remaining_ms),
         Arc::clone(run.policy),
         run.cancellation.clone(),
-        Some(base_oid),
+        crate::router::project_checks::CheckEnvironment {
+            task_base: Some(base_oid),
+            // `local_process_command` clears ambient variables, so leaving this
+            // unset selects build/check.py's worktree-local target/project-check.
+            // The integration lease owns and removes the containing scratch root.
+            artifact_root: None,
+        },
         Some((index, run.lease.clone())),
     )
     .await

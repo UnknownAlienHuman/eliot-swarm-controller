@@ -591,6 +591,18 @@ digest pending. Delivered digests are pruned under
 the commands retention window (see [core](core.md#retention)), oldest delivery
 first; pending digests are never pruned.
 
+A `child.run` digest follows an interrupted child turn to its exact automatic
+restart continuation. Startup waits for the initial restart pass to record
+that binding before delivering pending digests. Explicit turn waits retain
+their original turn identity.
+
+A child's delivered completion can reopen its idle parent after restart. The
+mail re-offer checks the parent's exact closed generation, proven custody exit,
+and unread result from its own digest registration. It rechecks the generation
+and Stop and archive fences before admitting Resume. Normal mail wake runs
+when the resumed session is ready. This uses the existing digest and mailbox
+records and leaves other mail queued for terminal Agents.
+
 ### Quoted data
 
 Swarm uses the shared Core fence for text from Agents, processes and files when

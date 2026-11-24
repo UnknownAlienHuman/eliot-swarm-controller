@@ -20,8 +20,8 @@ use crate::{
     common::now_ms,
     git_monitor::GitProbe,
     scripts::process::{
-        ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV, local_process_command,
-        run_owned_process,
+        ARTIFACT_ROOT_ENV, ProcessCapture, ProcessFailure, ProcessOutcome, TASK_BASE_ENV,
+        local_process_command, run_owned_process,
     },
 };
 use eliot_core::api::{UNSUCCESSFUL_TURN_NO_WORK, UNSUCCESSFUL_TURN_WORK_UNVERIFIED};
@@ -587,8 +587,10 @@ impl Router {
                 .map_err(|_| Error::new("internal", "goal.round result could not be encoded"));
         }
         let key = goal_round_key(&request)?;
-        let probe =
-            { store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())? };
+        let probe = store.goal_round_probe(&request.agent, request.mode.as_str(), key, now_ms())?;
+        let artifact_root = store
+            .agent_artifact_root(&request.agent, probe.view.generation)?
+            .map(|root| root.path);
         goal_round_gates(&probe, key)?;
         let definition = probe.view.definition.clone();
         let check_digest = goal_check_digest(&definition.check, definition.check_cwd.as_deref())?;
@@ -743,6 +745,9 @@ impl Router {
                     command.args(&definition.check[1..]);
                     if let Some(base) = &probe.task_base {
                         command.env(TASK_BASE_ENV, base);
+                    }
+                    if let Some(root) = &artifact_root {
+                        command.env(ARTIFACT_ROOT_ENV, root);
                     }
                     if let Some(cwd) = check_cwd.as_deref() {
                         command.current_dir(cwd);

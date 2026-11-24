@@ -232,8 +232,9 @@ the managers are the installed ones of `codex`, `claude` and `opencode` in that
 order (the harnesses that can disable native subagents per session), otherwise the
 first installed profile in name order. Each manager has `control = "tree"` and
 `child_profiles` listing the other installed bootstrap profiles. Bootstrap writes
-`native_subagents = "deny"` for every manager. A Muse or Antigravity
-fallback requires the Owner to opt in before its first launch. The `default`
+`native_subagents = "deny"` for managers whose harness can enforce it. If
+Muse or Antigravity is the fallback manager, bootstrap leaves the field
+omitted and its effective value is `allow`. The `default`
 routing role lists the managers followed by the other installed profiles in name
 order, so routing passes over one whose quota is used up or whose provider is on
 hold and starts the task on the next. The `worker` routing role and each manager's
@@ -520,18 +521,20 @@ A profile selects its harness-native subagent surface in `native_subagents`:
 `deny` asks the harness plugin to disable its native subagent tool for the
 session so delegation goes through Swarm (`launch` with `role` or an allowed
 profile, claims, mail, `wait`/`digest`). When omitted, it defaults to `deny`
-on every supported harness, independent of `child_profiles`. An
+for Codex, Claude and OpenCode, and to `allow` for Muse and Antigravity,
+independent of `child_profiles`. An
 explicit `native_subagents = "allow"` opts that profile into native subagents
 and remains valid for audit or other profiles that rely on them. The frozen
 value is captured in the profile snapshot and reported truthfully in effective
-settings. Ad-hoc Owner launches use the same default. Resume uses the
-retained snapshot, so adapters require explicit `allow` even for snapshots
-saved before the setting was frozen.
+settings, the desktop Profiles view and `swarm why`. Ad-hoc Owner launches use the same
+default. Resume uses the retained snapshot unchanged; the new default applies
+when a new launch snapshot is frozen, not when an existing Agent resumes.
 
 Muse and Antigravity have no verified per-session switch. A launch with
 `deny` on either harness returns `unsupported` before native process start,
-with a message showing how to opt in on a named profile. Codex, Claude, and
-OpenCode enforce `deny` on the session.
+with a reason surfaced by `swarm why`. Their desktop switch shows the effective
+`allow` default and cannot be switched off; an explicit deny from TOML still
+fails. Codex, Claude, and OpenCode enforce `deny` on the session.
 On OpenCode the denial is a per-session `subagent` wildcard deny stored as
 the final entry in the session's entire ruleset and verified by readback of that
 exact session on create and resume: the server merges session rules after
@@ -1978,24 +1981,29 @@ streams disconnected.
 ### Agent restart policy
 
 `[daemon].on_restart` takes `"continue"` (default) or `"hold"` and applies
-at daemon startup. Continue reopens eligible retained idle sessions without
-input and resumes eligible retained generations that were live, in batches
-of up to four resume commands within configured capacity. Roots resume
-before their children. Descendants wait for restart-affected ancestors to resume.
-A resumed live session opens with a framed Swarm note
-naming the interrupted turn. Resume uses the Agent's frozen profile and
-any inherited effective configuration from the retained generation. Goals
-and project assignments follow the Agent to its new generation. A Goal with
-unresolved prior work remains paused until that work is settled. Hold leaves
-those sessions for explicit resume. Previously
-admitted commands still follow durable command recovery. Interrupted turns
-and uncertain effects stay `unknown` under either policy: they are named,
-never replayed.
+at daemon startup. Continue has one automatic continuation rule: resume a
+retained generation only when work was interrupted or input was still waiting
+at restart. The restart event captures undelivered direct sends and unread
+wake-enabled mail. Mail arriving later does not reopen an idle Agent.
+An idle Agent without interrupted work or waiting input stays closed until a direct `send`,
+which uses normal resume admission and links that new input. Archived Agents
+are excluded, and an Owner-applied Stop remains a fence. Eligible generations
+resume in batches of up to four commands within configured capacity. Roots
+resume before their children. Descendants wait for ancestors with interrupted
+work or undelivered input. A resumed generation with interrupted work opens with a
+framed Swarm note naming the interrupted turn; no prior input is replayed.
+Resume uses the Agent's frozen profile and any inherited effective
+configuration from the retained generation. Goals and project assignments
+follow the Agent to its new generation. A Goal with unresolved prior work
+remains paused until that work is settled. Hold leaves those sessions for
+explicit resume. Previously admitted commands still follow durable command
+recovery. Interrupted turns and uncertain effects stay `unknown` under either
+policy: they are named, never replayed.
 
 `swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an
-applied Stop with proven process exit and native source drain allows promptless
-resume after replacement or rollback, with interrupted parents resumed before
+applied Stop with proven process exit and native source drain allows resume with
+the framed Swarm note after replacement or rollback, with interrupted parents before
 their children. The old turn retains its observed outcome. `hold` keeps those
 generations stopped for the Owner.
 

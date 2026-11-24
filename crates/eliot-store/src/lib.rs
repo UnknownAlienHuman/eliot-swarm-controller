@@ -607,8 +607,9 @@ impl Store {
 
     /// Admit one internal restart Resume only while its durable restart
     /// candidate remains eligible in this same Store transaction. The request
-    /// carries no linked input, or only new linked text: the framed Swarm
-    /// note naming the interrupted turn.
+    /// carries no linked input, or only new linked text: a framed Swarm note
+    /// or the exact initial launch input proven undispatched at restart. The
+    /// latter is revalidated against its retained command in this transaction.
     pub fn submit_restart_resume(&mut self, request: SubmitCommand, now: i64) -> Result<Admission> {
         let promptless = request.args == json!({});
         let noted = request
@@ -2437,9 +2438,10 @@ impl Store {
         Ok(turns)
     }
 
-    /// Latest terminal agent events (`agent.lost`, `agent.failed`) for one
-    /// generation, newest first. Powers `diagnose` process/exit steps: the
-    /// exit code, NTSTATUS and redacted stderr tail ride on these events.
+    /// Latest terminal process events (`agent.lost`, `agent.failed`, and an
+    /// idle `agent.stopped` recorded before restart) for one generation,
+    /// newest first. Powers `diagnose` process/exit steps: the exit code,
+    /// NTSTATUS and redacted stderr tail ride on these events.
     /// Bounded like every other page; at most `limit` rows.
     pub fn latest_agent_terminal_events(
         &self,
@@ -2454,7 +2456,10 @@ impl Store {
             .prepare(
                 "SELECT seq, ts, kind, agent, generation, source, native_id, data, subject, cause
                  FROM events
-                 WHERE agent = ?1 AND generation = ?2 AND kind IN ('agent.lost', 'agent.failed')
+                 WHERE agent = ?1 AND generation = ?2
+                   AND (kind IN ('agent.lost', 'agent.failed')
+                        OR (kind = 'agent.stopped'
+                            AND json_extract(data, '$.reason') = 'owned_exit_before_restart'))
                  ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
@@ -2737,6 +2742,10 @@ impl Store {
             )?);
         }
 
+        // A generation-0 Created Agent still has its accepted initial launch:
+        // dispatch advances it to Starting and marks that launch dispatched
+        // in this same transaction. Ordinary accepted-command recovery
+        // handles that pre-effect case; do not classify it as lost.
         let mut statement = tx
             .prepare(
                 "SELECT id, generation, state = 'idle' FROM agents
@@ -6607,6 +6616,32 @@ fn validate_resume_ready_subject_tx(
             "source_integrity",
             "session readiness does not match the exact resumed generation",
         ));
+    }
+    if command
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("restart_fresh_native"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if !result_page::is_restart_resume_intent_tx(tx, &command_id)?
+            || projection.native_scope.is_some()
+            || projection.native_ref.is_some()
+            || ["native_scope", "native_ref"].into_iter().any(|field| {
+                native_event
+                    .data
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "fresh restart readiness requires a new native subject",
+            ));
+        }
+        return Ok(());
     }
     let retained_scope = projection
         .native_scope

@@ -94,15 +94,47 @@ fn digest_results_locked(
         excerpt_recipient: Some(&row.parent),
         fair_budget: true,
     };
-    Router::wait_snapshot_locked(
-        store,
-        &wait_request_for_row(row),
-        &Principal::Owner,
-        None,
-        scope,
-        marks,
-    )
-    .map(|snapshot| snapshot.results)
+    let mut request = wait_request_for_row(row);
+    let mut results =
+        Router::wait_snapshot_locked(store, &request, &Principal::Owner, None, scope, marks)?
+            .results;
+    let [original] = row.commands.as_slice() else {
+        return Ok(results);
+    };
+    let Some(launch) = original.strip_suffix("/send") else {
+        return Ok(results);
+    };
+    if !row.turns.is_empty()
+        || !super::child_run::child_run_digest_id(launch).is_ok_and(|id| id == row.id)
+    {
+        return Ok(results);
+    }
+    let [entry] = results.as_mut_slice() else {
+        return Ok(results);
+    };
+    while let ("unknown", Some(agent), Some(generation), Some(turn)) = (
+        entry.status.as_str(),
+        entry.agent.as_deref(),
+        entry.generation,
+        entry.turn_id.as_deref(),
+    ) {
+        let Some(input) = store.completion_restart_input(agent, generation, turn)? else {
+            break;
+        };
+        request.commands[0] = input;
+        let mut next =
+            Router::wait_snapshot_locked(store, &request, &Principal::Owner, None, scope, marks)?
+                .results
+                .pop()
+                .ok_or_else(|| Error::new("internal", "restart digest input result is missing"))?;
+        next.id.clone_from(original);
+        let advanced = next.generation.is_some_and(|next| next > generation);
+        *entry = next;
+        if !advanced {
+            break;
+        }
+    }
+    Ok(results)
 }
 
 fn pending_response(
@@ -391,7 +423,18 @@ pub(crate) async fn run_completion_digest(
     router: Router,
     mut shutdown: watch::Receiver<bool>,
     reporter: crate::daemon::workers::WorkerReporter,
+    mut restart_ready: watch::Receiver<bool>,
 ) -> Result<()> {
+    // A restart can replace the result of a tracked child turn with its
+    // continuation. Wait for recovery to record its exact resume intent.
+    tokio::select! {
+        ready = restart_ready.wait_for(|ready| *ready) => {
+            if ready.is_err() {
+                return Err(Error::new("internal", "initial restart recovery did not finish"));
+            }
+        },
+        _ = shutdown.changed() => return Ok(()),
+    }
     let mut ticks = interval(DIGEST_POLL_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     // Deliver immediately on startup so a digest completed before a restart

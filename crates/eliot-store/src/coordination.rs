@@ -819,9 +819,9 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Page recipient ids due a normal mail notice: current `idle`,
-    /// non-observer, generation >= 1 agents holding waking unread mail whose
-    /// `mail_notices` row is absent or past the normal notice cooldown.
+    /// Page recipients due a normal mail notice or a restart-closed parent
+    /// with its exact unread child completion. An idle recipient's notice
+    /// must be outside the normal cooldown.
     /// Advisory attention mail never pages here; it stays inbox-durable
     /// without a wake. Attention escalation threads page at most once per
     /// (recipient, thread) and only with a bound incident proving the
@@ -838,16 +838,17 @@ impl Store {
     ) -> Result<Vec<String>> {
         validate_limit(limit)?;
         let after_num = after.map(parse_agent_id).transpose()?.unwrap_or(0);
+        let closed_completion = super::digests::CLOSED_COMPLETION_PARENT;
         let mut statement = self
             .connection
             .prepare(&format!(
                 "SELECT a.id FROM agents a
                  LEFT JOIN mail_notices mn ON mn.recipient = a.id
                  WHERE a.id > ?1
-                   AND a.state = 'idle'
+                   AND a.archived = 0
                    AND a.observe_only = 0
                    AND a.generation >= 1
-                   AND (mn.last_notice_at IS NULL
+                   AND ((a.state = 'idle' AND (mn.last_notice_at IS NULL
                         OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
                    AND EXISTS (
                            SELECT 1 FROM messages m
@@ -855,7 +856,7 @@ impl Store {
                              AND m.inline_wake_retries < 2
                              AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
                                   OR ({ATTENTION_WAKING_THREAD_SQL}))
-                       )
+                       )) OR ({closed_completion}))
                  ORDER BY a.id LIMIT ?4",
             ))
             .map_err(sql_error)?;
@@ -2177,7 +2178,7 @@ fn bind_inline_mail_tx(
 
 /// Count unread rows that can wake this recipient. Legacy advisory copies
 /// stay in the inbox until read or explicitly purged.
-fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<Option<i64>> {
+pub(super) fn notice_pending_count_tx(tx: &Transaction<'_>, num: i64) -> Result<Option<i64>> {
     let unread: i64 = tx
         .query_row(
             &format!(

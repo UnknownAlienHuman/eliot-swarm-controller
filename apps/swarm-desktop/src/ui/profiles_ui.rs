@@ -606,6 +606,7 @@ impl DesktopApp {
         config_view::SubagentsForm {
             children,
             native_allowed: profiles::native_subagents_allowed(draft, name),
+            native_can_deny: profiles::native_subagents_can_deny(draft, name),
             control,
         }
     }

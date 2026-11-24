@@ -486,9 +486,9 @@ isolated global `permission.task` deny is only a secondary layer (a project
 `subagent` allow beats it). The plugin owns an isolated per-Agent config root
 (`XDG_CONFIG_HOME` / `XDG_DATA_HOME` under the instance directory; see
 `plugins/opencode/src/native/server.rs`). When the frozen profile carries
-`native_subagents = "deny"` (the default for profiles with a non-empty
-`child_profiles`), the launch stores that final session deny (preserving
-existing session rules) and keeps the generated isolated `opencode.jsonc`
+`native_subagents = "deny"` (the default when the setting is omitted,
+independent of `child_profiles`), the launch stores that final session deny
+(preserving existing session rules) and keeps the generated isolated `opencode.jsonc`
 `permission.task: deny` as the second layer. `allow` sends no session ruleset
 and omits the key, preserving today's behavior. Implementation:
 `plugins/opencode/src/native/server.rs` (`native_subagents_permission`,

@@ -590,14 +590,15 @@ cache-read 16,837 + output 559 (total 32,330). A follow-up turn called
 reported principal `agent`. `agy acp --help` and `agy mcp --help` expose no
 isolation or tool-deferral surface, so both stay unsupported.
 
-## Native subagents (`native_subagents` deny): unsupported
+## Native subagents (`native_subagents` allow; deny unsupported)
 
 Checked against the installed Antigravity 1.5.9 binary (`agy --help`:
 `--agent`, `--mode`, `--settings` for a session only, no subagent/task
 disable flag): there is no verified per-session switch to turn off native
-subagents, so `native_subagents = "deny"` on an Antigravity profile is
-`unsupported` at config load (typed, matching the existing pattern for
-unmapped fields). `allow` is accepted and preserves today's behavior.
+subagents. An omitted setting freezes `native_subagents = "allow"` to preserve
+Antigravity's native behavior. An explicit `deny` remains unsupported and is
+refused before native process start. Previously frozen snapshots retain their
+original value.
 Implementation: `crates/eliot-daemon/src/config.rs`
 (`freeze_native_subagents`).
 

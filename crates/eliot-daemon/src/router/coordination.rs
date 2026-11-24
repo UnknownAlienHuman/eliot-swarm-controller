@@ -425,8 +425,13 @@ impl Router {
         // No standalone input while the recipient is busy or waiting.
         if !wake_enabled(&agent.profile_snapshot)
             || agent.generation < 1
+            || agent.archived
             || matches!(agent.state, AgentState::Busy | AgentState::Waiting)
         {
+            return;
+        }
+        if agent.is_terminal() {
+            let _ = self.resume_completion_parent(&agent).await;
             return;
         }
         if !self
@@ -470,6 +475,41 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let _ = store.notice_release(recipient, &notice_id);
         }
+    }
+
+    /// A completed child's durable mail is the new work for a closed parent.
+    /// Reopen it once through ordinary resume admission, then let normal mail
+    /// re-offer wake the new generation after its native stream is ready.
+    async fn resume_completion_parent(&self, agent: &eliot_core::Agent) -> Result<()> {
+        if crate::config::load_daemon_config(&self.inner.data_root)?.on_restart
+            != crate::config::OnRestart::Continue
+            || !self
+                .inner
+                .store
+                .lock()
+                .await
+                .closed_completion_parent_eligible(&agent.id, agent.generation)?
+        {
+            return Ok(());
+        }
+        let mut request = eliot_core::SubmitCommand::new(ulid::Ulid::new().to_string(), "resume");
+        request.target = Some(agent.id.clone());
+        request.expected_generation = Some(agent.generation);
+        let prepared = self.prepare_submission(request, &Principal::Owner).await?;
+        let admission = {
+            let mut store = self.inner.store.lock().await;
+            self.check_command_admission_mode("resume")?;
+            if !store.closed_completion_parent_eligible(&agent.id, agent.generation)? {
+                return Ok(());
+            }
+            let admission =
+                self.admit_prepared_submission(&mut store, "owner", prepared, Default::default())?;
+            self.publish_locked(&admission.events);
+            admission
+        };
+        self.schedule_admission(&admission);
+        self.signal_progress();
+        Ok(())
     }
 
     pub(super) async fn idle_event_can_reoffer_mail(
