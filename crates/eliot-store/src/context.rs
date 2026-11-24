@@ -128,12 +128,16 @@ impl Store {
             .map_err(sql_error)?
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(sql_error)?;
+        let check = check.join(" ");
+        // An unflagged command well below the byte cap cannot be a truncated
+        // prefix. A UTF-8 boundary can back up by up to three bytes.
+        let short_check = check.len() < eliot_core::limits::MAX_TOOL_COMMAND_BYTES - 3;
         let checked = self.connection.query_row(
             "SELECT EXISTS (
                 SELECT 1 FROM events AS e INDEXED BY events_agent
                 JOIN events AS changed ON changed.seq = json_extract(e.data, '$.edit_seq')
                 WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq < ?3 AND e.ts >= ?4
-                  AND e.kind = 'project.check.finished' AND e.source = 'project'
+                  AND e.kind = 'project.check.finished' AND e.source = 'daemon' AND e.family = 'project'
                   AND changed.agent = e.agent AND changed.generation = e.generation
                   AND changed.ts >= ?4 AND json_type(e.data, '$.exit_code') = 'integer'
              ) OR EXISTS (
@@ -149,10 +153,11 @@ impl Store {
                 WHERE start.agent = ?1 AND start.generation = ?2 AND start.seq < ?3 AND start.ts >= ?4
                   AND start.source = 'stream' AND start.native_id IS NOT NULL AND start.kind = 'tool.started'
                   AND json_extract(start.data, '$.turn_id') = ?5
-                  AND json_extract(start.data, '$.command_truncated') = 0
+                  AND (json_extract(start.data, '$.command_truncated') = 0
+                       OR (json_type(start.data, '$.command_truncated') IS NULL AND ?7))
                   AND json_extract(start.data, '$.command') = ?6
              )",
-            params![agent, turn.generation, through, started, turn.turn_id, check.join(" ")],
+            params![agent, turn.generation, through, started, turn.turn_id, check, short_check],
             |row| row.get(0),
         ).map_err(sql_error)?;
         Ok((paths, checked))

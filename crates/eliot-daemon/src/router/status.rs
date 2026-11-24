@@ -79,6 +79,7 @@ impl Router {
             command_without_dispatcher,
             goals_without_progress,
             repeated_failure_inbox_items,
+            ..
         } = self.read_owner_projection().await?;
         let DaemonSidebarResponse {
             owner_inbox,

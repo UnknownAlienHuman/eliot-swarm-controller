@@ -128,6 +128,9 @@ impl OwnerInboxRequest {
 pub struct OwnerInboxResponse {
     pub items: Vec<OwnerInboxItem>,
     pub next: Option<String>,
+    /// Current decision subjects older than 24 hours, including snoozed revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_over_24h: Option<usize>,
 }
 
 #[derive(JsonSchema, Clone, Debug, Deserialize, Serialize)]

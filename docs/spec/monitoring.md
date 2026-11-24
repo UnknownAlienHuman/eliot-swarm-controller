@@ -1496,6 +1496,9 @@ report end, using an age strictly greater than 24 hours regardless of the start
 of the activity window. The daemon runs one report at a time on a separate
 read-only SQLite snapshot. Indexed, capped source reads run outside the Store
 writer lock. A source that exceeds its work cap reports partial coverage.
+`swarm inbox` shows the same count of current decisions waiting more than 24
+hours, including snoozed revisions and decisions outside the current page. The
+inbox computes it while projecting its existing read-only snapshot.
 
 | Row | Evidence |
 | --- | --- |

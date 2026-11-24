@@ -952,10 +952,14 @@ after processing each event. A task card summarizes the retained task brief, bra
 at most 700 bytes. Swarm sends it after native compaction, resume, switch or handoff,
 at most once per turn. Lifecycle notes can queue before the first linked input.
 
-A completed fast project check records `project.check.finished` with its
-triggering edit sequence and exit code. Fact counters use later confirmed check,
-command or Git evidence where available. Without a confirming fact, correction
-remains unverified.
+A completed fast project check records a daemon event in the `project` family
+with kind `project.check.finished`, its triggering edit sequence and exit code.
+The turn-end reminder recognizes that receipt for the same generation and turn
+window. It also recognizes an exact native command with a matching completion.
+Older native command events without a truncation flag count when the exact
+command is short enough to rule out truncation. Fact counters use later
+confirmed check, command or Git evidence where available. Without a confirming
+fact, correction remains unverified.
 
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 the next-input move at turn end substitutes for a Claude Stop hook. Pending

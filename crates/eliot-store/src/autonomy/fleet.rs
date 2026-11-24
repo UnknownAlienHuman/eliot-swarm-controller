@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 
 const INPUT_CAP: usize = 10_000;
 const FETCH_LIMIT: i64 = INPUT_CAP as i64 + 1;
-const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const LIST_CAP: usize = 20;
 
 pub(super) struct Fleet {
@@ -183,7 +182,8 @@ fn read_owner_waiting(
     let waiting = items
         .into_iter()
         .filter(|item| {
-            item.age_ms > DAY_MS && crate::owner_decisions::is_reportable(item, until, confirmed)
+            item.age_ms > crate::owner_decisions::OWNER_WAIT_DAY_MS
+                && crate::owner_decisions::is_reportable(item, until, confirmed)
         })
         .collect::<Vec<_>>();
     let mut by_kind = std::collections::BTreeMap::new();

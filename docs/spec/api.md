@@ -804,7 +804,9 @@ and explicit unsupported boundary is owned by the [plugin protocol](plugin-proto
 `owner.inbox` gives the Owner one decision queue over retained Store rows.
 `OwnerInboxRequest` accepts an optional opaque
 `after` cursor and `limit`. `OwnerInboxResponse` returns `items` and an optional
-`next` cursor. Each item carries a snake_case kind, subject, subject revision,
+`next` cursor. `waiting_over_24h` counts reportable decision subjects older than
+24 hours across the inbox, including snoozed revisions. Each item carries a
+snake_case kind, subject, subject revision,
 age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn

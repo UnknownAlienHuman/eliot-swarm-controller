@@ -51,7 +51,11 @@ impl Router {
         require_owner(principal)?;
         let request: OwnerInboxRequest = decode_params(params.clone())?;
         let limit = request.effective_limit()?;
-        let items = self.read_owner_projection().await?.items;
+        let OwnerProjection {
+            items,
+            waiting_over_24h,
+            ..
+        } = self.read_owner_projection().await?;
         let mut items = items
             .into_iter()
             .map(|item| (item.cursor(), item))
@@ -84,6 +88,7 @@ impl Router {
         serde_json::to_value(OwnerInboxResponse {
             items: visible,
             next,
+            waiting_over_24h: Some(waiting_over_24h),
         })
         .map_err(|_| Error::new("internal", "owner inbox could not be encoded"))
     }

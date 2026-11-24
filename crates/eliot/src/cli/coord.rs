@@ -843,8 +843,15 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
     if json_output {
         print_value(&value, true);
     } else {
+        if let Some(waiting) = response.waiting_over_24h {
+            println!("{waiting} Owner decisions waiting more than 24 hours.");
+        }
         if response.items.is_empty() {
-            println!("Owner inbox is clear.");
+            if response.waiting_over_24h.is_some_and(|count| count > 0) {
+                println!("No visible decisions on this page.");
+            } else {
+                println!("Owner inbox is clear.");
+            }
         }
         for item in &response.items {
             let seconds = item.age_ms / 1000;
