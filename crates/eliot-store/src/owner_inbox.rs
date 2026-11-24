@@ -1347,7 +1347,6 @@ fn project_agents(
                   AND c.verb IN ('launch','resume') AND c.state IN ('accepted','queued','dispatched')) ELSE 0 END,
                 EXISTS(SELECT 1 FROM processes p WHERE p.owner IN (
                   'agent:a'||a.id||'#'||a.generation,'workspace:a'||a.id||'#'||a.generation) AND p.state='running'),
-                COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY events_agent WHERE e.agent=a.id AND e.generation=a.generation),0),
                 CASE WHEN a.state IN ('failed','lost') THEN COALESCE((SELECT MAX(e.ts) FROM events e
                   WHERE e.agent=a.id AND e.generation=a.generation AND e.kind IN ('agent.failed','agent.lost')),a.updated_at) ELSE a.updated_at END,
                 EXISTS(SELECT 1 FROM pending_requests r WHERE r.agent=a.id
@@ -1356,11 +1355,13 @@ fn project_agents(
                   AND t.turn_id=a.active_turn AND t.state='running'),
                 EXISTS(SELECT 1 FROM source_state s WHERE s.agent=a.id AND s.generation=a.generation
                   AND s.state='open' AND s.source NOT IN ('daemon','os','git','workspace_process')),
-                EXISTS(SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
-                  AND t.state IN ('running','unknown')),
-                EXISTS(SELECT 1 FROM commands c WHERE c.target=a.id
+                CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
+                  SELECT 1 FROM turns t WHERE t.agent=a.id AND t.generation=a.generation
+                  AND t.state IN ('running','unknown')) ELSE 0 END,
+                CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
+                  SELECT 1 FROM commands c WHERE c.target=a.id
                   AND (c.generation=a.generation OR c.expected_generation=a.generation)
-                  AND c.state IN ('accepted','queued','dispatched','unknown')),
+                  AND c.state IN ('accepted','queued','dispatched','unknown')) ELSE 0 END,
                 CASE WHEN a.state IN ('busy','waiting') AND a.active_turn IS NULL THEN EXISTS(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
@@ -1400,17 +1401,16 @@ fn project_agents(
                 r.get::<_, bool>(9)?,
                 r.get::<_, bool>(10)?,
                 r.get::<_, i64>(11)?,
-                r.get::<_, i64>(12)?,
+                r.get::<_, bool>(12)?,
                 r.get::<_, bool>(13)?,
                 r.get::<_, bool>(14)?,
                 r.get::<_, bool>(15)?,
                 r.get::<_, bool>(16)?,
                 r.get::<_, bool>(17)?,
-                r.get::<_, bool>(18)?,
+                r.get::<_, Option<i64>>(18)?,
                 r.get::<_, Option<i64>>(19)?,
-                r.get::<_, Option<i64>>(20)?,
-                r.get::<_, Option<String>>(21)?,
-                r.get::<_, Option<i64>>(22)?,
+                r.get::<_, Option<String>>(20)?,
+                r.get::<_, Option<i64>>(21)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1427,7 +1427,6 @@ fn project_agents(
             observe_only,
             launch_queued,
             process_running,
-            event_seq,
             terminal_at,
             has_request,
             observed_turn,
@@ -1509,6 +1508,7 @@ fn project_agents(
                 now,
             );
             tally(stats, &result);
+            let event_seq = agent_inbox_revision_seq(db, id, generation)?;
             items.push(item(
                 OwnerInboxKind::Agent,
                 format!("a{id}"),
@@ -1540,6 +1540,7 @@ fn project_agents(
             );
             tally(stats, &result);
             if let Mover::Stuck { reason } = result {
+                let event_seq = agent_inbox_revision_seq(db, id, generation)?;
                 let stop_safe = matches!(
                     state,
                     eliot_core::AgentState::Busy | eliot_core::AgentState::Waiting
@@ -1583,6 +1584,22 @@ fn project_agents(
         }
     }
     Ok(())
+}
+
+// Only actionable Agent items carry this revision. Read it in the same
+// snapshot after classifying liveness so healthy rows never seek history.
+fn agent_inbox_revision_seq(
+    db: &Connection,
+    agent: i64,
+    generation: i64,
+) -> eliot_core::Result<i64> {
+    db.prepare_cached(
+        "SELECT COALESCE(MAX(seq),0) FROM events INDEXED BY events_agent
+         WHERE agent=?1 AND generation=?2",
+    )
+    .map_err(sql_error)?
+    .query_row([agent, generation], |row| row.get(0))
+    .map_err(sql_error)
 }
 
 fn agent_wait_evidence(
