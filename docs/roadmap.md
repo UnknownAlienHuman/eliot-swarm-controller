@@ -1035,15 +1035,22 @@ of the explicitly selected release scope.
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.
 
-- [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
-      readers, durable archive/delete, settings project removal and private chats.
-      Private Windows Owner proof covers real Codex/Claude desktop launch/send,
-      a private chat, archive/unarchive/delete/replay, directory cleanup and Muse
-      stream-observed quota. OpenCode Go numerical readback remains blocked by
-      provider HTTP 403; Antigravity returned real windows before a later HTTP 401.
-      Native first-token time is not exposed by the consumed completed-message
-      surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
+- [ ] **K92 Backend quota and chat lifecycle (#407).** Private Windows Owner
+      proof covers real Codex/Claude desktop launch/send and private chats.
+      Native first-token time remains unavailable on the completed-message
+      surface the daemon consumes.
 
+  - [x] **Chat lifecycle and project removal.** On a private Windows stand on
+    2026-11-24, Claude Haiku 5.5 ran in a chat without a project. Migration 130
+    repaired its generation-1 directory binding from a Store with the chat
+    already at generation 2. Resume preserved the directory in generation 3.
+    Apply skipped the old plan and a fresh plan removed the directory. Archive,
+    unarchive, delete and exact delete replay passed. Settings unregistered an
+    unused project and preserved its checkout.
+  - [ ] **OpenCode Go numerical quota.** Last recorded private readback was
+    refused by the provider with HTTP 403.
+  - [ ] **Antigravity numerical quota.** Private readback returned real windows
+    before a later provider HTTP 401. New numerical evidence remains blocked.
   - [x] **Muse native allowance.** On a private Windows stand with Muse Code
     1.4.25, two Owner quota calls returned the same provider windows. The
     process log recorded one native read and one cache hit. Zero model turns.
@@ -1066,25 +1073,17 @@ of the explicitly selected release scope.
 
 ## Later
 
-- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+- [x] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
       Implemented generation/tree artifact custody, bounded plan/apply, handle
       deletion, branch verification, native archive, retirement opt-in, CLI and
-      Advanced Settings. The audit repair binds exclusive per-generation roots,
-      refuses hard links/repositories/configuration, requires a fresh remote
-      default, and preserves frozen native scope and uncertain archive fences.
-      Requalified on 2026-11-16 with a private release daemon and real Muse
-      `muse-spark-1.3-contributor`/low: manager a1 stopped children a2/a3 and
-      applied two plans, removing both managed worktrees, the merged branch,
-      temp/source artifacts and a released held directory (2,715 logical bytes).
-      The unmerged branch, initially dirty worktree, live-held directory, nested
-      repository, hard-linked Cargo targets and a substituted junction were
-      kept/refused as appropriate; sibling registration was denied. Static gate:
-      fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
-      tests passed. All owned processes exited and the private daemon drained.
-      Frozen Codex archive scope and malformed acknowledgements have source/regression
-      coverage, without a native fault-injection run. Automatic approval review
-      blocked deletion of the private proof directory and five scratch directories
-      left by failing-before tests.
+      Advanced Settings. On a private Windows stand on 2026-11-24, a self-scoped
+      Claude Haiku 5.5 manager removed a stopped child's managed worktree through
+      its Agent-authored cleanup job. Direct Agent worktree removal was refused.
+      An explicit Owner branch cleanup archived the exact retained tip.
+      The private main build also kept a dirty worktree, removed a child-registered
+      temp directory, and verified removal of an OpenCode native session.
+      Frozen Codex archive scope and malformed acknowledgements have source
+      coverage. This run did not inject a native archive fault.
 
       - [x] **Agent-launched managed child worktrees (2026-11-22).** A private
         Claude manager launched Claude and OpenCode children in parallel, refused
