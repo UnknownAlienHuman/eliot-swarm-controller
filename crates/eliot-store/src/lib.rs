@@ -239,7 +239,7 @@ pub use harness_checks::{HarnessCheckFailure, HarnessCheckRow};
 mod hierarchy;
 pub mod inference;
 mod lifecycle;
-pub use lifecycle::UserEventDispatch;
+pub use lifecycle::{RuleCoordinationDispatch, UserEventDispatch};
 mod native_children;
 pub mod overview;
 mod reparent;

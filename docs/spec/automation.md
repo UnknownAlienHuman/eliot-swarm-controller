@@ -1196,14 +1196,15 @@ defaults to it). For project mail, Store resolves the registration ID and checks
 the recipient's approved profile and checkout or managed worktree binding.
 Project registration must grant each canonical verb explicitly in `actions`;
 the captured registration revision is checked at dispatch and effect commit.
-Execution reuses the existing authorization, payload validation, mailbox limits,
+Store decodes the retained payload once at execution and reuses the existing
+authorization, payload validation, mailbox limits,
 compare-and-swap/version semantics and
 delivery/acknowledgement semantics; a stale or unauthorized destination fails
 explicitly. Each admitted rule child commits its effect together with its
 Applied settlement in a single Store transaction without entering the public
 write-id namespace, then publishes the committed batch in order while still
 serialized with the writer: `mail.send` publishes `command.applied` carrying
-the delivery readback and fans out mailbox wakes only after commit through the
+the delivery readback and uses the committed recipients for mailbox wakes through the
 existing coordination wake path; `var.set` publishes `var.changed` first, then
 `command.applied` carrying the write readback. These rule-produced events carry
 the exact child command's verified cause, preserving the depth-five guard;

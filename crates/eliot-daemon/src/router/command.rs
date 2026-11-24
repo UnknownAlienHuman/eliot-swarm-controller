@@ -1576,12 +1576,8 @@ impl Router {
             self.execute_user_event_command(&id, &dispatched.verb).await;
             return;
         }
-        if dispatched.verb == "mail.send" {
-            self.execute_mail_send_command(&id, dispatched).await;
-            return;
-        }
-        if dispatched.verb == "var.set" {
-            self.execute_var_set_command(&id, dispatched).await;
+        if is_coordination_verb(&dispatched.verb) {
+            self.execute_rule_coordination(&id, &dispatched.verb).await;
             return;
         }
         let target = match dispatched.target.as_deref() {
