@@ -423,14 +423,14 @@ and waits for its Job family to empty (terminating a remaining server tail withi
 the bounded close budget) before starting the next command or returning a catalogue.
 Unconfirmed family closure returns `unknown`, including for the optional variants
 read; a failed variants read degrades to ids only after confirmed cleanup.
-With a named profile, both reads use the same generated provider configuration,
-target environment and selected auth as launch. Pass `--workspace` to read in
-the intended launch directory. These results are previews, since the workspace
-and live provider state can differ. An unscoped read uses the canonical native
-configuration and is also a preview. Each reader's isolated credential store
-lives under its private host-owned instance directory. The host verifies removal
-after process-family closure on success, timeout and cancellation. Unconfirmed
-removal returns `unknown`.
+An unscoped read uses the native configuration and auth in place. For a named
+profile, the API inventory supplies membership and metadata using the same
+generated provider configuration, target environment and selected auth as
+launch. Pass `--workspace` to read in the intended launch directory. The named
+result is a preview because workspace and provider state can differ. Each scoped
+reader's isolated store lives under its private host-owned instance directory.
+The host verifies removal after process-family closure on success, timeout and
+cancellation. Unconfirmed removal returns `unknown`.
 
 `swarm models --harness opencode --agent <id>` reads the owned generation's
 `GET /api/model` through `agent.models`. It offers the model and

@@ -2,12 +2,15 @@ use super::{contextual_error, native_initialize_params};
 use crate::native::{
     NativeClient, NativeLaunch, NativeProcess,
     types::{
-        NativeAccountState, NativeInitializeResult, NativeModelListParams, NativeModelListResult,
+        NativeAccountState, NativeInitializeResult, NativeModelCatalogEntry,
+        NativeModelEffortVariants, NativeModelListParams, NativeModelListResult,
+        is_contributor_model, is_reasoning_effort_tier,
     },
 };
 use eliot_core::{Error, Result, SecretPolicy};
-use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_with_stderr};
-use std::{path::Path, time::Duration};
+use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_with_stderr, valid_model_id};
+use serde::Deserialize;
+use std::{fs::File, io::Read, path::Path, time::Duration};
 #[expect(
     clippy::disallowed_types,
     reason = "Muse catalogue refresh uses an owned native CLI command."
@@ -18,6 +21,95 @@ use tokio::time::Instant;
 const QUERY_BUDGET: Duration = Duration::from_secs(15);
 const REFRESH_BUDGET: Duration = Duration::from_secs(12);
 const CLOSE_BUDGET: Duration = Duration::from_secs(3);
+
+#[derive(Deserialize)]
+struct ContributorCache {
+    schema_version: u32,
+    provider_id: String,
+    profile_id: String,
+    source: String,
+    rows: Vec<CachedModel>,
+}
+
+#[derive(Deserialize)]
+struct CachedModel {
+    model_id: String,
+    provider_id: String,
+    profile_id: String,
+    visibility: String,
+    reasoning_effort_variants: Option<Vec<CachedEffort>>,
+}
+
+#[derive(Deserialize)]
+struct CachedEffort {
+    tier: String,
+}
+
+/// Muse 1.4.25 filters hidden models out of both catalogue commands. Use the
+/// Meta/TBH provider cache under the exact data root reported by this host.
+/// This augments picker metadata only. Native startup still owns admission.
+pub(super) fn include_cached_contributors(catalogue: &mut NativeModelListResult, home: &Path) {
+    if catalogue.provider_id != "meta" || catalogue.profile_id.as_deref() != Some("tbh") {
+        return;
+    }
+    let Some(cache) = read_contributor_cache(home) else {
+        return;
+    };
+    for row in cache.rows {
+        if row.provider_id != catalogue.provider_id
+            || Some(&row.profile_id) != catalogue.profile_id.as_ref()
+            || row.visibility != "hidden"
+            || !is_contributor_model(&row.model_id)
+            || !valid_model_id(&row.model_id)
+            || catalogue
+                .models
+                .iter()
+                .any(|model| model.model_id == row.model_id)
+        {
+            continue;
+        }
+        catalogue.models.push(NativeModelCatalogEntry {
+            model_id: row.model_id,
+            provider_id: row.provider_id,
+            profile_id: Some(row.profile_id),
+            display_label: None,
+            variants: row.reasoning_effort_variants.and_then(|raw| {
+                let efforts: Vec<_> = raw.into_iter().map(|effort| effort.tier).collect();
+                (!efforts.is_empty() && efforts.iter().all(|tier| is_reasoning_effort_tier(tier)))
+                    .then_some(NativeModelEffortVariants::Known(efforts))
+            }),
+            is_default: Some(false),
+        });
+    }
+}
+
+fn read_contributor_cache(home: &Path) -> Option<ContributorCache> {
+    const MAX_CACHE_BYTES: u64 = 1024 * 1024;
+    if !home.is_absolute() {
+        return None;
+    }
+    // The cache encodes provider "meta" and profile "tbh" as hex.
+    let path = home.join("model-catalog").join("6d657461__p746268.json");
+    let info = path.metadata().ok()?;
+    if !info.is_file() || info.len() > MAX_CACHE_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_CACHE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_CACHE_BYTES {
+        return None;
+    }
+    let cache: ContributorCache = serde_json::from_slice(&bytes).ok()?;
+    (cache.schema_version == 3
+        && cache.provider_id == "meta"
+        && cache.profile_id == "tbh"
+        && cache.source == "provider_catalog")
+        .then_some(cache)
+}
 
 pub(super) struct CatalogueHost {
     pub(super) native: NativeProcess,

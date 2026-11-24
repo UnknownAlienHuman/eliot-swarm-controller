@@ -3,7 +3,9 @@ use crate::{
     native::{
         AuthSetup, AuthTransfer, HttpOutcome, IntegrationSelector, OpenCodeHttp, OwnedServer,
         SWARM_MCP_SERVER_NAME, ServerLaunch,
-        models::{MAX_MODEL_ID_BYTES, ReaderContext, run_model_metadata, run_models},
+        models::{
+            MAX_MODEL_ID_BYTES, ReaderContext, run_canonical_models, run_model_metadata, run_models,
+        },
         server::{
             ArchiveServerLaunch, provider_config, validate_local_provider,
             validate_local_provider_environment,
@@ -896,55 +898,65 @@ impl OpenCodePlugin {
         } else {
             None
         };
-        let empty_config = base.join("auth-config");
-        let config_dir = config_home.join("opencode");
-        for dir in [&empty_config, &config_dir, &data_home] {
-            std::fs::create_dir_all(dir).map_err(|_| {
+        let xdg = if auth.is_some() || fragment.is_some() {
+            let empty_config = base.join("auth-config");
+            let config_dir = config_home.join("opencode");
+            for dir in [&empty_config, &config_dir, &data_home] {
+                std::fs::create_dir_all(dir).map_err(|_| {
+                    Error::new(
+                        "native_spawn",
+                        "OpenCode model reader could not prepare its private stores",
+                    )
+                })?;
+            }
+            std::fs::write(
+                config_dir.join("opencode.jsonc"),
+                provider_config(model.as_deref(), fragment.as_ref()).to_string(),
+            )
+            .map_err(|_| {
                 Error::new(
                     "native_spawn",
-                    "OpenCode model reader could not prepare its private stores",
+                    "OpenCode model reader could not write its provider config",
                 )
             })?;
-        }
-        std::fs::write(
-            config_dir.join("opencode.jsonc"),
-            provider_config(model.as_deref(), fragment.as_ref()).to_string(),
-        )
-        .map_err(|_| {
-            Error::new(
-                "native_spawn",
-                "OpenCode model reader could not write its provider config",
-            )
-        })?;
-        if let Some(selector) = auth.as_ref() {
-            transfer_selected_integration(
-                &AuthTransfer {
-                    program,
-                    selector,
-                    workspace,
-                    export_environment: &[],
-                    canonical_config_home: &empty_config,
-                    import_environment: &environment,
-                    isolated_config_home: &config_home,
-                    isolated_data_home: &data_home,
-                    reuse_existing: false,
-                },
-                until,
-            )
-            .await?;
-        }
+            if let Some(selector) = auth.as_ref() {
+                transfer_selected_integration(
+                    &AuthTransfer {
+                        program,
+                        selector,
+                        workspace,
+                        export_environment: &[],
+                        canonical_config_home: &empty_config,
+                        import_environment: &environment,
+                        isolated_config_home: &config_home,
+                        isolated_data_home: &data_home,
+                        reuse_existing: false,
+                    },
+                    until,
+                )
+                .await?;
+            }
+            Some((config_home.as_path(), data_home.as_path()))
+        } else {
+            None
+        };
         let context = ReaderContext {
             workspace,
             environment: &environment,
-            xdg: Some((config_home.as_path(), data_home.as_path())),
+            xdg,
             local_provider: fragment.is_some(),
         };
         let models: Vec<Value> = match params.part {
-            ModelListPart::Models => run_models(program, until, &context)
-                .await?
-                .into_iter()
-                .map(|id| json!({"id": id, "default": false}))
-                .collect(),
+            ModelListPart::Models => {
+                let ids = if xdg.is_some() {
+                    run_models(program, until, &context).await?
+                } else {
+                    run_canonical_models(program, until, &context).await?
+                };
+                ids.into_iter()
+                    .map(|id| json!({"id": id, "default": false}))
+                    .collect()
+            }
             ModelListPart::Variants => run_model_metadata(program, until, &context)
                 .await?
                 .into_iter()
@@ -953,7 +965,12 @@ impl OpenCodePlugin {
                 })
                 .collect(),
         };
-        Ok(json!({"models": models, "default": Value::Null, "provenance": "preview"}))
+        let provenance = if xdg.is_some() {
+            "preview"
+        } else {
+            "canonical"
+        };
+        Ok(json!({"models": models, "default": Value::Null, "provenance": provenance}))
     }
 
     /// Retain a proven-no-effect start failure and build its failed-state
