@@ -1494,7 +1494,9 @@ fn admit_worktree_remove_tx(
                 "expected_tip" | "observe_missing" | "refused_launch_command" | "cleanup_mode"
             )
         })
-        || observe_missing.is_some_and(|value| value != &Value::Bool(true) || principal != "owner")
+        || observe_missing.is_some_and(|value| {
+            value != &Value::Bool(true) || (principal != "owner" && manager_cleanup.is_none())
+        })
         || refused_launch.is_some_and(|value| {
             !value.is_string() || principal != "owner" || observe_missing.is_some()
         })

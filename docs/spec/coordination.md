@@ -66,8 +66,8 @@ Agents are restricted to their frozen and current subtree; Owner selects project
 or all. An admitted manager job delegates removal of its exact selected
 worktree to the guarded removal command. Both the job and derived command retain
 the manager principal. Recovery settles the job only from a command with that
-same principal and exact derived binding. Planning and execution require the
-manager's branch tip to be merged. Direct `worktree.remove` remains Owner-only.
+same principal and exact derived binding. Planning and execution require a merged tip
+when the manager removes a present worktree. Direct `worktree.remove` remains Owner-only.
 Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
 Clean managed worktrees require exact reciprocal Git/common-directory identity.
@@ -105,7 +105,9 @@ absence twice across the 15-second grace interval before settling
 `removed(already_absent)` with zero bytes, including when the directory was
 present in the plan.
 For a worktree, apply uses the existing
-missing-worktree reconciliation and preserves the local branch. A reappearing
+missing-worktree reconciliation and preserves the local branch. A manager can
+reconcile absence only for the exact safe item in its own reserved job.
+Refusals settle that item independently of the rest of the plan. A reappearing
 directory requires a fresh plan. Changed local identity,
 checked-out branches, filesystem guards and Git readiness still keep/refuse the
 candidate with their concrete reason. A present

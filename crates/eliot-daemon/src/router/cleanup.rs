@@ -1593,7 +1593,7 @@ impl Router {
                     &mut candidate,
                     auto_cleanup,
                     !matches!(principal, Principal::Owner),
-                    !auto_cleanup && matches!(principal, Principal::Owner),
+                    !auto_cleanup,
                 )
                 .await;
                 if bulk && cleanup_operation_failed(&candidate.reason) {

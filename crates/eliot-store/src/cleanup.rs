@@ -851,19 +851,16 @@ impl Store {
         now: i64,
     ) -> Result<Admission> {
         self.ensure_writer_healthy()?;
-        let artifact =
+        let candidate =
             reserved_manager_worktree(&self.connection, principal, apply_id, artifact_id)?;
-        let tip = artifact
-            .git
-            .as_ref()
-            .and_then(|git| git.planned_tip.as_deref());
+        let artifact = &candidate.artifact;
+        let planned_args = manager_worktree_args(&candidate)?;
         if request.verb != "worktree.remove"
             || request.id != cleanup_worktree_command_id(apply_id, artifact_id)?
             || request.target.as_deref() != Some(artifact.agent.as_str())
             || request.expected_generation != Some(artifact.generation)
-            || tip.is_none()
-            || request.args != json!({"expected_tip": tip})
-            || !self.cleanup_agent_quiescent(&artifact)?
+            || request.args != planned_args
+            || !self.cleanup_agent_quiescent(artifact)?
         {
             return Err(manager_cleanup_refused());
         }
@@ -1827,7 +1824,7 @@ fn reserved_manager_worktree(
     principal: &str,
     apply_id: &str,
     artifact_id: &str,
-) -> Result<ArtifactView> {
+) -> Result<CleanupCandidate> {
     let row: Option<(String, String)> = connection
         .query_row(
             "SELECT w.result, p.body
@@ -1854,15 +1851,28 @@ fn reserved_manager_worktree(
             && item.artifact.kind == ArtifactKind::Worktree
             && item.verdict == "safe"
     });
-    let artifact = candidate.ok_or_else(manager_cleanup_refused)?.artifact;
+    let candidate = candidate.ok_or_else(manager_cleanup_refused)?;
     if !principal.starts_with("agent:")
         || receipt.state != Some(CleanupJobState::Running)
         || !reserved
-        || !Store::cleanup_authorized_at(connection, principal, &artifact)?
+        || !Store::cleanup_authorized_at(connection, principal, &candidate.artifact)?
     {
         return Err(manager_cleanup_refused());
     }
-    Ok(artifact)
+    Ok(candidate)
+}
+
+fn manager_worktree_args(candidate: &CleanupCandidate) -> Result<Value> {
+    if candidate.reason == "already_absent" {
+        return Ok(json!({"observe_missing": true}));
+    }
+    let tip = candidate
+        .artifact
+        .git
+        .as_ref()
+        .and_then(|git| git.planned_tip.as_deref())
+        .ok_or_else(manager_cleanup_refused)?;
+    Ok(json!({"expected_tip": tip}))
 }
 
 pub(super) fn require_manager_cleanup_dispatch(
@@ -1876,17 +1886,15 @@ pub(super) fn require_manager_cleanup_dispatch(
     let artifact_id = binding["artifact_id"]
         .as_str()
         .ok_or_else(manager_cleanup_refused)?;
-    let artifact =
+    let candidate =
         reserved_manager_worktree(connection, &command.principal, apply_id, artifact_id)?;
-    let tip = artifact
-        .git
-        .as_ref()
-        .and_then(|git| git.planned_tip.as_deref());
+    let artifact = &candidate.artifact;
+    let planned_args = manager_worktree_args(&candidate)?;
     if command.id != cleanup_worktree_command_id(apply_id, artifact_id)?
         || command.target.as_deref() != Some(artifact.agent.as_str())
         || command.generation != Some(artifact.generation)
-        || tip.is_none()
-        || command.args["expected_tip"].as_str() != tip
+        || command.args.get("expected_tip") != planned_args.get("expected_tip")
+        || command.args.get("observe_missing") != planned_args.get("observe_missing")
     {
         return Err(manager_cleanup_refused());
     }

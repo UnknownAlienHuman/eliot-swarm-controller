@@ -1286,8 +1286,10 @@ impl WorkspaceManager {
         if Instant::now() >= deadline {
             return removal_unknown("workspace_remove_deadline");
         }
+        let manager_removing_present = command.principal.starts_with("agent:")
+            && command.args.get("observe_missing").and_then(Value::as_bool) != Some(true);
         if (command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic")
-            || command.principal.starts_with("agent:"))
+            || manager_removing_present)
             && let Err(error) = git
                 .require_automatic_removal_merge(preparation, expected_tip, deadline)
                 .await
