@@ -1473,11 +1473,12 @@ impl PluginHost {
         })
         .await
         .map_err(|_| Error::new("unavailable", "failed custody observation did not return"))??;
-        self.state
-            .store
-            .lock()
-            .await
-            .resolve_failed_custody(request, &snapshot, now_ms())
+        self.state.store.lock().await.resolve_failed_custody(
+            request,
+            &snapshot,
+            now_ms(),
+            crate::platform::custody::check_failed_exit_assertion,
+        )
     }
 
     #[cfg(windows)]
@@ -1544,7 +1545,18 @@ impl PluginHost {
             .store
             .lock()
             .await
-            .commit_failed_generation_job_exit(&snapshot, now_ms())?;
+            .commit_failed_generation_job_exit(&snapshot, now_ms(), |exact| {
+                match crate::platform::restart_custody(exact)? {
+                    crate::platform::RestartCustody::Closed {
+                        orphan_possible: false,
+                        ..
+                    } => Ok(()),
+                    _ => Err(Error::new(
+                        "process_custody_unproven",
+                        "failed generation Job or retained process became live before commit",
+                    )),
+                }
+            })?;
         self.state.bus.publish(&events);
         Ok(())
     }

@@ -52,6 +52,7 @@ impl Store {
         &mut self,
         snapshot: &RetainedGeneration,
         now: i64,
+        recheck: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
         let tx = self
@@ -72,6 +73,7 @@ impl Store {
                 "failed generation custody does not belong to this daemon",
             ));
         }
+        recheck(snapshot)?;
         let events = record_failed_exit(
             &tx,
             parse_agent_id(&snapshot.agent)?,
@@ -102,6 +104,7 @@ impl Store {
         request: &FailedCustodyResolveRequest,
         observed: &RetainedGeneration,
         now: i64,
+        recheck: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Change<FailedCustodyResolveResponse>> {
         self.ensure_writer_healthy()?;
         request.validate()?;
@@ -119,6 +122,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         require_current_exit_snapshot(&tx, &request.agent, request.generation, observed)?;
+        recheck(observed)?;
         let agent = parse_agent_id(&request.agent)?;
         let events = record_failed_exit(
             &tx,
@@ -212,25 +216,34 @@ fn failed_generation_exit_snapshot(
         )
         .map_err(sql_error)?;
     let owner = format!("agent:{agent}#{generation}");
+    // On Linux an exited plugin can still name a live process group. Windows
+    // checks the named Job independently of its recorded members.
     let mut statement = connection
         .prepare(
             "SELECT host_boot_id,pid,start_time,role,state='exited' FROM processes
-         WHERE owner=?1 AND (state!='exited' OR role='plugin')
+         WHERE owner=?1 AND (state!='exited' OR (?3 AND role='plugin'))
          ORDER BY host_boot_id,pid,start_time LIMIT ?2",
         )
         .map_err(sql_error)?;
     let mut processes = statement
-        .query_map(params![owner, MAX_PAGE_ENTRIES as i64 + 1], |row| {
-            Ok(RecordedProcess {
-                identity: ProcessIdentity {
-                    host_boot_id: row.get(0)?,
-                    pid: row.get(1)?,
-                    start_time: row.get::<_, i64>(2)? as u64,
-                },
-                role: row.get(3)?,
-                exited: row.get(4)?,
-            })
-        })
+        .query_map(
+            params![
+                owner,
+                MAX_PAGE_ENTRIES as i64 + 1,
+                cfg!(target_os = "linux")
+            ],
+            |row| {
+                Ok(RecordedProcess {
+                    identity: ProcessIdentity {
+                        host_boot_id: row.get(0)?,
+                        pid: row.get(1)?,
+                        start_time: row.get::<_, i64>(2)? as u64,
+                    },
+                    role: row.get(3)?,
+                    exited: row.get(4)?,
+                })
+            },
+        )
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;

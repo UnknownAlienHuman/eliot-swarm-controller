@@ -99,6 +99,13 @@ using that service.
   broker or service (or attributed to the wrong owner) is invisible to the
   Store and cannot be terminated safely by PID alone.
 
+Failed-generation exit resolution repeats the platform liveness check inside the Store
+write transaction after checking the retained-process snapshot. On Windows it checks the
+named Job and the exact PID and creation time of each retained, unconfirmed process. A
+live process or Job member keeps custody unresolved. Exited rows do not count toward
+this Windows readback limit. Linux includes exited plugin leaders because their process
+groups can still have live members.
+
 Every applied stop requires two independently committed facts for the exact
 generation: process-custody exit and native-source drain. On Windows the
 process fact requires the owned Job empty and all recorded process identities
