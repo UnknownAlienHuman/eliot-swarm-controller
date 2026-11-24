@@ -153,6 +153,17 @@ pub struct StoppedCommandSettlement {
     pub command_id: String,
     pub mark_stopped: bool,
     pub interrupted_turn: Option<String>,
+    /// Exact Owner interrupt completed through this linked force-stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt_fallback: Option<InterruptFallbackSettlement>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct InterruptFallbackSettlement {
+    pub command_id: String,
+    /// Captured turn binding; null is an exact idle binding.
+    pub turn_id: Option<String>,
+    pub reason: String,
 }
 
 /// An unknown permission or user-input reply whose exact native receipt was

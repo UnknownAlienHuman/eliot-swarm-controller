@@ -1942,8 +1942,19 @@ awaiting stop proof and continuation cursor together. Pages are ordered by
 command id across both candidate kinds, and `--after` advances through that
 combined order. Apply rechecks the whole page in one Store transaction; changed
 evidence returns `conflict`, while retrying the same write id and review returns
-the stored result. Interrupt and steer outcomes are not inferred, and no
+the stored result. No native interrupt or steer outcome is inferred, and no
 external effect is replayed.
+
+A proven stop entry may also carry `interrupt_fallback` for its exact linked
+Owner interrupt. It is eligible only when the retained `interrupt_stop` link
+binds the same Agent, generation and exact turn (including an empty binding),
+the stop requests `force: true`, and the parent interrupt is still dispatched
+or unknown. Applying the reviewed stop settles that parent in the same Store
+transaction with the existing fallback reason and `fallback_stop_id`. This
+proves the fallback stop completed; it does not claim native interrupt delivery
+or a terminal turn. A stop's historical `interrupted_turn` is omitted when its
+`command.dispatched` event explicitly records `live_at_dispatch: false`; rows
+without that evidence retain the legacy turn-link rules.
 
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
 command to be stored `unknown`. The one additional Owner assertion is
