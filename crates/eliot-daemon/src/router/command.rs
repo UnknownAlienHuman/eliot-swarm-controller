@@ -1577,7 +1577,7 @@ impl Router {
             return;
         }
         if is_coordination_verb(&dispatched.verb) {
-            self.execute_rule_coordination(&id, &dispatched.verb).await;
+            self.execute_rule_coordination(&dispatched).await;
             return;
         }
         let target = match dispatched.target.as_deref() {

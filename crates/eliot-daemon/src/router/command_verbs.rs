@@ -14,7 +14,7 @@ use eliot_core::{
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use eliot_plugin::session::native_no_write;
-use eliot_store::{RuleCoordinationDispatch, UserEventDispatch};
+use eliot_store::{PreparedRuleCoordination, UserEventDispatch};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -343,33 +343,38 @@ impl Router {
     }
 
     /// Publish the committed effect and settlement before waking recipients.
-    pub(super) async fn execute_rule_coordination(&self, id: &str, verb: &str) {
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result =
-                store.commit_rule_coordination(id, verb, self.inner.mail.limits(), now_ms());
-            if let Ok(RuleCoordinationDispatch::Applied { events, .. }) = &result
-                && !events.is_empty()
-            {
-                self.publish_locked(events);
-            }
-            result
-        };
-        match committed {
-            Ok(RuleCoordinationDispatch::Applied {
-                mail_recipients, ..
-            }) => {
-                for recipient in &mail_recipients {
-                    self.offer_notice(recipient).await;
-                }
-            }
-            Ok(RuleCoordinationDispatch::Rejected(error)) => {
+    pub(super) async fn execute_rule_coordination(&self, command: &Command) {
+        let id = &command.id;
+        let verb = &command.verb;
+        let prepared = match PreparedRuleCoordination::decode(command) {
+            Ok(prepared) => prepared,
+            Err(error) => {
                 self.settle(
                     id,
                     CommandState::Rejected,
                     Some(json!({"code": error.code})),
                 )
                 .await;
+                self.signal_progress();
+                return;
+            }
+        };
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result =
+                store.commit_rule_coordination(prepared, self.inner.mail.limits(), now_ms());
+            if let Ok(change) = &result
+                && !change.events.is_empty()
+            {
+                self.publish_locked(&change.events);
+            }
+            result
+        };
+        match committed {
+            Ok(change) => {
+                for recipient in &change.mail_recipients {
+                    self.offer_notice(recipient).await;
+                }
             }
             Err(error) => {
                 let cause = if verb == "mail.send" {

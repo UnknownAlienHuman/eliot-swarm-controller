@@ -1196,8 +1196,8 @@ defaults to it). For project mail, Store resolves the registration ID and checks
 the recipient's approved profile and checkout or managed worktree binding.
 Project registration must grant each canonical verb explicitly in `actions`;
 the captured registration revision is checked at dispatch and effect commit.
-Store decodes the retained payload once at execution and reuses the existing
-authorization, payload validation, mailbox limits,
+The Router decodes and validates the retained payload before taking the Store
+writer. Store rechecks its binding and reuses the existing authorization, mailbox limits,
 compare-and-swap/version semantics and
 delivery/acknowledgement semantics; a stale or unauthorized destination fails
 explicitly. Each admitted rule child commits its effect together with its

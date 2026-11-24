@@ -12,17 +12,55 @@ pub enum UserEventDispatch {
     Applied(Vec<Event>),
     Rejected(Error),
 }
-pub enum RuleCoordinationDispatch {
-    Applied {
-        events: Vec<Event>,
-        mail_recipients: Vec<String>,
-    },
-    Rejected(Error),
+pub struct RuleCoordinationDispatch {
+    pub events: Vec<Event>,
+    pub mail_recipients: Vec<String>,
 }
 
-enum RuleCoordinationEffect {
+enum RuleCoordinationDefinition {
     Mail(MailDefinitionArgs),
-    Variable(VarDefinitionArgs, String),
+    Variable(VarDefinitionArgs),
+}
+
+/// Validated coordination input captured from the dispatched command.
+pub struct PreparedRuleCoordination<'a> {
+    command: &'a Command,
+    subject: &'static str,
+    definition: RuleCoordinationDefinition,
+}
+
+impl<'a> PreparedRuleCoordination<'a> {
+    /// Validate command shape before acquiring the Store writer.
+    pub fn decode(command: &'a Command) -> Result<Self> {
+        let subject = match command.verb.as_str() {
+            "mail.send" => "mail",
+            "var.set" => "variable",
+            _ => return Err(Error::new("invalid", "not a coordination command")),
+        };
+        if command.target.is_some() || command.generation.is_some() {
+            return Err(Error::new(
+                "invalid",
+                format!("{subject} command must be targetless"),
+            ));
+        }
+        let malformed = |_| Error::new("invalid", format!("{subject} definition is malformed"));
+        let definition = if command.verb == "mail.send" {
+            let definition: MailDefinitionArgs =
+                serde_json::from_value(command.args.clone()).map_err(malformed)?;
+            definition.validate()?;
+            RuleCoordinationDefinition::Mail(definition)
+        } else {
+            let definition: VarDefinitionArgs =
+                serde_json::from_value(command.args.clone()).map_err(malformed)?;
+            definition.validate()?;
+            RuleCoordinationDefinition::Variable(definition)
+        };
+        Ok(Self {
+            command,
+            subject,
+            definition,
+        })
+    }
 }
 
 impl Store {
@@ -426,21 +464,19 @@ impl Store {
     }
 
     /// Commit a rule coordination effect and its Applied settlement together.
-    /// Shape errors reject before the effect. Scope and effect failures still
-    /// use the existing transactional settlement policy.
     pub fn commit_rule_coordination(
         &mut self,
-        command_id: &str,
-        verb: &str,
+        prepared: PreparedRuleCoordination<'_>,
         limits: MailLimits,
         now: i64,
     ) -> Result<RuleCoordinationDispatch> {
         self.ensure_writer_healthy()?;
-        let subject = match verb {
-            "mail.send" => "mail",
-            "var.set" => "variable",
-            _ => return Err(Error::new("invalid", "not a coordination command")),
-        };
+        let PreparedRuleCoordination {
+            command,
+            subject,
+            definition,
+        } = prepared;
+        let command_id = &command.id;
         let result = (|| {
             let tx = self
                 .connection
@@ -449,51 +485,39 @@ impl Store {
             let record = load_command_record(&tx, command_id)?.ok_or_else(|| {
                 Error::new("not_found", format!("{subject} command was not found"))
             })?;
-            if record.command.verb != verb {
+            if record.command.verb != command.verb {
                 return Err(Error::new(
                     "invalid",
                     format!("not a rule {subject} command"),
                 ));
             }
-            if record.target.is_some() || record.command.generation.is_some() {
-                return Ok(RuleCoordinationDispatch::Rejected(Error::new(
+            if record.command.target != command.target
+                || record.command.generation != command.generation
+            {
+                return Err(Error::new(
                     "invalid",
-                    "coordination command must be targetless",
-                )));
+                    format!("{subject} command must be targetless"),
+                ));
             }
             let principal = &record.command.principal;
-            let effect = if verb == "mail.send" {
-                let parsed =
-                    serde_json::from_value::<MailDefinitionArgs>(record.command.args.clone())
-                        .map_err(|_| Error::new("invalid", "mail.send definition is malformed"))
-                        .and_then(|definition| {
-                            definition.validate()?;
-                            Ok(definition)
-                        });
-                let definition = match parsed {
-                    Ok(definition) => definition,
-                    Err(error) => return Ok(RuleCoordinationDispatch::Rejected(error)),
-                };
-                Self::load_rule_mail_recipients_tx(&tx, principal, &definition.to)?;
-                RuleCoordinationEffect::Mail(definition)
-            } else {
-                let parsed =
-                    serde_json::from_value::<VarDefinitionArgs>(record.command.args.clone())
-                        .map_err(|_| Error::new("invalid", "var.set definition is malformed"))
-                        .and_then(|definition| {
-                            definition.validate()?;
-                            Ok(definition)
-                        });
-                let definition = match parsed {
-                    Ok(definition) => definition,
-                    Err(error) => return Ok(RuleCoordinationDispatch::Rejected(error)),
-                };
-                let scope = Self::resolve_rule_var_scope(principal, definition.scope.as_deref())?;
-                RuleCoordinationEffect::Variable(definition, scope)
+            if principal != &command.principal || record.command.args != command.args {
+                return Err(Error::new(
+                    "source_integrity",
+                    "rule coordination command binding changed after dispatch",
+                ));
+            }
+            let var_scope = match &definition {
+                RuleCoordinationDefinition::Mail(definition) => {
+                    Self::load_rule_mail_recipients_tx(&tx, principal, &definition.to)?;
+                    String::new()
+                }
+                RuleCoordinationDefinition::Variable(definition) => {
+                    Self::resolve_rule_var_scope(principal, definition.scope.as_deref())?
+                }
             };
             if record.state == CommandState::Applied {
                 commit_transaction(tx, &self.write_faulted)?;
-                return Ok(RuleCoordinationDispatch::Applied {
+                return Ok(RuleCoordinationDispatch {
                     events: Vec::new(),
                     mail_recipients: Vec::new(),
                 });
@@ -505,8 +529,8 @@ impl Store {
                 ));
             }
             projects::validate_project_command_dispatch_tx(&tx, &record)?;
-            let (outcome, mut events, mail_recipients) = match effect {
-                RuleCoordinationEffect::Mail(definition) => {
+            let (outcome, mut events, mail_recipients) = match definition {
+                RuleCoordinationDefinition::Mail(definition) => {
                     let delivery_prefix = rule_mail_delivery_prefix(&record.command)?;
                     let (response, events) = Self::mail_effect_tx(
                         &tx,
@@ -528,7 +552,7 @@ impl Store {
                         .collect();
                     (outcome, events, recipients)
                 }
-                RuleCoordinationEffect::Variable(definition, scope) => {
+                RuleCoordinationDefinition::Variable(definition) => {
                     let encoded_value = encode_json(&definition.value)?;
                     if encoded_value.len() > core::api::MAX_VAR_VALUE_BYTES {
                         return Err(Error::new(
@@ -539,7 +563,7 @@ impl Store {
                     let (response, event) = Self::var_effect_tx(
                         &tx,
                         principal,
-                        &scope,
+                        &var_scope,
                         &definition,
                         &encoded_value,
                         Some(command_id),
@@ -553,7 +577,7 @@ impl Store {
             };
             settle_applied_tx(&tx, &record, command_id, outcome, now, &mut events)?;
             commit_transaction(tx, &self.write_faulted)?;
-            Ok(RuleCoordinationDispatch::Applied {
+            Ok(RuleCoordinationDispatch {
                 events,
                 mail_recipients,
             })
