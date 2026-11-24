@@ -1,5 +1,10 @@
-use crate::git_integration::IntegrationLease;
+#[cfg(any(windows, target_os = "linux"))]
+use crate::daemon_process::wait_family_empty;
 use crate::platform::{CustodyGuarantee, CustodyObserver, OwnedChild, custody::AgentSpawnError};
+use crate::{
+    daemon_process::{BoundedCapture, capture_bounded},
+    git_integration::IntegrationLease,
+};
 use eliot_core::{Error, SecretPolicy, StderrSnapshot, limits::MAX_FRAME_BYTES};
 use eliot_plugin::{StderrCapture, spawn_stderr, spawn_stderr_prefix};
 use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::Duration};
@@ -9,7 +14,7 @@ use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::
 )]
 use tokio::process::Command;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     process::{ChildStdin, ChildStdout},
     sync::watch,
     task::JoinHandle,
@@ -146,8 +151,8 @@ pub(crate) enum ProcessOutcome {
 struct ProcessIo {
     stdin_task: JoinHandle<io::Result<()>>,
     stdin_result: Option<Result<io::Result<()>, tokio::task::JoinError>>,
-    stdout_task: JoinHandle<io::Result<StdoutCapture>>,
-    stdout_result: Option<Result<io::Result<StdoutCapture>, tokio::task::JoinError>>,
+    stdout_task: JoinHandle<io::Result<BoundedCapture>>,
+    stdout_result: Option<Result<io::Result<BoundedCapture>, tokio::task::JoinError>>,
     stderr_task: StderrCapture,
 }
 
@@ -396,7 +401,7 @@ async fn run_owned_process_inner(
     let mut io = ProcessIo {
         stdin_task: tokio::spawn(write_stdin(stdin_pipe, stdin)),
         stdin_result: None,
-        stdout_task: tokio::spawn(capture_stdout(stdout_pipe)),
+        stdout_task: tokio::spawn(capture_bounded(stdout_pipe, MAX_FRAME_BYTES, 8192)),
         stdout_result: None,
         stderr_task: match stderr {
             StderrExcerpt::Tail => spawn_stderr(stderr_pipe, policy),
@@ -490,7 +495,7 @@ async fn run_owned_process_inner(
         Some(Ok(Ok(stdout))) => stdout,
         _ => unreachable!("stdout errors exit through the cleanup path"),
     };
-    if !matches!(io.stdin_result.as_ref(), Some(Ok(Ok(())))) || !stdout.complete {
+    if !matches!(io.stdin_result.as_ref(), Some(Ok(Ok(())))) || stdout.exceeded {
         io.stdout_result = Some(Ok(Ok(stdout)));
         return settle_interrupted(
             interrupted,
@@ -634,12 +639,6 @@ fn pending_interruption(
     }
 }
 
-struct StdoutCapture {
-    bytes: Vec<u8>,
-    complete: bool,
-    exceeded: bool,
-}
-
 struct SettledProcess {
     status: ExitStatus,
     exit_was_known_before_cleanup: bool,
@@ -673,38 +672,6 @@ async fn write_stdin(mut stdin: ChildStdin, bytes: Vec<u8>) -> io::Result<()> {
     stdin.write_all(&bytes).await?;
     drop(stdin);
     Ok(())
-}
-
-async fn capture_stdout(stdout: ChildStdout) -> io::Result<StdoutCapture> {
-    capture_bounded(stdout, MAX_FRAME_BYTES).await
-}
-
-async fn capture_bounded<R>(mut reader: R, limit: usize) -> io::Result<StdoutCapture>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut bytes = Vec::with_capacity(limit.min(8192));
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(StdoutCapture {
-                bytes,
-                complete: true,
-                exceeded: false,
-            });
-        }
-        let remaining = limit.saturating_sub(bytes.len());
-        let retained = remaining.min(count);
-        bytes.extend_from_slice(&buffer[..retained]);
-        if retained != count {
-            return Ok(StdoutCapture {
-                bytes,
-                complete: false,
-                exceeded: true,
-            });
-        }
-    }
 }
 
 async fn settle_interrupted(
@@ -821,7 +788,7 @@ fn classify_settled_process(settled: SettledProcess) -> ProcessOutcome {
     if exit_was_known_before_cleanup && !status.success() {
         let capture = stdout.map(|stdout| ProcessCapture {
             stdout: stdout.bytes,
-            stdout_complete: stdout.complete,
+            stdout_complete: !stdout.exceeded,
             stderr,
             status,
             custody,
@@ -860,7 +827,7 @@ fn classify_settled_process(settled: SettledProcess) -> ProcessOutcome {
             quiescent: true,
         };
     }
-    if !output_limit && !stdout.complete {
+    if !output_limit && stdout.exceeded {
         return ProcessOutcome::Unknown {
             reason: ProcessUncertainty::Stdout,
             quiescent: true,
@@ -889,7 +856,7 @@ fn classify_settled_process(settled: SettledProcess) -> ProcessOutcome {
         reason,
         capture: Some(ProcessCapture {
             stdout: stdout.bytes,
-            stdout_complete: stdout.complete,
+            stdout_complete: !stdout.exceeded,
             stderr,
             status,
             custody,
@@ -1010,20 +977,11 @@ async fn wait_for_quiescence(
     observer: Option<&CustodyObserver>,
     deadline: Instant,
 ) -> Result<bool, ()> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let _ = observer;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        child
-            .wait_group_empty_except_leader(remaining)
-            .await
-            .map_err(|_| ())
-    }
-    #[cfg(windows)]
-    {
-        let _ = observer;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        child.wait_family_empty(remaining).await.map_err(|_| ())
+        wait_family_empty(child, remaining).await.map_err(|_| ())
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
