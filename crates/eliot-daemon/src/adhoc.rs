@@ -931,6 +931,40 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     read().unwrap_or_else(|error| installation_error(harness, error))
 }
 
+#[derive(PartialEq, Eq)]
+pub(crate) struct InstallationFingerprint {
+    executables: Vec<VersionKey>,
+    metadata_version: Option<String>,
+}
+
+/// Check the current installation without starting a native CLI. A ranked
+/// adapter can change its choice when any of its candidates changes.
+pub(crate) fn installation_fingerprint(
+    harness: &str,
+    deadline: Instant,
+) -> Option<InstallationFingerprint> {
+    let decl = discovery_for(harness).ok()?;
+    let mut metadata_version = None;
+    let executables = if matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        probe_candidate_paths_with((decl.candidates)().ok()?, |_| None)
+            .into_iter()
+            .map(|candidate| VersionKey::read(&candidate.cmd, None))
+            .collect::<Option<Vec<_>>>()?
+    } else {
+        let discovered = discover_cmd_for_harness(harness, deadline).ok()?;
+        let cmd =
+            resolve_native_executable(discovered.as_deref().unwrap_or(harness), harness).ok()?;
+        if let InstallStrategy::MetadataVersion(read) = decl.strategy {
+            metadata_version = read(Path::new(&cmd));
+        }
+        vec![VersionKey::read(&cmd, Some(&decl))?]
+    };
+    Some(InstallationFingerprint {
+        executables,
+        metadata_version,
+    })
+}
+
 /// Bound on one `<exe> --version` probe: a hung native executable must not
 /// stall `harness.list` for every harness.
 const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -946,7 +980,7 @@ const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30
 const VERSION_CACHE_MAX: usize = 64;
 
 #[derive(Clone, Hash, PartialEq, Eq)]
-struct VersionKey {
+pub(crate) struct VersionKey {
     program: String,
     modified: Option<std::time::SystemTime>,
     size: u64,
@@ -954,7 +988,7 @@ struct VersionKey {
 }
 
 impl VersionKey {
-    fn read(program: &str, verify: Option<&InstallDiscovery>) -> Option<Self> {
+    pub(crate) fn read(program: &str, verify: Option<&InstallDiscovery>) -> Option<Self> {
         let metadata = Path::new(program).metadata().ok()?;
         Some(Self {
             program: program.to_owned(),
