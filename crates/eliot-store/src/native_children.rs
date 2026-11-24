@@ -10,10 +10,13 @@ use std::collections::BTreeMap;
 pub const NATIVE_CHILD_ATTENTION_PAGE_SIZE: usize = 32;
 const OPEN_TURN_SQL: &str = "SELECT 1 FROM turns WHERE agent = ?1 AND generation = ?2
     AND state IN ('running', 'unknown') LIMIT 1";
+// Newest progress spans all turns in the generation. The time-ordered
+// index lets this stop at the first row without sorting turn activity.
 macro_rules! native_progress_select {
     ($agent:literal, $generation:literal) => {
         concat!(
-            "SELECT ts FROM events WHERE agent = ", $agent, " AND generation = ", $generation,
+            "SELECT ts FROM events INDEXED BY events_native_progress_time WHERE agent = ", $agent,
+            " AND generation = ", $generation,
             " AND native_id IS NOT NULL AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
               AND kind IN ('turn.started', 'turn.completed', 'message.completed',
                            'tool.started', 'tool.completed', 'request.opened', 'request.resolved', 'request.closed')
