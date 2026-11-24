@@ -326,12 +326,12 @@ impl DesktopApp {
                 };
                 let left = tries.saturating_sub(1);
                 // The render that attaches the menu's items comes first.
-                if self.renders.get() <= self.menu.show_after {
-                    self.post_menu_show(epoch, left, MENU_SHOW_RETRY_MS, context);
-                    return;
-                }
-                match crate::flyout::show_menu_at(crate::flyout::MENU_ANCHOR, open.x, open.y, epoch)
-                {
+                let shown = if self.renders.get() <= self.menu.show_after {
+                    Err("its render has not committed".to_owned())
+                } else {
+                    crate::flyout::show_menu_at(crate::flyout::MENU_ANCHOR, open.x, open.y, epoch)
+                };
+                match shown {
                     Ok(()) => self.menu.shown = true,
                     Err(_) if left > 0 => {
                         self.post_menu_show(epoch, left, MENU_SHOW_RETRY_MS, context);

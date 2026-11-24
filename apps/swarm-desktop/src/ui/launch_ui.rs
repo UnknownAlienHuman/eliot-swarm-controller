@@ -19,11 +19,11 @@
 //! open the chip carries it (`FlyoutExt::flyout_with`, built in
 //! [`super::picker_ui`]) and `crate::flyout` opens it once the render that
 //! attached it committed, closes it when a choice is made and reports a
-//! light dismiss (a press outside, a switch to another window), which
-//! closes the state here. Reactor 0.100.0 cannot open or close a flyout
-//! from code nor say that it closed. The highlight keys of an open popover
-//! come from the window's keyboard hook ([`crate::shortcuts`]), so its
-//! search field keeps the keyboard.
+//! light dismiss (a press outside it), which closes the state here.
+//! Reactor 0.100.0 cannot open or close a flyout from code nor say that it
+//! closed. The highlight keys of an open popover come from the window's
+//! keyboard hook ([`crate::shortcuts`]), so its search field keeps the
+//! keyboard.
 
 use super::*;
 use crate::picker::{self, Choice, Item, Pick, Row};
@@ -592,11 +592,12 @@ impl DesktopApp {
                 }
                 let left = tries.saturating_sub(1);
                 // The render that attaches the flyout to its chip comes first.
-                if self.renders.get() <= self.launch.show_after {
-                    self.post_show(epoch, left, SHOW_RETRY_MS, context);
-                    return;
-                }
-                match crate::flyout::show(crate::flyout::POPOVER_ANCHOR, epoch) {
+                let shown = if self.renders.get() <= self.launch.show_after {
+                    Err("its render has not committed".to_owned())
+                } else {
+                    crate::flyout::show(crate::flyout::POPOVER_ANCHOR, epoch)
+                };
+                match shown {
                     Ok(()) => {}
                     Err(_) if left > 0 => self.post_show(epoch, left, SHOW_RETRY_MS, context),
                     Err(error) => {
