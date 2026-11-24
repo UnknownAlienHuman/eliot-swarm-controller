@@ -196,8 +196,22 @@ impl SwitchRequest {
             let created = value.created.as_ref().ok_or_else(|| {
                 Error::new("source_integrity", "switch handoff has no destination")
             })?;
-            self.handoff(&value.handoff_command, &created.agent, created.generation)
-                .validate_response(handoff)?;
+            let mut expected =
+                self.handoff(&value.handoff_command, &created.agent, created.generation);
+            expected.commands = handoff
+                .transfers
+                .iter()
+                .map(|transfer| transfer.original.clone())
+                .collect();
+            if !expected.commands.starts_with(&self.commands)
+                || super::handoff::validate_send_selection(&expected.commands).is_err()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "switch reply changed its explicit SEND selection",
+                ));
+            }
+            expected.validate_response(handoff)?;
         }
         if value.disposal_command.is_some() != value.disposal_state.is_some()
             || value.disposal_command.as_ref().is_some_and(|id| {
