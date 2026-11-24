@@ -1446,11 +1446,12 @@ pub(super) fn model_mismatch_tx(
         .map_err(|_| Error::new("invalid", "invalid model mismatch hold evidence"))?;
     mismatch.validate()?;
     let turn_id = turn.unwrap_or_default();
-    db!(tx.execute(
+    tx.execute(
         "UPDATE turns SET effective_model = NULL
          WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
         params![parse_agent_id(&agent.id)?, agent.generation, turn_id],
-    ));
+    )
+    .map_err(sql_error)?;
     let restriction = ProviderRestriction {
         kind: ProviderRestrictionKind::ModelMismatch,
         retry_after: None,
