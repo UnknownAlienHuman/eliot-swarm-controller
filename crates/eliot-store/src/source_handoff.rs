@@ -404,7 +404,7 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Vec::new());
         }
-        let events = native_exit_gaps_tx(&tx, &current, reason, now)?;
+        let events = native_exit_gaps_tx(&tx, &current, reason, now, "host-root-exit", false)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
@@ -456,7 +456,7 @@ impl Store {
         }
         observer::require_controlled(&current)?;
         let mut events = if generation == current.generation && !current.is_terminal() {
-            native_exit_gaps_tx(&tx, &current, reason, now)?
+            native_exit_gaps_tx(&tx, &current, reason, now, "host-root-exit", false)?
         } else {
             Vec::new()
         };
@@ -629,11 +629,29 @@ pub(super) fn native_unavailable_tx(
     Ok(events)
 }
 
+pub(super) fn native_restart_gaps_tx(
+    tx: &Transaction<'_>,
+    current: &Agent,
+    restart_id: &str,
+    now: i64,
+) -> Result<Vec<Event>> {
+    native_exit_gaps_tx(
+        tx,
+        current,
+        "planned_restart_native_input_cutoff",
+        now,
+        &format!("host-planned-restart:{restart_id}"),
+        true,
+    )
+}
+
 fn native_exit_gaps_tx(
     tx: &Transaction<'_>,
     current: &Agent,
     reason: &str,
     now: i64,
+    gap_scope: &str,
+    planned_restart: bool,
 ) -> Result<Vec<Event>> {
     let agent = current.id.as_str();
     let agent_num = parse_agent_id(agent)?;
@@ -661,7 +679,7 @@ fn native_exit_gaps_tx(
                 "native owner has no committed source state",
             )
         })?;
-        let gap_id = format!("host-root-exit:{agent}:{generation}:{source}");
+        let gap_id = format!("{gap_scope}:{agent}:{generation}:{source}");
         let data = json!({
             "gap_id":gap_id, "agent_id":agent, "generation":generation,
             "source":source, "families":families, "reason":reason,
@@ -675,6 +693,9 @@ fn native_exit_gaps_tx(
         }
         let digest = canonical::digest(&data)?;
         if state.gap_id.as_deref() == Some(gap_id.as_str()) {
+            if planned_restart {
+                continue;
+            }
             if state.gap_digest.as_deref() != Some(digest.as_slice())
                 || state.gap_seq.is_none_or(|seq| seq <= 0)
             {
@@ -686,6 +707,9 @@ fn native_exit_gaps_tx(
             continue;
         }
         if state.state != "open" {
+            if planned_restart {
+                continue;
+            }
             return Err(Error::new(
                 "source_integrity",
                 "native owner source is already closed",

@@ -611,6 +611,49 @@ fn attempt_allowed(connection: &Connection, agent: &Agent, now: i64) -> Result<b
     switch_budget_available(connection, agent, now)
 }
 
+/// A failed no-write Resume may leave owed work on its exact predecessor
+/// generation. Bind its receipt to the current generation's exact agent.starting
+/// event, then use the immediately preceding generation for task history.
+fn safe_failed_resume_predecessor(connection: &Connection, agent: &Agent) -> Result<Option<i64>> {
+    let num = parse_agent_id(&agent.id)?;
+    let previous = agent.generation.checked_sub(1).unwrap_or_default();
+    if previous < 1 {
+        return Ok(None);
+    }
+    let selected =
+        crate::Store::selected_work_task_command(connection, &agent.id, agent.generation)?;
+    if selected.as_deref().is_none_or(str::is_empty)
+        || crate::has_unknown_gate(connection, num)?
+        || handoff::last_turn_uncertain(connection, num, previous)?
+    {
+        return Ok(None);
+    }
+    let failed_resume: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands c
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.verb = 'resume'
+               AND c.state = 'failed'
+               AND (c.principal = 'owner' OR EXISTS (
+                   SELECT 1 FROM restart_resume_intents r WHERE r.command_id = c.id
+               ))
+               AND json_extract(c.outcome, '$.native_start_refused') = 1
+               AND json_type(c.outcome, '$.restart_resume_refusal.reason') = 'text'
+               AND json_type(c.outcome, '$.restart_resume_refusal.where') = 'text'
+               AND EXISTS (SELECT 1 FROM events e
+                   WHERE e.agent = c.target AND e.generation = c.generation
+                     AND e.kind = 'agent.starting' AND e.source = 'agent'
+                     AND json_extract(e.data, '$.command_id') = c.id))",
+            params![num, agent.generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !failed_resume {
+        return Ok(None);
+    }
+    let unfinished = handoff::last_unfinished_turn(connection, num, previous)?.is_some();
+    Ok(unfinished.then_some(previous))
+}
+
 /// The input a successor must carry, when this generation still owes work.
 fn owed_work(
     connection: &Connection,
@@ -625,16 +668,22 @@ fn owed_work(
     }
     let num = parse_agent_id(&agent.id)?;
     if agent.is_terminal() {
-        let resuming: bool = connection
+        let resume_fenced: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_target
                  WHERE target = ?1 AND verb = 'resume'
-                   AND state IN ('accepted','queued','dispatched','unknown'))",
-                [num],
+                   AND (state IN ('accepted','queued','dispatched','unknown')
+                        OR (generation = ?2 AND state = 'rejected'
+                            AND COALESCE(json_extract(outcome, '$.code'),
+                                         json_extract(outcome, '$.reason')) IN (
+                                'workspace_branch_unattributed', 'workspace_branch_other_agent',
+                                'source_integrity', 'dirty'
+                            ))))",
+                params![num, agent.generation],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if resuming {
+        if resume_fenced {
             return Ok(None);
         }
     }
@@ -681,6 +730,11 @@ fn owed_work(
         )
         .map_err(sql_error)?;
     let unfinished = handoff::last_unfinished_turn(connection, num, agent.generation)?;
+    let safe_resume_predecessor = if reason == HandoffReason::SessionLost {
+        safe_failed_resume_predecessor(connection, agent)?
+    } else {
+        None
+    };
     if reason != HandoffReason::ProviderResponseWithheld
         && latest_turn_has_withheld_marker(connection, agent)?
     {
@@ -697,6 +751,7 @@ fn owed_work(
             )
             .map_err(sql_error)?,
         (HandoffReason::SessionLost, Some(_)) => true,
+        (HandoffReason::SessionLost, None) => safe_resume_predecessor.is_some(),
         (HandoffReason::ProviderResponseWithheld, Some(turn)) => withheld_turn == Some(turn),
         _ => false,
     };
@@ -918,7 +973,28 @@ impl Store {
             .prepare_cached(
                 "SELECT id FROM agents
                  WHERE state IN ('lost','failed') AND chat = 0 AND observe_only = 0
-                   AND archived = 0 AND project <> '' AND updated_at BETWEEN ?1 AND ?2
+                   AND archived = 0 AND project <> '' AND (
+                       updated_at BETWEEN ?1 AND ?2
+                       OR EXISTS (
+                           SELECT 1 FROM commands c
+                           WHERE c.target = agents.id
+                             AND c.generation = agents.generation
+                             AND c.verb = 'resume' AND c.state = 'failed'
+                             AND (c.principal = 'owner' OR EXISTS (
+                                 SELECT 1 FROM restart_resume_intents r WHERE r.command_id = c.id
+                             ))
+                             AND json_extract(c.outcome, '$.native_start_refused') = 1
+                             AND json_type(c.outcome, '$.restart_resume_refusal') = 'object'
+                             AND json_type(c.outcome, '$.restart_resume_refusal.reason') = 'text'
+                             AND length(trim(json_extract(c.outcome, '$.restart_resume_refusal.reason'))) > 0
+                             AND json_type(c.outcome, '$.restart_resume_refusal.where') = 'text'
+                             AND length(trim(json_extract(c.outcome, '$.restart_resume_refusal.where'))) > 0
+                             AND EXISTS (SELECT 1 FROM events e
+                                 WHERE e.agent = c.target AND e.generation = c.generation
+                                   AND e.kind = 'agent.starting' AND e.source = 'agent'
+                                   AND json_extract(e.data, '$.command_id') = c.id)
+                       )
+                   )
                  ORDER BY updated_at DESC LIMIT ?3",
             )
             .map_err(sql_error)?;

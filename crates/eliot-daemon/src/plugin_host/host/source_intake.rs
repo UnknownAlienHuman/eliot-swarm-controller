@@ -662,10 +662,19 @@ async fn put_events(
         .events
         .iter()
         .any(|event| event.kind == "session.usage");
+    if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+        record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
+        return Err(planned_restart_cutoff_error(&cutoff));
+    }
     let queued = Instant::now();
     let result = match timeout_at(until, store.lock()).await {
         Ok(mut store) => {
             let acquired = Instant::now();
+            if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+                drop(store);
+                record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
+                return Err(planned_restart_cutoff_error(&cutoff));
+            }
             let now = now_ms();
             let result = if is_child {
                 store.put_native_child_batch(binding.agent_id, binding.generation, batch, now)
@@ -710,10 +719,16 @@ async fn put_events(
             }
             result
         }
-        Err(_) => Err(Error::new(
-            "busy",
-            "Store lock deadline elapsed for events.put",
-        )),
+        Err(_) => {
+            if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+                record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
+                return Err(planned_restart_cutoff_error(&cutoff));
+            }
+            Err(Error::new(
+                "busy",
+                "Store lock deadline elapsed for events.put",
+            ))
+        }
     };
     match result {
         Ok(commit) => {
@@ -750,6 +765,43 @@ async fn put_events(
             }
         }
     }
+}
+
+fn planned_restart_cutoff(host: &std::sync::Weak<HostState>) -> Option<String> {
+    host.upgrade()
+        .and_then(|state| state.planned_restart_cutoff.lock_recover().clone())
+}
+
+fn planned_restart_cutoff_error(cutoff: &str) -> Error {
+    Error::new(
+        "unavailable",
+        format!("planned restart native input cutoff {cutoff}; no new batch write was attempted"),
+    )
+}
+
+fn record_planned_restart_cutoff(
+    credentials: &[String],
+    gap: &SourceGap,
+    batch_id: &str,
+    event_kinds: &str,
+    cutoff: &str,
+) {
+    let policy = SecretPolicy::new(credentials.iter());
+    let generation = gap.generation.to_string();
+    crate::logging::record(
+        &policy,
+        "events_put_planned_restart_cutoff",
+        &[
+            ("agent_id", &gap.agent_id),
+            ("generation", &generation),
+            ("source", &gap.source),
+            ("batch_id", batch_id),
+            ("event_kind", event_kinds),
+            ("coverage_ref", cutoff),
+            ("outcome", "unacknowledged"),
+        ],
+        None,
+    );
 }
 
 fn apply_command_guard(

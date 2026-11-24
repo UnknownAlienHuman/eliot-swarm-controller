@@ -1688,6 +1688,15 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   not finish, input is waiting or was refused by the hold, or a Goal is active;
 - a lost or failed session of this daemon's lifetime with the same kinds of owed work,
   20 seconds after the loss so native process-loss recovery can reopen it first.
+- a failed Resume with a bound native `agent.start` refusal that proves no native
+  subject was created. The daemon persists the exact refusal reason and location, then
+  selects it immediately through the same owed-work and automatic-handoff path. Boot
+  restart Resume and an explicit Owner Resume both reach this selector. A preflight
+  rejection for a dirty, changed, or unattributed checkout keeps the work with the
+  current Agent. Automatic handoff would cross the same unverified source boundary.
+  The Owner sees the rejected Resume in `swarm cmd <id>`, with both branch names
+  for branch drift and the other Agent identity when known. Verify or restore the
+  worktree before issuing a new Resume.
 
 Held and lost sessions use `handoff_fallback` in configured order. A lost session
 can reuse its profile if the fallback list names it. For a withheld response on a
@@ -1721,6 +1730,19 @@ dispatches a stop to the source. A refused admission is tried again
 after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
+
+The Resume refusal selector binds the exact failed `resume` command's updated
+generation to the matching `agent.starting` event and resulting terminal Agent
+generation. It also requires the durable `native_start_refused` classification and a
+nonempty typed reason/location. Predecessor work history is read from generation N-1.
+When the resulting generation has no current turn, owed work may come from the exact
+inherited predecessor task checkpoint plus an unfinished predecessor turn. The
+predecessor turn must have no uncertain effects and the Agent must have no unknown
+command gate; otherwise this path is ineligible. Unknown outcomes and non-native
+startup/preflight failures do not select. Ordinary handoff reservation still requires the durable
+process-custody exit proof, drained native source, owed work and the existing checkout,
+authority, dirtiness and branch-integrity gates; a blocked gate leaves an actionable
+handoff waiting reason for the Owner.
 
 For a withheld response, the Owner can choose a preset explicitly, configure
 eligible routing, or leave the work pending. An explicit Owner switch to a
@@ -2123,6 +2145,13 @@ remains paused until that work is settled. Hold leaves those sessions for
 explicit resume. Previously admitted commands still follow durable command
 recovery. Interrupted turns and uncertain effects stay `unknown` under either
 policy: they are named, never replayed.
+
+A restart Resume reuses an Agent's retained managed worktree. When its local branch
+differs from the originally registered branch, recovery accepts it after exact
+workspace ownership and Git registration readback, matching registry and symbolic
+HEAD branches, and a clean status. Store durably retains the original and observed
+branch names; cleanup continues to use the original frozen branch. Dirty or ambiguous
+worktrees remain fenced for Owner inspection.
 
 `swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an

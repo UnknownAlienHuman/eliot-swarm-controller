@@ -9,7 +9,9 @@ use crate::{
     platform::{CustodyObserver, OwnedChild, worktree_guard::WorktreeWriteGuard},
     router::SecretSet,
     setup,
-    workspace_git::{MissingWorktreeRemoval, RemovalBranch, WorkspaceGit},
+    workspace_git::{
+        MissingWorktreeRemoval, NativeBranchSwitchEvidence, RemovalBranch, WorkspaceGit,
+    },
 };
 use eliot_core::api::{CommandResolveRequest, CommandResolveResponse};
 use eliot_core::is_start_verb;
@@ -493,6 +495,74 @@ impl WorkspaceManager {
         }
     }
 
+    async fn inspect_resume_git(
+        &self,
+        git: &WorkspaceGit,
+        preparation: &WorkspacePreparation,
+    ) -> WorkspaceCreationOutcome {
+        let prior_generation = preparation.target_generation.saturating_sub(1);
+        let candidates = {
+            let store = self.inner.store.lock().await;
+            store
+                .native_branch_switch_candidates(&preparation.worktree_path, None, None)
+                .ok()
+        };
+        let (evidence, other_candidates) = candidates
+            .filter(|candidates| candidates.len() < 65)
+            .map(|candidates| {
+                let mut evidence = None;
+                let mut others = Vec::new();
+                for candidate in candidates {
+                    if candidate.agent == preparation.agent
+                        && candidate.generation == prior_generation
+                        && evidence.is_none()
+                        && eliot_core::workspace_path_key(&candidate.workspace)
+                            == eliot_core::workspace_path_key(&preparation.worktree_path)
+                    {
+                        let prior_branch = preparation
+                            .outcome
+                            .as_ref()
+                            .and_then(|outcome| outcome.get("resume_previous"))
+                            .and_then(|previous| previous.get("outcome"))
+                            .and_then(|outcome| outcome.get("result"))
+                            .and_then(|result| result.get("branch"))
+                            .and_then(Value::as_str);
+                        if let Some(prior_branch) = prior_branch {
+                            evidence = Some(NativeBranchSwitchEvidence {
+                                branch: candidate.branch,
+                                workspace: candidate.workspace,
+                                prior_branch: prior_branch.to_owned(),
+                                generation: candidate.generation,
+                                event_seq: candidate.terminal_seq,
+                                start_event_seq: candidate.start_seq,
+                                at_ms: candidate.completed_at_ms,
+                                started_at_ms: candidate.started_at_ms,
+                            });
+                        }
+                    } else {
+                        others.push(candidate);
+                    }
+                }
+                (evidence, others)
+            })
+            .unwrap_or_default();
+        let prior_drift = preparation
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.get("resume_previous"))
+            .and_then(|previous| previous.get("outcome"))
+            .and_then(|outcome| outcome.get("result"))
+            .and_then(|result| result.get("branch_drift"))
+            .and_then(|value| serde_json::from_value(value.clone()).ok());
+        git.inspect_resume_retained(
+            preparation,
+            evidence.as_ref(),
+            prior_drift.as_ref(),
+            &other_candidates,
+        )
+        .await
+    }
+
     async fn prepare_workspace(
         &self,
         command_id: &str,
@@ -515,8 +585,7 @@ impl WorkspaceManager {
             }
             match current.phase {
                 WorkspacePhase::Ready => {
-                    let readback = git.inspect_retained(&current).await;
-                    if let Some(error) = workspace_creation_error(&readback) {
+                    if let Err(error) = self.verify_ready_start(&git, &current).await {
                         if agent.generation > 0 {
                             return Err(error);
                         }
@@ -539,7 +608,7 @@ impl WorkspaceManager {
                         .and_then(Value::as_bool)
                         == Some(true);
                     let outcome = if reuse {
-                        git.inspect_retained(&current).await
+                        self.inspect_resume_git(&git, &current).await
                     } else {
                         // A stand records the creation externally before
                         // any Git effect; a refused record dispatches nothing.
@@ -1540,6 +1609,41 @@ impl WorkspaceManager {
         }
     }
 
+    async fn verify_ready_start(
+        &self,
+        git: &WorkspaceGit,
+        preparation: &WorkspacePreparation,
+    ) -> Result<()> {
+        let recorded_drift = preparation
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome["reuse"].as_bool() == Some(true))
+            .map(|outcome| &outcome["result"])
+            .filter(|result| result["branch_drift"].is_object());
+        let readback = if recorded_drift.is_some() {
+            self.inspect_resume_git(git, preparation).await
+        } else {
+            git.inspect_retained(preparation).await
+        };
+        if let Some(error) = workspace_creation_error(&readback) {
+            return Err(error);
+        }
+        if let Some(recorded) = recorded_drift
+            && let WorkspaceCreationOutcome::Verified { branch, head, .. } = &readback
+            && (recorded["branch"].as_str() != Some(branch)
+                || recorded["head"].as_str() != Some(head))
+        {
+            return Err(problem(
+                "source_integrity",
+                &format!(
+                    "workspace changed after resume verification: original branch '{}' and observed branch '{}'",
+                    preparation.requested_branch, branch
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn pending_start(&self, preparation: &WorkspacePreparation) -> Result<bool> {
         if !matches!(
             preparation.phase,
@@ -1592,7 +1696,7 @@ impl WorkspaceManager {
                         .and_then(Value::as_bool)
                         == Some(true);
                     let outcome = if reuse {
-                        git.inspect_retained(preparation).await
+                        self.inspect_resume_git(&git, preparation).await
                     } else {
                         self.finish_workspace_create(
                             &git,
@@ -1683,10 +1787,7 @@ impl WorkspaceManager {
             .ok_or_else(|| problem("not_found", "workspace disappeared during recovery"))?;
         drop(store);
         if self.pending_start(&current).await?
-            && matches!(
-                git.inspect_retained(&current).await,
-                WorkspaceCreationOutcome::Verified { .. }
-            )
+            && self.verify_ready_start(&git, &current).await.is_ok()
         {
             return Ok(Some(current.start_command_id));
         }

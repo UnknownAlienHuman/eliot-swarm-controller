@@ -6872,19 +6872,28 @@ impl Router {
         let owner = principal_name(principal);
         let payload =
             json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup});
-        let admission = if request.backup {
-            store.record_restart_and_seal(&request.id, &owner, &payload, &result, now_ms())
-        } else {
-            store.record_write(
+        let outcome = if action == ShutdownMode::Restart {
+            store.record_restart_and_seal(
                 &request.id,
                 &owner,
-                "daemon.shutdown",
                 &payload,
                 &result,
                 now_ms(),
+                &self.inner.plugin_host.live_source_generations(),
             )
+        } else {
+            store
+                .record_write(
+                    &request.id,
+                    &owner,
+                    "daemon.shutdown",
+                    &payload,
+                    &result,
+                    now_ms(),
+                )
+                .map(|admission| (admission, Vec::new()))
         };
-        let admission = match admission {
+        let (admission, restart_events) = match outcome {
             Ok(admission) => admission,
             Err(error) => {
                 if request.backup
@@ -6902,6 +6911,7 @@ impl Router {
                 return Err(error);
             }
         };
+        self.publish_locked(&restart_events);
         if admission.is_new {
             match action {
                 ShutdownMode::PrepareRestart => {
@@ -6930,6 +6940,11 @@ impl Router {
                     self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
                 }
                 ShutdownMode::Restart => {
+                    // A definite pre-seal failure leaves native intake live.
+                    // Only publish the cutoff when the restart has committed.
+                    self.inner
+                        .plugin_host
+                        .set_planned_restart_cutoff(&request.id);
                     self.inner.shutdown_ready.store(false, Ordering::SeqCst);
                     self.inner.mode.store(MODE_RESTART, Ordering::SeqCst);
                     *lease = None;

@@ -233,6 +233,8 @@ pub enum WorkspaceCreationOutcome {
         worktree_path: String,
         branch: String,
         head: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_drift: Option<Box<WorkspaceBranchDrift>>,
     },
     Failed {
         code: String,
@@ -259,6 +261,28 @@ pub enum WorkspaceCreationOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_evidence: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBranchDrift {
+    pub original_branch: String,
+    pub observed_branch: String,
+    /// Branch recorded by the ready workspace for the exact prior generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_generation_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_from_branch: Option<String>,
+    /// Exact Codex completion event that proves this branch switch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_event_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_start_seq: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_generation: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_started_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

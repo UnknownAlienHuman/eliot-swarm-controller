@@ -1592,6 +1592,13 @@ impl EventProcessor {
                                 .redact_bounded(&command, MAX_TOOL_COMMAND_BYTES),
                         );
                     }
+                    if item_type == "commandExecution"
+                        && let Ok(command) = serde_json::from_value::<NativeCommandExecutionItem>(
+                            notification.item.clone(),
+                        )
+                    {
+                        data["cwd"] = Value::String(command.cwd);
+                    }
                     self.commit_event("tool.started", native_id, data).await?;
                     self.open_tools.insert(item_id, item_type);
                 }
@@ -1763,6 +1770,19 @@ impl EventProcessor {
             {
                 if let Some(exit_code) = command.exit_code {
                     data["exit_code"] = json!(exit_code);
+                }
+                if native_status.as_deref() == Some("completed")
+                    && command.exit_code == Some(0)
+                    && let Some(branch) = simple_git_switch_branch(item)
+                    && !command.cwd.trim().is_empty()
+                {
+                    data["git_branch_switch"] = json!(CodexGitBranchSwitch {
+                        branch,
+                        cwd: command.cwd,
+                        native_at_ms: completed_at_ms,
+                        turn_id: turn_id.to_owned(),
+                        item_id: item_id.clone(),
+                    });
                 }
                 // A failure without its reason is a bare `failed`; keep the tail
                 // that usually says why. Success keeps its exit code only.
@@ -2622,6 +2642,73 @@ fn command_text(item: &Value) -> Option<String> {
         parsed.join("\n")
     };
     (!text.is_empty()).then_some(text)
+}
+
+/// Recognize only one simple switch parsed by Codex from its native
+/// `commandActions`. The raw shell wrapper is deliberately not interpreted.
+fn simple_git_switch_branch(item: &Value) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("commandExecution") {
+        return None;
+    }
+    let commands: Vec<&str> = item
+        .get("commandActions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|action| action.get("command").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .collect();
+    if commands.len() == 1
+        && let Some(branch) = parse_simple_git_switch(commands[0])
+    {
+        return Some(branch);
+    }
+    let raw = item.get("command")?.as_str()?.trim();
+    // The native raw form is accepted only as a direct argv-like command;
+    // shell wrappers, quoting, chaining and redirection are not interpreted.
+    if raw.chars().any(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | ';' | '&' | '|' | '<' | '>' | '$' | '`' | '(' | ')'
+        )
+    }) {
+        return None;
+    }
+    parse_simple_git_switch(raw)
+}
+
+fn parse_simple_git_switch(command: &str) -> Option<String> {
+    let mut words = command.split_ascii_whitespace();
+    let executable = words.next()?;
+    if !matches!(executable, "git" | "git.exe") || words.next()? != "switch" {
+        return None;
+    }
+    let first = words.next()?;
+    let branch = if matches!(first, "-c" | "--create" | "--") {
+        words.next()?
+    } else if !first.starts_with('-') {
+        first
+    } else {
+        return None;
+    };
+    if words.next().is_some()
+        || branch.starts_with('-')
+        || eliot_core::api::validate_integration_branch(branch).is_err()
+    {
+        return None;
+    }
+    Some(branch.to_owned())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+struct CodexGitBranchSwitch {
+    branch: String,
+    cwd: String,
+    native_at_ms: i64,
+    turn_id: String,
+    item_id: String,
 }
 
 fn is_tool_type(item_type: &str) -> bool {

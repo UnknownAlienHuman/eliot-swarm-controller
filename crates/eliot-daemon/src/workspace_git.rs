@@ -48,6 +48,18 @@ pub(crate) struct FrozenWorkspaceGit {
     pub worktree_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NativeBranchSwitchEvidence {
+    pub branch: String,
+    pub workspace: String,
+    pub prior_branch: String,
+    pub generation: i64,
+    pub event_seq: i64,
+    pub start_event_seq: i64,
+    pub at_ms: i64,
+    pub started_at_ms: i64,
+}
+
 #[derive(Clone)]
 pub(crate) struct WorkspaceGit {
     git: GitProbe,
@@ -73,6 +85,18 @@ fn git_path_matches(left: &Path, right: &Path) -> bool {
             .to_str()
             .zip(right.to_str())
             .is_some_and(|(left, right)| workspace_path_key(left) == workspace_path_key(right))
+}
+
+fn prior_ready_branch(preparation: &WorkspacePreparation) -> Option<String> {
+    preparation
+        .outcome
+        .as_ref()?
+        .get("resume_previous")?
+        .get("outcome")?
+        .get("result")?
+        .get("branch")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 fn verify_source_common_dir(source: &Repository, preparation: &WorkspacePreparation) -> Result<()> {
@@ -713,6 +737,7 @@ impl WorkspaceGit {
                 worktree_path: path_text(&subject.target.root)?,
                 branch: preparation.requested_branch.clone(),
                 head: subject.head,
+                branch_drift: None,
             })
         }
         .await;
@@ -732,6 +757,272 @@ impl WorkspaceGit {
                 origin_evidence: error.origin_evidence.clone().map(String::from),
             },
         }
+    }
+
+    /// Resume-only readback. Branch drift is accepted only when the Git
+    /// registration and symbolic HEAD agree and the changed checkout is clean.
+    /// The frozen branch remains the cleanup identity.
+    pub(crate) async fn inspect_resume_retained(
+        &self,
+        preparation: &WorkspacePreparation,
+        evidence: Option<&NativeBranchSwitchEvidence>,
+        prior_drift: Option<&eliot_core::WorkspaceBranchDrift>,
+        other_candidates: &[eliot_store::NativeBranchSwitchCandidate],
+    ) -> WorkspaceCreationOutcome {
+        let readback = async {
+            let deadline = Instant::now() + READ_TIME;
+            let subject = self.subject_inner(preparation, deadline, true).await?;
+            let observed = subject
+                .branch
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| problem("source_integrity", "workspace HEAD is not a local branch"))?
+                .to_owned();
+            let prior_branch = prior_ready_branch(preparation).or_else(|| {
+                let prior_was_elsewhere = prior_drift.is_some_and(|drift| {
+                    drift.observed_branch != preparation.requested_branch
+                });
+                (!prior_was_elsewhere).then(|| preparation.requested_branch.clone())
+            }).ok_or_else(|| {
+                problem(
+                    "workspace_branch_unattributed",
+                    &format!(
+                        "prior generation branch is unavailable; original '{}' and observed '{}'",
+                        preparation.requested_branch, observed
+                    ),
+                )
+            })?;
+            let branch_drift = if observed == prior_branch {
+                if observed == preparation.requested_branch {
+                    None
+                } else {
+                    let prior_drift = prior_drift
+                        .filter(|drift| drift.observed_branch == observed)
+                        .ok_or_else(|| {
+                            problem(
+                                "workspace_branch_unattributed",
+                                &format!(
+                                    "prior branch identity lacks validated native evidence; original '{}' and observed '{}'",
+                                    preparation.requested_branch, observed
+                                ),
+                            )
+                        })?;
+                    self.verify_native_checkout_reflog(
+                        &subject.target.root,
+                        prior_drift.native_from_branch.as_deref().unwrap_or(""),
+                        &observed,
+                        prior_drift.native_started_at_ms.unwrap_or_default(),
+                        prior_drift.native_at_ms.unwrap_or_default(),
+                        deadline,
+                    )
+                    .await?;
+                    let mut retained = prior_drift.clone();
+                    retained.prior_generation_branch = Some(prior_branch.clone());
+                    Some(retained)
+                }
+            } else {
+                let mut matched_other = Vec::new();
+                for candidate in other_candidates.iter().filter(|candidate| {
+                    candidate.agent != preparation.agent
+                        && candidate.branch == observed
+                        && eliot_core::workspace_path_key(&candidate.workspace)
+                            == eliot_core::workspace_path_key(&preparation.worktree_path)
+                        && candidate.started_at_ms <= candidate.completed_at_ms
+                        && candidate.start_seq < candidate.terminal_seq
+                }) {
+                    if let Some(from_branch) = self
+                        .checkout_reflog_transition(
+                            &subject.target.root,
+                            &observed,
+                            candidate.started_at_ms,
+                            candidate.completed_at_ms,
+                            deadline,
+                        )
+                        .await?
+                    {
+                        matched_other.push((
+                            candidate.agent.as_str(),
+                            candidate.generation,
+                            from_branch,
+                        ));
+                    }
+                }
+                if matched_other.len() == 1 {
+                    let (agent, generation, from_branch) = &matched_other[0];
+                    return Err(problem(
+                        "workspace_branch_other_agent",
+                        &format!(
+                            "branch change is attributed to Agent {agent} generation {generation}; original '{from_branch}' and observed '{observed}'"
+                        ),
+                    ));
+                }
+                if matched_other.len() > 1 {
+                    return Err(problem(
+                        "workspace_branch_unattributed",
+                        &format!(
+                            "multiple native principals match the checkout change; external or unattributed actor, original '{}' and observed '{}'",
+                            prior_branch, observed
+                        ),
+                    ));
+                }
+                let evidence = evidence.filter(|proof| {
+                    proof.branch == observed
+                        && eliot_core::workspace_path_key(&proof.workspace)
+                            == eliot_core::workspace_path_key(&preparation.worktree_path)
+                        && proof.generation + 1 == preparation.target_generation
+                        && proof.prior_branch == prior_branch
+                }).ok_or_else(|| {
+                    problem(
+                        "workspace_branch_unattributed",
+                        &format!(
+                            "external or unattributed branch change: original '{}' and observed '{}'",
+                            prior_branch, observed
+                        ),
+                    )
+                })?;
+                self.verify_native_checkout_reflog(
+                    &subject.target.root,
+                    &evidence.prior_branch,
+                    &observed,
+                    evidence.started_at_ms,
+                    evidence.at_ms,
+                    deadline,
+                )
+                .await?;
+                Some(eliot_core::WorkspaceBranchDrift {
+                    original_branch: preparation.requested_branch.clone(),
+                    observed_branch: observed.clone(),
+                    prior_generation_branch: Some(evidence.prior_branch.clone()),
+                    native_from_branch: Some(evidence.prior_branch.clone()),
+                    native_event_seq: Some(evidence.event_seq),
+                    native_start_seq: Some(evidence.start_event_seq),
+                    native_generation: Some(evidence.generation),
+                    native_at_ms: Some(evidence.at_ms),
+                    native_started_at_ms: Some(evidence.started_at_ms),
+                })
+            };
+            if branch_drift.is_some() {
+                self.require_clean(&subject, deadline)
+                    .await
+                    .map_err(|mut error| {
+                        error.message = format!(
+                            "{}; original branch '{}' and observed branch '{}'",
+                            error.message, preparation.requested_branch, observed
+                        )
+                        .into();
+                        error
+                    })?;
+            }
+            self.confirm_subject_mode(preparation, &subject, deadline, true)
+                .await?;
+            Ok::<_, Error>(WorkspaceCreationOutcome::Verified {
+                repo_path: path_text(&subject.source.root)?,
+                repo_common_dir: path_text(&subject.source.common_dir)?,
+                worktree_path: path_text(&subject.target.root)?,
+                branch: observed,
+                head: subject.head,
+                branch_drift: branch_drift.map(Box::new),
+            })
+        }
+        .await;
+        match readback {
+            Ok(outcome) => outcome,
+            Err(error) => WorkspaceCreationOutcome::Unknown {
+                code: error.code.clone(),
+                message: (*error.message).clone(),
+                failure_where: Some(
+                    error
+                        .failure_where
+                        .clone()
+                        .map(String::from)
+                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
+                ),
+                origin: Some(error.origin_or_unknown()),
+                origin_evidence: error.origin_evidence.clone().map(String::from),
+            },
+        }
+    }
+
+    async fn verify_native_checkout_reflog(
+        &self,
+        worktree: &Path,
+        prior_branch: &str,
+        observed_branch: &str,
+        native_started_at_ms: i64,
+        native_completed_at_ms: i64,
+        deadline: Instant,
+    ) -> Result<()> {
+        let transition = self
+            .checkout_reflog_transition(
+                worktree,
+                observed_branch,
+                native_started_at_ms,
+                native_completed_at_ms,
+                deadline,
+            )
+            .await?;
+        if transition.as_deref() != Some(prior_branch) {
+            return Err(problem(
+                "workspace_branch_unattributed",
+                &format!(
+                    "latest checkout reflog does not match the native operation; original '{}' and observed '{}'",
+                    prior_branch, observed_branch
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn checkout_reflog_transition(
+        &self,
+        worktree: &Path,
+        observed_branch: &str,
+        native_started_at_ms: i64,
+        native_completed_at_ms: i64,
+        deadline: Instant,
+    ) -> Result<Option<String>> {
+        let output = self
+            .read(
+                worktree,
+                &[
+                    "reflog",
+                    "show",
+                    "--date=unix",
+                    "--format=%gs%x09%gD",
+                    "-n",
+                    "32",
+                    "HEAD",
+                ],
+                deadline,
+            )
+            .await?;
+        let text = std::str::from_utf8(&output)
+            .map_err(|_| problem("source_integrity", "HEAD checkout reflog is not UTF-8"))?;
+        // HEAD reflog is newest first. A newer checkout supersedes any earlier
+        // matching operation, even when the older entry has a native event.
+        let latest_checkout = text.lines().find_map(|line| {
+            let (subject, selector) = line.split_once('\t')?;
+            let epoch = selector.strip_prefix("HEAD@{")?.strip_suffix('}')?;
+            subject
+                .strip_prefix("checkout: moving from ")?
+                .split_once(" to ")
+                .map(|(from, to)| (from, to, epoch))
+        });
+        let Some((from, to, epoch)) = latest_checkout else {
+            return Ok(None);
+        };
+        let epoch_ms = epoch
+            .parse::<i64>()
+            .ok()
+            .and_then(|seconds| seconds.checked_mul(1000))
+            .ok_or_else(|| problem("source_integrity", "checkout reflog time is invalid"))?;
+        if native_started_at_ms > native_completed_at_ms
+            || to != observed_branch
+            || epoch_ms < native_started_at_ms.saturating_sub(1_000)
+            || epoch_ms > native_completed_at_ms.saturating_add(1_000)
+        {
+            return Ok(None);
+        }
+        Ok(Some(from.to_owned()))
     }
 
     pub(crate) async fn creation_is_absent(
@@ -786,6 +1077,7 @@ impl WorkspaceGit {
             worktree_path: path_text(&subject.target.root)?,
             branch: preparation.requested_branch.clone(),
             head: subject.head,
+            branch_drift: None,
         })
     }
 
@@ -1420,6 +1712,15 @@ impl WorkspaceGit {
         preparation: &WorkspacePreparation,
         deadline: Instant,
     ) -> Result<Subject> {
+        self.subject_inner(preparation, deadline, false).await
+    }
+
+    async fn subject_inner(
+        &self,
+        preparation: &WorkspacePreparation,
+        deadline: Instant,
+        allow_branch_drift: bool,
+    ) -> Result<Subject> {
         let source = self.source(preparation, deadline).await?;
         let target_path = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target_path)?;
@@ -1434,13 +1735,7 @@ impl WorkspaceGit {
                 "workspace registration is duplicate, locked, prunable, or incomplete",
             ));
         }
-        let full_ref = branch_ref(&preparation.requested_branch);
-        if entry.branch.as_deref() != Some(full_ref.as_str()) {
-            return Err(problem(
-                "source_integrity",
-                "registered workspace branch differs from the requested branch",
-            ));
-        }
+        let registered_branch = entry.branch.as_deref();
         let target = self.repository(&path_text(&target_path)?, deadline).await?;
         let registry_root = canonical_root(&path_text(&source.common_dir.join("worktrees"))?)?;
         if target.common_dir != source.common_dir
@@ -1468,11 +1763,31 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        if branch != full_ref || !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str())
-        {
+        if !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str()) {
             return Err(problem(
                 "source_integrity",
-                "workspace HEAD, branch, or registration disagree",
+                "workspace HEAD or registration head disagree",
+            ));
+        }
+        if registered_branch != Some(branch.as_str()) {
+            return Err(problem(
+                "source_integrity",
+                &format!(
+                    "registered branch '{}' differs from observed HEAD branch '{}'",
+                    registered_branch.unwrap_or("<detached>"),
+                    branch
+                ),
+            ));
+        }
+        let full_ref = branch_ref(&preparation.requested_branch);
+        if !allow_branch_drift && branch != full_ref {
+            return Err(problem(
+                "source_integrity",
+                &format!(
+                    "workspace branch differs: original '{}' and observed '{}'",
+                    preparation.requested_branch,
+                    branch.strip_prefix("refs/heads/").unwrap_or(&branch)
+                ),
             ));
         }
         Ok(Subject {
@@ -1509,12 +1824,26 @@ impl WorkspaceGit {
         before: &Subject,
         deadline: Instant,
     ) -> Result<()> {
-        let after = self.subject(preparation, deadline).await?;
+        self.confirm_subject_mode(preparation, before, deadline, false)
+            .await
+    }
+
+    async fn confirm_subject_mode(
+        &self,
+        preparation: &WorkspacePreparation,
+        before: &Subject,
+        deadline: Instant,
+        allow_branch_drift: bool,
+    ) -> Result<()> {
+        let after = self
+            .subject_inner(preparation, deadline, allow_branch_drift)
+            .await?;
         if before.source.root != after.source.root
             || before.source.git_dir != after.source.git_dir
             || before.source.common_dir != after.source.common_dir
             || before.target.git_dir != after.target.git_dir
             || before.target.root != after.target.root
+            || before.branch != after.branch
             || before.head != after.head
         {
             return Err(problem(
