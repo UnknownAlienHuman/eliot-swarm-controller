@@ -1694,7 +1694,7 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   restart Resume and an explicit Owner Resume both reach this selector. A preflight
   rejection for a dirty, changed, or unattributed checkout keeps the work with the
   current Agent. Automatic handoff would cross the same unverified source boundary.
-  The Owner sees the rejected Resume in `swarm command <id>`, with both branch names
+  The Owner sees the rejected Resume in `swarm cmd <id>`, with both branch names
   for branch drift and the other Agent identity when known. Verify or restore the
   worktree before issuing a new Resume.
 
