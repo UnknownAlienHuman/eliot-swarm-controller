@@ -4,8 +4,11 @@
 //! prepares an isolated transport view, runs only the frozen fetch, CAS-updates
 //! the tracking ref, and returns exact readback or an explicit uncertain result.
 
+#[cfg(any(windows, target_os = "linux"))]
+use crate::daemon_process::wait_family_empty;
 use crate::{
     automation,
+    daemon_process::capture_bounded,
     git_monitor::{GitBinding, GitProbe, canonical_root, git_path_argument, reject_links},
     platform::OwnedChild,
     workspace_git::WorkspaceGit,
@@ -34,7 +37,7 @@ use std::{
 )]
 use tokio::process::Command;
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncWriteExt},
     sync::watch,
     time::{Instant, timeout_at},
 };
@@ -2260,8 +2263,8 @@ async fn run_owned_git(
             Ok::<(), Error>(())
         };
         let (stdout, stderr, (), (exit_code, quiescent, quiescence_class)) = tokio::try_join!(
-            capture_bounded(stdout, eliot_core::limits::MAX_FRAME_BYTES),
-            capture_bounded(stderr, eliot_core::MAX_STDERR_BYTES),
+            capture_git_output(stdout, eliot_core::limits::MAX_FRAME_BYTES),
+            capture_git_output(stderr, eliot_core::MAX_STDERR_BYTES),
             write,
             wait_owned_child(&mut child),
         )?;
@@ -2291,23 +2294,14 @@ async fn run_owned_git(
     }
 }
 
-async fn capture_bounded<R: AsyncRead + Unpin>(mut reader: R, cap: usize) -> Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(cap.min(64 * 1024));
-    // The transport polls two capture futures inside each cleanup preflight.
-    let mut buffer = vec![0_u8; 8192];
-    loop {
-        let read = reader
-            .read(&mut buffer)
-            .await
-            .map_err(|_| unavailable("Git output capture failed"))?;
-        if read == 0 {
-            return Ok(output);
-        }
-        if output.len().saturating_add(read) > cap {
-            return Err(unavailable("Git stdout exceeded the process capture bound"));
-        }
-        output.extend_from_slice(&buffer[..read]);
+async fn capture_git_output<R: AsyncRead + Unpin>(reader: R, cap: usize) -> Result<Vec<u8>> {
+    let capture = capture_bounded(reader, cap, 64 * 1024)
+        .await
+        .map_err(|_| unavailable("Git output capture failed"))?;
+    if capture.exceeded {
+        return Err(unavailable("Git stdout exceeded the process capture bound"));
     }
+    Ok(capture.bytes)
 }
 
 async fn wait_owned_child(
@@ -2319,7 +2313,7 @@ async fn wait_owned_child(
             .wait()
             .await
             .map_err(|_| unavailable("Git child wait failed"))?;
-        let quiescence: Result<bool> = child.wait_family_empty(GIT_CLEANUP_TIME).await;
+        let quiescence: Result<bool> = wait_family_empty(child, GIT_CLEANUP_TIME).await;
         let quiescence_class = quiescence_class_for(&quiescence);
         let quiescent = quiescence.unwrap_or(false);
         Ok((status.code(), quiescent, quiescence_class))
@@ -2330,7 +2324,7 @@ async fn wait_owned_child(
             .wait_exit_unreaped()
             .await
             .map_err(|_| unavailable("Git leader exit observation failed"))?;
-        let quiescence: Result<bool> = child.wait_group_empty_except_leader(GIT_CLEANUP_TIME).await;
+        let quiescence: Result<bool> = wait_family_empty(child, GIT_CLEANUP_TIME).await;
         let quiescence_class = quiescence_class_for(&quiescence);
         let status = child
             .wait()
