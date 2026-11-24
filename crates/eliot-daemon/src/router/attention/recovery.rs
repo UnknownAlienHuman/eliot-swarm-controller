@@ -236,6 +236,14 @@ fn readback(
         "final_text": turn["final_text"].as_str(),
         "turn_evidence": evidence,
     });
+    if outcome == TurnOutcome::Failure
+        && let Ok(fact) = serde_json::from_value::<eliot_core::api::ProviderResponseWithheldFact>(
+            turn["provider_response_withheld_fact"].clone(),
+        )
+    {
+        data["provider_response_withheld"] = json!(true);
+        data["provider_response_withheld_fact"] = json!(fact);
+    }
     // The adapter knows why no reply text is presented (it exceeded the event
     // bound, or a normal completion supplied none): the recovered terminal
     // keeps that reason, as the adapter's own write does.

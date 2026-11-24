@@ -336,6 +336,19 @@ impl Router {
                     .await?;
                 Some((name, launch.args["profile_choice"].take(), identity))
             } else {
+                if let Some(authority) = profile_authority {
+                    if eliot_core::provider_switch_authority(&source.profile_snapshot)? != authority
+                    {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "session growth switch source authority changed after reservation",
+                        ));
+                    }
+                    let candidate = request.launch.profile.as_deref().ok_or_else(|| {
+                        Error::new("invalid", "session growth switch requires a named preset")
+                    })?;
+                    self.check_growth_switch_route(&source, candidate).await?;
+                }
                 None
             };
             Ok::<_, Error>((provider_route, owner_automation))
@@ -355,8 +368,9 @@ impl Router {
                 if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
                     self.publish_locked(&change.events);
                 }
-                if let Some((reason, kind)) = reason_kind
-                    && let Some(message) = routing::handoff_waiting_message(&error, reason)
+                let (reason, kind) = reason_kind.unwrap_or((HandoffReason::Routing, None));
+                if let Some((message, blocked)) = routing::handoff_waiting_message(&error, reason)
+                    && (reason_kind.is_some() || blocked)
                 {
                     let candidate = eliot_store::AutomaticHandoff {
                         agent: source,
@@ -365,7 +379,8 @@ impl Router {
                         held_since: None,
                         withheld_event_seq: None,
                     };
-                    if let Ok(events) = store.record_handoff_waiting(&candidate, &message, now_ms())
+                    if let Ok(events) =
+                        store.record_handoff_waiting(&candidate, &message, blocked, now_ms())
                     {
                         self.publish_locked(&events);
                     }
@@ -528,21 +543,12 @@ impl Router {
                         provider_source: (provider_failure.is_some()
                             || profile_authority.is_some())
                         .then_some(&source.profile_snapshot),
+                        growth_switch: profile_authority.is_some(),
                         ..Default::default()
                     },
                     true,
                 )
                 .await?;
-            if let Some(authority) = profile_authority
-                && eliot_core::provider_switch_authority(
-                    &prepared.request.args["profile_snapshot"],
-                )? != authority
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "session growth switch authority differs from the source generation",
-                ));
-            }
             if let Some((_, choice, identity)) = provider_route {
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity

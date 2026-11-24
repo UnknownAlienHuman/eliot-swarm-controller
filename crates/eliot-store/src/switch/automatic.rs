@@ -17,6 +17,8 @@ const WAITING_RETRY_MS: i64 = 60_000;
 const HELD_SCAN_LIMIT: i64 = 256;
 const LOST_SCAN_LIMIT: i64 = 64;
 const WITHHELD_SCAN_LIMIT: i64 = 64;
+const WITHHELD_ROUTE_HISTORY_LIMIT: i64 = 32;
+const WITHHELD_ROUTE_TTL_MS: i64 = 60 * 60 * 1_000;
 const MAX_SWITCHES_PER_TASK: i64 = 3;
 type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
@@ -43,6 +45,216 @@ fn lineage_for(
         )
         .optional()
         .map_err(sql_error)
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct WithheldProviderEvidence {
+    pub route: String,
+    pub event_seq: i64,
+    pub expires_at: i64,
+}
+
+/// Active route evidence for this task, ordered newest first.
+pub(super) fn withheld_provider_evidence(
+    connection: &Connection,
+    source: &Agent,
+    now: i64,
+) -> Result<Vec<WithheldProviderEvidence>> {
+    let agent = parse_agent_id(&source.id)?;
+    let lineage = lineage_for(connection, agent, source.generation)?
+        .map_or(agent, |(lineage_agent, _)| lineage_agent);
+    // One frozen route per generation. Older events can use the original
+    // snapshot while that exact generation is still the Agent's current one.
+    let mut statement = connection
+        .prepare_cached(
+            "WITH generations(agent,generation) AS (
+                 SELECT agent,generation FROM handoff_task_lineages WHERE lineage_agent=?1
+                 UNION SELECT ?2,?3
+             )
+             SELECT json_extract(e.data, '$.route_key'),
+                    CASE WHEN json_extract(e.data, '$.route_key') IS NULL
+                         THEN a.profile_snapshot END,
+                    COALESCE(json_extract(e.data, '$.profile'), a.profile),
+                    e.seq, COALESCE(json_extract(e.data, '$.reset_at'), e.ts + ?4)
+             FROM generations g
+             JOIN events e INDEXED BY events_agent ON e.agent=g.agent AND e.generation=g.generation
+             LEFT JOIN agents a ON a.id=e.agent AND a.generation=e.generation
+             WHERE e.kind='provider.response_withheld' AND e.source='daemon'
+               AND COALESCE(json_extract(e.data, '$.reset_at'), e.ts + ?4) > ?5
+               AND NOT EXISTS (
+                   SELECT 1 FROM generations restored_generation
+                   JOIN events restored ON restored.agent=restored_generation.agent
+                     AND restored.generation=restored_generation.generation
+                   WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
+                     AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
+                     AND (
+                         json_extract(restored.data, '$.route_key') = json_extract(e.data, '$.route_key')
+                         OR (json_extract(e.data, '$.route_key') IS NULL
+                             AND COALESCE(json_extract(restored.data, '$.profile'), a.profile)
+                                 = COALESCE(json_extract(e.data, '$.profile'), a.profile))
+                     )
+               )
+             ORDER BY e.seq DESC LIMIT ?6",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                lineage,
+                agent,
+                source.generation,
+                WITHHELD_ROUTE_TTL_MS,
+                now,
+                WITHHELD_ROUTE_HISTORY_LIMIT
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?;
+    let mut evidence = Vec::new();
+    for row in rows {
+        let (key, legacy_snapshot, profile, event_seq, expires_at) = row.map_err(sql_error)?;
+        let key = key.or_else(|| {
+            let snapshot = serde_json::from_str(&legacy_snapshot?).ok()?;
+            core::provider_response_route_key(&snapshot)
+        });
+        let Some(route) = key.or_else(|| {
+            profile
+                .as_deref()
+                .map(core::provider_profile_refusal_marker)
+        }) else {
+            continue;
+        };
+        evidence.push(WithheldProviderEvidence {
+            route,
+            event_seq,
+            expires_at,
+        });
+    }
+    Ok(evidence)
+}
+
+/// Routes and profile names that withheld a response for this task. Entries
+/// are `route_key` digests and `profile:<name>` markers.
+pub(super) fn withheld_provider_routes(
+    connection: &Connection,
+    source: &Agent,
+    now: i64,
+) -> Result<HashSet<String>> {
+    Ok(withheld_provider_evidence(connection, source, now)?
+        .into_iter()
+        .map(|evidence| evidence.route)
+        .collect())
+}
+
+/// Append restoration in the same transaction as the successful native turn.
+/// The newest active refusal's sequence also clears older refusals on that
+/// route in the same task lineage.
+pub(crate) fn provider_response_restored_event_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    successful_turn: &core::NativeEvent,
+    terminal_seq: i64,
+    now: i64,
+) -> Result<Option<Event>> {
+    if successful_turn.kind != "turn.completed"
+        || successful_turn.data["outcome"].as_str() != Some("success")
+    {
+        return Ok(None);
+    }
+    let Some(turn_id) = successful_turn.data["turn_id"].as_str() else {
+        return Ok(None);
+    };
+    let agent_num = parse_agent_id(&agent.id)?;
+    let committed_success: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns t
+                 WHERE t.agent=?1 AND t.generation=?2 AND t.turn_id=?3
+                   AND t.state='completed' AND t.outcome='success'
+                   AND t.resolution_source IS NULL
+                   AND t.insertion_seq=(SELECT MAX(latest.insertion_seq) FROM turns latest
+                                        WHERE latest.agent=t.agent AND latest.generation=t.generation)
+                   AND EXISTS(
+                       SELECT 1 FROM events terminal
+                       WHERE terminal.seq=?4 AND terminal.agent=t.agent AND terminal.generation=t.generation
+                         AND terminal.kind='turn.completed'
+                         AND json_extract(terminal.data, '$.turn_id')=t.turn_id
+                         AND json_extract(terminal.data, '$.outcome')='success'
+                   )
+             )",
+            params![agent_num, agent.generation, turn_id, terminal_seq],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !committed_success {
+        return Ok(None);
+    }
+    let route_key = core::provider_response_route_key(&agent.profile_snapshot);
+    let lineage = lineage_for(tx, agent_num, agent.generation)?
+        .map_or(agent_num, |(lineage_agent, _)| lineage_agent);
+    let evidence_seq: Option<i64> = tx
+        .query_row(
+            "WITH generations(agent,generation) AS (
+                 SELECT agent,generation FROM handoff_task_lineages WHERE lineage_agent=?1
+                 UNION SELECT ?2,?3
+             )
+             SELECT MAX(e.seq) FROM generations g
+             JOIN events e ON e.agent=g.agent AND e.generation=g.generation
+             WHERE e.kind='provider.response_withheld' AND e.source='daemon'
+               AND (json_extract(e.data, '$.route_key')=?4
+                    OR (json_extract(e.data, '$.route_key') IS NULL
+                        AND COALESCE(json_extract(e.data, '$.profile'), '')=?7))
+               AND e.seq < ?8
+               AND COALESCE(json_extract(e.data, '$.reset_at'), e.ts + ?5) > ?6
+               AND NOT EXISTS (
+                   SELECT 1 FROM generations rg
+                   JOIN events restored ON restored.agent=rg.agent AND restored.generation=rg.generation
+                   WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
+                     AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
+                     AND (json_extract(restored.data, '$.route_key')=?4
+                          OR (json_extract(e.data, '$.route_key') IS NULL
+                              AND json_extract(restored.data, '$.profile')=?7))
+               )",
+            params![
+                lineage,
+                agent_num,
+                agent.generation,
+                route_key,
+                WITHHELD_ROUTE_TTL_MS,
+                now,
+                agent.profile,
+                terminal_seq
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let Some(evidence_seq) = evidence_seq else {
+        return Ok(None);
+    };
+    insert_daemon_event(
+        tx,
+        now,
+        "provider.response_restored",
+        "provider",
+        Some(agent_num),
+        Some(agent.generation),
+        json!({
+            "turn_id": turn_id,
+            "terminal_seq": terminal_seq,
+            "route_key": route_key,
+            "profile": agent.profile,
+            "evidence_seq": evidence_seq,
+        }),
+    )
+    .map(Some)
 }
 
 fn switch_budget_available(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
@@ -157,6 +369,11 @@ fn insert_lineage_generation_tx(
 }
 
 impl Store {
+    pub fn withheld_provider_routes(&self, source: &Agent, now: i64) -> Result<HashSet<String>> {
+        self.ensure_committed_reads()?;
+        withheld_provider_routes(&self.connection, source, now)
+    }
+
     /// Carry one task's continuation lineage across a committed switch.
     pub(crate) fn transfer_handoff_lineage_tx(
         tx: &Transaction<'_>,
@@ -567,6 +784,26 @@ impl Store {
                  JOIN turns t ON t.agent = a.id AND t.generation = a.generation
                    AND t.turn_id = json_extract(e.data, '$.turn_id')
                  WHERE e.kind = 'provider.response_withheld' AND e.source = 'daemon'
+                   AND COALESCE(json_extract(e.data, '$.reset_at'), e.ts + ?2) > ?3
+                   AND NOT EXISTS (
+                       SELECT 1 FROM events restored
+                       WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
+                         AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
+                         AND (restored.agent=a.id AND restored.generation=a.generation
+                              OR EXISTS(SELECT 1 FROM handoff_task_lineages lineage
+                                        WHERE lineage.agent=restored.agent
+                                          AND lineage.generation=restored.generation
+                                          AND lineage.lineage_agent=COALESCE(
+                                              (SELECT lineage_agent FROM handoff_task_lineages
+                                               WHERE agent=a.id AND generation=a.generation), a.id)))
+                         AND (
+                             json_extract(restored.data, '$.route_key')
+                                 = json_extract(e.data, '$.route_key')
+                             OR (json_extract(e.data, '$.route_key') IS NULL
+                                 AND COALESCE(json_extract(restored.data, '$.profile'), '')
+                                     = COALESCE(json_extract(e.data, '$.profile'), a.profile))
+                         )
+                   )
                    AND a.state IN ('idle','lost','failed') AND a.chat = 0
                    AND a.observe_only = 0 AND a.archived = 0 AND a.project <> ''
                    AND NOT EXISTS(SELECT 1 FROM agent_successors s
@@ -579,7 +816,10 @@ impl Store {
             )
             .map_err(sql_error)?;
         let withheld = withheld
-            .query_map([WITHHELD_SCAN_LIMIT], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(
+                params![WITHHELD_SCAN_LIMIT, WITHHELD_ROUTE_TTL_MS, now],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
@@ -927,6 +1167,7 @@ impl Store {
         &mut self,
         candidate: &AutomaticHandoff,
         message: &str,
+        withheld_routes_blocked: bool,
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
@@ -946,6 +1187,7 @@ impl Store {
                     "reason": candidate.reason,
                     "kind": candidate.kind,
                     "message": core::bound_chars(message, 512),
+                    "withheld_routes_blocked": withheld_routes_blocked,
                 }),
             )?;
             commit_transaction(tx, &self.write_faulted)?;

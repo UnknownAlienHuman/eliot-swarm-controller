@@ -109,12 +109,13 @@ with a `control_response` carrying the documented SDK `PermissionResult`.
 Arm the message reader before input. SessionStart hook lines carry the minted
 session id before any input, so the adapter declares no `start_requires_input`.
 A resumed CLI re-announces the same retained session id before readiness.
-On Windows, the owned launch supplies a per-invocation SessionStart hook for
-startup and resume. Claude Code 2.1.330 can acknowledge `initialize` without
-emitting the session id until input. The hook runs `exit 0` and causes the CLI
-to emit the native proof without sending model input. The adapter still
-requires a matching session id on the owned stream and successful
-`initialize` readback before readiness.
+The owned launch supplies a per-invocation SessionStart hook for startup and
+resume on every platform and supported CLI version. Claude Code can acknowledge
+`initialize` before it emits a session id. The hook runs `exit 0` so the CLI
+emits native proof before model input. Readiness requires both the matching id
+on the owned stream and successful `initialize` readback. If managed hook policy
+disables hooks or excludes the supplied hook, the CLI can omit the session proof
+and readiness times out.
 
 Each owned Claude CLI launch also receives a private per-session `--mcp-config`
 file in the Eliot-created Agent instance directory. It registers the standard

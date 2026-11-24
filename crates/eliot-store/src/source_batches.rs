@@ -29,36 +29,52 @@ impl CompletionWorktreeCapture {
     }
 }
 
-fn provider_response_withheld_event_tx(
+pub(super) fn provider_response_route_event_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
     terminal: &core::NativeEvent,
+    terminal_source: &str,
+    terminal_seq: i64,
     now: i64,
 ) -> Result<Option<Event>> {
     if !core::api::HarnessCapabilities::of(&agent.harness).provider_response_withholding
         || agent.observe_only
         || terminal.kind != "turn.completed"
-        || terminal.data["outcome"].as_str() != Some("failure")
-        || terminal.data["provider_response_withheld"].as_bool() != Some(true)
     {
         return Ok(None);
     }
-    let (Some(turn_id), Some(task_command)) = (
-        terminal.data["turn_id"].as_str(),
-        terminal.data["command_id"].as_str(),
+    match terminal.data["outcome"].as_str() {
+        Some("success") => {
+            return super::switch::provider_response_restored_event_tx(
+                tx,
+                agent,
+                terminal,
+                terminal_seq,
+                now,
+            );
+        }
+        Some("failure") => {}
+        _ => return Ok(None),
+    }
+    let Ok(fact) = serde_json::from_value::<core::api::ProviderResponseWithheldFact>(
+        terminal.data["provider_response_withheld_fact"].clone(),
     ) else {
         return Ok(None);
     };
-    if turn_id.is_empty() || task_command.is_empty() {
+    let Some(turn_id) = terminal.data["turn_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+    else {
         return Ok(None);
-    }
+    };
     let agent_num = parse_agent_id(&agent.id)?;
-    let exact_pending_turn: bool = tx
+    // Backfill may omit the Eliot command. Read it from the exact turn's
+    // persisted binding and require any supplied command to agree.
+    let task_command: Option<String> = tx
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM turns t JOIN commands c ON c.id = ?4
+            "SELECT c.id FROM turns t JOIN commands c ON c.id = t.start_command_id
                  WHERE t.agent = ?1 AND t.generation = ?2 AND t.turn_id = ?3
-                   AND t.start_command_id = ?4 AND t.state = 'completed'
+                   AND (?4 IS NULL OR c.id = ?4) AND t.state = 'completed'
                    AND t.outcome = 'failure' AND t.resolution_source IS NULL
                    AND t.insertion_seq = (
                        SELECT MAX(latest.insertion_seq) FROM turns latest
@@ -68,7 +84,7 @@ fn provider_response_withheld_event_tx(
                    AND c.turn_id = ?3 AND c.state = 'applied'
                    AND (SELECT COUNT(*) FROM turns bound
                         WHERE bound.agent = ?1 AND bound.generation = ?2
-                          AND bound.start_command_id = ?4) = 1
+                          AND bound.start_command_id = c.id) = 1
                    AND NOT EXISTS(
                        SELECT 1 FROM events resolved
                        WHERE resolved.agent = ?1 AND resolved.generation = ?2
@@ -80,15 +96,31 @@ fn provider_response_withheld_event_tx(
                        WHERE withheld.agent = ?1 AND withheld.generation = ?2
                          AND withheld.kind = 'provider.response_withheld'
                          AND (json_extract(withheld.data, '$.turn_id') = ?3
-                              OR json_extract(withheld.data, '$.task_command') = ?4)
-                   )
-             )",
-            params![agent_num, agent.generation, turn_id, task_command],
+                              OR json_extract(withheld.data, '$.task_command') = c.id)
+                   )",
+            params![
+                agent_num,
+                agent.generation,
+                turn_id,
+                terminal.data["command_id"].as_str()
+            ],
             |row| row.get(0),
         )
+        .optional()
         .map_err(sql_error)?;
-    if !exact_pending_turn {
+    let Some(task_command) = task_command else {
         return Ok(None);
+    };
+    let mut data = json!({
+        "turn_id": turn_id,
+        "task_command": task_command,
+        "profile": agent.profile,
+        "route_key": core::provider_response_route_key(&agent.profile_snapshot),
+        "terminal_source": terminal_source,
+        "detection": fact.detection,
+    });
+    if let Some(reset_at) = fact.reset_at.filter(|reset_at| *reset_at >= 0) {
+        data["reset_at"] = json!(reset_at);
     }
     insert_daemon_event(
         tx,
@@ -97,7 +129,7 @@ fn provider_response_withheld_event_tx(
         "provider",
         Some(agent_num),
         Some(agent.generation),
-        json!({"turn_id": turn_id, "task_command": task_command}),
+        data,
     )
     .map(Some)
 }
@@ -1146,12 +1178,14 @@ impl Store {
                 native_event,
                 &next,
             )?;
-            if !observed
-                && !resolves_recovered
-                && batch.source == "stream"
-                && let Some(event) =
-                    provider_response_withheld_event_tx(&tx, &next, native_event, now)?
-            {
+            if let Some(event) = provider_response_route_event_tx(
+                &tx,
+                &next,
+                native_event,
+                &batch.source,
+                stored.seq,
+                now,
+            )? {
                 provider_events.push(event);
             }
             // The inserted turn binds the exact admitted revision even if

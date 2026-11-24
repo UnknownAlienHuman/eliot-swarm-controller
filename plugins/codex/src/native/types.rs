@@ -510,13 +510,35 @@ pub struct NativeTurnError {
     pub codex_error_info: Option<serde_json::Value>,
 }
 
+/// Exact `TurnError.message` text Codex 0.167.1 uses when a provider withholds
+/// a response for a session without an authorized hardware key. No structured
+/// `codexErrorInfo` variant is known for this hold, so this sentence is the
+/// fallback evidence on every terminal path (live, readback and history).
+const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
+
+/// Outer whitespace is benign; nested metadata and other output are not part
+/// of this signal.
+pub(crate) fn response_withheld_evidence_from_message(message: &str) -> Option<&'static str> {
+    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then_some("text_fallback")
+}
+
 impl NativeTurnError {
     /// Match only the required `TurnError.message` value from Codex's native
-    /// terminal envelope. Outer whitespace is benign; nested metadata and
-    /// other output are not part of this signal.
-    pub(crate) fn is_provider_response_withheld(&self) -> bool {
-        const MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
-        self.message.trim() == MESSAGE
+    /// terminal envelope.
+    pub(crate) fn response_withheld_evidence(&self) -> Option<&'static str> {
+        response_withheld_evidence_from_message(&self.message)
+    }
+
+    pub(crate) fn response_withheld_fact(
+        &self,
+    ) -> Option<eliot_core::api::ProviderResponseWithheldFact> {
+        self.response_withheld_evidence()?;
+        // The verified Codex withholding protocol provides no reset field.
+        // Do not infer one from unrelated error metadata.
+        Some(eliot_core::api::ProviderResponseWithheldFact::new(
+            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+            None,
+        ))
     }
 
     /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded

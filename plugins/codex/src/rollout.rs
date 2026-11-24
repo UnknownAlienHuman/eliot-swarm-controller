@@ -669,7 +669,25 @@ fn normalize_live_event(
     let has_error = match payload.get("error") {
         None | Some(Value::Null) => false,
         Some(Value::Object(error)) => {
-            data["error"] = json!({"message":error.get("message").and_then(Value::as_str).ok_or_else(integrity)?});
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(integrity)?;
+            data["error"] = json!({"message": message});
+            // Rollout errors carry only the message, so the exact sentence is
+            // the sole (fallback) evidence for a provider hold on this path.
+            if !aborted
+                && let Some(evidence) =
+                    crate::native::types::response_withheld_evidence_from_message(message)
+            {
+                data["provider_response_withheld"] = Value::Bool(true);
+                data["provider_response_withheld_evidence"] = json!(evidence);
+                data["provider_response_withheld_fact"] =
+                    json!(eliot_core::api::ProviderResponseWithheldFact::new(
+                        eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+                        None,
+                    ));
+            }
             true
         }
         Some(_) => return Err(integrity()),
@@ -1383,14 +1401,29 @@ fn project_line(
                 return Err(integrity());
             }
             if view == "turns" {
-                entries.push(json!({
+                let withheld_evidence = line
+                    .payload
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .and_then(crate::native::types::response_withheld_evidence_from_message);
+                let mut entry = json!({
                     "turn_id": turn_id,
                     "status": if line.payload.get("error").is_some_and(|error| !error.is_null()) {"failed"} else {"completed"},
                     "started_at": started_at.map(super::milliseconds).transpose()?,
                     "completed_at": completed_at.map(super::milliseconds).transpose()?,
                     "duration_ms": duration_ms,
                     "ordinal": line.ordinal,
-                }));
+                });
+                if let Some(evidence) = withheld_evidence {
+                    entry["provider_response_withheld"] = Value::Bool(true);
+                    entry["provider_response_withheld_evidence"] = json!(evidence);
+                    entry["provider_response_withheld_fact"] =
+                        json!(eliot_core::api::ProviderResponseWithheldFact::new(
+                            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+                            None,
+                        ));
+                }
+                entries.push(entry);
             }
             if active.is_some() {
                 state.active_turn = None;

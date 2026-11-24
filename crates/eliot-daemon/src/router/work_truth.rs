@@ -902,12 +902,13 @@ impl Router {
             .route_handoff(&mut probe, &candidate.agent, &route)
             .await
         {
-            let Some(message) = super::routing::handoff_waiting_message(&error, candidate.reason)
+            let Some((message, blocked)) =
+                super::routing::handoff_waiting_message(&error, candidate.reason)
             else {
                 return Err(error);
             };
             let mut store = self.inner.store.lock().await;
-            let events = store.record_handoff_waiting(candidate, &message, now_ms())?;
+            let events = store.record_handoff_waiting(candidate, &message, blocked, now_ms())?;
             self.publish_locked(&events);
             return Ok(());
         }

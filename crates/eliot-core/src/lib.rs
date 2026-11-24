@@ -117,8 +117,9 @@ pub use routing::{
     ProviderModelMismatch, ProviderRestriction, ProviderRestrictionKind, RouteBinding,
     RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,
     UNATTRIBUTED_PROVIDER_HOLD_REASON, frozen_provider_scope, frozen_provider_scope_for,
-    handoff_authority_refusal, is_unattributed_provider_hold, model_hold_scope,
-    provider_switch_authority, same_provider_response_route,
+    growth_switch_authority_matches, handoff_authority_refusal, is_unattributed_provider_hold,
+    model_hold_scope, provider_profile_refusal_marker, provider_response_route_key,
+    provider_switch_authority,
 };
 pub use secrets::SecretPolicy;
 pub use source_handoff::{SourceHandoff, SourceHandoffAck, SourceHandoffGap};

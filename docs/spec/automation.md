@@ -764,7 +764,14 @@ re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a
 project in the same pass claim a slot on the blocked shared scope ahead of the waiting
 project. An already-dispatched or unknown command retains its reservation until verified closure.
 
-A completed Codex turn can carry the typed `provider_response_withheld` fact.
+A completed Codex turn can carry the typed `provider_response_withheld_fact`, whose
+optional `reset_at` is an absolute Unix timestamp in milliseconds supplied and
+normalized by the adapter. Store records `provider.response_withheld` once for the
+exact pending send-bound turn from live delivery, backfill or daemon recovery
+readback, and copies a supplied `reset_at` to the durable event's top level. Backfill can use the turn's
+persisted command binding when the terminal names none. Observer-only Agents and
+turns without an exact local send cannot trigger handoff. The fact's typed detection
+provenance is retained by recovery and Store.
 The daemon's [automatic handoff policy](configuration.md#automatic-handoff-918)
 uses it to continue the work with its retained task inputs and sources on another
 eligible preset. The original command and terminal outcome remain in history.

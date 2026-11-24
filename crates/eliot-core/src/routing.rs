@@ -41,6 +41,9 @@ pub enum RouteSkipReason {
     Unauthorized,
     /// The candidate's frozen authority is not provably equal or narrower.
     WiderAuthority,
+    /// This task already received a withheld provider response on this route
+    /// or profile.
+    ProviderWithheld,
     /// A sandboxed candidate could not commit on this worktree's branch.
     CannotCommit,
     InvalidProfile,
@@ -62,6 +65,7 @@ impl RouteSkipReason {
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
             Self::WiderAuthority => "authority wider than the source",
+            Self::ProviderWithheld => "provider withheld a response on this route for this task",
             Self::CannotCommit => "its sandbox cannot commit on this branch",
             Self::InvalidProfile => "profile does not resolve",
             Self::HarnessCheckFailed => "harness self-check failed and awaits a later pass",
@@ -121,6 +125,16 @@ pub const PROVIDER_LAUNCH_OVERRIDE_FIELDS: &[&str] = &[
 /// model and effort can vary. The normal launch still verifies native
 /// readback against the selected frozen permissions and approval policy.
 pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
+    switch_authority(snapshot, true)
+}
+
+/// A growth switch follows the Owner's current account on the same preset.
+/// All other frozen launch authority, including credentials and endpoint, is exact.
+pub fn growth_switch_authority_matches(source: &Value, candidate: &Value) -> Result<bool> {
+    Ok(switch_authority(source, false)? == switch_authority(candidate, false)?)
+}
+
+fn switch_authority(snapshot: &Value, include_account: bool) -> Result<[u8; 32]> {
     if !snapshot.is_object() || snapshot["harness"].as_str().is_none() {
         return Err(Error::new(
             "source_integrity",
@@ -162,6 +176,7 @@ pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
     let authority = Value::Object(
         fields
             .into_iter()
+            .filter(|key| include_account || *key != "account")
             .filter_map(|key| {
                 snapshot
                     .get(key)
@@ -194,30 +209,23 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
     }
 }
 
-/// Direct presets of the same harness share its provider session route. For adopted routes,
-/// the Responses endpoint identifies the route across renamed presets.
-pub fn same_provider_response_route(source: &Value, candidate: &Value) -> bool {
-    fn endpoint(snapshot: &Value) -> Option<Url> {
-        snapshot
-            .pointer("/route_binding/provider_base_url")
-            .and_then(Value::as_str)
-            .and_then(|url| validate_http_url(url).ok())
+/// Frozen Codex response route across aliases. Use the account and the selector
+/// that supplies credentials for this route. Never hash or retain a credential.
+pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
+    let capabilities = crate::api::HarnessCapabilities::for_harness(snapshot["harness"].as_str()?)?;
+    if !capabilities.provider_response_withholding {
+        return None;
     }
+    let identity = (capabilities.provider_response_route_identity?)(snapshot)?;
+    serde_json::to_vec(&identity)
+        .ok()
+        .map(|bytes| crate::api::inference::sha256_hex(&bytes))
+}
 
-    let Some(harness) = source["harness"].as_str() else {
-        return false;
-    };
-    if candidate["harness"] != harness {
-        return false;
-    }
-    match (endpoint(source), endpoint(candidate)) {
-        (Some(source), Some(candidate)) => {
-            source.origin() == candidate.origin()
-                && source.path().trim_end_matches('/') == candidate.path().trim_end_matches('/')
-        }
-        (None, None) => true,
-        _ => false,
-    }
+/// The withheld-route set entry that refuses a profile name for a task. Route
+/// digests never start with `profile:`, so the two forms cannot collide.
+pub fn provider_profile_refusal_marker(profile: &str) -> String {
+    format!("profile:{profile}")
 }
 
 /// Why `candidate` may not take over work from `source` automatically or at a
@@ -335,6 +343,16 @@ pub struct RouteBinding {
 }
 
 impl RouteBinding {
+    /// Canonical generic URL components used when an adapter declares a route
+    /// identity based on an HTTP endpoint.
+    pub fn provider_url_identity(value: &str) -> Option<(String, String)> {
+        let url = validate_http_url(value).ok()?;
+        Some((
+            url.origin().ascii_serialization(),
+            url.path().trim_end_matches('/').to_owned(),
+        ))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !valid_name(&self.name) {
             return Err(invalid_route("invalid route name"));
@@ -357,6 +375,23 @@ impl RouteBinding {
             return Err(invalid_route("invalid route client key environment name"));
         }
 
+        Ok(())
+    }
+
+    /// Validate against the owning adapter's route-selector environment names.
+    pub fn validate_for(&self, harness: &str) -> Result<()> {
+        self.validate()?;
+        let selector = crate::api::HarnessCapabilities::for_harness(harness)
+            .and_then(|capabilities| capabilities.route_client_key_env_selector);
+        if self
+            .client_key_env_name
+            .as_deref()
+            .is_some_and(|name| selector.is_some_and(|is_selector| is_selector(name)))
+        {
+            return Err(invalid_route(
+                "route client key environment name selects the route",
+            ));
+        }
         Ok(())
     }
 }
@@ -803,12 +838,7 @@ fn valid_client_key_env_name(value: &str) -> bool {
         return false;
     }
 
-    let is_selector = if cfg!(windows) {
-        value.eq_ignore_ascii_case("CODEX_HOME") || value.eq_ignore_ascii_case("CODEX_SQLITE_HOME")
-    } else {
-        value == "CODEX_HOME" || value == "CODEX_SQLITE_HOME"
-    };
-    !is_selector
+    true
 }
 
 fn invalid_route(message: &str) -> Error {
