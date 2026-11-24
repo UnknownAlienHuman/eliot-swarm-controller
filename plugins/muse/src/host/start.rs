@@ -360,16 +360,6 @@ impl MusePlugin {
                 "Muse session host did not identify its data scope",
             ));
         }
-        if initialized.platform_family.trim().is_empty()
-            || initialized.platform_os.trim().is_empty()
-            || initialized.user_agent.trim().is_empty()
-            || initialized.server_info.version.trim().is_empty()
-        {
-            return Err(Error::new(
-                "profile_error",
-                "Muse session host initialize omitted runtime identity fields",
-            ));
-        }
         if requested_model.is_none() && host.catalogue.models.is_empty() {
             return Err(host.catalogue_error(Error::new(
                 "native_model_unavailable",

@@ -89,29 +89,16 @@ pub struct NativeInitializeParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NativeServerInfo {
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct NativeSchemaInfo {
     pub fingerprint: String,
-    pub version: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeInitializeResult {
-    pub experimental_api: bool,
     pub granted_capabilities: Vec<String>,
     pub muse_home: String,
-    pub platform_family: String,
-    pub platform_os: String,
     pub schema: NativeSchemaInfo,
-    pub server_info: NativeServerInfo,
-    pub user_agent: String,
 }
 
 /// The two authorization fields of the MSP account read. Display identity
