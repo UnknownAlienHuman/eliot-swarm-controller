@@ -877,6 +877,42 @@ impl Store {
         Ok(recipients)
     }
 
+    /// Revision advanced by Store triggers whenever a fact used by
+    /// the deferred mail candidate scan changes.
+    pub fn mail_notice_revision(&self) -> Result<i64> {
+        self.connection
+            .query_row(
+                "SELECT revision FROM mail_notice_revision WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Earliest future cooldown boundary. This lets the worker sleep without
+    /// rerunning the candidate scan while its inputs and time predicate are
+    /// unchanged.
+    pub fn next_mail_notice_cooldown(&self, now: i64) -> Result<Option<i64>> {
+        self.connection
+            .query_row(
+                &format!(
+                    "SELECT MIN(mn.last_notice_at + ?1) FROM mail_notices mn
+                 JOIN agents a ON a.id = mn.recipient
+                 WHERE mn.last_notice_at + ?1 > ?2 AND a.state = 'idle'
+                   AND a.archived = 0 AND a.observe_only = 0 AND a.generation >= 1
+                   AND EXISTS (
+                       SELECT 1 FROM messages m WHERE m.recipient = a.id
+                         AND m.read_at IS NULL AND m.wake = 1 AND m.inline_wake_retries < 2
+                         AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
+                              OR ({ATTENTION_WAKING_THREAD_SQL}))
+                   )"
+                ),
+                params![MAIL_NOTICE_COOLDOWN_MS, now],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     fn resolve_mailbox(&self, principal: &str, agent: Option<&str>) -> Result<i64> {
         match parse_sender(principal, "mail")? {
             Sender::Owner => {

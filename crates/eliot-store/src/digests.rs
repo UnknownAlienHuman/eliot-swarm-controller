@@ -23,8 +23,9 @@ pub(super) const CLOSED_COMPLETION_PARENT: &str = r#"
     a.state IN ('lost', 'stopped') AND a.archived = 0 AND a.observe_only = 0
     AND a.capacity_generation IS NULL
     AND EXISTS (
-        SELECT 1 FROM events restart
+        SELECT 1 FROM events restart INDEXED BY mail_restart_events
         WHERE restart.agent = a.id AND restart.generation = a.generation
+          AND restart.kind IN ('agent.lost', 'agent.stopped')
           AND ((restart.kind = 'agent.lost'
                 AND json_extract(restart.data, '$.reason') = 'daemon_restart'
                 AND json_extract(restart.data, '$.previous_state') = 'idle')

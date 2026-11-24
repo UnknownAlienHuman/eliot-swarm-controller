@@ -1037,6 +1037,10 @@ retained source coverage. Its window is at least 900 seconds and at least the
 configured threshold, which together determine the fallback. Reports include
 the observed gap and history basis when available. `swarm doctor` shows the
 windows and the number of successful turns that contributed to each one.
+The sweep shares a bounded threshold cache across concurrent observations.
+A committed Store change invalidates it, including changes to retained history.
+History reads use each Agent's indexed newest successful turn to stop once
+remaining Agents cannot contribute to the selected twenty.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
 without a recovery claim, while no-progress may still recover on explicit stop.
 
