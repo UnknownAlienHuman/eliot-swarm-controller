@@ -20,6 +20,8 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
+pub use super::instructions::{ProjectInstructionRead, UserInstructionFiles};
+
 /// The native harness adapters the controller supports.
 pub const SUPPORTED_HARNESSES: &[&str] = &["codex", "claude", "muse", "opencode", "antigravity"];
 
@@ -55,22 +57,6 @@ pub enum NativeArchiveBinding {
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
 type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
-/// Evidence available for native project instruction-file reading.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProjectInstructionRead {
-    pub paths: &'static [(&'static str, super::InstructionReadStatus)],
-    pub report_version: bool,
-    pub byte_limit: Option<fn(&serde_json::Value) -> u64>,
-}
-
-/// Locations of the adapter's documented user instruction files.
-#[derive(Clone, Copy, Debug)]
-pub struct UserInstructionFiles {
-    pub root_override_env: Option<&'static str>,
-    pub home_subdir: &'static str,
-    pub paths: &'static [&'static str],
-}
-
 /// Access levels accepted by an Owner's ad-hoc launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdhocAccess {
