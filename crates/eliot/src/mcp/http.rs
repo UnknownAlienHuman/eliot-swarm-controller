@@ -238,34 +238,17 @@ async fn serve_agent_mcp(
     mut request: Request<axum::body::Body>,
 ) -> Response<axum::body::Body> {
     use axum::http::header::HeaderName;
-    let read = |name: &str| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-    };
-    let Some(agent_id) = read("x-eliot-agent-id")
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned)
-    else {
+    let Some(identity) = agent_http_identity(request.headers()) else {
         return rejected(axum::http::StatusCode::UNAUTHORIZED);
     };
-    let Some(generation) = read("x-eliot-agent-generation")
-        .and_then(|value| value.parse::<i64>().ok())
-        .filter(|value| *value > 0)
-    else {
-        return rejected(axum::http::StatusCode::UNAUTHORIZED);
-    };
-    let Some(token) = read(axum::http::header::AUTHORIZATION.as_str())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))
-        .map(str::to_owned)
-    else {
-        return rejected(axum::http::StatusCode::UNAUTHORIZED);
-    };
-    if eliot_daemon::verify_explicit_agent_identity(&state.data_dir, &agent_id, generation, &token)
-        .await
-        .is_err()
+    if eliot_daemon::verify_explicit_agent_identity(
+        &state.data_dir,
+        &identity.agent_id,
+        identity.generation,
+        &identity.token,
+    )
+    .await
+    .is_err()
     {
         return rejected(axum::http::StatusCode::UNAUTHORIZED);
     }
@@ -278,11 +261,7 @@ async fn serve_agent_mcp(
     request
         .headers_mut()
         .remove(axum::http::header::AUTHORIZATION);
-    request.extensions_mut().insert(AgentHttpIdentity {
-        agent_id,
-        generation,
-        token,
-    });
+    request.extensions_mut().insert(identity);
     use tower_service::Service as _;
     let mut service = state.service;
     if std::future::poll_fn(|cx| {
@@ -300,6 +279,23 @@ async fn serve_agent_mcp(
         Ok(response) => response.map(axum::body::Body::new),
         Err(error) => match error {},
     }
+}
+
+fn agent_http_identity(headers: &axum::http::HeaderMap) -> Option<AgentHttpIdentity> {
+    let read = |name: &str| headers.get(name)?.to_str().ok();
+    let agent_id = read("x-eliot-agent-id").filter(|value| !value.trim().is_empty())?;
+    let generation = read("x-eliot-agent-generation")?
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value > 0)?;
+    let token = read(axum::http::header::AUTHORIZATION.as_str())?
+        .strip_prefix("Bearer ")
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_whitespace))?;
+    Some(AgentHttpIdentity {
+        agent_id: agent_id.to_owned(),
+        generation,
+        token: token.to_owned(),
+    })
 }
 
 /// Public host/origin derived from `--public-url`, in SDK allowlist form.
