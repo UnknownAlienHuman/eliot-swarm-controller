@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::REDACTION_MARKER;
-use crate::{Error, Result};
+use crate::{Error, Result, is_lowercase_hex};
 
 /// The loader's maximum size for one rule file.
 pub const MAX_RULE_FILE_BYTES: usize = 128 * 1024;
@@ -43,11 +43,7 @@ fn validate_path(path: &str) -> Result<()> {
 }
 
 fn validate_revision(revision: &str) -> Result<()> {
-    if revision.len() != RULE_REVISION_HEX_LEN
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lowercase_hex(revision, RULE_REVISION_HEX_LEN) {
         return Err(Error::new(
             "invalid",
             "rule revision must be 64 lowercase hexadecimal characters",

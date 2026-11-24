@@ -14,7 +14,7 @@ use eliot_core::api::{
 };
 use eliot_core::{
     Command, CommandState, Error, FailureOrigin, MAX_STDERR_DIAGNOSTIC_BYTES, Result, SecretPolicy,
-    StderrDiagnostic, bound_stderr_diagnostics,
+    StderrDiagnostic, bound_stderr_diagnostics, is_lowercase_hex,
 };
 use eliot_plugin::{RpcError, RpcRequest, RpcResponse};
 use futures_util::{SinkExt, StreamExt};
@@ -2616,12 +2616,7 @@ fn caller_identity_from(
         let token = run_values[1]
             .as_ref()
             .and_then(|value| value.to_str())
-            .filter(|value| {
-                value.len() == 64
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            .filter(|value| is_lowercase_hex(value, 64))
             .ok_or_else(|| Error::new("not_allowed", "Run credential is invalid"))?;
         return Ok(ClientIdentity::Run {
             run_command_id: run_command_id.to_owned(),

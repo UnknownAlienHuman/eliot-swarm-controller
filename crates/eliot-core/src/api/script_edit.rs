@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{CONFIG_REVISION_HEX_LEN, REDACTION_MARKER};
-use crate::{Error, Result};
+use crate::{Error, Result, is_lowercase_hex};
 
 /// Largest script the editor reads or writes.
 pub const MAX_SCRIPT_EDIT_BYTES: usize = 256 * 1024;
@@ -47,11 +47,7 @@ fn validate_entry(project: &Option<String>, path: &str) -> Result<()> {
 }
 
 fn validate_revision(revision: &str) -> Result<()> {
-    if revision.len() != CONFIG_REVISION_HEX_LEN
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if !is_lowercase_hex(revision, CONFIG_REVISION_HEX_LEN) {
         return Err(Error::new(
             "invalid",
             "script revision must be 64 lowercase hexadecimal characters",

@@ -1,5 +1,5 @@
 //! Closed Increment M1 wire contract. No provider or filesystem I/O.
-use crate::{Error, Result};
+use crate::{Error, Result, is_lowercase_hex};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -39,11 +39,7 @@ pub fn inference_client(id: &str) -> Result<()> {
 }
 
 pub fn inference_digest(digest: &str) -> Result<()> {
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !is_lowercase_hex(digest, 64) {
         return Err(Error::new("invalid", "expected a lowercase SHA-256 digest"));
     }
     Ok(())
