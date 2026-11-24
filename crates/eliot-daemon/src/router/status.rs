@@ -5,9 +5,9 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
         AutonomyRequest, DaemonHealthSummary, DaemonSidebarResponse, DaemonStatusResponse,
-        DrainReport, OwnedProcessKind, OwnedProcessSummary, OwnerInboxItem, OwnerInboxKind,
-        RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
-        UnsettledCommandSummary, WorkspaceCustodyView,
+        DrainReport, OwnedProcessKind, OwnedProcessSummary, OwnerInboxKind, RetainedUnknownSummary,
+        RetentionView, RunningTurnSummary, StatusBlocker, UnsettledCommandSummary,
+        WorkspaceCustodyView,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -24,19 +24,6 @@ struct ControlFacts {
     live_owners_total: usize,
     write_faulted: bool,
     unknown_commands: Vec<String>,
-}
-
-fn count_owner_inbox(
-    items: impl IntoIterator<Item = OwnerInboxItem>,
-) -> BTreeMap<OwnerInboxKind, usize> {
-    let mut counts = OwnerInboxKind::ALL
-        .into_iter()
-        .map(|kind| (kind, 0))
-        .collect::<BTreeMap<_, _>>();
-    for item in items {
-        *counts.entry(item.kind).or_default() += 1;
-    }
-    counts
 }
 
 impl Router {
@@ -83,17 +70,17 @@ impl Router {
         request: eliot_core::api::DaemonStatusRequest,
     ) -> Result<Value> {
         let eliot_store::OwnerProjection {
-            items: inbox,
+            owner_inbox,
             liveness,
             command_without_dispatcher,
             goals_without_progress,
             repeated_failure_inbox_items,
             ..
-        } = self.read_owner_projection().await?;
+        } = self.read_owner_projection(None).await?;
         let DaemonSidebarResponse {
             owner_inbox,
             profile_command_issues,
-        } = self.sidebar_fields(count_owner_inbox(inbox));
+        } = self.sidebar_fields(owner_inbox);
         let (blockers, drain) = self.blockers_and_drain().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();

@@ -1485,10 +1485,13 @@ unavailable snapshot and clears the refresh flag. CLI status uses
 `disk_usage_scan_window: true` and shows both endpoint ages
 (`snapshot_age_ms` and `snapshot_end_age_ms`) for the published scan window.
 The desktop's ten-second sidebar poll uses
-`daemon.sidebar` for Owner inbox counts and profile command issues. The count
-read folds the same reportable, unsnoozed projection in one read snapshot and
-does not retain or sort the complete Owner inbox item vector; `owner.inbox`
-keeps its existing ordered pages and exclusive cursor semantics.
+`daemon.sidebar` for Owner inbox counts and profile command issues. Sidebar and
+full `daemon.status` fold the same reportable, unsnoozed projection in one read
+snapshot without retaining the complete Owner inbox item vector. Full status
+also streams liveness, health and age summaries from that projection.
+`owner.inbox` computes those same summaries while retaining at most `limit + 1`
+matching items for its existing kind/subject ordering and exclusive cursor
+semantics; `--aged` applies its age filter before that bounded page buffer.
 Before #729,
 Swarm's managed launch assigned each worktree a flat `worktrees/<ULID>/` path.
 Those paths share the same size accounting as project-named worktrees. A flat

@@ -836,10 +836,12 @@ same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner
 
 Items are ordered by their opaque cursor; `after` is exclusive. `next` is the
 last returned item's cursor only when another item exists. `daemon.sidebar`
-reports counts for exactly the same reportable, unsnoozed projection in one
-read snapshot. Its count path folds that projection into per-kind totals without
-retaining or sorting the complete item vector; it does not change Owner inbox
-page or cursor behavior.
+and full `daemon.status` report counts for exactly the same reportable,
+unsnoozed projection in one read snapshot. Both fold the projection into
+per-kind totals without retaining the complete item vector; status also streams
+its liveness and health summaries. `owner.inbox` streams those summaries while
+buffering at most `limit + 1` matching items, preserving kind/subject ordering,
+the exclusive `after` cursor, and filtering `aged` items before pagination.
 
 For a missing worktree with a retained checkpoint, the inbox instructions include
 `git worktree prune`, `git worktree add`, and the exact
