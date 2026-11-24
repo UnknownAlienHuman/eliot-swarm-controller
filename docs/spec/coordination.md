@@ -82,9 +82,10 @@ plan/apply and `stand down` retain their independent root, registry, marker,
 owner-binding and #885 two-pass cleanup checks.
 
 Plans anchor the managed workspace identity and branch tip. Apply rechecks the
-same identity and exact local tip before mutation. A proven missing directory for
-a retained artifact can surface as `safe(already_absent)`. Apply verifies it is
-still absent and settles zero bytes. For a worktree, apply uses the existing
+same identity and exact local tip before mutation. A missing directory for
+a retained artifact can surface as `safe(already_absent)`. Apply confirms
+absence twice across the 15-second grace interval before settling zero bytes.
+For a worktree, apply uses the existing
 missing-worktree reconciliation and preserves the local branch. A reappearing
 directory requires a fresh plan. Changed local identity,
 checked-out branches, filesystem guards and Git readiness still keep/refuse the
@@ -101,9 +102,15 @@ has passed. Expired registered private stands
 clean shutdown (`daemon.stopped`), and clean `#885` preflight on external-repo
 worktrees/branches before surfacing `safe(expired_stand)`.
 
-`cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates, rechecks
-authority, generation, expiry, Git cleanliness, opened identities and busy/link refusal,
-then records each outcome as `removed`, `skipped` with reason, or `unknown`. For an
+`cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates and
+returns a durable `running` receipt with its mutation id. The daemon owns the job after
+admission and rechecks authority, generation, expiry, Git cleanliness, opened identities
+and busy/link refusal before effects. `cleanup.status {id}` and exact apply retries read
+the caller's retained receipt. Items waiting for a live worker show `pending`. Settled
+items are `removed`, `skipped` with reason, `failed` for known operational failures, or
+`unknown` for uncertain effects. A completed job has visited its full selection. Drain
+waits for the cleanup worker, and an interrupted worker leaves durable attempt fences.
+For an
 expired stand candidate, apply performs `#885` two-pass external worktree and detached
 branch cleanup under `WorktreeWriteGuard` + `OwnedChild`, keeps the stand if any
 external item is kept/unknown, and deletes the offline stand root and external registry
@@ -116,13 +123,14 @@ Deleting an Agent tree supersedes all of its items in unapplied plans at the
 deletion commit. Apply keeps the original selection binding and records those
 items as `skipped(superseded)`, without reserving an attempt or touching their
 artifacts. Other items proceed under the same plan and checks.
-The Store commits an unknown attempt before effects and settles results before
-acknowledgement. Exact same-ID replay returns the retained response. Another ID
+The Store commits attempt reservations before effects and retains each outcome as it
+settles. Exact same-ID replay returns the current receipt. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted
 artifact. Uncertain attempts fence resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
-reparse points and deletes by handle disposition. Any file whose link count is
+reparse points and deletes by handle disposition. A scan is bounded to 262,144
+entries and by its deadline. Any file whose link count is
 not exactly one keeps the entire tree with `hard_link`, including Cargo targets
 with shared binaries. Guarded scans at both plan and apply refuse repository
 roots (including bare repositories), every `.git` entry, and native/user config
@@ -173,6 +181,17 @@ if an attempted effect is refused or uncertain. Session cleanup runs first.
 If a selected session is kept or uncertain, pending worktrees in that task
 tree settle as `skipped(native_session_kept)`. This also applies to a
 `cleanup.apply` selection that includes both effects.
+
+`cleanup.apply_all {id,scope?,project?,older_than?}` is an explicit Owner action that
+traverses the inventory on the daemon, with `all` as the default scope. It applies
+safe local candidates using the same attempt reservations and live rechecks, including
+native-session ordering across pages. Project registrations use current revision and
+path checks for each batch. One explicit cleanup apply runs at a time. Read progress
+with `cleanup.status {id}` or repeat the original call with the same id and filters.
+The tally includes pages, inventory issue count, applied, skipped by reason, failed,
+unknown, pending, and confirmed bytes reclaimed. A traversal failure retains the
+tally for work already examined and reports its reason. A daemon restart leaves
+interrupted jobs readable and never replays an uncertain effect.
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as

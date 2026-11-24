@@ -213,6 +213,7 @@ struct RouterInner {
     previous_crash: Mutex<Option<CrashMarker>>,
     worker_tasks: Mutex<Vec<WorkerTaskStatus>>,
     automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
+    cleanup_worker: Mutex<Option<String>>,
     mode: AtomicU8,
     restart_lease: Mutex<Option<String>>,
     restart_writes: RwLock<()>,
@@ -502,6 +503,7 @@ impl Router {
                         .collect(),
                 ),
                 automatic_cleanup: Mutex::new(cleanup::AutomaticCleanupState::default()),
+                cleanup_worker: Mutex::new(None),
                 mode: AtomicU8::new(MODE_OPEN),
                 restart_lease: Mutex::new(None),
                 restart_writes: RwLock::new(()),
@@ -726,6 +728,8 @@ impl Router {
             "artifact.register" => self.artifact_register(&params, &principal).await,
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
+            "cleanup.apply_all" => self.cleanup_apply_all(&params, &principal).await,
+            "cleanup.status" => self.cleanup_status(&params, &principal).await,
             "command.submit" => {
                 let result = match self
                     .submit_bound(&params, &principal, context, Some("command.submit"))
@@ -1058,7 +1062,8 @@ impl Router {
                 // worker the bounded receipt omits can never end the drain.
                 Ok(self.status_blockers().await?.is_empty()
                     && !self.inference_workers_active()
-                    && !self.run_workers_active())
+                    && !self.run_workers_active()
+                    && self.inner.cleanup_worker.lock_recover().is_none())
             }
             MODE_DRAIN => Ok(false),
             _ => Ok(false),
@@ -6869,6 +6874,14 @@ impl Router {
         let mut lease = self.inner.restart_lease.lock_recover();
         let mode = self.inner.mode.load(Ordering::SeqCst);
         let action = request.mode;
+        if (request.backup || action == ShutdownMode::Restart)
+            && self.inner.cleanup_worker.lock_recover().is_some()
+        {
+            return Err(Error::new(
+                "restart_busy",
+                "admitted cleanup is still running",
+            ));
+        }
         if action == ShutdownMode::PrepareRestart {
             if mode != MODE_OPEN && !(mode == MODE_QUIESCE && lease.as_ref() == Some(&request.id)) {
                 return Err(Error::new(

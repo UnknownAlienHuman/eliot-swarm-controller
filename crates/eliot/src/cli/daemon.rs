@@ -502,6 +502,7 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
                 StatusBlocker::DiscoveryReaders { count } => {
                     println!("  {count} discovery reader(s)")
                 }
+                StatusBlocker::CleanupActive { id } => println!("  active cleanup {id}"),
                 StatusBlocker::AgentLive {
                     agent,
                     generation,

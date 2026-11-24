@@ -423,6 +423,7 @@ impl Store {
         page: &PlanContinuation,
         limit: usize,
         include_ownership_roots: bool,
+        bulk: bool,
     ) -> Result<CleanupInventoryPage> {
         request.validate()?;
         if limit > MAX_CLEANUP_ITEMS {
@@ -452,6 +453,13 @@ impl Store {
                 })
                 .map_err(sql_error)?,
         };
+        let rank_of = |kind: ArtifactKind| {
+            if bulk && kind == ArtifactKind::NativeSession {
+                0
+            } else {
+                kind.cleanup_rank()
+            }
+        };
         let (mut rank, mut after_seq) = match page.inventory_rank {
             Some(rank) => (rank, page.inventory_seq_after),
             None => match page.artifact_after.as_deref() {
@@ -477,7 +485,7 @@ impl Store {
                     if seq > snapshot {
                         return Err(Error::new("invalid", "cleanup continuation is stale"));
                     }
-                    (kind.cleanup_rank(), Some(seq))
+                    (rank_of(kind), Some(seq))
                 }
             },
         };
@@ -524,8 +532,7 @@ impl Store {
                 let owned_root = include_ownership_roots
                     && matches!(caller, Sender::Owner)
                     && artifact.state == "ownership_root";
-                if artifact.kind.cleanup_rank() != rank
-                    || (artifact.state != "registered" && !owned_root)
+                if rank_of(artifact.kind) != rank || (artifact.state != "registered" && !owned_root)
                 {
                     continue;
                 }
@@ -697,6 +704,39 @@ impl Store {
             return Err(Error::new("id_conflict", "cleanup id is already in use"));
         }
         Ok(None)
+    }
+
+    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<(String, Value)> {
+        self.ensure_committed_reads()?;
+        let Some((author, method, _, result)) = write_binding(&self.connection, id)? else {
+            return Err(Error::new("not_found", "cleanup receipt absent"));
+        };
+        if !matches!(method.as_str(), "cleanup.apply" | "cleanup.apply_all") {
+            return Err(Error::new("not_found", "cleanup receipt absent"));
+        }
+        if author != principal {
+            return Err(Error::new(
+                "not_allowed",
+                "cleanup receipt belongs to another principal",
+            ));
+        }
+        Ok((method, decode_json(&result)?))
+    }
+
+    pub fn update_cleanup_job(
+        &mut self,
+        principal: &str,
+        id: &str,
+        method: &str,
+        result: &impl serde::Serialize,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        update_cleanup_result(&tx, principal, id, method, result)?;
+        commit_transaction(tx, &self.write_faulted)
     }
 
     /// Called after the Router pins and validates the existing local directory.
@@ -932,6 +972,7 @@ impl Store {
         principal: &str,
         request: &CleanupApplyRequest,
         now: i64,
+        job: bool,
     ) -> Result<(CleanupPlan, CleanupApplyResponse, bool)> {
         self.ensure_writer_healthy()?;
         request.validate()?;
@@ -1007,6 +1048,8 @@ impl Store {
         let attempted =
             |item: &CleanupCandidate| item.verdict == "safe" && request.selects(&item.artifact.id);
         let mut response = CleanupApplyResponse {
+            id: job.then(|| request.id.clone()),
+            state: job.then_some(CleanupJobState::Running),
             plan_id: plan.plan_id.clone(),
             bytes_reclaimed: 0,
             items: plan
@@ -1247,8 +1290,8 @@ impl Store {
             let mut updated = artifact.clone();
             updated.state = match outcome.outcome.as_str() {
                 "removed" => "removed",
-                "skipped" if artifact.state == "ownership_root" => "ownership_root",
-                "skipped" => "registered",
+                "skipped" | "failed" if artifact.state == "ownership_root" => "ownership_root",
+                "skipped" | "failed" => "registered",
                 _ => "unknown",
             }
             .to_owned();
@@ -1446,10 +1489,20 @@ fn update_cleanup_receipt(
     request: &CleanupApplyRequest,
     response: &CleanupApplyResponse,
 ) -> Result<()> {
+    update_cleanup_result(tx, principal, &request.id, "cleanup.apply", response)
+}
+
+fn update_cleanup_result(
+    tx: &Transaction<'_>,
+    principal: &str,
+    id: &str,
+    method: &str,
+    response: &impl serde::Serialize,
+) -> Result<()> {
     let changed = tx
         .execute(
-            "UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method='cleanup.apply'",
-            params![encode_json(response)?, request.id, principal],
+            "UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method=?4",
+            params![encode_json(response)?, id, principal, method],
         )
         .map_err(sql_error)?;
     if changed != 1 {

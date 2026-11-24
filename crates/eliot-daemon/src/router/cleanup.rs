@@ -11,12 +11,29 @@ use std::path::{Component, Path};
 use tokio::time::timeout;
 
 mod delete;
+mod jobs;
 mod projects;
 
 const CLEANUP_BACKFILL_BATCH: usize = 8;
 const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
 const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
 const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy)]
+enum CleanupApplyMode<'a> {
+    Manual,
+    Automatic,
+    AgentTree,
+    Bulk(&'a HashSet<String>),
+}
+
+#[cfg(windows)]
+async fn open_cleanup_tree(path: PathBuf, budget: Duration) -> Result<CleanupTree> {
+    let deadline = std::time::Instant::now() + budget;
+    tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline))
+        .await
+        .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?
+}
 
 #[expect(
     clippy::disallowed_methods,
@@ -1264,7 +1281,8 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        self.cleanup_plan_page(params, principal, None, false).await
+        self.cleanup_plan_page(params, principal, None, false, false)
+            .await
     }
 
     async fn auto_cleanup_plan(
@@ -1278,6 +1296,7 @@ impl Router {
             &Principal::Owner,
             Some(retention_ms),
             retain_for_apply,
+            false,
         )
         .await
     }
@@ -1288,6 +1307,7 @@ impl Router {
         principal: &Principal,
         auto_cleanup_after_ms: Option<i64>,
         retain_automatic_plan: bool,
+        bulk: bool,
     ) -> Result<Value> {
         let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
@@ -1331,7 +1351,7 @@ impl Router {
             truncated: false,
             continuation: None,
         };
-        let binding = cleanup_plan_request_binding(&name, &request)?;
+        let binding = cleanup_plan_request_binding(&name, &request, bulk)?;
         if page
             .request_binding
             .as_deref()
@@ -1358,7 +1378,7 @@ impl Router {
             }
         }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
-            if auto_cleanup {
+            if auto_cleanup || bulk {
                 if page.safe_skipped != 0
                     || page.kept_skipped != 0
                     || page.regs_revision.is_some()
@@ -1413,7 +1433,7 @@ impl Router {
         // skipping or repeating a registration. Non-owners never carry
         // project state: any such token in their hands is stale.
         let (safe_ids, kept_ids): (Option<Vec<String>>, Option<Vec<String>>) =
-            if matches!(principal, Principal::Owner) && !auto_cleanup {
+            if matches!(principal, Principal::Owner) && !auto_cleanup && !bulk {
                 (
                     Some(project_ids(&safe_projects)),
                     Some(project_ids(&kept_projects)),
@@ -1444,6 +1464,7 @@ impl Router {
             &page,
             artifact_limit,
             auto_cleanup,
+            bulk,
         )?;
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
@@ -1604,7 +1625,15 @@ impl Router {
                 {
                     break;
                 }
-                match self.cleanup_preflight(&candidate.artifact).await {
+                let scan_budget = if bulk {
+                    Duration::from_secs(120)
+                } else {
+                    call_deadline.saturating_duration_since(Instant::now())
+                };
+                match self
+                    .cleanup_preflight(&candidate.artifact, scan_budget)
+                    .await
+                {
                     Ok((bytes, absent)) => {
                         candidate.verdict = "safe".to_owned();
                         candidate.reason = if absent {
@@ -1669,6 +1698,8 @@ impl Router {
         }
         let retain_plan = if auto_cleanup {
             retain_automatic_plan && plan.items.iter().any(|item| item.verdict == "safe")
+        } else if bulk {
+            plan.items.iter().any(|item| item.verdict == "safe")
         } else {
             !plan.items.is_empty() || !plan.truncated
         };
@@ -2128,7 +2159,11 @@ impl Router {
         Ok(crate::workspace_git::observe_worktree_absence(missing)?.is_some())
     }
 
-    async fn cleanup_preflight(&self, artifact: &ArtifactView) -> Result<(u64, bool)> {
+    async fn cleanup_preflight(
+        &self,
+        artifact: &ArtifactView,
+        scan_budget: Duration,
+    ) -> Result<(u64, bool)> {
         if artifact.kind == ArtifactKind::NativeSession {
             // The archive itself runs at apply through the harness native
             // API; the plan verdict already gated harness and quiescence.
@@ -2183,7 +2218,7 @@ impl Router {
         }
         #[cfg(windows)]
         {
-            let tree = CleanupTree::open(&path)?;
+            let tree = open_cleanup_tree(path, scan_budget).await?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -2214,20 +2249,12 @@ impl Router {
         }
         #[cfg(not(windows))]
         {
-            let _ = path;
+            let _ = (path, scan_budget);
             Err(Error::new(
                 "unsupported",
                 "handle deletion is unavailable on this platform",
             ))
         }
-    }
-
-    pub(super) async fn cleanup_apply(
-        &self,
-        params: &Value,
-        principal: &Principal,
-    ) -> Result<Value> {
-        self.cleanup_apply_plan(params, principal, false).await
     }
 
     async fn cleanup_apply_plan(
@@ -2252,15 +2279,25 @@ impl Router {
         let (plan, mut response) = {
             let mut store = self.inner.store.lock().await;
             let (plan, mut response, is_new) =
-                store.begin_cleanup_apply(&name, &request, now_ms())?;
+                store.begin_cleanup_apply(&name, &request, now_ms(), false)?;
             if !is_new {
                 return encoded(response);
             }
             self.apply_project_registrations(&mut store, &request, &plan, &mut response)?;
             (plan, response)
         };
-        self.apply_cleanup_artifacts(&name, &request, &plan, &mut response, false, automatic)
-            .await?;
+        self.apply_cleanup_artifacts(
+            &name,
+            &request,
+            &plan,
+            &mut response,
+            if automatic {
+                CleanupApplyMode::Automatic
+            } else {
+                CleanupApplyMode::Manual
+            },
+        )
+        .await?;
         encoded(response)
     }
 
@@ -2270,8 +2307,7 @@ impl Router {
         request: &CleanupApplyRequest,
         plan: &CleanupPlan,
         response: &mut CleanupApplyResponse,
-        entire_tree: bool,
-        automatic: bool,
+        mode: CleanupApplyMode<'_>,
     ) -> Result<()> {
         // A native reader may need the managed workspace as its directory.
         let (sessions, other): (Vec<_>, Vec<_>) = plan
@@ -2286,9 +2322,19 @@ impl Router {
             {
                 continue;
             }
+            if self.is_force_requested()
+                && matches!(mode, CleanupApplyMode::Manual | CleanupApplyMode::Bulk(_))
+            {
+                return Err(Error::new(
+                    "interrupted",
+                    "forced shutdown interrupted cleanup",
+                ));
+            }
             let blocked_worktree = item.artifact.kind == ArtifactKind::Worktree
                 && item.reason != "already_absent"
-                && plan
+                && (matches!(mode, CleanupApplyMode::Bulk(blocked) if blocked.contains(
+                    cleanup_tree_root(&item.artifact).unwrap_or(&item.artifact.agent)
+                )) || plan
                     .items
                     .iter()
                     .zip(&response.items)
@@ -2297,12 +2343,13 @@ impl Router {
                             && session.verdict == "safe"
                             && request.selects(&session.artifact.id)
                             && outcome.outcome != "removed"
-                            && (entire_tree
+                            && (matches!(mode, CleanupApplyMode::AgentTree)
                                 || session.artifact.agent == item.artifact.agent
                                 || cleanup_tree_root(&session.artifact).is_some_and(|root| {
                                     cleanup_tree_root(&item.artifact) == Some(root)
                                 }))
-                    });
+                    }));
+            let automatic = matches!(mode, CleanupApplyMode::Automatic);
             let removal = if blocked_worktree {
                 Err(Error::new(
                     "native_session_kept",
@@ -2347,6 +2394,11 @@ impl Router {
                         // local branch is already gone: the item is partial,
                         // never a clean skip, and never replayed.
                         "unknown"
+                    } else if matches!(
+                        error.code.as_str(),
+                        "internal" | "platform_io" | "store_io" | "source_integrity"
+                    ) {
+                        "failed"
                     } else {
                         "skipped"
                     }
@@ -2553,7 +2605,7 @@ impl Router {
         }
         #[cfg(windows)]
         {
-            let tree = CleanupTree::open(&path)?;
+            let tree = open_cleanup_tree(path, Duration::from_secs(120)).await?;
             if tree.identity != artifact.identity {
                 return Err(Error::new(
                     "identity_changed",
@@ -2587,7 +2639,14 @@ impl Router {
                     "cleanup authority or generation changed",
                 ));
             }
-            tree.remove()
+            // The reservation fences Agent resume and another artifact
+            // attempt after this dispatch check. The pinned tree owns removal
+            // while the Store remains available to readers and other Agents.
+            let delete = tokio::task::spawn_blocking(move || tree.remove());
+            drop(store);
+            delete
+                .await
+                .map_err(|_| Error::new("unknown", "cleanup deletion worker did not settle"))?
         }
         #[cfg(not(windows))]
         {
@@ -3233,13 +3292,20 @@ fn project_ids(candidates: &[CleanupCandidate]) -> Vec<String> {
         .collect()
 }
 
-fn cleanup_plan_request_binding(principal: &str, request: &CleanupPlanRequest) -> Result<String> {
-    let value = json!({
+fn cleanup_plan_request_binding(
+    principal: &str,
+    request: &CleanupPlanRequest,
+    bulk: bool,
+) -> Result<String> {
+    let mut value = json!({
         "principal": principal,
         "scope": request.scope,
         "project": request.project.as_deref(),
         "older_than": request.older_than,
     });
+    if bulk {
+        value["bulk"] = json!(true);
+    }
     let digest = eliot_core::canonical_json_sha256(&value)
         .map_err(|_| Error::new("internal", "cleanup request binding could not encode"))?;
     let mut binding = String::with_capacity(64);
@@ -3464,7 +3530,10 @@ impl Router {
             .await
             .retirement_plan_gate(&candidate.artifact);
         match gate {
-            Ok(None) => match self.cleanup_preflight(&candidate.artifact).await {
+            Ok(None) => match self
+                .cleanup_preflight(&candidate.artifact, CLEANUP_PLAN_MAX_PREFLIGHT)
+                .await
+            {
                 Ok((bytes, absent)) => {
                     candidate.verdict = "safe".to_owned();
                     candidate.reason = if absent {
@@ -3566,17 +3635,15 @@ impl Router {
             delete_remote: false,
             artifacts: None,
         };
-        let (_, mut response, is_new) =
-            match self
-                .inner
-                .store
-                .lock()
-                .await
-                .begin_cleanup_apply("owner", &apply, now_ms())
-            {
-                Ok(applied) => applied,
-                Err(_) => return,
-            };
+        let (_, mut response, is_new) = match self.inner.store.lock().await.begin_cleanup_apply(
+            "owner",
+            &apply,
+            now_ms(),
+            false,
+        ) {
+            Ok(applied) => applied,
+            Err(_) => return,
+        };
         if !is_new {
             return;
         }

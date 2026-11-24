@@ -2056,6 +2056,9 @@ pub enum StatusBlocker {
     DiscoveryReaders {
         count: usize,
     },
+    CleanupActive {
+        id: String,
+    },
     AgentLive {
         agent: String,
         generation: i64,

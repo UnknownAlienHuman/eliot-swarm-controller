@@ -404,8 +404,11 @@ pub(crate) struct CleanupTree {
 }
 
 #[cfg(windows)]
+const MAX_CLEANUP_TREE_ENTRIES: usize = 262_144;
+
+#[cfg(windows)]
 impl CleanupTree {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path, deadline: std::time::Instant) -> Result<Self> {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             cleanup_name(name)?;
         }
@@ -422,7 +425,6 @@ impl CleanupTree {
             bytes: 0,
             contains_daemon_lock: false,
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         tree.visit(root, 0, deadline)?;
         Ok(tree)
     }
@@ -431,7 +433,7 @@ impl CleanupTree {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
-        let children = native::children(&directory).map_err(io)?;
+        let children = native::children(&directory, deadline).map_err(io)?;
         if ["HEAD", "objects", "refs"].iter().all(|expected| {
             children
                 .iter()
@@ -443,7 +445,9 @@ impl CleanupTree {
             ));
         }
         for (name, is_dir) in children {
-            if self.entries.len() >= 10_000 || std::time::Instant::now() >= deadline {
+            if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES
+                || std::time::Instant::now() >= deadline
+            {
                 return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
             }
             let text = name.to_str().ok_or_else(refused)?;
@@ -838,10 +842,18 @@ mod native {
         }
         Ok(())
     }
-    pub(super) fn children(file: &File) -> io::Result<Vec<(std::ffi::OsString, bool)>> {
+    pub(super) fn children(
+        file: &File,
+        deadline: std::time::Instant,
+    ) -> io::Result<Vec<(std::ffi::OsString, bool)>> {
         let mut result = Vec::new();
         let mut restart = true;
         loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "cleanup directory enumeration exceeded its deadline",
+                ));
+            }
             let mut buffer = vec![0u64; 8192];
             let class = if restart {
                 FileIdBothDirectoryRestartInfo
@@ -888,7 +900,7 @@ mod native {
                 });
                 if name != "." && name != ".." {
                     if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                        || result.len() >= 10_000
+                        || result.len() >= super::MAX_CLEANUP_TREE_ENTRIES
                     {
                         return Err(io::Error::other("linked or oversized cleanup tree"));
                     }

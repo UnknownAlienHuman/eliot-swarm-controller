@@ -611,6 +611,9 @@ impl Router {
             )
         };
         let mut blockers = Vec::new();
+        if let Some(id) = self.inner.cleanup_worker.lock_recover().clone() {
+            blockers.push(StatusBlocker::CleanupActive { id });
+        }
         if self.inner.workspaces.has_owned_processes() || live_owners_total > 0 {
             blockers.push(StatusBlocker::WorkspaceProcesses);
         }

@@ -423,9 +423,115 @@ pub struct CleanupItemOutcome {
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupApplyResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<CleanupJobState>,
     pub plan_id: String,
     pub items: Vec<CleanupItemOutcome>,
     pub bytes_reclaimed: u64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupJobState {
+    Running,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupApplyAllRequest {
+    pub id: String,
+    #[serde(default)]
+    pub scope: CleanupScope,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub older_than: Option<i64>,
+}
+
+impl CleanupApplyAllRequest {
+    pub fn validate(&self) -> Result<()> {
+        cleanup_id(&self.id)?;
+        if self.scope == CleanupScope::SelfTree {
+            return Err(Error::new(
+                "invalid",
+                "bulk cleanup requires project or all scope",
+            ));
+        }
+        self.plan_request().validate()
+    }
+
+    pub fn plan_request(&self) -> CleanupPlanRequest {
+        CleanupPlanRequest {
+            scope: self.scope,
+            project: self.project.clone(),
+            older_than: self.older_than,
+            continuation: None,
+        }
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupStatusRequest {
+    pub id: String,
+}
+
+impl CleanupStatusRequest {
+    pub fn validate(&self) -> Result<()> {
+        cleanup_id(&self.id)
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Default, Serialize, Deserialize)]
+pub struct CleanupTally {
+    pub pages: u64,
+    pub inventory_issues: u64,
+    pub applied: u64,
+    pub skipped: std::collections::BTreeMap<String, u64>,
+    pub failed: u64,
+    pub unknown: u64,
+    pub pending: u64,
+    pub bytes_reclaimed: u64,
+}
+
+impl CleanupTally {
+    pub fn count(&mut self, apply: &CleanupApplyResponse, running: bool) {
+        for item in &apply.items {
+            match item.outcome.as_str() {
+                "removed" => self.applied += 1,
+                "skipped" => {
+                    *self
+                        .skipped
+                        .entry(item.reason.clone().unwrap_or_default())
+                        .or_default() += 1;
+                }
+                "failed" => self.failed += 1,
+                "unknown" if running && item.reason.as_deref() == Some("attempt_reserved") => {
+                    self.pending += 1;
+                }
+                _ => self.unknown += 1,
+            }
+        }
+        self.bytes_reclaimed += apply.bytes_reclaimed;
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct CleanupJobStatus {
+    pub id: String,
+    pub state: CleanupJobState,
+    pub tally: CleanupTally,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apply: Option<CleanupApplyResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_apply_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn cleanup_id(id: &str) -> Result<()> {
