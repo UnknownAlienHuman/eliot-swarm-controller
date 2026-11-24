@@ -73,6 +73,7 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         manager_preference: Some(0),
         provider_probe: true,
+        provider_response_withholding: true,
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,

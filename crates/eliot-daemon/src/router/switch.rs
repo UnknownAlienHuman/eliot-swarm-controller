@@ -356,13 +356,14 @@ impl Router {
                     self.publish_locked(&change.events);
                 }
                 if let Some((reason, kind)) = reason_kind
-                    && let Some(message) = routing::handoff_waiting_message(&error)
+                    && let Some(message) = routing::handoff_waiting_message(&error, reason)
                 {
                     let candidate = eliot_store::AutomaticHandoff {
                         agent: source,
                         reason,
                         kind,
                         held_since: None,
+                        withheld_event_seq: None,
                     };
                     if let Ok(events) = store.record_handoff_waiting(&candidate, &message, now_ms())
                     {

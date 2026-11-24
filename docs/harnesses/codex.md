@@ -538,6 +538,22 @@ arguments/digests or replay input. See
 [profile binding](../spec/configuration.md#frozen-profile-and-route-binding) and the
 [shared binding type](../../crates/eliot-core/src/native_store.rs).
 
+### Terminal provider response-withheld signal
+
+Codex 0.167.1's native `TurnError` requires `message` and may include
+`additionalDetails`, `codexErrorInfo` and `misalignment` metadata. A response is
+classified as withheld only when the exactly bound `turn/completed` has status
+`failed` and its `turn.error.message`, after trimming outer whitespace, exactly
+matches:
+
+> You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.
+
+The matcher reads the required message of the terminal error. A match adds typed
+`provider_response_withheld: true` and provider `origin_evidence` before optional
+usage, native error and final text fields. It takes precedence over structured
+restriction and before-work classification for that event. The native error message
+uses the shared secret-redaction and bounded `native_error` projection.
+
 ## Usage attribution
 
 Verified read-only 2026-11-13 against installed Codex 0.167.1

@@ -194,6 +194,32 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
     }
 }
 
+/// Direct presets of the same harness share its provider session route. For adopted routes,
+/// the Responses endpoint identifies the route across renamed presets.
+pub fn same_provider_response_route(source: &Value, candidate: &Value) -> bool {
+    fn endpoint(snapshot: &Value) -> Option<Url> {
+        snapshot
+            .pointer("/route_binding/provider_base_url")
+            .and_then(Value::as_str)
+            .and_then(|url| validate_http_url(url).ok())
+    }
+
+    let Some(harness) = source["harness"].as_str() else {
+        return false;
+    };
+    if candidate["harness"] != harness {
+        return false;
+    }
+    match (endpoint(source), endpoint(candidate)) {
+        (Some(source), Some(candidate)) => {
+            source.origin() == candidate.origin()
+                && source.path().trim_end_matches('/') == candidate.path().trim_end_matches('/')
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// Why `candidate` may not take over work from `source` automatically or at a
 /// manager's request; `None` when its authority is provably equal or narrower.
 /// Credentials, model and executable belong to the candidate profile the Owner

@@ -360,6 +360,8 @@ pub struct HarnessCapabilities {
     pub turn_completed_reports_effective_model: bool,
     /// Each turn needs independent provider response evidence for its model.
     pub provider_response_model_verification: bool,
+    /// Controlled terminal events can carry a provider response-withheld fact.
+    pub provider_response_withholding: bool,
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     /// Supports `source.gap` view-projection recovery on active turns.

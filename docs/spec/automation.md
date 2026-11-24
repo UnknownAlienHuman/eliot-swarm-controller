@@ -759,6 +759,13 @@ re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a
 project in the same pass claim a slot on the blocked shared scope ahead of the waiting
 project. An already-dispatched or unknown command retains its reservation until verified closure.
 
+A completed Codex turn can carry the typed `provider_response_withheld` fact.
+The daemon's [automatic handoff policy](configuration.md#automatic-handoff-918)
+uses it to continue the work with its retained task inputs and sources on another
+eligible preset. The original command and terminal outcome remain in history.
+Automatic continuation excludes the source provider route. An unavailable successor
+is an Owner decision.
+
 The `launch` action submits the existing ordinary launch command with flat fields. An
 explicit `profile` or a routing `role` may be supplied; they are mutually exclusive.
 

@@ -1676,14 +1676,22 @@ default = ["codex-luna", "muse"]
 
 The daemon evaluates this every five seconds for root and child Agents outside chats:
 
+- a failed Codex turn with an exact provider-withheld response. The daemon carries
+  the retained task and its sources to a fresh successor through the ordinary
+  switch. It keeps the source turn and its effects in the original session.
 - a quota or rate-limit hold on an idle Agent that still owes work: its held turn did
   not finish, input is waiting or was refused by the hold, or a Goal is active;
 - a lost or failed session of this daemon's lifetime with the same kinds of owed work,
   20 seconds after the loss so native process-loss recovery can reopen it first.
 
-Automatic handoff uses `handoff_fallback` in configured order for every Agent. Role
-lists choose initial launches. A lost session can reuse its profile if the fallback
-list names it. Profiles this task already left and held profiles are skipped.
+Held and lost sessions use `handoff_fallback` in configured order. A lost session
+can reuse its profile if the fallback list names it. For a withheld response on a
+role-routed Agent, `on_provider_failure = "next"` selects from the remaining presets
+in that role. An explicitly selected preset uses `handoff_fallback` when
+`auto_handoff` is enabled. The source preset and its Codex provider route are
+ineligible for the withheld task, including direct presets and aliases of the same
+adopted Responses endpoint. Profiles this task already left and held profiles are
+skipped.
 Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
 eligible candidate the Agent keeps its work. The Owner inbox and `swarm why` report
@@ -1692,6 +1700,11 @@ dispatches a stop to the source. A refused admission is tried again
 after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
+
+For a withheld response, the Owner can choose another preset, configure eligible
+routing, or leave the work pending. The daemon records the provider refusal on the
+completed turn and names the selected preset in the handoff timeline after the
+transfer. The provider fact applies to the response on the source session.
 
 Each continuation lineage admits at most three switch reservations initiated outside an
 explicit Owner switch. This includes automatic held/lost/provider, rule and session-growth
