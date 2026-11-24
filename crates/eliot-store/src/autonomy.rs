@@ -9,7 +9,10 @@ use eliot_core::api::AutonomyResponse;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use std::{path::Path, time::Duration};
 
-pub(super) const INDEXES: &[&str] = &[activity::INDEXES, fleet::INDEXES];
+pub(super) const PROVIDER_HOLD_AGE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS autonomy_fleet_provider_hold_age
+    ON provider_holds(held_since, scope) WHERE state IN ('held', 'probing');";
+pub(super) const INDEXES: &[&str] = &[activity::INDEXES, fleet::INDEXES, PROVIDER_HOLD_AGE_INDEX];
 
 impl Store {
     pub fn read_autonomy(

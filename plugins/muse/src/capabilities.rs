@@ -20,6 +20,8 @@ pub fn declaration() -> HarnessCapabilities {
         configure_carries_previous_overlay: true,
         configure_effort_per_turn_overlay: true,
         configure_resolution_readback: true,
+        configure_reports_accepted_model: true,
+        provider_response_model_verification: true,
         configure_reports_effort_verification: true,
         reads_retained_quota: true,
         view_projection_gap_recovery: true,

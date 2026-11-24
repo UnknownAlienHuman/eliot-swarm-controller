@@ -875,12 +875,30 @@ valid structured Core restriction kind, but the
 Codex 0.161 classifier does not infer it from an unrecognized native variant, HTTP 404
 or message text.
 
+Muse reports typed quota exhaustion or its provider HTTP 429 error envelope
+as a quota hold. The same controlled terminal fact feeds the existing
+provider handoff policy. The model mismatch hold requires a separate
+successful provider response naming a different model.
+
 A hold is `Held` or `Probing`. It blocks new provider-backed launch/send/steer work in
 that scope, including queued dispatch. Future Goal work that admits provider-backed
 commands uses the same gate. A launch with linked input must reject before either effect;
 resume without new text, readback, request replies, interrupt and stop remain available.
 Resume with text is a linked send and remains gated. Steer remains bound to its exact
 active turn and generation.
+
+Muse also records a `model_mismatch` hold from the exact, controlled
+`turn.model_observed` response with both model IDs. Store commits the
+hold with the observation, including when native cancellation is still
+unconfirmed. The scope `model:<profile>` is independent of the account
+or quota hold. It refuses launch, send, steer, resume with or without
+input, restart continuation, Goal rounds and probes for that profile.
+The hold has no timer or probe budget. One Owner inbox item tracks it
+until the Owner clears it or launch, send, steer or resume preparation
+observes a changed installed Muse build or native settings file. A hold
+recorded without a readable revision clears on the first readable revision,
+allowing a single new attempt. An unreadable current revision keeps the hold.
+The next action uses ordinary admission and dispatch gates.
 
 The [Owner quota reserve](configuration.md#owner-quota-reserve-872) is a separate
 daemon admission policy for new automatic launches. It uses fresh passive quota
@@ -946,8 +964,9 @@ Clear uses a same-scope compare-and-swap against the expected probe command, inc
 explicit null; it cannot clear an unresolved probe. The mutation ID binds the clear
 request, so an exact retry returns the retained result and changed evidence conflicts.
 
-`agent.list` and `agent.get` project the hold matching that Agent's frozen account or
-profile as `AgentProviderHold { kind, state, retry_after, updated_at,
+`agent.list` and `agent.get` project a profile model hold first, or the
+hold matching that Agent's frozen account or profile, as
+`AgentProviderHold { kind, state, retry_after, updated_at,
 waiting_for_active_turn, next_probe_at, held_since }`; shared scope and probe-command
 identity remain on the owner-only provider-hold read. They also project
 the latest `turn.notice`, or the latest failed terminal `native_error`, as

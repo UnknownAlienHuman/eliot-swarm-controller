@@ -73,6 +73,10 @@ pub struct NativeClientInfo {
 pub struct NativeClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_input_dialogs: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_api: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_capabilities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -110,6 +114,15 @@ pub struct NativeInitializeResult {
     pub user_agent: String,
 }
 
+/// The two authorization fields of the MSP account read. Display identity
+/// stays on the native side of the adapter.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAccountState {
+    pub state: String,
+    pub credential_required: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle (SS2.5.1, SS2.5.5, SS3.8, SS3.10, SS3.21)
 // ---------------------------------------------------------------------------
@@ -121,8 +134,6 @@ pub struct NativeInitializeResult {
 #[serde(rename_all = "camelCase")]
 pub struct NativeSessionStartParams {
     pub command_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
     /// Starting approval mode; the server default rules when omitted.
@@ -186,13 +197,14 @@ pub struct NativeSessionSetModelParams {
     pub model: NativeModelSelection,
 }
 
-/// A model selection (SS3.8, `ModelSelection`): the catalog model id is
-/// required; label, provider routing and profile stay omitted, so the
-/// server default rules for everything but the model.
+/// A model selection (SS3.8, `ModelSelection`): the exact requested ID
+/// plus the provider route. The picker catalogue may hide a valid ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeModelSelection {
     pub model_id: String,
+    pub provider_id: String,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -244,13 +256,49 @@ pub struct NativeModelListResult {
     #[serde(default)]
     pub models: Vec<NativeModelCatalogEntry>,
     pub provider_id: String,
+    pub profile_id: Option<String>,
     /// Where the catalogue came from (`providerCatalog`, `bundledCatalog`,
-    /// ...; open enum). Only the source is modelled: the accompanying
-    /// `profileId` is account data and stays ignored, never persisted.
+    /// ...; open enum). Provider profile IDs stay on the native command plane.
     /// An empty `bundledCatalog` means the host has no visible rows in its
     /// snapshot. The exact-model check still applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+}
+
+impl NativeModelListResult {
+    /// Hidden IDs are absent from the picker. An explicit ID can still be
+    /// routed through the provider and profile of this catalogue.
+    pub fn selection(&self, model_id: &str) -> NativeModelSelection {
+        let row = self.models.iter().find(|row| row.model_id == model_id);
+        let provider_id = row.map_or(&self.provider_id, |row| &row.provider_id);
+        let profile_id = row
+            .and_then(|row| row.profile_id.as_ref())
+            .or(self.profile_id.as_ref())
+            .cloned()
+            .or_else(|| {
+                (provider_id == "meta" && is_contributor_model(model_id)).then(|| "tbh".to_owned())
+            });
+        NativeModelSelection {
+            model_id: model_id.to_owned(),
+            provider_id: provider_id.clone(),
+            profile_id,
+        }
+    }
+}
+
+pub(crate) fn is_contributor_model(model: &str) -> bool {
+    model.ends_with("-contributor")
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NativeSettingsReadResult {
+    pub values: NativeHostSettings,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct NativeHostSettings {
+    #[serde(default)]
+    pub contributor_mode_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +306,7 @@ pub struct NativeModelListResult {
 pub struct NativeModelCatalogEntry {
     pub model_id: String,
     pub provider_id: String,
+    pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_label: Option<String>,
     #[serde(default)]
@@ -359,6 +408,8 @@ pub struct NativeSessionReadResult {
 pub struct NativeSessionResumeParams {
     pub command_id: String,
     pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_items: Option<bool>,
 }
@@ -582,9 +633,8 @@ pub struct NativeQuotaDetail {
 }
 
 impl NativeTurnError {
-    /// Project the installed structured auth kind or Muse's exact native
-    /// API rate-limit error form. Generic text, the retryable hint and
-    /// unknown codes stay inert.
+    /// Project structured auth/quota or Muse's exact provider HTTP error
+    /// envelope. Generic text and the retryable hint stay inert.
     pub fn provider_restriction(&self) -> Option<ProviderRestriction> {
         if self.kind == "authRequired" {
             return Some(ProviderRestriction {
@@ -595,6 +645,7 @@ impl NativeTurnError {
             });
         }
 
+        let http_quota = muse_api_quota_restriction(&self.message);
         if let Some(quota) = &self.quota {
             let retry_after = quota
                 .resets_at_ms
@@ -604,20 +655,22 @@ impl NativeTurnError {
                         .filter(|at| *at >= 0)
                         .or_else(|| at.as_u64().map(|_| i64::MAX))
                 })
-                .or_else(|| muse_api_rate_limit_restriction(&self.message)?.retry_after);
+                .or_else(|| http_quota.as_ref()?.retry_after);
             return Some(ProviderRestriction {
                 kind: ProviderRestrictionKind::Quota,
                 retry_after,
-                code: (quota.limit_kind == "tierLimit").then(|| "tierLimit".to_owned()),
-                http_status: None,
+                code: (quota.limit_kind == "tierLimit")
+                    .then(|| "tierLimit".to_owned())
+                    .or_else(|| http_quota.as_ref()?.code.clone()),
+                http_status: http_quota.and_then(|restriction| restriction.http_status),
             });
         }
 
-        muse_api_rate_limit_restriction(&self.message)
+        http_quota
     }
 }
 
-fn muse_api_rate_limit_restriction(message: &str) -> Option<ProviderRestriction> {
+fn muse_api_quota_restriction(message: &str) -> Option<ProviderRestriction> {
     let after_status = message.strip_prefix("API error ")?.strip_prefix("429")?;
     let vendor_message = if let Some(after_request_id) = after_status.strip_prefix(" [request_id=")
     {
@@ -634,25 +687,22 @@ fn muse_api_rate_limit_restriction(message: &str) -> Option<ProviderRestriction>
     } else {
         after_status.strip_prefix(": ")?
     };
-    let (details, code) = vendor_message.rsplit_once(" (")?;
-    if code.strip_suffix(')')? != "rate_limit_error" || details.is_empty() {
-        return None;
-    }
+    let (details, code) = vendor_message
+        .rsplit_once(" (")
+        .and_then(|(details, code)| {
+            let code = code.strip_suffix(')')?;
+            (code == "rate_limit_error").then_some((details, Some(code.to_owned())))
+        })
+        .unwrap_or((vendor_message, None));
 
     let retry_after = details
         .split_once("Your usage window resets at ")
         .and_then(|(_, reset)| reset.strip_suffix('.'))
         .and_then(|reset| eliot_plugin::quota::reset(Some(&Value::String(reset.to_owned()))));
-    let kind = if details.starts_with("Subscription quota exhausted.") {
-        ProviderRestrictionKind::Quota
-    } else {
-        ProviderRestrictionKind::RateLimit
-    };
-
     Some(ProviderRestriction {
-        kind,
+        kind: ProviderRestrictionKind::Quota,
         retry_after,
-        code: Some("rate_limit_error".to_owned()),
+        code,
         http_status: Some(429),
     })
 }

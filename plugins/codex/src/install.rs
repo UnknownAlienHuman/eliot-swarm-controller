@@ -9,6 +9,9 @@ use std::path::PathBuf;
 pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "codex",
+        model_hold_revision: None,
+        #[cfg(windows)]
+        launcher_update: None,
         exe_stems: &["codex"],
         strategy: InstallStrategy::ByName,
         cli_identity: None,

@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "opencode",
+        model_hold_revision: None,
+        #[cfg(windows)]
+        launcher_update: None,
         exe_stems: &["opencode"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: None,

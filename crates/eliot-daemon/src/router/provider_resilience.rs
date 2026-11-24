@@ -15,6 +15,123 @@ pub(crate) struct ProviderProbeWork {
 }
 
 impl Router {
+    /// Recheck passive metadata only for a held profile. A refresh failure
+    /// leaves ordinary Store admission and dispatch to enforce the hold.
+    pub(super) async fn refresh_model_hold(&self, profile: &str, snapshot: &Value) {
+        if let Err(error) = self.try_refresh_model_hold(profile, snapshot).await {
+            self.log_model_hold_refresh_failure(&[("profile", profile)], &error);
+        }
+    }
+
+    async fn try_refresh_model_hold(&self, profile: &str, snapshot: &Value) -> Result<()> {
+        let Some(hold) = self.inner.store.lock().await.model_mismatch_hold(profile)? else {
+            return Ok(());
+        };
+        let harness = required_text(snapshot, "harness")?;
+        let revision = eliot_plugin::install::discovery_for(harness)?
+            .model_hold_revision
+            .ok_or_else(|| {
+                Error::new("unsupported", "native model hold revision is unavailable")
+            })?;
+        let environment = super::build_process_environment(snapshot)?;
+        let current = tokio::task::spawn_blocking(move || revision(&environment))
+            .await
+            .ok()
+            .flatten()
+            .ok_or_else(|| Error::new("unavailable", "native model hold metadata read failed"))?;
+        // Compare the exact row so a concurrent newer mismatch stays held.
+        let events = {
+            let mut store = self.inner.store.lock().await;
+            let events = store.clear_changed_model_hold(&hold, &current, now_ms())?;
+            self.publish_locked(&events);
+            events
+        };
+        if !events.is_empty() {
+            self.signal_progress();
+            self.signal_launch_arbitration();
+        }
+        Ok(())
+    }
+
+    fn log_model_hold_refresh_failure(&self, ids: &[(&str, &str)], error: &Error) {
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            "provider.model_hold_refresh_failed",
+            ids,
+            Some(error),
+        );
+    }
+
+    pub(super) async fn refresh_model_hold_for_submission(
+        &self,
+        request: &SubmitCommand,
+        principal: &Principal,
+    ) {
+        if !matches!(request.verb.as_str(), "send" | "steer" | "resume") {
+            return;
+        }
+        let agents = async {
+            let store = self.inner.store.lock().await;
+            let agents = if let Some(selector) = request
+                .selector
+                .as_deref()
+                .filter(|_| request.verb == "send")
+            {
+                if request.expected_generation.is_some() {
+                    return Ok(Vec::new());
+                }
+                store.model_hold_selector_targets(&principal_name(principal), selector)?
+            } else if let Some(target) = request.target.as_deref() {
+                store
+                    .model_hold_target(target, request.expected_generation)?
+                    .into_iter()
+                    .collect()
+            } else {
+                return Ok(Vec::new());
+            };
+            if !agents.is_empty() && store.get_command(&request.id)?.is_some() {
+                return Ok(Vec::new());
+            }
+            Ok(agents)
+        }
+        .await;
+        match agents {
+            Ok(agents) => {
+                for agent in agents {
+                    self.refresh_model_hold(&agent.profile, &agent.profile_snapshot)
+                        .await;
+                }
+            }
+            Err(error) => self.log_model_hold_refresh_failure(&[("command", &request.id)], &error),
+        }
+    }
+
+    pub(super) async fn refresh_model_hold_for_dispatch(&self, command: &Command) {
+        if !matches!(
+            command.verb.as_str(),
+            "launch" | "send" | "steer" | "resume" | "inject"
+        ) {
+            return;
+        }
+        let Some(target) = command.target.as_deref() else {
+            return;
+        };
+        let agent = self
+            .inner
+            .store
+            .lock()
+            .await
+            .model_hold_target(target, command.generation);
+        match agent {
+            Ok(Some(agent)) => {
+                self.refresh_model_hold(&agent.profile, &agent.profile_snapshot)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(error) => self.log_model_hold_refresh_failure(&[("command", &command.id)], &error),
+        }
+    }
+
     pub(crate) async fn notify_provider_attention(&self) -> Result<()> {
         let notices = {
             let mut store = self.inner.store.lock().await;

@@ -119,10 +119,16 @@ pub(crate) fn acquire_operator_event(data_dir: &Path) -> Result<OwnedHandle> {
         .map_err(|error| io_error("resolve operator data root", error))?;
     let identity = root.to_string_lossy().to_lowercase();
     let hash = eliot_core::api::inference::sha256_hex(identity.as_bytes());
-    let name: Vec<u16> = format!(r"Global\EliotSwarmOperator.{hash}")
-        .encode_utf16()
-        .chain([0])
-        .collect();
+    try_acquire_global_event(&format!(r"Global\EliotSwarmOperator.{hash}"))?.ok_or_else(|| {
+        Error::new(
+            "operator_busy",
+            "another local operator or daemon startup holds this data directory",
+        )
+    })
+}
+
+fn try_acquire_global_event(name: &str) -> Result<Option<OwnedHandle>> {
+    let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let descriptor = private_security_descriptor(false)?;
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -139,19 +145,19 @@ pub(crate) fn acquire_operator_event(data_dir: &Path) -> Result<OwnedHandle> {
     };
     if handle.is_null() {
         return Err(io_error(
-            "acquire operator event",
+            "acquire global event",
             std::io::Error::from_raw_os_error(error as i32),
         ));
     }
     // SAFETY: CreateEventW returned a uniquely owned non-null handle.
     let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
-    if error == ERROR_ALREADY_EXISTS {
-        return Err(Error::new(
-            "operator_busy",
-            "another local operator or daemon startup holds this data directory",
-        ));
-    }
-    Ok(handle)
+    Ok((error != ERROR_ALREADY_EXISTS).then_some(handle))
+}
+
+/// Only one daemon can check this vendor's machine installation at once.
+/// The vendor launcher records the cadence and owns locking of its update.
+pub(crate) fn try_acquire_launcher_check(harness: &str) -> Result<Option<OwnedHandle>> {
+    try_acquire_global_event(&format!(r"Global\EliotSwarmLauncherUpdate.{harness}"))
 }
 
 pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &Path) -> Result<()> {
@@ -193,20 +199,8 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
         }
         Ok(process)
     };
-    let process = create(CREATE_BREAKAWAY_FROM_JOB)
-        .or_else(|error| {
-            let mut in_job = 0;
-            // SAFETY: the pseudo-handle is valid and the output flag is writable.
-            if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
-                && unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } != 0
-                && in_job != 0
-            {
-                // An Agent's stand can run inside the caller's non-breakaway Job.
-                return create(0);
-            }
-            Err(error)
-        })
-        .map_err(|error| io_error("start background daemon", error))?;
+    let process =
+        with_job_breakaway(create).map_err(|error| io_error("start background daemon", error))?;
     // SAFETY: successful CreateProcessW returned these two uniquely owned handles.
     // Closing them neither waits for nor terminates the detached daemon. No PID
     // is retained or adopted as later control authority.
@@ -215,6 +209,24 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
         CloseHandle(process.hProcess);
     }
     Ok(())
+}
+
+/// Prefer breakaway from any enclosing Job. A private daemon can inherit
+/// its caller's restrictive Job, which is outside its own Agents' Jobs.
+pub(crate) fn with_job_breakaway<T>(
+    mut create: impl FnMut(u32) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    create(CREATE_BREAKAWAY_FROM_JOB).or_else(|error| {
+        let mut in_job = 0;
+        // SAFETY: the pseudo-handle is valid and the output flag is writable.
+        if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
+            && unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) } != 0
+            && in_job != 0
+        {
+            return create(0);
+        }
+        Err(error)
+    })
 }
 
 pub(crate) fn windows_command_line(arguments: &[&OsStr]) -> Result<Vec<u16>> {

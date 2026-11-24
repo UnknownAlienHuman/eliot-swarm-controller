@@ -807,6 +807,8 @@ impl PluginHost {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
+        #[cfg(windows)]
+        super::launcher_update::schedule(&agent.harness, &agent.id, &command.id);
         let spawn_started = Instant::now();
         // Per-spawn crash nonce, written as the plugin's first stdin line
         // (never argv or environment): only reports carrying it and the owned
@@ -1893,6 +1895,14 @@ impl PluginHost {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The install launcher reads this interval outside the profile's
+        // credential-bearing pass_env. A malformed value uses its default.
+        if let Ok(interval) = std::env::var("MUSE_UPDATE_INTERVAL_SECONDS")
+            && interval.bytes().all(|byte| byte.is_ascii_digit())
+            && interval.parse::<i64>().is_ok()
+        {
+            command.env("MUSE_UPDATE_INTERVAL_SECONDS", interval);
+        }
         // Debug-only owner fault hook: the plugin entry point panics when
         // `ELIOT_DEBUG_PLUGIN_PANIC=1`. The child environment is rebuilt from
         // a fixed base list, so forward this one flag explicitly or the hook
@@ -3128,7 +3138,7 @@ fn validate_agent_command_result(value: Value, harness: &str, command: &Command)
             } else {
                 Err(Error::new(
                     "unknown",
-                    "Claude configure reply did not prove acceptance of the requested selector",
+                    "Native configure reply did not prove acceptance of the requested selector",
                 ))
             }
         }
@@ -3436,6 +3446,7 @@ const BASE_ENVIRONMENT_NAMES: &[&str] = &[
     "SystemRoot",
     "SystemDrive",
     "ProgramData",
+    "ProgramFiles",
     "PATHEXT",
     "PATH",
     "TEMP",
@@ -3639,6 +3650,9 @@ fn prepare_process_environment(
                     "invalid",
                     "frozen profile pass_env cannot include reserved ELIOT_* names",
                 ));
+            }
+            if crate::config::managed_native_update_environment_name(name) {
+                continue;
             }
             if let Some(selector) = crate::config::native_store_selector(name) {
                 let frozen = captured.into_iter().flatten().find_map(|(name, value)| {

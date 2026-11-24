@@ -351,6 +351,7 @@ pub(super) fn admit_send_member(
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
+    provider_holds::require_model_unheld(tx, agent)?;
     let agent_num = parse_agent_id(&agent.id)?;
     if agent.archived {
         return Err(Error::new(
@@ -1414,6 +1415,7 @@ fn prepare_implicit_resume_send_tx(
     let Some(agent) = load_agent_by_num(tx, agent_num)? else {
         return Ok(false);
     };
+    provider_holds::require_model_unheld(tx, &agent)?;
     if !matches!(agent.state, AgentState::Lost | AgentState::Stopped)
         || request.args.get("notice_kind").is_some()
     {
@@ -1583,6 +1585,7 @@ fn admit_resume_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+    provider_holds::require_model_unheld(tx, &agent)?;
     if agent.archived {
         return Err(Error::new(
             "bad_state",

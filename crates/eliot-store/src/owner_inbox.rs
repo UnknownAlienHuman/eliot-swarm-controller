@@ -828,7 +828,8 @@ fn project_holds(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE CAST(json_extract(e.data,'$.scope') AS TEXT)=h.scope
                   AND e.kind IN ('provider.hold_updated','provider.hold_probe_started','provider.hold_probe_budget_exhausted',
                     'provider.hold_probe_outcome_unknown','provider.hold_cleared','provider.hold_probe_deferred')),0),
-                EXISTS(SELECT 1 FROM commands c WHERE c.id=h.probe_command AND c.state IN ('accepted','queued','dispatched'))
+                EXISTS(SELECT 1 FROM commands c WHERE c.id=h.probe_command AND c.state IN ('accepted','queued','dispatched')),
+                h.source
          FROM provider_holds h WHERE h.state IN ('held','probing')", "h.scope=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -845,6 +846,7 @@ fn project_holds(
                 r.get::<_, i64>(9)?,
                 r.get::<_, i64>(10)?,
                 r.get::<_, bool>(11)?,
+                r.get::<_, Option<String>>(12)?,
             ))
         })
         .map_err(sql_error)?;
@@ -862,6 +864,7 @@ fn project_holds(
             updated,
             seq,
             probe_active,
+            source,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "held" => eliot_core::ProviderHoldState::Held,
@@ -873,6 +876,7 @@ fn project_holds(
             "quota" => eliot_core::ProviderRestrictionKind::Quota,
             "auth" => eliot_core::ProviderRestrictionKind::Auth,
             "model_removed" => eliot_core::ProviderRestrictionKind::ModelRemoved,
+            "model_mismatch" => eliot_core::ProviderRestrictionKind::ModelMismatch,
             _ => {
                 return Err(crate::Error::new(
                     "corrupt",
@@ -922,13 +926,18 @@ fn project_holds(
             } else {
                 "provider_probe_budget_exhausted"
             };
+            let mismatch_reason = source
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<eliot_core::ProviderHoldSource>(raw).ok())
+                .and_then(|source| source.model_mismatch)
+                .map(|mismatch| mismatch.reason());
             items.push(item(
                 OwnerInboxKind::Hold,
                 scope,
                 format!("held:{since}:updated:{updated}:event:{seq}"),
                 now,
                 since,
-                reason,
+                mismatch_reason.as_deref().unwrap_or(reason),
                 None,
                 choices,
             ));

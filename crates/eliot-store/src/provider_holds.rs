@@ -208,6 +208,128 @@ impl Store {
         list_page(&self.connection, after, limit)
     }
 
+    pub fn model_mismatch_hold(&self, profile: &str) -> Result<Option<ProviderHold>> {
+        self.ensure_committed_reads()?;
+        Ok(get(&self.connection, &core::model_hold_scope(profile))?
+            .filter(|hold| hold.kind == ProviderRestrictionKind::ModelMismatch))
+    }
+
+    /// Hydrate a target only when its frozen profile has a mismatch hold.
+    pub fn model_hold_target(&self, id: &str, generation: Option<i64>) -> Result<Option<Agent>> {
+        self.ensure_committed_reads()?;
+        let id = parse_agent_id(id)?;
+        let held = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM agents AS a
+                JOIN provider_holds AS h ON h.scope = ?3 || a.profile
+                WHERE a.id = ?1 AND (?2 IS NULL OR a.generation = ?2)
+                  AND a.observe_only = 0 AND h.kind = 'model_mismatch'
+            )",
+                params![id, generation, core::model_hold_scope("")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if held {
+            load_agent_by_num(&self.connection, id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check for a held selector member before hydrating the authorized tree.
+    /// Admission expands and checks the selector again in its transaction.
+    pub fn model_hold_selector_targets(
+        &self,
+        principal: &str,
+        selector: &str,
+    ) -> Result<Vec<Agent>> {
+        self.ensure_committed_reads()?;
+        let root = core::api::parse_tree_selector(selector)?;
+        let ids = super::hierarchy::subtree_member_nums(
+            &self.connection,
+            root,
+            self.hierarchy_limits.max_selector_targets,
+        )?;
+        let held = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM json_each(?1) AS member
+                JOIN agents AS a ON a.id = member.value
+                JOIN provider_holds AS h ON h.scope = ?2 || a.profile
+                WHERE a.observe_only = 0 AND a.state NOT IN ('stopped', 'failed', 'lost')
+                  AND h.kind = 'model_mismatch'
+            )",
+                params![encode_json(&ids)?, core::model_hold_scope("")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if !held {
+            return Ok(Vec::new());
+        }
+        let mut agents = super::hierarchy::snapshot_selector_members(
+            &self.connection,
+            principal,
+            selector,
+            self.hierarchy_limits,
+        )?;
+        agents.retain(|agent| !agent.state.is_terminal() && !agent.observe_only);
+        Ok(agents)
+    }
+
+    /// Refresh only the exact mismatch row read before checking the
+    /// installed runtime and settings.
+    pub fn clear_changed_model_hold(
+        &mut self,
+        expected: &ProviderHold,
+        revision: &str,
+        now: i64,
+    ) -> Result<Vec<core::Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let Some(mismatch) = expected
+                .source
+                .as_ref()
+                .and_then(|source| source.model_mismatch.as_ref())
+            else {
+                return Ok(Vec::new());
+            };
+            // A hold observed without readable metadata gets one attempt
+            // when a revision becomes available.
+            if mismatch.revision.as_deref() == Some(revision) {
+                return Ok(Vec::new());
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if get(&tx, &expected.scope)?.as_ref() != Some(expected)
+                || !admin::clear_hold_tx(&tx, &expected.scope, None)?
+            {
+                return Ok(Vec::new());
+            }
+            let event = super::insert_daemon_event(
+                &tx,
+                now,
+                "provider.hold_cleared",
+                "provider",
+                None,
+                None,
+                json!({"scope": expected.scope, "reason": "model_route_changed"}),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(vec![event])
+        })();
+        // Refresh is optional. A failed pre-commit operation can leave the
+        // writer usable after rollback. Uncertain commits stay fenced.
+        if !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+        }
+        result
+    }
+
     pub fn provider_probe_attention(&self, limit: usize) -> Result<Vec<ProviderHold>> {
         self.ensure_committed_reads()?;
         admin::attention(&self.connection, limit)
@@ -721,6 +843,7 @@ impl Store {
 }
 
 pub(super) fn require_unheld_tx(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
+    require_model_unheld(tx, agent)?;
     let scope = core::frozen_provider_scope(agent)?;
     if get(tx, &scope)?.is_some() {
         return Err(Error::new(
@@ -731,11 +854,23 @@ pub(super) fn require_unheld_tx(tx: &Transaction<'_>, agent: &Agent) -> Result<(
     Ok(())
 }
 
+pub(super) fn require_model_unheld(connection: &rusqlite::Connection, agent: &Agent) -> Result<()> {
+    if let Some(hold) = get(connection, &core::model_hold_scope(&agent.profile))?
+        && let Some(mismatch) = hold.source.and_then(|source| source.model_mismatch)
+    {
+        return Err(
+            Error::new("provider_held", mismatch.reason()).with_where("provider.model_mismatch")
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn require_automatic_probe_due_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
     now: i64,
 ) -> Result<()> {
+    require_model_unheld(tx, agent)?;
     let scope = core::frozen_provider_scope(agent)?;
     if !get(tx, &scope)?.is_some_and(|hold| automatic_probe_due(&hold, now)) {
         return Err(provider_held());
@@ -762,6 +897,7 @@ pub(super) fn launch_probe(
     agent: &Agent,
     at: Option<i64>,
 ) -> Result<bool> {
+    require_model_unheld(connection, agent)?;
     let scope = core::frozen_provider_scope(agent)?;
     match get(connection, &scope)? {
         None => Ok(false),
@@ -785,7 +921,10 @@ fn automatic_probe_due(hold: &ProviderHold, now: i64) -> bool {
 }
 
 pub(super) fn profile_held(connection: &rusqlite::Connection, agent: &Agent) -> Result<bool> {
-    Ok(get(connection, &core::frozen_provider_scope(agent)?)?.is_some())
+    Ok(
+        get(connection, &core::model_hold_scope(&agent.profile))?.is_some()
+            || get(connection, &core::frozen_provider_scope(agent)?)?.is_some(),
+    )
 }
 
 /// Bind a probe claim only after its accepted command row exists in this same
@@ -798,6 +937,7 @@ pub(super) fn admit_send_tx(
     automatic_generation: Option<i64>,
     now: i64,
 ) -> Result<Vec<core::Event>> {
+    require_model_unheld(tx, agent)?;
     let automatic = automatic_generation.is_some();
     // A linked launch SEND belongs to the reserved generation even while the
     // Agent projection is still Created at generation zero.
@@ -960,6 +1100,7 @@ pub(super) fn require_dispatch_tx(
     agent: &Agent,
     command: &Command,
 ) -> Result<()> {
+    require_model_unheld(tx, agent)?;
     let scope = core::frozen_provider_scope(agent)?;
     let background_launch =
         command.verb == "launch" && command.args.get(core::PROVIDER_PROBE_LAUNCH_ARG).is_some();
@@ -1084,10 +1225,13 @@ pub(super) fn terminal_tx(
     let restriction_value = native_event.data.get("provider_restriction");
     let restriction = restriction_value
         .and_then(|value| serde_json::from_value::<ProviderRestriction>(value.clone()).ok())
-        .filter(|restriction| restriction.validate().is_ok());
+        .filter(|restriction| {
+            restriction.kind != ProviderRestrictionKind::ModelMismatch
+                && restriction.validate().is_ok()
+        });
     let mut events = Vec::new();
     if let Some(restriction) = &restriction
-        && let Some(event) = record_restriction_tx(tx, agent, turn_id, restriction, now)?
+        && let Some(event) = record_restriction_tx(tx, agent, turn_id, restriction, None, now)?
     {
         let reaction = core::AttentionStep {
             incident_id: format!("provider-refusal-{}", event.seq),
@@ -1268,15 +1412,63 @@ pub(super) fn command_terminal_tx(
     Ok(())
 }
 
+pub(super) fn model_mismatch_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    event: &core::NativeEvent,
+    now: i64,
+) -> Result<Option<core::Event>> {
+    let Some(evidence) = event.data.get("model_mismatch") else {
+        return Ok(None);
+    };
+    let turn = event.data["turn_id"]
+        .as_str()
+        .filter(|turn| Some(*turn) == agent.active_turn.as_deref());
+    if agent.observe_only
+        || !core::api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+        || turn.is_none()
+    {
+        return Err(Error::new(
+            "source_integrity",
+            "model mismatch is not bound to the owned turn",
+        ));
+    }
+    let mismatch: core::ProviderModelMismatch = serde_json::from_value(evidence.clone())
+        .map_err(|_| Error::new("invalid", "invalid model mismatch hold evidence"))?;
+    mismatch.validate()?;
+    let restriction = ProviderRestriction {
+        kind: ProviderRestrictionKind::ModelMismatch,
+        retry_after: None,
+        code: Some("model_mismatch".to_owned()),
+        http_status: None,
+    };
+    record_restriction_tx(
+        tx,
+        agent,
+        turn.unwrap_or_default(),
+        &restriction,
+        Some(mismatch),
+        now,
+    )
+}
+
 fn record_restriction_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
     turn_id: &str,
     restriction: &ProviderRestriction,
+    model_mismatch: Option<core::ProviderModelMismatch>,
     now: i64,
 ) -> Result<Option<core::Event>> {
-    let scope = core::frozen_provider_scope(agent)?;
+    let scope = if model_mismatch.is_some() {
+        core::model_hold_scope(&agent.profile)
+    } else {
+        core::frozen_provider_scope(agent)?
+    };
     let current = get(tx, &scope)?;
+    if model_mismatch.is_some() && current.is_some() {
+        return Ok(None);
+    }
     if let Some(current) = &current
         && is_permanent(current.kind)
         && !is_permanent(restriction.kind)
@@ -1346,6 +1538,7 @@ fn record_restriction_tx(
             harness: agent.harness.clone(),
             code: restriction.code.clone(),
             http_status: restriction.http_status,
+            model_mismatch,
         }),
         retry_after,
         next_probe_at,
@@ -1611,7 +1804,9 @@ fn has_intervening_same_scope_restriction_tx(
 fn is_permanent(kind: ProviderRestrictionKind) -> bool {
     matches!(
         kind,
-        ProviderRestrictionKind::Auth | ProviderRestrictionKind::ModelRemoved
+        ProviderRestrictionKind::Auth
+            | ProviderRestrictionKind::ModelRemoved
+            | ProviderRestrictionKind::ModelMismatch
     )
 }
 

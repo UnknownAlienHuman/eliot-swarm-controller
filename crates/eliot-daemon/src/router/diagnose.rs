@@ -214,15 +214,20 @@ impl Router {
             .get_agent(agent)?
             .ok_or_else(|| Error::new("not_found", format!("Agent {agent} was not found")))?;
         let generation = row.generation;
+        let model_mismatch = row
+            .effective
+            .as_ref()
+            .and_then(|effective| effective["model_mismatch"].as_str());
         let mut steps = vec![DiagnoseStep {
             kind: "agent".to_owned(),
-            code: Some(bound_chars(
-                eliot_core::api::agent_state_name(row.state),
-                128,
-            )),
-            message: None,
+            code: Some(if model_mismatch.is_some() {
+                "model_mismatch".to_owned()
+            } else {
+                eliot_core::api::agent_state_name(row.state).to_owned()
+            }),
+            message: model_mismatch.map(|message| bound_chars(message, 1024)),
             failure_where: None,
-            origin: None,
+            origin: model_mismatch.map(|_| "harness".to_owned()),
             origin_evidence: None,
             exit_code: None,
             ntstatus: None,

@@ -1171,6 +1171,7 @@ impl Router {
         launch_binding: &Option<(Agent, eliot_plugin::protocol::ProfileStoreResult)>,
     ) -> Option<DispatchedCommand> {
         loop {
+            self.refresh_model_hold_for_dispatch(command).await;
             let change = {
                 let mut store = self.inner.store.lock().await;
                 let dispatched = match launch_binding {

@@ -111,11 +111,12 @@ pub use remote_call::{RemoteCallContext, RemoteIdentity};
 pub use restart::{RESTART_PRINCIPAL, format_restart_interrupted_turn_note_body};
 pub use routing::{
     CapacityScope, MAX_AUTOMATIC_PROVIDER_PROBES, MAX_PROVIDER_RESET_HORIZON_MS,
-    PROVIDER_LAUNCH_OVERRIDE_FIELDS, PROVIDER_PROBE_LAUNCH_ARG, PROVIDER_PROBE_PROMPT,
-    ProviderHold, ProviderHoldSource, ProviderHoldState, ProviderRestriction,
-    ProviderRestrictionKind, RouteBinding, RouteQuotaStatus, RouteSkip, RouteSkipReason,
-    RoutingDecision, UNATTRIBUTED_PROVIDER_HOLD_REASON, frozen_provider_scope,
-    frozen_provider_scope_for, handoff_authority_refusal, is_unattributed_provider_hold,
+    PROVIDER_LAUNCH_OVERRIDE_FIELDS, PROVIDER_MODEL_UNNAMED, PROVIDER_PROBE_LAUNCH_ARG,
+    PROVIDER_PROBE_PROMPT, ProviderHold, ProviderHoldSource, ProviderHoldState,
+    ProviderModelMismatch, ProviderRestriction, ProviderRestrictionKind, RouteBinding,
+    RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision,
+    UNATTRIBUTED_PROVIDER_HOLD_REASON, frozen_provider_scope, frozen_provider_scope_for,
+    handoff_authority_refusal, is_unattributed_provider_hold, model_hold_scope,
     provider_switch_authority,
 };
 pub use secrets::SecretPolicy;
@@ -2114,6 +2115,7 @@ impl Error {
             crate::ProviderRestrictionKind::Quota => "quota_exhausted",
             crate::ProviderRestrictionKind::Auth => "provider_unauthorized",
             crate::ProviderRestrictionKind::ModelRemoved => "model_unavailable",
+            crate::ProviderRestrictionKind::ModelMismatch => "model_mismatch",
         };
         Self::new(
             code,
@@ -2125,6 +2127,7 @@ impl Error {
                     crate::ProviderRestrictionKind::Auth => "rejected the credentials for",
                     crate::ProviderRestrictionKind::ModelRemoved =>
                         "no longer serves the model for",
+                    crate::ProviderRestrictionKind::ModelMismatch => "changed the model for",
                 }
             ),
         )
@@ -2337,6 +2340,12 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 return Err(bad_state(event, "turn.started requires an idle Agent"));
             }
             let turn_id = required_text(event, "turn_id")?;
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+                && let Some(Value::Object(effective)) = next.effective.as_mut()
+            {
+                effective.insert("model".to_owned(), Value::Null);
+                effective.insert("model_verified".to_owned(), Value::Bool(false));
+            }
             if let Some(trigger) = optional_native_trigger(event)? {
                 if event.data.get("command_id").is_some() {
                     return Err(Error::new(
@@ -2358,9 +2367,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             // Refresh the admitted native settings when the harness reports
             // what the native turn runs under (Codex reports the model and
             // effort its turn request carried, only under a `configure`
-            // overlay; Muse reports its session-verified model on every
-            // association once verified, plus the carried effort under an
-            // overlay): the
+            // overlay; Muse reports the carried effort under an overlay): the
             // exact-turn association acknowledges native admission of those
             // values, so they read back verified as carried. Absent fields
             // invent nothing and a missing `effective` object is never
@@ -2393,7 +2400,32 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.model_observed" => {
             require_live_turn(agent, event)?;
-            record_serving_model(&mut next, required_text(event, "model")?);
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification {
+                if let Some(mismatch) = event.data.get("model_mismatch") {
+                    let mismatch: routing::ProviderModelMismatch =
+                        serde_json::from_value(mismatch.clone()).map_err(|_| {
+                            Error::new("invalid", "invalid provider model mismatch evidence")
+                        })?;
+                    mismatch.validate()?;
+                    if let Some(Value::Object(effective)) = next.effective.as_mut() {
+                        effective.insert("model".to_owned(), Value::Null);
+                        effective.insert("model_verified".to_owned(), Value::Bool(false));
+                        effective.remove("model_unverified_reason");
+                        effective.insert(
+                            "model_mismatch".to_owned(),
+                            Value::String(mismatch.reason()),
+                        );
+                    }
+                } else if event.data["model_unverified_reason"].as_str()
+                    == Some(routing::PROVIDER_MODEL_UNNAMED)
+                {
+                    record_unnamed_provider_model(&mut next);
+                } else {
+                    record_serving_model(&mut next, required_text(event, "model")?);
+                }
+            } else {
+                record_serving_model(&mut next, required_text(event, "model")?);
+            }
         }
         "turn.notice" => {
             require_live_turn(agent, event)?;
@@ -2530,6 +2562,12 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         "turn.completed" => {
             require_live_turn(agent, event)?;
             let terminal = native_turn_terminal(event, now)?;
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+                && event.data["model_unverified_reason"].as_str()
+                    == Some(routing::PROVIDER_MODEL_UNNAMED)
+            {
+                record_unnamed_provider_model(&mut next);
+            }
             // A harness-observed MCP inventory rides the terminal the same
             // way an observed model rides its message: merged as the only
             // change into the effective set, so a proven readback surfaces
@@ -2684,6 +2722,19 @@ fn record_serving_model(agent: &mut Agent, model: String) {
     {
         effective.insert("model".to_owned(), Value::String(model));
         effective.insert("model_verified".to_owned(), Value::Bool(true));
+        effective.remove("model_unverified_reason");
+        effective.remove("model_mismatch");
+    }
+}
+
+fn record_unnamed_provider_model(agent: &mut Agent) {
+    if let Some(Value::Object(effective)) = agent.effective.as_mut() {
+        effective.insert("model".to_owned(), Value::Null);
+        effective.insert("model_verified".to_owned(), Value::Bool(false));
+        effective.insert(
+            "model_unverified_reason".to_owned(),
+            Value::String(routing::PROVIDER_MODEL_UNNAMED.to_owned()),
+        );
     }
 }
 

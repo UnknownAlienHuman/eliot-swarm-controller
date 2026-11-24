@@ -162,6 +162,7 @@ pub fn agent_status_line(
             ProviderRestrictionKind::Quota => "quota exhausted",
             ProviderRestrictionKind::Auth => "authentication required",
             ProviderRestrictionKind::ModelRemoved => "model unavailable",
+            ProviderRestrictionKind::ModelMismatch => "model mismatch",
         };
         let waiting_for_provider = active_turn.is_some()
             && (matches!(

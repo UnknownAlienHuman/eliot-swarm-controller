@@ -285,6 +285,11 @@ pub(super) fn persist_effects(
     };
     let mut command_events = Vec::new();
     let mut provider_events = Vec::new();
+    if native_event.kind == "turn.model_observed"
+        && let Some(event) = provider_holds::model_mismatch_tx(tx, next_agent, native_event, now)?
+    {
+        provider_events.push(event);
+    }
     if matches!(
         native_event.kind.as_str(),
         "hook.before_tool" | "hook.after_tool" | "hook.before_model"

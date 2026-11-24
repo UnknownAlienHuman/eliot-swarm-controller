@@ -194,6 +194,7 @@ fn hold_from_raw(raw: RawHold) -> Result<ProviderHold> {
         "quota" => ProviderRestrictionKind::Quota,
         "auth" => ProviderRestrictionKind::Auth,
         "model_removed" => ProviderRestrictionKind::ModelRemoved,
+        "model_mismatch" => ProviderRestrictionKind::ModelMismatch,
         _ => return Err(Error::new("internal", "unknown provider hold kind")),
     };
     let state = match state.as_str() {
