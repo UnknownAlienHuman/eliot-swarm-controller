@@ -827,9 +827,16 @@ in its worktree under the same proof. On Windows the Job proves the whole family
 custody is degraded and proves what its process-group drain can.
 
 **Task record.** `refs/eliot/tasks/<input digest>` in the daemon-owned repository
-holds `task.md` (the full task), `card.json` (branch, base, Agent, profile, Goal and
-check) and `journal.md`. Known
-secrets and text shaped like a credential are redacted in all three. For a task the
+holds the exact original text in `task.md`, its origin and ordered Owner
+corrections in `instructions.json`, branch, base, Agent, profile, Goal and check
+in `card.json`, and reports in `journal.md`. Known secrets and text shaped like
+a credential are redacted. The Store binds the task ref to its exact selected
+command. A handoff captures the original correction bodies and their delivery
+facts through that binding. The task ref points to one parentless snapshot and
+older revisions are eligible for Git maintenance. A bounded per-source omission
+map adds distinct discarded corrections and compacted source totals. Admission
+order prevents a repeated Store scan from counting a discarded correction twice.
+The reported count remains a lower bound when older coverage is incomplete. For a task the
 Owner wrote directly, the card lists the path, size and SHA-256 of up to eight absolute
 `.md`/`.txt` files the task names. When that task text is only a pointer (at most 512
 bytes outside any delivered source block), the named file is the task, so a regular

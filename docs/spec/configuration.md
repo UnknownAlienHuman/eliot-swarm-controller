@@ -370,13 +370,18 @@ The Agent's Store record contains delivery metadata. `agent.get` and
 The owner rules text stays out of the Agent and profile readbacks. The unified
 settings read warns above 8 KiB of UTF-8 owner rules. The human-readable Agent view
 warns when readable project instruction files total more than 4 KiB of UTF-8 data.
-The first-input fallback enforces the existing 64 KiB persisted-text budget.
 
 Codex receives the frozen text through native thread developer instructions.
 Claude uses `--append-system-prompt-file` with an owned instance file. OpenCode v2
 loads the instance's isolated `AGENTS.md`. The Muse and Antigravity adapters declare
 first-input delivery. The daemon appends a fenced owner rules block after any
 quoted project-source data, including when the first input is a later `send`.
+The renderer reserves the exact first-input block and separator before allocating
+space for required and primary instruction sources. A launch with required sources
+freezes the rules revision and digest when it renders those sources. If the settings
+no longer supply that digest at delivery, the launch refuses before native start.
+The [source delivery contract](api.md#cli) covers the shared budget, completeness
+and the queued-launch source snapshot.
 
 A launch records `pending` independently of the linked input. A definite launch
 failure, rejection or cancellation settles an unbound receipt for that generation
@@ -1651,6 +1656,9 @@ transaction with fresh command IDs and the retained workspace. It chooses the fi
 eligible profile that is both in the current `handoff_fallback` order and still in the
 frozen list. Each switch removes its selected profile from that list. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
+The worker freezes the healthy stream boundary before STOP and rechecks it after
+the exact reserved stop drains. Only the daemon's terminal marker after that
+stop's dispatch is allowed as a new stream gap.
 An automated launch's provider successor applies the same quota admission policy.
 
 #### Automatic handoff (#918)

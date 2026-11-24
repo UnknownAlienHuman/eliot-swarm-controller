@@ -6,9 +6,12 @@ use crate::work_truth::{self, CheckpointRequest, TaskRecord, TaskSource};
 use eliot_core::api::{GitCheckpointState, HandoffReason};
 use eliot_store::{
     AutomaticHandoff, BriefFacts, GitCheckpointInput, GitCheckpointIntent,
-    GitCheckpointReservation, JournalTurn,
+    GitCheckpointReservation, JournalTurn, TaskInputs, TaskInstruction,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 use tokio::sync::broadcast;
 
 const JOURNAL_TEXT_BYTES: usize = 4 * 1024;
@@ -641,7 +644,7 @@ impl Router {
             return Ok(());
         };
         let policy = self.secret_policy_snapshot();
-        let raw = command.args["text"].as_str().unwrap_or_default();
+        let raw = eliot_store::input_before_owner_rules(&command).unwrap_or_default();
         let text = work_truth::redact_record(raw, &policy);
         let owner_authored = !row
             .profile_choice
@@ -682,6 +685,10 @@ impl Router {
                 text,
                 card,
                 sources,
+                inputs: TaskInputs {
+                    original: TaskInstruction::from_command(&command, String::new()),
+                    ..TaskInputs::default()
+                },
             },
         )
         .await?;
@@ -695,44 +702,119 @@ impl Router {
         )
     }
 
-    /// Checkpoint the source and read the facts its successor's brief quotes.
-    pub(super) async fn handoff_git_facts(
+    /// Freeze the mandatory task material before a switch dispatches STOP.
+    async fn prepare_handoff_task(
         &self,
-        agent: &str,
+        source: &Agent,
         task_command: Option<&str>,
-    ) -> BriefFacts {
-        self.read_handoff_facts(agent, task_command)
-            .await
-            .unwrap_or_default()
+    ) -> Result<BriefFacts> {
+        if !records_work(source) {
+            return Ok(BriefFacts::default());
+        }
+        self.ensure_work_task(&source.id, source.generation, task_command)
+            .await?;
+        let (reference, command) = {
+            let store = self.inner.store.lock().await;
+            (
+                store.work_task_ref(&source.id, source.generation)?,
+                store.work_task_command(&source.id, source.generation)?,
+            )
+        };
+        match (reference, command) {
+            (Some(reference), Some(command)) => {
+                work_truth::read_handoff_task(
+                    &self.inner.data_root,
+                    &reference,
+                    command,
+                    &self.secret_policy_snapshot(),
+                )
+                .await
+            }
+            _ => Ok(BriefFacts::default()),
+        }
     }
 
-    async fn read_handoff_facts(
+    /// Freeze task, delivery and Git facts before any switch crosses STOP.
+    pub(super) async fn prepare_handoff_facts(
         &self,
-        agent: &str,
-        task_command: Option<&str>,
-    ) -> Option<BriefFacts> {
-        let source = {
-            let store = self.inner.store.lock().await;
-            store.get_agent(agent).ok().flatten()
-        }?;
-        if !records_work(&source) {
-            return None;
-        }
-        if let Err(error) = self
-            .ensure_work_task(agent, source.generation, task_command)
-            .await
+        source: &Agent,
+        selected_task: Option<&str>,
+    ) -> Result<BriefFacts> {
+        let mut facts = self.prepare_handoff_task(source, selected_task).await?;
+        let Some(workspace) = source.workspace.as_deref().filter(|_| records_work(source)) else {
+            return Ok(facts);
+        };
+        let agent = &source.id;
+        let policy = self.secret_policy_snapshot();
+        if let (Some(reference), Some(command)) =
+            (facts.task_ref.as_deref(), facts.task_command.as_deref())
         {
-            self.log_work_truth_error("daemon.work_task_failed", &error);
+            let (original, mut corrections, omitted, history_unresolved) = {
+                let store = self.inner.store.lock().await;
+                let original_id = facts
+                    .task_inputs
+                    .original
+                    .as_ref()
+                    .map_or(command, |input| input.command_id.as_str());
+                let original = store
+                    .get_command(original_id)?
+                    .and_then(|row| TaskInstruction::from_command(&row, String::new()));
+                let mut corrections = Vec::new();
+                for saved in &facts.task_inputs.corrections {
+                    if let Some(row) = store.get_command(&saved.command_id)?
+                        && row.target.as_deref() == Some(&saved.source)
+                        && row.generation == Some(saved.generation)
+                        && row.principal == saved.principal
+                        && row.verb == saved.verb
+                        && row.state != saved.state
+                    {
+                        let mut refreshed = saved.clone();
+                        refreshed.state = row.state;
+                        corrections.push(refreshed);
+                    }
+                }
+                let mut omitted = BTreeMap::new();
+                if facts.task_inputs.history_incomplete
+                    && let Some(origin) = facts.task_inputs.original.as_ref()
+                    && origin.principal == "unverified"
+                    && (origin.source != *agent || origin.generation != source.generation)
+                {
+                    let (prior, missing) = store.task_owner_corrections(
+                        &origin.source,
+                        origin.generation,
+                        &origin.command_id,
+                        &policy,
+                    )?;
+                    corrections.extend(prior);
+                    if let Some(missing) = missing {
+                        omitted.insert(format!("{}/{}", origin.source, origin.generation), missing);
+                    }
+                }
+                let (current, missing) =
+                    store.task_owner_corrections(agent, source.generation, command, &policy)?;
+                corrections.extend(current);
+                if let Some(missing) = missing {
+                    omitted.insert(format!("{agent}/{}", source.generation), missing);
+                }
+                let history_unresolved = store.handoff_history_unresolved(agent)?;
+                (original, corrections, omitted, history_unresolved)
+            };
+            for correction in &mut corrections {
+                correction.text = work_truth::redact_record(&correction.text, &policy);
+            }
+            facts.task_inputs = work_truth::record_task_inputs(
+                &self.inner.data_root,
+                reference,
+                original,
+                corrections,
+                omitted,
+                history_unresolved,
+            )
+            .await?;
         }
-        if let Err(error) = self
-            .checkpoint_work(agent, source.generation, "handoff", None)
-            .await
-        {
-            self.log_work_truth_error("daemon.handoff_checkpoint_failed", &error);
-        }
-        let workspace = source.workspace.as_deref()?;
-        // The stored row names the snapshot even when this pass found no change.
-        let (recorded, base, task_command) = {
+        // The post-STOP checkpoint can advance this retained reference. It
+        // cannot change or invalidate the frozen input.
+        let (recorded, base) = {
             let store = self.inner.store.lock().await;
             (
                 store
@@ -745,28 +827,15 @@ impl Router {
                     .flatten()
                     .map(|(_, base)| base)
                     .or_else(|| source.base_oid.clone()),
-                store
-                    .work_task_command(agent, source.generation)
-                    .ok()
-                    .flatten(),
             )
         };
-        let (task, checkpoint) = recorded
-            .map(|view| (view.task_ref, view.checkpoint))
-            .unwrap_or_default();
-        let (task_note, task_text) = match task.as_deref() {
-            Some(reference) => (
-                work_truth::task_source_note(&self.inner.data_root, workspace, reference).await,
-                work_truth::task_record_text(&self.inner.data_root, workspace, reference).await,
-            ),
-            None => (None, None),
-        };
-        let git = match work_truth::handoff_facts(
+        let checkpoint = recorded.and_then(|view| view.checkpoint);
+        facts.git = match work_truth::handoff_facts(
             workspace,
             base.as_deref(),
-            task.as_deref(),
+            facts.task_ref.as_deref(),
             checkpoint.as_ref(),
-            &self.secret_policy_snapshot(),
+            &policy,
         )
         .await
         {
@@ -776,12 +845,17 @@ impl Router {
                 None
             }
         };
-        Some(BriefFacts {
-            git,
-            task_command,
-            task_note,
-            task_text,
-        })
+        Ok(facts)
+    }
+
+    pub(super) async fn checkpoint_handoff_source(&self, source: &Agent) {
+        if records_work(source)
+            && let Err(error) = self
+                .checkpoint_work(&source.id, source.generation, "handoff", None)
+                .await
+        {
+            self.log_work_truth_error("daemon.handoff_checkpoint_failed", &error);
+        }
     }
 
     fn log_work_truth_error(&self, name: &str, error: &Error) {

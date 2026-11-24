@@ -71,29 +71,6 @@ pub(super) struct ContextConsumer<'a> {
 }
 
 impl Store {
-    /// Most recent proven handoff input that this Agent has already accepted.
-    pub fn task_card_handoff_brief(&self, agent: &str, generation: i64) -> Result<Option<Command>> {
-        let id: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT id FROM commands INDEXED BY commands_target
-             WHERE target = ?1 AND generation <= ?2 AND verb = 'send'
-               AND link_kind = 'handoff' AND ordinal = 0
-             ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                params![parse_agent_id(agent)?, generation],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        id.map(|id| self.get_command(&id))
-            .transpose()
-            .map(|command| {
-                command
-                    .flatten()
-                    .filter(|command| command.state == CommandState::Applied)
-            })
-    }
-
     pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         let record = self
             .connection

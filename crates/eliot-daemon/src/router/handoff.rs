@@ -23,9 +23,18 @@ impl Router {
             }
             store.check_handoff_caller(&principal_name(principal), &request)?;
         }
+        let source = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent(&request.from)?
+            .filter(|source| source.generation == request.from_generation)
+            .ok_or_else(|| Error::new("stale_generation", "handoff source generation moved"))?;
+        self.checkpoint_handoff_source(&source).await;
         let git = self
-            .handoff_git_facts(&request.from, Some(&request.task_command))
-            .await;
+            .prepare_handoff_facts(&source, Some(&request.task_command))
+            .await?;
         let change = {
             let mut store = self.inner.store.lock().await;
             if let Some(value) = store.replay_handoff(&principal_name(principal), &request)? {
@@ -52,7 +61,12 @@ impl Router {
             self.publish_locked(&change.events);
             // No await between commit and scheduling: cancellation cannot strand inputs.
             if change.is_new {
-                self.queue_handoff_task_card(&mut store, &change.value, &change.events);
+                self.queue_handoff_task_card(
+                    &mut store,
+                    &change.value,
+                    &change.events,
+                    git.applied_task_text(),
+                );
                 for child in &change.value.children {
                     self.schedule_command(child.clone(), None);
                 }

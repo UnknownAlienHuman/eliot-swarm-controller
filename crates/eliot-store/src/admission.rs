@@ -71,10 +71,11 @@ pub(super) fn command_payload_digest(request: &SubmitCommand) -> Result<Vec<u8>>
             .remove("profile_snapshot");
     }
     if request.verb == "launch" {
-        semantic_args
+        let args = semantic_args
             .as_object_mut()
-            .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?
-            .remove("instruction_sources");
+            .ok_or_else(|| Error::new("invalid", "launch args must be an object"))?;
+        args.remove("instruction_sources");
+        args.remove(LAUNCH_SOURCE_RULES_ARG);
     }
     if request.verb == "launch"
         && semantic_args

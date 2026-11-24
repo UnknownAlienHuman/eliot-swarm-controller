@@ -125,6 +125,16 @@ pub struct HandoffResponse {
     pub goal_revision: Option<i64>,
     pub reparented: Vec<ReparentedAgent>,
     pub brief_truncated: bool,
+    /// Lower bound on later inputs omitted from the brief. Exact retained
+    /// Owner inputs may still be available in the Git task record.
+    #[serde(default)]
+    pub brief_omitted_instructions: usize,
+    /// Prior input coverage could not be verified from structured records.
+    #[serde(default)]
+    pub brief_history_incomplete: bool,
+    /// Number of saved sources delivered in full from the selected Git task.
+    #[serde(default)]
+    pub brief_saved_sources: Option<usize>,
     /// Current readback; immutable transfer identities above never change.
     pub brief_state: CommandState,
     pub successor_gate: String,

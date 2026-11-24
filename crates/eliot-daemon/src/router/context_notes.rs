@@ -253,6 +253,7 @@ impl Router {
         store: &mut Store,
         handoff: &HandoffResponse,
         events: &[Event],
+        task_text: Option<&str>,
     ) {
         if let Some(trigger) = events
             .iter()
@@ -265,7 +266,7 @@ impl Router {
                 store,
                 &event,
                 Some(&handoff.brief_command),
-                None,
+                task_text,
             ));
         }
     }

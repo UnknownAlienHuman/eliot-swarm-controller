@@ -5,7 +5,7 @@ use eliot_core::api::{
     SendTransfer,
 };
 
-mod brief;
+pub(super) mod brief;
 pub(super) use brief::{last_turn_uncertain, last_unfinished_turn};
 
 /// Committed when a generation's task inputs, claims, Goal and children move.
@@ -17,11 +17,88 @@ pub struct BriefFacts {
     pub git: Option<String>,
     /// Exact original SEND bound to the task record read for this brief.
     pub task_command: Option<String>,
+    pub task_ref: Option<String>,
     /// Where the task's own saved files can be read, shown with the task.
     pub task_note: Option<String>,
+    pub saved_sources: Option<usize>,
     /// The task text from the Git record, used when the Store retains none.
     pub task_text: Option<String>,
+    pub task_inputs: TaskInputs,
 }
+
+impl BriefFacts {
+    pub fn applied_task_text(&self) -> Option<&str> {
+        self.task_inputs
+            .original
+            .as_ref()
+            .filter(|original| original.state == CommandState::Applied)
+            .and(self.task_text.as_deref())
+    }
+}
+
+/// Exact retained command provenance, independent of prior rendered briefs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TaskInstruction {
+    pub command_id: String,
+    pub source: String,
+    pub generation: i64,
+    pub principal: String,
+    pub verb: String,
+    pub state: CommandState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_order: Option<(i64, i64)>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+}
+
+impl TaskInstruction {
+    pub fn from_command(command: &Command, text: String) -> Option<Self> {
+        Some(Self {
+            command_id: command.id.clone(),
+            source: command.target.clone()?,
+            generation: command.generation?,
+            principal: command.principal.clone(),
+            verb: command.verb.clone(),
+            state: command.state,
+            admission_order: None,
+            text,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TaskInputs {
+    pub original: Option<TaskInstruction>,
+    pub corrections: Vec<TaskInstruction>,
+    /// Known omissions by source generation, so recapture does not double-count.
+    pub omitted: std::collections::BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub omitted_through: std::collections::BTreeMap<String, (i64, i64)>,
+    /// Legacy lower bound without contributing source identities.
+    #[serde(default)]
+    pub compacted_omissions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<CompactedTaskOmissions>,
+    pub history_incomplete: bool,
+    #[serde(default)]
+    pub history_unresolved: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CompactedTaskOmissions {
+    pub through: (i64, i64),
+    pub count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct TaskOmissionObservation {
+    pub count: usize,
+    pub through: (i64, i64),
+}
+
+/// Allow fixed H2 framing and Store facts even when all optional excerpts
+/// have been reduced to completeness markers.
+pub const MAX_HANDOFF_TASK_BYTES: usize = MAX_TEXT_BYTES - 32 * 1024;
 
 /// Bound on following a chain of same-worktree handoffs.
 const MAX_SUCCESSOR_CHAIN: usize = 64;
@@ -35,6 +112,10 @@ pub struct HandoffAdmission {
 }
 
 impl Store {
+    pub fn handoff_history_unresolved(&self, agent: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        brief::has_unverified_instructions(&self.connection, agent)
+    }
     /// Find the task turn before any commandless native continuations.
     /// An intervening failed or unbound ordinary turn still blocks handoff.
     pub fn latest_handoff_task_turn(&self, agent: &str, generation: i64) -> Result<Option<Turn>> {
@@ -162,10 +243,7 @@ impl Store {
             policy,
             now,
             self.hierarchy_limits,
-            HandoffInput::Brief {
-                facts,
-                discover: false,
-            },
+            HandoffInput::Brief { facts },
         )?;
         annotate_owner_events(&tx, &mut change.events, owner_process)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -432,7 +510,7 @@ pub(super) fn switch_transfer_commands(
     Ok(transfer_commands)
 }
 
-fn source_task(
+pub(super) fn source_task(
     connection: &Connection,
     from: &Agent,
     task_command: &str,
@@ -631,18 +709,9 @@ pub(super) fn transferable_send(record: &CommandRecord, stopped_source: bool) ->
 #[derive(Clone, Copy)]
 pub(super) enum HandoffInput<'a> {
     /// Context for an existing destination, which waits for its own input.
-    Brief {
-        facts: &'a BriefFacts,
-        /// A switch finds the task itself and accepts an ended source.
-        discover: bool,
-    },
-    /// B continues the task from its branch.
-    Continuation {
-        directive: &'a str,
-        facts: &'a BriefFacts,
-    },
-    /// The switch has already proven an exact provider refusal before work.
-    ProviderRetry,
+    Brief { facts: &'a BriefFacts },
+    /// Exact payload sized before dispatching the source stop.
+    Switch(&'a crate::switch::PreparedSwitchBrief),
     /// The project transfer has proved source custody and performed the team edits.
     ProjectTransfer { saved_context: Option<&'a str> },
 }
@@ -658,10 +727,7 @@ pub(super) fn handoff_tx(
     input: HandoffInput<'_>,
 ) -> Result<HandoffAdmission> {
     let project_transfer = matches!(input, HandoffInput::ProjectTransfer { .. });
-    let from_switch = matches!(
-        input,
-        HandoffInput::Continuation { .. } | HandoffInput::Brief { discover: true, .. }
-    );
+    let from_switch = matches!(input, HandoffInput::Switch(_));
     if (!project_transfer && !from_switch) || !request.task_command.is_empty() {
         request.validate()?;
     }
@@ -753,7 +819,7 @@ pub(super) fn handoff_tx(
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
-    let continuation = matches!(input, HandoffInput::Continuation { .. });
+    let continuation = matches!(input, HandoffInput::Switch(plan) if plan.resume_goal);
     if project_transfer && from.is_terminal() {
         require_settled_input(tx, &from, parse_agent_id(&from.id)?)?;
     } else if from_switch {
@@ -763,11 +829,29 @@ pub(super) fn handoff_tx(
     }
     quiescent(tx, &to, true)?;
     let input_principal = manager_caller.as_ref().map(|_| principal);
-    let task = if matches!(input, HandoffInput::ProviderRetry) {
-        source_task(tx, &from, &request.task_command, input_principal)?
-    } else if from_switch {
-        continuation_task(tx, &from, &request.task_command, input_principal)?
-    } else if project_transfer && request.task_command.is_empty() {
+    let binding = match input {
+        HandoffInput::Brief { facts } => {
+            facts.task_command.as_deref().zip(facts.task_ref.as_deref())
+        }
+        HandoffInput::Switch(plan) => plan
+            .binding
+            .as_ref()
+            .map(|(command, reference)| (command.as_str(), reference.as_str())),
+        HandoffInput::ProjectTransfer { .. } => None,
+    };
+    if let Some((command, reference)) = binding {
+        let selected = Store::selected_work_task_command(tx, &from.id, from.generation)?;
+        let bound = Store::work_task_binding(tx, &from.id, from.generation, command)?;
+        if selected.as_deref() != Some(command)
+            || bound.as_ref().map(|(reference, _)| reference.as_str()) != Some(reference)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "the source Git task binding changed after handoff preparation",
+            ));
+        }
+    }
+    let task = if from_switch || (project_transfer && request.task_command.is_empty()) {
         None
     } else {
         source_task(tx, &from, &request.task_command, input_principal)?
@@ -780,11 +864,7 @@ pub(super) fn handoff_tx(
         policy,
         project_transfer || (from_switch && from.is_terminal()),
     )?;
-    let required_task = || {
-        task.as_ref()
-            .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))
-    };
-    let (brief_text, brief_truncated) = match input {
+    let built = match input {
         HandoffInput::Brief { facts, .. } => brief::build(
             tx,
             request,
@@ -798,19 +878,15 @@ pub(super) fn handoff_tx(
                 now,
             },
         )?,
-        HandoffInput::Continuation { directive, facts } => brief::build(
-            tx,
-            request,
-            task.as_ref(),
-            policy,
-            brief::BriefInput {
-                saved_context: None,
-                transferred: &originals,
-                facts: Some(facts),
-                directive: Some(directive),
-                now,
-            },
-        )?,
+        HandoffInput::Switch(plan) => {
+            if policy.contains_text(&plan.brief.text) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "the frozen handoff input contains a known secret",
+                ));
+            }
+            plan.brief.clone()
+        }
         HandoffInput::ProjectTransfer { saved_context } => brief::build(
             tx,
             request,
@@ -824,21 +900,6 @@ pub(super) fn handoff_tx(
                 now,
             },
         )?,
-        HandoffInput::ProviderRetry => {
-            let task = required_task()?;
-            if policy.contains_value(&task.args) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "retry input contains a known secret",
-                ));
-            }
-            let text = task
-                .args
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::new("source_integrity", "retry task text missing"))?;
-            (text.to_owned(), false)
-        }
     };
     let mut events = Vec::new();
     // Agent authority never widens: an Agent handoff transfers only task
@@ -900,7 +961,10 @@ pub(super) fn handoff_tx(
         conflicts_truncated,
         goal_revision,
         reparented,
-        brief_truncated,
+        brief_truncated: built.truncated,
+        brief_omitted_instructions: built.omitted_instructions,
+        brief_history_incomplete: built.history_incomplete,
+        brief_saved_sources: built.saved_sources,
         brief_state: CommandState::Accepted,
         successor_gate: "queued_until_brief_applied".into(),
     };
@@ -955,7 +1019,7 @@ pub(super) fn handoff_tx(
         child.target = Some(to.id.clone());
         child.expected_generation = Some(to.generation);
         let (child_principal, args) = if ordinal == 0 {
-            (principal, json!({"text":brief_text}))
+            (principal, json!({"text":built.text}))
         } else {
             let original = &originals[ordinal - 1];
             (original.principal.as_str(), original.args.clone())
@@ -988,6 +1052,9 @@ pub(super) fn handoff_tx(
         Some(from.generation),
         json!({"handoff": request.id, "to": to.id, "to_generation": to.generation}),
     )?);
+    if matches!(input, HandoffInput::Brief { .. }) {
+        super::work_truth::inherit_work_task_tx(tx, &from, &to, &transfers, now)?;
+    }
     super::result_page::record_handoff_origin_tx(tx, parse_agent_id(&to.id)?, to.generation)?;
     refresh_parent_tx(tx, &brief_command, now)?;
     let parent = load_command(tx, &request.id)?
