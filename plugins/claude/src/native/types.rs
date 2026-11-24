@@ -14,6 +14,8 @@ use eliot_core::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 /// Outbound stdin control envelope.
@@ -384,7 +386,7 @@ pub(crate) fn assistant_call_input(record: &Value) -> Option<i64> {
     )
 }
 
-pub(crate) fn assistant_context_used(record: &Value) -> Option<i64> {
+fn assistant_context_used(record: &Value) -> Option<i64> {
     let usage = record.get("message")?.get("usage")?;
     assistant_call_input(record)?.checked_add(usage_counter(usage.get("output_tokens"))?)
 }
@@ -423,11 +425,10 @@ pub(crate) fn transcript_config_roots() -> Vec<PathBuf> {
 /// Maximum project entries scanned for one session transcript.
 pub(crate) const MAX_TRANSCRIPT_PROJECTS: usize = 512;
 
-/// Native transcript size for one session: `<config>/projects/*/<session>.jsonl`.
+/// Native transcript for one session: `<config>/projects/*/<session>.jsonl`.
 /// The project slug is never guessed: the projects directory is scanned
 /// (bounded entries) for the exact session filename and the first hit wins.
-/// Anything unresolvable fails closed to None, never zero.
-pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option<u64> {
+fn open_transcript(roots: &[PathBuf], session_id: &str) -> Option<File> {
     if session_id.trim().is_empty() || session_id.len() > 128 {
         return None;
     }
@@ -439,21 +440,65 @@ pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option
     }
     let file_name = format!("{session_id}.jsonl");
     for root in roots {
-        let entries = std::fs::read_dir(root.join("projects")).ok()?;
-        let mut checked = 0;
-        for entry in entries.flatten() {
-            checked += 1;
-            if checked > MAX_TRANSCRIPT_PROJECTS {
-                break;
-            }
-            if let Ok(meta) = std::fs::metadata(entry.path().join(&file_name))
-                && meta.is_file()
+        let Ok(entries) = std::fs::read_dir(root.join("projects")) else {
+            continue;
+        };
+        for entry in entries.flatten().take(MAX_TRANSCRIPT_PROJECTS) {
+            let path = entry.path().join(&file_name);
+            if path.is_file()
+                && let Ok(file) = File::open(path)
             {
-                return Some(meta.len());
+                return Some(file);
             }
         }
     }
     None
+}
+
+/// The streamed assistant frame can precede the final native output count.
+/// Read back only the finalized entry for the message bound by that stream.
+pub(crate) fn transcript_usage_in(
+    roots: &[PathBuf],
+    session_id: &str,
+    latest_message: Option<(String, String)>,
+) -> Option<(u64, Option<i64>)> {
+    let mut file = open_transcript(roots, session_id)?;
+    let size = file.metadata().ok()?.len();
+    let context = latest_message.and_then(|(model, message_id)| {
+        transcript_context(&mut file, size, session_id, &model, &message_id)
+    });
+    Some((size, context))
+}
+
+fn transcript_context(
+    file: &mut File,
+    size: u64,
+    session_id: &str,
+    model: &str,
+    message_id: &str,
+) -> Option<i64> {
+    const MAX_CONTEXT_READ_BYTES: u64 = 512 * 1024;
+    let offset = size.saturating_sub(MAX_CONTEXT_READ_BYTES);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut tail = Vec::new();
+    file.take(size - offset).read_to_end(&mut tail).ok()?;
+    let tail = if offset > 0 {
+        &tail[tail.iter().position(|byte| *byte == b'\n')? + 1..]
+    } else {
+        &tail
+    };
+    let record = tail
+        .rsplit(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .find(|record| {
+            record["type"].as_str() == Some("assistant")
+                && record["sessionId"].as_str() == Some(session_id)
+                && record["isSidechain"].as_bool() == Some(false)
+                && record["message"]["id"].as_str() == Some(message_id)
+                && record["message"]["model"].as_str() == Some(model)
+                && record["message"]["stop_reason"].as_str().is_some()
+        })?;
+    assistant_context_used(&record)
 }
 
 /// Extract the session-scoped fact from a terminal `result` record:
@@ -471,7 +516,8 @@ pub(crate) fn transcript_bytes_in(roots: &[PathBuf], session_id: &str) -> Option
 /// guessed here.
 pub(crate) fn result_session_usage(
     record: &Value,
-    latest_context_sample: Option<&(String, i64)>,
+    latest_model: Option<&str>,
+    used: Option<i64>,
     init_context_window: Option<&(String, i64)>,
 ) -> Option<SessionUsage> {
     let cumulative_tokens = result_session_tokens(record);
@@ -479,18 +525,16 @@ pub(crate) fn result_session_usage(
         .get("total_cost_usd")
         .and_then(Value::as_f64)
         .filter(|amount| amount.is_finite() && *amount >= 0.0);
-    let used = latest_context_sample.map(|(_, used)| *used);
-    let window = latest_context_sample
-        .and_then(|(model, _)| {
+    let window = latest_model
+        .and_then(|model| {
             record["modelUsage"]
                 .get(model)
                 .and_then(frame_context_window)
         })
         .or_else(|| frame_context_window(record))
         .or_else(|| {
-            let (model, _) = latest_context_sample?;
             let (initialized_model, window) = init_context_window?;
-            (model == initialized_model).then_some(*window)
+            (latest_model? == initialized_model).then_some(*window)
         });
     if cumulative_tokens.is_none() && amount.is_none() && used.is_none() && window.is_none() {
         return None;

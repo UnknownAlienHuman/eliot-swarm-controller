@@ -1514,8 +1514,8 @@ harness self-check fact.
   absent or invalid context count cannot trigger or sustain a context reaction.
   Retained journal rows remain available as recorded. Suppliers are harness-native only: Codex
   `thread/tokenUsage/updated` (latest context occupancy against `modelContextWindow`
-  for the same turn or model), Claude stream-json plus the reported model window
-  and transcript file size, Muse `session/contextUsage`, Antigravity ACP
+  for the same turn or model), Claude's finalized per-message transcript usage
+  with the stream-json model window and transcript file size, Muse `session/contextUsage`, Antigravity ACP
   `usage_update`, and OpenCode's latest assistant-message input, cache and output
   counters from terminal readback. OpenCode has no capacity or
   session-file-size source, and the Muse event log exposes no size; those signals
