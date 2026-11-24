@@ -99,12 +99,14 @@ using that service.
   broker or service (or attributed to the wrong owner) is invisible to the
   Store and cannot be terminated safely by PID alone.
 
-Failed-generation exit resolution repeats the platform liveness check inside the Store
-write transaction after checking the retained-process snapshot. On Windows it checks the
-named Job and the exact PID and creation time of each retained, unconfirmed process. A
-live process or Job member keeps custody unresolved. Exited rows do not count toward
-this Windows readback limit. Linux includes exited plugin leaders because their process
-groups can still have live members.
+Failed-generation exit resolution fences Swarm startup from the initial generation
+snapshot through settlement. Platform liveness checks run outside the Store lock.
+The write transaction compares the observed custody identities with the current
+generation and closed native sources. An Owner assertion retries the observation once
+if those identities changed. Windows checks named Job membership when a Job is
+recorded, along with exact PID and creation time. Linux checks recorded processes
+and the distinct process groups of exited plugins on this boot. Group witnesses
+are read separately from the limit on process identities with unconfirmed exit.
 
 Every applied stop requires two independently committed facts for the exact
 generation: process-custody exit and native-source drain. On Windows the

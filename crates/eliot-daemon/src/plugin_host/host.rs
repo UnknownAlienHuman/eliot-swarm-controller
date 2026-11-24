@@ -1450,35 +1450,58 @@ impl PluginHost {
         &self,
         request: &eliot_core::api::FailedCustodyResolveRequest,
     ) -> Result<eliot_store::Change<eliot_core::api::FailedCustodyResolveResponse>> {
+        // Serialize with owned generation startup until the Store accepts the
+        // observed identities. The platform probe never holds the Store.
         let _startup = self.state.startup_gate.lock().await;
-        let snapshot = {
-            let store = self.state.store.lock().await;
-            if let Some(value) = store.replay_failed_custody_resolution(request)? {
-                return Ok(eliot_store::Change {
-                    value,
-                    events: Vec::new(),
-                });
+        #[cfg(target_os = "linux")]
+        let boot_id = crate::platform::unix::host_boot_id()?;
+        let mut retry = true;
+        loop {
+            let snapshot = {
+                let store = self.state.store.lock().await;
+                if let Some(value) = store.replay_failed_custody_resolution(request)? {
+                    return Ok(eliot_store::Change {
+                        value,
+                        events: Vec::new(),
+                    });
+                }
+                if self.controls_generation(&request.agent, request.generation) {
+                    return Err(Error::new(
+                        "busy",
+                        "the daemon still controls this generation; stop it first",
+                    ));
+                }
+                store.failed_generation_exit_snapshot(
+                    &request.agent,
+                    request.generation,
+                    #[cfg(target_os = "linux")]
+                    &boot_id,
+                )?
+            };
+            let snapshot = tokio::task::spawn_blocking(move || {
+                crate::platform::custody::check_failed_exit_assertion(&snapshot)?;
+                Ok::<_, Error>(snapshot)
+            })
+            .await
+            .map_err(|_| {
+                Error::new("unavailable", "failed custody observation did not return")
+            })??;
+            let result =
+                self.state
+                    .store
+                    .lock()
+                    .await
+                    .resolve_failed_custody(request, &snapshot, now_ms());
+            if retry
+                && result
+                    .as_ref()
+                    .is_err_and(|error| error.code == "process_custody_changed")
+            {
+                retry = false;
+                continue;
             }
-            if self.controls_generation(&request.agent, request.generation) {
-                return Err(Error::new(
-                    "busy",
-                    "the daemon still controls this generation; stop it first",
-                ));
-            }
-            store.failed_generation_exit_snapshot(&request.agent, request.generation)?
-        };
-        let snapshot = tokio::task::spawn_blocking(move || {
-            crate::platform::custody::check_failed_exit_assertion(&snapshot)?;
-            Ok::<_, Error>(snapshot)
-        })
-        .await
-        .map_err(|_| Error::new("unavailable", "failed custody observation did not return"))??;
-        self.state.store.lock().await.resolve_failed_custody(
-            request,
-            &snapshot,
-            now_ms(),
-            crate::platform::custody::check_failed_exit_assertion,
-        )
+            return result;
+        }
     }
 
     #[cfg(windows)]
@@ -1493,7 +1516,9 @@ impl PluginHost {
         let snapshot = {
             let store = self.state.store.lock().await;
             let snapshot = store.failed_generation_exit_snapshot(&agent.id, agent.generation)?;
-            if snapshot.custody_namespace.as_deref() != Some(store.custody_namespace()?.as_str()) {
+            if snapshot.retained.custody_namespace.as_deref()
+                != Some(store.custody_namespace()?.as_str())
+            {
                 return Err(Error::new(
                     "process_custody_foreign",
                     "no local named Job binding for failed generation",
@@ -1502,13 +1527,14 @@ impl PluginHost {
             snapshot
         };
         let snapshot = tokio::task::spawn_blocking(move || {
-            if snapshot.processes_truncated {
+            let generation = &snapshot.retained;
+            if generation.processes_truncated {
                 return Err(Error::new(
                     "process_custody_unproven",
                     "retained process identities exceed the readback bound",
                 ));
             }
-            let namespace = snapshot.custody_namespace.as_deref().ok_or_else(|| {
+            let namespace = generation.custody_namespace.as_deref().ok_or_else(|| {
                 Error::new(
                     "process_custody_unproven",
                     "failed generation has no named Job",
@@ -1516,13 +1542,13 @@ impl PluginHost {
             })?;
             let name = crate::platform::custody::agent_custody_name(
                 namespace,
-                &snapshot.agent,
-                snapshot.generation,
+                &generation.agent,
+                generation.generation,
             );
             if !crate::platform::windows::named_job_closed(&name)? {
                 crate::platform::windows::terminate_named_generation_job(&name)?;
             }
-            match crate::platform::restart_custody(&snapshot)? {
+            match crate::platform::restart_custody(generation)? {
                 crate::platform::RestartCustody::Closed {
                     orphan_possible: false,
                     ..
@@ -1545,18 +1571,7 @@ impl PluginHost {
             .store
             .lock()
             .await
-            .commit_failed_generation_job_exit(&snapshot, now_ms(), |exact| {
-                match crate::platform::restart_custody(exact)? {
-                    crate::platform::RestartCustody::Closed {
-                        orphan_possible: false,
-                        ..
-                    } => Ok(()),
-                    _ => Err(Error::new(
-                        "process_custody_unproven",
-                        "failed generation Job or retained process became live before commit",
-                    )),
-                }
-            })?;
+            .commit_failed_generation_job_exit(&snapshot, now_ms())?;
         self.state.bus.publish(&events);
         Ok(())
     }

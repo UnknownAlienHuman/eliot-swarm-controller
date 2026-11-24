@@ -6,6 +6,15 @@ pub(super) const OWNER_ASSERTED: &str = "owner_asserted_exit";
 pub(super) const JOB_VERIFIED: &str = "verified_generation_job_exit";
 pub(super) const NEVER_SPAWNED: &str = "start_never_spawned";
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct FailedGenerationExitSnapshot {
+    pub retained: RetainedGeneration,
+    #[cfg(target_os = "linux")]
+    pub boot_id: String,
+    #[cfg(target_os = "linux")]
+    pub exited_plugin_groups: Vec<u32>,
+}
+
 impl Store {
     pub(super) fn migrate_failed_custody(&mut self, version: i64) -> Result<()> {
         let tx = self
@@ -43,23 +52,30 @@ impl Store {
         &self,
         agent: &str,
         generation: i64,
-    ) -> Result<RetainedGeneration> {
+        #[cfg(target_os = "linux")] boot_id: &str,
+    ) -> Result<FailedGenerationExitSnapshot> {
         self.ensure_committed_reads()?;
-        failed_generation_exit_snapshot(&self.connection, agent, generation)
+        failed_generation_exit_snapshot(
+            &self.connection,
+            agent,
+            generation,
+            #[cfg(target_os = "linux")]
+            boot_id,
+        )
     }
 
     pub fn commit_failed_generation_job_exit(
         &mut self,
-        snapshot: &RetainedGeneration,
+        snapshot: &FailedGenerationExitSnapshot,
         now: i64,
-        recheck: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        require_current_exit_snapshot(&tx, &snapshot.agent, snapshot.generation, snapshot)?;
+        let generation = &snapshot.retained;
+        require_current_exit_snapshot(&tx, &generation.agent, generation.generation, snapshot)?;
         let namespace: String = tx
             .query_row(
                 "SELECT namespace FROM custody_binding WHERE singleton=1",
@@ -67,17 +83,16 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if snapshot.custody_namespace.as_deref() != Some(namespace.as_str()) {
+        if generation.custody_namespace.as_deref() != Some(namespace.as_str()) {
             return Err(Error::new(
                 "process_custody_foreign",
                 "failed generation custody does not belong to this daemon",
             ));
         }
-        recheck(snapshot)?;
         let events = record_failed_exit(
             &tx,
-            parse_agent_id(&snapshot.agent)?,
-            snapshot.generation,
+            parse_agent_id(&generation.agent)?,
+            generation.generation,
             JOB_VERIFIED,
             "Exact generation Job and retained process identities verified gone",
             now,
@@ -102,9 +117,8 @@ impl Store {
     pub fn resolve_failed_custody(
         &mut self,
         request: &FailedCustodyResolveRequest,
-        observed: &RetainedGeneration,
+        observed: &FailedGenerationExitSnapshot,
         now: i64,
-        recheck: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Change<FailedCustodyResolveResponse>> {
         self.ensure_writer_healthy()?;
         request.validate()?;
@@ -122,7 +136,6 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         require_current_exit_snapshot(&tx, &request.agent, request.generation, observed)?;
-        recheck(observed)?;
         let agent = parse_agent_id(&request.agent)?;
         let events = record_failed_exit(
             &tx,
@@ -164,13 +177,19 @@ fn require_current_exit_snapshot(
     tx: &Transaction<'_>,
     agent: &str,
     generation: i64,
-    observed: &RetainedGeneration,
+    observed: &FailedGenerationExitSnapshot,
 ) -> Result<()> {
-    if observed.processes_truncated
-        || failed_generation_exit_snapshot(tx, agent, generation)? != *observed
+    if observed.retained.processes_truncated
+        || failed_generation_exit_snapshot(
+            tx,
+            agent,
+            generation,
+            #[cfg(target_os = "linux")]
+            &observed.boot_id,
+        )? != *observed
     {
         return Err(Error::new(
-            "stale_generation",
+            "process_custody_changed",
             "failed generation custody changed during verification",
         ));
     }
@@ -206,7 +225,8 @@ fn failed_generation_exit_snapshot(
     connection: &Connection,
     agent: &str,
     generation: i64,
-) -> Result<RetainedGeneration> {
+    #[cfg(target_os = "linux")] boot_id: &str,
+) -> Result<FailedGenerationExitSnapshot> {
     let num = require_failed_generation(connection, agent, generation)?;
     let custody_namespace = connection
         .query_row(
@@ -216,45 +236,55 @@ fn failed_generation_exit_snapshot(
         )
         .map_err(sql_error)?;
     let owner = format!("agent:{agent}#{generation}");
-    // On Linux an exited plugin can still name a live process group. Windows
-    // checks the named Job independently of its recorded members.
     let mut statement = connection
         .prepare(
-            "SELECT host_boot_id,pid,start_time,role,state='exited' FROM processes
-         WHERE owner=?1 AND (state!='exited' OR (?3 AND role='plugin'))
+            "SELECT host_boot_id,pid,start_time,role FROM processes
+         WHERE owner=?1 AND state!='exited'
          ORDER BY host_boot_id,pid,start_time LIMIT ?2",
         )
         .map_err(sql_error)?;
     let mut processes = statement
-        .query_map(
-            params![
-                owner,
-                MAX_PAGE_ENTRIES as i64 + 1,
-                cfg!(target_os = "linux")
-            ],
-            |row| {
-                Ok(RecordedProcess {
-                    identity: ProcessIdentity {
-                        host_boot_id: row.get(0)?,
-                        pid: row.get(1)?,
-                        start_time: row.get::<_, i64>(2)? as u64,
-                    },
-                    role: row.get(3)?,
-                    exited: row.get(4)?,
-                })
-            },
-        )
+        .query_map(params![owner, MAX_PAGE_ENTRIES as i64 + 1], |row| {
+            Ok(RecordedProcess {
+                identity: ProcessIdentity {
+                    host_boot_id: row.get(0)?,
+                    pid: row.get(1)?,
+                    start_time: row.get::<_, i64>(2)? as u64,
+                },
+                role: row.get(3)?,
+                exited: false,
+            })
+        })
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
     let processes_truncated = processes.len() > MAX_PAGE_ENTRIES;
     processes.truncate(MAX_PAGE_ENTRIES);
-    Ok(RetainedGeneration {
-        agent: agent.to_owned(),
-        generation,
-        custody_namespace,
-        processes,
-        processes_truncated,
+    // A dead Linux plugin can still name a live process group. Keep each
+    // distinct group on this boot independently of the retained PID budget.
+    #[cfg(target_os = "linux")]
+    let exited_plugin_groups = connection
+        .prepare_cached(
+            "SELECT DISTINCT pid FROM processes WHERE owner=?1 AND host_boot_id=?2
+             AND state='exited' AND role='plugin' ORDER BY pid",
+        )
+        .map_err(sql_error)?
+        .query_map(params![owner, boot_id], |row| row.get(0))
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    Ok(FailedGenerationExitSnapshot {
+        retained: RetainedGeneration {
+            agent: agent.to_owned(),
+            generation,
+            custody_namespace,
+            processes,
+            processes_truncated,
+        },
+        #[cfg(target_os = "linux")]
+        boot_id: boot_id.to_owned(),
+        #[cfg(target_os = "linux")]
+        exited_plugin_groups,
     })
 }
 

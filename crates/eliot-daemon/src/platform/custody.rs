@@ -772,8 +772,9 @@ pub(crate) fn checkpoint_restore_job_name(id: &str) -> String {
 /// An Owner can resolve the missing family evidence only after all observable
 /// custody has been checked. A failed observation also keeps the fence.
 pub(crate) fn check_failed_exit_assertion(
-    generation: &eliot_store::RetainedGeneration,
+    snapshot: &eliot_store::FailedGenerationExitSnapshot,
 ) -> Result<()> {
+    let generation = &snapshot.retained;
     if generation.processes_truncated {
         return Err(Error::new(
             "process_custody_unproven",
@@ -791,12 +792,7 @@ pub(crate) fn check_failed_exit_assertion(
             None => false,
         };
     #[cfg(target_os = "linux")]
-    let live = matches!(
-        restart_custody(generation)?,
-        RestartCustody::Retained {
-            missing: "unix_process_live" | "unix_group_live"
-        }
-    );
+    let live = linux_failed_exit_live(snapshot)?;
     #[cfg(not(any(windows, target_os = "linux")))]
     let live = if generation.processes.iter().any(|process| !process.exited) {
         return Err(Error::new(
@@ -816,6 +812,27 @@ pub(crate) fn check_failed_exit_assertion(
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_failed_exit_live(snapshot: &eliot_store::FailedGenerationExitSnapshot) -> Result<bool> {
+    for process in &snapshot.retained.processes {
+        if process.identity.host_boot_id != snapshot.boot_id {
+            continue;
+        }
+        let pid = process.identity.pid;
+        if super::unix::recorded_process_alive(pid, process.identity.start_time)?
+            || (process.role == "plugin" && !super::unix::recorded_process_group_empty(pid)?)
+        {
+            return Ok(true);
+        }
+    }
+    for &leader in &snapshot.exited_plugin_groups {
+        if !super::unix::recorded_process_group_empty(leader)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(windows)]

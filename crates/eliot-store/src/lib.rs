@@ -33,6 +33,7 @@ pub use config_overlay::AgentConfig;
 pub use context::{ContextDispatch, SendInput};
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
+pub use failed_custody::FailedGenerationExitSnapshot;
 pub use fleet::{AgentListFilter, AgentListPage};
 pub use git::CodeProgressState;
 pub use goals::{
@@ -3093,6 +3094,15 @@ impl Store {
         let current = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "process source Agent was not found"))?;
         validate_process_generation(&tx, &current, generation, scope, true)?;
+        if matches!(scope, ProcessSourceKind::Agent)
+            && !current.observe_only
+            && current.state != AgentState::Starting
+        {
+            return Err(Error::new(
+                "stale_generation",
+                "controlled startup requires the current Starting generation",
+            ));
+        }
         let owner: Option<(String, String)> = tx
             .query_row(
                 "SELECT source, mechanism FROM source_owners
