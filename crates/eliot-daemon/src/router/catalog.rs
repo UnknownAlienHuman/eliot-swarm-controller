@@ -1928,7 +1928,6 @@ pub(crate) fn project_quota(
             let windows: Vec<&Value> = windows.iter().collect();
             windows_projection(observation, &windows, true, model, now, "windows")
         }
-        _ => None,
     }
 }
 
