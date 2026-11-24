@@ -2,7 +2,7 @@ use super::{Principal, Router, principal_name};
 use eliot_core::{
     Command, CommandState, Error, Event, FrozenScriptContext, FrozenScriptRun, RemoteCallContext,
     Result,
-    api::{GoalMode, GoalView, inference::sha256_hex},
+    api::{GoalView, inference::sha256_hex},
 };
 use eliot_plugin::sync::LockExt;
 use eliot_store::{RepeatAlertGoal, RepeatAlertUpdate};
@@ -40,7 +40,7 @@ enum FailureOwner {
         goal_id: String,
         agent: String,
         generation: i64,
-        mode: GoalMode,
+        mode: &'static str,
     },
 }
 
@@ -111,7 +111,7 @@ impl WindowKey {
     fn matches_goal(&self, view: &GoalView) -> bool {
         matches!(self, Self::Failure(FailureKey {
             owner: FailureOwner::Goal { agent, generation, mode, .. }, ..
-        }) if agent == &view.agent && *generation == view.generation && *mode == view.mode)
+        }) if agent == &view.agent && *generation == view.generation && *mode == view.mode.as_str())
     }
 }
 
@@ -297,7 +297,7 @@ impl Router {
                 goal_id: sha256_hex(&definition),
                 agent: goal.agent.clone(),
                 generation: goal.generation,
-                mode: goal.mode,
+                mode: goal.mode.as_str(),
             },
             principal,
             FailureObservation {
