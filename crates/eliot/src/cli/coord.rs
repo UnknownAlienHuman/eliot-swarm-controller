@@ -65,13 +65,14 @@ pub(crate) async fn run_cmd(
                 .map_err(|_| Failure::new(4, "stop settlement response is invalid"))?;
             print_value_or_human(&value, json_output, || {
                 println!(
-                    "Stop settlement {}: {} proven stop(s), {} still awaiting proof.",
+                    "Historical settlement {}: {} proven stop(s), {} exact request-reply receipt(s), {} stop(s) still awaiting proof.",
                     if response.applied {
                         "applied"
                     } else {
                         "preview"
                     },
                     response.stops.len(),
+                    response.request_replies.len(),
                     response.awaiting_proof.len()
                 );
                 println!("Review digest: {}", response.review);
@@ -90,6 +91,18 @@ pub(crate) async fn run_cmd(
                 }
                 for command in &response.awaiting_proof {
                     println!("  Awaiting process or reader proof: {command}");
+                }
+                for reply in &response.request_replies {
+                    println!(
+                        "  Agent {} generation {} · {} command {} · request {} · turn {} · native receipt event {}",
+                        reply.agent,
+                        reply.generation,
+                        reply.verb,
+                        reply.command_id,
+                        reply.request_id,
+                        reply.turn_id,
+                        reply.receipt_seq
+                    );
                 }
                 if let Some(next) = response.next.as_deref() {
                     println!("Continue with --after {next}");
