@@ -2248,10 +2248,7 @@ pub(super) fn validate_observer_command_result(
     Ok(value)
 }
 
-/// Settlement for an authoritative plugin `agent.start` result. A `"failed"`
-/// state proves the plugin dispatched no native session effect, so the
-/// launch settles failed, never unknown. Any other shape keeps the
-/// historical ready settlement.
+/// Settlement for a validated plugin `agent.start` result.
 pub(super) fn classify_start_result(value: &Value) -> CommandState {
     if value.get("state").and_then(Value::as_str) == Some("failed") {
         CommandState::Failed

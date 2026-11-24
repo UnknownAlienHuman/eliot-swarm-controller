@@ -56,7 +56,8 @@ pub fn classify_start_failure(mut error: Error, harness: &str, phase: &str) -> E
     error
 }
 
-/// Preserve typed diagnostics when a plugin proves that startup had no effect.
+/// Preserve typed diagnostics when a plugin proves that the session could not
+/// become ready. If a native session was established, include its identity.
 /// Redact the complete fields before Error's wire bounds are applied.
 pub fn failed_start_value(params: &crate::AgentStartParams, error: Error) -> Value {
     let secrets: Vec<_> = params

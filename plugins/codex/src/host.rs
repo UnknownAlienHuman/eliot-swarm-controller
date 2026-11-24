@@ -1225,6 +1225,21 @@ impl CodexPlugin {
         session.selected_effort = selected.effort.clone();
         session.native_scope = native_scope;
 
+        #[cfg(windows)]
+        if plan.sandbox_mode == NativeSandboxMode::WorkspaceWrite
+            && let Err(error) = verify_windows_sandbox_ready(&session.native_client).await
+        {
+            let error = discard_failed_start(&mut session, error).await;
+            return self
+                .settle_pre_dispatch_outcome(
+                    session,
+                    params,
+                    error,
+                    "owned app-server cleanup is unconfirmed; no thread or input was sent",
+                )
+                .map(DispatchOutcome::Settled);
+        }
+
         if let Some(subject) = &plan.resume_subject {
             if subject.native_scope != session.native_scope {
                 let error = discard_failed_start(
@@ -1418,6 +1433,51 @@ impl CodexPlugin {
             effort: selected_effort,
             catalogue_omits_model,
         } = selected;
+        if !sandbox_matches(
+            &readback.sandbox,
+            &plan.permissions,
+            &plan.workspace,
+            &params.commit_roots,
+        ) {
+            let actual = readback
+                .sandbox
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("unavailable");
+            let network = readback
+                .sandbox
+                .get("networkAccess")
+                .and_then(Value::as_bool)
+                .map_or_else(String::new, |value| format!(" (networkAccess={value})"));
+            let error = discard_failed_start(
+                &mut session,
+                Error::new(
+                    "profile_error",
+                    format!(
+                        "Codex returned sandbox type {actual:?}{network} with a policy that does not match the requested {:?} permissions",
+                        plan.permissions
+                    ),
+                )
+                .with_where("plugin.codex.start.sandbox_readback")
+                .with_origin(
+                    eliot_core::FailureOrigin::Harness,
+                    "native thread readback disagreed with the frozen sandbox policy",
+                ),
+            )
+            .await;
+            if session.phase == SessionPhase::Unknown {
+                self.session = Some(session);
+                return Err(unconfirmed_start_cleanup_error(
+                    error,
+                    "owned app-server cleanup is unconfirmed; no input was sent",
+                ));
+            }
+            let mut failure = eliot_plugin::session::failed_start_value(params, error);
+            failure["native_scope"] = json!(session.native_scope);
+            failure["native_ref"] = json!(readback.thread.id);
+            self.failed_start = Some(FailedStart);
+            return Ok(failure);
+        }
         // Expose the daemon-materialized coordination skill before any
         // input is sent: without it the Agent would start believing it has
         // no skill. The roots replace nothing on disk; a failed delivery
@@ -1508,12 +1568,6 @@ impl CodexPlugin {
             && readback.model == selected_model
             && readback.model_provider == plan.route.provider()
             && paths_equal(Path::new(&readback.cwd), &plan.workspace)
-            && sandbox_matches(
-                &readback.sandbox,
-                &plan.permissions,
-                &plan.workspace,
-                &params.commit_roots,
-            )
             && readback_approval_matches(&readback.approval_policy, &plan.approval_policy)
             // Enforce the exact effective effort only if one was requested;
             // an omitted effort accepts and reports the native readback.
@@ -1552,7 +1606,7 @@ impl CodexPlugin {
             self.session = Some(session);
             return Err(Error::new(
                 "profile_error",
-                "Codex effective model, provider, cwd, permissions, approval policy, or reasoning effort did not match the frozen profile",
+                "Codex effective model, provider, cwd, approval policy, or reasoning effort did not match the frozen profile",
             ));
         }
         session.phase = SessionPhase::Ready;
@@ -1596,7 +1650,7 @@ impl CodexPlugin {
         unconfirmed_context: &str,
     ) -> Result<Value> {
         if session.phase == SessionPhase::Unknown {
-            let error = unconfirmed_pre_dispatch_error(error, unconfirmed_context);
+            let error = unconfirmed_start_cleanup_error(error, unconfirmed_context);
             self.session = Some(session);
             return Err(error);
         }
@@ -3148,6 +3202,55 @@ fn thread_state(thread: &Value) -> &'static str {
     }
 }
 
+#[cfg(windows)]
+async fn verify_windows_sandbox_ready(client: &NativeClient) -> Result<()> {
+    use crate::native::types::{
+        NativeWindowsSandboxReadiness, NativeWindowsSandboxReadinessResponse,
+    };
+
+    let response = match client
+        .call(
+            "windowsSandbox/readiness",
+            json!({}),
+            Instant::now() + RPC_TIMEOUT,
+        )
+        .await
+    {
+        Ok(response) => response,
+        // The thread's exact sandbox readback still gates readiness when an
+        // installed Codex version does not expose this diagnostic.
+        Err(error)
+            if error.failure_where.as_deref()
+                == Some("plugin.codex.native.response.method_not_found") =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let readiness: NativeWindowsSandboxReadinessResponse =
+        decode(&response, "invalid Codex windowsSandbox/readiness response")?;
+    let (status, action) = match readiness.status {
+        NativeWindowsSandboxReadiness::Ready => return Ok(()),
+        NativeWindowsSandboxReadiness::NotConfigured => (
+            "notConfigured",
+            "Configure a Windows sandbox in Codex to use workspace-write.",
+        ),
+        NativeWindowsSandboxReadiness::UpdateRequired => (
+            "updateRequired",
+            "Complete the administrator-approved Codex Windows sandbox setup to use workspace-write.",
+        ),
+    };
+    Err(Error::new(
+        "native_rejected",
+        format!("Codex windowsSandbox/readiness returned {status}. {action}"),
+    )
+    .with_where("plugin.codex.start.windows_sandbox")
+    .with_origin(
+        eliot_core::FailureOrigin::Harness,
+        "native app-server reported that the Windows sandbox is not ready",
+    ))
+}
+
 fn sandbox_matches(
     sandbox: &Value,
     requested: &str,
@@ -3283,11 +3386,8 @@ fn pre_dispatch_read_error(error: Error, code: &str, message: &str) -> Error {
     error.with_code(code).with_message(message)
 }
 
-/// Recode any pre-dispatch failure to unknown when owned cleanup is
-/// unconfirmed. No thread/resume/input was dispatched, but the child may still
-/// hold custody, so the session is retained and the daemon must not treat this
-/// as settled.
-fn unconfirmed_pre_dispatch_error(error: Error, context: &str) -> Error {
+/// Preserve the start failure detail when app-server cleanup is unconfirmed.
+fn unconfirmed_start_cleanup_error(error: Error, context: &str) -> Error {
     let message = format!("{}; {context}", error.message);
     error.with_code("unknown").with_message(message)
 }

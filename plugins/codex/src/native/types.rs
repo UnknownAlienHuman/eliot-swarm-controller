@@ -131,6 +131,22 @@ pub enum NativeSandboxMode {
     DangerFullAccess,
 }
 
+/// Installed v2 `WindowsSandboxReadinessResponse.json`.
+#[cfg(windows)]
+#[derive(Deserialize)]
+pub(crate) struct NativeWindowsSandboxReadinessResponse {
+    pub status: NativeWindowsSandboxReadiness,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum NativeWindowsSandboxReadiness {
+    Ready,
+    NotConfigured,
+    UpdateRequired,
+}
+
 /// Per-thread `config` overlay; config keys retain their snake_case names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeThreadConfigOverrides {

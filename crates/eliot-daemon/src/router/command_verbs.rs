@@ -640,9 +640,7 @@ impl Router {
 
     /// Start a launched or resumed Agent through the owned plugin, settle
     /// ready, and schedule the linked input if there is one. A plugin
-    /// `"failed"` start state is an authoritative proven-no-effect verdict
-    /// (the plugin returns it instead of an error only for checks before any
-    /// native session effect), so the launch settles failed, never unknown.
+    /// `"failed"` start state proves the generation did not become ready.
     pub(super) async fn execute_start_command(
         &self,
         id: &str,
@@ -670,12 +668,13 @@ impl Router {
         match start {
             Ok(mut value) => {
                 if classify_start_result(&value) == CommandState::Failed {
+                    let native_start_refused = value.get("native_ref").is_none();
                     self.redact_native_value(&mut value);
                     Self::ensure_outcome_failure_fields(
                         &mut value,
                         &format!("plugin.{harness}.command.start"),
                     );
-                    value["native_start_refused"] = Value::Bool(true);
+                    value["native_start_refused"] = Value::Bool(native_start_refused);
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
                     let artifact_snapshot =

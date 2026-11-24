@@ -435,8 +435,8 @@ async fn run_agent_startup(
     match start {
         Ok(value) if validate_start_result(&value, &actor.agent, &actor.start_command).is_ok() => {
             if is_failed_start_result(&value) {
-                // The plugin's authoritative proven-no-effect verdict: never
-                // enter the live actor loop. Retire and drain this exact
+                // The plugin proved the generation did not become ready.
+                // Retire and drain this exact
                 // plugin actor and process tree first so Store sees the
                 // generation's processes exit and the owned-exit proof path
                 // releases the capacity reservation, then deliver the
