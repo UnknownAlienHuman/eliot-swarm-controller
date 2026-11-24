@@ -194,6 +194,22 @@ fn gitfile_target(root: &Path) -> Option<PathBuf> {
     pointer_path(root, line.strip_prefix("gitdir: ")?)
 }
 
+/// Locate a managed linked checkout's admin directory without starting Git.
+/// The worktree's pointer can only select a direct child of its admitted
+/// common directory's worktree registry with the reciprocal backlink.
+#[cfg(any(windows, target_os = "linux"))]
+pub(crate) fn linked_watch_admin(root: &Path, common: &Path) -> Option<PathBuf> {
+    let admin = gitfile_target(root)?;
+    if !same_path(admin.parent()?, &common.join("worktrees")) {
+        return None;
+    }
+    let common_pointer = metadata_line(&admin.join("commondir")).ok()?;
+    let backlink = metadata_line(&admin.join("gitdir")).ok()?;
+    (same_path(&pointer_path(&admin, &common_pointer)?, common)
+        && same_path(&pointer_path(&admin, &backlink)?, &root.join(".git")))
+    .then_some(admin)
+}
+
 /// Normalize a Git pointer lexically. No components of the pointer are opened.
 /// The callers compare it to a pinned path or require a reciprocal backlink.
 fn pointer_path(base: &Path, pointer: &str) -> Option<PathBuf> {

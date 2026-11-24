@@ -622,7 +622,8 @@ owner-configured remote whose complete effective URL set passed the validation i
 use Git's normal transport helper internally; “disabled remote helpers” never means
 silently disabling the configured HTTPS/SSH transport itself.
 
-- refresh on debounced filesystem invalidation and poll interval, at most once per 2 s;
+- refresh on debounced filesystem invalidation or new native file hints, at most
+  once per 2 s;
 - `status --porcelain=v2 --branch -z` for current state;
 - index entries are parsed as a NUL-delimited stream under record-count,
   record-size, memory and time bounds. Listing-limit errors report the observed
@@ -647,8 +648,13 @@ silently disabling the configured HTTPS/SSH transport itself.
   including no-op observations. After restart, retained Git views and HEAD transitions
   provide the durable lower bounds; an unchanged observation needs no durable heartbeat.
 
-The current subset polls local state at least 2 s apart without submodule recursion;
-slow/error probes back off up to 30 s. A binding's final read (its generation is
+The monitor skips periodic Git reads for an idle checkout with a complete sample
+under a healthy filesystem watch. A five-minute reconciliation bounds changes
+outside the watch, including external Git configuration and ignore files. A
+new binding, a native file hint or filesystem invalidation schedules a new
+read. Active bindings, incomplete samples, and unavailable or degraded watches
+keep periodic reads at least 2 s apart without submodule recursion. Slow/error
+probes back off up to 30 s. A binding's final read (its generation is
 terminal and its native stream closed) bypasses that backoff but keeps the 2 s minimum,
 and the stream's committed `source.closed` wakes the poller, so a stopped Agent's Git
 source closes within one probe interval even when its workspace is not a Git
@@ -657,13 +663,13 @@ The target requirements above remain binding. `git-status AGENT` / `agent.git` r
 the current generation's cached view; `edits AGENT` / `agent.edits` pages retained
 attribution, including historical generations for an authorized owner.
 
-Native filesystem invalidation watches the admitted root on Windows/Linux. Linux
-registration disables symlink following; notify's option does not apply to the Windows
-backend. Notifications never establish path containment: Git/path checks remain
-authoritative. Notifications coalesce into wake hints; access-only events do not
-trigger a read feedback loop. Backend errors or rescan notices latch degraded watcher
-health, while periodic polling remains authoritative. Neither a healthy watcher nor a
-notification proves fresh Git coverage or counts as model progress.
+Native filesystem invalidation watches the admitted root on Windows/Linux. A
+linked managed checkout also watches its verified Git admin directory and the
+shared refs and metadata. Linux registration disables symlink following.
+Notifications coalesce into read hints. Access-only activity is ignored. Backend
+errors, rescan notices, and changes to watched bindings mark the watcher degraded
+and restore polling while registration is retried. Git readback remains
+authoritative for facts and containment. Notifications never count as model progress.
 
 The Git view exposes `filesystem_invalidation.state`: `healthy` means an active watcher
 without reported degradation; `degraded` means an active watcher reported an error/rescan;
@@ -674,7 +680,10 @@ independent of the top-level Git probe retry delay and cache `available`/coverag
 watcher degradation alone does not invalidate a usable Git sample.
 
 Freshness and coverage are independent. The view exposes `observed_at`, `age_ms`,
-`ttl_ms` (4,000), `available`, `clock_regressed`, `retry_after_ms`, `error` and `source`.
+`ttl_ms`, `available`, `clock_regressed`, `retry_after_ms`, `error` and `source`.
+The TTL is 306,000 ms for a sample taken under a healthy watch with no pending
+invalidation, and 4,000 ms otherwise. The observation timestamp is the actual
+Git read time.
 No sample, a probe/monitor error, clock regression or an expired sample makes the view
 unavailable; cached values may remain visible as diagnostics. An available sample can
 still have `complete=false`. The persisted `git.changed` representation is budgeted to the
