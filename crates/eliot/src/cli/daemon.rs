@@ -470,8 +470,12 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
     );
     if let Some(health) = &response.health {
         println!(
-            "Health: {} Goals without progress · {} active repeat windows",
-            health.goals_without_progress, health.active_repeat_windows
+            "Health: {} Goals without progress · {} active repeat windows · {} repeated-failure inbox items",
+            health.goals_without_progress,
+            health.active_repeat_windows,
+            health
+                .repeated_failure_inbox_items
+                .map_or_else(|| "unavailable".to_owned(), |count| count.to_string())
         );
     }
     match response.command_without_dispatcher.as_ref() {

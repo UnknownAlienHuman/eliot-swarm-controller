@@ -233,7 +233,12 @@ mod native_events;
 mod observer;
 mod owner_decisions;
 mod owner_inbox;
-pub use owner_decisions::{OwnerDecisionAdmission, StuckStates};
+mod repeat_failure_alerts;
+pub use owner_decisions::{OwnerDecisionAdmission, OwnerProjection, StuckStates};
+pub use repeat_failure_alerts::{
+    MAX_REPEAT_FAILURE_ALERTS, REPEAT_ALERT_OVERFLOW_MESSAGE, RepeatAlertBatch, RepeatAlertGoal,
+    RepeatAlertUpdate,
+};
 mod observer_live;
 mod organization;
 mod processes;

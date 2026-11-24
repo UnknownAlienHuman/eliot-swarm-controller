@@ -560,6 +560,16 @@ impl Router {
         let result = self
             .handle_authorized(method, params, principal, context)
             .await;
+        if method != "command.submit"
+            && let Err(error) = &result
+        {
+            self.note_rpc_failure(
+                log_principal,
+                discovery::canonical_method(method).unwrap_or("unsupported"),
+                remote.as_ref(),
+                error,
+            );
+        }
         if let Some(trace) = mcp_trace {
             self.finish_swarm_mcp_tool_call(&trace, result.is_err())
                 .await;
@@ -712,13 +722,15 @@ impl Router {
             "cleanup.plan" => self.cleanup_plan(&params, &principal).await,
             "cleanup.apply" => self.cleanup_apply(&params, &principal).await,
             "command.submit" => {
-                let result = match self.submit_bound(&params, &principal, context).await {
+                let result = match self
+                    .submit_bound(&params, &principal, context, Some("command.submit"))
+                    .await
+                {
                     // Admission preflight call site: a typed refusal is
                     // marked only when no command was admitted for this ID.
                     Err(error) => Err(self.mark_admission_preflight(&params, error).await),
                     ok => ok,
                 };
-                self.note_command_submission(&principal, context.remote, "command.submit", &result);
                 // An explicit admission preflight refusal (capacity, a missing
                 // profile executable) happens before a command exists. Retain
                 // diagnostic metadata under the caller's exact ID in the
@@ -1590,11 +1602,13 @@ impl Router {
         principal: &Principal,
         method: &'static str,
     ) -> Result<Value> {
-        let result = self
-            .submit_bound(params, principal, SubmissionContext::default())
-            .await;
-        self.note_command_submission(principal, None, method, &result);
-        result
+        self.submit_bound(
+            params,
+            principal,
+            SubmissionContext::default(),
+            Some(method),
+        )
+        .await
     }
 
     /// Mark a refused submission as an admission preflight refusal only when
@@ -1620,9 +1634,22 @@ impl Router {
         params: &Value,
         principal: &Principal,
         context: SubmissionContext<'_>,
+        storm_method: Option<&'static str>,
     ) -> Result<Value> {
-        let mut request: CommandSubmitRequest =
-            eliot_core::api::discovery::decode_params(params.clone())?;
+        let request = eliot_core::api::discovery::decode_params(params.clone())?;
+        let result = self.submit_decoded(request, principal, context).await;
+        if let Some(method) = storm_method {
+            self.note_command_submission(principal, context.remote, method, &result);
+        }
+        result
+    }
+
+    async fn submit_decoded(
+        &self,
+        mut request: CommandSubmitRequest,
+        principal: &Principal,
+        context: SubmissionContext<'_>,
+    ) -> Result<Value> {
         if request.verb == "git.integrate" {
             return self.submit_git_integrate(request, principal, context).await;
         }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = MODEL_MISMATCH_HOLD_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = REPEAT_FAILURE_ALERTS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -9,6 +9,7 @@ const HANDOFF_BUDGET_VERSION: i64 = 116;
 const WORK_TASK_BINDINGS_VERSION: i64 = 117;
 const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
 const MODEL_MISMATCH_HOLD_VERSION: i64 = 119;
+const REPEAT_FAILURE_ALERTS_VERSION: i64 = 120;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -38,7 +39,8 @@ impl Store {
         self.migrate_through_42(current)?;
         self.migrate_after_42(current)?;
         self.migrate_work_truth(current)?;
-        self.migrate_model_mismatch_hold(current)
+        self.migrate_model_mismatch_hold(current)?;
+        self.migrate_repeat_failure_alerts(current)
     }
 
     // Keep the debug-build migration frames small enough for Windows.
@@ -2816,6 +2818,24 @@ impl Store {
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [MODEL_MISMATCH_HOLD_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_repeat_failure_alerts(&mut self, current: i64) -> Result<()> {
+        if current < REPEAT_FAILURE_ALERTS_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(include_str!("../migrations/repeat_failure_alerts.sql"))
+                .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [REPEAT_FAILURE_ALERTS_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

@@ -1304,33 +1304,50 @@ round marker. A blocked check includes its bounded observation and can explain t
 diagnosis of an otherwise idle Agent.
 
 `daemon.status.health` and the `swarm status` health line report
-`goals_without_progress` and `active_repeat_windows`. The Goal count reuses
-the Owner inbox projection for blocked Goals and active Goals classified as
-stuck. The repeat count covers unexpired in-memory windows that have observed
-at least one failure or refusal, including windows below the alert threshold.
+Goals without progress, active repeat windows, and repeated-failure inbox items.
+Goals without progress include blocked Goals, Goals paused at the completion
+deferral limit, and active Goals confirmed stuck. Both inbox item counts exclude
+snoozed rows. The in-memory window count includes unexpired windows that have
+observed at least one failure or refusal, including windows below the alert threshold.
 
 The standard log records `daemon.command_storm` once when an authenticated
 principal/method pair accumulates at least 32 refused submissions in its ten-second
-window. Accepted attempts still contribute to the reported attempt and accepted
-counts. Remote connection ids are retained only in a bounded in-memory set for
+window. RPC submissions enter these totals after authentication and successful
+decoding. Accepted attempts contribute to the reported attempt and accepted counts.
+Remote connection ids are retained only in a bounded in-memory set for
 deduplication and never written to the log. The record includes numeric
 `connection_count`, exact through 64; a value of 65 with `connections_overflow` set
 means at least 65 distinct connections. One redacted representative rule id may use
 the existing `source` field. Direct internal producers keep their method labels,
 including internal mail and attribution notices, daemon archive, attention, and
-admitted rule actions. The daemon
-shares the existing 1024-entry repeated-failure counter and flushes qualifying storm
-windows on closure or maintenance shutdown. A qualifying storm also routes one
-daemon attention notice to the Owner.
+admitted rule actions. The Router bounds its active repeat windows and pending
+observations to 1024 keys each. It flushes qualifying storm windows on closure or
+maintenance shutdown. Authenticated RPC methods other than
+`command.submit` use the same threshold, grouped by principal, canonical method,
+failure code and operation, validation field when available, and normalized redacted
+cause. Those windows count failures and log `daemon.rpc_storm` with the cause.
 
-The same counter records a repeated Goal failure and routes one Owner attention
-notice at the third matching failure in a minute. A failing exit has the same
-identity whether the round continues or blocks on its budget. Replaying a retained
-Goal round reuses the original outcome without increasing the count.
+The same counter records a repeated Goal failure at the third matching failure
+in a minute. Goal failures match by Agent generation, Goal definition including
+the resolved check, failure class, and code. Changing check output or blocking on
+the round budget leaves the cause unchanged. Replaying a retained Goal round
+reuses the original outcome without increasing the count.
+
+The first qualifying repeat opens one current Owner inbox item per cause and commits
+one daemon attention notification in the same transaction. Matching failures refresh
+the occurrence and later qualifying windows update its diagnostic. A snooze holds for
+the entire occurrence. The Store holds at most 1024 causes and keeps existing causes
+when the limit is reached. Dropped causes at any of these limits share one additional
+overflow item, notification, and `daemon.repeat_failure_overflow` log record per
+occurrence. The overflow item clears after one minute without another overflow.
+A cause resolves after a minute without a matching failure
+or 20 seconds without a matching storm refusal. A Goal alert also resolves when its
+Goal completes, is replaced, paused, or cleared, or its Agent generation ends.
+A recurrence must meet the repeat threshold to open a new item and notification.
 
 When the Router commits a third rejection of the same command verb for the same
-Agent within one minute, it records `daemon.repeated_command_rejected` and one
-daemon attention notice. Further matching rejections in that window add no
+Agent within one minute, it records `daemon.repeated_command_rejected` and uses
+the same Owner inbox path. Further matching rejections in that window add no
 diagnostics. Each command keeps its own durable outcome and event.
 
 Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)

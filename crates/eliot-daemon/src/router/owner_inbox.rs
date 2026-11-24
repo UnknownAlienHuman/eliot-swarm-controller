@@ -2,14 +2,13 @@ use super::{Principal, Router, SubmissionContext, require_owner};
 use eliot_core::{
     Error, Result,
     api::{
-        CommandWithoutDispatcherStatus, LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest,
-        OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef,
-        OwnerInboxRequest, OwnerInboxResponse, SWARM_MAIL_SENDER, SwarmLiveness,
-        discovery::decode_params,
+        LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest, OwnerDecideRequest,
+        OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxRequest, OwnerInboxResponse,
+        SWARM_MAIL_SENDER, discovery::decode_params,
     },
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{OwnerDecisionAdmission, Store, StuckStates};
+use eliot_store::{OwnerDecisionAdmission, OwnerProjection, Store, StuckStates};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -38,13 +37,7 @@ impl Router {
         self.inner.confirmed_stuck.lock_recover().clone()
     }
 
-    pub(super) async fn read_owner_projection(
-        &self,
-    ) -> Result<(
-        Vec<OwnerInboxItem>,
-        SwarmLiveness,
-        CommandWithoutDispatcherStatus,
-    )> {
+    pub(super) async fn read_owner_projection(&self) -> Result<OwnerProjection> {
         let path = self.inner.data_root.join("eliot.db");
         let confirmed = self.confirmed_stuck();
         tokio::task::spawn_blocking(move || {
@@ -58,7 +51,7 @@ impl Router {
         require_owner(principal)?;
         let request: OwnerInboxRequest = decode_params(params.clone())?;
         let limit = request.effective_limit()?;
-        let (items, _, _) = self.read_owner_projection().await?;
+        let items = self.read_owner_projection().await?.items;
         let mut items = items
             .into_iter()
             .map(|item| (item.cursor(), item))
@@ -161,14 +154,13 @@ impl Router {
                                 Some("approve" | "deny" | "answer" | "resume" | "stop")
                             ) =>
                         {
-                            let result = self.submit_bound(&action.args, principal, context).await;
-                            self.note_command_submission(
+                            self.submit_bound(
+                                &action.args,
                                 principal,
-                                context.remote,
-                                "owner.decide",
-                                &result,
-                            );
-                            result
+                                context,
+                                Some("owner.decide"),
+                            )
+                            .await
                         }
                         "command.resolve" => self.command_resolve(&action.args, principal).await,
                         "command.cancel" => self.command_cancel(&action.args, principal).await,

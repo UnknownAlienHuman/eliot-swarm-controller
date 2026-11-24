@@ -101,14 +101,13 @@ impl Router {
     }
 
     pub(super) async fn status(&self) -> Result<Value> {
-        let (inbox, liveness, command_without_dispatcher) = self.read_owner_projection().await?;
-        let goals_without_progress = inbox
-            .iter()
-            .filter(|item| {
-                item.kind == OwnerInboxKind::BlockedGoal
-                    || (item.kind == OwnerInboxKind::Stuck && item.subject.starts_with("goal:"))
-            })
-            .count();
+        let eliot_store::OwnerProjection {
+            items: inbox,
+            liveness,
+            command_without_dispatcher,
+            goals_without_progress,
+            repeated_failure_inbox_items,
+        } = self.read_owner_projection().await?;
         let mut owner_inbox = OwnerInboxKind::ALL
             .into_iter()
             .map(|kind| (kind, 0))
@@ -201,6 +200,7 @@ impl Router {
             health: Some(DaemonHealthSummary {
                 goals_without_progress,
                 active_repeat_windows: self.active_repeat_windows(),
+                repeated_failure_inbox_items: Some(repeated_failure_inbox_items),
             }),
             command_without_dispatcher: Some(command_without_dispatcher),
             build_identity: Some(crate::build_identity::current().clone()),

@@ -10,6 +10,7 @@ use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
 
 pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
+pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
 
 pub(crate) fn project(
     connection: &Connection,
@@ -31,6 +32,7 @@ pub(crate) fn project(
     project_handoffs(connection, now, &mut items, &mut liveness, &[])?;
     project_switch_fences(connection, now, &mut items, &mut liveness, &[])?;
     project_work_not_in_git(connection, now, &mut items, &mut liveness, &[])?;
+    items.extend(project_repeated_failures(connection, now, None)?);
 
     items.sort_by(|left, right| {
         left.kind
@@ -48,6 +50,11 @@ pub(crate) fn project_item(
     subject: &str,
     now: i64,
 ) -> eliot_core::Result<Option<OwnerInboxItem>> {
+    if kind == OwnerInboxKind::Stuck
+        && let Some(cause) = subject.strip_prefix("repeat:")
+    {
+        return Ok(project_repeated_failures(db, now, Some(cause))?.pop());
+    }
     type Projector = fn(
         &Connection,
         i64,
@@ -167,6 +174,43 @@ pub(crate) fn project_item(
     Ok(items
         .into_iter()
         .find(|item| item.kind == kind && item.subject == subject))
+}
+
+fn project_repeated_failures(
+    db: &Connection,
+    now: i64,
+    cause: Option<&str>,
+) -> eliot_core::Result<Vec<OwnerInboxItem>> {
+    let sql = "SELECT r.cause, r.occurrence, r.opened_at, r.message
+         FROM repeat_failure_alerts r LEFT JOIN agents a ON a.id = r.goal_agent
+         WHERE r.expires_at > ?1 AND (r.goal_agent IS NULL OR
+           (a.generation = r.goal_generation AND a.state NOT IN ('stopped','failed','lost')))";
+    let (mut stmt, bindings): (_, &[&dyn ToSql]) = if let Some(cause) = &cause {
+        (
+            db.prepare_cached(&format!("{sql} AND r.cause = ?2"))
+                .map_err(sql_error)?,
+            &[&now, cause],
+        )
+    } else {
+        (db.prepare_cached(sql).map_err(sql_error)?, &[&now])
+    };
+    let rows = stmt
+        .query_map(bindings, |row| {
+            let mut alert = item(
+                OwnerInboxKind::Stuck,
+                format!("repeat:{}", row.get::<_, String>(0)?),
+                row.get(1)?,
+                now,
+                row.get(2)?,
+                REPEATED_FAILURE_REASON,
+                None,
+                Vec::new(),
+            );
+            alert.detail = Some(row.get(3)?);
+            Ok(alert)
+        })
+        .map_err(sql_error)?;
+    rows.map(|row| row.map_err(sql_error)).collect()
 }
 
 fn projection_query<'a>(
@@ -1735,6 +1779,7 @@ fn item(
         revision,
         age_ms: now.saturating_sub(since).max(0),
         reason: reason.to_owned(),
+        detail: None,
         recommended,
         choices,
         instructions: None,

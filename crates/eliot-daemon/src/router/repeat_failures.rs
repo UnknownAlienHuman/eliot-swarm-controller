@@ -5,7 +5,9 @@ use eliot_core::{
     api::{GoalView, inference::sha256_hex},
 };
 use eliot_plugin::sync::LockExt;
+use eliot_store::{RepeatAlertGoal, RepeatAlertUpdate};
 use regex::Regex;
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
@@ -13,11 +15,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-const REPEAT_WINDOW: Duration = Duration::from_secs(60);
+const REPEAT_WINDOW_MS: u64 = 60_000;
+const REPEAT_WINDOW: Duration = Duration::from_millis(REPEAT_WINDOW_MS);
 const REPEAT_THRESHOLD: u32 = 3;
 const STORM_WINDOW_MS: u64 = 10_000;
 const STORM_THRESHOLD: u64 = 32;
-const MAX_TRACKED_WINDOWS: usize = 1024;
+const MAX_TRACKED_WINDOWS: usize = eliot_store::MAX_REPEAT_FAILURE_ALERTS;
 const MAX_STORM_CONNECTION_IDS: usize = 64;
 
 static VOLATILE_MESSAGE_VALUES: LazyLock<Regex> = LazyLock::new(|| {
@@ -27,7 +30,7 @@ static VOLATILE_MESSAGE_VALUES: LazyLock<Regex> = LazyLock::new(|| {
     .expect("valid pattern for UUIDs, ULIDs, Agent ids and numbers")
 });
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 enum FailureOwner {
     Rule {
         principal: String,
@@ -37,25 +40,34 @@ enum FailureOwner {
         goal_id: String,
         agent: String,
         generation: i64,
+        mode: &'static str,
     },
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 struct FailureKey {
     owner: FailureOwner,
     failure_class: String,
     code: String,
-    message: String,
-    evidence: Option<String>,
+    rule_message: Option<String>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 struct StormKey {
     principal: String,
     method: &'static str,
+    rpc_failure: Option<RpcFailure>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+struct RpcFailure {
+    code: String,
+    operation: String,
+    field: Option<String>,
+    message: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
 enum WindowKey {
     Failure(FailureKey),
     CommandRejection { agent: String, verb: String },
@@ -66,7 +78,39 @@ struct CounterWindow {
     ends: Instant,
     count: u64,
     refused: u64,
+    last_refusal_at: i64,
     storm: StormDiagnostics,
+}
+
+struct FailureObservation<'a> {
+    class: &'a str,
+    code: &'a str,
+    message: &'a str,
+    goal: Option<RepeatAlertGoal>,
+}
+
+struct PendingAlert {
+    first_observed_at: i64,
+    last_observed_at: i64,
+    goal: Option<RepeatAlertGoal>,
+    message: Option<String>,
+}
+
+impl WindowKey {
+    fn quiet_ms(&self) -> i64 {
+        match self {
+            // The total is reported at window closure. Keep it through the
+            // following quiet window so even a burst at the start is visible.
+            Self::Storm(_) => 2 * STORM_WINDOW_MS as i64,
+            Self::Failure(_) | Self::CommandRejection { .. } => REPEAT_WINDOW_MS as i64,
+        }
+    }
+
+    fn matches_goal(&self, view: &GoalView) -> bool {
+        matches!(self, Self::Failure(FailureKey {
+            owner: FailureOwner::Goal { agent, generation, mode, .. }, ..
+        }) if agent == &view.agent && *generation == view.generation && *mode == view.mode.as_str())
+    }
 }
 
 #[derive(Default)]
@@ -98,45 +142,52 @@ impl StormDiagnostics {
 #[derive(Default)]
 pub(super) struct RepeatFailures {
     windows: HashMap<WindowKey, CounterWindow>,
-    overflow_logged_at: Option<Instant>,
-}
-
-enum RepeatOutcome {
-    Quiet,
-    Threshold,
-    Overflow,
+    pending_alerts: HashMap<WindowKey, PendingAlert>,
+    overflow_at: Option<i64>,
 }
 
 impl RepeatFailures {
-    fn record(
+    fn note_overflow(&mut self, observed_at: i64) {
+        self.overflow_at = Some(
+            self.overflow_at
+                .map_or(observed_at, |at| at.max(observed_at)),
+        );
+    }
+
+    fn queue_alert(
         &mut self,
-        owner: FailureOwner,
-        failure_class: &str,
-        code: &str,
-        message: &str,
-        evidence: Option<&str>,
-    ) -> RepeatOutcome {
-        let key = WindowKey::Failure(FailureKey {
-            owner,
-            failure_class: failure_class.to_owned(),
-            code: code.to_owned(),
-            message: normalized_message(message),
-            evidence: evidence.map(str::to_owned),
-        });
-        let now = Instant::now();
-        match self
-            .increment(key, now, 1, 0)
-            .map(|(window, _)| window.count)
+        key: WindowKey,
+        observed_at: i64,
+        goal: Option<RepeatAlertGoal>,
+        message: Option<String>,
+    ) {
+        if self.pending_alerts.len() >= MAX_TRACKED_WINDOWS
+            && !self.pending_alerts.contains_key(&key)
         {
-            Some(count) if count == u64::from(REPEAT_THRESHOLD) => RepeatOutcome::Threshold,
-            None if self
-                .overflow_logged_at
-                .is_none_or(|logged| now.duration_since(logged) >= REPEAT_WINDOW) =>
-            {
-                self.overflow_logged_at = Some(now);
-                RepeatOutcome::Overflow
-            }
-            _ => RepeatOutcome::Quiet,
+            self.note_overflow(observed_at);
+            return;
+        }
+        let quiet_ms = key.quiet_ms();
+        let pending = self.pending_alerts.entry(key).or_insert(PendingAlert {
+            first_observed_at: observed_at,
+            last_observed_at: observed_at,
+            goal,
+            message: None,
+        });
+        if observed_at.saturating_add(quiet_ms) <= pending.last_observed_at {
+            return;
+        }
+        if observed_at >= pending.last_observed_at.saturating_add(quiet_ms) {
+            pending.first_observed_at = observed_at;
+            pending.message = None;
+        }
+        pending.first_observed_at = pending.first_observed_at.min(observed_at);
+        pending.last_observed_at = pending.last_observed_at.max(observed_at);
+        if goal.is_some_and(|goal| pending.goal.is_none_or(|old| goal.revision > old.revision)) {
+            pending.goal = goal;
+        }
+        if message.is_some() {
+            pending.message = message;
         }
     }
 
@@ -152,6 +203,9 @@ impl RepeatFailures {
             self.windows
                 .retain(|key, window| matches!(key, WindowKey::Storm(_)) || now < window.ends);
             if self.windows.len() >= MAX_TRACKED_WINDOWS {
+                if refused > 0 || !matches!(key, WindowKey::Storm(_)) {
+                    self.note_overflow(super::now_ms());
+                }
                 return None;
             }
         }
@@ -172,6 +226,7 @@ impl RepeatFailures {
             ends: now + duration,
             count: 0,
             refused: 0,
+            last_refusal_at: 0,
             storm: StormDiagnostics::default(),
         });
         window.count = window.count.saturating_add(count);
@@ -202,9 +257,8 @@ impl Router {
             .count()
     }
 
-    /// Record a failed Goal check in the shared repeat counter. A matching
-    /// failure is bound to this Goal, Agent generation, failure class, code,
-    /// normalized diagnostic text and any exact check-output digest.
+    /// Match failures by Goal definition (including the check), Agent
+    /// generation, failure class, and code.
     pub(super) fn note_goal_failure(
         &self,
         principal: &str,
@@ -212,11 +266,13 @@ impl Router {
         failure_class: &str,
         code: &str,
         message: &str,
-        evidence: Option<&str>,
     ) {
         // A Goal's revision advances after each round; its definition is
         // stable across those rounds and separates replacement definitions.
         let Ok(definition) = serde_json::to_vec(&goal.definition) else {
+            return;
+        };
+        let Ok(agent) = eliot_core::parse_agent_id(&goal.agent) else {
             return;
         };
         self.note_repeated_failure(
@@ -224,13 +280,29 @@ impl Router {
                 goal_id: sha256_hex(&definition),
                 agent: goal.agent.clone(),
                 generation: goal.generation,
+                mode: goal.mode.as_str(),
             },
             principal,
-            failure_class,
-            code,
-            message,
-            evidence,
+            FailureObservation {
+                class: failure_class,
+                code,
+                message,
+                goal: Some(RepeatAlertGoal {
+                    agent,
+                    generation: goal.generation,
+                    mode: goal.mode,
+                    revision: goal.revision,
+                }),
+            },
         );
+    }
+
+    pub(super) fn reset_goal_repeat_failures(&self, goal: &GoalView) {
+        let mut counter = self.inner.repeat_failures.lock_recover();
+        counter.windows.retain(|key, _| !key.matches_goal(goal));
+        counter
+            .pending_alerts
+            .retain(|key, _| !key.matches_goal(goal));
     }
 
     pub(super) fn note_command_rejection(&self, command: &Command, events: &[Event]) {
@@ -248,12 +320,17 @@ impl Router {
             agent: agent.to_owned(),
             verb: verb.to_owned(),
         };
-        let reached_threshold = self
-            .inner
-            .repeat_failures
-            .lock_recover()
-            .increment(key, Instant::now(), 1, 0)
-            .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
+        let reached_threshold = {
+            let mut counter = self.inner.repeat_failures.lock_recover();
+            let observed_at = super::now_ms();
+            let reached = counter
+                .increment(key.clone(), Instant::now(), 1, 0)
+                .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
+            counter.queue_alert(key, observed_at, None, reached.then(|| format!(
+                "Agent {agent} had {REPEAT_THRESHOLD} rejected {verb} commands in one minute."
+            )));
+            reached
+        };
         if reached_threshold {
             crate::logging::record(
                 &self.secret_policy_snapshot(),
@@ -261,10 +338,39 @@ impl Router {
                 &[("agent", agent), ("command", verb)],
                 None,
             );
-            self.report_repeated_failure(format!(
-                "Agent {agent} had {REPEAT_THRESHOLD} rejected {verb} commands in one minute."
-            ));
         }
+    }
+
+    pub(super) fn note_rpc_failure(
+        &self,
+        principal: &str,
+        method: &'static str,
+        remote: Option<&RemoteCallContext>,
+        error: &Error,
+    ) {
+        let policy = self.secret_policy_snapshot();
+        let bounded =
+            |value: &str, limit| eliot_core::bound_chars(&policy.redact_text(value), limit);
+        let source = StormKey {
+            principal: principal.to_owned(),
+            method,
+            rpc_failure: Some(RpcFailure {
+                code: bounded(&error.code, 64),
+                operation: bounded(error.failure_where.as_deref().unwrap_or(method), 128),
+                field: error
+                    .details
+                    .as_ref()
+                    .map(|details| bounded(&details.field, 128)),
+                message: normalized_message(&bounded(&error.message, 512)),
+            }),
+        };
+        self.note_command_activity(
+            source,
+            1,
+            1,
+            remote.map(|call| call.connection_id.as_str()),
+            None,
+        );
     }
 
     pub(super) fn note_command_submission(
@@ -274,9 +380,13 @@ impl Router {
         method: &'static str,
         result: &Result<Value>,
     ) {
+        if method == "daemon.attention" {
+            return;
+        }
         let source = StormKey {
             principal: principal_name(principal),
             method,
+            rpc_failure: None,
         };
         let refused = result
             .as_ref()
@@ -297,6 +407,7 @@ impl Router {
         let source = StormKey {
             principal: admission.command.principal.clone(),
             method: "daemon.rule_action",
+            rpc_failure: None,
         };
         let attempts = 1 + u64::from(admission.linked_command.is_some());
         let refused = u64::from(admission.command.state == CommandState::Rejected)
@@ -320,8 +431,12 @@ impl Router {
     ) {
         let closed = {
             let mut counter = self.inner.repeat_failures.lock_recover();
-            let Some((window, closed)) =
-                counter.increment(WindowKey::Storm(source), Instant::now(), count, refused)
+            let key = WindowKey::Storm(source);
+            let observed_at = super::now_ms();
+            if refused > 0 {
+                counter.queue_alert(key.clone(), observed_at, None, None);
+            }
+            let Some((window, closed)) = counter.increment(key, Instant::now(), count, refused)
             else {
                 return;
             };
@@ -331,6 +446,9 @@ impl Router {
             if let Some(rule_id) = rule_id {
                 window.storm.observe_rule(rule_id);
             }
+            if refused > 0 {
+                window.last_refusal_at = observed_at;
+            }
             closed
         };
         if let Some((WindowKey::Storm(source), window)) = closed {
@@ -338,7 +456,7 @@ impl Router {
         }
     }
 
-    pub(crate) fn flush_command_storms(&self, shutdown: bool) {
+    pub(crate) async fn flush_repeat_failures(&self, shutdown: bool) {
         let closed: Vec<_> = {
             let mut counter = self.inner.repeat_failures.lock_recover();
             let now = Instant::now();
@@ -356,6 +474,60 @@ impl Router {
         for (source, window) in closed {
             self.log_command_storm(source, window);
         }
+        let pending_exists = {
+            let counter = self.inner.repeat_failures.lock_recover();
+            !counter.pending_alerts.is_empty() || counter.overflow_at.is_some()
+        };
+        if !pending_exists {
+            return;
+        }
+        let mut store = self.inner.store.lock().await;
+        let (pending, overflow_at, now) = {
+            let mut counter = self.inner.repeat_failures.lock_recover();
+            (
+                std::mem::take(&mut counter.pending_alerts),
+                counter.overflow_at.take(),
+                super::now_ms(),
+            )
+        };
+        let policy = self.secret_policy_snapshot();
+        let updates: Vec<_> = pending
+            .into_iter()
+            .filter_map(|(key, pending)| {
+                let encoded = serde_json::to_vec(&key).ok()?;
+                Some(RepeatAlertUpdate {
+                    cause: sha256_hex(&encoded),
+                    observed_at: pending.first_observed_at,
+                    expires_at: pending.last_observed_at.saturating_add(key.quiet_ms()),
+                    goal: pending.goal,
+                    message: pending
+                        .message
+                        .map(|text| eliot_core::bound_chars(&policy.redact_text(&text), 1024)),
+                })
+            })
+            .collect();
+        match store.update_repeat_alerts(&updates, overflow_at, now) {
+            Ok(batch) => {
+                self.publish_locked(&batch.events);
+                if batch.opened_overflow {
+                    crate::logging::record(
+                        &policy,
+                        "daemon.repeat_failure_overflow",
+                        &[("producer", "daemon.repeat_failures")],
+                        Some(&Error::new(
+                            "capacity",
+                            eliot_store::REPEAT_ALERT_OVERFLOW_MESSAGE,
+                        )),
+                    );
+                }
+            }
+            Err(error) => crate::logging::record(
+                &policy,
+                "daemon.repeat_alert_commit_failed",
+                &[],
+                Some(&error),
+            ),
+        }
     }
 
     fn log_command_storm(&self, source: StormKey, window: CounterWindow) {
@@ -367,6 +539,9 @@ impl Router {
             if let Some(rule_id) = window.storm.source.as_deref() {
                 ids.push(("source", rule_id));
             }
+            let error = source.rpc_failure.as_ref().map(|failure| {
+                Error::new(&failure.code, &failure.message).with_where(&failure.operation)
+            });
             crate::logging::record_command_storm(
                 &self.secret_policy_snapshot(),
                 &ids,
@@ -378,13 +553,29 @@ impl Router {
                         + u64::from(window.storm.connections_overflow),
                     connections_overflow: window.storm.connections_overflow,
                 },
+                error.as_ref(),
             );
-            if source.method != "daemon.attention" {
-                self.report_repeated_failure(format!(
+            let message = match &error {
+                Some(error) => format!(
+                    "RPC refusal storm from {} on {}: {} failures in {} ms ({}). {}",
+                    source.principal,
+                    source.method,
+                    window.refused,
+                    STORM_WINDOW_MS,
+                    error.code,
+                    error.message
+                ),
+                None => format!(
                     "Command rejection storm from {} on {}: {} of {} submissions were refused in one {} ms window.",
                     source.principal, source.method, window.refused, window.count, STORM_WINDOW_MS
-                ));
-            }
+                ),
+            };
+            self.inner.repeat_failures.lock_recover().queue_alert(
+                WindowKey::Storm(source),
+                window.last_refusal_at,
+                None,
+                Some(message),
+            );
         }
     }
 
@@ -401,10 +592,12 @@ impl Router {
                         rule: rule.to_owned(),
                     },
                     principal,
-                    "rule",
-                    code,
-                    message,
-                    None,
+                    FailureObservation {
+                        class: "rule",
+                        code,
+                        message,
+                        goal: None,
+                    },
                 );
             }
         }
@@ -438,10 +631,12 @@ impl Router {
                 rule: rule.id.clone(),
             },
             &command.principal,
-            "rule",
-            cause,
-            &message,
-            None,
+            FailureObservation {
+                class: "rule",
+                code: cause,
+                message: &message,
+                goal: None,
+            },
         );
     }
 
@@ -449,33 +644,29 @@ impl Router {
         &self,
         owner: FailureOwner,
         principal: &str,
-        failure_class: &str,
-        code: &str,
-        message: &str,
-        evidence: Option<&str>,
+        failure: FailureObservation<'_>,
     ) {
         let policy = self.secret_policy_snapshot();
-        let failure_class = eliot_core::bound_chars(&policy.redact_text(failure_class), 64);
-        let code = eliot_core::bound_chars(&policy.redact_text(code), 64);
-        let message = eliot_core::bound_chars(&policy.redact_text(message), 512);
-        let outcome = self.inner.repeat_failures.lock_recover().record(
-            owner.clone(),
-            &failure_class,
-            &code,
-            &message,
-            evidence,
-        );
-        match outcome {
-            RepeatOutcome::Quiet => return,
-            RepeatOutcome::Overflow => {
-                let event = match owner {
-                    FailureOwner::Rule { .. } => "daemon.rule_failure_counter_overflow",
-                    FailureOwner::Goal { .. } => "daemon.goal_failure_counter_overflow",
-                };
-                crate::logging::record(&policy, event, &[], None);
-                return;
-            }
-            RepeatOutcome::Threshold => {}
+        let failure_class = eliot_core::bound_chars(&policy.redact_text(failure.class), 64);
+        let code = eliot_core::bound_chars(&policy.redact_text(failure.code), 64);
+        let message = eliot_core::bound_chars(&policy.redact_text(failure.message), 512);
+        let key = WindowKey::Failure(FailureKey {
+            owner: owner.clone(),
+            failure_class: failure_class.clone(),
+            code: code.clone(),
+            rule_message: failure.goal.is_none().then(|| normalized_message(&message)),
+        });
+        let (reached_threshold, observed_at) = {
+            let mut counter = self.inner.repeat_failures.lock_recover();
+            let observed_at = super::now_ms();
+            let reached_threshold = counter
+                .increment(key.clone(), Instant::now(), 1, 0)
+                .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
+            counter.queue_alert(key.clone(), observed_at, failure.goal, None);
+            (reached_threshold, observed_at)
+        };
+        if !reached_threshold {
+            return;
         }
         let count = REPEAT_THRESHOLD;
         let text = match owner {
@@ -491,6 +682,7 @@ impl Router {
                 goal_id,
                 agent,
                 generation,
+                ..
             } => {
                 crate::logging::record_repeated_goal_failure(
                     &policy,
@@ -510,23 +702,11 @@ impl Router {
                 )
             }
         };
-        self.report_repeated_failure(text);
-    }
-
-    fn report_repeated_failure(&self, text: String) {
-        let router = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = router.report_daemon_attention(text).await {
-                crate::logging::record(
-                    &router.secret_policy_snapshot(),
-                    "daemon.attention_delivery_failed",
-                    &[],
-                    Some(&Error::new(
-                        error.code,
-                        "repeated failure notice could not be delivered",
-                    )),
-                );
-            }
-        });
+        self.inner.repeat_failures.lock_recover().queue_alert(
+            key,
+            observed_at,
+            failure.goal,
+            Some(text),
+        );
     }
 }

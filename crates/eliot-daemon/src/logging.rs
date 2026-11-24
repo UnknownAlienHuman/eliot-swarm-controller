@@ -299,6 +299,7 @@ pub(crate) fn record_command_storm(
     refused: u64,
     window_ms: u64,
     metadata: CommandStormMetadata,
+    error: Option<&Error>,
 ) {
     let detail = Map::from_iter([
         ("attempts".to_owned(), Value::from(attempts)),
@@ -319,11 +320,15 @@ pub(crate) fn record_command_storm(
     ]);
     write_record(
         policy,
-        "daemon.command_storm",
+        if error.is_some() {
+            "daemon.rpc_storm"
+        } else {
+            "daemon.command_storm"
+        },
         ids,
         None,
         Some(detail),
-        None,
+        error,
     );
 }
 

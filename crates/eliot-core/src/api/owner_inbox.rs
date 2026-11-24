@@ -78,6 +78,8 @@ pub struct OwnerInboxItem {
     pub revision: String,
     pub age_ms: i64,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     pub recommended: Option<OwnerAction>,
     pub choices: Vec<OwnerAction>,
     /// Exact commands for the Owner when no single action does the work.
