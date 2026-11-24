@@ -2024,16 +2024,32 @@ async fn launch_session(
         plan.requested_mcp_policy,
         mcp_config.path().as_os_str(),
     ));
+    let mut settings = serde_json::Map::new();
+    if cfg!(windows) {
+        // Claude Code can acknowledge initialize without sending a pre-input
+        // system record. A native SessionStart hook makes the CLI emit its
+        // exact session id on the owned stream. The hook contributes no input.
+        settings.insert(
+            "hooks".to_owned(),
+            json!({
+                "SessionStart": [{
+                    "matcher": "startup|resume",
+                    "hooks": [{"type": "command", "command": "exit 0", "timeout": 3}]
+                }]
+            }),
+        );
+    }
     if let Some(hostname) = &plan.inherit_cloud_hostname {
         // Native policy also covers remote servers fetched after preflight.
         // Per-scope deny entries merge, including with managed settings.
+        settings.insert(
+            "deniedMcpServers".to_owned(),
+            json!([{"serverUrl": format!("*://{hostname}:*/*")}]),
+        );
+    }
+    if !settings.is_empty() {
         argv.push(OsString::from("--settings"));
-        argv.push(OsString::from(
-            json!({
-                "deniedMcpServers": [{"serverUrl": format!("*://{hostname}:*/*")}],
-            })
-            .to_string(),
-        ));
+        argv.push(OsString::from(Value::Object(settings).to_string()));
     }
     // Expose the daemon-materialized coordination skill through the CLI's
     // own plugin mechanism: the materialized skill root doubles as the
