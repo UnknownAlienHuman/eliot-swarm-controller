@@ -8,10 +8,8 @@ const HARNESS_NAMES: &[&str] = &["codex", "claude", "opencode", "muse", "antigra
 // Exact allowances for remaining configuration identity and display vocabulary.
 const EXISTING: &[(&str, usize)] = &[
     ("eliot-core/src/api/harness.rs", 6),
-    ("eliot-daemon/src/adhoc.rs", 11),
     ("eliot-daemon/src/config.rs", 12),
     ("eliot-daemon/src/config/profiles_edit.rs", 2),
-    ("eliot-daemon/src/harness_capabilities.rs", 4),
     ("eliot-daemon/src/router/catalog.rs", 13),
     ("eliot-daemon/src/router/discovery.rs", 5),
 ];

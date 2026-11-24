@@ -41,6 +41,7 @@ ulid.workspace = true
 url.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+eliot = { path = "../../crates/eliot" }
 # First real code import of windows-reactor: Microsoft windows-rs 0.100.0
 # (https://github.com/microsoft/windows-rs), MIT OR Apache-2.0, rust-version
 # 1.95, below the pinned workspace toolchain 1.99.1. License texts live in

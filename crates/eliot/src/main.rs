@@ -47,19 +47,7 @@ fn main() -> ExitCode {
     {
         return report_failure(Failure::new(1, error.to_string()));
     }
-    if let Err(error) = eliot_core::api::register_harness_capabilities([
-        ("codex", eliot_plugin_codex::capabilities::declaration()),
-        ("claude", eliot_plugin_claude::capabilities::declaration()),
-        (
-            "opencode",
-            eliot_plugin_opencode::capabilities::declaration(),
-        ),
-        ("muse", eliot_plugin_muse::capabilities::declaration()),
-        (
-            "antigravity",
-            eliot_plugin_antigravity::capabilities::declaration(),
-        ),
-    ]) {
+    if let Err(error) = eliot::register_harness_capabilities() {
         return report_failure(Failure::new(1, error.to_string()));
     }
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));

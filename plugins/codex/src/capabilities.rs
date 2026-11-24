@@ -1,24 +1,29 @@
 //! Codex native adapter capability declaration.
 
-use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, NativeAccessBounds,
-    NativeQuotaReadback, QuotaProjectionFormat, UserInstructionFiles,
+    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeQuotaReadback, ProfileCapabilities,
+    ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
-    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, CodexApprovalPolicy, CodexPermissions,
-    codex_project_doc_override,
+    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, NativeSubagentsPolicy, codex_project_doc_override,
 };
-use eliot_core::api::{HarnessCapabilities, InputTokenAccounting, InstructionReadStatus};
+use eliot_core::api::{
+    HarnessCapabilities, InputTokenAccounting, InstructionReadStatus::Documented,
+};
+use eliot_core::{InjectPoint, McpPolicy};
+use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        profile: ProfileCapabilities {
+            script_wrapper_cmd: true,
+            project_doc_max_bytes: true,
+            native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
+            ..ProfileCapabilities::default()
+        },
         quota_readback: Some(NativeQuotaReadback {
-            projection: QuotaProjectionFormat::RateLimits,
             method: "account/rateLimits/read",
-            adhoc_integration: None,
-            description: |_| "Codex account/rateLimits/read; provider read-only values",
             unsupported_note: Some(
                 "Installed Codex app-server does not support account/rateLimits/read",
             ),
@@ -27,14 +32,16 @@ pub fn declaration() -> HarnessCapabilities {
                     "Codex profile routes through an adopted proxy; ChatGPT account limits would describe the direct route",
                 )
             }),
+            ..quota_readback(
+                QuotaProjectionFormat::RateLimits,
+                |_| "Codex account/rateLimits/read; provider read-only values",
+            )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
-        adhoc_launch: Some(AdhocLaunchDefaults {
-            permissions: adhoc_permissions,
-            mcp: eliot_core::McpPolicy::Inherit,
-            pass_env: &[],
-            installed_profile_mcp: eliot_core::McpPolicy::Minimal,
-        }),
+        adhoc_launch: Some(adhoc_launch(
+            sandbox_permissions(true, "approval_policy", ["on-request", "never", "never"]),
+            McpPolicy::Minimal,
+        )),
         documentation_section: Some("docs/harnesses/codex.md#sources"),
         native_access_bounds: Some(native_access_bounds),
         workspace_write_commit_roots: true,
@@ -42,7 +49,19 @@ pub fn declaration() -> HarnessCapabilities {
         manager_preference: Some(0),
         provider_probe: true,
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
-        project_instruction_read: Some(project_instruction_read),
+        project_instruction_read: Some(ProjectInstructionRead {
+            paths: &[
+                ("AGENTS.md", Documented),
+                ("AGENTS.override.md", Documented),
+            ],
+            byte_limit: Some(|profile| {
+                profile
+                    .as_object()
+                    .and_then(codex_project_doc_override)
+                    .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
+            }),
+            ..ProjectInstructionRead::default()
+        }),
         user_instruction_files: Some(UserInstructionFiles {
             root_override_env: Some("CODEX_HOME"),
             home_subdir: ".codex",
@@ -66,48 +85,6 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
         ..HarnessCapabilities::default()
     }
-}
-
-fn adhoc_permissions(
-    snapshot: &mut serde_json::Map<String, Value>,
-    access: Option<AdhocAccess>,
-) -> eliot_core::Result<()> {
-    let (permissions, approval) = match access {
-        Some(AdhocAccess::Ask) => (
-            CodexPermissions::WorkspaceWrite,
-            CodexApprovalPolicy::OnRequest,
-        ),
-        Some(AdhocAccess::Auto) => (CodexPermissions::WorkspaceWrite, CodexApprovalPolicy::Never),
-        Some(AdhocAccess::Full) => (
-            CodexPermissions::DangerFullAccess,
-            CodexApprovalPolicy::Never,
-        ),
-        None => (CodexPermissions::default(), CodexApprovalPolicy::default()),
-    };
-    snapshot.insert("permissions".to_owned(), Value::from(permissions.as_str()));
-    snapshot.insert("approval_policy".to_owned(), Value::from(approval.as_str()));
-    Ok(())
-}
-
-fn project_instruction_read(
-    path: &str,
-    profile: &Value,
-    size_bytes: Option<u64>,
-) -> (InstructionReadStatus, Option<String>) {
-    use InstructionReadStatus::{Documented, NotNative, Partial, Unknown};
-    if !matches!(path, "AGENTS.md" | "AGENTS.override.md") {
-        return (Unknown, None);
-    }
-    let limit = profile
-        .as_object()
-        .and_then(codex_project_doc_override)
-        .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES);
-    let status = match limit {
-        0 => NotNative,
-        limit if size_bytes.is_some_and(|size| size > limit) => Partial,
-        _ => Documented,
-    };
-    (status, None)
 }
 
 fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {

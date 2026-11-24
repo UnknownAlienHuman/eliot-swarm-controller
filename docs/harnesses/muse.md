@@ -770,9 +770,11 @@ snapshot from safe defaults (`workspace-write`, `never`, explicit MCP `inherit`)
 flags. An omitted `--model` defers to the server default whether or not the
 catalogue marks a row with `isDefault` (an empty catalogue refuses launch); the
 effective id is read back from the session. An explicit model is passed
-unchanged even when the catalogue omits it. `cmd` is discovered from the launcher dir version
-the launcher marks current (`muse.cmd` wrappers are never frozen); omitted
-profile `cmd` uses this same discovery. The selected native executable is
+unchanged even when the catalogue omits it. Discovery prefers the native payload
+identified by the Windows launcher manifest. If the manifest cannot identify a
+payload, discovery can use a single unambiguous native payload in the launcher
+directory and reports its version as unknown. Omitted profile `cmd` uses this
+same discovery. The selected native executable is
 frozen only in the launch generation. `--cmd` is the Owner's one-launch
 override. On Linux the native payload
 installs directly (`muse`

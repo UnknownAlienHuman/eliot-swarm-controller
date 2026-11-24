@@ -1,4 +1,5 @@
 mod bounded_file;
+pub mod capabilities;
 pub mod debug;
 pub mod edit_path;
 pub mod event_actor;

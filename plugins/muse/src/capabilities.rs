@@ -1,48 +1,55 @@
 //! Muse native adapter capability declaration.
 
-use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, ModelReaderOptions,
-    NativeAccessBounds, NativeQuotaReadback, QuotaProjectionFormat,
+    AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeQuotaReadback,
+    ProfileCapabilities, QuotaProjectionFormat,
 };
-use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
-use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus};
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
+use eliot_core::api::{
+    ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus::NotNative,
+};
+use eliot_core::{InjectPoint, McpPolicy};
+use eliot_plugin::capabilities::{
+    adhoc_launch, instruction_files, quota_readback, sandbox_permissions,
+};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        profile: ProfileCapabilities {
+            native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
+            ..ProfileCapabilities::default()
+        },
         model_reader: ModelReaderOptions {
             budget_seconds: Some(60),
             ..ModelReaderOptions::default()
         },
         quota_readback: Some(NativeQuotaReadback {
-            projection: QuotaProjectionFormat::UsagePair,
             method: "usage/read",
-            adhoc_integration: None,
-            description: |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
             unsupported_note: Some(
                 "Installed Muse MSP does not support usage/read and has no retained subscription observation",
             ),
-            route_refusal: None,
+            ..quota_readback(
+                QuotaProjectionFormat::UsagePair,
+                |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
+            )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
-        adhoc_launch: Some(AdhocLaunchDefaults {
-            permissions: adhoc_permissions,
-            mcp: eliot_core::McpPolicy::Inherit,
-            pass_env: &[],
-            installed_profile_mcp: eliot_core::McpPolicy::Inherit,
-        }),
+        adhoc_launch: Some(adhoc_launch(
+            sandbox_permissions(
+                true,
+                "approval",
+                ["onRequest", "promptUnmatched", "allowAll"],
+            ),
+            McpPolicy::Inherit,
+        )),
         documentation_section: Some("docs/harnesses/muse.md#usage-attribution"),
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
-        project_instruction_read: Some(|path, _, _| {
-            let status = if matches!(path, "AGENTS.md" | "AGENTS.override.md") {
-                InstructionReadStatus::NotNative
-            } else {
-                InstructionReadStatus::Unknown
-            };
-            (status, None)
-        }),
+        project_instruction_read: Some(instruction_files(&[
+            ("AGENTS.md", NotNative),
+            ("AGENTS.override.md", NotNative),
+        ])),
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
@@ -69,31 +76,6 @@ pub fn declaration() -> HarnessCapabilities {
         session_input_includes_cache_reads: true,
         ..HarnessCapabilities::default()
     }
-}
-
-fn adhoc_permissions(
-    snapshot: &mut serde_json::Map<String, Value>,
-    access: Option<AdhocAccess>,
-) -> eliot_core::Result<()> {
-    let permissions = match access {
-        Some(AdhocAccess::Full) => CodexPermissions::DangerFullAccess,
-        Some(AdhocAccess::Ask | AdhocAccess::Auto) => CodexPermissions::WorkspaceWrite,
-        None => CodexPermissions::default(),
-    };
-    snapshot.insert("permissions".to_owned(), Value::from(permissions.as_str()));
-    snapshot.insert(
-        "approval_policy".to_owned(),
-        Value::from(CodexApprovalPolicy::default().as_str()),
-    );
-    if let Some(access) = access {
-        let approval = match access {
-            AdhocAccess::Ask => "onRequest",
-            AdhocAccess::Auto => "promptUnmatched",
-            AdhocAccess::Full => "allowAll",
-        };
-        snapshot.insert("approval".to_owned(), Value::from(approval));
-    }
-    Ok(())
 }
 
 fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {

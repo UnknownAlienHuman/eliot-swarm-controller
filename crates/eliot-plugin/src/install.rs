@@ -23,9 +23,9 @@ pub enum OwnedFileDurability {
     Sync,
 }
 
-/// Create and write one exclusively owned file, removing a partial file if
-/// writing or the requested durability step fails. Adapter-specific errors
-/// and durability remain at the call site.
+/// Stage and atomically publish one exclusively owned file without replacing
+/// an existing destination. Adapter-specific errors and durability remain at
+/// the call site.
 pub fn write_new_file(
     path: &Path,
     contents: &[u8],
@@ -33,19 +33,76 @@ pub fn write_new_file(
     create_error: impl FnOnce() -> core::Error,
     write_error: impl FnOnce() -> core::Error,
 ) -> core::Result<()> {
-    let mut file = OpenOptions::new()
+    let Some(filename) = path.file_name() else {
+        return Err(create_error());
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return Err(create_error());
+    };
+    let target = parent.join(filename);
+    let temporary = parent.join(format!(".eliot-install.{}.tmp", ulid::Ulid::new()));
+    let Ok(mut file) = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
-        .map_err(|_| create_error())?;
+        .open(&temporary)
+    else {
+        return Err(create_error());
+    };
     let write_result = file.write_all(contents).and_then(|()| match durability {
         OwnedFileDurability::Flush => file.flush(),
         OwnedFileDurability::Sync => file.sync_all(),
     });
     if write_result.is_err() {
         drop(file);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&temporary);
         return Err(write_error());
+    }
+    drop(file);
+    if publish_new_file(&temporary, &target).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(create_error());
+    }
+    #[cfg(not(windows))]
+    let _ = fs::remove_file(&temporary);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_new_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    // A same-directory link publishes without replacing an existing target.
+    fs::hard_link(temporary, target)
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Atomic no-replace rename uses the Windows filesystem API."
+)]
+fn publish_new_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let mut source: Vec<u16> = temporary.as_os_str().encode_wide().collect();
+    let mut destination: Vec<u16> = target.as_os_str().encode_wide().collect();
+    if source.contains(&0) || destination.contains(&0) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    source.push(0);
+    destination.push(0);
+    // SAFETY: Both buffers are NUL-terminated and live for the whole call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }

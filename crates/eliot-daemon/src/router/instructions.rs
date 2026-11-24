@@ -53,7 +53,12 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
             };
             if let Some(native_read) = native_read {
                 (file.native_read_status, file.native_read_version) =
-                    native_read(path, profile, file.size_bytes);
+                    eliot_plugin::capabilities::project_instruction_read(
+                        native_read,
+                        path,
+                        profile,
+                        file.size_bytes,
+                    );
             }
             file
         })

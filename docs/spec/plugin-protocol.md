@@ -149,6 +149,11 @@ verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
 Adapters declare their project instruction-file behavior and the user instruction
 paths that doctor compares with committed owner rules.
+The controller and offline desktop settings editor register the same profile
+capabilities from the built-in adapters.
+Claude `AGENTS.md` is `unknown` at prelaunch because the adapter cannot establish
+which project instructions the native loader will select. Swarm's normal project
+source delivery applies, and any installed version is provenance.
 They also declare ad-hoc access mappings and the MCP and environment defaults
 used by ad-hoc launches and installed profile presets.
 Catalogue reader stages and native quota readback formats come from the same
@@ -935,7 +940,8 @@ Use the shared [`retry`](../../crates/eliot-plugin/src/retry.rs) module for read
 polls and absolute deadline waits. Adapters translate native resume readback into shared
 preflight evidence. They translate exact native provider refusals into the common
 restriction fact so the daemon and Store can apply hold policy. Shared file installation
-owns exclusive creation and partial-write cleanup for staged hook and configuration files.
+writes hook and configuration files to an exclusive temporary file beside the destination.
+It publishes the completed file atomically and refuses to overwrite an existing file.
 
 All adapters follow the shared [native data rule](../../crates/eliot-plugin/src/native_data.rs).
 Skip extra fields. Decode an unfamiliar enum value as `Other` and emit a diagnostic.

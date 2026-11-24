@@ -1,47 +1,48 @@
 //! Opencode native adapter capability declaration.
 
+use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, ModelReaderOptions, NativeQuotaReadback,
-    QuotaProjectionFormat, UserInstructionFiles,
+    AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
+    NativeQuotaReadback, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
 };
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
+    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting,
+    InstructionReadStatus::{Conditional, Documented},
 };
+use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback};
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        profile: ProfileCapabilities {
+            route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
+            local_provider: true,
+            native_subagents_policy: Some(NativeSubagentsPolicy::deny_by_default()),
+            ..ProfileCapabilities::default()
+        },
         model_reader: ModelReaderOptions {
             separate_variant_reader: true,
             ..ModelReaderOptions::default()
         },
         quota_readback: Some(NativeQuotaReadback {
-            projection: QuotaProjectionFormat::IntegrationWindows,
-            method: "quota.read",
             adhoc_integration: Some("opencode-go"),
-            description: |details| {
+            ..quota_readback(QuotaProjectionFormat::IntegrationWindows, |details| {
                 if details["integration"] == "opencode" {
                     "OpenCode Console workspace budgets and Go allowance; provider read-only values"
                 } else {
                     "OpenCode Go account usage; provider read-only values"
                 }
-            },
-            unsupported_note: None,
-            route_refusal: None,
+            })
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
         adhoc_launch: Some(AdhocLaunchDefaults {
-            permissions: |_, access| {
-                if access == Some(AdhocAccess::Full) {
-                    return Err(eliot_core::Error::new(
-                        "unsupported",
-                        "the opencode slice has no full-access permission mapping",
-                    ));
-                }
-                Ok(())
-            },
-            mcp: eliot_core::McpPolicy::Inherit,
-            pass_env: &[],
-            installed_profile_mcp: eliot_core::McpPolicy::Minimal,
+            model: AdhocModel::ProviderIntegration,
+            ..adhoc_launch(
+                AdhocPermissions::RefuseFull(
+                    "the opencode slice has no full-access permission mapping",
+                ),
+                McpPolicy::Minimal,
+            )
         }),
         documentation_section: Some("docs/harnesses/opencode.md#working-profile"),
         // No frozen permission knob or OS sandbox constrains this range.
@@ -49,14 +50,10 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         manager_preference: Some(2),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
-        project_instruction_read: Some(|path, _, _| {
-            let status = match path {
-                "AGENTS.md" => InstructionReadStatus::Documented,
-                "CLAUDE.md" => InstructionReadStatus::Conditional,
-                _ => InstructionReadStatus::Unknown,
-            };
-            (status, None)
-        }),
+        project_instruction_read: Some(instruction_files(&[
+            ("AGENTS.md", Documented),
+            ("CLAUDE.md", Conditional),
+        ])),
         user_instruction_files: Some(UserInstructionFiles {
             root_override_env: Some("XDG_CONFIG_HOME"),
             home_subdir: ".config",

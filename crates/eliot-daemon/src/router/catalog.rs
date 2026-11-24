@@ -1274,7 +1274,7 @@ pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot
     }
 }
 
-/// Derive the nonsecret `(scope, credential)` pair for one frozen snapshot.
+/// Display the nonsecret `(scope, credential)` pair for a frozen snapshot.
 ///
 /// `profile_label` is the validated profile name, or `adhoc` for daemon
 /// defaults. A `None` snapshot covers static harnesses (Claude,
@@ -1299,8 +1299,7 @@ pub(crate) fn describe_snapshot(
         .unwrap_or(harness);
     let mut scope = format!("profile:{profile_label} harness:{harness}");
     let mut credential = "none".to_owned();
-    // The frozen account binding selects the native account: a profile edit
-    // that renames it must not reuse the previous account's cache entry.
+    // Show the account within the public scope field's byte budget.
     if let Some(account) = snapshot
         .get("account")
         .and_then(Value::as_str)
@@ -1609,6 +1608,7 @@ fn native_models_response(
         .and_then(Value::as_str)
         .filter(|default| !default.trim().is_empty())
         .map(str::to_owned);
+    // These response labels describe the reader's provenance to the caller.
     let (catalogue, note) = if harness == "muse" && entries.is_empty() {
         (
             "empty".to_owned(),

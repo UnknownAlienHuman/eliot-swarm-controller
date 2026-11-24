@@ -18,6 +18,19 @@ pub fn provider(message: &'static str) -> Error {
         .with_origin(FailureOrigin::Provider, "provider quota read failed")
 }
 
+/// Whether a native environment contains a configured route marker.
+pub fn has_nonempty_env_marker(environment: &Value, names: &[&str]) -> bool {
+    environment.as_object().is_some_and(|environment| {
+        environment.iter().any(|(name, value)| {
+            value.as_str().is_some_and(|text| !text.is_empty())
+                && names.iter().any(|candidate| {
+                    name.as_str() == *candidate
+                        || (cfg!(windows) && name.eq_ignore_ascii_case(candidate))
+                })
+        })
+    })
+}
+
 /// Native evidence distinguishes a 429 rate limit from a quota exhaustion.
 #[derive(Clone, Copy)]
 pub enum HttpLimitKind {

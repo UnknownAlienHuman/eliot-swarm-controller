@@ -334,9 +334,9 @@ native byte limit. Conditional means documented behavior depends on settings, pr
 or exclusions that this launch did not prove; not_native means the active Eliot
 adapter configuration does not enable that reader; unknown means no supported
 conclusion. These statuses describe the adapter's configured reading behavior.
-The Claude adapter reports AGENTS.md as conditional because native reading
-depends on project-instruction settings, precedence, plugins and exclusions.
-The inventory retains the installed Claude version where available as provenance.
+The Claude adapter reports `AGENTS.md` as `unknown` because prelaunch readback
+does not establish whether the native instruction loader will select it. The
+inventory retains the installed Claude version where available as provenance.
 The managed Claude adapter leaves project memory
 enabled, so `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` use documented
 native delivery. Only the separate print inference path passes empty

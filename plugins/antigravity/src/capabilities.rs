@@ -1,39 +1,44 @@
 //! Antigravity native adapter capability declaration.
 
-use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, NativeQuotaReadback,
-    QuotaProjectionFormat, UserInstructionFiles,
+    AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeAccessBounds, NativeQuotaReadback,
+    ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
 };
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use eliot_core::{InjectPoint, McpPolicy};
+use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        profile: ProfileCapabilities {
+            command_refusal: Some(|cmd| {
+                (!eliot_plugin::install::cli_identity_matches(cmd, crate::install::CLI_STEM)).then_some(
+                "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
+            )
+            }),
+            native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
+            ..ProfileCapabilities::default()
+        },
         quota_readback: Some(NativeQuotaReadback {
-            projection: QuotaProjectionFormat::Windows,
-            method: "quota.read",
-            adhoc_integration: None,
-            description: |_| "Antigravity account quota; provider read-only values",
-            unsupported_note: None,
             route_refusal: Some(|_, environment| {
                 ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]
                     .into_iter()
                     .any(|name| environment.get(name).and_then(Value::as_str).is_some_and(|text| !text.is_empty()))
                     .then_some("Antigravity profile selects external auth; native keyring quota would describe another route")
             }),
+            ..quota_readback(
+                QuotaProjectionFormat::Windows,
+                |_| "Antigravity account quota; provider read-only values",
+            )
         }),
         adhoc_launch: Some(AdhocLaunchDefaults {
-            permissions: |snapshot, access| {
-                snapshot.insert(
-                    "dangerously_skip_permissions".to_owned(),
-                    Value::Bool(access == Some(AdhocAccess::Full)),
-                );
-                Ok(())
-            },
-            mcp: eliot_core::McpPolicy::Inherit,
-            pass_env: &[],
-            installed_profile_mcp: eliot_core::McpPolicy::Inherit,
+            model: AdhocModel::Explicit,
+            ..adhoc_launch(
+                AdhocPermissions::FullFlag("dangerously_skip_permissions"),
+                McpPolicy::Inherit,
+            )
         }),
         documentation_section: Some("docs/harnesses/antigravity.md#native-identity-and-transport"),
         native_access_bounds: Some(native_access_bounds),

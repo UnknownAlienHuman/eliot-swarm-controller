@@ -55,8 +55,13 @@ pub enum NativeArchiveBinding {
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
 type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
-type ProjectInstructionRead =
-    fn(&str, &serde_json::Value, Option<u64>) -> (super::InstructionReadStatus, Option<String>);
+/// Evidence available for native project instruction-file reading.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProjectInstructionRead {
+    pub paths: &'static [(&'static str, super::InstructionReadStatus)],
+    pub report_version: bool,
+    pub byte_limit: Option<fn(&serde_json::Value) -> u64>,
+}
 
 /// Locations of the adapter's documented user instruction files.
 #[derive(Clone, Copy, Debug)]
@@ -96,13 +101,32 @@ impl AdhocAccess {
     }
 }
 
-type AdhocPermissions =
-    fn(&mut serde_json::Map<String, serde_json::Value>, Option<AdhocAccess>) -> Result<()>;
+/// Native permission fields selected by the three ad-hoc access levels.
+#[derive(Clone, Copy, Debug)]
+pub enum AdhocPermissions {
+    Sandbox {
+        full_changes_sandbox: bool,
+        field: &'static str,
+        values: [&'static str; 3],
+    },
+    FullFlag(&'static str),
+    RefuseFull(&'static str),
+}
+
+/// Model and auth syntax for an ad-hoc launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdhocModel {
+    #[default]
+    NativeDefault,
+    Explicit,
+    ProviderIntegration,
+}
 
 /// Defaults the native adapter can enforce for a launch without a saved profile.
 #[derive(Clone, Copy, Debug)]
 pub struct AdhocLaunchDefaults {
     pub permissions: AdhocPermissions,
+    pub model: AdhocModel,
     pub mcp: crate::McpPolicy,
     pub pass_env: &'static [&'static str],
     pub installed_profile_mcp: crate::McpPolicy,
@@ -166,9 +190,32 @@ pub struct ModelReaderOptions {
     pub interruption_code: Option<&'static str>,
 }
 
+/// Native profile vocabulary used by the daemon and the desktop editor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProfileCapabilities {
+    pub model_pin_selectors: bool,
+    pub route_selectors_resolved: bool,
+    pub route_scope_secret_names: &'static [&'static str],
+    pub config_dir_credential: bool,
+    pub latest_cmd: bool,
+    pub script_wrapper_cmd: bool,
+    pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
+    pub local_provider: bool,
+    pub project_doc_max_bytes: bool,
+    pub native_subagents_policy: Option<super::native_profile::NativeSubagentsPolicy>,
+}
+
+impl ProfileCapabilities {
+    pub fn of(harness: &str) -> Self {
+        HarnessCapabilities::of(harness).profile
+    }
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
+    /// Native profile vocabulary supplied by this adapter.
+    pub profile: ProfileCapabilities,
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// `None` when the adapter has no ad-hoc effort mapping.
@@ -320,10 +367,11 @@ pub fn register_harness_capabilities(
         capabilities
             .documentation_section
             .is_none_or(|section| section.trim().is_empty())
+            || capabilities.profile.native_subagents_policy.is_none()
     }) {
         return Err(Error::new(
             "internal",
-            "built-in adapter declaration is missing its documentation section",
+            "built-in adapter declaration is missing its documentation section or native-subagent policy",
         ));
     }
     BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
