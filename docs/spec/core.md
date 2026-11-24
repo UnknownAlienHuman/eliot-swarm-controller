@@ -255,7 +255,8 @@ proof, in which case the stop outcome records
 keeps the stop `unknown` with the missing fact named. Stop never retries an
 uncertain native call.
 An actor that retires control without proof of exit records the Agent as lost
-and keeps the custody reservation for reconciliation.
+and keeps the custody reservation for reconciliation. A live stop stays
+dispatched through concurrent Agent loss while its worker checks those proofs.
 
 An acknowledged Owner interrupt labels its captured turn `interrupted_by_owner`
 when a native interrupted terminal commits. A proven Owner stop can also
