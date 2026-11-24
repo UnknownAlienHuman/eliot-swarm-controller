@@ -341,7 +341,11 @@ fn later_instructions(
             .omitted
             .values()
             .copied()
-            .fold(0usize, usize::saturating_add)
+            .fold(
+                inputs.compacted.map_or(0, |compacted| compacted.count),
+                usize::saturating_add,
+            )
+            // Older records did not identify the sources in this aggregate.
             .max(inputs.compacted_omissions);
         for record in inputs.corrections.iter().rev() {
             if transferred.iter().any(|send| send.id == record.command_id) {

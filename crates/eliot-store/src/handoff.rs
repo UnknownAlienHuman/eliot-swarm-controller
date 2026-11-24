@@ -45,6 +45,8 @@ pub struct TaskInstruction {
     pub principal: String,
     pub verb: String,
     pub state: CommandState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_order: Option<(i64, i64)>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
 }
@@ -58,6 +60,7 @@ impl TaskInstruction {
             principal: command.principal.clone(),
             verb: command.verb.clone(),
             state: command.state,
+            admission_order: None,
             text,
         })
     }
@@ -69,11 +72,28 @@ pub struct TaskInputs {
     pub corrections: Vec<TaskInstruction>,
     /// Known omissions by source generation, so recapture does not double-count.
     pub omitted: std::collections::BTreeMap<String, usize>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub omitted_through: std::collections::BTreeMap<String, (i64, i64)>,
+    /// Legacy lower bound without contributing source identities.
     #[serde(default)]
     pub compacted_omissions: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacted: Option<CompactedTaskOmissions>,
     pub history_incomplete: bool,
     #[serde(default)]
     pub history_unresolved: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct CompactedTaskOmissions {
+    pub through: (i64, i64),
+    pub count: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct TaskOmissionObservation {
+    pub count: usize,
+    pub through: (i64, i64),
 }
 
 /// Allow fixed H2 framing and Store facts even when all optional excerpts

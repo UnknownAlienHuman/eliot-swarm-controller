@@ -40,8 +40,8 @@ pub use goals::{
     GoalRoundKey, GoalRoundProbe,
 };
 pub use handoff::{
-    AGENT_HANDED_OFF, BriefFacts, HandoffAdmission, MAX_HANDOFF_TASK_BYTES, TaskInputs,
-    TaskInstruction,
+    AGENT_HANDED_OFF, BriefFacts, CompactedTaskOmissions, HandoffAdmission, MAX_HANDOFF_TASK_BYTES,
+    TaskInputs, TaskInstruction, TaskOmissionObservation,
 };
 pub use projects::ProjectRegistrationInput;
 pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};

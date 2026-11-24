@@ -1129,17 +1129,23 @@ impl Store {
         generation: i64,
         task: &str,
         policy: &core::SecretPolicy,
-    ) -> Result<(Vec<crate::TaskInstruction>, usize)> {
+    ) -> Result<(
+        Vec<crate::TaskInstruction>,
+        Option<crate::TaskOmissionObservation>,
+    )> {
         self.ensure_committed_reads()?;
         const LIMIT: u32 = 64;
         let mut statement = self
             .connection
             .prepare(
-                "SELECT c.id, COUNT(*) OVER () FROM commands c
+                "SELECT c.id, COUNT(*) OVER (), c.created_at, c.rowid FROM commands c
+             LEFT JOIN commands parent ON parent.id = c.parent_command
              WHERE c.target = ?1 AND c.generation = ?2 AND c.principal = 'owner'
                AND c.id <> ?3 AND c.verb IN ('send', 'steer', 'inject')
                AND c.state <> 'rejected'
                AND c.link_kind IS NOT 'handoff' AND c.link_kind IS NOT 'rule_action'
+               AND json_extract(c.cause, '$.rule') IS NULL
+               AND json_extract(parent.cause, '$.rule') IS NULL
                AND json_type(c.args, '$.text') = 'text'
                AND NOT EXISTS (SELECT 1 FROM commands t WHERE t.id = ?3
                  AND t.target = c.target AND t.generation = c.generation
@@ -1151,27 +1157,37 @@ impl Store {
             .map_err(sql_error)?;
         let rows = statement
             .query_map(
-                params![parse_agent_id(agent)?, generation, task, LIMIT],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                params![parse_agent_id(agent)?, generation, task, LIMIT + 1],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        (row.get(2)?, row.get(3)?),
+                    ))
+                },
             )
             .map_err(sql_error)?;
         let mut corrections = Vec::new();
-        let mut omitted = 0;
-        for row in rows {
-            let (id, total) = row.map_err(sql_error)?;
-            omitted = usize::try_from(total.saturating_sub(i64::from(LIMIT)).max(0))
-                .unwrap_or(usize::MAX);
-            if !self.command_is_owner_authored(&id)? {
-                continue;
+        let mut omitted = None;
+        for (index, row) in rows.enumerate() {
+            let (id, total, order) = row.map_err(sql_error)?;
+            if index == LIMIT as usize {
+                omitted = Some(crate::TaskOmissionObservation {
+                    count: usize::try_from(total.saturating_sub(i64::from(LIMIT)))
+                        .unwrap_or(usize::MAX),
+                    through: order,
+                });
+                break;
             }
             let command = load_command(&self.connection, &id)?
                 .ok_or_else(|| Error::new("source_integrity", "task correction disappeared"))?;
             let text = input_before_owner_rules(&command).ok_or_else(|| {
                 Error::new("source_integrity", "task correction text is unreadable")
             })?;
-            if let Some(input) =
+            if let Some(mut input) =
                 crate::TaskInstruction::from_command(&command, policy.redact_text(text))
             {
+                input.admission_order = Some(order);
                 corrections.push(input);
             }
         }

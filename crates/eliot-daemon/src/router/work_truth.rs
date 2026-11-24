@@ -786,14 +786,14 @@ impl Router {
                         &policy,
                     )?;
                     corrections.extend(prior);
-                    if missing > 0 {
+                    if let Some(missing) = missing {
                         omitted.insert(format!("{}/{}", origin.source, origin.generation), missing);
                     }
                 }
                 let (current, missing) =
                     store.task_owner_corrections(agent, source.generation, command, &policy)?;
                 corrections.extend(current);
-                if missing > 0 {
+                if let Some(missing) = missing {
                     omitted.insert(format!("{agent}/{}", source.generation), missing);
                 }
                 let history_unresolved = store.handoff_history_unresolved(agent)?;

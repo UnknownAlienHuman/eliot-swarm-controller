@@ -1,5 +1,8 @@
 use super::*;
-use eliot_store::{BriefFacts, MAX_HANDOFF_TASK_BYTES, TaskInstruction};
+use eliot_store::{
+    BriefFacts, CompactedTaskOmissions, MAX_HANDOFF_TASK_BYTES, TaskInstruction,
+    TaskOmissionObservation,
+};
 
 const INSTRUCTIONS: &str = "instructions.json";
 const MAX_INSTRUCTIONS_BYTES: usize = 896 * 1024;
@@ -167,6 +170,7 @@ async fn read_inputs(
                 principal: "unverified".to_owned(),
                 verb: "send".to_owned(),
                 state: eliot_core::CommandState::Unknown,
+                admission_order: None,
                 text: String::new(),
             }),
             _ => None,
@@ -187,7 +191,7 @@ pub(crate) async fn record_task_inputs(
     task_ref: &str,
     original: Option<TaskInstruction>,
     corrections: Vec<TaskInstruction>,
-    omitted: BTreeMap<String, usize>,
+    omitted: BTreeMap<String, TaskOmissionObservation>,
     history_unresolved: bool,
 ) -> Result<TaskInputs> {
     let git = GitProbe::new()?;
@@ -209,9 +213,25 @@ pub(crate) async fn record_task_inputs(
     {
         inputs.original = Some(original);
     }
-    for (source, omitted) in omitted {
-        let count = inputs.omitted.entry(source).or_default();
-        *count = (*count).max(omitted);
+    for (source, observation) in omitted {
+        if source_is_compacted(&inputs, &source) {
+            continue;
+        }
+        let retained = inputs
+            .corrections
+            .iter()
+            .filter(|entry| {
+                instruction_source(entry) == source
+                    && entry
+                        .admission_order
+                        .is_none_or(|order| order <= observation.through)
+            })
+            .count();
+        // Store scans are overlapping observations. Exclude any older
+        // corrections still saved in Git before raising the lower bound.
+        let count = inputs.omitted.entry(source.clone()).or_default();
+        *count = (*count).max(observation.count.saturating_sub(retained));
+        advance_omission_bound(&mut inputs, source, observation.through);
     }
     for correction in corrections {
         if let Some(old) = inputs
@@ -220,7 +240,21 @@ pub(crate) async fn record_task_inputs(
             .find(|old| old.command_id == correction.command_id)
         {
             old.state = correction.state;
-        } else {
+            old.admission_order = old.admission_order.or(correction.admission_order);
+        } else if !correction.admission_order.is_some_and(|order| {
+            inputs
+                .omitted_through
+                .get(&instruction_source(&correction))
+                .is_some_and(|through| order <= *through)
+        }) {
+            // An exact correction recovered from an older source may already
+            // be represented in a compacted aggregate without individual IDs.
+            if source_is_compacted(&inputs, &instruction_source(&correction))
+                && let Some(compacted) = &mut inputs.compacted
+            {
+                compacted.count = compacted.count.saturating_sub(1);
+            }
+            inputs.compacted_omissions = inputs.compacted_omissions.saturating_sub(1);
             inputs.corrections.push(correction);
         }
     }
@@ -229,7 +263,6 @@ pub(crate) async fn record_task_inputs(
         return Ok(inputs);
     }
     let mut encoded = encode_task_inputs(&inputs)?;
-    let mut dropped = BTreeMap::<_, usize>::new();
     while encoded.len() > MAX_INSTRUCTIONS_BYTES {
         if inputs.corrections.is_empty() {
             return Err(Error::new(
@@ -238,11 +271,18 @@ pub(crate) async fn record_task_inputs(
             ));
         }
         let removed = inputs.corrections.remove(0);
-        let source = format!("{}/{}", removed.source, removed.generation);
-        let number = dropped.entry(source.clone()).or_default();
-        *number += 1;
-        let count = inputs.omitted.entry(source).or_default();
-        *count = (*count).max(*number);
+        let source = instruction_source(&removed);
+        if source_is_compacted(&inputs, &source)
+            && let Some(compacted) = &mut inputs.compacted
+        {
+            compacted.count = compacted.count.saturating_add(1);
+        } else {
+            let count = inputs.omitted.entry(source.clone()).or_default();
+            *count = count.saturating_add(1);
+            if let Some(order) = removed.admission_order {
+                advance_omission_bound(&mut inputs, source, order);
+            }
+        }
         compact_omission_sources(&mut inputs);
         encoded = encode_task_inputs(&inputs)?;
     }
@@ -266,18 +306,45 @@ fn compact_omission_sources(inputs: &mut TaskInputs) {
         let source = inputs
             .omitted
             .keys()
-            .min_by_key(|key| {
-                key.split_once('/').and_then(|(agent, generation)| {
-                    Some((
-                        eliot_core::parse_agent_id(agent).ok()?,
-                        generation.parse::<i64>().ok()?,
-                    ))
-                })
-            })
+            .min_by_key(|key| source_order(key))
             .cloned()
             .expect("omission map exceeds its nonzero bound");
+        inputs.omitted_through.remove(&source);
         if let Some(omitted) = inputs.omitted.remove(&source) {
-            inputs.compacted_omissions = inputs.compacted_omissions.max(omitted);
+            if let Some(through) = source_order(&source) {
+                let count = inputs
+                    .compacted
+                    .map_or(omitted, |prior| prior.count.saturating_add(omitted));
+                inputs.compacted = Some(CompactedTaskOmissions { through, count });
+            } else {
+                inputs.compacted_omissions = inputs.compacted_omissions.max(omitted);
+            }
         }
     }
+}
+
+fn instruction_source(input: &TaskInstruction) -> String {
+    format!("{}/{}", input.source, input.generation)
+}
+
+fn source_order(key: &str) -> Option<(i64, i64)> {
+    let (agent, generation) = key.split_once('/')?;
+    Some((
+        eliot_core::parse_agent_id(agent).ok()?,
+        generation.parse().ok()?,
+    ))
+}
+
+fn source_is_compacted(inputs: &TaskInputs, key: &str) -> bool {
+    // An older generation can return through a handoff to an existing
+    // Agent. Its count may already be in the compacted total.
+    inputs
+        .compacted
+        .zip(source_order(key))
+        .is_some_and(|(compacted, source)| source <= compacted.through)
+}
+
+fn advance_omission_bound(inputs: &mut TaskInputs, source: String, order: (i64, i64)) {
+    let through = inputs.omitted_through.entry(source).or_insert(order);
+    *through = (*through).max(order);
 }
