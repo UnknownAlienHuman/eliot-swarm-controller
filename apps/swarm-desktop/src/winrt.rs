@@ -27,6 +27,10 @@ macro_rules! winrt_interface {
         // vtable is declared by `$vtable` (the six IInspectable slots, or
         // the three IUnknown slots of a delegate, then the slots used); the
         // IID is the interface's id from the Windows App SDK metadata.
+        #[allow(
+            unsafe_code,
+            reason = "A hand-declared WinRT interface is an unsafe Interface implementation."
+        )]
         unsafe impl windows_core::Interface for $name {
             type Vtable = $vtable;
             const IID: windows_core::GUID = $iid;

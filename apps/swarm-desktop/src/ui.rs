@@ -959,7 +959,6 @@ impl Component for DesktopApp {
         }
         app.note_window_size();
         if let Ok(data_dir) = app.data_dir.clone() {
-            app.watch_accessibility(context);
             let _start = app.start_connection(data_dir, 0, context);
         }
         // On the UI thread, before its message loop runs.

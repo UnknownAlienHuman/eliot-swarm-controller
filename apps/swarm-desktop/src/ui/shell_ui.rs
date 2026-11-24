@@ -184,11 +184,6 @@ pub(super) enum ShellMsg {
     StartupChosen(Startup),
     /// The re-created editors of this re-prime exist: give them their text.
     FieldsPrimed(u64),
-    /// The periodic reading of High Contrast and of animation effects.
-    AccessibilityRead {
-        high_contrast: bool,
-        animations: bool,
-    },
     /// Expand (true) or collapse an Agent's children.
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
@@ -206,11 +201,6 @@ pub(super) enum ShellMsg {
     SidebarToggled,
 }
 
-/// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
-/// Contrast theme can keep the same base scheme, so High Contrast (and
-/// Windows' animation effects, which no event reports either) is read at
-/// the monitor's cadence.
-const ACCESSIBILITY_POLL_MS: u64 = 2_000;
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
 /// The sidebar's padding around its rows.
@@ -886,27 +876,6 @@ impl DesktopApp {
                     }
                 }
             }
-            ShellMsg::AccessibilityRead {
-                high_contrast,
-                animations,
-            } => {
-                if high_contrast != self.appearance.high_contrast {
-                    self.appearance.high_contrast = high_contrast;
-                    self.apply_scheme();
-                    self.reprime_fields(context);
-                }
-                if animations != self.appearance.animations {
-                    // New templates; the tree, keyed by the setting, is
-                    // rebuilt with controls that take them.
-                    self.appearance.animations = animations;
-                    if let Err(error) = crate::app_resources::apply_animations(animations) {
-                        self.set_status(format!("WinUI motion not applied: {error}"));
-                    }
-                    self.nav.search = Search::default();
-                    self.reprime_fields(context);
-                }
-                self.watch_accessibility(context);
-            }
             ShellMsg::ThemeChosen(theme) => {
                 let before = self.palette();
                 self.prefs.theme = theme;
@@ -1029,6 +998,12 @@ impl DesktopApp {
                         self.launch_update(LaunchMsg::Closed(epoch), context);
                         self.menu_update(MenuMsg::Closed(epoch), context);
                     }
+                    // Windows changed High Contrast or animation effects:
+                    // before the dialog arm, as the window follows either way.
+                    Shortcut::Accessibility {
+                        high_contrast,
+                        animations,
+                    } => self.accessibility_changed(high_contrast, animations, context),
                     // Before the dialog arm: the notice shows either way.
                     Shortcut::Panicked => {
                         self.alert(
@@ -1186,10 +1161,35 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         if self.palette() != before {
-            // The palette-keyed tree is rebuilt with new controls (an empty
-            // search box among them).
-            self.nav.search = Search::default();
+            // The palette-keyed tree is rebuilt with new controls; what was
+            // typed stays in the model and is drawn into them (the search
+            // text at once, the multi-line editors after a re-prime).
             self.apply_scheme();
+            self.reprime_fields(context);
+        }
+    }
+
+    /// Windows changed High Contrast or animation effects (Reactor 0.100.0
+    /// reports neither; `crate::shortcuts` hears Windows announce it).
+    /// Either rebuilds the tree, keyed by both, with new controls that keep
+    /// what was typed.
+    fn accessibility_changed(
+        &mut self,
+        high_contrast: bool,
+        animations: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        if high_contrast != self.appearance.high_contrast {
+            self.appearance.high_contrast = high_contrast;
+            self.apply_scheme();
+            self.reprime_fields(context);
+        }
+        if animations != self.appearance.animations {
+            // New templates, which only new controls take.
+            self.appearance.animations = animations;
+            if let Err(error) = crate::app_resources::apply_animations(animations) {
+                self.set_status(format!("WinUI motion not applied: {error}"));
+            }
             self.reprime_fields(context);
         }
     }
@@ -1770,30 +1770,6 @@ impl DesktopApp {
                 }
             }
         }
-    }
-
-    /// Read High Contrast and animation effects at their cadence and report
-    /// only a change. Every message re-renders the whole window (k209
-    /// measured 30 ms per render, 70 ms with a 588-item chat open), so an
-    /// unchanged reading posts nothing.
-    pub(super) fn watch_accessibility(&self, context: &ComponentContext<Self>) {
-        let shown = (self.appearance.high_contrast, self.appearance.animations);
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            loop {
-                let ran = feed::backoff(ACCESSIBILITY_POLL_MS, &cancelled);
-                let read = (
-                    crate::accessibility::high_contrast_on(),
-                    crate::accessibility::animations_on(),
-                );
-                if read != shown || !ran {
-                    return Message::Shell(ShellMsg::AccessibilityRead {
-                        high_contrast: read.0,
-                        animations: read.1,
-                    });
-                }
-            }
-        });
     }
 
     /// The main area's width from the window width, the sidebar (its rail

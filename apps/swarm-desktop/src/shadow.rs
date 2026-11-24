@@ -21,11 +21,8 @@
 //! vtable below asserts its slot offsets. Every call runs on the UI thread,
 //! inside Reactor's host callbacks or a component's update, and fails
 //! quietly: a shadow that cannot be built is left out and noted once in
-//! `desktop.log`.
-#![allow(
-    unsafe_code,
-    reason = "Composition shadows are built through hand-declared WinRT calls."
-)]
+//! `desktop.log`. Each function that calls through a hand-declared slot
+//! allows `unsafe_code` for itself alone.
 
 use std::cell::{Cell, RefCell};
 use std::mem::offset_of;
@@ -336,6 +333,7 @@ impl windows_core::RuntimeType for CompositionShape {
 /// # Safety
 /// `setter` must be a slot of `this`'s vtable that takes one object of
 /// `argument`'s interface.
+#[allow(unsafe_code, reason = "Calls a hand-declared WinRT setter slot.")]
 unsafe fn set_object<T: Interface, A: Interface>(
     this: &T,
     setter: SetObject,
@@ -350,6 +348,7 @@ unsafe fn set_object<T: Interface, A: Interface>(
 ///
 /// # Safety
 /// As [`set_object`], for a slot that returns one owned object.
+#[allow(unsafe_code, reason = "Calls a hand-declared WinRT factory slot.")]
 unsafe fn create_from<T: Interface, A: Interface>(
     this: &T,
     factory: CreateFrom,
@@ -383,6 +382,10 @@ impl Compositor {
         })
     }
 
+    #[allow(
+        unsafe_code,
+        reason = "Calls the compositor's CreateContainerVisual slot."
+    )]
     fn container(&self) -> windows_core::Result<IContainerVisual> {
         // SAFETY: slot 9 of ICompositor is CreateContainerVisual.
         unsafe { get(&self.base, self.base.vtable().create_container_visual) }?.cast()
@@ -390,6 +393,10 @@ impl Compositor {
 
     /// One layer: a brushless sprite whose drop shadow is masked by the
     /// element's rounded rectangle.
+    #[allow(
+        unsafe_code,
+        reason = "Builds a layer's visuals through hand-declared Composition slots."
+    )]
     fn layer(&self, layer: brand::Shadow) -> windows_core::Result<Layer> {
         let base = &self.base;
         let shapes = &self.shapes;
@@ -490,6 +497,10 @@ struct Layer {
 impl Layer {
     /// Size the layer to an element of `width` × `height` at `radius`:
     /// the CSS spread grows the rectangle and its corner on every side.
+    #[allow(
+        unsafe_code,
+        reason = "Sizes the layer through hand-declared Composition setters."
+    )]
     fn fit(&self, width: f64, height: f64, radius: f64) -> windows_core::Result<()> {
         let spread = self.layer.spread;
         let size = Vector2 {
@@ -550,6 +561,10 @@ fn note(error: &windows_core::Error) {
 
 impl State {
     /// Build the layers for the host (`None`: nothing to draw).
+    #[allow(
+        unsafe_code,
+        reason = "Adds the layers through hand-declared Composition slots."
+    )]
     fn build(&mut self) -> windows_core::Result<Option<IUnknown>> {
         self.drawn.clear();
         let Some(compositor) = &self.compositor else {

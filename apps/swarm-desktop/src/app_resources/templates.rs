@@ -620,6 +620,15 @@ fn wave_path(span: f64) -> String {
 /// sits in a canvas (no layout clip moves with it) inside a grid whose
 /// corner clips it to the bar. Still a real `ProgressBar`, with its own
 /// automation peer.
+///
+/// WinUI's `ProgressBar` (Windows App SDK WinUI 2.3.0 `generic.xaml`)
+/// looks up the parts `LayoutRoot` (a `Grid`) and the `Rectangle`s
+/// `DeterminateProgressBarIndicator`, `IndeterminateProgressBarIndicator`
+/// and `IndeterminateProgressBarIndicator2`, whose widths it sets, and
+/// moves between the `CommonStates` named below. Every part is here (the
+/// two indeterminate rectangles stay collapsed: the wave replaces them)
+/// and every state exists, so no state change misses a part or a state;
+/// each storyboard targets only this template's own names.
 pub(super) fn progress_bar(motion: bool) -> String {
     let (track, stroke) = (wave::TRACK, wave::STROKE);
     let travel = if motion {
@@ -659,6 +668,8 @@ pub(super) fn progress_bar(motion: bool) -> String {
              <Rectangle x:Name=\"DeterminateProgressBarIndicator\" Height=\"{track}\" \
                RadiusX=\"{track_radius}\" RadiusY=\"{track_radius}\" Fill=\"{{TemplateBinding Foreground}}\" \
                HorizontalAlignment=\"Left\" VerticalAlignment=\"Center\"/>\
+             <Rectangle x:Name=\"IndeterminateProgressBarIndicator\" Visibility=\"Collapsed\"/>\
+             <Rectangle x:Name=\"IndeterminateProgressBarIndicator2\" Visibility=\"Collapsed\"/>\
              <Grid x:Name=\"Wave\" Opacity=\"0\" CornerRadius=\"{clip_radius}\">\
                <Canvas>\
                  <Path x:Name=\"WavePath\" Data=\"{path}\" Stroke=\"{{TemplateBinding Foreground}}\" \
