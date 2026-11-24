@@ -50,10 +50,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, OpenJobObjectW, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
+    QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::Pipes::{
     CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -62,11 +62,13 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CreateEventW,
-    CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
-    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW,
-    TerminateProcess, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED,
+    CreateEventW, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcess, OpenProcessToken,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, ResumeThread,
+    STARTUPINFOEXW, STARTUPINFOW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -221,10 +223,126 @@ impl VendorLoginConsole {
     }
 }
 
-/// Run the adapter's credential-free login command from the interactive desktop.
-pub fn start_vendor_login_console(
+/// A console whose primary thread is suspended until the daemon records it.
+pub struct PreparedVendorLogin {
+    process: OwnedHandle,
+    thread: OwnedHandle,
+    guard: OwnedHandle,
+    _preparation_fence: OwnedHandle,
+    identity: eliot_core::api::auth_login::AuthConsoleIdentity,
+}
+
+impl PreparedVendorLogin {
+    pub fn identity(&self) -> eliot_core::api::auth_login::AuthConsoleIdentity {
+        self.identity
+    }
+
+    /// The caller has a durable receipt for this exact process.
+    pub fn start(self) -> Result<VendorLoginConsole> {
+        // SAFETY: this is the owned primary thread created suspended below.
+        if unsafe { ResumeThread(self.thread.as_raw_handle()) } == u32::MAX {
+            return Err(io_error(
+                "start prepared vendor login",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // The daemon can now observe the exact console after a companion exit.
+        // The preparation Job contains only the primary process. Vendor-launched
+        // processes, including the browser, inherit outside that Job.
+        set_vendor_login_guard(&self.guard, false)?;
+        Ok(VendorLoginConsole(self.process))
+    }
+}
+
+fn set_vendor_login_guard(job: &OwnedHandle, kill_on_close: bool) -> Result<()> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+        | if kill_on_close {
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        } else {
+            0
+        };
+    // SAFETY: the Job handle and the correctly sized information buffer are live.
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        return Err(io_error(
+            "configure vendor login preparation Job",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
+}
+
+struct VendorLoginAttributes(Vec<usize>);
+
+impl VendorLoginAttributes {
+    fn new(job: &HANDLE) -> Result<Self> {
+        let mut bytes = 0;
+        // SAFETY: the null list requests the buffer size for one attribute.
+        unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut bytes) };
+        if bytes == 0 {
+            return Err(io_error(
+                "size vendor login attributes",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let mut storage = vec![0; bytes.div_ceil(size_of::<usize>())];
+        let list = storage.as_mut_ptr().cast();
+        // SAFETY: storage is aligned and large enough for the returned size.
+        if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut bytes) } == 0 {
+            return Err(io_error(
+                "initialize vendor login attributes",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let attributes = Self(storage);
+        // SAFETY: the caller retains the one-element Job handle array until
+        // after CreateProcessW has consumed the attribute list.
+        if unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                (job as *const HANDLE).cast(),
+                size_of::<HANDLE>(),
+                null_mut(),
+                null(),
+            )
+        } == 0
+        {
+            return Err(io_error(
+                "set vendor login Job attribute",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(attributes)
+    }
+
+    fn list(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+        self.0.as_mut_ptr().cast()
+    }
+}
+
+impl Drop for VendorLoginAttributes {
+    fn drop(&mut self) {
+        // SAFETY: this buffer contains a successfully initialized attribute list.
+        unsafe { DeleteProcThreadAttributeList(self.list()) };
+    }
+}
+
+/// Create the native command suspended and atomically in a preparation Job.
+pub fn prepare_vendor_login_console(
     command: eliot_core::api::harness::NativeAuthCommand,
-) -> Result<VendorLoginConsole> {
+    revision: &str,
+    start_by_ms: i64,
+) -> Result<PreparedVendorLogin> {
     if !interactive_session(std::process::id()) {
         return Err(Error::new(
             "not_allowed",
@@ -239,10 +357,35 @@ pub fn start_vendor_login_console(
         .collect();
     let command_line = windows_command_line(&argv)?;
     let application = wide_path(&executable);
-    let startup = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..STARTUPINFOW::default()
+    let revision = ulid::Ulid::from_string(revision)
+        .map_err(|_| Error::new("invalid", "invalid vendor sign-in revision"))?;
+    // A reissued grant for this incident cannot concurrently create a second
+    // suspended console while an earlier desktop is still in preparation.
+    let preparation_fence =
+        try_acquire_global_event(&format!(r"Global\EliotAuthPrepare.{revision}"))?
+            .ok_or_else(|| Error::new("busy", "another desktop is preparing this sign-in"))?;
+    // SAFETY: null attributes and name create one private noninheritable Job.
+    let job = unsafe { CreateJobObjectW(null(), null()) };
+    if job.is_null() {
+        return Err(io_error(
+            "create vendor login preparation Job",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    // SAFETY: CreateJobObjectW returned a uniquely owned handle.
+    let guard = unsafe { OwnedHandle::from_raw_handle(job) };
+    set_vendor_login_guard(&guard, true)?;
+    let mut attributes = VendorLoginAttributes::new(&job)?;
+    let startup = STARTUPINFOEXW {
+        StartupInfo: STARTUPINFOW {
+            cb: size_of::<STARTUPINFOEXW>() as u32,
+            ..STARTUPINFOW::default()
+        },
+        lpAttributeList: attributes.list(),
     };
+    if crate::common::now_ms() >= start_by_ms {
+        return Err(Error::new("stale_item", "vendor login claim expired"));
+    }
     let process = with_job_breakaway(|job_flags| {
         let mut command_line = command_line.clone();
         let mut process = PROCESS_INFORMATION::default();
@@ -256,10 +399,10 @@ pub fn start_vendor_login_console(
                 null(),
                 null(),
                 0,
-                CREATE_NEW_CONSOLE | job_flags,
+                CREATE_NEW_CONSOLE | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | job_flags,
                 null(),
                 null(),
-                &startup,
+                &startup.StartupInfo,
                 &mut process,
             )
         };
@@ -271,12 +414,24 @@ pub fn start_vendor_login_console(
     })
     .map_err(|error| io_error("start vendor login console", error))?;
     // SAFETY: both handles are returned uniquely owned by CreateProcessW.
-    unsafe {
-        CloseHandle(process.hThread);
-        Ok(VendorLoginConsole(OwnedHandle::from_raw_handle(
-            process.hProcess,
-        )))
-    }
+    let (process_handle, thread) = unsafe {
+        (
+            OwnedHandle::from_raw_handle(process.hProcess),
+            OwnedHandle::from_raw_handle(process.hThread),
+        )
+    };
+    let identity = eliot_core::api::auth_login::AuthConsoleIdentity {
+        pid: process.dwProcessId,
+        start_time: i64::try_from(process_start_time(process.dwProcessId)?)
+            .map_err(|_| Error::new("process_identity", "invalid console creation time"))?,
+    };
+    Ok(PreparedVendorLogin {
+        process: process_handle,
+        thread,
+        guard,
+        _preparation_fence: preparation_fence,
+        identity,
+    })
 }
 
 /// Prefer breakaway from any enclosing Job. A private daemon can inherit

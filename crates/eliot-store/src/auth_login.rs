@@ -1,10 +1,12 @@
 use super::*;
 use eliot_core::api::auth_login::{
-    AuthDesktopReportRequest, AuthDesktopState, AuthDesktopWork, AuthLoginStatus,
+    AuthConsoleIdentity, AuthDesktopClaimResponse, AuthDesktopReportRequest,
+    AuthDesktopReportResponse, AuthDesktopState, AuthDesktopWork, AuthLoginStatus,
 };
 use eliot_core::api::{OwnerAction, OwnerInboxItem, OwnerInboxKind, SwarmLiveness};
 
 const COOLDOWN_MS: i64 = 5 * 60 * 1000;
+const CLAIM_TIMEOUT_MS: i64 = 15 * 1000;
 
 impl Store {
     pub(super) fn migrate_auth_login(&mut self, version: i64) -> Result<()> {
@@ -17,9 +19,12 @@ impl Store {
                     ('queued', 'claimed', 'open', 'closed', 'failed', 'unsupported')),
                 first_seen INTEGER NOT NULL,
                 attempt TEXT,
+                claim_until INTEGER NOT NULL DEFAULT 0,
+                console_pid INTEGER,
+                console_start INTEGER,
+                recovered INTEGER NOT NULL DEFAULT 0,
                 retry_at INTEGER NOT NULL DEFAULT 0,
                 signed_out INTEGER NOT NULL,
-                verified_signed_out INTEGER NOT NULL DEFAULT 0,
                 resolved INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE harness_auth_holds (
@@ -87,7 +92,7 @@ impl Store {
                              first_seen=CASE WHEN ?6 THEN excluded.first_seen ELSE first_seen END,
                              signed_out=CASE WHEN ?6 THEN excluded.signed_out
                                              ELSE signed_out OR excluded.signed_out END,
-                             verified_signed_out=CASE WHEN ?6 THEN 0 ELSE verified_signed_out END,
+                             claim_until=0, console_pid=NULL, console_start=NULL, recovered=0,
                              resolved=0",
                         params![harness, new_revision, phase, now, !manual, reset],
                     ).map_err(sql_error)?;
@@ -96,8 +101,8 @@ impl Store {
                 };
                 if !manual {
                     tx.execute(
-                        "UPDATE harness_auth SET signed_out=1, resolved=0
-                     WHERE harness=?1 AND (signed_out=0 OR resolved=1)",
+                        "UPDATE harness_auth SET signed_out=1
+                     WHERE harness=?1 AND resolved=0 AND signed_out=0",
                         [harness],
                     )
                     .map_err(sql_error)?;
@@ -139,59 +144,123 @@ impl Store {
         harness: &str,
         revision: &str,
         now: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<AuthDesktopClaimResponse> {
         self.ensure_writer_healthy()?;
         let attempt = ulid::Ulid::new().to_string();
+        let start_by_ms = now.saturating_add(CLAIM_TIMEOUT_MS);
         let result = self
             .connection
             .execute(
-                "UPDATE harness_auth SET phase='claimed', attempt=?3, retry_at=?4
-             WHERE harness=?1 AND revision=?2 AND resolved=0 AND phase='queued' AND retry_at<=?5",
+                "UPDATE harness_auth SET phase='claimed', attempt=?3, retry_at=?4,
+                         claim_until=?5, recovered=0
+             WHERE harness=?1 AND revision=?2 AND resolved=0 AND phase='queued' AND retry_at<=?6",
                 params![
                     harness,
                     revision,
                     attempt,
                     now.saturating_add(COOLDOWN_MS),
+                    start_by_ms,
                     now
                 ],
             )
             .map_err(sql_error);
         self.fault_on_persistence_error(&result);
-        Ok((result? == 1).then_some(attempt))
+        let claimed = result? == 1;
+        Ok(AuthDesktopClaimResponse {
+            attempt: claimed.then_some(attempt),
+            start_by_ms: claimed.then_some(start_by_ms),
+        })
+    }
+
+    /// Expire unused grants and settle consoles only after exact process exit.
+    pub fn recover_harness_logins(
+        &mut self,
+        now: i64,
+        mut console_gone: impl FnMut(AuthConsoleIdentity) -> bool,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self.connection.transaction().map_err(sql_error)?;
+            let expired = {
+                let mut statement = tx
+                    .prepare_cached(
+                        "SELECT harness, resolved, console_pid, console_start FROM harness_auth
+                     WHERE phase='open' OR (phase='claimed' AND claim_until<=?1)",
+                    )
+                    .map_err(sql_error)?;
+                let rows = statement
+                    .query_map([now], |row| {
+                        let pid: Option<u32> = row.get(2)?;
+                        let start_time: Option<i64> = row.get(3)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, bool>(1)?,
+                            pid.zip(start_time)
+                                .map(|(pid, start_time)| AuthConsoleIdentity { pid, start_time }),
+                        ))
+                    })
+                    .map_err(sql_error)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(sql_error)?
+            };
+            for (harness, resolved, console) in expired {
+                if console.is_some_and(|identity| !console_gone(identity)) {
+                    continue;
+                }
+                let requeue = !resolved && console.is_none();
+                tx.execute(
+                    "UPDATE harness_auth SET phase=?2, recovered=1, attempt=NULL, claim_until=0,
+                         retry_at=CASE WHEN ?3 THEN 0 ELSE retry_at END,
+                         console_pid=NULL, console_start=NULL WHERE harness=?1",
+                    params![harness, if requeue { "queued" } else { "closed" }, requeue],
+                )
+                .map_err(sql_error)?;
+            }
+            commit_transaction(tx, &self.write_faulted)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     pub fn report_harness_login(
         &mut self,
         report: &AuthDesktopReportRequest,
         now: i64,
-    ) -> Result<(bool, Vec<Event>)> {
-        use AuthDesktopState::{Closed, Failed, Open, SignedIn, SignedOut};
+    ) -> Result<(AuthDesktopReportResponse, bool, Vec<Event>)> {
+        use AuthDesktopState::{Closed, Failed, Open, Prepared, SignedIn, SignedOut};
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self.connection.transaction().map_err(sql_error)?;
-            let verified_outage = matches!(report.state, SignedIn)
-                && tx
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM harness_auth
-                     WHERE harness=?1 AND revision=?2 AND verified_signed_out=1)",
-                        params![report.harness, report.revision],
-                        |row| row.get::<_, bool>(0),
-                    )
-                    .map_err(sql_error)?;
-            let changed = match report.state {
-                SignedIn | SignedOut if report.attempt.is_none() => tx.execute(
+            let changed = match (report.state, report.attempt.as_deref(), report.console) {
+                (SignedIn | SignedOut, None, None) => tx.execute(
                     "UPDATE harness_auth
                      SET resolved=?3, signed_out=NOT ?3,
-                         verified_signed_out=verified_signed_out OR NOT ?3,
                          phase=CASE WHEN ?3 AND phase='queued' THEN 'closed' ELSE phase END
-                     WHERE harness=?1 AND revision=?2 AND resolved=0 AND (?3 OR verified_signed_out=0)",
+                     WHERE harness=?1 AND revision=?2 AND resolved=0 AND (?3 OR signed_out=0)",
                     params![
                         report.harness,
                         report.revision,
                         matches!(report.state, SignedIn)
                     ],
                 ),
-                Open | Closed | Failed if report.attempt.is_some() => {
+                (Prepared, Some(attempt), Some(console))
+                    if console.pid != 0 && console.start_time > 0 =>
+                {
+                    tx.execute(
+                        "UPDATE harness_auth SET console_pid=?4, console_start=?5
+                     WHERE harness=?1 AND revision=?2 AND attempt=?3 AND resolved=0
+                         AND phase='claimed' AND claim_until>?6 AND console_pid IS NULL",
+                        params![
+                            report.harness,
+                            report.revision,
+                            attempt,
+                            console.pid,
+                            console.start_time,
+                            now
+                        ],
+                    )
+                }
+                (Open | Closed | Failed, Some(attempt), None) => {
                     let phase = match report.state {
                         Open => "open",
                         Closed => "closed",
@@ -199,9 +268,10 @@ impl Store {
                     };
                     tx.execute(
                         "UPDATE harness_auth SET phase=?4
-                         WHERE harness=?1 AND revision=?2 AND attempt=?3 AND
+                         WHERE harness=?1 AND revision=?2 AND attempt=?3 AND resolved=0
+                             AND (?4!='open' OR console_pid IS NOT NULL) AND
                              (phase='claimed' OR (phase='open' AND ?4='closed'))",
-                        params![report.harness, report.revision, report.attempt, phase],
+                        params![report.harness, report.revision, attempt, phase],
                     )
                 }
                 _ => return Err(Error::new("invalid", "incomplete sign-in report binding")),
@@ -209,7 +279,7 @@ impl Store {
             .map_err(sql_error)?;
             let resolved = changed == 1 && matches!(report.state, SignedIn);
             let mut events = if resolved {
-                settle_auth_holds(&tx, &report.harness, verified_outage, now)?
+                settle_auth_holds(&tx, &report.harness, now)?
             } else {
                 Vec::new()
             };
@@ -240,7 +310,13 @@ impl Store {
                 )?);
             }
             commit_transaction(tx, &self.write_faulted)?;
-            Ok((resolved, events))
+            Ok((
+                AuthDesktopReportResponse {
+                    accepted: changed == 1,
+                },
+                resolved,
+                events,
+            ))
         })();
         self.fault_on_persistence_error(&result);
         result
@@ -282,13 +358,8 @@ impl Store {
     }
 }
 
-fn settle_auth_holds(
-    tx: &Transaction<'_>,
-    harness: &str,
-    verified_outage: bool,
-    now: i64,
-) -> Result<Vec<Event>> {
-    let scopes = if verified_outage {
+fn settle_auth_holds(tx: &Transaction<'_>, harness: &str, now: i64) -> Result<Vec<Event>> {
+    let scopes = {
         let mut statement = tx
             .prepare(
                 "DELETE FROM provider_holds WHERE kind='auth' AND state='held'
@@ -304,8 +375,6 @@ fn settle_auth_holds(
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?
-    } else {
-        Vec::new()
     };
     tx.execute("DELETE FROM harness_auth_holds WHERE harness=?1", [harness])
         .map_err(sql_error)?;
@@ -333,9 +402,9 @@ pub(super) fn project_harness_auth(
     keys: &[&dyn rusqlite::ToSql],
 ) -> Result<()> {
     let mut statement = db.prepare_cached(if keys.is_empty() {
-        "SELECT harness, revision, phase, first_seen, signed_out FROM harness_auth WHERE resolved=0"
+        "SELECT harness, revision, phase, first_seen, signed_out, recovered FROM harness_auth WHERE resolved=0"
     } else {
-        "SELECT harness, revision, phase, first_seen, signed_out FROM harness_auth WHERE resolved=0 AND harness=?1"
+        "SELECT harness, revision, phase, first_seen, signed_out, recovered FROM harness_auth WHERE resolved=0 AND harness=?1"
     }).map_err(sql_error)?;
     let mut rows = statement.query(keys).map_err(sql_error)?;
     while let Some(row) = rows.next().map_err(sql_error)? {
@@ -344,10 +413,13 @@ pub(super) fn project_harness_auth(
         let phase: String = row.get(2).map_err(sql_error)?;
         let first_seen: i64 = row.get(3).map_err(sql_error)?;
         let signed_out: bool = row.get(4).map_err(sql_error)?;
+        let recovered: bool = row.get(5).map_err(sql_error)?;
         let detail = match phase.as_str() {
             "open" => "The sign-in window is open. Complete sign-in with the vendor.",
+            "queued" if recovered => "A sign-in claim expired. Swarm queued it again.",
             "queued" => "Swarm is waiting for the interactive desktop to handle sign-in.",
             "claimed" => "Swarm is waiting for the desktop to confirm the sign-in window.",
+            "closed" if recovered => "The previous sign-in console process exited.",
             "closed" => "The sign-in window closed. Swarm is checking the vendor sign-in status.",
             "failed" => "The desktop could not open the vendor sign-in window.",
             _ => "This installation has no supported interactive vendor sign-in command.",

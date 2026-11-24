@@ -773,16 +773,17 @@ runs the vendor's native interactive flow in the Owner's desktop session, and re
 the result through the bounded desktop sign-in DTOs. The CLI request itself never
 opens a headless vendor process or asserts that the desktop action completed.
 
-The daemon retains one durable automatic claim per harness outage until a positive
-read-only probe closes it. An explicit request for open work reports `open`. A request
+The daemon dispatches one automatic console per harness outage. An unused grant
+expires after 15 seconds and returns to the queue. An explicit request for open work
+reports `open`. A request
 inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
 eligible only after five minutes have passed since the last claim and the prior launch
 is known closed or failed. Store schema 123 retains the claim across daemon restarts.
-The running companion keeps its process handle across reconnects. A lost claim reply
-or a lost companion leaves the launch fenced while its outcome is uncertain. Swarm
-publishes `x.user.notify` when the desktop confirms the sign-in console is open.
-A signed-in probe clears the inbox item and wakes launch arbitration. Scoped provider
-auth holds clear only when bound to the same verified native sign-out and sign-in.
+The companion records the suspended console's PID and creation time before running
+it. A later companion can retire a dead console using that exact identity. A live
+console keeps its claim. Swarm publishes `x.user.notify` when the desktop confirms
+an unresolved console is open. A signed-in probe clears the inbox item and bound
+provider auth holds, then wakes launch arbitration.
 
 The native vendor handles the console, browser and credential storage. Swarm passes
 fixed argv and leaves the console streams with the vendor. It never collects passwords,

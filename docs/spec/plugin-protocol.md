@@ -126,9 +126,11 @@ Harness sign-in runs only from the local Owner's interactive desktop session. Th
 The desktop polls bounded `AuthDesktopWork` rows. A `probe` runs the read-only status
 command. A claim with `can_claim` authorizes one login invocation bound to the exact
 harness, revision and attempt. A typed sign-in refusal can queue this work automatically.
-The desktop reports `signed_in` or `signed_out` for the exact revision and `open`,
-`closed` or `failed` for the exact attempt. A verified sign-out followed by a positive
-read-only status can clear a bound provider auth hold.
+The desktop reports `signed_in` or `signed_out` for the exact revision. Before
+resuming the vendor process, it records the suspended process identity with a
+`prepared` report within the 15-second claim deadline. The exact attempt then accepts
+`open`, `closed` or `failed` while the incident remains unresolved. Positive
+read-only status clears bound provider auth holds.
 
 Every login invocation uses fixed argument vectors and the Owner's native configuration.
 The new console gives the vendor its own interactive streams. Swarm does not capture

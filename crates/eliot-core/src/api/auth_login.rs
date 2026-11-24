@@ -60,6 +60,14 @@ pub struct AuthDesktopClaimRequest {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 pub struct AuthDesktopClaimResponse {
     pub attempt: Option<String>,
+    pub start_by_ms: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthConsoleIdentity {
+    pub pid: u32,
+    pub start_time: i64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -69,6 +77,7 @@ pub struct AuthDesktopReportRequest {
     pub revision: String,
     pub attempt: Option<String>,
     pub state: AuthDesktopState,
+    pub console: Option<AuthConsoleIdentity>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema)]
@@ -76,10 +85,13 @@ pub struct AuthDesktopReportRequest {
 pub enum AuthDesktopState {
     SignedIn,
     SignedOut,
+    Prepared,
     Open,
     Closed,
     Failed,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
-pub struct AuthDesktopReportResponse {}
+pub struct AuthDesktopReportResponse {
+    pub accepted: bool,
+}

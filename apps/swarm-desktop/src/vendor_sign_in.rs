@@ -3,12 +3,12 @@
 use eliot_core::api::{
     HarnessCapabilities,
     auth_login::{
-        AuthDesktopClaimResponse, AuthDesktopReportRequest, AuthDesktopReportResponse,
-        AuthDesktopState,
+        AuthConsoleIdentity, AuthDesktopClaimResponse, AuthDesktopReportRequest,
+        AuthDesktopReportResponse, AuthDesktopState,
     },
     harness::{NativeAuthCheck, NativeAuthState},
 };
-use eliot_daemon::{VendorLoginConsole, start_vendor_login_console};
+use eliot_daemon::{VendorLoginConsole, prepare_vendor_login_console};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -55,6 +55,7 @@ impl Attempt {
             &self.revision,
             Some(&self.attempt),
             state,
+            None,
         )
         .await
         .is_err()
@@ -121,7 +122,7 @@ async fn run() {
                 next_probe.insert(key, Instant::now() + PROBE_INTERVAL);
                 if let Some(state) = state {
                     let reported =
-                        report(&data_dir, &work.harness, &work.revision, None, state).await;
+                        report(&data_dir, &work.harness, &work.revision, None, state, None).await;
                     if reported.is_err() || matches!(state, AuthDesktopState::SignedIn) {
                         continue;
                     }
@@ -134,14 +135,37 @@ async fn run() {
                 crate::client::auth_desktop_claim(&data_dir, &work.harness, &work.revision).await;
             if let Ok(AuthDesktopClaimResponse {
                 attempt: Some(attempt),
+                start_by_ms: Some(start_by_ms),
             }) = claimed
             {
+                let console =
+                    match prepare_vendor_login_console(command, &work.revision, start_by_ms) {
+                        Ok(prepared) => {
+                            let receipt = report(
+                                &data_dir,
+                                &work.harness,
+                                &work.revision,
+                                Some(&attempt),
+                                AuthDesktopState::Prepared,
+                                Some(prepared.identity()),
+                            )
+                            .await;
+                            if !receipt.is_ok_and(|receipt| receipt.accepted) {
+                                continue;
+                            }
+                            prepared.start().ok()
+                        }
+                        Err(error) if matches!(error.code.as_str(), "busy" | "stale_item") => {
+                            continue;
+                        }
+                        Err(_) => None,
+                    };
                 let mut attempt = Attempt {
                     data_dir: data_dir.clone(),
                     harness: work.harness,
                     revision: work.revision,
                     attempt,
-                    console: start_vendor_login_console(command).ok(),
+                    console,
                     open_reported: false,
                 };
                 if !attempt.advance().await {
@@ -158,6 +182,7 @@ async fn report(
     revision: &str,
     attempt: Option<&str>,
     state: AuthDesktopState,
+    console: Option<AuthConsoleIdentity>,
 ) -> eliot_core::Result<AuthDesktopReportResponse> {
     crate::client::auth_desktop_report(
         data_dir,
@@ -166,6 +191,7 @@ async fn report(
             revision: revision.to_owned(),
             attempt: attempt.map(str::to_owned),
             state,
+            console,
         },
     )
     .await

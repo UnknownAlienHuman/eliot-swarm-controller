@@ -51,6 +51,23 @@ pub(super) fn supports_login(harness: &str) -> bool {
             .is_some()
 }
 
+fn recover_attempts(store: &mut eliot_store::Store, now: i64) -> Result<()> {
+    #[cfg(windows)]
+    return store.recover_harness_logins(now, |console| {
+        u64::try_from(console.start_time).is_ok_and(|start_time| {
+            matches!(
+                crate::platform::windows::recorded_process_alive(console.pid, start_time),
+                Ok(false)
+            )
+        })
+    });
+    #[cfg(not(windows))]
+    {
+        let _ = (store, now);
+        Ok(())
+    }
+}
+
 impl Router {
     pub(super) fn harness_auth_applies(&self, harness: &str, snapshot: &Value) -> bool {
         let env = &snapshot["pass_env_values"];
@@ -143,6 +160,8 @@ impl Router {
         }
         let status = {
             let mut store = self.inner.store.lock().await;
+            let now = now_ms();
+            recover_attempts(&mut store, now)?;
             if inbox_decision {
                 super::owner_inbox::check_binding(&store)?;
             }
@@ -151,7 +170,7 @@ impl Router {
                 request.revision.as_deref(),
                 true,
                 true,
-                now_ms(),
+                now,
             )?
         };
         self.signal_progress();
@@ -185,41 +204,55 @@ impl Router {
 
     pub(super) async fn auth_desktop_poll(&self, params: &Value) -> Result<Value> {
         decode_params::<AuthDesktopPollRequest>(params.clone())?;
-        let pending = self
-            .inner
-            .store
-            .lock()
-            .await
-            .harness_auth_pending(now_ms())?;
+        let _write = self.inner.restart_writes.read().await;
+        let mut store = self.inner.store.lock().await;
+        let now = now_ms();
+        if self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN && !self.is_restart_requested() {
+            recover_attempts(&mut store, now)?;
+        }
+        let pending = store.harness_auth_pending(now)?;
         Ok(json!(AuthDesktopPollResponse { pending }))
     }
 
     pub(super) async fn auth_desktop_claim(&self, params: &Value) -> Result<Value> {
         let request: AuthDesktopClaimRequest = decode_params(params.clone())?;
         let mut store = self.inner.store.lock().await;
-        let attempt = if supports_login(&request.harness)
+        let response = if supports_login(&request.harness)
             && self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN
         {
-            store.claim_harness_login(&request.harness, &request.revision, now_ms())?
+            let now = now_ms();
+            recover_attempts(&mut store, now)?;
+            store.claim_harness_login(&request.harness, &request.revision, now)?
         } else {
-            None
+            AuthDesktopClaimResponse {
+                attempt: None,
+                start_by_ms: None,
+            }
         };
-        Ok(json!(AuthDesktopClaimResponse { attempt }))
+        Ok(json!(response))
     }
 
     pub(super) async fn auth_desktop_report(&self, params: &Value) -> Result<Value> {
         let request: AuthDesktopReportRequest = decode_params(params.clone())?;
-        let resolved = {
+        #[cfg(windows)]
+        if let (AuthDesktopState::Prepared, Some(console)) = (request.state, request.console) {
+            let start_time = u64::try_from(console.start_time)
+                .map_err(|_| Error::new("invalid", "invalid console creation time"))?;
+            if !crate::platform::windows::recorded_process_alive(console.pid, start_time)? {
+                return Ok(json!(AuthDesktopReportResponse { accepted: false }));
+            }
+        }
+        let (response, resolved) = {
             let mut store = self.inner.store.lock().await;
-            let (resolved, events) = store.report_harness_login(&request, now_ms())?;
+            let (response, resolved, events) = store.report_harness_login(&request, now_ms())?;
             self.publish_locked(&events);
-            resolved
+            (response, resolved)
         };
         self.signal_progress();
         if resolved {
             *self.inner.catalog_cache.lock_recover() = super::catalog::CatalogCache::default();
             self.signal_launch_arbitration();
         }
-        Ok(json!(AuthDesktopReportResponse {}))
+        Ok(json!(response))
     }
 }
