@@ -15,11 +15,15 @@
 //! ad-hoc launch (`harness`, `model`, `effort`, `access`), which the daemon
 //! validates and freezes; a preset launches its profile as configured.
 //!
-//! The popovers are drawn in the window above the composer, not as WinUI
-//! flyouts: Reactor 0.100.0 cannot close a `Flyout` it opened, and a menu
-//! whose callback captures data is replaced (dropping the click) on every
-//! render. Their keys come from the window's keyboard hook
-//! ([`crate::shortcuts`]) while one is open.
+//! Each popover is a real WinUI `Flyout` anchored to its chip: while it is
+//! open the chip carries it (`FlyoutExt::flyout_with`, built in
+//! [`super::picker_ui`]) and `crate::flyout` opens it once the render that
+//! attached it committed, closes it when a choice is made and reports a
+//! light dismiss (a press outside it), which closes the state here.
+//! Reactor 0.100.0 cannot open or close a flyout from code nor say that it
+//! closed. The highlight keys of an open popover come from the window's
+//! keyboard hook ([`crate::shortcuts`]), so its search field keeps the
+//! keyboard.
 
 use super::*;
 use crate::picker::{self, Choice, Item, Pick, Row};
@@ -29,7 +33,8 @@ use eliot_core::api::ModelsCatalogResponse;
 use eliot_core::api::harness::ModelsCatalogWatchResponse;
 use std::path::PathBuf;
 
-/// A popover above the composer.
+/// A popover of the composer's chips (a preset's Model field opens the
+/// model picker too).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Pop {
     /// The model picker: a new task's, a preset's, or the open Agent's
@@ -73,22 +78,17 @@ pub(super) enum LaunchMsg {
     /// Open a popover, or close it when it is the one open.
     Toggle(Pop),
     OpenModel,
-    /// Close the open popover (a click outside it, Esc).
-    Close,
+    /// Show the open popover's flyout, asked for with this epoch, once
+    /// its render committed (tries left).
+    Show(u64, u8),
+    /// A popover flyout shown with this epoch closed.
+    Closed(u64),
     /// The composer's + button: choose files to attach.
     AttachRequested,
     /// Remove one attached file (its path) from the composer.
     AttachmentRemoved(String),
     /// The New worktree chip: ask for a new worktree for this task.
     WorktreeToggled,
-    /// The popover's first frame is drawn: let it settle in.
-    Entered,
-    /// The pointer entered (true) or left the composer's message field,
-    /// and whether a button was already down as it entered.
-    ComposerPointer {
-        over: bool,
-        pressed: bool,
-    },
     /// The model search field's text.
     PickerQuery(String),
     /// A picker row was clicked (its key).
@@ -189,15 +189,25 @@ pub(super) struct Submission {
     launch_rev: u64,
 }
 
-/// The new-task draft and its context.
-/// How long the popover's first frame stays before it settles in.
-const ENTRANCE_FRAME_MS: u64 = 16;
+/// Tries to open a popover's flyout after its render, one frame apart.
+const SHOW_TRIES: u8 = 10;
+const SHOW_RETRY_MS: u64 = 16;
+/// A press outside a popover that lands on its own chip closes it (light
+/// dismiss) and then clicks the chip: a toggle of that chip carrying the
+/// same press (no press since, within this long) must not open it again.
+const DISMISS_PRESS_MS: u128 = 300;
 
+/// The new-task draft and its context.
 #[derive(Default)]
 pub(super) struct LaunchState {
-    /// The open popover's first frame: drawn clear and lowered, it then
-    /// settles in (the design's 250 ms entrance).
-    pub(super) entering: bool,
+    /// The epoch of the open popover's last show (`crate::flyout`).
+    pub(super) flyout_epoch: u64,
+    /// Renders composed when the popover was asked for: its flyout opens
+    /// after the render that attaches it to its chip.
+    pub(super) show_after: u64,
+    /// The chip whose popover a pointer press just closed (light dismiss),
+    /// that press's number (`crate::motion::last_press`) and when.
+    pub(super) dismissed: Option<(u8, u64, std::time::Instant)>,
     /// Files attached in the composer, for the composer they were attached
     /// in (`NEW_TASK` or the open Agent's id).
     pub(super) attachments: Option<(String, Vec<String>)>,
@@ -578,12 +588,70 @@ impl DesktopApp {
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
+                } else if self
+                    .launch
+                    .dismissed
+                    .take()
+                    .is_some_and(|(chip, press, at)| {
+                        self.launch.open.is_none()
+                            && chip == chip_of(pop)
+                            && press == crate::motion::presses()
+                            && at.elapsed().as_millis() < DISMISS_PRESS_MS
+                    })
+                {
+                    // The very press that light-dismissed this chip's
+                    // popover (no press since); a later click opens it.
                 } else {
                     self.open_popover(pop, context);
                 }
             }
             LaunchMsg::OpenModel => self.open_popover(Pop::Model, context),
-            LaunchMsg::Close => self.close_popover(),
+            LaunchMsg::Show(epoch, tries) => {
+                if epoch != self.launch.flyout_epoch || self.launch.open.is_none() {
+                    return;
+                }
+                let left = tries.saturating_sub(1);
+                // The render that attaches the flyout to its chip comes first.
+                let shown = if self.renders.get() <= self.launch.show_after {
+                    Err("its render has not committed".to_owned())
+                } else {
+                    crate::flyout::show(crate::flyout::POPOVER_ANCHOR, epoch)
+                };
+                match shown {
+                    Ok(()) => {}
+                    Err(_) if left > 0 => self.post_show(epoch, left, SHOW_RETRY_MS, context),
+                    Err(error) => {
+                        crate::startup::note(&format!("popover not shown: {error}"));
+                        // Not shown: its keys must not keep the composer's.
+                        self.close_popover();
+                    }
+                }
+            }
+            LaunchMsg::Closed(epoch) => {
+                // After a choice, Esc, Tab or a dialog opening the state is
+                // closed already (`close_popover`), and focus is where that
+                // put it: only a light dismiss of an open popover moves on.
+                let Some(open) = self
+                    .launch
+                    .open
+                    .filter(|_| epoch == self.launch.flyout_epoch)
+                else {
+                    return;
+                };
+                // A press that just came closed it: remember which one. A
+                // close with no press behind it (a switch to another
+                // window, Esc in WinUI) swallows nothing.
+                let (press, age) = crate::motion::last_press();
+                self.launch.dismissed = (u128::from(age) < DISMISS_PRESS_MS)
+                    .then(|| (chip_of(open), press, std::time::Instant::now()));
+                let preset = self.launch.preset.is_some();
+                self.close_popover();
+                // WinUI puts focus back where it was as the flyout closes:
+                // the composer takes it, as when a choice closed it.
+                if !preset {
+                    self.take_focus(FocusTarget::Composer);
+                }
+            }
             LaunchMsg::AttachRequested => {
                 self.close_popover();
                 match crate::file_dialog::pick_files("Attach files") {
@@ -623,16 +691,6 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::WorktreeToggled => self.launch.worktree = !self.launch.worktree,
-            LaunchMsg::Entered => {
-                self.launch.entering = false;
-                crate::motion::popover_entered();
-            }
-            LaunchMsg::ComposerPointer { over, pressed } => {
-                crate::shortcuts::set_composer_over(over);
-                if over && pressed {
-                    self.composer_pressed();
-                }
-            }
             LaunchMsg::PickerQuery(text) => {
                 if self.launch.query != text {
                     self.launch.query = text;
@@ -683,16 +741,19 @@ impl DesktopApp {
                 }
             }
             LaunchMsg::ManageOpened => {
+                // The same flyout, its content switched in place.
                 self.launch.open = Some(Pop::Manage);
                 self.launch.manage_query.clear();
                 crate::shortcuts::set_popover(HookPopover::Panel);
                 self.load_catalog(context);
+                self.request_show(context);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
             LaunchMsg::ManageClosed => {
                 self.launch.open = Some(Pop::Model);
                 self.launch.highlight = picker::initial(&self.picker_rows());
                 crate::shortcuts::set_popover(HookPopover::Picker);
+                self.request_show(context);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
             LaunchMsg::ManageQuery(text) => self.launch.manage_query = text,
@@ -858,14 +919,17 @@ impl DesktopApp {
         if !preset {
             self.launch.preset = None;
         }
+        // Another chip's flyout closes first: the render takes it off its
+        // chip, and WinUI would keep a detached flyout open.
+        if self
+            .launch
+            .open
+            .is_some_and(|open| chip_of(open) != chip_of(pop))
+        {
+            crate::flyout::hide(crate::flyout::POPOVER_ANCHOR);
+        }
         self.launch.open = Some(pop);
-        // The entrance: one frame clear and lowered, then the transition.
-        self.launch.entering = true;
-        let _task = context.spawn_background(|cancel| {
-            let cancelled = || cancel.is_cancelled();
-            let _ = crate::feed::backoff(ENTRANCE_FRAME_MS, &cancelled);
-            Message::Launch(LaunchMsg::Entered)
-        });
+        self.request_show(context);
         match pop {
             Pop::Model => {
                 self.launch.query.clear();
@@ -891,7 +955,7 @@ impl DesktopApp {
             Pop::Manage => self.launch_update(LaunchMsg::ManageOpened, context),
             Pop::Access => {
                 self.launch.access_highlight = Some(self.launch.access());
-                crate::shortcuts::set_popover(HookPopover::Menu);
+                crate::shortcuts::set_popover(HookPopover::List);
             }
             Pop::Project => {
                 self.launch.project_query.clear();
@@ -899,7 +963,7 @@ impl DesktopApp {
                     self.selected_project()
                         .map_or_else(|| OTHER_FOLDER.to_owned(), |p| p.workspace.clone()),
                 );
-                crate::shortcuts::set_popover(HookPopover::Menu);
+                crate::shortcuts::set_popover(HookPopover::List);
                 self.post_focus_field(FIELD_FOCUS_TRIES, 0, context);
             }
             Pop::Effort => {
@@ -913,25 +977,36 @@ impl DesktopApp {
                 // Left and right step the effort, Enter applies it.
                 crate::shortcuts::set_popover(HookPopover::Picker);
             }
-            Pop::Usage => crate::shortcuts::set_popover(HookPopover::Menu),
+            Pop::Usage => crate::shortcuts::set_popover(HookPopover::List),
         }
         self.ensure_catalog_watch(context);
     }
 
-    /// A press on the composer's message field (the pointer hook's report,
-    /// or the field's `PointerEntered` with a button already down: touch,
-    /// or a press without a move first) closes the open popover, so its
-    /// keys stop taking the composer's Enter; the press itself reached the
-    /// field. A preset's picker in Settings has no composer.
-    pub(super) fn composer_pressed(&mut self) {
-        if self.main == Main::Conversation && self.launch.preset.is_none() {
-            self.close_popover();
-        }
+    /// Ask for the open popover's flyout to show after the next render.
+    fn request_show(&mut self, context: &ComponentContext<Self>) {
+        self.launch.flyout_epoch = crate::flyout::next_epoch();
+        self.launch.show_after = self.renders.get();
+        self.post_show(self.launch.flyout_epoch, SHOW_TRIES, 0, context);
     }
 
-    /// Close the open popover; its keys go back to the focused control.
+    fn post_show(&self, epoch: u64, tries: u8, delay_ms: u64, context: &ComponentContext<Self>) {
+        if tries == 0 {
+            return;
+        }
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 {
+                let _ = feed::backoff(delay_ms, &cancelled);
+            }
+            Message::Launch(LaunchMsg::Show(epoch, tries))
+        });
+    }
+
+    /// Close the open popover and its flyout; its keys go back to the
+    /// focused control.
     pub(super) fn close_popover(&mut self) {
         if self.launch.open.take().is_some() {
+            crate::flyout::hide(crate::flyout::POPOVER_ANCHOR);
             crate::shortcuts::set_popover(HookPopover::None);
             if self.launch.preset.take().is_none() {
                 // Keyboard focus goes back to the composer (no-op while unbound).
@@ -1827,6 +1902,17 @@ impl LaunchOutcome {
             model: None,
             work: None,
         }
+    }
+}
+
+/// The chip a popover opens from: the model picker, Manage models and the
+/// open Agent's effort popover share the model chip.
+fn chip_of(pop: Pop) -> u8 {
+    match pop {
+        Pop::Model | Pop::Manage | Pop::Effort => 0,
+        Pop::Access => 1,
+        Pop::Project => 2,
+        Pop::Usage => 3,
     }
 }
 

@@ -96,6 +96,25 @@ pub fn note(error: &str) {
     record(error);
 }
 
+/// Whether this session already told the window about a caught panic.
+static PANIC_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A panic stopped at a native boundary (a WinUI event handler or one of
+/// the window's hooks), where unwinding would abort the process: each one
+/// is noted in the log, and the first of the session also reaches the
+/// window, which shows a notice (`Shortcut::Panicked`).
+pub fn caught_panic(source: &str, panic: &(dyn std::any::Any + Send)) {
+    let what = panic
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_owned());
+    note(&format!("{source} panicked and was stopped there: {what}"));
+    if !PANIC_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        crate::shortcuts::panicked();
+    }
+}
+
 /// A start-up error that ends the process: the terminal (if any), the log
 /// and a message box, then exit status 1.
 pub fn fatal(error: &str) -> ! {

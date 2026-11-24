@@ -51,11 +51,8 @@ pub struct ProfilesData<'a> {
     /// The selected profile's enumerated fields, with its harness's values.
     pub fields: Vec<FormField>,
     /// The selected profile's Model control: a field that opens the
-    /// catalogue picker.
+    /// catalogue picker as its flyout.
     pub model: Option<View>,
-    /// The open picker: a layer over the form rows from the Model row down
-    /// (the rows stay where they are).
-    pub model_popover: Option<View>,
     /// The selected profile's harness in the owner's words ("Claude Code").
     pub harness: Option<&'a str>,
     /// The selected profile's Subagents section.
@@ -381,8 +378,6 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 ),
             ));
         }
-        // The rows from Model down: the open picker lies over them.
-        let above = form.len();
         if let Some(model) = data.model {
             form.push(KeyedView::new(
                 "field-model",
@@ -451,13 +446,6 @@ pub fn profiles_screen(data: ProfilesData<'_>, actions: ProfilesActions, palette
                 ),
             ),
         ));
-        if let Some(popover) = data.model_popover {
-            let below = form.split_off(above);
-            form.push(KeyedView::new(
-                "fields-with-picker",
-                Grid::new().children((StackPanel::new().keyed_children(below), popover)),
-            ));
-        }
     }
     let state = if !data.file_valid {
         format!(

@@ -144,17 +144,13 @@ pub mod icon {
 /// colors and the press feedback on effects-fast (a storyboard over the
 /// 347-ms spatial-fast settle time would read as a slow press; the press
 /// morph moves to the spatial-fast spring with the motion increment), the
-/// ripple on effects-slow, popovers moving into place on spatial with a
-/// 4-DIP rise.
+/// ripple on effects-slow. A popover's entrance is its WinUI flyout's own.
 pub mod motion {
     use super::brand;
 
     pub const STATE_MS: u64 = brand::EFFECTS_FAST_MS;
     pub const PRESS_MS: u64 = brand::EFFECTS_FAST_MS;
     pub const RIPPLE_MS: u64 = brand::EFFECTS_SLOW_MS;
-    pub const POPOVER_MS: u64 = brand::SPATIAL_MS;
-    /// How far a popover rises into place while it fades in.
-    pub const POPOVER_RISE: f64 = brand::SIZE_POPOVER_RISE;
     pub const PRESS_SCALE: f64 = brand::SCALE_PRESS;
     pub const FAB_PRESS_SCALE: f64 = brand::SCALE_PRESS_ACTION;
     pub const EMPHASIZED: &str = crate::brand::EASING_EMPHASIZED;
@@ -280,7 +276,6 @@ pub mod layout {
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
-    pub const CONTEXT_MENU_WIDTH: f64 = 248.0;
     pub const USAGE_MENU_WIDTH: f64 = 320.0;
     pub const EFFORT_MENU_MIN_WIDTH: f64 = 300.0;
     /// The scrolling list of a popover.

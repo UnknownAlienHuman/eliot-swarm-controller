@@ -56,8 +56,8 @@ pub(super) enum ChatMsg {
     ApprovalRequested(UiPending, bool),
     AnswerRequested(UiPending),
     ControlSubmitted(String, eliot_core::Result<String>),
-    /// A "…" menu entry (its label).
-    AgentMenu(String),
+    /// A "…" menu entry, or Stop Agent.
+    AgentMenu(menu_ui::Action),
     /// The Force stop banner's answer: true confirms the bound action.
     ForceStopAnswered(bool),
     /// Outcomes of the inputs still shown as waiting (epoch, per command).
@@ -97,12 +97,6 @@ pub(super) struct MenuBinding {
     generation: i64,
 }
 
-/// "…" menu entries.
-const MENU_DETAILS: &str = "Agent details";
-const MENU_HANDOFF: &str = "Hand off or switch…";
-const MENU_MOVE: &str = "Move under another task…";
-const MENU_RESUME: &str = "Resume";
-const MENU_DETACH: &str = "Detach";
 /// How long the desktop waits for a Stop's final state before saying so.
 const CONTROL_SETTLE_SECONDS: u64 = 10;
 
@@ -144,9 +138,6 @@ fn command_reason(outcome: Option<&serde_json::Value>) -> String {
         })
         .unwrap_or_else(|| "No reason was reported.".to_owned())
 }
-
-const MENU_STOP: &str = "Stop";
-const MENU_FORCE: &str = "Force stop…";
 
 /// Delay before the composer takes focus after an open or a send, and
 /// before a send scrolls the transcript to its end: the next render has
@@ -493,8 +484,6 @@ impl DesktopApp {
                 if text == previous {
                     return;
                 }
-                // Typing in the composer dismisses an open popover.
-                self.close_popover();
                 // Enter without Shift typed this line break: send instead.
                 // A pending retry needs no text (promptless Resume), so it
                 // satisfies the Enter guard on its own.
@@ -1062,7 +1051,7 @@ impl DesktopApp {
                     self.alert(format!("{what}: {error}"));
                 }
             },
-            ChatMsg::AgentMenu(label) => {
+            ChatMsg::AgentMenu(action) => {
                 // Bound now, to the Agent and generation the header shows.
                 let binding = self.selected_agent_id().zip(self.chat.detail.as_ref()).map(
                     |(agent, detail)| MenuBinding {
@@ -1071,7 +1060,7 @@ impl DesktopApp {
                     },
                 );
                 if let Some(binding) = binding {
-                    self.agent_menu(&label, binding, context);
+                    self.agent_menu(action, binding, context);
                 }
             }
             ChatMsg::ForceStopAnswered(confirmed) => {
@@ -1533,26 +1522,9 @@ impl DesktopApp {
                 .unwrap_or_else(View::empty),
         };
         let composer = self.composer_view(column, context, palette);
-        // An open popover overlays the rows above the composer (drawn after
-        // them), so nothing moves when it opens; a click anywhere on those
-        // rows outside it closes it.
-        let popover = self.popover_view(column, context, palette);
-        let dismiss: View = if self.launch.open.is_some() {
-            Border::new()
-                .grid_row(1)
-                .grid_row_span(super::picker_ui::POPOVER_ROWS)
-                .background(Brush::Solid(Color::transparent()))
-                .on_pointer_pressed(
-                    context.callback(|_: PointerEventInfo| Message::Launch(LaunchMsg::Close)),
-                )
-                .into()
-        } else {
-            View::empty()
-        };
 
         // Rows: the header, the transcript, (spare), pending requests, the
-        // notice, the composer; the popover spans the transcript to the
-        // notice.
+        // notice, the composer (its popovers are flyouts on its chips).
         Grid::new()
             .rows([
                 GridLength::Auto,
@@ -1562,7 +1534,7 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .children((header, body, pending, alert, composer, dismiss, popover))
+            .children((header, body, pending, alert, composer))
     }
 
     /// The reading column's width: the reading width, or the main area less

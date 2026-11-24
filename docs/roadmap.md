@@ -790,12 +790,13 @@ of the explicitly selected release scope.
       control template (Uno.Themes' Material styles and Material
       Components' state layers as the pattern): a state layer in the
       content color on hover (8 %) and press (12 %), a ripple from the press
-      point, a slight press scale on M3's emphasized motion (150 ms for states,
-      250 ms for a popover's entrance, a fade and a 4-DIP rise), the FAB's key
-      and ambient shadows drawn under it as the design's CSS shadows render
-      (each blur a Gaussian falloff; WinUI's ThemeShadow draws nothing outside
-      a popup without receivers), deeper on hover; the composer, popovers and in-window menus
-      lifted the same way (elevation 0 to 3). Shapes: everything pressed is a
+      point, a slight press scale on M3's emphasized motion (150 ms for
+      states), the FAB's key and ambient shadows drawn under it as the
+      design's CSS shadows render (each blur a Gaussian falloff; WinUI's
+      ThemeShadow draws nothing outside a popup without receivers), deeper on
+      hover; the composer lifted the same way (elevation 0 to 3); popovers
+      and menus are WinUI flyouts with their own entrance and shadow (D11).
+      Shapes: everything pressed is a
       pill (buttons, icon buttons, chips, rows, segments, dropdowns; radius half
       the height), cards and tool rows 12, the composer 20, dialogs 28. The
       approved design's density (2026-11-19): rows and controls 32, chips 28,
@@ -869,13 +870,9 @@ of the explicitly selected release scope.
       Approve for me / Full access → `ask` / `auto` / `full`, Full in the
       warning color, refused up front for OpenCode), remembered in
       `[desktop] last_access`; the chip itself is borderless, Full access as
-      warning text. The popovers overlay the conversation right above the
-      composer, so nothing behind them moves, and are not WinUI flyouts
-      (Reactor 0.100.0 cannot close a flyout it opened). A click on the
-      conversation or into the message field, Tab, or Esc closes one, so its
-      keys never take the composer's Enter (the message field's press is seen
-      by the window's pointer hook while the pointer is over it: WinUI's
-      TextBox keeps its presses and Reactor has no focus events).
+      warning text. The popovers are WinUI flyouts anchored to their chips
+      (D11): a press outside one, Tab or Esc closes it, so its keys never
+      take the composer's Enter.
       Settings follows Codex: a Search field over the settings of every page,
       then the groups General (General: appearance and startup on one page;
       Keyboard shortcuts), Agents (Models & presets, Default access, Usage),
@@ -935,7 +932,7 @@ of the explicitly selected release scope.
       Delete stopped tasks, Remove project) and on tasks and chats (Rename,
       Stop while live, idle included, Archive/Unarchive, Delete after a
       confirmation naming it, with a refused step's typed error, Copy
-      Agent ID, Open folder) are drawn in the window and open from a right
+      Agent ID, Open folder) are WinUI menu flyouts (D11) and open from a right
       click, the row's "⋯" (shown under the pointer, with keyboard focus in
       the row and on the open task), Shift+F10 or the context-menu key; archiving the open chat
       returns to a new task with "Archived · Undo", and the fleet line counts
@@ -1016,9 +1013,15 @@ of the explicitly selected release scope.
     size, shape, type, state and motion constants. Roboto, Roboto Mono and
     Material Symbols Rounded ship inside the executable and load from `fonts`
     beside it.
-  - [ ] **Real flyouts.** Popovers through Reactor's `Flyout::rich`, menus
-    through `.menu()`, a native module for hide, show at a point and closed;
-    the in-window menus and popovers are removed.
+  - [x] **Real flyouts.** Popovers are Reactor `Flyout::rich` flyouts on
+    their chips (attached while open), the sidebar's row menus one `.menu()`
+    `MenuFlyout` on a hidden window button; a native module (`flyout.rs`)
+    opens them at the chip or at a point, hides them, reports closed and
+    gives menu items their glyphs, the danger tint and the menu its
+    accessible name. Menu items are typed actions whose labels are proven
+    distinct at compile time; Attach to project is its own chooser flyout
+    keyed by project id and checkout. The in-window menus and popovers are
+    removed.
   - [ ] **Styles, shapes, motion, shadows, wave.** Carrier control types with
     implicit styles and styles set by key; spring-sampled template key frames;
     composition-host shadows; the wave as a re-templated `ProgressBar`.

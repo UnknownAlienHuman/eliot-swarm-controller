@@ -11,13 +11,29 @@
 //! Archiving the open chat returns to New task with an "Archived · Undo"
 //! notice (the Codex app's archive).
 //!
-//! Reactor 0.100.0 attaches a `Menu` only as a Button's left-click flyout
-//! and has no `ContextFlyout`, so the menu is drawn in the window, at the
-//! pointer, over a transparent layer that closes it on any press. All modal
+//! Each menu is a real WinUI `MenuFlyout`. Reactor 0.100.0 attaches a
+//! `Menu` only as a Button's left-click flyout and has no `ContextFlyout`,
+//! so the window keeps one row-menu button that is never shown
+//! ([`DesktopApp::menu_anchor`], automation id `crate::flyout::MENU_ANCHOR`)
+//! carrying the menu of the row last asked for, and `crate::flyout` opens
+//! it at a point once the render that attached its items committed: under
+//! the row's "…", at the pointer for a right press (it arrives through the
+//! row's `Border`, `PointerPressed` with the right button, which a Button
+//! leaves unhandled), or under the focused row for Shift+F10 and the
+//! context-menu key (`crate::shortcuts`). WinUI gives the menu its keyboard
+//! (arrows, Enter, Esc), light dismiss and placement. Reactor's `MenuItem`
+//! is text only: before the menu opens, `crate::flyout` gives each native
+//! item its glyph (and the danger items the error color) and the menu its
+//! accessible name. Every item, here and in the conversation header's "…",
+//! is a typed [`Action`] with one fixed label; Reactor reports a chosen
+//! item only by that label, the labels are proven distinct at compile time,
+//! and the label maps back to its action, which runs only if the opened
+//! menu offered it. No project or task name is ever an item (the tags item
+//! only shows the current tags). More is a submenu. "Attach to project…" opens its own chooser, a WinUI
+//! `Flyout` at the row ([`DesktopApp::attach_anchor`]) whose rows are keyed
+//! by the project's id and checkout, never by its name. All modal
 //! confirmations use the common M3 body/footer and native focus host in
 //! [`super::dialog_ui`].
-//! A row's right press arrives through its `Border` (`PointerPressed` with
-//! the right button, which a Button leaves unhandled).
 //!
 //! Rename writes an owner display name (`[desktop] display_names`); it
 //! renames what the sidebar shows, not a registration or an Agent record.
@@ -66,52 +82,259 @@ impl Target {
     }
 }
 
-/// One menu entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Action {
-    NewTaskHere,
-    OpenFolder,
-    Rename,
-    ToggleCollapse,
-    RemoveProject,
+/// Declares [`Action`] from one list, so every action has exactly one label,
+/// glyph and danger flag, and [`Action::ALL`] lists every variant.
+macro_rules! actions {
+    ($($(#[$doc:meta])* $variant:ident => ($label:expr, $glyph:expr, $danger:expr),)*) => {
+        /// One menu command of a row menu or the conversation header's "…".
+        ///
+        /// Reactor 0.100.0's `Menu` reports a chosen item only by its label
+        /// (its `on_click` is a `Callback<String>`; each native
+        /// `MenuFlyoutItem.Click` enqueues the item's label, never its key),
+        /// so the label is the only payload a menu can carry. Each action
+        /// owns one fixed label, the labels are proven distinct at compile
+        /// time (the assertion below), menus are built from actions and a
+        /// chosen label maps back through [`Action::from_label`]: no label
+        /// can stand for two actions, in any build.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) enum Action {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl Action {
+            /// Every action, in declaration order.
+            pub(super) const ALL: &'static [Action] = &[$(Action::$variant,)*];
+
+            /// The text a menu shows for it and Reactor reports back.
+            pub(super) const fn label(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $label,)*
+                }
+            }
+
+            /// Its icon in a row menu.
+            pub(super) const fn glyph(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $glyph,)*
+                }
+            }
+
+            /// Deletes, removes or forces (the error color; a row menu ends
+            /// with it).
+            pub(super) const fn danger(self) -> bool {
+                match self {
+                    $(Action::$variant => $danger,)*
+                }
+            }
+        }
+    };
+}
+
+actions! {
+    NewTaskHere => ("New task here", m3::glyph::NEW_TASK, false),
+    OpenFolder => ("Open folder", m3::glyph::OPEN_FOLDER, false),
+    Rename => ("Rename", m3::glyph::RENAME, false),
+    /// Expand a collapsed project.
+    Expand => ("Expand", m3::glyph::CHEVRON_DOWN, false),
+    /// Collapse a project.
+    Collapse => ("Collapse", m3::glyph::CHEVRON_RIGHT, false),
     /// Archive every finished task of the project or subproject.
-    ArchiveFinished,
+    ArchiveFinished => ("Archive finished tasks…", m3::glyph::ARCHIVE, false),
     /// Delete every stopped task of the project or subproject.
-    DeleteStopped,
-    Stop,
+    DeleteStopped => ("Delete stopped tasks…", m3::glyph::DELETE, true),
+    RemoveProject => ("Remove from Swarm…", m3::glyph::DELETE, true),
     /// "Move under another task…": open the picker.
-    MoveUnder,
-    /// Resume a lost task in its conversation.
-    Resume,
-    Archive(bool),
-    Delete,
-    CopyId,
-    More,
-    /// "Attach to project…": open the registered projects (a chat).
-    AttachMenu,
-    /// Attach the chat to the opened list's project at this index.
-    AttachTo(usize),
+    MoveUnder => ("Move under another task…", m3::glyph::MOVE, false),
+    /// "Attach to project…": open the project chooser at the row.
+    AttachMenu => ("Attach to project…", m3::glyph::FOLDER, false),
     /// Return the chat to the no-project bucket.
-    Detach,
-    /// Edit the Agent's tags inline.
-    EditTags,
+    Detach => ("Detach from project", m3::glyph::FOLDER, false),
+    /// Edit the Agent's tags inline (the item shows the current tags).
+    EditTags => ("Tags…", m3::glyph::TAG, false),
+    Archive => ("Archive", m3::glyph::ARCHIVE, false),
+    Unarchive => ("Unarchive", m3::glyph::ARCHIVE, false),
+    /// Resume an ended task in its conversation.
+    Resume => ("Resume", m3::glyph::RESUME, false),
+    Stop => ("Stop", m3::glyph::STOP, false),
+    /// The More submenu (never chosen itself).
+    More => ("More", m3::glyph::MORE, false),
+    Delete => ("Delete…", m3::glyph::DELETE, true),
+    CopyId => ("Copy Agent ID", m3::glyph::COPY, false),
+    /// The conversation header's Agent details.
+    Details => ("Agent details", m3::glyph::INFO, false),
+    /// The conversation header's handoff or switch.
+    Handoff => ("Hand off or switch…", m3::glyph::FORWARD, false),
+    /// Detach Eliot's observer from an observed Agent (header only).
+    DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
+    /// The conversation header's Force stop (it asks first).
+    ForceStop => ("Force stop…", m3::glyph::STOP, true),
+}
+
+/// Whether `a` and `b` hold the same text, in a constant context.
+const fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < a.len() {
+        if a[at] != b[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+// Compile time: no two actions share a label, so a reported label names
+// exactly one action.
+const _: () = {
+    let all = Action::ALL;
+    let mut first = 0;
+    while first < all.len() {
+        let mut second = first + 1;
+        while second < all.len() {
+            assert!(
+                !same_text(all[first].label(), all[second].label()),
+                "two menu actions share a label"
+            );
+            second += 1;
+        }
+        first += 1;
+    }
+};
+
+impl Action {
+    /// The action whose label Reactor reported, by an exhaustive search of
+    /// [`Action::ALL`].
+    pub(super) fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|action| action.label() == label)
+    }
+}
+
+/// One item of a row menu: a command, or a submenu of commands.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Entry {
+    Item {
+        action: Action,
+        /// What the item shows in place of its label (Tags lists the
+        /// current tags); display only: the native item's text is replaced
+        /// as the menu opens, and a choice still reports the label.
+        display: Option<String>,
+    },
+    Submenu {
+        action: Action,
+        items: Vec<Entry>,
+    },
+}
+
+impl Entry {
+    pub(super) fn item(action: Action) -> Self {
+        Self::Item {
+            action,
+            display: None,
+        }
+    }
+
+    fn action(&self) -> Action {
+        match self {
+            Self::Item { action, .. } | Self::Submenu { action, .. } => *action,
+        }
+    }
+
+    /// Whether it deletes or removes.
+    pub(super) fn is_destructive(&self) -> bool {
+        matches!(self, Self::Item { action, .. } if action.danger())
+    }
+
+    /// Whether it is the More submenu (the conversation header has its
+    /// own).
+    pub(super) fn is_more(&self) -> bool {
+        matches!(
+            self,
+            Self::Submenu {
+                action: Action::More,
+                ..
+            }
+        )
+    }
+}
+
+/// The automation id prefix of a sidebar row's "…" button, followed by the
+/// row's key (`agent:<id>`, `project:<key>`); its menu opens under it.
+pub(super) const MORE_ID_PREFIX: &str = "eliot-more:";
+
+/// Reactor's menu items for `entries`, each keyed and labelled by its
+/// action's label.
+pub(super) fn menu_items(entries: &[Entry]) -> Vec<MenuItem> {
+    entries
+        .iter()
+        .map(|entry| {
+            let label = entry.action().label();
+            match entry {
+                Entry::Item { .. } => MenuItem::item(label, label),
+                Entry::Submenu { items, .. } => MenuItem::submenu(label, label, menu_items(items)),
+            }
+        })
+        .collect()
+}
+
+/// Whether the menu `entries` offers `action`, at any depth: a choice runs
+/// only in the menu that offered it.
+pub(super) fn offers(entries: &[Entry], action: Action) -> bool {
+    entries.iter().any(|entry| match entry {
+        Entry::Item { action: item, .. } => *item == action,
+        Entry::Submenu { items, .. } => offers(items, action),
+    })
+}
+
+/// How each command of `entries` looks natively: its glyph, danger tint and
+/// display text, by label (`crate::flyout::MenuDress`).
+fn entry_looks(entries: &[Entry], looks: &mut Vec<crate::flyout::MenuLook>) {
+    for entry in entries {
+        let action = entry.action();
+        let display = match entry {
+            Entry::Item { display, .. } => display.clone(),
+            Entry::Submenu { items, .. } => {
+                entry_looks(items, looks);
+                None
+            }
+        };
+        looks.push(crate::flyout::MenuLook {
+            label: action.label(),
+            display,
+            glyph: action.glyph(),
+            danger: action.danger(),
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum MenuMsg {
-    /// A row's right press: its target and the pointer in window DIPs.
-    Requested(Target, f64, f64),
-    Closed,
-    /// Move the keyboard highlight by `step` rows (wrapping).
-    HighlightMove(i32),
-    /// Choose the keyboard-highlighted row, if any.
-    HighlightActivate,
-    /// Bring the keyboard-highlighted row into view after its render
-    /// (the highlight move that needs it).
-    Reveal(u64),
-    Chosen(Action),
-    /// A row's '…': its menu at the pointer.
+    /// Open the menu of a row at a point in window DIPs (a right press,
+    /// Shift+F10 or the context-menu key); true when the row itself asked
+    /// (the keyboard or its "…"), so focus goes back to it if the menu
+    /// closes without a choice.
+    Requested(Target, f64, f64, bool),
+    /// A row's "…": its menu under the button.
     Opened(Target),
+    /// Show the menu or attach chooser asked for with this epoch once its
+    /// render committed (tries left).
+    Show(u64, u8),
+    /// A menu item was chosen (mapped from the label Reactor reports by
+    /// [`Action::from_label`]).
+    Picked(Action),
+    /// A row of the attach chooser was chosen: the project's id and
+    /// checkout.
+    AttachPicked(String, String),
+    /// A menu or attach chooser shown with this epoch closed.
+    Closed(u64),
+    /// The row menu of this epoch closed without a choice: give its row
+    /// the keyboard back.
+    ReturnFocus(u64),
     Hovered(Option<String>),
     RenameChanged(String),
     /// The tag editor's field at this index changed (the index past the
@@ -140,16 +363,63 @@ pub(super) enum MenuMsg {
     Ignored,
 }
 
-/// The open menu, the rename in progress and the pending confirmation.
+/// The row menu the window's menu button carries: what it acts on, its
+/// items as they were built, and where it opens (window DIPs).
+pub(super) struct OpenMenu {
+    pub(super) target: Target,
+    pub(super) entries: Vec<Entry>,
+    x: f64,
+    y: f64,
+    /// Opened from the row itself (Shift+F10, the context-menu key or its
+    /// "…"): closed without a choice, it gives keyboard focus back to the
+    /// row (the "…" leaves the tree as the menu takes focus).
+    return_focus: bool,
+}
+
+/// One row of the attach chooser: a registered project, by its id and
+/// checkout; `name` is only shown.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct AttachChoice {
+    project: String,
+    checkout: String,
+    name: String,
+}
+
+/// The open "Attach to project…" chooser: the chat it places, its rows,
+/// where it opens (window DIPs) and its show epoch.
+pub(super) struct AttachChooser {
+    agent: UiAgent,
+    choices: Vec<AttachChoice>,
+    x: f64,
+    y: f64,
+    epoch: u64,
+    /// Renders composed when it was asked for: it opens after the render
+    /// that attaches its flyout.
+    show_after: u64,
+}
+
+/// The row menu last asked for, the rename in progress and the pending
+/// confirmation.
 #[derive(Default)]
 pub(super) struct MenuState {
-    pub(super) open: Option<(Target, f64, f64)>,
-    /// The keyboard-highlighted row (arrow keys, Enter activates).
-    pub(super) highlight: Option<usize>,
-    pub(super) more: bool,
-    /// "Attach to project…" is open: the registered projects as it
-    /// captured them, `(project, name)`.
-    pub(super) attach: Option<Vec<(String, String)>>,
+    /// Kept after it closes, so a chosen item still finds its action; the
+    /// next row's menu replaces it.
+    pub(super) open: Option<OpenMenu>,
+    /// The attach chooser, while it is open.
+    pub(super) attach: Option<AttachChooser>,
+    /// The Enter presses counted when the rename or tag edit started
+    /// (`crate::shortcuts::enter_presses`): the Enter that chose it in the
+    /// menu must not commit it.
+    pub(super) rename_enter: u64,
+    /// The epoch of the last show (`crate::flyout`).
+    epoch: u64,
+    /// Renders composed when the menu was asked for: it opens after the
+    /// render that attaches its items.
+    show_after: u64,
+    /// The menu is open (shown, its `Closed` not seen yet).
+    shown: bool,
+    /// An item of the last menu asked for was chosen.
+    picked: bool,
     pub(super) hovered: Option<String>,
     /// The sidebar row holding keyboard focus (`crate::motion`).
     pub(super) focused: Option<String>,
@@ -160,15 +430,6 @@ pub(super) struct MenuState {
     pub(super) tag_fields: Vec<String>,
     pub(super) confirm: Option<(Target, Action)>,
     pub(super) rename_ref: ElementRef<TextBox>,
-    /// The keyboard-highlighted row, bound when it renders: focusing
-    /// it scrolls it into view (WinUI brings a focused element in).
-    row_ref: ElementRef<Button>,
-    /// Highlight moves handed out by `reveal_highlight`: a reveal for
-    /// an older move is ignored.
-    reveal_epoch: u64,
-    /// Renders composed when the latest highlight move ran: the reveal
-    /// waits for the render that binds the row.
-    reveal_after: u64,
     /// "Move under another task…" is open.
     pub(super) moving: Option<super::move_ui::MoveDialog>,
     /// "Archived · Undo" after an archive: the Agent, whether it was the
@@ -180,93 +441,180 @@ pub(super) struct MenuState {
 /// How long the "Archived · Undo" notice stays.
 const ARCHIVED_NOTICE_MS: u64 = 10_000;
 
-/// Between bringing the highlighted row into view and retrying it:
-/// one frame later (see `reveal_highlight`).
-const MENU_REVEAL_RETRY_MS: u64 = 16;
+/// Tries to open a row menu after its render, one frame apart.
+const MENU_SHOW_TRIES: u8 = 10;
+const MENU_SHOW_RETRY_MS: u64 = 16;
+/// How long a closed row menu waits for its chosen item's click before it
+/// gives focus back to its row.
+const RETURN_FOCUS_MS: u64 = 60;
 
 impl DesktopApp {
     pub(super) fn menu_update(&mut self, msg: MenuMsg, context: &ComponentContext<Self>) {
         match msg {
-            MenuMsg::Requested(target, x, y) => {
+            MenuMsg::Requested(target, x, y, return_focus) => {
                 self.close_popover();
-                self.menu.more = false;
-                self.menu.attach = None;
-                self.menu.highlight = None;
-                self.menu.open = Some((target, x, y));
-                crate::shortcuts::set_popover(crate::shortcuts::Popover::Menu);
+                // A menu shown now closes first (Shift+F10 twice, or "…"
+                // then a right press): its watch ends with it, and Reactor
+                // never swaps the native menu under an open one, whose
+                // clicks would be lost.
+                self.close_menu();
+                let entries = self.menu_entries(&target);
+                self.menu.open = Some(OpenMenu {
+                    target,
+                    entries,
+                    x,
+                    y,
+                    return_focus,
+                });
+                self.menu.picked = false;
+                self.menu.epoch = crate::flyout::next_epoch();
+                self.menu.show_after = self.renders.get();
+                self.post_menu_show(self.menu.epoch, MENU_SHOW_TRIES, 0, context);
             }
-            MenuMsg::HighlightMove(step) => {
-                let Some((target, _, _)) = &self.menu.open else {
-                    return;
-                };
-                // The rename field and the confirmation own the keyboard.
-                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
-                    return;
-                }
-                let count = self.menu_entries(target).len();
-                self.menu.highlight = highlight_step(self.menu.highlight, step, count);
-                if self.menu.highlight.is_some() {
-                    self.reveal_highlight(context);
-                }
-            }
-            MenuMsg::Reveal(epoch) => {
-                if epoch != self.menu.reveal_epoch || self.menu.open.is_none() {
-                    return;
-                }
-                // Only a highlighted row binds the reference.
-                if self.menu.highlight.is_none() {
-                    return;
-                }
-                // The highlighted row's reference binds when it renders.
-                if self.renders.get() <= self.menu.reveal_after {
-                    self.post_reveal_highlight(epoch, MENU_REVEAL_RETRY_MS, context);
-                    return;
-                }
-                // Focusing the row brings it into view; the thread hook
-                // keeps the keyboard while the menu is open, so arrows
-                // and Enter keep working.
-                if !self.menu.row_ref.request_focus() {
-                    self.post_reveal_highlight(epoch, MENU_REVEAL_RETRY_MS, context);
-                }
-            }
-            MenuMsg::HighlightActivate => {
-                let Some((target, _, _)) = &self.menu.open else {
-                    return;
-                };
-                if self.menu.renaming.is_some() || self.menu.confirm.is_some() {
-                    return;
-                }
-                if let Some(index) = self.menu.highlight
-                    && let Some((action, _, _, _)) = self.menu_entries(target).get(index)
-                {
-                    let action = *action;
-                    self.menu_update(MenuMsg::Chosen(action), context);
-                }
-            }
-            MenuMsg::Closed => self.close_menu(),
             MenuMsg::Opened(target) => {
-                let (x, y) = crate::shortcuts::pointer_position();
-                self.menu_update(MenuMsg::Requested(target, x, y), context);
+                // Under the "…" just pressed or invoked; at the pointer
+                // when it cannot be placed.
+                let (x, y) = crate::motion::element_bottom_left(&format!(
+                    "{MORE_ID_PREFIX}{}",
+                    target.name_key()
+                ))
+                .unwrap_or_else(crate::shortcuts::pointer_position);
+                self.menu_update(MenuMsg::Requested(target, x, y, true), context);
+            }
+            MenuMsg::Show(epoch, tries)
+                if self
+                    .menu
+                    .attach
+                    .as_ref()
+                    .is_some_and(|chooser| chooser.epoch == epoch) =>
+            {
+                self.show_attach(epoch, tries, context);
+            }
+            MenuMsg::Show(epoch, tries) => {
+                let Some(open) = self.menu.open.as_ref().filter(|_| epoch == self.menu.epoch)
+                else {
+                    return;
+                };
+                let left = tries.saturating_sub(1);
+                // The render that attaches the menu's items comes first.
+                let shown = if self.renders.get() <= self.menu.show_after {
+                    Err("its render has not committed".to_owned())
+                } else {
+                    let mut items = Vec::new();
+                    entry_looks(&open.entries, &mut items);
+                    let name = format!("Actions for {}", open.target.title());
+                    let dress = crate::flyout::MenuDress {
+                        name: &name,
+                        items: &items,
+                        danger: self.palette().roles().map(|roles| {
+                            (
+                                roles.attention_text.r,
+                                roles.attention_text.g,
+                                roles.attention_text.b,
+                            )
+                        }),
+                    };
+                    crate::flyout::show_menu_at(
+                        crate::flyout::MENU_ANCHOR,
+                        open.x,
+                        open.y,
+                        epoch,
+                        &dress,
+                    )
+                };
+                match shown {
+                    Ok(()) => self.menu.shown = true,
+                    Err(_) if left > 0 => {
+                        self.post_menu_show(epoch, left, MENU_SHOW_RETRY_MS, context);
+                    }
+                    Err(error) => crate::startup::note(&format!("row menu not shown: {error}")),
+                }
+            }
+            MenuMsg::Picked(action) => {
+                let Some(open) = &self.menu.open else {
+                    return;
+                };
+                self.menu.picked = true;
+                // Only an action the opened menu offered runs.
+                if offers(&open.entries, action) {
+                    let target = open.target.clone();
+                    self.menu_action(target, action, context);
+                }
+            }
+            MenuMsg::AttachPicked(project, checkout) => {
+                let Some(chooser) = self.menu.attach.take() else {
+                    return;
+                };
+                crate::flyout::hide(crate::flyout::ATTACH_ANCHOR);
+                let Some(choice) = chooser
+                    .choices
+                    .into_iter()
+                    .find(|choice| choice.project == project && choice.checkout == checkout)
+                else {
+                    return;
+                };
+                let agent = chooser.agent;
+                self.submit_organize(
+                    format!("Attach to {}", choice.name),
+                    client::Organize::Attach {
+                        agent: agent.id.clone(),
+                        project: choice.project,
+                        revision: agent.organization_revision.unwrap_or(0),
+                    },
+                    context,
+                );
+            }
+            MenuMsg::Closed(epoch)
+                if self
+                    .menu
+                    .attach
+                    .as_ref()
+                    .is_some_and(|chooser| chooser.epoch == epoch) =>
+            {
+                // Esc or a press outside it.
+                self.menu.attach = None;
+            }
+            MenuMsg::Closed(epoch) => {
+                if epoch != self.menu.epoch {
+                    return;
+                }
+                self.menu.shown = false;
+                // WinUI puts focus back where it was as the menu closes:
+                // a rename or tag edit the menu started takes it now.
+                if self.menu.renaming.is_some() {
+                    self.focus_rename(5, context);
+                } else if self
+                    .menu
+                    .open
+                    .as_ref()
+                    .is_some_and(|open| open.return_focus)
+                {
+                    // The chosen item's click may still be on its way.
+                    let _task = context.spawn_background(move |cancel| {
+                        let _ = feed::backoff(RETURN_FOCUS_MS, &|| cancel.is_cancelled());
+                        Message::Menu(MenuMsg::ReturnFocus(epoch))
+                    });
+                }
+            }
+            MenuMsg::ReturnFocus(epoch) => {
+                // Closed without a choice (Esc, a press outside): the row
+                // the menu came from takes the keyboard back, unless
+                // something else took it since.
+                let Some(open) = self.menu.open.as_ref() else {
+                    return;
+                };
+                if epoch == self.menu.epoch
+                    && !self.menu.picked
+                    && !self.menu.shown
+                    && self.menu.renaming.is_none()
+                    && self.menu.attach.is_none()
+                    && self.dialog_kind() == 0
+                    && !crate::motion::focus_row(&open.target.name_key())
+                {
+                    crate::startup::note("row menu closed: its row could not take focus back");
+                }
             }
             MenuMsg::Hovered(agent) => self.menu.hovered = agent,
-            MenuMsg::Chosen(Action::More) => {
-                self.menu.more = !self.menu.more;
-                self.menu.highlight = None;
-            }
-            MenuMsg::Chosen(Action::AttachMenu) => {
-                self.menu.attach = match self.menu.attach.take() {
-                    Some(_) => None,
-                    None => Some(self.attach_choices()),
-                };
-                self.menu.highlight = None;
-            }
-            MenuMsg::Chosen(action) => {
-                let Some((target, _, _)) = self.menu.open.take() else {
-                    return;
-                };
-                crate::shortcuts::set_popover(crate::shortcuts::Popover::None);
-                self.menu_action(target, action, context);
-            }
             MenuMsg::RenameChanged(text) => {
                 if let Some((_, typed)) = self.menu.renaming.as_mut() {
                     *typed = text;
@@ -442,11 +790,89 @@ impl DesktopApp {
         });
     }
 
+    /// Close the row menu and the attach chooser if they are open (a dialog
+    /// takes over, another menu replaces it). A show still pending is
+    /// cancelled: it carries the epoch this replaces.
     pub(super) fn close_menu(&mut self) {
-        if self.menu.open.take().is_some() {
-            crate::shortcuts::set_popover(crate::shortcuts::Popover::None);
+        self.menu.epoch = crate::flyout::next_epoch();
+        if std::mem::take(&mut self.menu.shown) {
+            crate::flyout::hide(crate::flyout::MENU_ANCHOR);
         }
-        self.menu.highlight = None;
+        if self.menu.attach.take().is_some() {
+            crate::flyout::hide(crate::flyout::ATTACH_ANCHOR);
+        }
+    }
+
+    /// Open the attach chooser for `agent` under its sidebar row (where its
+    /// menu opened when the row is not in view, else at the pointer).
+    fn open_attach(&mut self, agent: UiAgent, context: &ComponentContext<Self>) {
+        let choices = self.attach_choices();
+        if choices.is_empty() {
+            self.alert("No registered project to attach this chat to.");
+            return;
+        }
+        let row = format!("{}agent:{}", crate::motion::ROW_ID_PREFIX, agent.id);
+        let (x, y) = crate::motion::element_bottom_left(&row)
+            .or_else(|| {
+                self.menu
+                    .open
+                    .as_ref()
+                    .filter(|open| matches!(&open.target, Target::Agent(row) if row.id == agent.id))
+                    .map(|open| (open.x, open.y))
+            })
+            .unwrap_or_else(crate::shortcuts::pointer_position);
+        let epoch = crate::flyout::next_epoch();
+        self.menu.attach = Some(AttachChooser {
+            agent,
+            choices,
+            x,
+            y,
+            epoch,
+            show_after: self.renders.get(),
+        });
+        self.post_menu_show(epoch, MENU_SHOW_TRIES, 0, context);
+    }
+
+    /// Show the attach chooser of `epoch` once the render that attached its
+    /// flyout committed; out of tries, it closes and says why in the log.
+    fn show_attach(&mut self, epoch: u64, tries: u8, context: &ComponentContext<Self>) {
+        let Some(chooser) = &self.menu.attach else {
+            return;
+        };
+        let left = tries.saturating_sub(1);
+        let shown = if self.renders.get() <= chooser.show_after {
+            Err("its render has not committed".to_owned())
+        } else {
+            crate::flyout::show(crate::flyout::ATTACH_ANCHOR, epoch)
+        };
+        match shown {
+            Ok(()) => {}
+            Err(_) if left > 0 => self.post_menu_show(epoch, left, MENU_SHOW_RETRY_MS, context),
+            Err(error) => {
+                crate::startup::note(&format!("attach chooser not shown: {error}"));
+                self.menu.attach = None;
+            }
+        }
+    }
+
+    /// After `delay_ms`, try to show the row menu of `epoch`.
+    fn post_menu_show(
+        &self,
+        epoch: u64,
+        tries: u8,
+        delay_ms: u64,
+        context: &ComponentContext<Self>,
+    ) {
+        if tries == 0 {
+            return;
+        }
+        let _task = context.spawn_background(move |cancel| {
+            let cancelled = || cancel.is_cancelled();
+            if delay_ms > 0 {
+                let _ = feed::backoff(delay_ms, &cancelled);
+            }
+            Message::Menu(MenuMsg::Show(epoch, tries))
+        });
     }
 
     pub(super) fn menu_action(
@@ -468,7 +894,7 @@ impl DesktopApp {
                     self.open_folder(folder);
                 }
             }
-            (Action::ToggleCollapse, Target::Project { key, .. }) => {
+            (Action::Expand | Action::Collapse, Target::Project { key, .. }) => {
                 self.shell_update(ShellMsg::ProjectToggled(key.clone()), context);
             }
             (Action::Rename, _) => {
@@ -478,6 +904,7 @@ impl DesktopApp {
                     .unwrap_or(target.title())
                     .to_owned();
                 self.menu.renaming = Some((target, current));
+                self.menu.rename_enter = crate::shortcuts::enter_presses();
                 self.focus_rename(5, context);
             }
             (Action::Delete, Target::Agent(agent)) if !agent.native_child && agent.deletable() => {
@@ -530,29 +957,14 @@ impl DesktopApp {
             (Action::Stop, Target::Agent(agent)) => {
                 self.stop_agent(&agent.id, agent.generation, context);
             }
-            (Action::Archive(archived), Target::Agent(agent)) => {
-                self.submit_archive(agent.clone(), archived, false, context);
+            (Action::Archive | Action::Unarchive, Target::Agent(agent)) => {
+                self.submit_archive(agent.clone(), action == Action::Archive, false, context);
             }
             (Action::MoveUnder, Target::Agent(agent)) => {
                 self.move_update(super::move_ui::MoveMsg::Open(agent.clone()), context);
             }
-            (Action::AttachTo(index), Target::Agent(agent)) => {
-                let chosen = self
-                    .menu
-                    .attach
-                    .take()
-                    .and_then(|choices| choices.into_iter().nth(index));
-                if let Some((project, name)) = chosen {
-                    self.submit_organize(
-                        format!("Attach to {name}"),
-                        client::Organize::Attach {
-                            agent: agent.id.clone(),
-                            project,
-                            revision: agent.organization_revision.unwrap_or(0),
-                        },
-                        context,
-                    );
-                }
+            (Action::AttachMenu, Target::Agent(agent)) => {
+                self.open_attach(agent.clone(), context);
             }
             (Action::Detach, Target::Agent(agent)) => {
                 self.submit_organize(
@@ -569,6 +981,7 @@ impl DesktopApp {
                 // unchanged.
                 self.menu.tag_fields = agent.tags.clone();
                 self.menu.renaming = Some((Target::Tags(agent.clone()), String::new()));
+                self.menu.rename_enter = crate::shortcuts::enter_presses();
                 self.focus_rename(5, context);
             }
             (Action::Resume, Target::Agent(agent)) => {
@@ -680,9 +1093,9 @@ impl DesktopApp {
         });
     }
 
-    /// The registered projects a chat can be attached to, as the sidebar
-    /// names them, in the daemon's order.
-    fn attach_choices(&self) -> Vec<(String, String)> {
+    /// The registered projects a chat can be attached to, in the daemon's
+    /// order: each by its id and checkout, with the name the sidebar shows.
+    fn attach_choices(&self) -> Vec<AttachChoice> {
         let checkouts = self.checkouts();
         self.nav
             .organization
@@ -694,7 +1107,11 @@ impl DesktopApp {
                     .prefs
                     .display_name(&format!("project:{}", nav::group_key(Some(&project))))
                     .map_or_else(|| nav::place_label(&checkout, &checkouts), str::to_owned);
-                Some((project, name))
+                Some(AttachChoice {
+                    project,
+                    checkout,
+                    name,
+                })
             })
             .collect()
     }
@@ -708,29 +1125,10 @@ impl DesktopApp {
         });
     }
 
-    /// After the next render, bring the highlighted menu row into view.
-    fn reveal_highlight(&mut self, context: &ComponentContext<Self>) {
-        self.menu.reveal_epoch += 1;
-        self.menu.reveal_after = self.renders.get();
-        self.post_reveal_highlight(self.menu.reveal_epoch, 0, context);
-    }
-
-    fn post_reveal_highlight(&self, epoch: u64, delay_ms: u64, context: &ComponentContext<Self>) {
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            if delay_ms > 0 {
-                let _ = feed::backoff(delay_ms, &cancelled);
-            }
-            Message::Menu(MenuMsg::Reveal(epoch))
-        });
-    }
-
-    /// The menu's entries for a target, in order: (action, label, glyph,
-    /// destructive).
-    pub(super) fn menu_entries(
-        &self,
-        target: &Target,
-    ) -> Vec<(Action, String, &'static str, bool)> {
+    /// The menu's entries for a target, in order: the destructive one last.
+    /// Every item is an [`Action`] with its fixed label (unique at compile
+    /// time); the tags item only shows the current tags.
+    pub(super) fn menu_entries(&self, target: &Target) -> Vec<Entry> {
         match target {
             Target::Project {
                 collapsed,
@@ -738,161 +1136,58 @@ impl DesktopApp {
                 checkout,
                 ..
             } => {
-                let mut entries = vec![
-                    (
-                        Action::OpenFolder,
-                        "Open folder".to_owned(),
-                        m3::glyph::OPEN_FOLDER,
-                        false,
-                    ),
-                    (
-                        Action::Rename,
-                        "Rename".to_owned(),
-                        m3::glyph::RENAME,
-                        false,
-                    ),
-                    (
-                        Action::ToggleCollapse,
-                        if *collapsed { "Expand" } else { "Collapse" }.to_owned(),
-                        if *collapsed {
-                            m3::glyph::CHEVRON_DOWN
-                        } else {
-                            m3::glyph::CHEVRON_RIGHT
-                        },
-                        false,
-                    ),
-                    (
-                        Action::ArchiveFinished,
-                        "Archive finished tasks…".to_owned(),
-                        m3::glyph::ARCHIVE,
-                        false,
-                    ),
-                    (
-                        Action::DeleteStopped,
-                        "Delete stopped tasks…".to_owned(),
-                        m3::glyph::DELETE,
-                        true,
-                    ),
-                ];
+                let mut entries = Vec::new();
                 if self.can_launch_here(checkout) {
-                    entries.insert(
-                        0,
-                        (
-                            Action::NewTaskHere,
-                            "New task here".to_owned(),
-                            m3::glyph::NEW_TASK,
-                            false,
-                        ),
-                    );
+                    entries.push(Entry::item(Action::NewTaskHere));
                 }
+                entries.extend([
+                    Entry::item(Action::OpenFolder),
+                    Entry::item(Action::Rename),
+                    Entry::item(if *collapsed {
+                        Action::Expand
+                    } else {
+                        Action::Collapse
+                    }),
+                    Entry::item(Action::ArchiveFinished),
+                    Entry::item(Action::DeleteStopped),
+                ]);
                 // Only a registered checkout can be forgotten.
                 if !self.registrations_in(checkouts).is_empty() {
-                    entries.push((
-                        Action::RemoveProject,
-                        "Remove from Swarm…".to_owned(),
-                        m3::glyph::DELETE,
-                        true,
-                    ));
+                    entries.push(Entry::item(Action::RemoveProject));
                 }
                 entries
             }
             Target::Tags(_) => Vec::new(),
             Target::Agent(agent) => {
-                if self.menu.more && self.menu.open.is_some() {
-                    return std::iter::once((
-                        Action::More,
-                        "Back".to_owned(),
-                        m3::glyph::BACK,
-                        false,
-                    ))
-                    .chain(self.developer_entries(target))
-                    .collect();
-                }
-                if let Some(choices) = self
-                    .menu
-                    .attach
-                    .as_ref()
-                    .filter(|_| self.menu.open.is_some())
-                {
-                    return std::iter::once((
-                        Action::AttachMenu,
-                        "Back".to_owned(),
-                        m3::glyph::BACK,
-                        false,
-                    ))
-                    .chain(choices.iter().enumerate().map(|(index, (_, name))| {
-                        (
-                            Action::AttachTo(index),
-                            name.clone(),
-                            m3::glyph::FOLDER,
-                            false,
-                        )
-                    }))
-                    .collect();
-                }
-                let mut entries = vec![(
-                    Action::Rename,
-                    "Rename".to_owned(),
-                    m3::glyph::RENAME,
-                    false,
-                )];
+                let mut entries = vec![Entry::item(Action::Rename)];
                 if !agent.native_child {
-                    entries.push((
-                        Action::MoveUnder,
-                        "Move under another task…".to_owned(),
-                        m3::glyph::MOVE,
-                        false,
-                    ));
+                    entries.push(Entry::item(Action::MoveUnder));
                 }
                 // Placement and tags (`chat.attach`/`chat.detach`/`chat.tag`):
-                // attach and detach place chats; tags group any task.
+                // attach and detach place chats; tags group any task. The
+                // projects are rows of the attach chooser, never items here.
                 if agent.chat
                     && !agent.pending
                     && self.nav.organization.registered().next().is_some()
                 {
-                    entries.push((
-                        Action::AttachMenu,
-                        "Attach to project…".to_owned(),
-                        m3::glyph::FOLDER,
-                        false,
-                    ));
+                    entries.push(Entry::item(Action::AttachMenu));
                 }
                 if agent.chat && agent.organization.is_some() {
-                    entries.push((
-                        Action::Detach,
-                        "Detach from project".to_owned(),
-                        m3::glyph::FOLDER,
-                        false,
-                    ));
+                    entries.push(Entry::item(Action::Detach));
                 }
                 if !agent.native_child && !agent.pending {
-                    entries.push((
-                        Action::EditTags,
-                        if agent.tags.is_empty() {
-                            "Tags…".to_owned()
-                        } else {
-                            format!("Tags: {}…", agent.tags.join(", "))
-                        },
-                        m3::glyph::TAG,
-                        false,
-                    ));
+                    entries.push(Entry::Item {
+                        action: Action::EditTags,
+                        display: (!agent.tags.is_empty())
+                            .then(|| format!("Tags: {}…", agent.tags.join(", "))),
+                    });
                 }
                 if !agent.native_child {
-                    entries.push(if agent.archived {
-                        (
-                            Action::Archive(false),
-                            "Unarchive".to_owned(),
-                            m3::glyph::ARCHIVE,
-                            false,
-                        )
+                    entries.push(Entry::item(if agent.archived {
+                        Action::Unarchive
                     } else {
-                        (
-                            Action::Archive(true),
-                            "Archive".to_owned(),
-                            m3::glyph::ARCHIVE,
-                            false,
-                        )
-                    });
+                        Action::Archive
+                    }));
                 }
                 // A lost task cannot be deleted (the Store keeps it):
                 // resume it, or archive it to hide it.
@@ -903,58 +1198,35 @@ impl DesktopApp {
                         | eliot_core::AgentState::Failed
                 ) && !agent.native_child
                 {
-                    entries.push((
-                        Action::Resume,
-                        "Resume".to_owned(),
-                        m3::glyph::RESUME,
-                        false,
-                    ));
+                    entries.push(Entry::item(Action::Resume));
                 }
                 if agent.live() && !agent.native_child {
-                    entries.push((Action::Stop, "Stop".to_owned(), m3::glyph::STOP, false));
+                    entries.push(Entry::item(Action::Stop));
                 }
-                entries.push((
-                    Action::More,
-                    "More".to_owned(),
-                    m3::glyph::CHEVRON_RIGHT,
-                    false,
-                ));
+                entries.push(Entry::Submenu {
+                    action: Action::More,
+                    items: self.developer_entries(target),
+                });
                 // The destructive action ends the menu.
                 if !agent.native_child && agent.deletable() {
-                    entries.push((
-                        Action::Delete,
-                        "Delete…".to_owned(),
-                        m3::glyph::DELETE,
-                        true,
-                    ));
+                    entries.push(Entry::item(Action::Delete));
                 }
                 entries
             }
         }
     }
 
-    pub(super) fn developer_entries(
-        &self,
-        target: &Target,
-    ) -> Vec<(Action, String, &'static str, bool)> {
+    /// The developer commands of a task (its menu's More): Copy Agent ID
+    /// and Open folder.
+    pub(super) fn developer_entries(&self, target: &Target) -> Vec<Entry> {
         let Target::Agent(agent) = target else {
             return Vec::new();
         };
-        let mut entries = vec![(
-            Action::CopyId,
-            "Copy Agent ID".to_owned(),
-            m3::glyph::COPY,
-            false,
-        )];
+        let mut entries = vec![Entry::item(Action::CopyId)];
         // No-project chats have only a private daemon workspace. Other
         // tasks need a real workspace or an absolute legacy project path.
         if agent_folder(agent).is_some() {
-            entries.push((
-                Action::OpenFolder,
-                "Open folder".to_owned(),
-                m3::glyph::OPEN_FOLDER,
-                false,
-            ));
+            entries.push(Entry::item(Action::OpenFolder));
         }
         entries
     }
@@ -973,78 +1245,78 @@ impl DesktopApp {
             .content(View::empty())
     }
 
-    /// The window-wide layer: the open menu at the pointer (a press outside
-    /// closes it) or the confirmation dialog over a scrim.
-    pub(super) fn menu_overlay(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        let Some((target, x, y)) = &self.menu.open else {
-            return View::empty();
+    /// The window's row-menu button. It is never shown (no size, not
+    /// enabled, so never a tab stop): it carries the row menu last asked
+    /// for as its `MenuFlyout` (`crate::flyout` opens it at a point) and,
+    /// like the menu, is named "Actions for {title}". The items and the
+    /// capture-free callback compare equal from one render to the next, so
+    /// Reactor keeps the native menu while it is open (a replaced menu
+    /// drops the click on the open one).
+    pub(super) fn menu_anchor(&self, context: &mut ViewContext<Self>) -> View {
+        let items = self
+            .menu
+            .open
+            .as_ref()
+            .map(|open| menu_items(&open.entries))
+            .unwrap_or_default();
+        let name = self.menu.open.as_ref().map_or_else(
+            || "Actions".to_owned(),
+            |open| format!("Actions for {}", open.target.title()),
+        );
+        Button::new()
+            .automation_id(crate::flyout::MENU_ANCHOR)
+            .automation_name(name)
+            .is_enabled(false)
+            .width(0.0)
+            .height(0.0)
+            .min_width(0.0)
+            .min_height(0.0)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .vertical_alignment(VerticalAlignment::Top)
+            .menu(Menu::new(
+                items,
+                context.callback(|label: String| {
+                    Action::from_label(&label).map_or(Message::Menu(MenuMsg::Ignored), |action| {
+                        Message::Menu(MenuMsg::Picked(action))
+                    })
+                }),
+            ))
+    }
+
+    /// The window's attach-chooser button: no size, at the point under the
+    /// row where the chooser opens. While the chooser is open it carries it
+    /// as its `Flyout` (`crate::flyout` opens it at the button), one row
+    /// per registered project keyed by the project's id and checkout; the
+    /// name is only shown ([`AttachRows`]). Enabled only then (a flyout
+    /// opened at a disabled target would disable its content); it is out of
+    /// the tab order otherwise.
+    pub(super) fn attach_anchor(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let button = Button::new()
+            .automation_id(crate::flyout::ATTACH_ANCHOR)
+            .width(0.0)
+            .height(0.0)
+            .min_width(0.0)
+            .min_height(0.0)
+            .horizontal_alignment(HorizontalAlignment::Left)
+            .vertical_alignment(VerticalAlignment::Top);
+        let Some(chooser) = &self.menu.attach else {
+            return button.is_enabled(false).into();
         };
-        let width = self.window_width.unwrap_or(tokens::layout::WINDOW_WIDTH);
-        let height = self.window_height.unwrap_or(tokens::layout::WINDOW_HEIGHT);
-        let margin = tokens::spacing::SM;
-        // A narrow client caps the outer menu (its padding included)
-        // instead of running past the client edge (#683).
-        let menu_width = menu_width(width);
-        let left = x.min(width - menu_width - margin).max(0.0);
-        let entries = self.menu_entries(target);
-        let (top, max_height) = menu_placement(*y, entries.len(), height);
-        let highlight = self.menu.highlight;
-        let rows: Vec<KeyedView> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(index, (action, label, glyph, destructive))| {
-                let selected = highlight == Some(index);
-                let entry = if destructive {
-                    m3::destructive_row(palette, selected)
-                } else {
-                    m3::row(palette, selected)
-                };
-                let mut button = entry
-                    .automation_name(label.clone())
-                    .on_click(context.message(Message::Menu(MenuMsg::Chosen(action))));
-                if highlight == Some(index) {
-                    // Bound when it renders; focusing it scrolls it into
-                    // view (#683).
-                    button = button.element_ref(&self.menu.row_ref);
-                }
-                let title = m3::body(label.clone());
-                KeyedView::new(
-                    label,
-                    button.content(
-                        StackPanel::new()
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::ROW)
-                            .children((m3::icon(glyph), title)),
-                    ),
-                )
-            })
-            .collect();
-        Grid::new().children((
-            Border::new()
-                .background(Brush::Solid(Color::transparent()))
-                .on_pointer_pressed(
-                    context.callback(|_: PointerEventInfo| Message::Menu(MenuMsg::Closed)),
-                ),
-            m3::lifted(
-                palette,
-                crate::theme::elevation::Level::Two,
-                tokens::radius::CONTAINER,
-                Grid::new()
-                    .width(menu_width)
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .vertical_alignment(VerticalAlignment::Top)
-                    .margin(Thickness::new(left, top, 0.0, 0.0)),
-                m3::popover(palette)
-                    .automation_name(format!("Actions for {}", target.title()))
-                    .content(
-                        ScrollViewer::new()
-                            .max_height(max_height)
-                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .automation_name(format!("Actions for {}", target.title()))
-                            .content(StackPanel::new().keyed_children(rows)),
-                    ),
-            ),
-        ))
+        // A component: its rows render again only when the projects, the
+        // chat's placement or the palette change, not on every window render.
+        let content = View::component::<AttachRows>(AttachRowsInput {
+            palette,
+            title: self.agent_label(&chooser.agent),
+            current: chooser.agent.organization.clone(),
+            choices: chooser.choices.clone(),
+            send: context.forward(),
+        });
+        button
+            .margin(Thickness::new(chooser.x, chooser.y, 0.0, 0.0))
+            .flyout_with(
+                Flyout::rich(Border::new().content(content))
+                    .placement(FlyoutPlacement::BottomEdgeAlignedLeft),
+            )
     }
 
     fn confirm_dialog(
@@ -1159,6 +1431,87 @@ impl DesktopApp {
     }
 }
 
+/// What the attach chooser shows: its rows render again only when this
+/// changes.
+#[derive(Clone, PartialEq)]
+pub(super) struct AttachRowsInput {
+    palette: Palette,
+    /// The chat's name.
+    title: String,
+    /// The project the chat is placed in now.
+    current: Option<String>,
+    choices: Vec<AttachChoice>,
+    send: Callback<Message>,
+}
+
+/// The attach chooser's content: a caption and one row per registered
+/// project, keyed and chosen by the project's id and checkout.
+pub(super) struct AttachRows {
+    send: Callback<Message>,
+}
+
+impl Component for AttachRows {
+    type Input = AttachRowsInput;
+    type Message = Message;
+
+    fn create(input: &AttachRowsInput, _context: &ComponentContext<Self>) -> Self {
+        Self {
+            send: input.send.clone(),
+        }
+    }
+
+    fn input_changed(&mut self, input: &AttachRowsInput, _context: &ComponentContext<Self>) {
+        self.send = input.send.clone();
+    }
+
+    fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
+        let _ = self.send.call(message);
+    }
+
+    fn view(&self, input: &AttachRowsInput, context: &mut ViewContext<Self>) -> View {
+        let palette = input.palette;
+        let rows: Vec<KeyedView> = input
+            .choices
+            .iter()
+            .map(|choice| {
+                let path = nav::display_path(&choice.checkout);
+                let current = input.current.as_deref() == Some(choice.project.as_str());
+                KeyedView::new(
+                    format!("{}\u{1f}{}", choice.project, choice.checkout),
+                    m3::row(palette, false)
+                        .automation_name(format!("{}, {path}", choice.name))
+                        .on_click(context.message(Message::Menu(MenuMsg::AttachPicked(
+                            choice.project.clone(),
+                            choice.checkout.clone(),
+                        ))))
+                        .content(m3::row_content(
+                            Some(m3::glyph::FOLDER),
+                            &choice.name,
+                            &path,
+                            if current {
+                                m3::icon(m3::glyph::CHECK)
+                            } else {
+                                View::empty()
+                            },
+                        )),
+                )
+            })
+            .collect();
+        StackPanel::new()
+            .width(tokens::layout::MENU_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .automation_name(format!("Attach {} to a project", input.title))
+            .children((
+                m3::secondary("Attach to project")
+                    .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
+                ScrollViewer::new()
+                    .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(StackPanel::new().keyed_children(rows)),
+            ))
+    }
+}
+
 impl DesktopApp {
     /// The menu's Open folder: a folder that is gone says so above the
     /// composer (the menu has closed).
@@ -1185,43 +1538,4 @@ fn agent_folder(agent: &UiAgent) -> Option<&str> {
                 .is_absolute()
                 .then_some(project)
         })
-}
-
-/// A menu row's height: a default button row.
-const MENU_ROW_HEIGHT: f64 = tokens::height::CONTROL;
-/// The popover's vertical insets around the rows.
-const MENU_VERTICAL_PADDING: f64 = 2.0 * tokens::spacing::XS;
-
-/// The menu's width in window DIPs: the fixed width, capped
-/// to a narrow client (the same margin both sides) so the outer menu,
-/// its padding included, never runs past the client edge (#683). It
-/// never collapses below one row's height.
-fn menu_width(client_width: f64) -> f64 {
-    tokens::layout::CONTEXT_MENU_WIDTH
-        .min((client_width - 2.0 * tokens::spacing::SM).max(MENU_ROW_HEIGHT))
-}
-
-/// The menu's top edge in window DIPs and its visible height cap: the
-/// pointer, moved up when the menu would run past the client bottom. An
-/// oversized menu keeps the top margin and scrolls instead of placing
-/// actions out of reach (#683).
-fn menu_placement(y: f64, rows: usize, height: f64) -> (f64, f64) {
-    let margin = tokens::spacing::SM;
-    let estimated = rows as f64 * MENU_ROW_HEIGHT + MENU_VERTICAL_PADDING;
-    let top = y.min(height - estimated - margin).max(margin);
-    let max_height = (height - top - margin).max(MENU_ROW_HEIGHT + MENU_VERTICAL_PADDING);
-    (top, max_height)
-}
-
-/// The keyboard highlight after moving `step` rows from `current`
-/// (wrapping around both ends).
-fn highlight_step(current: Option<usize>, step: i32, count: usize) -> Option<usize> {
-    if count == 0 {
-        return None;
-    }
-    match current {
-        None if step >= 0 => Some(0),
-        None => Some(count - 1),
-        Some(at) => Some((at as i32 + step).rem_euclid(count as i32) as usize),
-    }
 }

@@ -1,16 +1,13 @@
 //! The window's keyboard: the chords Ctrl+N (new task), Ctrl+K (search
 //! tasks), Ctrl+M (model picker) and Ctrl+, (Settings); the keys of an open
-//! popover (↑/↓/←/→, Enter, Esc, Ctrl+F); how the last input arrived,
+//! popover flyout (↑/↓/←/→, Enter, Esc, Ctrl+F), which move its highlight
+//! while its search field keeps the keyboard; how the last input arrived,
 //! which tells a search suggestion reached with the arrows from one chosen
 //! with Enter or a click; and whether the last key was Enter without Shift,
 //! which turns the line break it typed into the composer into Send
 //! (Reactor 0.100.0 has no key events on `TextBox`; Shift+Enter keeps the
-//! line break); and a press on the composer's message field while a
-//! popover is open, which closes it (WinUI's `TextBox` handles its own
-//! pointer presses and Reactor 0.100.0 has no focus events, so only the
-//! field's `PointerEntered`/`PointerExited` reach the window: they tell
-//! this hook where the pointer is, and the press itself goes on to the
-//! field).
+//! line break). The same channel carries `crate::flyout`'s closed flyouts
+//! to the window.
 //!
 //! Reactor 0.100.0 has no key events, and its `KeyAccelerator` keys are R,
 //! Enter and the number pad only; WinUI's own `KeyboardAccelerator` needs
@@ -83,11 +80,9 @@ pub enum Shortcut {
     /// A key while a popover is open (taken from the focused control).
     Popover(PopoverKey),
     /// Enter outside a popover, passed on to the focused control; carries
-    /// the input epoch at the press (see [`last_input`]).
-    Enter(u64),
-    /// A pointer press on the composer's message field while a popover is
-    /// open; the press itself goes on to the field.
-    ComposerPressed,
+    /// the input epoch at the press (see [`last_input`]) and the press's
+    /// number (see [`enter_presses`]).
+    Enter(u64, u64),
     /// Keyboard focus moved (`crate::motion::resolve_focused_row` says
     /// whether a sidebar row holds it).
     FocusMoved,
@@ -97,16 +92,22 @@ pub enum Shortcut {
     /// The window became the foreground window while keyboard focus was
     /// held (`crate::window_place::held_focus_ready`).
     Foreground,
+    /// A flyout `crate::flyout` showed closed (the epoch it was shown with).
+    FlyoutClosed(u64),
+    /// A panic was stopped at a native boundary for the first time this
+    /// session (`crate::startup::caught_panic`): the window says so.
+    Panicked,
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a
-/// menu (no ←/→ or Ctrl+F), or a panel of focusable controls (Manage
-/// models), whose Tab stays native so it reaches the panel's switches.
+/// list (no ←/→ or Ctrl+F: access, project, usage), a panel of focusable
+/// controls (Manage models), whose Tab stays native so it reaches the
+/// panel's switches, or a dialog (Esc only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popover {
     None = 0,
     Picker = 1,
-    Menu = 2,
+    List = 2,
     Panel = 3,
     Dialog = 4,
 }
@@ -126,10 +127,6 @@ pub enum Input {
 
 static CHORDS: OnceLock<Mutex<Sender<Shortcut>>> = OnceLock::new();
 static POPOVER: AtomicU8 = AtomicU8::new(Popover::None as u8);
-/// The pointer is over the composer's message field (its `PointerEntered`
-/// since the last `PointerExited`). Cleared whenever a popover opens or
-/// closes, so a field rebuilt under a still pointer never reads as hovered.
-static COMPOSER_OVER: AtomicU8 = AtomicU8::new(0);
 /// A sidebar row holds keyboard focus (Shift+F10 and the context-menu key
 /// open its menu; elsewhere they go on to the focused control).
 static ROW_FOCUSED: AtomicU8 = AtomicU8::new(0);
@@ -138,6 +135,8 @@ static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// Counts inputs that end a keyboard walk through suggestions: any key
 /// other than ↑/↓/Enter, and every pointer press.
 static INPUT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Counts Enter presses (first press, not auto-repeat) outside a popover.
+static ENTER_PRESSES: AtomicU64 = AtomicU64::new(0);
 /// The last key press was Enter without Shift (cleared by any other key and
 /// when [`take_plain_enter`] consumes it), and when it was pressed.
 static PLAIN_ENTER: AtomicU8 = AtomicU8::new(0);
@@ -167,19 +166,23 @@ pub fn take_plain_enter() -> bool {
 /// Tell the hook which popover is open (its keys are taken while it is).
 pub fn set_popover(popover: Popover) {
     POPOVER.store(popover as u8, Ordering::SeqCst);
-    COMPOSER_OVER.store(0, Ordering::SeqCst);
 }
 
-/// Tell the hook whether the pointer is over the composer's message field
-/// (the field's `PointerEntered` / `PointerExited`).
-pub fn set_composer_over(over: bool) {
-    COMPOSER_OVER.store(u8::from(over), Ordering::SeqCst);
+/// A flyout `crate::flyout` showed with `epoch` closed.
+pub fn flyout_closed(epoch: u64) {
+    send(Shortcut::FlyoutClosed(epoch));
 }
 
-/// Whether a pointer press is one on the composer's field while a popover
-/// is open.
-fn composer_press(popover: u8, over: u8) -> bool {
-    popover != Popover::None as u8 && over == 1
+/// Tell the window that a panic was stopped at a native boundary.
+pub fn panicked() {
+    send(Shortcut::Panicked);
+}
+
+/// The Enter presses counted so far. The hook counts a press as the key
+/// goes down, before WinUI hands it to a control, so a press that chose a
+/// menu item is counted before the item's click reaches the window.
+pub fn enter_presses() -> u64 {
+    ENTER_PRESSES.load(Ordering::SeqCst)
 }
 
 /// How the last input arrived, how long ago (ms) and the input epoch.
@@ -357,8 +360,29 @@ fn send(found: Shortcut) {
 
 /// `KeyboardProc`: `wparam` is the virtual key; `lparam` bit 29 is Alt
 /// held, bit 30 the previous key state (auto-repeat) and bit 31 the
-/// transition (0 when pressed).
+/// transition (0 when pressed). A panic stops here (unwinding out of an
+/// `extern "system"` function aborts) and the key passes on.
 unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(|| keyboard_takes(code, wparam, lparam)) {
+        // Taken: neither the press nor the release reaches a control.
+        Ok(true) => 1,
+        Ok(false) => next_hook(code, wparam, lparam),
+        Err(panic) => {
+            crate::startup::caught_panic("the keyboard hook", &*panic);
+            next_hook(code, wparam, lparam)
+        }
+    }
+}
+
+/// Pass a hook message on unchanged (the hook handle is ignored).
+fn next_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: passes the message on unchanged.
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// The keyboard hook's work: whether it takes the key. It reads and
+/// writes this module's atomics and enqueues shortcuts, nothing else.
+fn keyboard_takes(code: i32, wparam: WPARAM, lparam: LPARAM) -> bool {
     if code == HC_ACTION as i32 {
         let flags = lparam as u32;
         // SAFETY: GetKeyState reads this thread's keyboard state.
@@ -374,7 +398,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             }
             // Taken, press and release: F10 would otherwise enter the
             // window's menu mode on its release.
-            return 1;
+            return true;
         }
         let popover = POPOVER.load(Ordering::SeqCst);
         let taken = popover_key(popover, key, ctrl, shift, alt)
@@ -390,8 +414,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             // system-menu mode, which takes the next keys and clicks
             // (observed live). No control acts on Alt+arrow.
             if !matches!(found, Shortcut::Back | Shortcut::Forward) {
-                // Taken: neither the press nor the release reaches a control.
-                return 1;
+                return true;
             }
         }
         if pressed && !matches!(key, VK_CONTROL | VK_SHIFT) {
@@ -405,21 +428,29 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 VK_RETURN => {
                     note_input(Input::Enter);
                     if first {
-                        send(Shortcut::Enter(INPUT_EPOCH.load(Ordering::SeqCst)));
+                        let press = ENTER_PRESSES.fetch_add(1, Ordering::SeqCst) + 1;
+                        send(Shortcut::Enter(INPUT_EPOCH.load(Ordering::SeqCst), press));
                     }
                 }
                 _ => note_input(Input::Key),
             }
         }
     }
-    // SAFETY: passes the message on unchanged (the hook handle is ignored).
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    false
 }
 
 /// `LowLevelMouseProc`: `wparam` is the mouse message, `lparam` points at
 /// its `MSLLHOOKSTRUCT`. Steps only while this process's window is in
-/// front and under the pointer; never takes the event.
+/// front and under the pointer; never takes the event. A panic stops here.
 unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Err(panic) = std::panic::catch_unwind(|| side_button(code, wparam, lparam)) {
+        crate::startup::caught_panic("the mouse button hook", &*panic);
+    }
+    next_hook(code, wparam, lparam)
+}
+
+/// The mouse hook's work: enqueue Back or Forward, nothing else.
+fn side_button(code: i32, wparam: WPARAM, lparam: LPARAM) {
     if code == HC_ACTION as i32 && lparam != 0 {
         // SAFETY: for HC_ACTION the system passes a valid MSLLHOOKSTRUCT.
         let event = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -439,13 +470,20 @@ unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM
             }
         }
     }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 /// `GetMsgProc`: `lparam` points at the retrieved `MSG`; `wparam` is
-/// `PM_REMOVE` when it leaves the queue (counted once, not per peek).
+/// `PM_REMOVE` when it leaves the queue (counted once, not per peek). A
+/// panic stops here.
 unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Err(panic) = std::panic::catch_unwind(|| message_seen(code, wparam, lparam)) {
+        crate::startup::caught_panic("the message hook", &*panic);
+    }
+    next_hook(code, wparam, lparam)
+}
+
+/// The message hook's work: note a pointer press in this module's atomics.
+fn message_seen(code: i32, wparam: WPARAM, lparam: LPARAM) {
     if code == HC_ACTION as i32 && wparam == PM_REMOVE as WPARAM && lparam != 0 {
         // SAFETY: for HC_ACTION the system passes a valid MSG pointer.
         let message = unsafe { (*(lparam as *const MSG)).message };
@@ -454,14 +492,6 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_NCLBUTTONDOWN | WM_POINTERDOWN
         ) {
             note_input(Input::Pointer);
-            if composer_press(
-                POPOVER.load(Ordering::SeqCst),
-                COMPOSER_OVER.load(Ordering::SeqCst),
-            ) {
-                send(Shortcut::ComposerPressed);
-            }
         }
     }
-    // SAFETY: passes the message on unchanged.
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
