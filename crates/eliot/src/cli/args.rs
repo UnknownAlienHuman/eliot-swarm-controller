@@ -1376,7 +1376,7 @@ pub(crate) enum CmdCommand {
     Children(CmdChildrenArgs),
     /// Resolve an unknown command to its owner-asserted terminal state.
     Resolve(CmdResolveArgs),
-    /// Preview or settle unknown stops whose owned process exit is proven.
+    /// Preview or settle historical stops, linked Owner interrupt fallbacks and exact native reply receipts.
     SettleStopped(CmdSettleStoppedArgs),
     /// Withdraw one undispatched handoff input with no native effect.
     Cancel(CmdShowArgs),

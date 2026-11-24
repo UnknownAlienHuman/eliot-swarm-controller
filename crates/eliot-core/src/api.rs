@@ -214,9 +214,9 @@ pub use reads::{
     RuleStateView, TurnGetRequest,
 };
 pub use resolutions::{
-    CommandResolution, CommandResolveRequest, CommandResolveResponse, SettleStoppedRequest,
-    SettleStoppedResponse, StoppedCommandSettlement, TurnResolveRequest, TurnResolveResponse,
-    TurnResolveStatus,
+    CommandResolution, CommandResolveRequest, CommandResolveResponse, InterruptFallbackSettlement,
+    RequestReplySettlement, SettleStoppedRequest, SettleStoppedResponse, StoppedCommandSettlement,
+    TurnResolveRequest, TurnResolveResponse, TurnResolveStatus,
 };
 pub use rule_edit::{
     MAX_RULE_FILE_BYTES, MAX_RULE_PATH_BYTES, RULE_REVISION_HEX_LEN, RuleDeleteRequest,

@@ -1333,13 +1333,17 @@ impl Router {
                 }
             }
             Err(error) => {
-                if let Some(summary) = self
-                    .terminal_stop_noop_summary(id, agent, &dispatched)
+                // Actor loss may already have moved this exact stop to Unknown.
+                // Recheck the committed facts in the settlement transaction.
+                let summary = json!({
+                    "state": "applied",
+                    "stop_basis": "owned_process_exit",
+                    "native_stop_error_code": error.code,
+                });
+                if self
+                    .settle_stop_with_proof(id, summary)
                     .await
-                    && self
-                        .settle_stop_with_proof(id, summary)
-                        .await
-                        .is_some_and(|command| command.state == CommandState::Applied)
+                    .is_some_and(|command| command.state == CommandState::Applied)
                 {
                     self.retire_assignment_cleanup(&agent.id, agent.generation)
                         .await;

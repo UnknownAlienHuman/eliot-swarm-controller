@@ -255,15 +255,18 @@ proof, in which case the stop outcome records
 keeps the stop `unknown` with the missing fact named. Stop never retries an
 uncertain native call.
 An actor that retires control without proof of exit records the Agent as lost
-and keeps the custody reservation for reconciliation.
+and keeps the custody reservation for reconciliation. A live stop stays
+dispatched through concurrent Agent loss while its worker checks those proofs.
 
-An acknowledged Owner interrupt or a proven Owner stop labels a captured
-turn `interrupted_by_owner` only after its native interrupted terminal is
-committed. The Store retains native status, completion time, text and usage,
-sets `resolution_source=owner`, and emits `turn.resolved` with the control's
-reason. Natural completion and failure keep their original outcomes. A turn
-without terminal evidence stays `unknown` after stop. A SEND dispatched
-before the stop can supply its exact turn binding while that stop is in flight.
+An acknowledged Owner interrupt labels its captured turn `interrupted_by_owner`
+when a native interrupted terminal commits. A proven Owner stop can also
+settle its exact captured running or unknown turn as interrupted when the
+stop dispatched against a live generation. The Store sets
+`resolution_source=owner` and emits `turn.resolved` with `stopped_by_owner`
+for the stop. It preserves any committed native status, text and usage and
+leaves natural completion and failure authoritative. A stop dispatched after
+unsolicited loss leaves that earlier unknown turn for Owner resolution.
+A SEND dispatched before stop can supply the stop's exact turn binding.
 Force stop skips the cooperative interrupt window and uses the same process and
 source proof requirement.
 

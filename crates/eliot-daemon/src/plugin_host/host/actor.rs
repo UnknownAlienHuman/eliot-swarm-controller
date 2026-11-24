@@ -790,11 +790,12 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                     ).await;
                                     (native, graceful, exited)
                                 }
-                                Err(ref error) if error.code == "unknown" => {
+                                Err(ref error) if error.code == "unknown" || client.reader_closed() => {
                                     // The effect is uncertain. Retire owned custody
                                     // without calling the plugin again.
-                                    let exited = child.terminate().is_ok()
-                                        && wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
+                                    let _ = child.terminate();
+                                    let exited =
+                                        wait_stop_child(child, monitoring, agent, deadlines.custody_until).await;
                                     (native, false, exited)
                                 }
                                 Err(error) => {
@@ -819,33 +820,18 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                         }
                         planned_exit = true;
                         let source_error = source_exit.err();
-                        let proof = if exited && source_error.is_none() {
-                            Some(
-                                wait_for_stop_exit_proof(state, agent, deadlines.source_until)
-                                    .await,
-                            )
-                        } else {
-                            None
-                        };
+                        // A failed teardown step is provisional. The observer may
+                        // already have committed exit, and source settlement can
+                        // fail after its proof commits (for example, on child cleanup).
+                        let proof = wait_for_stop_exit_proof(state, agent, deadlines.source_until)
+                            .await;
                         let (native_result, native_stop_error_code) = match native {
                             Ok(native_result) => (native_result, None),
                             Err(error) => (None, Some(error.code)),
                         };
                         let native_session_end_observed = native_result.is_some();
-                        let result = match (exited, source_error, proof) {
-                            (false, _, _) => Err(Error::new(
-                                "unknown",
-                                format!(
-                                    "stop process custody exit is unproven ({})",
-                                    custody_label(guarantee),
-                                ),
-                            )),
-                            (true, Some(error), _) => Err(error),
-                            (true, None, Some(Err(error))) => Err(error),
-                            (true, None, Some(Ok(proof)))
-                                if Instant::now() <= deadlines.source_until =>
-                            {
-                                Ok(json!({
+                        let result = match proof {
+                            Ok(proof) => Ok(json!({
                                     "state": "applied",
                                     "custody": custody_label(guarantee),
                                     "graceful": graceful,
@@ -859,12 +845,16 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                     },
                                     "process_custody_exit_proven": proof.process_custody_exited,
                                     "native_source_drain_proven": proof.native_source_drained,
-                                }))
+                            })),
+                            Err(error) => {
+                                let error = if let Some(source) = source_error {
+                                    let message = format!("{}; {}", error.message, source.message);
+                                    error.with_message(message)
+                                } else {
+                                    error
+                                };
+                                Err(error)
                             }
-                            _ => Err(Error::new(
-                                "unknown",
-                                "stop source settlement exceeded its absolute deadline",
-                            )),
                         };
                         if result.is_err() {
                             // The actor is exiting and control is fenced even if cleanup

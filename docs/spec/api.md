@@ -1931,6 +1931,31 @@ theirs is refused with `not_allowed`. Such unknowns still stop blocking
 drain once no live process, turn or reader backs them: the drain receipt
 lists them as retained-unresolved instead (see the drain section).
 
+The Owner-only `command.settle_stopped` preview/apply page also includes an
+unknown `approve`, `deny` or `answer` command when the Store has a committed
+native `request.resolved` event matching that exact command id, generation,
+request id and turn id. The native receipt sequence is shown in
+`request_replies` and retained in the resolved command outcome. The receipt
+proves the exact request reply. Process closure requires separate evidence.
+The review digest covers the stop candidates, exact reply receipts, candidates
+awaiting stop proof and continuation cursor together. Pages are ordered by
+command id across both candidate kinds, and `--after` advances through that
+combined order. Apply rechecks the whole page in one Store transaction.
+Changed evidence returns `conflict`. Retrying the same write id and review
+returns the stored result. Settlement records the proven outcome without
+replaying the external effect.
+
+A proven stop entry may also carry `interrupt_fallback` for its exact linked
+Owner interrupt. It is eligible only when the retained `interrupt_stop` link
+binds the same Agent, generation and exact turn (including an empty binding),
+the stop requests `force: true`, and the parent interrupt is still unknown.
+Applying the reviewed stop settles that parent in the same Store transaction
+with the existing fallback reason and `fallback_stop_id`. That receipt proves
+the fallback stop completed. Native interrupt delivery and turn outcomes
+require their own evidence. A stop dispatched after loss leaves the prior
+unknown turn for Owner resolution when `command.dispatched` records
+`live_at_dispatch: false`. Older rows retain the legacy turn-link rules.
+
 `command.resolve {id, command_id, as: applied|failed, reason}` requires the target
 command to be stored `unknown`. The one additional Owner assertion is
 `failed -> applied` for an exact handoff brief; ordinary terminal commands,

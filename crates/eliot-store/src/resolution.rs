@@ -28,7 +28,8 @@ use eliot_core::is_start_verb;
 use eliot_core::{
     CommandState, TurnOutcome, TurnState, WorkspacePhase, WorkspacePreparation,
     api::{
-        CommandResolution, CommandResolveRequest, CommandResolveResponse, SettleStoppedRequest,
+        CommandResolution, CommandResolveRequest, CommandResolveResponse,
+        InterruptFallbackSettlement, RequestReplySettlement, SettleStoppedRequest,
         SettleStoppedResponse, StoppedCommandSettlement, TurnResolveRequest, TurnResolveResponse,
         TurnResolveStatus, inference::sha256_hex,
     },
@@ -41,7 +42,7 @@ const RESOLVE_COMMAND_METHOD: &str = "command.resolve";
 const RESOLVE_TURN_METHOD: &str = "turn.resolve";
 const OWNER_ASSERTION: &str = "owner";
 const SETTLE_STOPPED_METHOD: &str = "command.settle_stopped";
-const STOP_SETTLEMENT_PAGE: usize = 64;
+const HISTORICAL_SETTLEMENT_PAGE: usize = 64;
 
 /// Native readback proving one turn inactive, obtained by the Router through
 /// the plugin's `agent.snapshot` turn readback before resolving a turn whose
@@ -148,7 +149,7 @@ impl Store {
         self.ensure_committed_reads()?;
         let Some(review) = &request.review else {
             return Ok(Change {
-                value: stopped_settlement_page(&self.connection, request)?,
+                value: historical_settlement_page(&self.connection, request)?,
                 events: Vec::new(),
             });
         };
@@ -187,7 +188,7 @@ impl Store {
             });
         }
         validate_id_age(&request.id, now)?;
-        let mut value = stopped_settlement_page(&tx, request)?;
+        let mut value = historical_settlement_page(&tx, request)?;
         if value.review != *review {
             return Err(Error::new(
                 "conflict",
@@ -205,7 +206,7 @@ impl Store {
                 id: request.id.clone(),
                 command_id: stop.command_id.clone(),
                 resolution: CommandResolution::Applied,
-                reason: "Owned processes exited and the native reader drained. A native stop receipt was unavailable.".into(),
+                reason: "Owned processes exited and the native reader drained.".into(),
             };
             events.push(resolve_command_tx(
                 &tx,
@@ -215,6 +216,16 @@ impl Store {
                 None,
                 now,
             )?);
+            if let Some(fallback) = &stop.interrupt_fallback {
+                super::lifecycle::settle_interrupt_after_fallback_tx(
+                    &tx,
+                    &fallback.command_id,
+                    &record.command,
+                    (agent_num, stop.generation),
+                    now,
+                    &mut events,
+                )?;
+            }
             if let Some(turn_id) = &stop.interrupted_turn {
                 let turn = TurnResolveRequest {
                     id: request.id.clone(),
@@ -234,6 +245,48 @@ impl Store {
                     &mut events,
                 )?;
             }
+        }
+        for reply in &value.request_replies {
+            let agent_num = parse_agent_id(&reply.agent)?;
+            let record = load_command_record(&tx, &reply.command_id)?.ok_or_else(|| {
+                Error::new("source_integrity", "reviewed request reply disappeared")
+            })?;
+            if record.state != CommandState::Unknown
+                || record.target != Some(agent_num)
+                || record.command.generation != Some(reply.generation)
+                || record.command.verb != reply.verb
+                || !matches!(reply.verb.as_str(), "approve" | "deny" | "answer")
+                || record.command.request_id.as_deref() != Some(reply.request_id.as_str())
+                || record.command.turn_id.as_deref() != Some(reply.turn_id.as_str())
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "reviewed request reply no longer matches its command binding",
+                ));
+            }
+            let command = CommandResolveRequest {
+                id: request.id.clone(),
+                command_id: reply.command_id.clone(),
+                resolution: CommandResolution::Applied,
+                reason: "The exact native request.resolved receipt proves this reply was applied."
+                    .into(),
+            };
+            events.push(resolve_command_tx(
+                &tx,
+                &record,
+                &command,
+                CommandState::Applied,
+                Some(json!({
+                    "native_receipt": {
+                        "kind": "request.resolved",
+                        "seq": reply.receipt_seq,
+                        "request_id": reply.request_id,
+                        "turn_id": reply.turn_id,
+                    }
+                })),
+                now,
+            )?);
+            super::goals::continue_stop_paused_goal_tx(&tx, agent_num, now, &mut events)?;
         }
         value.applied = true;
         insert_resolution_write(
@@ -941,7 +994,7 @@ impl Store {
     }
 }
 
-fn stopped_settlement_page(
+fn historical_settlement_page(
     connection: &Connection,
     request: &SettleStoppedRequest,
 ) -> Result<SettleStoppedResponse> {
@@ -950,7 +1003,12 @@ fn stopped_settlement_page(
     let mut statement = connection
         .prepare(
             "SELECT c.id, c.target, c.generation, t.turn_id,
-                    a.generation = c.generation AND a.state = 'lost'
+                    a.generation = c.generation AND a.state = 'lost',
+                    interrupt.id, interrupt.turn_id,
+                    CASE WHEN interrupt.id IS NULL THEN NULL
+                         WHEN json_extract(c.args,'$.interrupt_runtime_unavailable')=1
+                         THEN 'interrupt_runtime_unavailable_agent_stopped'
+                         ELSE 'interrupt_unconfirmed_agent_stopped' END
              FROM commands c JOIN agents a ON a.id = c.target
          LEFT JOIN turns t ON c.principal = 'owner' AND t.agent = c.target
             AND t.generation = c.generation AND t.turn_id = COALESCE(
@@ -974,6 +1032,21 @@ fn stopped_settlement_page(
                     )) END
             )
             AND t.state = 'unknown'
+            AND NOT EXISTS (
+                SELECT 1 FROM events AS dispatch
+                WHERE dispatch.agent=c.target AND dispatch.generation=c.generation
+                  AND dispatch.source='daemon' AND dispatch.kind='command.dispatched'
+                  AND json_extract(dispatch.data,'$.command_id')=c.id
+                  AND json_type(dispatch.data,'$.live_at_dispatch')='false'
+            )
+         LEFT JOIN commands AS interrupt
+            ON interrupt.id=c.parent_command AND c.link_kind='interrupt_stop' AND c.ordinal=0
+           AND c.principal='owner'
+           AND c.verb='stop' AND json_extract(c.args,'$.force')=1
+           AND interrupt.principal='owner' AND interrupt.verb='interrupt'
+           AND interrupt.target=c.target AND interrupt.generation=c.generation
+           AND interrupt.turn_id IS c.expected_turn_id
+           AND interrupt.state='unknown'
          WHERE c.state = 'unknown' AND c.verb = 'stop' AND a.observe_only = 0
            AND c.id > COALESCE(?1, '')
            AND (a.generation > c.generation OR
@@ -981,9 +1054,9 @@ fn stopped_settlement_page(
          ORDER BY c.id LIMIT ?2",
         )
         .map_err(sql_error)?;
-    let rows = statement
+    let stop_rows = statement
         .query_map(
-            params![request.after, STOP_SETTLEMENT_PAGE as i64 + 1],
+            params![request.after, HISTORICAL_SETTLEMENT_PAGE as i64 + 1],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -991,37 +1064,155 @@ fn stopped_settlement_page(
                     row.get(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, bool>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
                 ))
             },
         )
         .map_err(sql_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
-    let next =
-        (rows.len() > STOP_SETTLEMENT_PAGE).then(|| rows[STOP_SETTLEMENT_PAGE - 1].0.clone());
+    let mut candidates = Vec::new();
+    for (
+        command_id,
+        agent,
+        generation,
+        turn,
+        is_lost,
+        interrupt_id,
+        interrupt_turn,
+        interrupt_reason,
+    ) in stop_rows
+    {
+        let interrupt_fallback = match (interrupt_id, interrupt_reason) {
+            (Some(command_id), Some(reason)) => Some(InterruptFallbackSettlement {
+                command_id,
+                turn_id: interrupt_turn,
+                reason,
+            }),
+            (None, None) if interrupt_turn.is_none() => None,
+            _ => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "linked interrupt fallback preview is incomplete",
+                ));
+            }
+        };
+        candidates.push((
+            command_id,
+            HistoricalSettlementCandidate::Stop {
+                agent,
+                generation,
+                turn,
+                is_lost,
+                interrupt_fallback,
+            },
+        ));
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT c.id, c.target, c.generation, c.verb, c.request_id, c.turn_id,
+                    (SELECT MIN(receipt.seq) FROM events receipt
+                     WHERE receipt.agent=c.target AND receipt.generation=c.generation
+                       AND receipt.source='stream' AND receipt.kind='request.resolved'
+                       AND json_extract(receipt.data,'$.command_id')=c.id
+                       AND json_extract(receipt.data,'$.request_id')=c.request_id
+                       AND json_extract(receipt.data,'$.turn_id')=c.turn_id)
+             FROM commands c JOIN agents a ON a.id=c.target
+             WHERE c.state='unknown' AND c.verb IN ('approve','deny','answer')
+               AND c.generation IS NOT NULL AND c.request_id IS NOT NULL AND c.turn_id IS NOT NULL
+               AND a.observe_only=0 AND c.id > COALESCE(?1, '')
+               AND (a.generation > c.generation OR
+                    (a.generation = c.generation AND a.state IN ('stopped','failed','lost')))
+               AND EXISTS (
+                    SELECT 1 FROM events receipt
+                    WHERE receipt.agent=c.target AND receipt.generation=c.generation
+                      AND receipt.source='stream' AND receipt.kind='request.resolved'
+                      AND json_extract(receipt.data,'$.command_id')=c.id
+                      AND json_extract(receipt.data,'$.request_id')=c.request_id
+                      AND json_extract(receipt.data,'$.turn_id')=c.turn_id
+               )
+             ORDER BY c.id LIMIT ?2",
+        )
+        .map_err(sql_error)?;
+    let reply_rows = statement
+        .query_map(
+            params![request.after, HISTORICAL_SETTLEMENT_PAGE as i64 + 1],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)?;
+    candidates.extend(reply_rows.into_iter().map(
+        |(command_id, agent, generation, verb, request_id, turn_id, receipt_seq)| {
+            (
+                command_id.clone(),
+                HistoricalSettlementCandidate::RequestReply(RequestReplySettlement {
+                    agent: super::format_agent_id(agent),
+                    generation,
+                    command_id,
+                    verb,
+                    request_id,
+                    turn_id,
+                    receipt_seq,
+                }),
+            )
+        },
+    ));
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    let next = (candidates.len() > HISTORICAL_SETTLEMENT_PAGE)
+        .then(|| candidates[HISTORICAL_SETTLEMENT_PAGE - 1].0.clone());
     let mut stops = Vec::new();
+    let mut request_replies = Vec::new();
     let mut awaiting_proof = Vec::new();
     let mut turns = std::collections::HashSet::new();
+    let mut interrupts = std::collections::HashSet::new();
     let mut lost = std::collections::HashSet::new();
-    for (command_id, agent, generation, turn, is_lost) in
-        rows.into_iter().take(STOP_SETTLEMENT_PAGE)
-    {
-        if super::capacity::has_owned_exit_and_reader_drain_tx(connection, agent, generation)? {
-            let interrupted_turn = turn.filter(|id| turns.insert((agent, generation, id.clone())));
-            stops.push(StoppedCommandSettlement {
-                agent: super::format_agent_id(agent),
+    for (command_id, candidate) in candidates.into_iter().take(HISTORICAL_SETTLEMENT_PAGE) {
+        match candidate {
+            HistoricalSettlementCandidate::Stop {
+                agent,
                 generation,
-                command_id,
-                mark_stopped: is_lost && lost.insert(agent),
-                interrupted_turn,
-            });
-        } else {
-            awaiting_proof.push(command_id);
+                turn,
+                is_lost,
+                interrupt_fallback,
+            } => {
+                if super::capacity::has_owned_exit_and_reader_drain_tx(
+                    connection, agent, generation,
+                )? {
+                    let interrupted_turn =
+                        turn.filter(|id| turns.insert((agent, generation, id.clone())));
+                    stops.push(StoppedCommandSettlement {
+                        agent: super::format_agent_id(agent),
+                        generation,
+                        command_id,
+                        mark_stopped: is_lost && lost.insert(agent),
+                        interrupted_turn,
+                        interrupt_fallback: interrupt_fallback
+                            .filter(|fallback| interrupts.insert(fallback.command_id.clone())),
+                    });
+                } else {
+                    awaiting_proof.push(command_id);
+                }
+            }
+            HistoricalSettlementCandidate::RequestReply(reply) => request_replies.push(reply),
         }
     }
     let review = sha256_hex(
         encode_json(&json!({
             "stops": stops,
+            "request_replies": request_replies,
             "awaiting_proof": awaiting_proof,
             "next": next,
         }))?
@@ -1032,9 +1223,21 @@ fn stopped_settlement_page(
         review,
         applied: false,
         stops,
+        request_replies,
         awaiting_proof,
         next,
     })
+}
+
+enum HistoricalSettlementCandidate {
+    Stop {
+        agent: i64,
+        generation: i64,
+        turn: Option<String>,
+        is_lost: bool,
+        interrupt_fallback: Option<InterruptFallbackSettlement>,
+    },
+    RequestReply(RequestReplySettlement),
 }
 
 fn command_resolution_digest(request: &CommandResolveRequest) -> Result<Vec<u8>> {

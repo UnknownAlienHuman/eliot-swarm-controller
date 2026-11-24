@@ -158,31 +158,11 @@ async fn wait_for_stop_exit_proof(
         if Instant::now() >= until {
             break proof;
         }
-        timeout_at(until, state.monitoring.sample_generation(agent))
-            .await
-            .map_err(|_| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "stop proof deadline elapsed: {}",
-                        proof
-                            .missing_reason()
-                            .unwrap_or("process/source proof is incomplete"),
-                    ),
-                )
-            })?
-            .map_err(|error| {
-                Error::new(
-                    "unknown",
-                    format!(
-                        "{}; process custody readback failed: {}",
-                        proof
-                            .missing_reason()
-                            .unwrap_or("process/source proof is incomplete"),
-                        error.message,
-                    ),
-                )
-            })?;
+        if !proof.process_custody_exited {
+            // A single sampling failure does not invalidate independent
+            // proof from the OS observer or the host's final sample.
+            let _ = timeout_at(until, state.monitoring.sample_generation(agent)).await;
+        }
         tokio::time::sleep_until((Instant::now() + Duration::from_millis(50)).min(until)).await;
     };
     Err(Error::new(
@@ -1225,7 +1205,16 @@ impl PluginHost {
         native_error: Error,
         until: Instant,
     ) -> Result<Value> {
-        let proof_until = (Instant::now() + RPC_GRACE).min(until);
+        // A fenced actor may still be waiting on its family and draining its
+        // event task. Keep that work within the original stop deadline.
+        let runtime_gone = !self.controls_generation(&agent.id, agent.generation);
+        let grace =
+            if runtime_gone || matches!(native_error.code.as_str(), "unknown" | "unavailable") {
+                STOP_GRACE * 3 + RPC_GRACE
+            } else {
+                RPC_GRACE
+            };
+        let proof_until = (Instant::now() + grace).min(until);
         match wait_for_stop_exit_proof(&Arc::downgrade(&self.state), agent, proof_until).await {
             Ok(proof) => Ok(json!({
                 "state": "applied",
@@ -1238,7 +1227,12 @@ impl PluginHost {
             })),
             Err(proof_error) => {
                 let message = format!("{}; {}", native_error.message, proof_error.message);
-                Err(native_error.with_message(message))
+                let error = native_error.with_message(message);
+                if runtime_gone || !self.controls_generation(&agent.id, agent.generation) {
+                    Err(error.with_code("unknown"))
+                } else {
+                    Err(error)
+                }
             }
         }
     }
@@ -4160,17 +4154,17 @@ async fn settle_drained_source_exit(
     reason: &'static str,
 ) -> Result<()> {
     let settlement = async {
-        if reader_closed && exited {
+        if reader_closed {
             record_root_exit_gap(state, key, reason).await?;
             let state = state
                 .upgrade()
                 .ok_or_else(|| Error::new("unavailable", "plugin host is unavailable"))?;
             let mut store = timeout_at(deadline(), state.store.lock())
                 .await
-                .map_err(|_| Error::new("unknown", "owned exit capacity release timed out"))?;
-            // This call is reachable only after both physical exit and reader
-            // drain were proven above. Closing a source alone never frees capacity.
-            let events = store.record_owned_control_exit(&key.id, key.generation, now_ms())?;
+                .map_err(|_| Error::new("unknown", "native reader drain persistence timed out"))?;
+            // The reader fact can arrive before the OS observer proves custody
+            // exit. Store releases capacity only once both are committed.
+            let events = store.record_owned_reader_drained(&key.id, key.generation, now_ms())?;
             state.bus.publish(&events);
             drop(store);
             if native_children::is_codex_producer(&state.store, &key.id).await? {

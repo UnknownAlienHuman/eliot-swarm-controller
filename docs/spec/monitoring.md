@@ -102,8 +102,10 @@ using that service.
 Every applied stop requires two independently committed facts for the exact
 generation: process-custody exit and native-source drain. On Windows the
 process fact requires the owned Job empty and all recorded process identities
-exited; the source fact requires the authoritative reader drained and its
-closure committed. The checks share one absolute stop deadline. A missing
+exited; the source fact requires the authoritative reader finished or joined
+after abandonment and its closure committed. A gap records any missing
+native evidence. The two facts can commit in either order within the stop
+deadline. A missing
 process or source fact keeps the outcome unknown and names that missing proof.
 An `agent.stop` reply or native `session.ended` is preserved when observed, but
 neither is required once both process/source facts are proven. If native session
