@@ -449,8 +449,8 @@ impl Store {
                      ORDER BY created_at, rowid LIMIT 1) AS preview,
                     (SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy'
                      AND agent = a.id AND generation = a.generation) AS heavy_count,
-                    (SELECT json_group_array(data) FROM (
-                         SELECT data FROM events WHERE kind = 'activity.heavy'
+                    (SELECT json_group_array(data ORDER BY seq DESC) FROM (
+                         SELECT seq, data FROM events WHERE kind = 'activity.heavy'
                          AND agent = a.id AND generation = a.generation
                          ORDER BY seq DESC LIMIT ?3
                      )) AS heavy_episodes
