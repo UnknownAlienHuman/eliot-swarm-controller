@@ -1,10 +1,9 @@
 # OpenCode
 
 The HTTP/SSE shapes below were verified against OpenCode v2.2.7 on 2026-11-23.
-The plugin has no exact vendor-version comparison gate; its manifest's `2.2.7`
-is reference metadata, not proof of the installed version. A newer CLI is
-attempted through the same API contract, with compatibility unverified until
-live qualification. Select one installed HTTP/SSE API generation from its
+The manifest reports the adapter package version. A newer CLI is attempted
+with compatibility unverified until live qualification. Select one installed
+HTTP/SSE API generation from its
 OpenAPI document (`GET /openapi.json`); do not mix generations after a 404. Source:
 [anomalyco/opencode](https://github.com/anomalyco/opencode).
 

@@ -672,6 +672,14 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             check,
             entry.doc_section,
         );
+        let checked_at = entry
+            .checked_at
+            .and_then(|ms| {
+                std::time::UNIX_EPOCH.checked_add(Duration::from_millis(u64::try_from(ms).ok()?))
+            })
+            .map_or(String::new(), |time| {
+                format!(" at {}", humantime::format_rfc3339(time))
+            });
         match entry.check_outcome {
             HarnessCheckOutcome::NotChecked => {
                 if let Some(reason) = &entry.not_checked_reason {
@@ -682,27 +690,16 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
             }
             HarnessCheckOutcome::Passed => {
                 println!(
-                    "  check: passed{}{}",
+                    "  check: passed{}{checked_at}",
                     entry
                         .check_profile
                         .as_deref()
                         .map_or(String::new(), |profile| format!(" on {profile}")),
-                    entry
-                        .checked_at
-                        .and_then(|ms| {
-                            std::time::UNIX_EPOCH
-                                .checked_add(Duration::from_millis(u64::try_from(ms).ok()?))
-                        })
-                        .map_or(String::new(), |time| format!(
-                            " at {}",
-                            humantime::format_rfc3339(time)
-                        ))
                 );
             }
             HarnessCheckOutcome::Failed => {
                 println!(
-                    "  check: version {} FAILED at {}{}",
-                    entry.checked_version.as_deref().unwrap_or("-"),
+                    "  check: FAILED{checked_at} (step {}){}",
                     entry.failure_step.as_deref().unwrap_or("?"),
                     entry
                         .failure_error

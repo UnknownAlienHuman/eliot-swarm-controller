@@ -124,9 +124,12 @@ reader reaps the owned helper on a deadline or read failure.
 An initial plugin may declare:
 
 The [`PluginManifest`](../../crates/eliot-plugin/src/protocol.rs) DTO owns the manifest
-field catalog. The manifest carries the adapter package version. Swarm reads
-the installed vendor version through install discovery and reports its check in
-[`harness.doctor`](monitoring.md#heavy-work-session-growth-and-harness-checks).
+field catalog. Its version identifies the adapter package. Swarm reads the installed
+vendor version through install discovery and reports it with the last check for that
+version in [`harness.doctor`](monitoring.md#heavy-work-session-growth-and-harness-checks).
+A newly observed installation is eligible for explicit launches and reports
+`not_checked` until qualified. The separate automatic-routing policy can defer a
+route after a failed check.
 
 `proxy` remains a string capability. "none" remains valid for direct native
 adapters (for example direct Codex). A controlled Codex profile with an adopted Responses route
@@ -929,7 +932,9 @@ native discriminator, without the raw payload. They have no lifecycle, authority
 outcome semantics. A terminal record with an unfamiliar outcome cannot establish
 success, failure or interruption. Preserve frame integrity and exact binding checks.
 Detect native capabilities from advertised or observed behavior. Installed version
-strings are diagnostic metadata and do not select a decoder or gate a session.
+strings are diagnostic metadata. Choose native formats from the advertised methods,
+schema or fields present in the data. Check the feature or authority required for the
+specific operation before dispatch.
 
 Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
 `item/commandExecution/outputDelta`, `item/fileChange/outputDelta`, `item/plan/delta`,
