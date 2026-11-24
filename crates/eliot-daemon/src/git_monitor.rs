@@ -644,6 +644,9 @@ impl GitProbe {
                 "committed-path comparison requires exact object ids",
             ));
         }
+        if head == base {
+            return Ok((Vec::new(), true));
+        }
         let read_deadline = deadline
             .checked_sub(Duration::from_secs(2))
             .unwrap_or(deadline);
@@ -740,6 +743,19 @@ impl GitProbe {
                 return Ok(unavailable_work(reason, None, !dirty.is_empty()));
             }
         };
+        if head == base && dirty.is_empty() {
+            return Ok(GitWorkProbe {
+                available: true,
+                error: None,
+                commits_ahead: Some(0),
+                files_changed: Some(0),
+                insertions: Some(0),
+                deletions: Some(0),
+                diff_digest: Some(hex_digest(&Sha256::digest([]))),
+                dirty_digest: Some(dirty_digest),
+                has_changes: false,
+            });
+        }
         let read_deadline = deadline
             .checked_sub(Duration::from_secs(2))
             .unwrap_or(deadline);
