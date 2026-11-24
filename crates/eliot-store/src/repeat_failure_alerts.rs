@@ -35,7 +35,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let mut events = Vec::new();
+            let mut openings = Vec::new();
             for update in updates {
                 if update.expires_at <= now {
                     continue;
@@ -67,21 +67,29 @@ impl Store {
                         ],
                     )
                     .map_err(sql_error)?;
-                let Some(message) = update.message.as_deref().filter(|_| renewed == 0) else {
-                    continue;
-                };
+                if let Some(message) = update.message.as_deref().filter(|_| renewed == 0) {
+                    openings.push((update, message));
+                }
+            }
+            // Keep the slot for an existing occurrence when a pending observation
+            // renews its deadline. Count capacity only after applying those renewals.
+            tx.execute(
+                "DELETE FROM repeat_failure_alerts WHERE expires_at <= ?1",
+                [now],
+            )
+            .map_err(sql_error)?;
+            let mut events = Vec::new();
+            for (update, message) in openings {
                 let inserted = tx.execute(
                     "INSERT INTO repeat_failure_alerts
                        (cause, occurrence, opened_at, expires_at, message, goal_agent, goal_generation, goal_mode)
                      SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
-                     WHERE (SELECT COUNT(*) FROM repeat_failure_alerts WHERE expires_at > ?9) < ?10
-                     ON CONFLICT(cause) DO UPDATE SET occurrence = excluded.occurrence,
-                       opened_at = excluded.opened_at, expires_at = excluded.expires_at,
-                       message = excluded.message WHERE repeat_failure_alerts.expires_at <= ?3",
+                     WHERE (SELECT COUNT(*) FROM repeat_failure_alerts) < ?9
+                     ON CONFLICT(cause) DO NOTHING",
                     params![update.cause, ulid::Ulid::new().to_string(), update.observed_at,
                         update.expires_at, message, update.goal.map(|goal| goal.agent),
                         update.goal.map(|goal| goal.generation),
-                        update.goal.map(|goal| goal.mode.as_str()), now, MAX_REPEAT_FAILURE_ALERTS as i64],
+                        update.goal.map(|goal| goal.mode.as_str()), MAX_REPEAT_FAILURE_ALERTS as i64],
                 ).map_err(sql_error)?;
                 if inserted > 0 {
                     events.push(insert_daemon_event(
@@ -95,11 +103,6 @@ impl Store {
                     )?);
                 }
             }
-            tx.execute(
-                "DELETE FROM repeat_failure_alerts WHERE expires_at <= ?1",
-                [now],
-            )
-            .map_err(sql_error)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(events)
         })();
