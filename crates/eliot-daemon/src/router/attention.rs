@@ -664,10 +664,6 @@ async fn inspect_agent(
     if captured.agent.observe_only {
         return Ok(());
     }
-    let thresholds = pair_thresholds_for_agent(router, &captured.agent, config).await?;
-    let no_progress_window = Duration::from_secs(thresholds.no_progress.threshold_secs as u64);
-    let no_code_progress_window =
-        Duration::from_secs(thresholds.no_code_progress.threshold_secs as u64);
     if captured.agent.state == AgentState::Idle
         && config.session_growth.enabled
         && let Err(error) = router.react_to_session_growth(&captured.agent).await
@@ -720,6 +716,13 @@ async fn inspect_agent(
         )
         .await;
     }
+    // Native recovery and deterministic loss reports do not use learned
+    // progress thresholds. Read the historical turns only on the path that
+    // evaluates or clears progress incidents.
+    let thresholds = pair_thresholds_for_agent(router, &captured.agent, config).await?;
+    let no_progress_window = Duration::from_secs(thresholds.no_progress.threshold_secs as u64);
+    let no_code_progress_window =
+        Duration::from_secs(thresholds.no_code_progress.threshold_secs as u64);
     let desired = desired_incident(
         &captured,
         &config,
