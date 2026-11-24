@@ -76,11 +76,11 @@ fn provider_response_withheld_event_tx(
                          AND json_extract(resolved.data, '$.turn_id') = ?3
                    )
                    AND NOT EXISTS(
-                       SELECT 1 FROM events indexed
-                       WHERE indexed.agent = ?1 AND indexed.generation = ?2
-                         AND indexed.kind = 'provider.response_withheld'
-                         AND (json_extract(indexed.data, '$.turn_id') = ?3
-                              OR json_extract(indexed.data, '$.task_command') = ?4)
+                       SELECT 1 FROM events withheld
+                       WHERE withheld.agent = ?1 AND withheld.generation = ?2
+                         AND withheld.kind = 'provider.response_withheld'
+                         AND (json_extract(withheld.data, '$.turn_id') = ?3
+                              OR json_extract(withheld.data, '$.task_command') = ?4)
                    )
              )",
             params![agent_num, agent.generation, turn_id, task_command],
