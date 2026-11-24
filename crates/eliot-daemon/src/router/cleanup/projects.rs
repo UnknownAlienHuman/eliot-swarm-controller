@@ -17,13 +17,13 @@ impl Router {
             return Ok((Vec::new(), None));
         }
         let policy = self.secret_policy_snapshot();
-        let store = self.inner.store.lock().await;
-        let read = settings::read_internal(
+        let snapshot = settings::read_snapshot(
             &self.inner.data_root,
-            &store,
             Some(&[SettingsSection::Projects]),
             &policy,
         )?;
+        let store = self.inner.store.lock().await;
+        let read = snapshot.into_response(&store)?;
         let Some(revision) = &read.revision else {
             return Ok((Vec::new(), None));
         };

@@ -1722,7 +1722,9 @@ settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still re
 restart after the save.
 
 The `settings.read` RPC reads and validates one file revision before locking the Store
-for history. It parses valid TOML once for strict validation and section projection.
+for history. Bootstrap and project discovery also prepare settings snapshots before
+locking the Store. Write-side revision checks and publication stay under the writer
+lock. The reader parses valid TOML once for strict validation and section projection.
 Located diagnostics and possible literal secrets require a table-header scan. Malformed
 TOML uses the header spans to independently parse readable section blocks and their
 validation dependencies.

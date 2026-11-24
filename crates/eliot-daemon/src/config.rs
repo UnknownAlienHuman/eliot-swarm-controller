@@ -3100,7 +3100,6 @@ fn validated_control<'a>(
     Ok(control)
 }
 
-/// The one frozen `control` insert for resolved profile snapshots.
 /// Validate the worker MCP inheritance policy and freeze it with the profile
 /// snapshot. `minimal`/`allow` name whether the harness plugin implements an
 /// isolation mechanism for `minimal` and selective
