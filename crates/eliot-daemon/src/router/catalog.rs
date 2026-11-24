@@ -318,11 +318,17 @@ impl Router {
                     route.identity.as_deref(),
                     &route.environment,
                 )
-                .and_then(|key| catalog::models_key(&key, &cmd, version.as_deref()))
+                .and_then(|scope| {
+                    Some(ModelsCacheKey {
+                        scope,
+                        executable: crate::adhoc::VersionKey::read(&cmd, None)?,
+                        version: version?,
+                    })
+                })
             } else {
                 None
             };
-            if let Some(hit) = cache_key.as_deref().and_then(|key| {
+            if let Some(hit) = cache_key.as_ref().and_then(|key| {
                 self.inner
                     .catalog_cache
                     .lock_recover()
@@ -776,8 +782,8 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        let settings_revision = self.catalog_settings_revision();
-        if let Some(snapshot) = self.cached_catalog(request, settings_revision.as_deref()) {
+        let key = self.catalog_key(deadline).await?;
+        if let Some(snapshot) = self.cached_catalog(request, &key) {
             return self.catalog_page(request, &snapshot, deadline).await;
         }
         let snapshot = {
@@ -785,12 +791,16 @@ impl Router {
                 tokio::time::timeout_at(deadline.into(), self.inner.catalog_aggregate_lock.lock())
                     .await
                     .map_err(|_| crate::adhoc::discovery_timeout())?;
-            let settings_revision = self.catalog_settings_revision();
-            match self.cached_catalog(request, settings_revision.as_deref()) {
+            let key = self.catalog_key(deadline).await?;
+            match self.cached_catalog(request, &key) {
                 Some(snapshot) => snapshot,
                 None => {
-                    let snapshot = Arc::new(self.build_catalog(settings_revision, deadline).await?);
-                    if self.catalog_settings_revision() == snapshot.settings_revision {
+                    let snapshot = Arc::new(self.build_catalog(key, deadline).await?);
+                    if self
+                        .catalog_key(deadline)
+                        .await
+                        .is_ok_and(|key| key == snapshot.key)
+                    {
                         self.inner.catalog_cache.lock_recover().aggregate = Some(snapshot.clone());
                     }
                     snapshot
@@ -800,23 +810,31 @@ impl Router {
         self.catalog_page(request, &snapshot, deadline).await
     }
 
-    fn catalog_settings_revision(&self) -> Option<String> {
-        crate::config::settings::current_revision(&self.inner.data_root)
-            .ok()
-            .flatten()
+    async fn catalog_key(&self, deadline: Instant) -> Result<catalog::CatalogKey> {
+        let root = self.inner.data_root.clone();
+        crate::adhoc::blocking_discovery(deadline, move || catalog::CatalogKey {
+            settings_revision: crate::config::settings::current_revision(&root)
+                .ok()
+                .flatten(),
+            installations: SUPPORTED_HARNESSES
+                .iter()
+                .map(|harness| crate::adhoc::installation_fingerprint(harness, deadline))
+                .collect(),
+        })
+        .await
     }
 
     fn cached_catalog(
         &self,
         request: &ModelsCatalogRequest,
-        settings_revision: Option<&str>,
+        key: &catalog::CatalogKey,
     ) -> Option<Arc<catalog::CachedAggregate>> {
         self.inner
             .catalog_cache
             .lock_recover()
             .aggregate
             .as_ref()
-            .filter(|entry| entry.settings_revision.as_deref() == settings_revision)
+            .filter(|entry| &entry.key == key)
             .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now_ms()))
             .filter(|entry| request.after.is_some() || entry.failures.is_empty())
             .cloned()
@@ -824,7 +842,7 @@ impl Router {
 
     async fn build_catalog(
         &self,
-        settings_revision: Option<String>,
+        key: catalog::CatalogKey,
         deadline: Instant,
     ) -> Result<catalog::CachedAggregate> {
         let discovery_deadline = tokio::time::Instant::from_std(deadline);
@@ -1020,7 +1038,7 @@ impl Router {
             catalog::PARTIAL_AGGREGATE_TTL_MS
         };
         Ok(catalog::CachedAggregate {
-            settings_revision,
+            key,
             harnesses,
             models,
             quotas,
@@ -1072,14 +1090,13 @@ impl Router {
             let exact_scopes: Vec<_> = scopes.values().cloned().collect();
             let holds = tokio::time::timeout_at(deadline.into(), self.inner.store.lock())
                 .await
-                .ok()
-                .and_then(|store| store.provider_holds_for_scopes(&exact_scopes).ok());
+                .map_err(|_| crate::adhoc::discovery_timeout())?
+                .provider_holds_for_scopes(&exact_scopes)?;
             let now = now_ms();
             for model in models.iter_mut().filter(|model| model.profile.is_none()) {
-                let held = holds
-                    .as_ref()
-                    .zip(scopes.get(&model.harness))
-                    .map(|(holds, scope)| holds.contains_key(scope));
+                let held = scopes
+                    .get(&model.harness)
+                    .map(|scope| holds.contains_key(scope));
                 model.availability =
                     availability(held, snapshot.quotas.get(&model.harness), &model.id, now)
                         .to_owned();
@@ -1353,7 +1370,7 @@ fn endpoint_authority(url: &str) -> &str {
 /// catalogue reads are never tied to an Agent).
 #[derive(Default)]
 pub(crate) struct CatalogCache {
-    models: HashMap<String, HarnessModelsResponse>,
+    models: HashMap<ModelsCacheKey, HarnessModelsResponse>,
     quotas: HashMap<String, HarnessQuotaResponse>,
     aggregate: Option<Arc<CachedAggregate>>,
 }
@@ -1361,7 +1378,7 @@ pub(crate) struct CatalogCache {
 /// One sorted catalogue snapshot shared across pages. Holds and quota
 /// freshness are evaluated when projecting each requested page.
 struct CachedAggregate {
-    settings_revision: Option<String>,
+    key: CatalogKey,
     harnesses: Vec<HarnessEntry>,
     models: Vec<ModelsCatalogEntry>,
     quotas: HashMap<String, ScopedQuota>,
@@ -1370,15 +1387,28 @@ struct CachedAggregate {
     ttl_ms: u64,
 }
 
+#[derive(PartialEq, Eq)]
+struct CatalogKey {
+    settings_revision: Option<String>,
+    installations: Vec<Option<crate::adhoc::InstallationFingerprint>>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct ModelsCacheKey {
+    scope: String,
+    executable: crate::adhoc::VersionKey,
+    version: String,
+}
+
 impl CatalogCache {
-    pub(crate) fn get_models(&self, key: &str, now: i64) -> Option<HarnessModelsResponse> {
+    fn get_models(&self, key: &ModelsCacheKey, now: i64) -> Option<HarnessModelsResponse> {
         self.models
             .get(key)
             .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now))
             .cloned()
     }
 
-    pub(crate) fn insert_models(&mut self, key: String, entry: HarnessModelsResponse) {
+    fn insert_models(&mut self, key: ModelsCacheKey, entry: HarnessModelsResponse) {
         evict_models(&mut self.models, entry.fetched_at_ms);
         self.models.insert(key, entry);
     }
@@ -1521,13 +1551,6 @@ fn native_models_response(
         credential,
         configure: eliot_core::api::ConfigureSupport::for_harness(harness),
     })
-}
-
-/// The private native-read key includes executable/version identity without
-/// changing the public account scope. A failed version probe cannot reuse
-/// a previously cached native read.
-pub(crate) fn models_key(scope: &str, cmd: &str, version: Option<&str>) -> Option<String> {
-    version.map(|version| format!("{scope}\0{cmd}\0{version}"))
 }
 
 /// Project model metadata. An aggregate page sets availability for ad-hoc rows.
@@ -2286,7 +2309,7 @@ pub(crate) fn quota_fresh(fetched_at_ms: i64, ttl_ms: u64, now: i64) -> bool {
     fetched_at_ms >= 0 && now >= 0 && (now.saturating_sub(fetched_at_ms) as u64) <= ttl_ms
 }
 
-fn evict_models(map: &mut HashMap<String, HarnessModelsResponse>, now: i64) {
+fn evict_models(map: &mut HashMap<ModelsCacheKey, HarnessModelsResponse>, now: i64) {
     if map.len() < MAX_CACHED_SCOPES {
         return;
     }
