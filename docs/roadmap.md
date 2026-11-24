@@ -990,10 +990,15 @@ of the explicitly selected release scope.
       Retry first and a confirmed new empty data directory last; a new directory is
       remembered only once its daemon answers.
 
-- [ ] **Idle Agent restart continuation (#984).** Store selects a retained idle
+- [x] **Idle Agent restart continuation (#984).** Store selects a retained idle
       session for promptless, generation-bound Resume after owned exit and reader
-      drain are proven; unresolved work remains fenced. Private runtime proof and
-      the required static checks remain outstanding for this branch.
+      drain are proven; unresolved work remains fenced. On a private Windows
+      stand on 2026-11-24, Claude Haiku 5.5 reopened the same session from
+      generation 1 to 2 after `daemon update`, with no linked SEND. Holding the
+      old Job open across a second daemon exit kept generation 2 lost until
+      exact closure; it then resumed without input. A separate Agent's
+      dispatched interrupt and open turn stayed unknown with no Resume after
+      its own custody was released.
 
 - [x] **Owner pages for autonomous Swarm (#883, 2026-11-22).** The project editor
       edits the launch policy (#868) with Validate and Save on the read revision,

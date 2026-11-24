@@ -228,7 +228,10 @@ Eligibility requires exact custody closure and settled commands, requests,
 and Goal rounds for the prior generation. Idle continuation uses retained
 `owned_exit_before_restart` evidence or a restart loss that captured the
 generation idle with no active turn ID. The Store rechecks closure and
-settled work before admitting a promptless Resume.
+settled work before admitting a promptless Resume with no linked SEND.
+A retained old process family keeps the generation lost until exact
+custody readback releases it. Startup reconciliation closes the old
+native publisher and retains any recorded source gap.
 Unresolved commands, turns, requests, Goal rounds, Owner Stops, or restart-
 affected ancestors continue to fence admission. The exact turn interrupted by
 the restart may remain unknown. The new generation keeps the native subject
