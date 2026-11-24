@@ -23,7 +23,11 @@ use eliot_core::api::{
 };
 use serde_json::Value;
 use serde_json::json;
-use std::{fs::File, io::Read, path::PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 fn print_rule_list(response: &RuleListResponse) {
     if response.rules.is_empty() {
@@ -424,16 +428,47 @@ pub(crate) async fn run_rule(
                 expected_revision,
                 content,
             };
-            request.validate().map_err(Failure::for_mutation)?;
-            let response: RuleSaveResponse =
-                eliot_daemon::client_call_typed(&data_dir, "rule.save", &request)
-                    .await
-                    .map_err(Failure::for_mutation)?;
-            request
-                .validate_response(&response)
-                .map_err(Failure::invalid_response)?;
-            print_value(&json!(response), json_output);
-            Ok(0)
+            save_rule(&data_dir, request, json_output).await
+        }
+        RuleCommand::InstallReview {
+            project,
+            author,
+            reviewer,
+            workspace,
+            expected_revision,
+        } => {
+            if author.trim().is_empty() || reviewer.trim().is_empty() || author == reviewer {
+                return Err(Failure::new(
+                    2,
+                    "review requires distinct author and reviewer profiles",
+                ));
+            }
+            if !Path::new(&workspace).is_absolute() {
+                return Err(Failure::new(2, "review workspace must be an absolute path"));
+            }
+            let template = include_str!("../../../../config/recipes/review-after-turn.toml");
+            let content = template
+                .lines()
+                .map(|line| {
+                    if line.starts_with("on = ") && line.contains("\"author-profile\"") {
+                        line.replace("\"author-profile\"", &json!(author).to_string())
+                    } else if line == "profile = \"reviewer-profile\"" {
+                        format!("profile = {}", json!(reviewer))
+                    } else if line == "workspace = \"C:/src/app\"" {
+                        format!("workspace = {}", json!(workspace))
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let request = RuleSaveRequest {
+                project: Some(project),
+                path: "review-after-turn.toml".to_owned(),
+                expected_revision,
+                content,
+            };
+            save_rule(&data_dir, request, json_output).await
         }
         RuleCommand::Delete {
             entry: RuleFileArgs { project, path },
@@ -480,6 +515,23 @@ pub(crate) async fn run_rule(
             Ok(exit_code)
         }
     }
+}
+
+async fn save_rule(
+    data_dir: &Path,
+    request: RuleSaveRequest,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    request.validate().map_err(Failure::for_mutation)?;
+    let response: RuleSaveResponse =
+        eliot_daemon::client_call_typed(data_dir, "rule.save", &request)
+            .await
+            .map_err(Failure::for_mutation)?;
+    request
+        .validate_response(&response)
+        .map_err(Failure::invalid_response)?;
+    print_value(&json!(response), json_output);
+    Ok(0)
 }
 
 pub(crate) async fn run_timer(

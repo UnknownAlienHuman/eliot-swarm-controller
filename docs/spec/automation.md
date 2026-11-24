@@ -606,9 +606,13 @@ out of rule settings, argv, watch state and event payloads.
 
 ### Worktree review recipe
 
-Install [review-after-turn.toml](../../config/recipes/review-after-turn.toml) in the
-registered checkout's rules directory and approve the launch, initial send and inject
-actions. Use a distinct reviewer profile with native read-only permissions.
+Run `swarm rule install-review --project ID --author PROFILE --reviewer PROFILE --workspace PATH`
+to install [review-after-turn.toml](../../config/recipes/review-after-turn.toml)
+through the existing rule save API. To replace an existing file, supply its
+`--expected-revision` from `swarm rule read`. Approve launch, initial send and
+inject in the project registration. Use a distinct reviewer profile with native
+read-only permissions. The Owner explicitly installs the recipe because it
+launches a reviewer and delivers its result.
 An assigned project reserves launches for its current team. To review from a separate
 checkout in that case, install an Owner rule, constrain the author's project in the
 trigger, and give the reviewer an unassigned checkout.
