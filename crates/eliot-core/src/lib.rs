@@ -233,6 +233,8 @@ pub enum WorkspaceCreationOutcome {
         worktree_path: String,
         branch: String,
         head: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch_drift: Option<WorkspaceBranchDrift>,
     },
     Failed {
         code: String,
@@ -259,6 +261,12 @@ pub enum WorkspaceCreationOutcome {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_evidence: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceBranchDrift {
+    pub original_branch: String,
+    pub observed_branch: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -2124,6 +2124,13 @@ explicit resume. Previously admitted commands still follow durable command
 recovery. Interrupted turns and uncertain effects stay `unknown` under either
 policy: they are named, never replayed.
 
+A restart Resume reuses an Agent's retained managed worktree. When its local branch
+differs from the originally registered branch, recovery accepts it after exact
+workspace ownership and Git registration readback, matching registry and symbolic
+HEAD branches, and a clean status. Store durably retains the original and observed
+branch names; cleanup continues to use the original frozen branch. Dirty or ambiguous
+worktrees remain fenced for Owner inspection.
+
 `swarm daemon update --interrupt-on-deadline` uses the ordinary Stop custody
 path for captured active turns after the wait expires. Under `continue`, an
 applied Stop with proven process exit and native source drain allows resume with

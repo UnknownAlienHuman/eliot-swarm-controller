@@ -2610,17 +2610,47 @@ impl Store {
                         worktree_path,
                         branch,
                         head,
+                        branch_drift,
                     } => {
                         validate_git_oid(&head)?;
+                        let branch_identity_valid = match branch_drift {
+                            Some(drift) => {
+                                let owner = load_agent_by_num(&tx, agent_num)?;
+                                reuse
+                                    && command.command.verb == "resume"
+                                    && matches!(
+                                        command.state,
+                                        CommandState::Accepted | CommandState::Queued
+                                    )
+                                    && drift.original_branch == workspace.requested_branch
+                                    && drift.observed_branch == branch
+                                    && drift.observed_branch != drift.original_branch
+                                    && core::api::validate_integration_branch(
+                                        &drift.observed_branch,
+                                    )
+                                    .is_ok()
+                                    && owner.is_some_and(|agent| {
+                                        command.command.generation == Some(agent.generation)
+                                            && agent.is_terminal()
+                                            && agent.active_turn.is_none()
+                                            && agent.workspace.as_deref()
+                                                == Some(workspace.worktree_path.as_str())
+                                    })
+                            }
+                            None => branch == workspace.requested_branch,
+                        };
                         if repo_path != workspace.repo_path
                             || repo_common_dir != workspace.repo_common_dir
                             || worktree_path != workspace.worktree_path
-                            || branch != workspace.requested_branch
+                            || !branch_identity_valid
                             || (!reuse && head != workspace.base_oid)
                         {
                             return Err(Error::new(
                                 "source_integrity",
-                                "worktree readback does not match its frozen identity",
+                                format!(
+                                    "worktree readback does not match its frozen identity: original branch '{}' and observed branch '{}'",
+                                    workspace.requested_branch, branch
+                                ),
                             ));
                         }
                         workspace.phase = if workspace.setup_index == workspace.frozen_setup.len() {

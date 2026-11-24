@@ -713,6 +713,70 @@ impl WorkspaceGit {
                 worktree_path: path_text(&subject.target.root)?,
                 branch: preparation.requested_branch.clone(),
                 head: subject.head,
+                branch_drift: None,
+            })
+        }
+        .await;
+        match readback {
+            Ok(outcome) => outcome,
+            Err(error) => WorkspaceCreationOutcome::Unknown {
+                code: error.code.clone(),
+                message: (*error.message).clone(),
+                failure_where: Some(
+                    error
+                        .failure_where
+                        .clone()
+                        .map(String::from)
+                        .unwrap_or_else(|| "store.dispatch.workspace_gate".to_owned()),
+                ),
+                origin: Some(error.origin_or_unknown()),
+                origin_evidence: error.origin_evidence.clone().map(String::from),
+            },
+        }
+    }
+
+    /// Resume-only readback. Branch drift is accepted only when the Git
+    /// registration and symbolic HEAD agree and the changed checkout is clean.
+    /// The frozen branch remains the cleanup identity.
+    pub(crate) async fn inspect_resume_retained(
+        &self,
+        preparation: &WorkspacePreparation,
+    ) -> WorkspaceCreationOutcome {
+        let readback = async {
+            let deadline = Instant::now() + READ_TIME;
+            let subject = self.subject_inner(preparation, deadline, true).await?;
+            let observed = subject
+                .branch
+                .strip_prefix("refs/heads/")
+                .ok_or_else(|| problem("source_integrity", "workspace HEAD is not a local branch"))?
+                .to_owned();
+            let branch_drift = (observed != preparation.requested_branch).then(|| {
+                eliot_core::WorkspaceBranchDrift {
+                    original_branch: preparation.requested_branch.clone(),
+                    observed_branch: observed.clone(),
+                }
+            });
+            if branch_drift.is_some() {
+                self.require_clean(&subject, deadline)
+                    .await
+                    .map_err(|mut error| {
+                        error.message = format!(
+                            "{}; original branch '{}' and observed branch '{}'",
+                            error.message, preparation.requested_branch, observed
+                        )
+                        .into();
+                        error
+                    })?;
+            }
+            self.confirm_subject_mode(preparation, &subject, deadline, true)
+                .await?;
+            Ok::<_, Error>(WorkspaceCreationOutcome::Verified {
+                repo_path: path_text(&subject.source.root)?,
+                repo_common_dir: path_text(&subject.source.common_dir)?,
+                worktree_path: path_text(&subject.target.root)?,
+                branch: observed,
+                head: subject.head,
+                branch_drift,
             })
         }
         .await;
@@ -786,6 +850,7 @@ impl WorkspaceGit {
             worktree_path: path_text(&subject.target.root)?,
             branch: preparation.requested_branch.clone(),
             head: subject.head,
+            branch_drift: None,
         })
     }
 
@@ -1420,6 +1485,15 @@ impl WorkspaceGit {
         preparation: &WorkspacePreparation,
         deadline: Instant,
     ) -> Result<Subject> {
+        self.subject_inner(preparation, deadline, false).await
+    }
+
+    async fn subject_inner(
+        &self,
+        preparation: &WorkspacePreparation,
+        deadline: Instant,
+        allow_branch_drift: bool,
+    ) -> Result<Subject> {
         let source = self.source(preparation, deadline).await?;
         let target_path = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target_path)?;
@@ -1434,13 +1508,7 @@ impl WorkspaceGit {
                 "workspace registration is duplicate, locked, prunable, or incomplete",
             ));
         }
-        let full_ref = branch_ref(&preparation.requested_branch);
-        if entry.branch.as_deref() != Some(full_ref.as_str()) {
-            return Err(problem(
-                "source_integrity",
-                "registered workspace branch differs from the requested branch",
-            ));
-        }
+        let registered_branch = entry.branch.as_deref();
         let target = self.repository(&path_text(&target_path)?, deadline).await?;
         let registry_root = canonical_root(&path_text(&source.common_dir.join("worktrees"))?)?;
         if target.common_dir != source.common_dir
@@ -1468,11 +1536,31 @@ impl WorkspaceGit {
                 deadline,
             )
             .await?;
-        if branch != full_ref || !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str())
-        {
+        if !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str()) {
             return Err(problem(
                 "source_integrity",
-                "workspace HEAD, branch, or registration disagree",
+                "workspace HEAD or registration head disagree",
+            ));
+        }
+        if registered_branch != Some(branch.as_str()) {
+            return Err(problem(
+                "source_integrity",
+                format!(
+                    "registered branch '{}' differs from observed HEAD branch '{}'",
+                    registered_branch.unwrap_or("<detached>"),
+                    branch
+                ),
+            ));
+        }
+        let full_ref = branch_ref(&preparation.requested_branch);
+        if !allow_branch_drift && branch != full_ref {
+            return Err(problem(
+                "source_integrity",
+                format!(
+                    "workspace branch differs: original '{}' and observed '{}'",
+                    preparation.requested_branch,
+                    branch.strip_prefix("refs/heads/").unwrap_or(&branch)
+                ),
             ));
         }
         Ok(Subject {
@@ -1509,12 +1597,26 @@ impl WorkspaceGit {
         before: &Subject,
         deadline: Instant,
     ) -> Result<()> {
-        let after = self.subject(preparation, deadline).await?;
+        self.confirm_subject_mode(preparation, before, deadline, false)
+            .await
+    }
+
+    async fn confirm_subject_mode(
+        &self,
+        preparation: &WorkspacePreparation,
+        before: &Subject,
+        deadline: Instant,
+        allow_branch_drift: bool,
+    ) -> Result<()> {
+        let after = self
+            .subject_inner(preparation, deadline, allow_branch_drift)
+            .await?;
         if before.source.root != after.source.root
             || before.source.git_dir != after.source.git_dir
             || before.source.common_dir != after.source.common_dir
             || before.target.git_dir != after.target.git_dir
             || before.target.root != after.target.root
+            || before.branch != after.branch
             || before.head != after.head
         {
             return Err(problem(

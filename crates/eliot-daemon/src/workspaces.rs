@@ -539,7 +539,7 @@ impl WorkspaceManager {
                         .and_then(Value::as_bool)
                         == Some(true);
                     let outcome = if reuse {
-                        git.inspect_retained(&current).await
+                        git.inspect_resume_retained(&current).await
                     } else {
                         // A stand records the creation externally before
                         // any Git effect; a refused record dispatches nothing.
