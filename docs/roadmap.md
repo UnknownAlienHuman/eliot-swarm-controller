@@ -503,7 +503,7 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       Antigravity (+73), 9,460 to 9,502 for Claude (+42), 16,412 to 16,482
       for Codex (+70), 13,311 to 13,473 for Muse (+162), and 15,300 to
       15,386 for OpenCode (+86).
-      A private Owner stand matched all five CLI catalogues and three quota readings and completed Claude Haiku, proxied Codex Luna and OpenCode free turns.
+      A private Owner stand matched all five CLI catalogues and three usage-window readings and completed Claude Haiku 5.5, read-only GPT-6 Luna through OpenCodex, and OpenCode DeepSeek V4.1 Flash Free turns.
 - [x] Daemon update preflights a Store snapshot, fences admission, and starts the
       replacement or rolls back on the same schema. Deadline Stops use ordinary
       custody and promptless continuation in parent-first order (#836).
