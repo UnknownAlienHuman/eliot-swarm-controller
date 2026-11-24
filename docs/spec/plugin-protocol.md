@@ -544,6 +544,20 @@ kind/family, timestamp, exact correlations and bounded data. The daemon computes
 canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
+For a planned daemon restart, while holding the same Store writer lock used to
+seal the restart receipt, the daemon records a generation-bound `source.gap` for
+each currently controlled native source. Its `from` is that source's last
+committed cursor and `to` is absent: the boundary covers any buffered native
+bytes that do not commit before the cutoff. It is conservative coverage
+evidence, not proof that bytes were lost. A batch committed before the cutoff
+is represented by the cursor. Afterward, a late `events.put` receives an
+explicit `unavailable` response without a new write attempt and a bounded
+`events_put_planned_restart_cutoff` record with the gap's coverage reference;
+the frame remains unacknowledged and is not replayed. This does not assert
+whether the same batch had committed before its acknowledgement was lost.
+These gaps do not settle a turn, request, or tool outcome. The old reader is
+retired after the receipt.
+
 Codex, Claude, Muse and OpenCode also hold early native facts pending exact
 association in the shared [early-event buffer](../../crates/eliot-plugin/src/event_buffer.rs).
 An unassociated head stays in place. Explicit adapter operations such as removing a

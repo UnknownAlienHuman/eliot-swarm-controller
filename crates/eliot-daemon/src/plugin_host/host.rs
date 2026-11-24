@@ -367,6 +367,7 @@ struct HostState {
     unknown_commands: UnknownCommands,
     progress: watch::Sender<u64>,
     late_batch_causes: Mutex<HashMap<AgentKey, String>>,
+    planned_restart_cutoff: Mutex<Option<String>>,
     running: Mutex<HashMap<AgentKey, RuntimeEntry>>,
     planned_stops: Mutex<HashMap<AgentKey, Arc<Mutex<Option<DeferredLoss>>>>>,
     startup_gate: AsyncMutex<()>,
@@ -502,6 +503,7 @@ impl PluginHost {
                 unknown_commands,
                 progress,
                 late_batch_causes: Mutex::new(HashMap::new()),
+                planned_restart_cutoff: Mutex::new(None),
                 running: Mutex::new(HashMap::new()),
                 planned_stops: Mutex::new(HashMap::new()),
                 startup_gate: AsyncMutex::new(()),
@@ -1440,12 +1442,29 @@ impl PluginHost {
         self.state.running.lock_recover().len()
     }
 
+    /// Exact generations whose native readers are currently owned by this host.
+    /// The Store validates each generation and its committed source owners when
+    /// the planned-restart coverage gaps are written.
+    pub(crate) fn live_source_generations(&self) -> Vec<(String, i64)> {
+        let running = self.state.running.lock_recover();
+        let mut generations = running
+            .keys()
+            .map(|key| (key.id.clone(), key.generation))
+            .collect::<Vec<_>>();
+        generations.sort_unstable();
+        generations
+    }
+
     pub(crate) fn controls_generation(&self, agent: &str, generation: i64) -> bool {
         let key = AgentKey {
             id: agent.to_owned(),
             generation,
         };
         self.state.running.lock_recover().contains_key(&key)
+    }
+
+    pub(crate) fn set_planned_restart_cutoff(&self, cutoff: Option<&str>) {
+        *self.state.planned_restart_cutoff.lock_recover() = cutoff.map(str::to_owned);
     }
 
     pub(crate) async fn resolve_failed_custody(

@@ -377,6 +377,61 @@ impl Store {
         result
     }
 
+    /// Record the exact native input cutoff for a planned daemon restart.
+    /// The restart mutation id makes the boundary stable across retries; each
+    /// gap starts at the source's last committed cursor and covers any native
+    /// bytes that were still buffered when the Store writer was sealed.
+    pub fn record_native_restart_gaps(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        restart_id: &str,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = self.record_native_restart_gaps_inner(agent, generation, restart_id, now);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    fn record_native_restart_gaps_inner(
+        &mut self,
+        agent: &str,
+        generation: i64,
+        restart_id: &str,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        validate_ulid(restart_id)?;
+        let agent_num = parse_agent_id(agent)?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let current = load_agent_by_num(&tx, agent_num)?
+            .ok_or_else(|| Error::new("not_found", "restart gap Agent was not found"))?;
+        if generation <= 0 || current.generation != generation {
+            return Err(Error::new(
+                "stale_generation",
+                "restart gap generation is no longer current",
+            ));
+        }
+        observer::require_controlled(&current)?;
+        if current.is_terminal() {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(Vec::new());
+        }
+        let events = native_exit_gaps_tx(
+            &tx,
+            &current,
+            "planned_restart_native_input_cutoff",
+            now,
+            &format!("host-planned-restart:{restart_id}"),
+            true,
+        )?;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok(events)
+    }
+
     fn record_native_exit_gaps_inner(
         &mut self,
         agent: &str,
@@ -404,7 +459,7 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(Vec::new());
         }
-        let events = native_exit_gaps_tx(&tx, &current, reason, now)?;
+        let events = native_exit_gaps_tx(&tx, &current, reason, now, "host-root-exit", false)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(events)
     }
@@ -456,7 +511,7 @@ impl Store {
         }
         observer::require_controlled(&current)?;
         let mut events = if generation == current.generation && !current.is_terminal() {
-            native_exit_gaps_tx(&tx, &current, reason, now)?
+            native_exit_gaps_tx(&tx, &current, reason, now, "host-root-exit", false)?
         } else {
             Vec::new()
         };
@@ -634,6 +689,8 @@ fn native_exit_gaps_tx(
     current: &Agent,
     reason: &str,
     now: i64,
+    gap_scope: &str,
+    same_id_is_idempotent: bool,
 ) -> Result<Vec<Event>> {
     let agent = current.id.as_str();
     let agent_num = parse_agent_id(agent)?;
@@ -661,7 +718,7 @@ fn native_exit_gaps_tx(
                 "native owner has no committed source state",
             )
         })?;
-        let gap_id = format!("host-root-exit:{agent}:{generation}:{source}");
+        let gap_id = format!("{gap_scope}:{agent}:{generation}:{source}");
         let data = json!({
             "gap_id":gap_id, "agent_id":agent, "generation":generation,
             "source":source, "families":families, "reason":reason,
@@ -675,6 +732,9 @@ fn native_exit_gaps_tx(
         }
         let digest = canonical::digest(&data)?;
         if state.gap_id.as_deref() == Some(gap_id.as_str()) {
+            if same_id_is_idempotent {
+                continue;
+            }
             if state.gap_digest.as_deref() != Some(digest.as_slice())
                 || state.gap_seq.is_none_or(|seq| seq <= 0)
             {

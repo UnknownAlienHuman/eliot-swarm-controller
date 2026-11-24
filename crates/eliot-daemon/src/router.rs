@@ -6866,8 +6866,30 @@ impl Router {
             None
         };
         let result = json!({"state": "applied", "mode": action});
+        if action == ShutdownMode::Restart {
+            // This Store lock is the source-input cutoff: writes already holding
+            // it committed before these cursor-bound gaps; pending or later
+            // frames are covered from the last committed native cursor onward.
+            // Keep the cutoff and optional backup ahead of the seal in one
+            // writer critical section.
+            for (agent, generation) in self.inner.plugin_host.live_source_generations() {
+                let events =
+                    store.record_native_restart_gaps(&agent, generation, &request.id, now_ms())?;
+                self.publish_locked(&events);
+            }
+            self.inner
+                .plugin_host
+                .set_planned_restart_cutoff(Some(&request.id));
+        }
         if request.backup {
-            crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
+            if let Err(error) =
+                crate::update_backup::create(&self.inner.data_root, &request.id, &store)
+            {
+                if action == ShutdownMode::Restart {
+                    self.inner.plugin_host.set_planned_restart_cutoff(None);
+                }
+                return Err(error);
+            }
         }
         let owner = principal_name(principal);
         let payload =
@@ -6894,10 +6916,14 @@ impl Router {
                         &request.id,
                     )
                 {
+                    self.inner.plugin_host.set_planned_restart_cutoff(None);
                     return Err(Error::new(
                         error.code,
                         format!("{}; Store backup cleanup failed: {cleanup}", error.message),
                     ));
+                }
+                if action == ShutdownMode::Restart && !store.is_write_faulted() {
+                    self.inner.plugin_host.set_planned_restart_cutoff(None);
                 }
                 return Err(error);
             }

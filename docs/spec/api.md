@@ -3160,6 +3160,20 @@ SQLite backup next to `eliot.db`, and verifies SQLite integrity and the
 source page count. The restart receipt commits only after the old Store
 connection has been sealed. Confirmed cancellation discards its backup.
 
+Immediately before a planned `restart`, under the Store writer lock, the
+daemon records one generation-bound native `source.gap` per currently
+controlled source, from its last committed cursor with no asserted end cursor.
+This conservatively covers native bytes that do not commit before the cutoff;
+it does not prove that bytes were lost or assign a turn or tool outcome. A late
+`events.put` after the cutoff gets an `unavailable` response without a new
+write attempt and a log entry tied to the gap reference; its frame remains
+unacknowledged, without asserting whether an earlier attempt committed. The online backup is
+created after these gap events so rollback retains them. A backup or receipt
+failure before seal keeps the old Store writable, clears the temporary event
+cutoff, and uses the existing backup cleanup path; any already committed gap
+remains historical coverage evidence. A Store write fault leaves the cutoff
+closed because the seal outcome may be uncertain.
+
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
 both honor `on_restart` and continue eligible Agents with interrupted work,
