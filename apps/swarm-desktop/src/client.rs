@@ -210,56 +210,46 @@ pub async fn cleanup_apply_and_wait(
             tokio::time::sleep(CLEANUP_STATUS_POLL_INTERVAL).await;
         }
         let status: CleanupJobStatus =
-            eliot_daemon::client_call_typed(data_dir, "cleanup.status", &status_request).await?;
+            eliot_daemon::client_call_typed(data_dir, "cleanup.status", &status_request)
+                .await
+                .map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!("cleanup status unavailable: {}", error.user_message()),
+                    )
+                })?;
         if status.id != request.id {
             return Err(Error::new(
                 "source_integrity",
                 "cleanup status returned a different job ID",
             ));
         }
-        let CleanupJobStatus {
-            id: _,
-            state,
-            apply,
-            reason,
-            tally: _,
-        } = status;
-        match state {
-            CleanupJobState::Running => wait = true,
-            CleanupJobState::Completed => {
-                let mut apply = apply.ok_or_else(|| {
-                    Error::new("unknown", "completed cleanup job has no page result")
-                })?;
-                apply.state = Some(CleanupJobState::Completed);
-                return Ok((apply, None));
-            }
-            CleanupJobState::Failed => {
-                let mut apply = apply.ok_or_else(|| {
-                    Error::new("unknown", "failed cleanup job has no page result")
-                })?;
-                apply.state = Some(CleanupJobState::Failed);
-                return Ok((
-                    apply,
-                    Some(format!(
-                        "Cleanup failed: {}",
-                        reason.as_deref().unwrap_or("the job reported failure")
-                    )),
-                ));
-            }
-            CleanupJobState::Interrupted => {
-                let mut apply = apply.ok_or_else(|| {
-                    Error::new("unknown", "interrupted cleanup job has no page result")
-                })?;
-                apply.state = Some(CleanupJobState::Interrupted);
-                return Ok((
-                    apply,
-                    Some(format!(
-                        "Cleanup interrupted: {}",
-                        reason.as_deref().unwrap_or("the job was interrupted")
-                    )),
-                ));
-            }
+        if status.state == CleanupJobState::Running {
+            wait = true;
+            continue;
         }
+        let mut apply = status
+            .apply
+            .filter(|apply| apply.plan_id == request.plan_id)
+            .ok_or_else(|| {
+                Error::new(
+                    "unknown",
+                    "terminal cleanup job has no matching plan result",
+                )
+            })?;
+        apply.state = Some(status.state);
+        let notice = match status.state {
+            CleanupJobState::Failed => Some("Cleanup failed"),
+            CleanupJobState::Interrupted => Some("Cleanup interrupted"),
+            _ => None,
+        };
+        return Ok((
+            apply,
+            notice.map(|notice| match status.reason {
+                Some(reason) => format!("{notice} ({reason})"),
+                None => notice.to_owned(),
+            }),
+        ));
     }
 }
 

@@ -374,10 +374,11 @@ pub fn result_lines(
         })
         .unwrap_or_default();
     let mut lines = vec![format!(
-        "{state}Removed {} ({}) · kept {} · couldn't confirm {}",
+        "{state}Removed {} ({}) · kept {} · failed {} · couldn't confirm {}",
         count("removed"),
         size_words(reply.bytes_reclaimed),
         count("skipped"),
+        count("failed"),
         count("unknown")
     )];
     for item in &reply.items {

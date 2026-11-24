@@ -69,6 +69,7 @@ pub(crate) async fn run_cleanup(
                 project,
                 older_than,
             };
+            request.validate().map_err(Failure::for_mutation)?;
             let reply: CleanupJobStatus =
                 eliot_daemon::client_call_typed(&data, "cleanup.apply_all", &request)
                     .await
