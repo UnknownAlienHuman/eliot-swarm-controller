@@ -124,6 +124,7 @@ impl Router {
                 | "launch.queue"
                 | "timer.get"
                 | "provider.holds"
+                | "settings.read"
                 | "diagnose"
         );
         if !read_only && action.method != "auth.login" {
@@ -228,6 +229,7 @@ impl Router {
             "launch.queue" => self.read_launch_queue(params, principal).await,
             "timer.get" => self.timer_get(params, principal).await,
             "provider.holds" => self.provider_holds(params, principal).await,
+            "settings.read" => self.settings_read(params, principal).await,
             "diagnose" => self.diagnose(params, principal).await,
             _ => Err(Error::new(
                 "internal",
