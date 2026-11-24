@@ -90,12 +90,20 @@ Startup lets Muse resolve the profile for the exact `--model`. Resume uses
 to its provider profile for sessions retained from earlier versions.
 The Contributor model can be hidden from the public picker, so its absence
 does not prevent attempting the exact selector on the native catalogue route.
-Swarm disables auto-update in its owned host process and leaves Contributor
-mode and disclosure consent under the Owner's native configuration.
+Contributor mode and disclosure consent use the Owner's native configuration.
 On 2026-11-24, Muse 1.4.25-R9361.1 preserved the `tbh` profile and still
 returned the base model, both with native settings and with the process
 override `--contributor-mode on`. A qualified Contributor route on this
 release remains unproven.
+
+On Windows the adapter reads the installed launcher's
+`.muse-update-checked-at` before starting an owned host. When the check
+is due, it starts a bounded `muse.cmd --version` child on the installed
+channel and lets the vendor launcher run its background update. The host
+starts independently of the check's outcome. Omitted `cmd` resolves from
+the vendor manifest again on the next launch. The interval comes from the
+daemon's `MUSE_UPDATE_INTERVAL_SECONDS` environment setting, with a default
+of 3600 seconds. Profile environment entries cannot suppress updates.
 
 Model proof comes from the exact session's MSP `log/subscribe` live stream
 (`rawLog`). The adapter checks every successful provider response bound to

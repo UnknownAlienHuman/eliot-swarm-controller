@@ -274,6 +274,7 @@ fn capture_native_store_inputs_inner(
     let credentials = names
         .iter()
         .filter_map(Value::as_str)
+        .filter(|name| !managed_native_update_environment_name(name))
         .filter(|name| {
             (!private_route_selector(name)
                 || (profile_capabilities(profile).config_dir_credential
@@ -3156,6 +3157,13 @@ pub(crate) fn reserved_eliot_environment_name(name: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ELIOT_"))
 }
 
+/// Updater controls are managed outside profiles. In particular, an old
+/// pass_env entry must never suppress the installed vendor's updates.
+pub(crate) fn managed_native_update_environment_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("MUSE_NO_AUTO_UPDATE")
+        || name.eq_ignore_ascii_case("MUSE_UPDATE_INTERVAL_SECONDS")
+}
+
 fn validate_pass_env(
     profile: &str,
     names: &[String],
@@ -3196,7 +3204,7 @@ fn validate_pass_env(
                 "profile_error",
             ));
         }
-        if seen.insert(name.to_owned()) {
+        if !managed_native_update_environment_name(name) && seen.insert(name.to_owned()) {
             out.push(name.to_owned());
         }
     }

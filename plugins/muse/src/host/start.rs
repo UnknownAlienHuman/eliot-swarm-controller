@@ -168,7 +168,7 @@ pub(super) fn prepare_profile(
             )
         })?;
     let TargetEnvironment {
-        variables: mut environment,
+        variables: environment,
         mut secrets,
     } = target_environment(
         params.target_environment.as_ref(),
@@ -180,8 +180,6 @@ pub(super) fn prepare_profile(
         .as_ref()
         .and_then(Value::as_object)
         .and_then(crate::install::model_hold_revision);
-    environment.retain(|(name, _)| !name.eq_ignore_ascii_case("MUSE_NO_AUTO_UPDATE"));
-    environment.push((OsString::from("MUSE_NO_AUTO_UPDATE"), OsString::from("1")));
     secrets.push(initialized.credential.clone());
     // Sandbox posture is fixed at host birth (`muse serve` flags):
     // canonical danger-full-access passes --disable-sandbox, while

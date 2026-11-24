@@ -244,7 +244,9 @@ profiles and routing choices are preserved. An omitted model
 in these profiles requests the native default and retains requested/effective
 readback separately, as for an ad-hoc launch. There is no builtin fake profile.
 Bootstrap detects the installed harnesses and writes profiles with `cmd` omitted.
-Muse follows the launcher-current binary at launch. An empty catalogue can
+Muse follows the launcher-current binary at launch. On Windows the adapter
+also asks the vendor launcher to check for updates when its interval is due.
+The next launch resolves the current binary again. An empty catalogue can
 prevent model selection and is reported by the Muse launch path.
 Before admission, an omitted profile selects the first available ordered role candidate.
 The [routing policy](#routing-policy-s3) governs continuation after a confirmed provider

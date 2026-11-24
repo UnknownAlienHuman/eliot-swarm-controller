@@ -1428,8 +1428,7 @@ fn native_capture(
                     command
                         .args(args)
                         .env_clear()
-                        .envs(crate::router::minimal_plugin_environment())
-                        .env("MUSE_NO_AUTO_UPDATE", "1");
+                        .envs(crate::router::minimal_plugin_environment());
                     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
                     match run_owned_process(
                         command,

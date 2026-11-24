@@ -1,5 +1,7 @@
 mod catalogue;
 mod start;
+#[cfg(windows)]
+mod update;
 
 use crate::{
     events::{EventHandle, EventStatus, TurnFacts, turn_native_error},
@@ -504,6 +506,12 @@ impl MusePlugin {
             Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
         };
         let policy = SecretPolicy::new(secrets.iter());
+        #[cfg(windows)]
+        update::schedule(
+            &initialized.instance_dir,
+            &params.agent_id,
+            &params.command_id,
+        );
         let mut host = match catalogue::CatalogueHost::open(
             &launch,
             Path::new(&initialized.instance_dir),
