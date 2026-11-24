@@ -992,6 +992,10 @@ does not claim a full external workflow.
 Contain owned children before tools run; use absolute deadlines. Drain buffered native
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
+Claude's native stdout queue holds 64 frames. Its event processor waits for
+each Store acknowledgement before moving on. Native queue overflow faults the
+stream. The adapter reports a source gap for the lost coverage. Coverage
+remains unknown if the gap cannot commit.
 
 Use the shared [`retry`](../../crates/eliot-plugin/src/retry.rs) module for readiness
 polls and absolute deadline waits. Adapters translate native resume readback into shared

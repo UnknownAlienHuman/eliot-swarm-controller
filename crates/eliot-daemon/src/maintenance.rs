@@ -480,12 +480,29 @@ async fn run_epochs(
         };
         let rows = report.rows_deleted();
         let path = data_root.join("eliot.db");
-        let result = tokio::task::spawn_blocking(move || Store::checkpoint_retention(&path)).await;
+        let queued_at = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || {
+            let started_at = std::time::Instant::now();
+            Store::checkpoint_retention(&path).map(|stats| (stats, started_at.elapsed()))
+        })
+        .await;
         match result {
-            Ok(Ok((frames, checkpointed, busy))) => {
+            Ok(Ok(((frames, checkpointed, busy), duration))) => {
                 report.wal_frames = frames;
                 report.checkpointed_frames = checkpointed;
                 report.checkpoint_busy = busy;
+                logging::record_debug(
+                    policy,
+                    "daemon.wal_checkpoint",
+                    &[("method", "retention.checkpoint")],
+                    &[
+                        ("frames", frames as u64),
+                        ("checkpointed", checkpointed as u64),
+                        ("busy", u64::from(busy)),
+                        ("duration_us", duration.as_micros() as u64),
+                        ("elapsed_us", queued_at.elapsed().as_micros() as u64),
+                    ],
+                );
             }
             Ok(Err(error)) => {
                 logging::record(
