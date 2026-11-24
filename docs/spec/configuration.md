@@ -2143,10 +2143,13 @@ roots, and cannot contain those roots. Before canonicalization or admission,
 every existing component of the supplied path is checked for links and Windows
 reparse points, including ancestors of a nonexistent suffix. The daemon validates
 private directory ownership, rejects links/reparse traversal and creates a new
-`aN` child exclusively for an Owner `launch` with `chat:true` and no workspace.
+`aN-<lowercase-launch-id>` child exclusively for an Owner `launch` with
+`chat:true` and no workspace.
 Native stores and owner configuration are never created there by Eliot. Changing
 this setting affects future admissions; existing chat Agents retain their exact
-workspace and directory identity. Cleanup uses that registered identity and the
-existing artifact plan/apply path before Agent record deletion. A chat directory
+workspace and directory identity. Resume advances the unchanged chat directory's
+registered cleanup binding with its Agent generation. Cleanup uses that identity
+through artifact plan/apply before Owner deletion when the directory should be
+removed. A chat directory
 is kept while another Agent record references its workspace, including a stopped
 child; apply rechecks this under the Store lock before removing the directory.

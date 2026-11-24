@@ -333,6 +333,28 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
+    if agent.chat
+        && let Some(workspace) = agent.workspace.as_deref()
+    {
+        db!(tx.execute(
+            "UPDATE artifacts
+             SET generation = ?1, body = json_set(body, '$.generation', ?1)
+             WHERE agent = ?2 AND generation = ?3 AND path = ?4
+               AND json_extract(body, '$.agent') = ?5
+               AND json_extract(body, '$.generation') = ?3
+               AND json_extract(body, '$.path') = ?4
+               AND json_extract(body, '$.kind') = 'other'
+               AND json_extract(body, '$.purpose') = 'Swarm chat directory'
+               AND json_extract(body, '$.state') = 'registered'",
+            params![
+                next_generation,
+                agent_num,
+                old_generation,
+                workspace,
+                agent.id
+            ],
+        ));
+    }
     Store::inherit_handoff_lineage_tx(tx, agent_num, old_generation, next_generation)?;
     let reason = if restart_resume {
         eliot_core::api::GenerationReason::RestartResume
