@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = OWNER_INBOX_LOOKUPS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = ATTENTION_NATIVE_TURN_ACTIVITY_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -21,6 +21,7 @@ const CHECKPOINT_RESTORE_CUSTODY_VERSION: i64 = 128;
 const FAILED_CUSTODY_VERSION: i64 = 129;
 const CHAT_ARTIFACT_RESUME_VERSION: i64 = 130;
 const OWNER_INBOX_LOOKUPS_VERSION: i64 = 131;
+const ATTENTION_NATIVE_TURN_ACTIVITY_VERSION: i64 = 132;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -127,6 +128,24 @@ impl Store {
                    WHERE verb = 'resume' AND principal = 'owner'
                      AND state IN ('rejected', 'failed');
                  INSERT INTO schema_migrations(version) VALUES (131);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < ATTENTION_NATIVE_TURN_ACTIVITY_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX attention_native_turn_activity
+                 ON events(agent, generation, json_extract(data, '$.turn_id'), seq, ts, source)
+                 WHERE native_id IS NOT NULL
+                   AND source NOT IN ('daemon', 'os', 'git', 'workspace_process')
+                   AND kind IN ('turn.started', 'turn.completed', 'message.completed',
+                                'tool.started', 'tool.completed', 'request.opened',
+                                'request.resolved', 'request.closed');
+                 INSERT INTO schema_migrations(version) VALUES (132);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
