@@ -303,25 +303,27 @@ impl ModelCatalogue {
                     "plugin session catalogue did not bind to the requested live Agent generation",
                 ));
             }
-            if !value["default"].is_null() {
-                return Err(Error::new(
-                    "source_integrity",
-                    "plugin session catalogue names an unexpected default",
-                ));
-            }
             "session"
         } else {
-            match value.get("provenance") {
-                Some(Value::String(text)) if text == "preview" => "preview",
-                None => "canonical",
-                Some(provenance) => {
-                    degraded = provenance != "canonical";
+            match value["provenance"].as_str() {
+                Some("preview") => "preview",
+                Some("session") => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "dedicated model reader returned session provenance",
+                    ));
+                }
+                Some("canonical") => "canonical",
+                _ => {
+                    degraded = value.get("provenance").is_some();
                     "canonical"
                 }
             }
         };
         let default = match value.get_mut("default").map(Value::take) {
-            Some(Value::String(text)) => Some(text).filter(|text| !text.trim().is_empty()),
+            Some(Value::String(text)) if session.is_none() => {
+                Some(text).filter(|text| !text.trim().is_empty())
+            }
             None | Some(Value::Null) => None,
             Some(_) => {
                 degraded = true;

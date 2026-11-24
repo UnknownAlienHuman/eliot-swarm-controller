@@ -2536,8 +2536,10 @@ binds the exact Agent and generation. OpenCode's optional metadata supplements
 only the IDs returned by its primary catalogue. The read skips rows with unusable
 IDs and discards malformed optional fields on otherwise usable rows. The `note`
 marks a partial catalogue when either read discards malformed metadata. A
-dedicated read uses canonical provenance for an unknown label. A live read
-requires `session` provenance and the exact generation binding.
+dedicated read uses canonical provenance for an unknown label and refuses
+`session` with `source_integrity`. A live read requires `session` provenance and
+the exact generation binding. A non-null default in a live session is ignored
+and marks the result partial.
 Public `scope` names the profile and route without
 private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`,
 `stale` and a nonsecret `credential` reference. Native model IDs remain verbatim.
