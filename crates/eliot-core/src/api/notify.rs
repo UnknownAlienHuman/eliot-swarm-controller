@@ -29,7 +29,10 @@ impl UserEventCommand {
     }
 
     pub fn validate_admission(&self) -> Result<()> {
-        self.event()?;
+        match self {
+            Self::Notify(args) => args.validate()?,
+            Self::Emit(args) | Self::AttentionEmit(args) => args.validate()?,
+        }
         match self {
             Self::Emit(args)
                 if matches!(
