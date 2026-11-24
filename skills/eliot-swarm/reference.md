@@ -11,6 +11,8 @@ readback. Add `--metadata` to result when you need the current Agent metadata.
 
 Use `wait_ms:0` if you can finish your turn and take the completion wake. To stay in your turn, launch with a bounded wait and continue with the same `id` only if the result is `still_running`. Read `status`, `final_text` and available `facts`. Use `agent.result` with the exact Agent, generation and turn if the text is truncated.
 
+Use `swarm.wait` for a bounded wait on exact, already known child commands or turns. Use `agent.patch_digest` to review an Agent's changes and `usage.summary` for bounded usage totals.
+
 ## Mail
 
 `mail.send` queues by default; `to` accepts one Agent id or a list. Set `wake:false` to defer delivery to the recipient's next natural turn. To wait for an answer, send with `mail.send`, then call `mail.inbox` with `reply_to` set to the exact question delivery id. A reply sets `reply_to_delivery` to that id, which wakes the asker.
@@ -19,7 +21,7 @@ Inline `Mail from` entries include sender, topic, delivery id and body. `Mail fr
 
 ## Insertions
 
-`[Swarm note from {sender}] This adds to your task and does not replace it.` is the first line. The next block quotes the note. Swarm picks an available native delivery point for `soonest`. If an unclaimed note misses its turn, Swarm moves it to your next input when possible. The sender can use `inject.wait` or read the command by its returned id. A Goal check continuation reports the check exit code and the available diagnostics.
+`[Swarm note from {sender}] This adds to your task and does not replace it.` is the first line. The next block quotes the note. Swarm picks an available native delivery point for `soonest`, such as a supported hook or Codex `turn/steer`. If an unclaimed note misses its turn, Swarm moves it to your next input when possible. The sender can use `inject.wait` or read the command by its returned id. A Goal check continuation reports `Goal check {command} finished with exit {code}.` or `no exit code` and includes the available diagnostics.
 
 ## Shared state and work areas
 
