@@ -126,8 +126,6 @@ impl Store {
                 "CREATE INDEX owner_inbox_resume_failures ON commands(id, updated_at)
                    WHERE verb = 'resume' AND principal = 'owner'
                      AND state IN ('rejected', 'failed');
-                 CREATE INDEX owner_inbox_switch_commands ON switch_checkout_owners(switch_command)
-                   WHERE switch_command IS NOT NULL;
                  INSERT INTO schema_migrations(version) VALUES (131);",
             )
             .map_err(sql_error)?;
