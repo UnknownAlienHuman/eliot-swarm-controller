@@ -97,6 +97,7 @@ pub(super) fn provider_response_withheld_event_tx(
     let mut data = json!({
         "turn_id": turn_id,
         "task_command": task_command,
+        "profile": agent.profile,
         "route_key": core::provider_response_route_key(&agent.profile_snapshot),
         "terminal_source": terminal_source,
     });

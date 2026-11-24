@@ -90,7 +90,19 @@ pub(super) struct HandoffRoute {
     pub(super) allowed: Option<Vec<String>>,
 }
 
-pub(super) fn handoff_waiting_message(error: &Error, reason: HandoffReason) -> Option<String> {
+pub(super) fn handoff_waiting_message(
+    error: &Error,
+    reason: HandoffReason,
+) -> Option<(String, bool)> {
+    if error.code == "provider_route_withheld" {
+        return Some(((*error.message).clone(), true));
+    }
+    let blocked = error.routing.as_deref().is_some_and(|decision| {
+        decision
+            .skipped
+            .iter()
+            .any(|skip| skip.reason == RouteSkipReason::ProviderWithheld)
+    });
     let message = if let Some(decision) = error.routing.as_deref() {
         let skipped = decision
             .skipped
@@ -108,11 +120,12 @@ pub(super) fn handoff_waiting_message(error: &Error, reason: HandoffReason) -> O
     } else {
         return None;
     };
-    Some(if reason == HandoffReason::ProviderResponseWithheld {
+    let message = if reason == HandoffReason::ProviderResponseWithheld {
         format!("Provider withheld the response. {message}")
     } else {
         message
-    })
+    };
+    Some((message, blocked))
 }
 
 fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<String>> {
@@ -175,6 +188,27 @@ impl RoutePreflight {
 }
 
 impl Router {
+    pub(super) async fn check_growth_switch_route(&self, source: &Agent) -> Result<()> {
+        let withheld = self
+            .inner
+            .store
+            .lock()
+            .await
+            .withheld_provider_routes(source, now_ms())?;
+        let key = eliot_core::provider_response_route_key(&source.profile_snapshot)
+            .unwrap_or_else(|| eliot_core::provider_profile_refusal_marker(&source.profile));
+        if withheld.contains(&key) {
+            return Err(Error::new(
+                "provider_route_withheld",
+                format!(
+                    "Preset {} withheld a response for this task and is temporarily ineligible",
+                    source.profile
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// `routing.preview`: run the admission selection for `role` without a
     /// command. Nothing is admitted, frozen or reserved; the next launch
     /// evaluates the candidates again and may decide differently.
@@ -425,6 +459,12 @@ impl Router {
             prefer_candidate_order: true,
             provider_authority: Some(authority),
             provider_source: Some(source.profile_snapshot.clone()),
+            withheld_provider_routes: self
+                .inner
+                .store
+                .lock()
+                .await
+                .withheld_provider_routes(source, now_ms())?,
             ..RoutePreflight::default()
         };
         preflight.held_accounts.insert(
@@ -527,7 +567,11 @@ impl Router {
         if route.reason != HandoffReason::SessionLost || source.state != AgentState::Lost {
             skipped.push(RouteSkip {
                 profile: source.profile.clone(),
-                reason: RouteSkipReason::ProviderFailure,
+                reason: if route.reason == HandoffReason::ProviderResponseWithheld {
+                    RouteSkipReason::ProviderWithheld
+                } else {
+                    RouteSkipReason::ProviderFailure
+                },
                 quota_status: RouteQuotaStatus::Unknown,
             });
         }
@@ -570,7 +614,7 @@ impl Router {
             .store
             .lock()
             .await
-            .withheld_provider_routes(source)?;
+            .withheld_provider_routes(source, now_ms())?;
         let mut preflight = RoutePreflight {
             provider_switch: true,
             prefer_candidate_order: route.role.is_none(),

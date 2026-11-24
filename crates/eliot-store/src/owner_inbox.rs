@@ -862,12 +862,14 @@ fn project_handoffs(
     let mut stmt = projection_query(
         db,
         "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message'),
-                json_extract(e.data,'$.reason')
+                json_extract(e.data,'$.reason'),
+                COALESCE(json_extract(e.data,'$.withheld_routes_blocked'),0)
          FROM events e INDEXED BY events_kind
          JOIN agents a ON a.id = e.agent AND a.generation = e.generation
          WHERE e.kind = 'handoff.waiting' AND a.archived = 0
            AND NOT EXISTS(SELECT 1 FROM agent_successors s WHERE s.agent = a.id)
-           AND ((json_extract(e.data,'$.reason') = 'session_lost' AND a.state IN ('lost','failed'))
+           AND ((json_extract(e.data,'$.withheld_routes_blocked') = 1 AND a.state IN ('idle','lost','failed'))
+                OR (json_extract(e.data,'$.reason') = 'session_lost' AND a.state IN ('lost','failed'))
                 OR (json_extract(e.data,'$.reason') = 'provider_hold' AND a.state = 'idle'
                     AND EXISTS(SELECT 1 FROM provider_holds h
                         WHERE h.kind IN ('quota','rate_limit')
@@ -909,13 +911,14 @@ fn project_handoffs(
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
                 r.get::<_, String>(5)?,
+                r.get::<_, bool>(6)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (seq, since, agent, generation, message, reason) = row.map_err(sql_error)?;
+        let (seq, since, agent, generation, message, reason, blocked) = row.map_err(sql_error)?;
         let inspect = action("inspect", "agent.get", json!({"id":format!("a{agent}")}));
-        let (choices, instructions) = if reason == "provider_response_withheld" {
+        let (choices, instructions) = if reason == "provider_response_withheld" || blocked {
             (
                 vec![
                     inspect,

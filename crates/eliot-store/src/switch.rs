@@ -385,18 +385,14 @@ fn require_switch_caller(
     hierarchy::caller_may_command(tx, &caller, &source)
 }
 
-/// The exact check for a successor nobody with Owner authority chose by hand.
-/// Runs inside the caller's switch transaction, so the withheld-route
-/// evidence it reads is the same committed state that admits the switch.
-fn require_handoff_bounds(
+fn require_unwithheld_route(
     tx: &Connection,
     source: &Agent,
     successor: &Value,
-    workspace: Option<&str>,
     profile: Option<&str>,
-    requested_by: Option<&str>,
+    now: i64,
 ) -> Result<()> {
-    let withheld = automatic::withheld_provider_routes(tx, source)?;
+    let withheld = automatic::withheld_provider_routes(tx, source, now)?;
     let route_withheld =
         core::provider_response_route_key(successor).is_some_and(|route| withheld.contains(&route));
     let profile_withheld = profile
@@ -407,6 +403,18 @@ fn require_handoff_bounds(
             "successor resolved to a provider route that withheld a response for this task",
         ));
     }
+    Ok(())
+}
+
+/// The exact authority check for a successor nobody with Owner authority chose by hand.
+fn require_handoff_bounds(
+    tx: &Connection,
+    source: &Agent,
+    successor: &Value,
+    workspace: Option<&str>,
+    profile: Option<&str>,
+    requested_by: Option<&str>,
+) -> Result<()> {
     if let Some(reason) = core::handoff_authority_refusal(&source.profile_snapshot, successor) {
         return Err(Error::new(
             "not_allowed",
@@ -1597,6 +1605,7 @@ impl Store {
                 source_checkout_root,
                 source_checkout_key,
                 provider_failure,
+                profile_authority,
                 continuation,
                 requested_by,
                 ..
@@ -1643,6 +1652,19 @@ impl Store {
                 )
             })?;
             require_switch_source_exit(&tx, id, source_stop, &source)?;
+            if continuation.is_some()
+                || requested_by.is_some()
+                || provider_failure.is_some()
+                || profile_authority.is_some()
+            {
+                require_unwithheld_route(
+                    &tx,
+                    &agent,
+                    &request.args["profile_snapshot"],
+                    request.args.get("profile").and_then(Value::as_str),
+                    now,
+                )?;
+            }
             if continuation.is_some() || requested_by.is_some() {
                 require_handoff_bounds(
                     &tx,
@@ -1909,6 +1931,7 @@ impl Store {
                 target_checkout_root,
                 target_checkout_key,
                 provider_failure,
+                profile_authority,
                 continuation,
                 requested_by,
                 ..
@@ -1943,6 +1966,19 @@ impl Store {
                     );
                     let (source, _) =
                         source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
+                    if continuation.is_some()
+                        || requested_by.is_some()
+                        || provider_failure.is_some()
+                        || profile_authority.is_some()
+                    {
+                        require_unwithheld_route(
+                            &tx,
+                            &source,
+                            &destination.profile_snapshot,
+                            Some(destination.profile.as_str()),
+                            now,
+                        )?;
+                    }
                     if let Some(failure) = provider_failure {
                         let stop = source_stop_command.as_deref().ok_or_else(|| {
                             Error::new(

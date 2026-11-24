@@ -18,6 +18,7 @@ const HELD_SCAN_LIMIT: i64 = 256;
 const LOST_SCAN_LIMIT: i64 = 64;
 const WITHHELD_SCAN_LIMIT: i64 = 64;
 const WITHHELD_ROUTE_HISTORY_LIMIT: i64 = 32;
+const WITHHELD_ROUTE_TTL_MS: i64 = 60 * 60 * 1_000;
 const MAX_SWITCHES_PER_TASK: i64 = 3;
 type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
@@ -54,6 +55,7 @@ fn lineage_for(
 pub(super) fn withheld_provider_routes(
     connection: &Connection,
     source: &Agent,
+    now: i64,
 ) -> Result<HashSet<String>> {
     let agent = parse_agent_id(&source.id)?;
     let lineage = lineage_for(connection, agent, source.generation)?
@@ -63,37 +65,49 @@ pub(super) fn withheld_provider_routes(
     // snapshot while that exact generation is still the Agent's current one.
     let mut statement = connection
         .prepare_cached(
-            "SELECT MAX(json_extract(e.data, '$.route_key')),
+            "WITH generations(agent,generation) AS (
+                 SELECT agent,generation FROM handoff_task_lineages WHERE lineage_agent=?1
+                 UNION SELECT ?2,?3
+             )
+             SELECT MAX(json_extract(e.data, '$.route_key')),
                     CASE WHEN MAX(json_extract(e.data, '$.route_key')) IS NULL
                          THEN a.profile_snapshot END,
-                    a.profile
-             FROM events e
-             LEFT JOIN handoff_task_lineages l
-                    ON l.agent=e.agent AND l.generation=e.generation
+                    COALESCE(MAX(json_extract(e.data, '$.profile')), a.profile)
+             FROM generations g
+             JOIN events e INDEXED BY events_agent ON e.agent=g.agent AND e.generation=g.generation
              LEFT JOIN agents a ON a.id=e.agent AND a.generation=e.generation
-             WHERE e.kind='provider.response_withheld' AND e.source='daemon'
-               AND ((l.lineage_agent=?1)
-                    OR (l.agent IS NULL AND e.agent=?1))
+             WHERE e.kind='provider.response_withheld' AND e.source='daemon' AND e.ts>=?4
              GROUP BY e.agent, e.generation
-             ORDER BY MAX(e.seq) DESC LIMIT ?2",
+             ORDER BY MAX(e.seq) DESC LIMIT ?5",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(params![lineage, WITHHELD_ROUTE_HISTORY_LIMIT], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })
+        .query_map(
+            params![
+                lineage,
+                agent,
+                source.generation,
+                now.saturating_sub(WITHHELD_ROUTE_TTL_MS),
+                WITHHELD_ROUTE_HISTORY_LIMIT
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
         .map_err(sql_error)?;
     for row in rows {
         let (key, legacy_snapshot, profile) = row.map_err(sql_error)?;
-        routes.extend(profile.map(|name| core::provider_profile_refusal_marker(&name)));
-        routes.extend(key.or_else(|| {
+        let key = key.or_else(|| {
             let snapshot = serde_json::from_str(&legacy_snapshot?).ok()?;
             core::provider_response_route_key(&snapshot)
-        }));
+        });
+        routes.extend(
+            key.or_else(|| profile.map(|name| core::provider_profile_refusal_marker(&name))),
+        );
     }
     Ok(routes)
 }
@@ -210,9 +224,9 @@ fn insert_lineage_generation_tx(
 }
 
 impl Store {
-    pub fn withheld_provider_routes(&self, source: &Agent) -> Result<HashSet<String>> {
+    pub fn withheld_provider_routes(&self, source: &Agent, now: i64) -> Result<HashSet<String>> {
         self.ensure_committed_reads()?;
-        withheld_provider_routes(&self.connection, source)
+        withheld_provider_routes(&self.connection, source, now)
     }
 
     /// Carry one task's continuation lineage across a committed switch.
@@ -985,6 +999,7 @@ impl Store {
         &mut self,
         candidate: &AutomaticHandoff,
         message: &str,
+        withheld_routes_blocked: bool,
         now: i64,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
@@ -1004,6 +1019,7 @@ impl Store {
                     "reason": candidate.reason,
                     "kind": candidate.kind,
                     "message": core::bound_chars(message, 512),
+                    "withheld_routes_blocked": withheld_routes_blocked,
                 }),
             )?;
             commit_transaction(tx, &self.write_faulted)?;

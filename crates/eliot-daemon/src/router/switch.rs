@@ -336,6 +336,9 @@ impl Router {
                     .await?;
                 Some((name, launch.args["profile_choice"].take(), identity))
             } else {
+                if profile_authority.is_some() {
+                    self.check_growth_switch_route(&source).await?;
+                }
                 None
             };
             Ok::<_, Error>((provider_route, owner_automation))
@@ -355,8 +358,9 @@ impl Router {
                 if let Ok(change) = store.fail_switch_preparation(id, &error, &policy, now_ms()) {
                     self.publish_locked(&change.events);
                 }
-                if let Some((reason, kind)) = reason_kind
-                    && let Some(message) = routing::handoff_waiting_message(&error, reason)
+                let (reason, kind) = reason_kind.unwrap_or((HandoffReason::Routing, None));
+                if let Some((message, blocked)) = routing::handoff_waiting_message(&error, reason)
+                    && (reason_kind.is_some() || blocked)
                 {
                     let candidate = eliot_store::AutomaticHandoff {
                         agent: source,
@@ -365,7 +369,8 @@ impl Router {
                         held_since: None,
                         withheld_event_seq: None,
                     };
-                    if let Ok(events) = store.record_handoff_waiting(&candidate, &message, now_ms())
+                    if let Ok(events) =
+                        store.record_handoff_waiting(&candidate, &message, blocked, now_ms())
                     {
                         self.publish_locked(&events);
                     }

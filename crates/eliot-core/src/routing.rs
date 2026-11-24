@@ -231,13 +231,7 @@ pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
                 .pointer("/pass_env_values/CODEX_HOME")
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
-                .map(crate::workspace_path_key);
-            // Without a frozen login home or an account, every such profile
-            // would share one key. That identity is unknown, so it must not
-            // match (or block) unrelated routes. Profile-name refusal covers it.
-            if login_home.is_none() && account.is_none() {
-                return None;
-            }
+                .map(crate::workspace_path_key)?;
             serde_json::json!(["codex_chatgpt", account, login_home])
         }
     };
