@@ -159,12 +159,12 @@ attachment cannot issue either native stop or other control operations.
 
 The [automatic background-process wake](automation.md#automatic-background-process-wake)
 uses a fresh, complete custody snapshot. A candidate is a running `child` of the
-Agent generation. Its OS start time (Unix ms) falls inside a native tool
-call window of the completing turn. Swarm also requires direct launch evidence from
-the recorded tool command and OS argv: the process runs the command, or its immediate
-parent is the command's shell runner. A known non-shell intermediary rules out the
-candidate, because that process owns its descendants. The shell names identify command
-interpreters, not build products or daemons.
+Agent generation whose live process tree contains a launch from a native tool call
+of the completing turn. The launch's OS start time (Unix ms) must fall inside the
+call's window. Swarm compares the recorded tool command with the process's argv or
+the full command text of its shell wrapper. Each parent edge to that launch must
+connect live identities in the same custody. This includes ancestors such as Cargo
+or npm and descendants started after the tool call returned.
 
 Codex and Claude report their own tool start and end times (`native_at_ms`). When
 both edges are native, a helper they start after the call ended is outside the
@@ -174,24 +174,27 @@ call uses commit times: OpenCode, Muse and Antigravity, or a frame without a nat
 time. Its lower bound is one second further below the `tool.started` commit. Commit
 lag has no fixed bound, so under heavy Store load a job spawned earlier than that
 margin is missed, and the window can include starts between tool exit and
-`tool.completed` commit. Those starts still need direct launch evidence. The wake
+`tool.completed` commit. Those starts still need launch evidence. The wake
 row records the `tool_time_basis` (`native` or `commit`). A call with no recorded end covers one
 second after its start, because a harness starts its own helpers at turn end.
 
 A `tool.started` fact with `native_background` declares a harness-owned background
 task. A start with `native_auto_background` declares the same when the call has
-no `tool.completed` in its originating turn. A process attributed to an open native
-background task waits for the harness's own wake. For `native_background`
+no `tool.completed` in its originating turn. An open native background task blocks
+arming when its window contains the candidate's start, even if another window supplies
+launch evidence. For `native_background`
 tasks, `tool.background_ended` closes the task window and allows another check for
-directly launched survivors. An auto-backgrounded call with `native_wake_scope: "process_tree"`
+attached survivors. An auto-backgrounded call with `native_wake_scope: "process_tree"`
 also covers descendants of processes bound exclusively to that call. The harness's
 wake still covers that tree after the task ends (#916).
 
-On Windows custody is the Agent's Job, so every member descends from the session
-and a parent chain may break at an exited launcher, as a detached job's does. A
-survivor without a visible launcher must itself match the recorded tool command. On
-Linux custody is a process group, so the exact chain (at most 16 links) must reach
-the live `harness`. Neither chain may pass through the `plugin`. A candidate must
+On Windows the Agent's Job can retain processes after their parents exit. The
+live chain stops at a missing, exited or reused parent. An explicitly started
+survivor can still match the recorded invocation, including a command inside an
+exited shell wrapper. A detached helper with no matching launch in its live chain
+cannot arm from Job membership alone. On Linux custody is a process group, so the
+chain (at most 16 links) must also reach the live `harness`. Neither chain may pass
+through the `plugin`. A candidate must
 also not be harness-owned: console hosts, harness runtimes, language
 servers, or Swarm or configured MCP servers. A configured MCP server matches by its
 program and arguments, never by a generic launcher name such as `npx` or `node`.
@@ -206,9 +209,8 @@ exit code is always unknown.
 
 Known limits:
 
-- If a launcher exits before observation, Swarm needs the shell command or a literal
-  leading invocation to match the survivor's argv. Missing or truncated command facts,
-  shell expansions and commands hidden in scripts may leave a survivor unattributed.
+- Missing or truncated command facts, shell expansions and commands hidden in scripts
+  may leave a survivor unattributed.
 - The substring server exclusions in `is_harness_owned_process` can exclude a
   wrapped command such as `cargo test -p eliot-mcp`.
 - A survivor whose Claude background task ends during a later turn is not woken,

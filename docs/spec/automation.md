@@ -960,12 +960,12 @@ For [#879](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/87
 while a background task it launched is still running. When a `turn.completed` with outcome
 `success` or `failure` commits, the note worker freshly samples that generation's
 custody and picks one top-level [candidate](monitoring.md#background-process-wake-candidates)
-directly launched by a native tool call of that completing turn: the first process still
-running from the newest such call. A compiler-cache server, build daemon or language
-server spawned indirectly by a build tool is not a task the Agent launched. A process
-started outside the completing turn's tool calls, such as a harness notify helper,
-cannot arm. While the harness still runs a call as its own background task, Swarm
-leaves the wake to the harness. The
+still attached to a native tool launch from that completing turn: the first process still
+running from the newest such call. An attached tree may include a build tool or package
+manager. When a helper's launcher exits, a surviving compiler-cache server, build daemon
+or language server needs its own explicit launch evidence to arm. A harness notify helper
+at turn end has no such binding. While an overlapping window belongs to a harness-owned
+background task, Swarm leaves the wake to the harness. The
 [candidate rules](monitoring.md#background-process-wake-candidates) use the
 adapter's task and wake-scope facts to determine whether a survivor can arm when
 `tool.background_ended` commits. Swarm retains one `waiting`

@@ -1196,16 +1196,8 @@ impl PinnedProcess {
     }
 }
 
-pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
-    if pid == 0 {
-        return None;
-    }
-    // SAFETY: read-only query rights; the wrapper closes the handle.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return None;
-    }
-    let process = QueryHandle(process);
+pub(crate) fn inspect_process_node(pid: u32, start_time: u64) -> Option<super::ProcessNodeInfo> {
+    let process = verified_process(pid, start_time, 0).ok()?;
     let parent_pid = process_parent_pid(process.0);
     let image_path = process_image_path(process.0);
     let command_line = process_command_line(process.0);
@@ -1218,6 +1210,7 @@ pub(crate) fn inspect_process_node(pid: u32) -> Option<super::ProcessNodeInfo> {
     }
     Some(super::ProcessNodeInfo {
         parent_pid,
+        process_group: None,
         image_path,
         command_line,
         argv,
