@@ -27,3 +27,10 @@ BEGIN
     UPDATE goals SET repeat_alert_epoch = NEW.revision WHERE agent = NEW.agent AND mode = NEW.mode;
     DELETE FROM repeat_failure_alerts WHERE goal_agent = NEW.agent AND goal_mode = NEW.mode;
 END;
+
+CREATE TRIGGER repeat_failure_agent_ended AFTER UPDATE OF state, generation ON agents
+WHEN NEW.generation <> OLD.generation
+ OR (NEW.state IN ('stopped','failed','lost') AND OLD.state NOT IN ('stopped','failed','lost'))
+BEGIN
+    DELETE FROM repeat_failure_alerts WHERE goal_agent = NEW.id;
+END;

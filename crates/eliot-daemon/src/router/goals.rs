@@ -496,8 +496,10 @@ impl Router {
                 now_ms(),
             )?;
             if store
-                .goal_get(&request.agent, request.mode.as_str())?
-                .is_some_and(|current| current.revision == view.revision)
+                .goal_get(&request.agent, request.mode.as_str())
+                .is_ok_and(|current| {
+                    current.is_some_and(|current| current.revision == view.revision)
+                })
             {
                 self.reset_goal_repeat_failures(&view);
             }
@@ -528,8 +530,10 @@ impl Router {
                 now_ms(),
             )?;
             if store
-                .goal_get(&request.agent, request.mode.as_str())?
-                .is_some_and(|current| current.revision == view.revision)
+                .goal_get(&request.agent, request.mode.as_str())
+                .is_ok_and(|current| {
+                    current.is_some_and(|current| current.revision == view.revision)
+                })
             {
                 self.reset_goal_repeat_failures(&view);
             }
@@ -1101,7 +1105,6 @@ impl Router {
                     && event.generation == Some(goal.generation)
                     && event.data["revision"].as_i64() == Some(goal.revision)
                 {
-                    drop(store);
                     self.note_goal_failure(
                         principal,
                         &goal,
@@ -1175,36 +1178,36 @@ impl Router {
                 self.reset_goal_repeat_failures(&result.view);
             }
             self.publish_locked(&result.events);
+            if !result.events.is_empty() {
+                if let Some(check) = &commit.check
+                    && let Some(exit_code) = check.exit_code.filter(|code| *code != 0)
+                {
+                    self.note_goal_failure(
+                        principal,
+                        &result.view,
+                        "check_exit",
+                        &exit_code.to_string(),
+                        &format!("Check exited with code {exit_code}"),
+                        check.output_digest.as_deref(),
+                    );
+                } else if let Some(decision) = &commit.decision {
+                    let reason = match decision {
+                        GoalRoundDecision::Block(reason) => reason,
+                        GoalRoundDecision::RetryCheck => CHECK_SPAWN_RETRYABLE,
+                        GoalRoundDecision::RetryCompletion(reason) => reason,
+                    };
+                    self.note_goal_failure(
+                        principal,
+                        &result.view,
+                        "round",
+                        reason,
+                        commit.observation.as_deref().unwrap_or(reason),
+                        None,
+                    );
+                }
+            }
             result
         };
-        if !result.events.is_empty() {
-            if let Some(check) = &commit.check
-                && let Some(exit_code) = check.exit_code.filter(|code| *code != 0)
-            {
-                self.note_goal_failure(
-                    principal,
-                    &result.view,
-                    "check_exit",
-                    &exit_code.to_string(),
-                    &format!("Check exited with code {exit_code}"),
-                    check.output_digest.as_deref(),
-                );
-            } else if let Some(decision) = &commit.decision {
-                let reason = match decision {
-                    GoalRoundDecision::Block(reason) => reason,
-                    GoalRoundDecision::RetryCheck => CHECK_SPAWN_RETRYABLE,
-                    GoalRoundDecision::RetryCompletion(reason) => reason,
-                };
-                self.note_goal_failure(
-                    principal,
-                    &result.view,
-                    "round",
-                    reason,
-                    commit.observation.as_deref().unwrap_or(reason),
-                    None,
-                );
-            }
-        }
         // The escalation configure was admitted first and is scheduled
         // first; the settings lane keeps the continuation behind it.
         if let Some(escalation) = &result.escalation

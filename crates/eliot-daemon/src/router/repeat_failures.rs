@@ -174,6 +174,9 @@ impl RepeatFailures {
             goal,
             message: None,
         });
+        if observed_at.saturating_add(quiet_ms) <= pending.last_observed_at {
+            return;
+        }
         if observed_at >= pending.last_observed_at.saturating_add(quiet_ms) {
             pending.first_observed_at = observed_at;
             pending.message = None;

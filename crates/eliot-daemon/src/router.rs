@@ -560,15 +560,15 @@ impl Router {
         let result = self
             .handle_authorized(method, params, principal, context)
             .await;
-        if method != "command.submit" {
-            if let Err(error) = &result {
-                self.note_rpc_failure(
-                    log_principal,
-                    discovery::canonical_method(method).unwrap_or("unsupported"),
-                    remote.as_ref(),
-                    error,
-                );
-            }
+        if method != "command.submit"
+            && let Err(error) = &result
+        {
+            self.note_rpc_failure(
+                log_principal,
+                discovery::canonical_method(method).unwrap_or("unsupported"),
+                remote.as_ref(),
+                error,
+            );
         }
         if let Some(trace) = mcp_trace {
             self.finish_swarm_mcp_tool_call(&trace, result.is_err())
@@ -728,12 +728,7 @@ impl Router {
                     Err(error) => Err(self.mark_admission_preflight(&params, error).await),
                     ok => ok,
                 };
-                self.note_command_submission(
-                    &principal,
-                    context.remote,
-                    "command.submit",
-                    &result,
-                );
+                self.note_command_submission(&principal, context.remote, "command.submit", &result);
                 // An explicit admission preflight refusal (capacity, a missing
                 // profile executable) happens before a command exists. Retain
                 // diagnostic metadata under the caller's exact ID in the

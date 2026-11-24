@@ -81,7 +81,7 @@ impl Store {
                     params![update.cause, ulid::Ulid::new().to_string(), update.observed_at,
                         update.expires_at, message, update.goal.map(|goal| goal.agent),
                         update.goal.map(|goal| goal.generation),
-                        update.goal.map(|goal| goal.mode.as_str()), now, MAX_REPEAT_FAILURE_ALERTS],
+                        update.goal.map(|goal| goal.mode.as_str()), now, MAX_REPEAT_FAILURE_ALERTS as i64],
                 ).map_err(sql_error)?;
                 if inserted > 0 {
                     events.push(insert_daemon_event(
