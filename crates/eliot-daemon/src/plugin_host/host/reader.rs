@@ -80,7 +80,7 @@ impl PluginHost {
         observation: Option<&Agent>,
     ) -> ReaderOpen {
         if let Err(error) = crate::config::verify_stand_codex_route(
-            &self.state.data_root,
+            self.state.stand_codex_home.as_deref(),
             harness,
             profile,
             environment,

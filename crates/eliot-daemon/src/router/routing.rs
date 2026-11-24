@@ -685,7 +685,7 @@ impl Router {
                 Ok(mut snapshot) => {
                     if crate::config::capture_native_store_inputs(
                         &mut snapshot,
-                        &self.inner.data_root,
+                        self.inner.stand_codex_home.as_deref(),
                     )
                     .is_err()
                     {

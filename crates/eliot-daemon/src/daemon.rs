@@ -507,7 +507,7 @@ async fn initialize_runtime(
         mail_config,
         daemon_config.attention,
         daemon_config.background_wake_max_wait_secs * 1_000,
-    );
+    )?;
 
     crate::bootstrap::ensure_hot_start(data_dir.path(), &store, &policy).await?;
 

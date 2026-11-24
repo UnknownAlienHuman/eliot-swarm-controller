@@ -240,7 +240,7 @@ fn claude_route_selectors_resolved(
         })
 }
 
-fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
+pub(crate) fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
     match std::fs::symlink_metadata(data_root.join(crate::stand_cleanup::STAND_MARKER)) {
         Ok(_) => Ok(Some(data_root.join("codex-home"))),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -254,7 +254,7 @@ fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
 /// Compare the actual environment and any retained native store before the plugin
 /// can start Codex. A retained binding can repin the home after environment setup.
 pub(crate) fn verify_stand_codex_route(
-    data_root: &Path,
+    stand_home: Option<&Path>,
     harness: &str,
     profile: &Value,
     environment: &Value,
@@ -262,10 +262,10 @@ pub(crate) fn verify_stand_codex_route(
     if !core::api::HarnessCapabilities::of(harness).requires_frozen_store_inputs {
         return Ok(());
     }
-    let Some(home) = stand_codex_home(data_root)? else {
+    let Some(home) = stand_home else {
         return Ok(());
     };
-    let home = canonical_stand_codex_home(&home)?;
+    let home = canonical_stand_codex_home(home)?;
     match std::fs::symlink_metadata(home.join("config.toml")) {
         Ok(metadata) if metadata.is_file() && !crate::platform::is_reparse_point(&metadata) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -307,18 +307,13 @@ pub(crate) fn verify_stand_codex_route(
 /// Called only for a newly resolved launch, attach or metadata profile.
 pub(crate) fn capture_native_store_inputs(
     profile: &mut Value,
-    data_root: &Path,
+    stand_home: Option<&Path>,
 ) -> core::Result<()> {
-    let home =
-        if core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+    let home = if let Some(home) = stand_home.filter(|_| {
+        core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
             .requires_frozen_store_inputs
-        {
-            stand_codex_home(data_root)?
-        } else {
-            None
-        };
-    let home = if let Some(home) = home {
-        if let Err(error) = std::fs::create_dir(&home)
+    }) {
+        if let Err(error) = std::fs::create_dir(home)
             && error.kind() != std::io::ErrorKind::AlreadyExists
         {
             return Err(core::Error::new(
@@ -334,7 +329,7 @@ pub(crate) fn capture_native_store_inputs(
                 names.push(Value::from(selector));
             }
         }
-        Some(canonical_stand_codex_home(&home)?)
+        Some(canonical_stand_codex_home(home)?)
     } else {
         None
     };

@@ -177,6 +177,7 @@ pub(crate) struct Router {
 struct RouterInner {
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
+    stand_codex_home: Option<PathBuf>,
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
     agent_list_readers: Arc<tokio::sync::Semaphore>,
@@ -421,7 +422,8 @@ impl Router {
         mail: crate::config::MailConfig,
         attention: crate::config::AttentionConfig,
         background_wake_max_wait_ms: i64,
-    ) -> Self {
+    ) -> Result<Self> {
+        let stand_codex_home = crate::config::stand_codex_home(&data_root)?;
         let secrets: SecretSet = Arc::new(Mutex::new(HashSet::from([owner_token.clone()])));
         let agent_credentials: AgentCredentials = Arc::new(Mutex::new(Default::default()));
         let run_credentials = RunCredentialRegistry::default();
@@ -442,7 +444,11 @@ impl Router {
             Arc::clone(&acl_notices),
         );
         let plugin_host = PluginHost::new(
-            PluginHostOptions::new(data_root.clone(), owner_token.clone()),
+            PluginHostOptions::new(
+                data_root.clone(),
+                owner_token.clone(),
+                stand_codex_home.clone(),
+            ),
             Arc::clone(&store),
             bus.clone(),
             Arc::clone(&secrets),
@@ -452,10 +458,11 @@ impl Router {
             monitoring.clone(),
             Arc::clone(&acl_notices),
         );
-        Self {
+        Ok(Self {
             inner: Arc::new(RouterInner {
                 acl_notices,
                 data_root,
+                stand_codex_home,
                 store,
                 autonomy_reader: Arc::new(tokio::sync::Semaphore::new(1)),
                 agent_list_readers: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -519,7 +526,7 @@ impl Router {
                 goal_reconcile,
                 launch_arbitration,
             }),
-        }
+        })
     }
 
     async fn handle(
@@ -3301,6 +3308,7 @@ impl Router {
                 && let Err(error) = freeze_attach_profile(
                     &self.inner.profile_cache,
                     &self.inner.data_root,
+                    self.inner.stand_codex_home.as_deref(),
                     &mut request,
                 )
                 .await
@@ -3957,7 +3965,10 @@ impl Router {
             })
             .await??;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
-            crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
+            crate::config::capture_native_store_inputs(
+                &mut snapshot,
+                self.inner.stand_codex_home.as_deref(),
+            )?;
             crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
             let harness = snapshot
                 .get("harness")
@@ -4053,7 +4064,10 @@ impl Router {
                     ));
                 }
                 let mut snapshot = self.resolve_profile_cached(name)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
+                crate::config::capture_native_store_inputs(
+                    &mut snapshot,
+                    self.inner.stand_codex_home.as_deref(),
+                )?;
                 crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
@@ -4091,7 +4105,10 @@ impl Router {
                     None => required_text(&request.args, "profile")?.to_owned(),
                 };
                 let mut snapshot = self.resolve_profile_cached(&profile_name)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
+                crate::config::capture_native_store_inputs(
+                    &mut snapshot,
+                    self.inner.stand_codex_home.as_deref(),
+                )?;
                 crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
@@ -4841,7 +4858,10 @@ impl Router {
         )
         .await?;
         crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
-        crate::config::capture_native_store_inputs(&mut profile, &self.inner.data_root)?;
+        crate::config::capture_native_store_inputs(
+            &mut profile,
+            self.inner.stand_codex_home.as_deref(),
+        )?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
@@ -7447,6 +7467,7 @@ impl Router {
 async fn freeze_attach_profile(
     cache: &Mutex<crate::config::ProfileCache>,
     data_root: &std::path::Path,
+    stand_codex_home: Option<&std::path::Path>,
     request: &mut SubmitCommand,
 ) -> Result<()> {
     let profile_name = required_text(&request.args, "profile")?;
@@ -7465,7 +7486,7 @@ async fn freeze_attach_profile(
     )
     .await?;
     crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
-    crate::config::capture_native_store_inputs(&mut snapshot, data_root)?;
+    crate::config::capture_native_store_inputs(&mut snapshot, stand_codex_home)?;
     install_frozen_profile(request, &harness, snapshot, true)
 }
 
