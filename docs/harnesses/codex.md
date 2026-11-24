@@ -551,7 +551,9 @@ The fallback matches this message.
 
 A match sets `provider_response_withheld: true` and carries the shared typed
 `provider_response_withheld_fact` with optional absolute Unix-millisecond
-`reset_at`.
+`reset_at`. This Codex response supplies no reset time. The route evidence
+expires one hour after recording, or sooner when a successful native turn on
+the same route clears it in the task lineage.
 The legacy `provider_response_withheld_evidence: "text_fallback"` field remains
 for older readers. The stream also records provider origin before optional usage,
 native error and final text fields. The withheld classification takes precedence
