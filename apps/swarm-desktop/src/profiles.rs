@@ -12,7 +12,8 @@ use eliot_core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, COMMON_EFFORTS,
     CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS, NativeSubagentsPolicy,
 };
-use eliot_daemon::operator::native_subagents_policy;
+use eliot_daemon::operator::{native_subagents_policy, profile_draft_blocks};
+use std::ops::Range;
 use toml_edit::visit_mut::{self, VisitMut};
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
@@ -124,10 +125,51 @@ pub fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn parse_document(draft: &str) -> Result<DocumentMut, String> {
-    draft
-        .parse()
-        .map_err(|_| "The profile source has invalid TOML; correct it before editing.".to_owned())
+fn profile_ranges(draft: &str, name: &str) -> Vec<Range<usize>> {
+    profile_draft_blocks(draft)
+        .into_iter()
+        .filter_map(|(owner, range)| owner.is_none_or(|owner| owner == name).then_some(range))
+        .collect()
+}
+
+struct DraftProfile {
+    document: DocumentMut,
+    ranges: Vec<Range<usize>>,
+}
+
+impl DraftProfile {
+    fn read(draft: &str, name: &str) -> Result<Self, String> {
+        if let Ok(document) = draft.parse() {
+            return Ok(Self {
+                document,
+                ranges: Vec::new(),
+            });
+        }
+        let ranges = profile_ranges(draft, name);
+        let source: String = ranges.iter().map(|range| &draft[range.clone()]).collect();
+        let document = source
+            .parse()
+            .ok()
+            .filter(|document| profile(document, name).is_some())
+            .ok_or_else(|| format!("Correct invalid TOML in profile {name} before editing it."))?;
+        Ok(Self { document, ranges })
+    }
+
+    fn render(self, draft: &str, name: &str) -> Result<String, String> {
+        let edited = self.document.to_string();
+        if self.ranges.is_empty() {
+            return Ok(edited);
+        }
+        let ranges = profile_ranges(&edited, name);
+        if ranges.len() != self.ranges.len() {
+            return Err(format!("Profile {name} could not be edited independently."));
+        }
+        let mut output = draft.to_owned();
+        for (before, after) in self.ranges.into_iter().zip(ranges).rev() {
+            output.replace_range(before, &edited[after]);
+        }
+        Ok(output)
+    }
 }
 
 fn profiles(document: &DocumentMut) -> Option<&dyn TableLike> {
@@ -162,14 +204,34 @@ fn profile_mut<'a>(
 
 /// Profile names in draft order.
 pub fn profile_names(draft: &str) -> Vec<String> {
-    draft
-        .parse::<DocumentMut>()
-        .ok()
-        .and_then(|document| {
-            profiles(&document)
-                .map(|profiles| profiles.iter().map(|(key, _)| key.to_owned()).collect())
-        })
-        .unwrap_or_default()
+    if let Ok(document) = draft.parse::<DocumentMut>() {
+        return profiles(&document)
+            .map(|profiles| profiles.iter().map(|(key, _)| key.to_owned()).collect())
+            .unwrap_or_default();
+    }
+    let (document, _) = toml::de::DeTable::parse_recoverable(draft);
+    let mut located: Vec<_> = document
+        .get_ref()
+        .iter()
+        .find(|(key, _)| key.get_ref() == "profiles")
+        .and_then(|(_, value)| value.get_ref().as_table())
+        .into_iter()
+        .flat_map(|profiles| profiles.iter())
+        .map(|(key, _)| (key.span().start, key.get_ref().to_string()))
+        .collect();
+    located.extend(
+        profile_draft_blocks(draft)
+            .into_iter()
+            .filter_map(|(name, range)| name.map(|name| (range.start, name))),
+    );
+    located.sort_by_key(|(start, _)| *start);
+    let mut names = Vec::new();
+    for (_, name) in located {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 /// What the form may show for one key.
@@ -199,10 +261,10 @@ fn simple_string(value: &Value) -> Option<String> {
 
 /// The form state of key in profile name.
 pub fn field(draft: &str, name: &str, key: &str) -> Field {
-    let Ok(document) = draft.parse::<DocumentMut>() else {
+    let Ok(parsed) = DraftProfile::read(draft, name) else {
         return Field::Complex;
     };
-    profile(&document, name)
+    profile(&parsed.document, name)
         .and_then(|profile| profile.get(key))
         .map_or(Field::Absent, |item| {
             item.as_value()
@@ -232,8 +294,8 @@ fn set_value(
     key: &str,
     replacement: Option<Value>,
 ) -> Result<String, String> {
-    let mut document = parse_document(draft)?;
-    let profile = profile_mut(&mut document, name)?;
+    let mut parsed = DraftProfile::read(draft, name)?;
+    let profile = profile_mut(&mut parsed.document, name)?;
     match replacement {
         Some(mut replacement) => {
             if let Some(item) = profile.get_mut(key) {
@@ -250,19 +312,17 @@ fn set_value(
         }
         None => return Ok(draft.to_owned()),
     }
-    Ok(document.to_string())
+    parsed.render(draft, name)
 }
 
 /// Copy profile from (and its nested tables) as to, omitting its
 /// top-level cmd so the copy follows the installed default.
 pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
     let to = to.trim();
-    let mut document: DocumentMut = draft.parse().map_err(|_| {
-        "The profile source has invalid TOML; correct it before duplicating.".to_owned()
-    })?;
-    check_new_name(&document, to)?;
+    check_new_name(draft, to)?;
+    let parsed = DraftProfile::read(draft, from)?;
 
-    let source = profiles(&document)
+    let source = profiles(&parsed.document)
         .and_then(|profiles| profiles.get(from))
         .ok_or_else(|| format!("profile {from} is not in the draft"))?;
     let mut copied = source.clone();
@@ -272,8 +332,28 @@ pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
         .remove("cmd");
     AppendTables.visit_item_mut(&mut copied);
 
-    profiles_mut(&mut document)?.insert(to, copied);
-    Ok(document.to_string())
+    insert_new(draft, to, copied)
+}
+
+fn insert_new(draft: &str, name: &str, profile: Item) -> Result<String, String> {
+    if let Ok(mut document) = draft.parse::<DocumentMut>() {
+        profiles_mut(&mut document)?.insert(name, profile);
+        return Ok(document.to_string());
+    }
+    // An independent table leaves every byte of the invalid draft intact.
+    let mut document = DocumentMut::new();
+    let profile = profile
+        .into_table()
+        .map_err(|_| format!("Profile {name} could not be inserted independently."))?;
+    profiles_mut(&mut document)?.insert(name, Item::Table(profile));
+    let extended = format!("{draft}\n\n{document}");
+    if !profile_draft_blocks(&extended)
+        .iter()
+        .any(|(owner, range)| owner.as_deref() == Some(name) && range.start >= draft.len())
+    {
+        return Err("Correct the unfinished TOML before appending this profile.".to_owned());
+    }
+    Ok(extended)
 }
 
 struct AppendTables;
@@ -315,10 +395,10 @@ fn simple_list(value: &Value) -> Option<Vec<String>> {
 
 /// The form state of list key in profile name.
 pub fn list_field(draft: &str, name: &str, key: &str) -> ListField {
-    let Ok(document) = draft.parse::<DocumentMut>() else {
+    let Ok(parsed) = DraftProfile::read(draft, name) else {
         return ListField::Complex;
     };
-    profile(&document, name)
+    profile(&parsed.document, name)
         .and_then(|profile| profile.get(key))
         .map_or(ListField::Absent, |item| {
             item.as_value()
@@ -346,7 +426,7 @@ pub fn set_list_field(
 
 /// Check a new preset name: the daemon's profile-name alphabet, not yet
 /// in the draft.
-fn check_new_name(document: &DocumentMut, name: &str) -> Result<(), String> {
+fn check_new_name(draft: &str, name: &str) -> Result<(), String> {
     if name.is_empty()
         || !name
             .chars()
@@ -354,7 +434,7 @@ fn check_new_name(document: &DocumentMut, name: &str) -> Result<(), String> {
     {
         return Err("A preset name uses letters, digits, hyphen and underscore.".to_owned());
     }
-    if profiles(document).is_some_and(|profiles| profiles.contains_key(name)) {
+    if profile_names(draft).iter().any(|existing| existing == name) {
         return Err(format!("A preset named {name} already exists."));
     }
     Ok(())
@@ -365,13 +445,11 @@ fn check_new_name(document: &DocumentMut, name: &str) -> Result<(), String> {
 /// the installed default; explicit Owner command overrides remain in source.
 pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> {
     let name = name.trim();
-    let mut document = parse_document(draft)?;
-    check_new_name(&document, name)?;
+    check_new_name(draft, name)?;
 
     let mut profile = Table::new();
     profile.insert("harness", Item::Value(Value::from(harness.to_owned())));
-    profiles_mut(&mut document)?.insert(name, Item::Table(profile));
-    Ok(document.to_string())
+    insert_new(draft, name, Item::Table(profile))
 }
 
 fn native_subagents_policy_for_profile(draft: &str, name: &str) -> Option<NativeSubagentsPolicy> {

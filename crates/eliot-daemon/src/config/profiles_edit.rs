@@ -11,7 +11,7 @@
 //! URLs) are never handed out as source. Other readable settings sections stay
 //! available. Profile saves go through `settings.save`.
 
-use std::path::Path;
+use std::{ops::Range, path::Path};
 
 use eliot_core::SecretPolicy;
 use eliot_core::api::{MAX_LISTED_PROFILES, ProfileListResponse, ProfileSummary, REDACTION_MARKER};
@@ -34,6 +34,7 @@ pub(crate) fn revision_of(source: &str) -> String {
 pub(super) struct Block<'a> {
     pub(super) text: &'a str,
     pub(super) section: Option<String>,
+    profile: Option<String>,
 }
 
 /// Split at parsed table headers, including arrays of tables. Keep the
@@ -43,46 +44,58 @@ pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
     let mut spans = Vec::new();
     let mut start = 0;
     let mut section = None;
+    let mut profile = None;
     let mut header_start = None;
+    let mut profile_key_expected = false;
     parse_document(
         &input.lex().into_vec(),
         &mut |event: Event| match event.kind() {
             EventKind::StdTableOpen | EventKind::ArrayTableOpen => {
                 header_start = Some(event.span().start());
+                profile_key_expected = false;
             }
-            EventKind::SimpleKey => {
-                if let Some(offset) = header_start.take()
-                    && let Some(raw) = input.get(event)
-                {
+            EventKind::SimpleKey if header_start.is_some() || profile_key_expected => {
+                if let Some(raw) = input.get(event) {
                     let mut key = String::new();
                     let mut error = None;
                     raw.decode_key(&mut key, &mut error);
+                    let first_key = header_start.take();
+                    profile_key_expected = false;
                     if error.is_none() {
-                        let line = source[..offset]
-                            .rsplit_once('\n')
-                            .map_or(0, |(before, _)| before.len() + 1);
-                        let offset =
-                            line.max(source.len() - source.trim_start_matches('\u{FEFF}').len());
-                        if offset > start {
-                            spans.push((start, offset, section.take()));
+                        if let Some(offset) = first_key {
+                            let line = source[..offset]
+                                .rsplit_once('\n')
+                                .map_or(0, |(before, _)| before.len() + 1);
+                            let offset = line
+                                .max(source.len() - source.trim_start_matches('\u{FEFF}').len());
+                            if offset > start {
+                                spans.push((start, offset, section.take(), profile.take()));
+                            }
+                            start = offset;
+                            profile_key_expected = key == "profiles";
+                            section = Some(key);
+                            profile = None;
+                        } else {
+                            profile = Some(key);
                         }
-                        start = offset;
-                        section = Some(key);
                     }
                 }
             }
-            EventKind::Whitespace => {}
-            _ => header_start = None,
+            EventKind::Whitespace | EventKind::KeySep => {}
+            _ => {
+                header_start = None;
+                profile_key_expected = false;
+            }
         },
         &mut (),
     );
     if source.len() > start {
-        spans.push((start, source.len(), section));
+        spans.push((start, source.len(), section, profile));
     }
     // Boundary comments and blank lines belong to neither section. Keep them
     // as separate spans so replacing either neighbor preserves their bytes.
     let mut blocks = Vec::new();
-    for (index, (start, end, section)) in spans.iter().enumerate() {
+    for (index, (start, end, section, profile)) in spans.iter().enumerate() {
         let mut split = *end;
         if section.is_some() && spans.get(index + 1).is_some_and(|next| section != &next.2) {
             for line in source[*start..*end].split_inclusive('\n').rev() {
@@ -96,15 +109,32 @@ pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
         blocks.push(Block {
             text: &source[*start..split],
             section: section.clone(),
+            profile: profile.clone(),
         });
         if split < *end {
             blocks.push(Block {
                 text: &source[split..*end],
                 section: None,
+                profile: None,
             });
         }
     }
     blocks
+}
+
+/// Profile-section ranges in source order, including nested setup blocks.
+/// A range owned by the parent `[profiles]` table has no individual name.
+/// Callers must still parse the isolated ranges before editing them.
+pub fn profile_draft_blocks(source: &str) -> Vec<(Option<String>, Range<usize>)> {
+    let mut offset = 0;
+    split_blocks(source)
+        .into_iter()
+        .filter_map(|block| {
+            let start = offset;
+            offset += block.text.len();
+            (block.section.as_deref() == Some("profiles")).then_some((block.profile, start..offset))
+        })
+        .collect()
 }
 
 /// The bytes owned by one top-level section, retained in source order.

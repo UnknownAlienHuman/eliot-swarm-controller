@@ -1712,7 +1712,9 @@ row links directly to Routing; reordering candidates uses the same immediate wri
 The `profiles` section of `settings.read`/`settings.save` carries the `[profiles.*]`
 tables as JSON, under the file revision like every other section. The desktop renders
 its TOML source view from that value. Form edits and duplication operate on parsed TOML
-tables, preserving nested arrays such as `setup`. Named and ad-hoc launches share the
+tables, preserving nested arrays such as `setup`. While the source draft is invalid,
+the desktop retains the profile list and allows edits to independently parseable
+profile blocks. Saving requires a valid full draft. Named and ad-hoc launches share the
 frozen harness, model and effort representation. Named profiles apply common control,
 MCP, executable and setup validation around the harness-specific field mappings.
 Profiles resolve from `config.toml` at launch admission (above), so a saved
