@@ -356,6 +356,8 @@ impl Router {
                 Ok(response)
             }
             Err(error) => {
+                self.note_harness_auth_required(harness, Some(&error.code))
+                    .await;
                 if let Some(documented) =
                     documented_models.filter(|_| catalog::documented_fallback_eligible(&error))
                 {
@@ -638,6 +640,8 @@ impl Router {
             // return it uncached so the next read tries again.
             Err(error) if error.code == "busy" => return Err(error),
             Err(error) => {
+                self.note_harness_auth_required(&harness, Some(&error.code))
+                    .await;
                 catalog::quota_read_error(&mut response, error);
             }
         }
@@ -1129,10 +1133,10 @@ pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot
         response.details = Some(
             serde_json::json!({"state":"error","origin":origin,"error":"quota read failed; no values available"}),
         );
-        response.note = Some(if error.code == "quota_unavailable" {
-            eliot_core::bound_chars(&error.message, 512)
-        } else {
-            "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned()
+        response.note = Some(match error.code.as_str() {
+            "auth_required" => "The vendor CLI requires sign-in.".to_owned(),
+            "quota_unavailable" => eliot_core::bound_chars(&error.message, 512),
+            _ => "Read-only native/provider quota unavailable; no inference or credential refresh attempted".to_owned(),
         });
     }
 }

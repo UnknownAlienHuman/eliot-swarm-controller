@@ -661,6 +661,46 @@ pub(crate) struct LocalPeer {
 }
 
 impl LocalPeer {
+    pub(crate) fn is_interactive_desktop(&self) -> bool {
+        use windows_sys::Win32::System::RemoteDesktop::{
+            ProcessIdToSessionId, WTS_CONNECTSTATE_CLASS, WTSActive, WTSConnectState,
+            WTSFreeMemory, WTSQuerySessionInformationW,
+        };
+
+        if !self
+            .image_path()
+            .as_deref()
+            .and_then(|image| Path::new(image).file_name())
+            .is_some_and(|name| name.eq_ignore_ascii_case("swarm-desktop.exe"))
+        {
+            return false;
+        }
+        let mut session = 0;
+        let mut buffer = null_mut();
+        let mut bytes = 0;
+        // SAFETY: each output pointer refers to its initialized writable local.
+        unsafe {
+            if ProcessIdToSessionId(self.pid, &mut session) == 0
+                || session == 0
+                || WTSQuerySessionInformationW(
+                    null_mut(),
+                    session,
+                    WTSConnectState,
+                    &mut buffer,
+                    &mut bytes,
+                ) == 0
+                || buffer.is_null()
+            {
+                return false;
+            }
+            // WTSConnectState returns one WTS_CONNECTSTATE_CLASS enum.
+            let active = bytes as usize >= size_of::<WTS_CONNECTSTATE_CLASS>()
+                && buffer.cast::<WTS_CONNECTSTATE_CLASS>().read_unaligned() == WTSActive;
+            WTSFreeMemory(buffer.cast());
+            active
+        }
+    }
+
     pub(crate) fn process_id(&self) -> u32 {
         self.pid
     }

@@ -266,6 +266,13 @@ impl Router {
             route = checked_route(&prepared.request, route.as_deref(), automatic)?;
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
+            let snapshot = &prepared.request.args["profile_snapshot"];
+            if let Some(harness) = snapshot["harness"].as_str()
+                && self.harness_auth_applies(harness, snapshot)
+                && store.harness_auth_held(harness)?
+            {
+                return Err(Error::new("auth_required", "vendor sign-in is pending"));
+            }
             let admission = store.admit_launch_intent(
                 intent,
                 prepared.request,

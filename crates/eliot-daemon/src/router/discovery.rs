@@ -19,6 +19,7 @@ struct Method {
 }
 
 const EXAMPLE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const EXAMPLE_HARNESS: &str = eliot_core::api::harness::SUPPORTED_HARNESSES[0];
 
 macro_rules! method {
     ($name:literal, $request:ty, $response:ty, $owner:literal, $write:literal, $doc:literal, $example:tt) => {
@@ -37,6 +38,18 @@ macro_rules! method {
 // Every Router match arm is described here. The coverage regression below makes
 // omission deliberate: new methods must be described before they can ship.
 const METHODS: &[Method] = &[
+    method!("auth.login", eliot_core::api::auth_login::AuthLoginRequest, eliot_core::api::auth_login::AuthLoginResponse, true, true, "Request the vendor sign-in console from the local Owner desktop.", {"harness":EXAMPLE_HARNESS}),
+    method!(
+        "auth.desktop.poll",
+        eliot_core::api::auth_login::AuthDesktopPollRequest,
+        eliot_core::api::auth_login::AuthDesktopPollResponse,
+        true,
+        false,
+        "Read pending vendor sign-in work from the interactive desktop.",
+        {}
+    ),
+    method!("auth.desktop.claim", eliot_core::api::auth_login::AuthDesktopClaimRequest, eliot_core::api::auth_login::AuthDesktopClaimResponse, true, true, "Claim one exact vendor sign-in attempt from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID}),
+    method!("auth.desktop.report", eliot_core::api::auth_login::AuthDesktopReportRequest, eliot_core::api::auth_login::AuthDesktopReportResponse, true, true, "Report only vendor sign-in status or exact console lifecycle from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID,"state":"signed_in"}),
     method!(
         "owner.inbox",
         OwnerInboxRequest,
@@ -612,6 +625,7 @@ impl Router {
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
             "owner.inbox" => &["swarm inbox"],
+            "auth.login" => &["swarm auth login"],
             "checkpoint.restore" => &["swarm checkpoint restore"],
             "owner.decide.bulk" => &["swarm inbox apply"],
             "mail.read" => &["swarm msg show"],

@@ -129,22 +129,15 @@ fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
 
 fn classify_auth_status(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> NativeAuthState {
     if code == Some(0)
-        && serde_json::from_slice::<Value>(stdout).is_ok_and(|value| value.is_object())
+        && serde_json::from_slice::<Value>(stdout).is_ok_and(|value| value["allowance"].is_object())
     {
         return NativeAuthState::SignedIn;
     }
     if code == Some(1)
         && [stdout, stderr].into_iter().any(|bytes| {
             std::str::from_utf8(bytes).is_ok_and(|text| {
-                text.lines().any(|line| {
-                    let line = line.trim().to_ascii_lowercase();
-                    line == "not logged in"
-                        || line.starts_with("not logged in.")
-                        || line.starts_with("muse: not logged in")
-                        || line.starts_with("error: not logged in")
-                        || line.starts_with("missing meta credential")
-                        || line.starts_with("muse: missing meta credential")
-                })
+                text.lines()
+                    .any(|line| line.trim().starts_with("muse usage: not logged in:"))
             })
         })
     {
