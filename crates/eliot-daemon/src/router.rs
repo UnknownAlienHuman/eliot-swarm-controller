@@ -6877,19 +6877,9 @@ impl Router {
                     store.record_native_restart_gaps(&agent, generation, &request.id, now_ms())?;
                 self.publish_locked(&events);
             }
-            self.inner
-                .plugin_host
-                .set_planned_restart_cutoff(Some(&request.id));
         }
         if request.backup {
-            if let Err(error) =
-                crate::update_backup::create(&self.inner.data_root, &request.id, &store)
-            {
-                if action == ShutdownMode::Restart {
-                    self.inner.plugin_host.set_planned_restart_cutoff(None);
-                }
-                return Err(error);
-            }
+            crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
         }
         let owner = principal_name(principal);
         let payload =
@@ -6909,6 +6899,11 @@ impl Router {
         let admission = match admission {
             Ok(admission) => admission,
             Err(error) => {
+                if action == ShutdownMode::Restart && store.is_write_faulted() {
+                    self.inner
+                        .plugin_host
+                        .set_planned_restart_cutoff(&request.id);
+                }
                 if request.backup
                     && !store.is_write_faulted()
                     && let Err(cleanup) = crate::update_backup::discard_update_backup(
@@ -6916,14 +6911,10 @@ impl Router {
                         &request.id,
                     )
                 {
-                    self.inner.plugin_host.set_planned_restart_cutoff(None);
                     return Err(Error::new(
                         error.code,
                         format!("{}; Store backup cleanup failed: {cleanup}", error.message),
                     ));
-                }
-                if action == ShutdownMode::Restart && !store.is_write_faulted() {
-                    self.inner.plugin_host.set_planned_restart_cutoff(None);
                 }
                 return Err(error);
             }
@@ -6956,6 +6947,11 @@ impl Router {
                     self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
                 }
                 ShutdownMode::Restart => {
+                    // A definite pre-seal failure leaves native intake live.
+                    // Only publish the cutoff when the restart has committed.
+                    self.inner
+                        .plugin_host
+                        .set_planned_restart_cutoff(&request.id);
                     self.inner.shutdown_ready.store(false, Ordering::SeqCst);
                     self.inner.mode.store(MODE_RESTART, Ordering::SeqCst);
                     *lease = None;

@@ -1463,8 +1463,8 @@ impl PluginHost {
         self.state.running.lock_recover().contains_key(&key)
     }
 
-    pub(crate) fn set_planned_restart_cutoff(&self, cutoff: Option<&str>) {
-        *self.state.planned_restart_cutoff.lock_recover() = cutoff.map(str::to_owned);
+    pub(crate) fn set_planned_restart_cutoff(&self, cutoff: &str) {
+        *self.state.planned_restart_cutoff.lock_recover() = Some(cutoff.to_owned());
     }
 
     pub(crate) async fn resolve_failed_custody(

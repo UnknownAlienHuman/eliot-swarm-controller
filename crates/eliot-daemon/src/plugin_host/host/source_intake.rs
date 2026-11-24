@@ -719,10 +719,16 @@ async fn put_events(
             }
             result
         }
-        Err(_) => Err(Error::new(
-            "busy",
-            "Store lock deadline elapsed for events.put",
-        )),
+        Err(_) => {
+            if let Some(cutoff) = planned_restart_cutoff(intake.host) {
+                record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
+                return Err(planned_restart_cutoff_error(&cutoff));
+            }
+            Err(Error::new(
+                "busy",
+                "Store lock deadline elapsed for events.put",
+            ))
+        }
     };
     match result {
         Ok(commit) => {

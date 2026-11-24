@@ -690,7 +690,7 @@ fn native_exit_gaps_tx(
     reason: &str,
     now: i64,
     gap_scope: &str,
-    same_id_is_idempotent: bool,
+    planned_restart: bool,
 ) -> Result<Vec<Event>> {
     let agent = current.id.as_str();
     let agent_num = parse_agent_id(agent)?;
@@ -732,7 +732,7 @@ fn native_exit_gaps_tx(
         }
         let digest = canonical::digest(&data)?;
         if state.gap_id.as_deref() == Some(gap_id.as_str()) {
-            if same_id_is_idempotent {
+            if planned_restart {
                 continue;
             }
             if state.gap_digest.as_deref() != Some(digest.as_slice())
@@ -746,6 +746,9 @@ fn native_exit_gaps_tx(
             continue;
         }
         if state.state != "open" {
+            if planned_restart {
+                continue;
+            }
             return Err(Error::new(
                 "source_integrity",
                 "native owner source is already closed",
