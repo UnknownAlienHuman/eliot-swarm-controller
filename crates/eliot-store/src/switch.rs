@@ -1772,7 +1772,7 @@ impl Store {
                             destination.workspace.as_deref(),
                             Some(destination.profile.as_str()),
                             requested_by.as_deref(),
-                            handoff_reason,
+                            Some(handoff_reason),
                         )?;
                     }
                     let source_num = parse_agent_id(&request.from)?;
@@ -2070,7 +2070,7 @@ impl Store {
                     "error": value.error,
                     "state": state,
                 });
-                if handoff_reason == Some(HandoffReason::ProviderResponseWithheld)
+                if handoff_reason == HandoffReason::ProviderResponseWithheld
                     && state == CommandState::Applied
                     && let Some(created) = value.created.as_ref()
                     && let Some(destination) =
