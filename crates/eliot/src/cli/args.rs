@@ -1205,6 +1205,9 @@ pub(crate) struct InboxArgs {
 pub(crate) struct OwnerInboxArgs {
     #[command(flatten)]
     pub(crate) page: InboxArgs,
+    /// Show only visible Owner decisions waiting more than 24 hours.
+    #[arg(long)]
+    pub(crate) aged: bool,
     #[command(subcommand)]
     pub(crate) command: Option<OwnerInboxCommand>,
 }

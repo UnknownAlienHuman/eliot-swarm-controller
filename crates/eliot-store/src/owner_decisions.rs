@@ -16,7 +16,6 @@ use std::{
 };
 
 const METHOD: &str = "owner.decide";
-pub(crate) const OWNER_WAIT_DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 
 /// The existing writes table binds the decision ID and its exact inner
 /// mutation ID. An admitted command replays through its own ordinary receipt.
@@ -152,7 +151,7 @@ impl Store {
             let mut waiting_over_24h = 0;
             items.retain(|item| {
                 if is_reportable(item, now, confirmed) {
-                    waiting_over_24h += usize::from(item.age_ms > OWNER_WAIT_DAY_MS);
+                    waiting_over_24h += usize::from(item.waiting_over_24h());
                     return true;
                 }
                 liveness.stuck = liveness.stuck.saturating_sub(1);

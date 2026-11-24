@@ -182,8 +182,7 @@ fn read_owner_waiting(
     let waiting = items
         .into_iter()
         .filter(|item| {
-            item.age_ms > crate::owner_decisions::OWNER_WAIT_DAY_MS
-                && crate::owner_decisions::is_reportable(item, until, confirmed)
+            item.waiting_over_24h() && crate::owner_decisions::is_reportable(item, until, confirmed)
         })
         .collect::<Vec<_>>();
     let mut by_kind = std::collections::BTreeMap::new();

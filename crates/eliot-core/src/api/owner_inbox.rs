@@ -94,6 +94,10 @@ pub struct OwnerInboxItem {
 }
 
 impl OwnerInboxItem {
+    pub fn waiting_over_24h(&self) -> bool {
+        self.age_ms > 24 * 60 * 60 * 1_000
+    }
+
     pub fn cursor(&self) -> String {
         format!("{}/{}", self.kind.as_str(), self.subject)
     }

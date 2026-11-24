@@ -1500,6 +1500,8 @@ writer lock. A source that exceeds its work cap reports partial coverage.
 snapshot, including snoozed revisions and decisions outside the current page.
 It uses the same age threshold and reportability rules as the autonomy report.
 Separate reads can have different end times and current subjects.
+`swarm inbox --aged` lists visible decisions over that threshold and retains
+the ordinary revision-bound actions and cursor.
 
 | Row | Evidence |
 | --- | --- |

@@ -50,6 +50,7 @@ const METHODS: &[Method] = &[
     ),
     method!("auth.desktop.claim", eliot_core::api::auth_login::AuthDesktopClaimRequest, eliot_core::api::auth_login::AuthDesktopClaimResponse, true, true, "Claim one exact vendor sign-in attempt from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID}),
     method!("auth.desktop.report", eliot_core::api::auth_login::AuthDesktopReportRequest, eliot_core::api::auth_login::AuthDesktopReportResponse, true, true, "Report only vendor sign-in status or exact console lifecycle from the interactive desktop.", {"harness":EXAMPLE_HARNESS,"revision":EXAMPLE_ID,"state":"signed_in"}),
+    method!("owner.inbox.aged", OwnerInboxRequest, OwnerInboxResponse, true, false, "Page Owner decisions waiting more than 24 hours.", {"limit":20}),
     method!(
         "owner.inbox",
         OwnerInboxRequest,
@@ -646,6 +647,7 @@ impl Router {
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
             "owner.inbox" => &["swarm inbox"],
+            "owner.inbox.aged" => &["swarm inbox --aged"],
             "auth.login" => &["swarm auth login"],
             "checkpoint.restore" => &["swarm checkpoint restore"],
             "owner.decide.bulk" => &["swarm inbox apply"],
@@ -1042,7 +1044,7 @@ fn method_scopes(name: &str, principal: &Principal, identity: &IdentityResponse)
 
 fn method_limits(name: &str) -> &'static str {
     match name {
-        "owner.inbox" => {
+        "owner.inbox" | "owner.inbox.aged" => {
             "Owner only. Page at most 100 current items. Continue with next, when present."
         }
         "checkpoint.restore" => {
