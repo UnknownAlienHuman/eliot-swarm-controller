@@ -834,6 +834,13 @@ the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
+Items are ordered by their opaque cursor; `after` is exclusive. `next` is the
+last returned item's cursor only when another item exists. `daemon.sidebar`
+reports counts for exactly the same reportable, unsnoozed projection in one
+read snapshot. Its count path folds that projection into per-kind totals without
+retaining or sorting the complete item vector; it does not change Owner inbox
+page or cursor behavior.
+
 For a missing worktree with a retained checkpoint, the inbox instructions include
 `git worktree prune`, `git worktree add`, and the exact
 `swarm --data-dir <daemon-data> checkpoint restore --agent A --generation N
@@ -968,7 +975,9 @@ and refresh state described in [monitoring](monitoring.md). Desktop Storage
 requests `disk_usage_scan_window: true` to include the scan end age as well.
 An empty request returns disk usage buckets.
 The Owner-only `daemon.sidebar` accepts an empty object and returns Owner
-inbox counts and profile command issues for the desktop poll.
+inbox counts and profile command issues for the desktop poll. Counts include
+all visible items of each kind, including items beyond the first page, and use
+the same liveness-confirmation and exact-revision snooze rules as `owner.inbox`.
 
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
 daemon retention settings and runs one bounded retention epoch (the periodic

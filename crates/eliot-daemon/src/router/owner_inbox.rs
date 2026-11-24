@@ -3,8 +3,8 @@ use eliot_core::{
     Error, Result,
     api::{
         LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest, OwnerDecideRequest,
-        OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxRequest, OwnerInboxResponse,
-        SWARM_MAIL_SENDER, discovery::decode_params,
+        OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest,
+        OwnerInboxResponse, SWARM_MAIL_SENDER, discovery::decode_params,
     },
 };
 use eliot_plugin::sync::LockExt;
@@ -45,6 +45,18 @@ impl Router {
         })
         .await
         .map_err(|_| Error::new("internal", "owner projection reader failed"))?
+    }
+
+    pub(super) async fn read_owner_inbox_counts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<OwnerInboxKind, usize>> {
+        let path = self.inner.data_root.join("eliot.db");
+        let confirmed = self.confirmed_stuck();
+        tokio::task::spawn_blocking(move || {
+            Store::read_owner_inbox_counts(&path, super::now_ms(), &confirmed)
+        })
+        .await
+        .map_err(|_| Error::new("internal", "owner inbox count reader failed"))?
     }
 
     pub(super) async fn owner_inbox(

@@ -1,3 +1,4 @@
+use super::owner_inbox::OwnerInboxItemSink;
 use super::*;
 use eliot_core::api::auth_login::{
     AuthConsoleIdentity, AuthDesktopClaimResponse, AuthDesktopReportRequest,
@@ -508,7 +509,7 @@ fn settle_auth_holds(tx: &Transaction<'_>, harness: &str, now: i64) -> Result<Ve
 pub(super) fn project_harness_auth(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     _liveness: &mut SwarmLiveness,
     keys: &[&dyn rusqlite::ToSql],
 ) -> Result<()> {

@@ -1,3 +1,4 @@
+use super::owner_inbox::OwnerInboxItemSink;
 use super::{
     Error, Result, Store, TransactionBehavior, canonical, command_binding, commit_transaction,
     decode_json, digest_id_bound, encode_json, insert_write_tx, sql_error, validate_id_age,
@@ -11,7 +12,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     time::Duration,
 };
@@ -55,6 +56,26 @@ pub struct OwnerProjection {
     pub command_without_dispatcher: CommandWithoutDispatcherStatus,
     pub goals_without_progress: usize,
     pub repeated_failure_inbox_items: usize,
+}
+
+struct OwnerInboxCountSink<'s, 'c> {
+    counts: BTreeMap<OwnerInboxKind, usize>,
+    snoozed: HashSet<(OwnerInboxKind, &'s str, &'s str)>,
+    confirmed: &'c StuckStates,
+    now: i64,
+}
+
+impl OwnerInboxItemSink for OwnerInboxCountSink<'_, '_> {
+    fn push(&mut self, item: OwnerInboxItem) {
+        if !is_reportable(&item, self.now, self.confirmed)
+            || self
+                .snoozed
+                .contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
+        {
+            return;
+        }
+        *self.counts.entry(item.kind).or_default() += 1;
+    }
 }
 
 pub(crate) fn is_reportable(item: &OwnerInboxItem, now: i64, confirmed: &StuckStates) -> bool {
@@ -216,6 +237,33 @@ impl Store {
                 goals_without_progress,
                 repeated_failure_inbox_items,
             })
+        })
+    }
+
+    /// Count the same visible, unsnoozed inbox projection without retaining
+    /// and sorting every item. The snooze and source reads share one snapshot.
+    pub fn read_owner_inbox_counts(
+        path: &Path,
+        now: i64,
+        confirmed: &StuckStates,
+    ) -> Result<BTreeMap<OwnerInboxKind, usize>> {
+        read_inbox_snapshot(path, |connection| {
+            let snoozes = inbox_snoozes(connection)?;
+            let snoozed = snoozes
+                .iter()
+                .map(|row| (row.kind, row.subject.as_str(), row.revision.as_str()))
+                .collect();
+            let mut sink = OwnerInboxCountSink {
+                counts: OwnerInboxKind::ALL
+                    .into_iter()
+                    .map(|kind| (kind, 0))
+                    .collect(),
+                snoozed,
+                confirmed,
+                now,
+            };
+            super::owner_inbox::project_into(connection, now, &mut sink)?;
+            Ok(sink.counts)
         })
     }
 
