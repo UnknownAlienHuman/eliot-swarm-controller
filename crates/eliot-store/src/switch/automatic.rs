@@ -668,16 +668,22 @@ fn owed_work(
     }
     let num = parse_agent_id(&agent.id)?;
     if agent.is_terminal() {
-        let resuming: bool = connection
+        let resume_fenced: bool = connection
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM commands INDEXED BY commands_target
                  WHERE target = ?1 AND verb = 'resume'
-                   AND state IN ('accepted','queued','dispatched','unknown'))",
-                [num],
+                   AND (state IN ('accepted','queued','dispatched','unknown')
+                        OR (generation = ?2 AND state = 'rejected'
+                            AND COALESCE(json_extract(outcome, '$.code'),
+                                         json_extract(outcome, '$.reason')) IN (
+                                'workspace_branch_unattributed', 'workspace_branch_other_agent',
+                                'source_integrity', 'dirty'
+                            ))))",
+                params![num, agent.generation],
                 |row| row.get(0),
             )
             .map_err(sql_error)?;
-        if resuming {
+        if resume_fenced {
             return Ok(None);
         }
     }
