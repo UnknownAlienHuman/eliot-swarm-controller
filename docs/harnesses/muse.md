@@ -463,7 +463,8 @@ observation alone cannot establish authorship: only this native hint
 attributes Muse edits. When the item carries no inline target, the adapter
 makes exactly one bounded `item/readOutput` fetch of the stored `patchRef`
 (offset 0, 128 KiB page, 10 s deadline, before any commit and holding no
-Store lock) and attaches only the file paths from the patch headers
+Store lock). It reads parsed string leaves by reference, with raw text as
+the fallback, and attaches only the file paths from the patch headers
 (`*** Add/Update/Delete File:` and `*** Move to:` markers, plus unified-diff
 `---`/`+++` lines only as adjacent pairs with the `a/`/`b/` prefix stripped
 and never inside a `*** ... File:` section) in the verbatim

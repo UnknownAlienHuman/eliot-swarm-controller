@@ -5027,10 +5027,18 @@ fn patch_page_paths(page: &NativeItemReadOutputResult) -> (Vec<String>, bool) {
     if page.encoding != "utf8" {
         return (Vec::new(), complete);
     }
+    let document = serde_json::from_str::<Value>(&page.content).ok();
+    let mut texts = Vec::new();
+    if let Some(document) = &document {
+        collect_patch_texts(document, &mut texts);
+    }
+    if texts.is_empty() {
+        texts.push(&page.content);
+    }
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
-    for text in patch_candidate_texts(&page.content) {
-        for path in patch_text_paths(&text) {
+    for text in texts {
+        for path in patch_text_paths(text) {
             if paths.len() > MAX_CHANGED_PATHS {
                 return (paths, complete);
             }
@@ -5113,27 +5121,10 @@ fn patch_text_paths(text: &str) -> Vec<String> {
     paths
 }
 
-/// Candidate patch texts inside one stored page body. The `tool_patch`
-/// document is `application/json`: a bare patch string, or an object/array
-/// whose string leaves carry the patch text. Every string leaf scans — no
-/// field name is assumed — and a non-JSON body scans as raw patch text.
-fn patch_candidate_texts(body: &str) -> Vec<String> {
-    let Ok(document) = serde_json::from_str::<Value>(body) else {
-        return vec![body.to_owned()];
-    };
-    let mut texts = Vec::new();
-    collect_patch_texts(&document, &mut texts);
-    if texts.is_empty() {
-        vec![body.to_owned()]
-    } else {
-        texts
-    }
-}
-
-/// Every string leaf of a stored patch document, in document order.
-fn collect_patch_texts(document: &Value, texts: &mut Vec<String>) {
+/// Borrow every string leaf of a stored patch document in document order.
+fn collect_patch_texts<'a>(document: &'a Value, texts: &mut Vec<&'a str>) {
     match document {
-        Value::String(text) => texts.push(text.clone()),
+        Value::String(text) => texts.push(text),
         Value::Array(items) => {
             for item in items {
                 collect_patch_texts(item, texts);
