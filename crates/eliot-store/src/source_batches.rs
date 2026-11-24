@@ -1011,7 +1011,7 @@ impl Store {
                     batch.generation,
                     native_event,
                 )?;
-            let (next, effects) = if observed {
+            let (mut next, effects) = if observed {
                 observer_live::persist_turn_fact(&tx, &projection, native_event)?;
                 (projection.clone(), Vec::new())
             } else if resolves_recovered
@@ -1072,6 +1072,30 @@ impl Store {
                 native_event,
                 &next,
             )?;
+            // The inserted turn binds the exact config revision that Muse
+            // admitted. Use it even if a newer overlay exists on the Agent.
+            if !observed
+                && next.harness == "muse"
+                && native_event.kind == "turn.started"
+                && let Some(turn) = next.active_turn.as_deref()
+            {
+                let selected_model: Option<String> = tx
+                    .query_row(
+                        "SELECT json_extract(config.effective, '$.model')
+                         FROM turns AS turn JOIN agent_config AS config ON
+                           config.agent = turn.agent AND config.generation = turn.generation
+                           AND config.revision = turn.config_revision
+                         WHERE turn.agent = ?1 AND turn.generation = ?2 AND turn.turn_id = ?3",
+                        params![agent_num, batch.generation, turn],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .flatten();
+                if let Some(model) = selected_model {
+                    next.set_admitted_model(model);
+                }
+            }
             command_events.extend(effects);
             if resolves_recovered {
                 provider_events.push(turn_recovery::insert_native_resolution_tx(

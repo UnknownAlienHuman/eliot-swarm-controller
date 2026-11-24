@@ -1030,8 +1030,10 @@ carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
 `effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
 record on the bound turn. Muse exposes the requested selector in `effective.model`
-as unverified at readiness and on turns lacking provider model evidence, including
-exact echoes. In that case `model_verified` is false and `model_unverified_reason`
+as unverified at readiness. The `admitted_model` field retains the selector
+from the native session or the turn's bound configuration revision. On a turn
+lacking provider model evidence, including an exact echo, `effective.model`
+shows that selector, `model_verified` is false, and `model_unverified_reason`
 explains the missing evidence. `swarm show` displays the model and the reason
 when present. The turn retains its native outcome. Muse verifies
 the model only on matching foreground provider evidence. An explicit mismatch
