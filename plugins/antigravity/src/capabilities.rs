@@ -2,7 +2,7 @@
 
 use eliot_core::api::harness::{
     AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeAccessBounds, NativeQuotaReadback,
-    NativeRoute, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
+    NativeRoute, ProfileCapabilities, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
@@ -32,7 +32,8 @@ pub fn declaration() -> HarnessCapabilities {
                     .then_some("Antigravity profile selects external auth; native keyring quota would describe another route")
             }),
             ..quota_readback(
-                QuotaProjectionFormat::Windows,
+                crate::quota::project_quota,
+                eliot_plugin::quota::projection::account_usage_windows,
                 |_| "Antigravity account quota; provider read-only values",
             )
         }),

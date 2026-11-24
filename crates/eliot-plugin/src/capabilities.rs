@@ -2,7 +2,7 @@
 
 use eliot_core::api::harness::{
     AdhocAccess, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeQuotaReadback,
-    ProjectInstructionRead, QuotaProjectionFormat,
+    ProjectInstructionRead, QuotaProjector, QuotaUsageWindows,
 };
 use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::{Error, McpPolicy, Result, api::InstructionReadStatus};
@@ -20,11 +20,13 @@ pub const fn instruction_files(
 }
 
 pub const fn quota_readback(
-    projection: QuotaProjectionFormat,
+    project: QuotaProjector,
+    usage_windows: QuotaUsageWindows,
     description: fn(&Value) -> &'static str,
 ) -> NativeQuotaReadback {
     NativeQuotaReadback {
-        projection,
+        project,
+        usage_windows,
         method: "quota.read",
         adhoc_integration: None,
         description,

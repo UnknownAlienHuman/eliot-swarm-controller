@@ -5,7 +5,7 @@ use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
     NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
     NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
-    ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
+    ProjectInstructionRead, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
 use eliot_core::api::{
@@ -53,7 +53,8 @@ pub fn declaration() -> HarnessCapabilities {
         quota_readback: Some(NativeQuotaReadback {
             route_refusal: Some(external_quota_route),
             ..quota_readback(
-                QuotaProjectionFormat::Windows,
+                crate::quota::project_quota,
+                eliot_plugin::quota::projection::account_usage_windows,
                 |_| "Claude CLI OAuth usage; provider read-only values",
             )
         }),

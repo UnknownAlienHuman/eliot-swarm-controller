@@ -9,7 +9,7 @@ const HARNESS_NAMES: &[&str] = &["codex", "claude", "opencode", "muse", "antigra
 const EXISTING: &[(&str, usize)] = &[
     ("eliot-core/src/api/harness.rs", 6),
     ("eliot-daemon/src/config.rs", 9),
-    ("eliot-daemon/src/router/catalog.rs", 8),
+    ("eliot-daemon/src/router/catalog.rs", 5),
     ("eliot-daemon/src/router/discovery.rs", 5),
 ];
 

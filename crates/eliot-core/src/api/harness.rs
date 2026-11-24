@@ -12,9 +12,9 @@
 //! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
 //! an explicit supported/unsupported/unknown status and provider-verbatim
-//! `details` when supported (Codex `account/rateLimits/read` plus
-//! `account/usage/read`; Muse `usage/read`); it performs no inference and
-//! never polls per Agent.
+//! `details` when supported. The adapter declares how to interpret details
+//! and read account windows. The query performs no inference and never polls
+//! per Agent.
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -151,21 +151,43 @@ pub enum LaunchDefaultPolicy {
     OmitForServerDefault,
 }
 
-/// Native evidence the daemon can project into shared quota windows.
+/// Vendor quota evidence for an optional exact model selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QuotaProjectionFormat {
-    RateLimits,
-    IntegrationWindows,
-    UsagePair,
-    Windows,
+pub enum QuotaMapping {
+    /// A bucket keyed by the exact requested model id.
+    ExactId,
+    /// A documented provider group window applying to this model
+    /// (`account` for unlabeled account-scope windows).
+    Group(&'static str),
+    /// No documented mapping: the window constrains no model.
+    Unmapped,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuotaProjection {
+    pub exhausted: bool,
+    pub available: bool,
+    pub mapping: QuotaMapping,
+    pub provenance: &'static str,
+    pub headroom: QuotaHeadroom,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QuotaHeadroom {
+    pub max_used: Option<f64>,
+    pub weekly_used: Option<f64>,
+}
+
+pub type QuotaProjector = fn(&serde_json::Value, Option<&str>, i64) -> Option<QuotaProjection>;
+pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
 
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
 
 /// Adapter readback shape and route preflight for provider quota.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeQuotaReadback {
-    pub projection: QuotaProjectionFormat,
+    pub project: QuotaProjector,
+    pub usage_windows: QuotaUsageWindows,
     pub method: &'static str,
     pub adhoc_integration: Option<&'static str>,
     pub description: fn(&serde_json::Value) -> &'static str,

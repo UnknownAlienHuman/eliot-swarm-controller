@@ -3,7 +3,7 @@
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
     NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
-    ProfileCapabilities, ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
+    ProfileCapabilities, ProjectInstructionRead, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
     CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, NativeSubagentsPolicy, codex_project_doc_override,
@@ -55,7 +55,8 @@ pub fn declaration() -> HarnessCapabilities {
                 )
             }),
             ..quota_readback(
-                QuotaProjectionFormat::RateLimits,
+                crate::discovery::project_quota,
+                crate::discovery::quota_usage_windows,
                 |_| "Codex account/rateLimits/read; provider read-only values",
             )
         }),

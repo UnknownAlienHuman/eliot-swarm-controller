@@ -2483,12 +2483,12 @@ These provider readers return `details.windows`: at most 32
 `{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
 at or above zero (Muse can report over 100); reset time is Unix milliseconds or null when absent. Windows identify
 5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
-or reset times. Routing and the catalogue consume every reader through one
-typed projection carrying provider, scope, observation time, verdict
-(`exhausted`/`available`), mapping provenance and how the decisive bucket
-maps to the model: an exact bucket id, a documented provider group, or
-unmapped. Group matching is on whole model-id tokens against the documented
-group table, never substrings: a depleted `Gemini 4 Argon weekly` bucket
+or reset times. The daemon binds the adapter's typed evidence to the verified
+response scope and observation time. Routing and the catalogue share that
+freshness gate and consume the adapter's verdict (`exhausted`/`available`) and
+mapping (an exact bucket id, a documented provider group, or unmapped).
+Group matching is on whole model-id tokens against the adapter's documented
+groups. A depleted `Gemini 4 Argon weekly` bucket
 skips Argon models but never a Hydrogen model, and an unrecognized label
 such as `Model group` applies to no model (reported as unmapped, so callers
 stay `unknown`). An omitted model has no group membership. Account limits

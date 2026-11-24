@@ -4,8 +4,7 @@ use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
     NativeAuthCapability, NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation,
-    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
-    UserInstructionFiles,
+    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
@@ -40,13 +39,17 @@ pub fn declaration() -> HarnessCapabilities {
         },
         quota_readback: Some(NativeQuotaReadback {
             adhoc_integration: Some("opencode-go"),
-            ..quota_readback(QuotaProjectionFormat::IntegrationWindows, |details| {
-                if details["integration"] == "opencode" {
-                    "OpenCode Console workspace budgets and Go allowance; provider read-only values"
-                } else {
-                    "OpenCode Go account usage; provider read-only values"
-                }
-            })
+            ..quota_readback(
+                crate::quota::project_quota,
+                eliot_plugin::quota::projection::account_usage_windows,
+                |details| {
+                    if details["integration"] == "opencode" {
+                        "OpenCode Console workspace budgets and Go allowance; provider read-only values"
+                    } else {
+                        "OpenCode Go account usage; provider read-only values"
+                    }
+                },
+            )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
         adhoc_launch: Some(AdhocLaunchDefaults {

@@ -193,9 +193,12 @@ which project instructions the native loader will select. Swarm's normal project
 source delivery applies, and any installed version is provenance.
 They also declare ad-hoc access mappings and the MCP and environment defaults
 used by ad-hoc launches and installed profile presets.
-Catalogue reader stages and native quota readback formats come from the same
-declarations. The daemon owns reader custody, route verification, cache identity
-and the use of quota evidence for routing.
+Catalogue reader stages and quota readback come from the same declarations.
+The quota adapter projects its reader's details into typed model evidence
+and account window bounds. Adapters use the shared window interpretation in
+`eliot-plugin` for common fields and declare their own model groups. The daemon
+owns reader custody, route verification, caching, freshness, routing and hold
+settlement.
 
 ## Host requests
 

@@ -3,7 +3,7 @@
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeAuthCapability,
     NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback,
-    NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
+    NativeRoute, ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
@@ -46,7 +46,8 @@ pub fn declaration() -> HarnessCapabilities {
             ),
             route_refusal: Some(crate::quota::route_refusal),
             ..quota_readback(
-                QuotaProjectionFormat::UsagePair,
+                crate::quota::project_quota,
+                crate::quota::quota_usage_windows,
                 |_| "Muse subscription allowance",
             )
         }),

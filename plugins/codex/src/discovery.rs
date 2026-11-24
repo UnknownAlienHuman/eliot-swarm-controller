@@ -16,6 +16,7 @@ use crate::{
         },
     },
 };
+use eliot_core::api::harness::{QuotaHeadroom, QuotaMapping, QuotaProjection, QuotaWindowBounds};
 use eliot_core::{
     Error, NativeStoreBinding, Result, SecretPolicy,
     api::{
@@ -24,6 +25,7 @@ use eliot_core::{
     },
     canonical_json_sha256,
 };
+use eliot_plugin::quota::projection::{observe, usage_bound, window_exhausted, window_headroom};
 use eliot_plugin::{
     DiscoverParams, MAX_EVENT_BYTES,
     retry::{Retry, RetryOperation, StartupAfterFailure},
@@ -2017,4 +2019,83 @@ fn too_large() -> Error {
         "frame_too_large",
         "Codex discovery metadata exceeds its bound",
     )
+}
+
+pub(crate) fn project_quota(
+    details: &Value,
+    model: Option<&str>,
+    now: i64,
+) -> Option<QuotaProjection> {
+    let rates = details
+        .get("rateLimits")
+        .filter(|rates| rates.is_object())?;
+    // Only the primary bucket's explicit limit state settles exhaustion: the
+    // deny signals, or a full primary window without credits. A full secondary
+    // window or a metered `rateLimitsByLimitId` bucket never proves the
+    // request's own quota is spent, so neither skips the route.
+    let mut exhausted = rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
+        || rates
+            .get("rateLimitReachedType")
+            .is_some_and(|reached| !reached.is_null())
+        || rates
+            .get("individualLimit")
+            .and_then(|limit| limit.get("remainingPercent"))
+            .and_then(Value::as_i64)
+            .is_some_and(|remaining| remaining <= 0);
+    let credits = &rates["credits"];
+    let credit_available = credits["unlimited"].as_bool() == Some(true)
+        || credits["hasCredits"].as_bool() == Some(true);
+    exhausted |= !credit_available && window_exhausted(&rates["primary"], now);
+    let available = !exhausted
+        && details["ordinaryUsageAllowed"].as_bool() == Some(true)
+        && window_headroom(&rates["primary"], now)
+        && window_headroom(&rates["secondary"], now)
+        && match details.get("rateLimitsByLimitId") {
+            None | Some(Value::Null) => true,
+            Some(Value::Object(limits)) if limits.is_empty() => true,
+            Some(Value::Object(limits)) => model.is_some_and(|model| {
+                limits.get(model).is_some_and(|rates| {
+                    window_headroom(&rates["primary"], now)
+                        && window_headroom(&rates["secondary"], now)
+                })
+            }),
+            _ => false,
+        };
+    // Only the primary bucket can establish exhaustion. Per-model buckets
+    // can establish the mapping for affirmative headroom.
+    let mapping = match model {
+        Some(model)
+            if !exhausted
+                && details
+                    .get("rateLimitsByLimitId")
+                    .and_then(|limits| limits.get(model))
+                    .is_some() =>
+        {
+            QuotaMapping::ExactId
+        }
+        _ => QuotaMapping::Group("primary"),
+    };
+    let mut headroom = QuotaHeadroom::default();
+    for bucket in std::iter::once(rates)
+        .chain(model.and_then(|model| details.get("rateLimitsByLimitId")?.get(model)))
+    {
+        for key in ["primary", "secondary"] {
+            observe(&mut headroom, &bucket[key], now, false);
+        }
+    }
+    Some(QuotaProjection {
+        exhausted,
+        available,
+        mapping,
+        provenance: "codex:rateLimits",
+        headroom,
+    })
+}
+
+pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
+    let rates = &details["rateLimits"];
+    [("primary", "Primary"), ("secondary", "Secondary")]
+        .into_iter()
+        .filter_map(|(key, label)| usage_bound(label, &rates[key], None, now))
+        .collect()
 }
