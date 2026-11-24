@@ -6,9 +6,9 @@
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::{
-    CLAUDE_EXTERNAL_ROUTE_MARKERS, HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities,
-    HarnessEntry, HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry,
-    ModelsCatalogFailure, SUPPORTED_HARNESSES,
+    HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry,
+    HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
+    SUPPORTED_HARNESSES,
 };
 use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
@@ -33,25 +33,24 @@ impl Router {
     async fn harness_inventory(deadline: Instant) -> Result<Value> {
         // Filesystem presence plus bounded `--version` probes is blocking
         // work: run it on the blocking pool so slow native CLIs never stall
-        // async command/event service. Claude candidates are enumerated once
-        // and reused for both the entry and the candidate list instead of
-        // versioning every install twice per inventory pass.
+        // async command/event service. Ranked candidates are enumerated once
+        // and reused for both the entry and candidate list.
         let harnesses: Vec<eliot_core::api::HarnessEntry> =
             crate::adhoc::blocking_discovery(deadline, move || {
-                let claude_candidates = crate::adhoc::discover_claude_candidates(deadline);
                 let mut harnesses = Vec::new();
                 for harness in SUPPORTED_HARNESSES {
-                    let entry = if *harness == "claude" {
-                        crate::adhoc::claude_installation(&claude_candidates)
+                    let ranked = crate::adhoc::has_ranked_install_candidates(harness);
+                    let ranked_candidates = if ranked {
+                        crate::adhoc::discover_ranked_candidates(harness, deadline)
+                    } else {
+                        Vec::new()
+                    };
+                    let entry = if ranked {
+                        crate::adhoc::ranked_installation(harness, &ranked_candidates)
                     } else {
                         crate::adhoc::harness_installation(harness, deadline)
                     };
-                    // Report eligible standalone Claude installs newest first.
-                    let candidates = if *harness == "claude" {
-                        (!claude_candidates.is_empty()).then(|| claude_candidates.clone())
-                    } else {
-                        None
-                    };
+                    let candidates = (!ranked_candidates.is_empty()).then_some(ranked_candidates);
                     harnesses.push(eliot_core::api::HarnessEntry {
                         harness: (*harness).to_owned(),
                         installed: entry
@@ -107,10 +106,13 @@ impl Router {
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
             return Ok((Some(snapshot), name.to_owned(), None));
         }
-        let (cmd, discovered) = if harness == "claude" && !quota {
-            match crate::adhoc::claude_reader_executable(deadline).await {
+        let (cmd, discovered) = if !quota && crate::adhoc::has_ranked_install_candidates(harness) {
+            match crate::adhoc::ranked_reader_executable(harness, deadline).await {
                 Ok(candidate) => (Some(candidate.cmd.clone()), Some(candidate)),
-                Err(error) if catalog::claude_fallback_eligible(&error) => {
+                Err(error)
+                    if HarnessCapabilities::of(harness).documented_models.is_some()
+                        && catalog::documented_fallback_eligible(&error) =>
+                {
                     return Ok((None, "adhoc".to_owned(), None));
                 }
                 Err(error) => return Err(error),
@@ -129,9 +131,13 @@ impl Router {
             crate::adhoc::AdhocAuth::Skip,
             None,
         )?;
-        if quota && harness == "opencode" {
+        if quota
+            && let Some(integration) = HarnessCapabilities::of(harness)
+                .quota_readback
+                .and_then(|readback| readback.adhoc_integration)
+        {
             // Named launch routes bind their own integration.
-            snapshot["auth_integration"] = json!("opencode-go");
+            snapshot["auth_integration"] = Value::from(integration);
         }
         crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
         crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
@@ -219,40 +225,43 @@ impl Router {
                 (snapshot, label, discovered, None)
             }
         };
-        let response =
-            if let Some((agent, generation)) = live_identity.filter(|_| harness == "opencode") {
-                let (scope, credential) =
-                    catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
-                let raw = self
-                    .inner
-                    .plugin_host
-                    .agent_models(&agent, generation)
-                    .await?;
-                if !self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .get_agent(&agent)?
-                    .is_some_and(|agent| agent.generation == generation)
-                {
-                    return Err(Error::new(
-                        "stale_generation",
-                        "Agent generation changed during its model read",
-                    ));
-                }
-                catalog::native_models_response(&harness, "", scope, credential, "session", &raw)?
-            } else {
-                self.models_for_snapshot(
-                    &harness,
-                    snapshot,
-                    &label,
-                    discovered,
-                    request.workspace.clone(),
-                    deadline,
-                )
-                .await?
-            };
+        let response = if let Some((agent, generation)) = live_identity.filter(|_| {
+            HarnessCapabilities::of(&harness)
+                .manifest_extra_verbs
+                .contains(&"models")
+        }) {
+            let (scope, credential) =
+                catalog::describe_snapshot(&label, &harness, snapshot.as_ref());
+            let raw = self
+                .inner
+                .plugin_host
+                .agent_models(&agent, generation)
+                .await?;
+            if !self
+                .inner
+                .store
+                .lock()
+                .await
+                .get_agent(&agent)?
+                .is_some_and(|agent| agent.generation == generation)
+            {
+                return Err(Error::new(
+                    "stale_generation",
+                    "Agent generation changed during its model read",
+                ));
+            }
+            catalog::native_models_response(&harness, "", scope, credential, "session", &raw)?
+        } else {
+            self.models_for_snapshot(
+                &harness,
+                snapshot,
+                &label,
+                discovered,
+                request.workspace.clone(),
+                deadline,
+            )
+            .await?
+        };
         request.validate_response(&response)?;
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "harness models could not be encoded"))
@@ -281,6 +290,7 @@ impl Router {
                 .await;
         }
         let (scope, credential) = catalog::describe_snapshot(label, harness, snapshot.as_ref());
+        let documented_models = HarnessCapabilities::of(harness).documented_models;
         let read = async {
             let mut profile = snapshot.ok_or_else(|| {
                 Error::new(
@@ -289,11 +299,10 @@ impl Router {
                 )
             })?;
             let route = crate::router::plugin_host::metadata_route(&profile)?;
-            if harness == "claude" && route.identity.is_none() {
-                return Err(Error::new(
-                    "unavailable",
-                    "Claude model catalogue route could not be verified",
-                ));
+            if let Some(documented) = documented_models
+                && route.identity.is_none()
+            {
+                return Err(Error::new("unavailable", documented.unverified_route));
             }
             let cmd = profile["cmd"].as_str().unwrap_or(harness);
             let (cmd, version) = match discovered {
@@ -352,10 +361,17 @@ impl Router {
                 }
                 Ok(response)
             }
-            Err(error) if harness == "claude" && catalog::claude_fallback_eligible(&error) => {
-                Ok(catalog::claude_alias_fallback(scope, credential))
+            Err(error) => {
+                if let Some(documented) =
+                    documented_models.filter(|_| catalog::documented_fallback_eligible(&error))
+                {
+                    Ok(catalog::alias_fallback(
+                        harness, documented, scope, credential,
+                    ))
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(error),
         }
     }
 
@@ -599,7 +615,7 @@ impl Router {
                 route_verified,
             });
         }
-        if harness == "antigravity" {
+        if HarnessCapabilities::of(&harness).reader_executable_discovery {
             let candidate = crate::adhoc::resolve_profile_command_until(
                 &label,
                 &harness,
@@ -693,15 +709,14 @@ impl Router {
                         observation.validate()?;
                     }
                     response.details = Some(details.clone());
-                    response.note=Some(match harness.as_str() {
-                        "codex" => "Codex account/rateLimits/read; provider read-only values",
-                        "muse" => "Muse subscription usage observed during a turn; timestamp is the native observation",
-                        "claude" => "Claude CLI OAuth usage; provider read-only values",
-                        "antigravity" => "Antigravity account quota; provider read-only values",
-                        _ if details["integration"] == "opencode" => "OpenCode Console workspace budgets and Go allowance; provider read-only values",
-                        _ => "OpenCode Go account usage; provider read-only values",
-                    }.to_owned());
-                    if harness == "muse" {
+                    response.note = Some(
+                        HarnessCapabilities::of(&harness)
+                            .quota_readback
+                            .map(|readback| (readback.description)(details))
+                            .unwrap_or("Read-only native/provider quota values")
+                            .to_owned(),
+                    );
+                    if HarnessCapabilities::of(&harness).reads_retained_quota {
                         if let Some(at) = details
                             .pointer("/usage/observedAtMs")
                             .and_then(Value::as_i64)
@@ -934,7 +949,7 @@ impl Router {
             // Profile models are independent preset rows. They remain visible
             // when ad-hoc discovery returns the same id, and never inherit the
             // ad-hoc hold or quota.
-            if harness == "opencode" {
+            if HarnessCapabilities::of(harness).models_preview_auth_integrations {
                 let profile_names =
                     crate::config::profile_names_for_harness(&self.inner.data_root, harness);
                 let total = profile_names.len();
@@ -1010,7 +1025,7 @@ impl Router {
                 ) {
                     if let Some(existing) = failures
                         .iter_mut()
-                        .find(|failure| failure.harness == "opencode")
+                        .find(|failure| failure.harness == harness)
                     {
                         catalog::append_failure_message(existing, &entry.message);
                     } else {
@@ -1173,76 +1188,18 @@ fn muse_catalog_note(default: Option<&str>) -> String {
     }
 }
 
-/// Universal external-route quota guard: a frozen profile that selects an
-/// external provider route must never report CLI/keyring quota measured for
-/// another route. Claude's markers are the core list shared with the Claude
-/// reader; the daemon refuses before spawning any reader, so routing and
-/// `harness.quota` share one decision. The one native fact it cannot see
-/// stays in the plugin: user settings that select an external route (Claude
-/// `settings.json`) are still refused by the Claude reader itself.
-///
-/// A Codex profile on an adopted proxy (`route_binding`) is such a route:
-/// Codex's `account/rateLimits/read` reports the signed-in ChatGPT account
-/// whatever provider the session uses, so its limits never describe the
-/// proxy route (a free proxied model was refused as exhausted while the
-/// ChatGPT weekly window was full).
+/// Shared preflight for a quota reader whose frozen route is external or
+/// ambiguous. The adapter declaration classifies only the frozen profile
+/// and reader environment and returns a nonsecret refusal reason. The daemon
+/// applies that refusal before cache access or a provider read, so routing
+/// and `harness.quota` share the same decision.
 pub(crate) fn external_quota_route(
     harness: &str,
     profile: &Value,
     environment: &Value,
 ) -> Option<&'static str> {
-    // Claude matches its reader's lookup: exact on non-Windows, ASCII
-    // case-insensitive on Windows.
-    let present = |name: &str| {
-        environment
-            .as_object()
-            .into_iter()
-            .flatten()
-            .any(|(key, value)| {
-                (key == name || (cfg!(windows) && key.eq_ignore_ascii_case(name)))
-                    && value.as_str().is_some_and(|text| !text.is_empty())
-            })
-    };
-    match harness {
-        "codex"
-            if profile
-                .get("route_binding")
-                .is_some_and(|binding| !binding.is_null()) =>
-        {
-            Some(
-                "Codex profile routes through an adopted proxy; ChatGPT account limits would describe the direct route",
-            )
-        }
-        "claude"
-            if CLAUDE_EXTERNAL_ROUTE_MARKERS
-                .iter()
-                .any(|marker| present(marker)) =>
-        {
-            Some(
-                "Claude profile route is external or ambiguous; CLI OAuth quota would describe an unverified route",
-            )
-        }
-        // Antigravity matches its reader's lookup exactly.
-        "antigravity"
-            if [
-                "GEMINI_API_KEY",
-                "GOOGLE_API_KEY",
-                "GOOGLE_APPLICATION_CREDENTIALS",
-            ]
-            .iter()
-            .any(|marker| {
-                environment
-                    .get(*marker)
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty())
-            }) =>
-        {
-            Some(
-                "Antigravity profile selects external auth; native keyring quota would describe another route",
-            )
-        }
-        _ => None,
-    }
+    let readback = HarnessCapabilities::of(harness).quota_readback?;
+    readback.route_refusal?(profile, environment)
 }
 
 /// Daemon-owned launch default for an omitted model, decided over the
@@ -1254,18 +1211,20 @@ pub(crate) fn launch_model_default(
     harness: &str,
     response: &HarnessModelsResponse,
 ) -> Result<Option<String>> {
-    match harness {
-        "codex" => match response.default.clone() {
-            Some(model) => Ok(Some(model)),
-            None => Err(
-                eliot_plugin::start_classification::harness_unavailable_model(
-                    "codex",
-                    "model_list",
-                    "Codex model/list reported no default model; use an explicit model",
+    match HarnessCapabilities::of(harness).launch_default_policy {
+        eliot_core::api::harness::LaunchDefaultPolicy::NativeMarkedDefault => {
+            match response.default.clone() {
+                Some(model) => Ok(Some(model)),
+                None => Err(
+                    eliot_plugin::start_classification::harness_unavailable_model(
+                        harness,
+                        "model_list",
+                        "Codex model/list reported no default model; use an explicit model",
+                    ),
                 ),
-            ),
-        },
-        "muse" => {
+            }
+        }
+        eliot_core::api::harness::LaunchDefaultPolicy::OmitForServerDefault => {
             if response.models.is_empty() {
                 return Err(Error::new(
                     "profile_error",
@@ -1278,7 +1237,7 @@ pub(crate) fn launch_model_default(
             }
             Ok(None)
         }
-        _ => Ok(None),
+        eliot_core::api::harness::LaunchDefaultPolicy::None => Ok(None),
     }
 }
 
@@ -1291,11 +1250,13 @@ pub(crate) fn launch_model_default(
 pub(super) fn quota_read_error(response: &mut HarnessQuotaResponse, error: eliot_core::Error) {
     if error.code == "unsupported" {
         response.status = "unsupported".to_owned();
-        response.note = Some(match response.harness.as_str() {
-            "muse" => "Installed Muse MSP does not support usage/read and has no retained subscription observation",
-            "codex" => "Installed Codex app-server does not support account/rateLimits/read",
-            _ => "Installed harness has no supported read-only quota method",
-        }.to_owned());
+        response.note = Some(
+            HarnessCapabilities::of(&response.harness)
+                .quota_readback
+                .and_then(|readback| readback.unsupported_note)
+                .unwrap_or("Installed harness has no supported read-only quota method")
+                .to_owned(),
+        );
     } else {
         let origin = if error.origin == Some(eliot_core::FailureOrigin::Provider) {
             "provider"
@@ -1567,25 +1528,27 @@ impl CatalogCache {
     }
 }
 
-fn claude_fallback_eligible(error: &Error) -> bool {
+fn documented_fallback_eligible(error: &Error) -> bool {
     matches!(error.code.as_str(), "unavailable" | "unsupported")
 }
 
-fn claude_alias_fallback(scope: String, credential: String) -> HarnessModelsResponse {
+fn alias_fallback(
+    harness: &str,
+    documented: eliot_core::api::harness::DocumentedModelCatalog,
+    scope: String,
+    credential: String,
+) -> HarnessModelsResponse {
     HarnessModelsResponse {
-        harness: "claude".to_owned(),
+        harness: harness.to_owned(),
         catalogue: "aliases".to_owned(),
-        models: crate::adhoc::claude_documented_models(),
+        models: (documented.entries)(),
         default: None,
-        note: Some(
-            "Claude native initialize inventory is unavailable for this scope. Entries are documented aliases and full model ids with unknown availability. The CLI default applies when no model is passed."
-                .to_owned(),
-        ),
+        note: Some(documented.note.to_owned()),
         scope,
         fetched_at_ms: now_ms(),
         ttl_ms: CATALOG_TTL_MS,
         credential,
-        configure: eliot_core::api::ConfigureSupport::for_harness("claude"),
+        configure: eliot_core::api::ConfigureSupport::for_harness(harness),
     }
 }
 
@@ -1633,10 +1596,12 @@ fn native_models_response(
             source: None,
         });
     }
-    if harness == "claude" && entries.is_empty() {
+    if let Some(documented) = HarnessCapabilities::of(harness).documented_models
+        && entries.is_empty()
+    {
         return Err(Error::new(
             "source_integrity",
-            "Claude model.list returned no usable ids in its projected inventory",
+            documented.empty_native_inventory,
         ));
     }
     let default = raw
@@ -1922,9 +1887,9 @@ pub(crate) struct QuotaObservation<'a> {
     pub observed_at_ms: i64,
 }
 
-/// Normalize provider-specific quota `details` into one projection.
+/// Normalize the adapter-declared quota `details` into one projection.
 /// A model scopes named windows. Without one only account windows apply.
-/// Returns `None` when no signal maps to this observation's provider
+/// Returns `None` when no signal maps to this observation's route
 /// (missing or unsupported shapes stay `unknown` at the caller).
 pub(crate) fn project_quota(
     observation: QuotaObservation<'_>,
@@ -1935,9 +1900,10 @@ pub(crate) fn project_quota(
     if !details.is_object() {
         return None;
     }
-    match observation.provider {
-        "muse" => {
-            let (windows, complete, provenance) = muse_window_set(details)?;
+    let readback = HarnessCapabilities::of(observation.provider).quota_readback?;
+    match readback.projection {
+        eliot_core::api::harness::QuotaProjectionFormat::UsagePair => {
+            let (windows, complete, provenance) = usage_pair_window_set(details)?;
             let mut projection =
                 windows_projection(observation, &windows, complete, model, now, provenance)?;
             if provenance != "muse:windows"
@@ -1948,9 +1914,13 @@ pub(crate) fn project_quota(
             }
             Some(projection)
         }
-        "codex" => codex_projection(observation, details, model, now),
-        "opencode" => opencode_projection(observation, details, model, now),
-        "claude" | "antigravity" => {
+        eliot_core::api::harness::QuotaProjectionFormat::RateLimits => {
+            rate_limits_projection(observation, details, model, now)
+        }
+        eliot_core::api::harness::QuotaProjectionFormat::IntegrationWindows => {
+            integration_windows_projection(observation, details, model, now)
+        }
+        eliot_core::api::harness::QuotaProjectionFormat::Windows => {
             let windows = details
                 .get("windows")
                 .and_then(Value::as_array)
@@ -2001,11 +1971,11 @@ pub(crate) fn projected_quota(
     )
 }
 
-/// Muse contributes three shapes over time: retained `windows[]`
+/// Usage-pair readers contribute three shapes over time: retained `windows[]`
 /// observations, live `usage{window,weekly}` reads, and the older top-level
 /// `window`/`weekly` pair. The legacy pair is complete only when both halves
 /// are present; a lone half is not headroom.
-fn muse_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
+fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
     if let Some(windows) = details
         .get("windows")
         .and_then(Value::as_array)
@@ -2072,6 +2042,9 @@ fn quota_usage_windows(
     let Some(details) = response.details.as_ref() else {
         return bounds;
     };
+    let Some(readback) = HarnessCapabilities::of(&response.harness).quota_readback else {
+        return bounds;
+    };
     let mut collect = |label: &str, window: &Value, duration: Option<i64>| {
         let Some((resets, minutes)) =
             window_reset_ms(window).zip(window["windowDurationMins"].as_i64().or(duration))
@@ -2093,23 +2066,32 @@ fn quota_usage_windows(
             });
         }
     };
-    if response.harness == "codex" {
-        let rates = &details["rateLimits"];
-        for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
-            collect(label, &rates[key], None);
-        }
-    } else if let Some(windows) = details["windows"].as_array() {
-        for window in windows {
-            if let Some(label) = window["label"].as_str()
-                && window_family(label).is_none()
-            {
-                collect(label, window, None);
+    use eliot_core::api::harness::QuotaProjectionFormat;
+    match readback.projection {
+        QuotaProjectionFormat::RateLimits => {
+            let rates = &details["rateLimits"];
+            for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
+                collect(label, &rates[key], None);
             }
         }
-    } else if response.harness == "muse" {
-        let usage = details.get("usage").unwrap_or(details);
-        collect("5-hour", &usage["window"], None);
-        collect("Weekly", &usage["weekly"], Some(10_080));
+        QuotaProjectionFormat::UsagePair if details["windows"].as_array().is_none() => {
+            let usage = details.get("usage").unwrap_or(details);
+            collect("5-hour", &usage["window"], None);
+            collect("Weekly", &usage["weekly"], Some(10_080));
+        }
+        QuotaProjectionFormat::UsagePair
+        | QuotaProjectionFormat::IntegrationWindows
+        | QuotaProjectionFormat::Windows => {
+            if let Some(windows) = details["windows"].as_array() {
+                for window in windows {
+                    if let Some(label) = window["label"].as_str()
+                        && window_family(label).is_none()
+                    {
+                        collect(label, window, None);
+                    }
+                }
+            }
+        }
     }
     bounds
 }
@@ -2291,7 +2273,7 @@ fn summarize_windows(
     })
 }
 
-fn opencode_projection(
+fn integration_windows_projection(
     observation: QuotaObservation<'_>,
     details: &Value,
     model: Option<&str>,
@@ -2335,7 +2317,7 @@ fn opencode_projection(
     }
 }
 
-fn codex_projection(
+fn rate_limits_projection(
     observation: QuotaObservation<'_>,
     details: &Value,
     model: Option<&str>,

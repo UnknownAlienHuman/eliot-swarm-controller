@@ -276,7 +276,11 @@ impl PluginHost {
         } else {
             None
         };
-        let claude = profile["harness"] == "claude";
+        let options = profile["harness"]
+            .as_str()
+            .map(HarnessCapabilities::of)
+            .unwrap_or_default()
+            .model_reader;
         let request = ModelListParams {
             target_environment: Some(environment),
             profile,
@@ -286,12 +290,9 @@ impl PluginHost {
         let slot = tokio::time::timeout_at(deadline, self.discovery_slot())
             .await
             .map_err(|_| crate::adhoc::discovery_timeout())??;
-        // A Muse cache miss can require a second host after a bounded refresh.
-        let reader_budget = if request.profile["harness"] == "muse" {
-            Duration::from_secs(60)
-        } else {
-            READER_DEADLINE
-        };
+        let reader_budget = options
+            .budget_seconds
+            .map_or(READER_DEADLINE, Duration::from_secs);
         let until = deadline.min(Instant::now() + reader_budget);
         let (id, stop_rx, done_tx) = self.register_metadata_reader_slot(slot)?;
         let host = self.clone();
@@ -316,7 +317,7 @@ impl PluginHost {
         });
         response.await.map_err(|_| {
             Error::new(
-                if claude { "unknown" } else { "unavailable" },
+                options.interruption_code.unwrap_or("unavailable"),
                 "model.list reader stopped",
             )
         })?
@@ -337,12 +338,7 @@ impl PluginHost {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(|harness| {
-                matches!(
-                    harness,
-                    "codex" | "muse" | "claude" | "opencode" | "antigravity"
-                )
-            })
+            .is_some_and(is_supported_harness)
         {
             return Err(Error::new(
                 "unsupported",
@@ -395,12 +391,10 @@ impl PluginHost {
             };
         };
         let harness = harness.to_owned();
-        let checked = match harness.as_str() {
-            "codex" => "account/rateLimits/read",
-            "muse" => "usage/read",
-            _ => "quota.read",
-        }
-        .to_owned();
+        let checked = HarnessCapabilities::of(&harness)
+            .quota_readback
+            .map_or("quota.read", |readback| readback.method)
+            .to_owned();
         let opened = self
             .open_reader_with_cleanup(
                 &AgentKey {
@@ -621,11 +615,18 @@ impl PluginHost {
         // OpenCode's two CLI operations must never share a reader lifetime:
         // closing the first Job proves its standalone server is gone before
         // starting the metadata command. Retain one admission slot throughout.
-        let opencode = request.profile["harness"] == "opencode";
+        let separate_variant_reader = request.profile["harness"].as_str().is_some_and(|harness| {
+            HarnessCapabilities::of(harness)
+                .model_reader
+                .separate_variant_reader
+        });
         let mut catalogue = self
             .read_model_catalogue_part(request.clone(), stop.clone(), until)
             .await;
-        if !opencode || catalogue.result.is_err() || catalogue.cleanup != ReaderCleanup::Confirmed {
+        if !separate_variant_reader
+            || catalogue.result.is_err()
+            || catalogue.cleanup != ReaderCleanup::Confirmed
+        {
             return catalogue;
         }
         request.part = ModelListPart::Variants;
@@ -701,7 +702,7 @@ impl PluginHost {
         known.extend([self.state.owner_token.clone(), reader.credential.clone()]);
         let metadata_secrets = metadata_secret_snapshot(profile, environment, known);
         let read = async {
-            if harness == "opencode" {
+            if HarnessCapabilities::of(&harness).models_preview_auth_integrations {
                 reader.create_model_catalogue_dir()?;
             }
             let manifest = reader.initialize(&harness, until).await?;
@@ -730,7 +731,7 @@ impl PluginHost {
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>
                 result.unwrap_or_else(|_| Err(Error::new(
-                    if harness == "claude" { "unknown" } else { "unavailable" },
+                    HarnessCapabilities::of(&harness).model_reader.interruption_code.unwrap_or("unavailable"),
                     "model.list deadline exceeded",
                 ))),
             _ = stop.changed() => Err(Error::new("cancelled", "model.list was cancelled")),

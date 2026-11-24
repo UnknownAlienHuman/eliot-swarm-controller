@@ -1,8 +1,8 @@
 //! Claude native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, NativeAccessBounds, NativeQuotaReadback,
-    QuotaProjectionFormat, UserInstructionFiles,
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
+    NativeAccessBounds, NativeQuotaReadback, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
     CLAUDE_EFFORT_LEVELS, CodexApprovalPolicy, CodexPermissions,
@@ -15,9 +15,20 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        model_reader: ModelReaderOptions {
+            interruption_code: Some("unknown"),
+            ..ModelReaderOptions::default()
+        },
+        documented_models: Some(DocumentedModelCatalog {
+            entries: crate::native::models::documented_models,
+            note: "Claude native initialize inventory is unavailable for this scope. Entries are documented aliases and full model ids with unknown availability. The CLI default applies when no model is passed.",
+            unverified_route: "Claude model catalogue route could not be verified",
+            empty_native_inventory: "Claude model.list returned no usable ids in its projected inventory",
+        }),
         quota_readback: Some(NativeQuotaReadback {
             projection: QuotaProjectionFormat::Windows,
             method: "quota.read",
+            adhoc_integration: None,
             description: |_| "Claude CLI OAuth usage; provider read-only values",
             unsupported_note: None,
             route_refusal: Some(external_quota_route),

@@ -73,95 +73,18 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
 pub use core::api::native_profile::CLAUDE_EFFORT_LEVELS;
 
-/// Provenance marker for the frozen Claude catalogue entries below: the ids
-/// are documented aliases and full model names, not a live native read.
-pub const CLAUDE_CATALOGUE_SOURCE: &str = "documented_alias";
-
-/// Frozen Claude Code `--model` aliases from the vendor model configuration
-/// ([Model configuration](https://code.claude.com/docs/en/model-config),
-/// checked 2026-11-16; installed CLI 2.1.325 `--help` names `fable`,
-/// `opus` and `sonnet` as examples): `best` resolves like `opus`; `fable`
-/// selects the Fable model; `sonnet[1m]`/`opus[1m]` request the 1M context
-/// window; `opusplan` runs plan mode on Opus then executes on Sonnet, with
-/// the documented `opusplan[1m]` variant for 1M context in both phases.
-/// `default` is deliberately absent: the doc marks it a special value that
-/// clears any override rather than a model alias, and omitting `--model`
-/// already selects the CLI default (read back from initialize/stream).
-pub const CLAUDE_DOCUMENTED_ALIASES: &[&str] = &[
-    "best",
-    "fable",
-    "sonnet",
-    "opus",
-    "haiku",
-    "sonnet[1m]",
-    "opus[1m]",
-    "opusplan",
-    "opusplan[1m]",
-];
-
-/// Frozen full Claude model ids, each shown in the same vendor doc as a
-/// `/model`, `--model`, settings, fallback or allowlist selection
-/// (checked 2026-11-16): pinning a version instead of following an alias.
-/// `claude-haiku-5-5` is documented as `Its model ID is ... To use it, run
-/// /model claude-haiku-5-5 ... or claude --model claude-haiku-5-5`.
-pub const CLAUDE_DOCUMENTED_MODEL_IDS: &[&str] = &[
-    "claude-fable-5-2",
-    "claude-fable-5-1",
-    "claude-fable-5",
-    "claude-opus-5-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-opus-4-8[1m]",
-    "claude-opus-4-6",
-    "claude-opus-4-6[1m]",
-    "claude-opus-4-1",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6[1m]",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-5-5",
-    "claude-haiku-4-5",
-];
-
-/// Build the frozen `harness.models` entries for Claude. No native
-/// catalogue exists (verified read-only against installed 2.1.325 on
-/// 2026-11-16: no `models` subcommand, `--model` names aliases or a full
-/// model name, settings `model`/`availableModels` is an allowlist rather
-/// than an inventory, and the stream-json `initialize` reply reports only
-/// the session model), so the documented aliases and full ids above are
-/// returned verbatim, each marked `documented_alias` with the CLI effort
-/// vocabulary attached. Availability is never asserted here: quota stays
-/// unsupported for Claude, so the unified catalogue reads `unknown`.
-pub(crate) fn claude_documented_models() -> Vec<core::api::HarnessModelEntry> {
-    let efforts: Vec<String> = CLAUDE_EFFORT_LEVELS
-        .iter()
-        .map(|effort| (*effort).to_owned())
-        .collect();
-    CLAUDE_DOCUMENTED_ALIASES
-        .iter()
-        .chain(CLAUDE_DOCUMENTED_MODEL_IDS.iter())
-        .map(|id| core::api::HarnessModelEntry {
-            id: (*id).to_owned(),
-            display_name: None,
-            default: false,
-            efforts: Some(efforts.clone()),
-            default_effort: None,
-            source: Some(CLAUDE_CATALOGUE_SOURCE.to_owned()),
-        })
-        .collect()
-}
-
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     // OpenCode efforts are the installed per-model `Model.Variant` ids
     // (the TUI "Variant" switch), so any well-formed value freezes and the
     // live native catalogue proves membership at launch.
-    if !matches!(harness, "codex" | "muse" | "claude" | "opencode") {
-        return Err(core::Error::new(
-            "unsupported",
-            format!("the {harness} slice has no reasoning-effort mapping"),
-        ));
-    }
+    let adhoc_effort = core::api::HarnessCapabilities::of(harness)
+        .adhoc_effort
+        .ok_or_else(|| {
+            core::Error::new(
+                "unsupported",
+                format!("the {harness} slice has no reasoning-effort mapping"),
+            )
+        })?;
     let trimmed = effort.trim();
     if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
         return Err(core::Error::new(
@@ -169,11 +92,10 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
             "ad-hoc effort must be non-empty, at most 128 characters and contain no controls",
         ));
     }
-    if harness == "claude" && !CLAUDE_EFFORT_LEVELS.contains(&trimmed) {
-        return Err(core::Error::new(
-            "profile_error",
-            "unknown Claude effort level (low, medium, high, xhigh, or max)",
-        ));
+    if let core::api::harness::AdhocEffort::Choices { values, refusal } = adhoc_effort
+        && !values.contains(&trimmed)
+    {
+        return Err(core::Error::new("profile_error", refusal));
     }
     Ok(trimmed.to_owned())
 }
@@ -602,19 +524,51 @@ pub(crate) fn profile_command_exists(cmd: &str) -> bool {
 /// Enumeration comes from the Claude plugin's install declaration; the
 /// bounded `--version` probe loop stays shared here.
 pub(crate) fn discover_claude_candidates(deadline: Instant) -> Vec<core::api::HarnessCandidate> {
-    let paths = discovery_for("claude")
-        .ok()
-        .and_then(|decl| (decl.candidates)().ok())
-        .unwrap_or_default();
-    probe_candidate_paths_with(paths, |cmd| {
-        probe_native_version(cmd, None, deadline).ok().flatten()
-    })
+    discover_ranked_candidates("claude", deadline)
 }
 
 /// Select the newest verified Claude candidate through the shared
 /// newest-verified engine over the plugin's declaration.
 fn discover_verified_claude(deadline: Instant) -> core::Result<core::api::HarnessCandidate> {
-    let decl = discovery_for("claude")?;
+    discover_ranked_candidate("claude", deadline)
+}
+
+/// Whether the adapter declares a ranked native install inventory.
+pub(crate) fn has_ranked_install_candidates(harness: &str) -> bool {
+    discovery_for(harness)
+        .is_ok_and(|decl| matches!(decl.strategy, InstallStrategy::NewestVerified))
+}
+
+/// Probe all candidates from a ranked adapter, newest and parseable versions
+/// first. Failed or unparseable probes remain in the candidate list as
+/// unverified entries, matching Claude's existing inventory behavior.
+pub(crate) fn discover_ranked_candidates(
+    harness: &str,
+    deadline: Instant,
+) -> Vec<core::api::HarnessCandidate> {
+    let Ok(decl) = discovery_for(harness) else {
+        return Vec::new();
+    };
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return Vec::new();
+    }
+    let paths = (decl.candidates)().unwrap_or_default();
+    probe_candidate_paths_with(paths, |cmd| {
+        probe_native_version(cmd, None, deadline).ok().flatten()
+    })
+}
+
+fn discover_ranked_candidate(
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    let decl = discovery_for(harness)?;
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return Err(core::Error::new(
+            "unsupported",
+            "native install declaration does not rank candidates",
+        ));
+    }
     discover_newest_verified(&decl, deadline)
 }
 
@@ -633,12 +587,15 @@ fn verified_candidate_from_candidates(
     })
 }
 
-pub(crate) fn is_latest_claude_selector(cmd: &str) -> bool {
+pub(crate) fn is_latest_selector(cmd: &str) -> bool {
     cmd.trim().eq_ignore_ascii_case("latest")
 }
 
-pub(crate) fn claude_candidate_available() -> bool {
-    discovery_for("claude").ok().is_some_and(|decl| {
+pub(crate) fn ranked_candidate_available(harness: &str) -> bool {
+    if !has_ranked_install_candidates(harness) {
+        return false;
+    }
+    discovery_for(harness).ok().is_some_and(|decl| {
         (decl.candidates)()
             .unwrap_or_default()
             .iter()
@@ -672,7 +629,7 @@ pub(crate) fn missing_profile_command_refusal(
     configured_cmd: &str,
     replacement: Option<&core::api::HarnessCandidate>,
 ) -> core::Error {
-    let fallback = if harness == "claude" {
+    let fallback = if crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd {
         format!(
             "omit cmd from profiles.{profile} to follow the installed version, or use {}",
             claude_latest_settings_command(profile)
@@ -744,9 +701,10 @@ pub(crate) fn inherit_profile_command(
 }
 
 pub(crate) fn explicit_profile_command<'a>(snapshot: &'a Value, harness: &str) -> Option<&'a str> {
-    snapshot["cmd"]
-        .as_str()
-        .filter(|cmd| !(harness == "claude" && is_latest_claude_selector(cmd)))
+    snapshot["cmd"].as_str().filter(|cmd| {
+        !(crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd
+            && is_latest_selector(cmd))
+    })
 }
 
 pub(crate) async fn resolve_profile_command_until(
@@ -755,7 +713,7 @@ pub(crate) async fn resolve_profile_command_until(
     cmd: Option<&str>,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
-    if harness == "claude" {
+    if crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd {
         return resolve_claude_profile_command_until(profile, cmd, deadline).await;
     }
     let Some(cmd) = cmd else {
@@ -807,7 +765,7 @@ fn resolve_claude_profile_command_sync(
     cmd: Option<&str>,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
-    if let Some(cmd) = cmd.filter(|cmd| !is_latest_claude_selector(cmd)) {
+    if let Some(cmd) = cmd.filter(|cmd| !is_latest_selector(cmd)) {
         let cmd = validate_claude_cmd(profile, cmd)?;
         if is_native_executable(Path::new(&cmd)) {
             return Ok(core::api::HarnessCandidate {
@@ -848,35 +806,35 @@ fn shell_quote_settings_arg(value: &str) -> String {
     }
 }
 
-/// Inventory entry for Claude from one candidate pass, so `harness.list`
-/// does not enumerate and version every install twice.
-pub(crate) fn claude_installation(candidates: &[core::api::HarnessCandidate]) -> Value {
+/// Inventory entry derived from the same ranked candidates displayed to the caller.
+pub(crate) fn ranked_installation(
+    harness: &str,
+    candidates: &[core::api::HarnessCandidate],
+) -> Value {
+    let decl = match discovery_for(harness) {
+        Ok(decl) => decl,
+        Err(error) => return installation_error(harness, error),
+    };
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return installation_error(
+            harness,
+            core::Error::new(
+                "unsupported",
+                "native install declaration does not rank candidates",
+            ),
+        );
+    }
     if let Some(best) = verified_candidate_from_candidates(candidates) {
         let version = best.version.clone().map_or(Value::Null, Value::String);
         json!({
-            "harness": "claude",
+            "harness": harness,
             "installed": true,
             "cmd": best.cmd.clone(),
             "version": version,
         })
     } else {
-        let error = discovery_for("claude")
-            .ok()
-            .map(|decl| (decl.not_found)(!candidates.is_empty(), &(decl.searched)()))
-            .unwrap_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "Standalone Claude CLI was not found; select a native executable explicitly with --cmd",
-                )
-            });
-        json!({
-            "harness": "claude",
-            "installed": false,
-            "cmd": Value::Null,
-            "version": Value::Null,
-            "error": error.message,
-            "code": error.code,
-        })
+        let error = (decl.not_found)(!candidates.is_empty(), &(decl.searched)());
+        installation_error(harness, error)
     }
 }
 /// Resolve and check the exact executable before any probe. An IDE symlink
@@ -1003,14 +961,15 @@ pub(crate) async fn reader_executable(
     .await?
 }
 
-/// Select the newest Claude reader with a successful parseable `--version`
-/// under the caller's deadline, reusing its version from the same pass.
-pub(crate) async fn claude_reader_executable(
+/// Resolve the newest verified reader and reuse its observed version.
+pub(crate) async fn ranked_reader_executable(
+    harness: &str,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
+    let harness = harness.to_owned();
     blocking_discovery(deadline, move || {
-        let best = discover_verified_claude(deadline)?;
-        let cmd = resolve_native_executable(&best.cmd, "claude")?;
+        let best = discover_ranked_candidate(&harness, deadline)?;
+        let cmd = resolve_native_executable(&best.cmd, &harness)?;
         Ok(core::api::HarnessCandidate {
             cmd,
             version: best.version.clone(),

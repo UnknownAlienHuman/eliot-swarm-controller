@@ -13,6 +13,7 @@ pub fn declaration() -> HarnessCapabilities {
         quota_readback: Some(NativeQuotaReadback {
             projection: QuotaProjectionFormat::Windows,
             method: "quota.read",
+            adhoc_integration: None,
             description: |_| "Antigravity account quota; provider read-only values",
             unsupported_note: None,
             route_refusal: Some(|_, environment| {

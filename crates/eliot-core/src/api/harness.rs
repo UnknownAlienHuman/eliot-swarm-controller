@@ -143,9 +143,27 @@ type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'
 pub struct NativeQuotaReadback {
     pub projection: QuotaProjectionFormat,
     pub method: &'static str,
+    pub adhoc_integration: Option<&'static str>,
     pub description: fn(&serde_json::Value) -> &'static str,
     pub unsupported_note: Option<&'static str>,
     pub route_refusal: Option<QuotaRouteRefusal>,
+}
+
+/// A documented model list usable when a verified native read is unavailable.
+#[derive(Clone, Copy, Debug)]
+pub struct DocumentedModelCatalog {
+    pub entries: fn() -> Vec<HarnessModelEntry>,
+    pub note: &'static str,
+    pub unverified_route: &'static str,
+    pub empty_native_inventory: &'static str,
+}
+
+/// Requirements for a dedicated native catalogue reader.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModelReaderOptions {
+    pub budget_seconds: Option<u64>,
+    pub separate_variant_reader: bool,
+    pub interruption_code: Option<&'static str>,
 }
 
 /// Prelaunch capability declaration supplied by each built-in adapter.
@@ -161,8 +179,13 @@ pub struct HarnessCapabilities {
     pub workspace_write_commit_roots: bool,
     /// Accepts the `compact` verb and emits a compact hint on session growth.
     pub compact: bool,
+    /// Native compaction exposes a recoverable boundary after a stream gap.
+    pub compaction_gap_recovery: bool,
     /// `harness.models` accepts a `workspace` launch-preview argument.
     pub models_workspace_preview: bool,
+    /// Published native aliases used when a verified live catalogue is unavailable.
+    pub documented_models: Option<DocumentedModelCatalog>,
+    pub model_reader: ModelReaderOptions,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,
     /// The native model refusal permits cleanup before any initial turn work.
@@ -193,6 +216,8 @@ pub struct HarnessCapabilities {
     pub observed_live_families: &'static [&'static str],
     /// Observation stream families supported for registered native children.
     pub native_child_families: &'static [&'static str],
+    /// Exact refusal for native child history when only its live facts are available.
+    pub native_child_history_refusal: Option<&'static str>,
     /// Process executable stems owned by this harness runtime.
     pub executable_stems: &'static [&'static str],
     /// Product prefixes stripped when normalizing `--version` strings.
@@ -256,6 +281,8 @@ pub struct HarnessCapabilities {
     pub launch_default_policy: LaunchDefaultPolicy,
     /// Injection point for a guard refusal on a live stream, if any.
     pub guard_refusal_point: Option<crate::InjectPoint>,
+    /// A guarded denial requires one uniquely identified native option.
+    pub guard_refusal_choice_error: Option<&'static str>,
     /// Manifest verbs this adapter may declare without implementing.
     pub manifest_extra_verbs: &'static [&'static str],
     /// Hot-start manager order among harnesses that can deny native subagents;

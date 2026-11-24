@@ -151,6 +151,9 @@ Adapters declare their project instruction-file behavior and the user instructio
 paths that doctor compares with committed owner rules.
 They also declare ad-hoc access mappings and the MCP and environment defaults
 used by ad-hoc launches and installed profile presets.
+Catalogue reader stages and native quota readback formats come from the same
+declarations. The daemon owns reader custody, route verification, cache identity
+and the use of quota evidence for routing.
 
 ## Host requests
 

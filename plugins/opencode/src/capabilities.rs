@@ -1,8 +1,8 @@
 //! Opencode native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, NativeQuotaReadback, QuotaProjectionFormat,
-    UserInstructionFiles,
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, ModelReaderOptions, NativeQuotaReadback,
+    QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::{
     ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
@@ -10,9 +10,14 @@ use eliot_core::api::{
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        model_reader: ModelReaderOptions {
+            separate_variant_reader: true,
+            ..ModelReaderOptions::default()
+        },
         quota_readback: Some(NativeQuotaReadback {
             projection: QuotaProjectionFormat::IntegrationWindows,
             method: "quota.read",
+            adhoc_integration: Some("opencode-go"),
             description: |details| {
                 if details["integration"] == "opencode" {
                     "OpenCode Console workspace budgets and Go allowance; provider read-only values"
@@ -61,6 +66,7 @@ pub fn declaration() -> HarnessCapabilities {
         resume_config: true,
         manifest_extra_verbs: &["models"],
         compact: true,
+        compaction_gap_recovery: true,
         models_workspace_preview: true,
         models_preview_auth_integrations: true,
         initial_model_refusal_cleanup: true,

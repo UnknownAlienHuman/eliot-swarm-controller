@@ -17,6 +17,7 @@ pub fn declaration() -> HarnessCapabilities {
         quota_readback: Some(NativeQuotaReadback {
             projection: QuotaProjectionFormat::RateLimits,
             method: "account/rateLimits/read",
+            adhoc_integration: None,
             description: |_| "Codex account/rateLimits/read; provider read-only values",
             unsupported_note: Some(
                 "Installed Codex app-server does not support account/rateLimits/read",

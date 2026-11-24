@@ -2,8 +2,8 @@
 
 use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, NativeAccessBounds,
-    NativeQuotaReadback, QuotaProjectionFormat,
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, ModelReaderOptions,
+    NativeAccessBounds, NativeQuotaReadback, QuotaProjectionFormat,
 };
 use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus};
@@ -11,9 +11,14 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        model_reader: ModelReaderOptions {
+            budget_seconds: Some(60),
+            ..ModelReaderOptions::default()
+        },
         quota_readback: Some(NativeQuotaReadback {
             projection: QuotaProjectionFormat::UsagePair,
             method: "usage/read",
+            adhoc_integration: None,
             description: |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
             unsupported_note: Some(
                 "Installed Muse MSP does not support usage/read and has no retained subscription observation",
@@ -43,6 +48,7 @@ pub fn declaration() -> HarnessCapabilities {
         resume_previous_turn: true,
         launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
+        guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),
         allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
@@ -55,6 +61,9 @@ pub fn declaration() -> HarnessCapabilities {
         reads_retained_quota: true,
         view_projection_gap_recovery: true,
         native_child_families: &eliot_core::MUSE_NATIVE_CHILD_FAMILIES,
+        native_child_history_refusal: Some(
+            "native history is unsupported for Muse child observations",
+        ),
         executable_stems: &["muse"],
         version_prefixes: &["muse-code", "muse"],
         session_input_includes_cache_reads: true,
