@@ -576,8 +576,8 @@ impl MailReofferScan {
                 ..Self::default()
             };
         }
-        // Keep the initial revision and cutoff throughout the page walk. A
-        // commit or cooldown reached behind the cursor then forces a new walk.
+        // Finish the in-progress walk at its original time cutoff. Once it
+        // completes, a changed revision or elapsed cooldown starts a new walk.
         let page = store.due_mail_notice_recipients(
             self.after.as_deref(),
             MAIL_REOFFER_PAGE,

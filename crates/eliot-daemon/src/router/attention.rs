@@ -27,7 +27,6 @@ use observe::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -130,10 +129,7 @@ pub(super) struct ThresholdCache {
 }
 
 impl ThresholdCache {
-    fn synchronize(&mut self, path: &Path) -> Result<i64> {
-        if self.reader.is_none() {
-            self.reader = Some(AttentionVersionReader::open(path)?);
-        }
+    fn synchronize(&mut self) -> Result<i64> {
         let version = self.reader.as_ref().unwrap().version()?;
         if self.version != Some(version) {
             self.pairs.clear();
@@ -382,22 +378,29 @@ async fn pair_thresholds_for_agent(
     let router = router.clone();
     tokio::task::spawn_blocking(move || {
         let path = router.inner.data_root.join("eliot.db");
-        let mut cache = router
-            .inner
-            .attention_threshold_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let version = cache.synchronize(&path)?;
-        if let Some(cached) = cache.pairs.get(&key) {
-            return Ok(cached.thresholds);
-        }
+        let shared = &router.inner.attention_threshold_cache;
+        let version = {
+            let mut cache = shared.lock().unwrap_or_else(|error| error.into_inner());
+            if cache.reader.is_none() {
+                drop(cache);
+                let reader = AttentionVersionReader::open(&path)?;
+                cache = shared.lock().unwrap_or_else(|error| error.into_inner());
+                cache.reader.get_or_insert(reader);
+            }
+            let version = cache.synchronize()?;
+            if let Some(cached) = cache.pairs.get(&key) {
+                return Ok(cached.thresholds);
+            }
+            version
+        };
         let store = Store::open_read_only(&path)?;
         let include_git = store.attention_pair_code_eligible(&key.profile, &key.project)?;
         let (native_gaps_ms, git_gaps_ms) =
             store.attention_quiet_gaps(&key.profile, &key.project, include_git)?;
         let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
         // The sampled data version must also cover the completed read snapshot.
-        if cache.synchronize(&path)? == version {
+        let mut cache = shared.lock().unwrap_or_else(|error| error.into_inner());
+        if cache.synchronize()? == version && !cache.pairs.contains_key(&key) {
             if cache.pairs.len() >= ATTENTION_THRESHOLD_CACHE_MAX
                 && let Some(oldest) = cache
                     .pairs

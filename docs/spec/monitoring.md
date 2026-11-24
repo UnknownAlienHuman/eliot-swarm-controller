@@ -1038,7 +1038,11 @@ configured threshold, which together determine the fallback. Reports include
 the observed gap and history basis when available. `swarm doctor` shows the
 windows and the number of successful turns that contributed to each one.
 The sweep shares a bounded threshold cache across concurrent observations.
-A committed Store change invalidates it, including changes to retained history.
+Independent misses read their snapshots concurrently and publish only while
+their Store version still matches. Any committed Store write invalidates the
+cache. This can reduce hits during active writes. Pair-specific invalidation
+would need to track turn and command history, source coverage, project bindings
+and pruning, so the cache uses SQLite's committed data version.
 History reads use each Agent's indexed newest successful turn to stop once
 remaining Agents cannot contribute to the selected twenty.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
