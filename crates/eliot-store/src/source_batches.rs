@@ -808,6 +808,38 @@ impl Store {
             if source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
                 && source.cursor == batch.cursor
             {
+                let mut native_wake_cancel = read_native_wake_cancellation(
+                    &tx,
+                    agent_num,
+                    batch.generation,
+                    source.last_batch_first_seq.unwrap_or_default(),
+                    source.last_batch_last_seq.unwrap_or_default(),
+                )?;
+                let mut events = Vec::new();
+                if native_wake_cancel.as_ref().is_some_and(|cancel| {
+                    projection.active_turn.as_deref() != Some(cancel.turn_id.as_str())
+                }) && let Some(cancel) = native_wake_cancel.take()
+                {
+                    let already_recorded: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                         WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.native_wake_cancel_dropped'
+                           AND json_extract(data, '$.turn_id') = ?3)",
+                        params![agent_num, batch.generation, cancel.turn_id],
+                        |row| row.get(0),
+                    ).map_err(sql_error)?;
+                    if !already_recorded {
+                        events.push(insert_daemon_event(
+                            &tx,
+                            now,
+                            "turn.native_wake_cancel_dropped",
+                            "turn",
+                            Some(agent_num),
+                            Some(batch.generation),
+                            json!({"turn_id": cancel.turn_id, "reason": "wake_no_longer_active",
+                                "cancel_reason": cancel.reason}),
+                        )?);
+                    }
+                }
                 let ack = BatchAck {
                     first_seq: source.last_batch_first_seq.ok_or_else(|| {
                         Error::new("internal", "source batch ack is missing its first sequence")
@@ -818,12 +850,10 @@ impl Store {
                     cursor: source.cursor,
                     dropped_unclassified: source.last_batch_dropped,
                     permission_refusal: None,
+                    native_wake_cancel,
                 };
                 commit_source_batch(tx, &self.write_faulted)?;
-                return Ok(BatchCommit {
-                    ack,
-                    events: Vec::new(),
-                });
+                return Ok(BatchCommit { ack, events });
             }
             return Err(Error::new(
                 "source_integrity",
@@ -856,6 +886,12 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             for event in &batch.events {
+                if event.data.get("native_wake_cancel").is_some() {
+                    return Err(Error::new(
+                        "invalid",
+                        "native wake cancellation is assigned by Store",
+                    ));
+                }
                 let family = family_for_kind(&event.kind)?;
                 let owner: Option<String> = source_owner
                     .query_row(params![agent_num, batch.generation, family], |row| {
@@ -897,6 +933,19 @@ impl Store {
                 continue;
             }
             let mut enriched = None;
+            if !observed
+                && batch.source == "stream"
+                && source_event.kind == "turn.started"
+                && source_event.data["native_trigger"].is_string()
+                && source_event.data["command_id"].is_null()
+                && let Some(turn_id) = source_event.data["turn_id"].as_str()
+                && let Some(cancellation) =
+                    native_events::native_wake_cancellation(&tx, agent_num, &projection, turn_id)?
+            {
+                let mut event = published.as_ref().clone();
+                event.data["native_wake_cancel"] = json!(cancellation);
+                enriched = Some(event);
+            }
             if !observed
                 && batch.source == "stream"
                 && source_event.kind == "turn.completed"
@@ -1143,6 +1192,8 @@ impl Store {
                 dropped_unclassified,
             ],
         ));
+        let native_wake_cancel =
+            read_native_wake_cancellation(&tx, agent_num, batch.generation, first_seq, last_seq)?;
         commit_source_batch(tx, &self.write_faulted)?;
         Ok(BatchCommit {
             ack: BatchAck {
@@ -1151,10 +1202,40 @@ impl Store {
                 cursor: batch.cursor,
                 dropped_unclassified,
                 permission_refusal: None,
+                native_wake_cancel,
             },
             events: committed_events,
         })
     }
+}
+
+fn read_native_wake_cancellation(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+    first_seq: i64,
+    last_seq: i64,
+) -> Result<Option<core::NativeWakeCancellation>> {
+    tx.query_row(
+        "SELECT json_extract(data, '$.native_wake_cancel') FROM events
+         WHERE seq BETWEEN ?1 AND ?2 AND agent = ?3 AND generation = ?4
+           AND source = 'stream' AND kind = 'turn.started'
+           AND json_type(data, '$.native_wake_cancel') = 'object'
+         ORDER BY seq DESC LIMIT 1",
+        params![first_seq, last_seq, agent_num, generation],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(sql_error)?
+    .map(|raw| {
+        serde_json::from_str(&raw).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "retained native wake cancellation is invalid",
+            )
+        })
+    })
+    .transpose()
 }
 
 fn admit_native_diagnostic(tx: &Transaction<'_>, agent: &Agent) -> Result<bool> {

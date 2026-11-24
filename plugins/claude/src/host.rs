@@ -1877,7 +1877,6 @@ async fn dispatch_send(
     content: String,
     context: Vec<ContextItem>,
 ) -> Result<Value> {
-    let deadline = Instant::now() + SEND_TIMEOUT;
     let turn_id = new_uuid();
     let outcome = match session
         .events
@@ -1893,6 +1892,7 @@ async fn dispatch_send(
             return Ok(result);
         }
     };
+    let deadline = Instant::now() + SEND_TIMEOUT;
     session.pending_turn.pending = Some(TurnWaiter { outcome });
     let input = OutboundUserInput {
         kind: "user",

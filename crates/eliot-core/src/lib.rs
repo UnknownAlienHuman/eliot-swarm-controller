@@ -42,7 +42,8 @@ pub use background_wake::{
     BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_AMBIGUOUS_TAIL, BACKGROUND_WAKE_NOTE_KIND,
     BACKGROUND_WAKE_PRINCIPAL, ConfiguredMcpServer, DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS,
     MAX_BACKGROUND_WAKE_COMMAND_BYTES, MAX_BACKGROUND_WAKE_MAX_WAIT_SECS,
-    MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES, extract_configured_mcp_servers,
+    MAX_BACKGROUND_WAKE_OUTPUT_TAIL_BYTES, NATIVE_WAKE_SCOPE_PROCESS_TREE,
+    NATIVE_WAKE_SCOPE_TOOL_PROCESS, extract_configured_mcp_servers,
     format_background_wake_note_body, is_harness_owned_process, redact_secret_shapes,
 };
 pub use canonical::canonical_json_sha256;
@@ -1473,6 +1474,16 @@ pub struct BatchAck {
     pub dropped_unclassified: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_refusal: Option<PermissionRefusal>,
+    /// Stop the exact commandless wake before handling its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_wake_cancel: Option<NativeWakeCancellation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWakeCancellation {
+    pub turn_id: String,
+    pub reason: String,
+    pub message: String,
 }
 
 /// Daemon refusal returned with the durable acknowledgement for one exact
@@ -2561,6 +2572,16 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
         }
         "turn.completed" => {
             require_live_turn(agent, event)?;
+            if event
+                .data
+                .get("native_followup_pending")
+                .is_some_and(|pending| !pending.is_boolean())
+            {
+                return Err(Error::new(
+                    "invalid",
+                    "turn.completed native_followup_pending must be a boolean",
+                ));
+            }
             let terminal = native_turn_terminal(event, now)?;
             if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
                 && event.data["model_unverified_reason"].as_str()

@@ -2,7 +2,7 @@ mod catalogue;
 mod start;
 
 use crate::{
-    events::{EventHandle, EventStatus, TurnFacts, turn_native_error},
+    events::{EventHandle, EventStatus, SendAssociation, TurnFacts, turn_native_error},
     native::{
         NativeClient, NativeLaunch, NativeProcess,
         requests::describe_request,
@@ -1026,6 +1026,7 @@ impl MusePlugin {
             command_id,
             session_id,
             input,
+            if_busy: "queue".to_owned(),
             reasoning_effort,
         }
     }
@@ -1228,6 +1229,10 @@ impl MusePlugin {
             ));
         }
         session.expected_model = Some(requested_model.clone());
+        session
+            .events
+            .remember_expected_model(requested_model.clone())
+            .await?;
         Ok(with_model_catalogue_diagnostic(
             json!({
                 "state": "applied",
@@ -1379,7 +1384,7 @@ impl MusePlugin {
                 }
             }
         }
-        if event_status.active_turn_id.is_some()
+        if event_status.active_command_id.is_some()
             && Self::reprove_idle_send_gate(session, proof_deadline)
                 .await
                 .is_none()
@@ -1421,6 +1426,41 @@ impl MusePlugin {
         {
             return Ok(rejected_control(&error.message));
         }
+        if let Some(model) = expected_model.as_deref()
+            && session.expected_model.as_deref() != Some(model)
+        {
+            // Store can resolve a configure through readback after the
+            // setter's reply was lost. Refresh our session selector from
+            // that same native evidence before admitting another input.
+            let selected = read_owned_session_value(
+                &session.native_client,
+                session.session_id.as_deref().unwrap_or_default(),
+                proof_deadline,
+            )
+            .await;
+            if selected
+                .as_ref()
+                .ok()
+                .and_then(|session| session.pointer("/session/modelId"))
+                .and_then(Value::as_str)
+                != Some(model)
+            {
+                return Ok(rejected_control(
+                    "Muse session/read did not confirm the accepted model for this input",
+                ));
+            }
+            if session
+                .events
+                .remember_expected_model(model.to_owned())
+                .await
+                .is_err()
+            {
+                return Ok(rejected_control(
+                    "Muse could not record the confirmed model before turn/start",
+                ));
+            }
+            session.expected_model = Some(model.to_owned());
+        }
         let effort = params
             .effort_override
             .clone()
@@ -1447,6 +1487,16 @@ impl MusePlugin {
         );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Muse turn/start params could not be encoded"))?;
+        if session
+            .events
+            .expect_turn_start(command_id.clone(), native_command_id.clone())
+            .await
+            .is_err()
+        {
+            return Ok(rejected_control(
+                "Muse turn/start was not dispatched because its exact event binding could not be fenced",
+            ));
+        }
         // One request budget (k167b): the native write shares the dispatch
         // deadline instead of minting a fresh timeout past it.
         let response = session
@@ -1456,17 +1506,33 @@ impl MusePlugin {
         let response = match response {
             Ok(value) => value,
             Err(error) if native_no_write(&error.code) => {
+                let _ = session
+                    .events
+                    .reject_turn_start(native_command_id.clone())
+                    .await;
                 return Ok(rejected_control("Muse turn/start was not dispatched"));
             }
             Err(error) if error.code == "native_rejected" => {
+                let _ = session
+                    .events
+                    .reject_turn_start(native_command_id.clone())
+                    .await;
                 return Ok(rejected_control("Muse rejected turn/start"));
             }
             Err(error) if error.code == "frame_too_large" => {
+                let _ = session
+                    .events
+                    .reject_turn_start(native_command_id.clone())
+                    .await;
                 return Ok(rejected_control(
                     "Muse turn/start frame exceeded the native transport bound before dispatch",
                 ));
             }
             Err(error) => {
+                let _ = session
+                    .events
+                    .unknown_turn_start(native_command_id.clone())
+                    .await;
                 session.phase = SessionPhase::Unknown;
                 return Err(contextual_error(
                     error,
@@ -1496,6 +1562,10 @@ impl MusePlugin {
                     // it did not create. PR1 holds single-flight and cannot
                     // associate that input exactly, so the command and the
                     // session latch unknown; the input is never resubmitted.
+                    let _ = session
+                        .events
+                        .unknown_turn_start(native_command_id.clone())
+                        .await;
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -1503,6 +1573,10 @@ impl MusePlugin {
                     ));
                 }
                 _ => {
+                    let _ = session
+                        .events
+                        .unknown_turn_start(native_command_id.clone())
+                        .await;
                     session.phase = SessionPhase::Unknown;
                     return Err(Error::new(
                         "unknown",
@@ -1510,33 +1584,41 @@ impl MusePlugin {
                     ));
                 }
             };
+        let native_queued = started.disposition == "queued";
         let turn_id = started.turn_id;
         session.current_turn = Some((command_id.clone(), turn_id.clone()));
-        if session
+        let associated = match session
             .events
             .associate_turn(
-                command_id.clone(),
-                turn_id.clone(),
-                params.context.clone(),
-                sent_effort.clone(),
-                expected_model,
+                SendAssociation {
+                    command_id,
+                    native_command_id: native_command_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: params.context,
+                    effort: sent_effort,
+                },
+                native_queued,
             )
             .await
-            .is_err()
         {
-            session.phase = SessionPhase::Unknown;
-            return Err(Error::new(
-                "unknown",
-                "Muse turn was accepted but turn.started was not acknowledged",
-            ));
-        }
+            Ok(associated) => associated,
+            Err(_) => {
+                let _ = session.events.unknown_turn_start(native_command_id).await;
+                session.phase = SessionPhase::Unknown;
+                return Err(Error::new(
+                    "unknown",
+                    "Muse turn was accepted but its exact turn association was not retained",
+                ));
+            }
+        };
         // The first turn carrying the skill text is now accepted and
         // acknowledged: later turns send plain input.
         session.skill_pointer = None;
         // Echo what the native request carried when a `configure` overlay
         // applied, so the settled outcome reads back the effective values
         // alongside the native turn association. Unchanged without one.
-        let mut result = json!({"state": "applied", "turn_id": turn_id});
+        let state = if associated { "applied" } else { "queued" };
+        let mut result = json!({"state": state, "turn_id": turn_id});
         if let Some(revision) = params.config_revision {
             result["config_revision"] = json!(revision);
             result["effort"] = json!(effort);
@@ -2432,6 +2514,7 @@ async fn read_live_snapshot(
     let explicit_idle = raw.pointer("/session/activeTurnId") == Some(&Value::Null);
     let readback: NativeSessionReadResult = serde_json::from_value(raw)
         .map_err(|_| Error::new("native_readback", "Muse session/read response was invalid"))?;
+    let event_status = session.events.status();
     let mut last_turn = if let Some(turn_id) = turn_id {
         let exact_running = readback.session.status == "running"
             && readback.session.active_turn_id.as_deref() == Some(turn_id);
@@ -2442,11 +2525,47 @@ async fn read_live_snapshot(
                 "Muse session/read did not prove the exact turn was idle or active",
             );
         }
+        let retained_command_id = if event_status.active_turn_id.as_deref() == Some(turn_id) {
+            Some(event_status.active_command_id.clone())
+        } else if let Some(last_turn) = event_status
+            .last_turn
+            .as_ref()
+            .filter(|last_turn| last_turn.turn_id == turn_id)
+        {
+            Some(last_turn.command_id.clone())
+        } else {
+            session
+                .current_turn
+                .as_ref()
+                .filter(|(_, retained_turn_id)| retained_turn_id == turn_id)
+                .map(|(command_id, _)| Some(command_id.clone()))
+        };
+        let command_id = match retained_command_id {
+            Some(Some(command_id)) if command_id == params.command_id => Some(command_id),
+            Some(None) if params.command_id == session.start_command_id => None,
+            Some(_) => {
+                return view_unknown_snapshot(
+                    session,
+                    params,
+                    "Muse snapshot command did not match the exact retained turn binding",
+                );
+            }
+            None if params.command_id != session.start_command_id => {
+                Some(params.command_id.clone())
+            }
+            None => {
+                return view_unknown_snapshot(
+                    session,
+                    params,
+                    "Muse native turn binding is not retained for commandless readback",
+                );
+            }
+        };
         match read_owned_turn(
             &session.native_client,
             session_id,
             turn_id,
-            &params.command_id,
+            command_id,
             readback.session.active_turn_id.as_deref(),
             &session.secrets,
         )
@@ -2773,13 +2892,13 @@ async fn read_owned_turn(
     client: &NativeClient,
     session_id: &str,
     turn_id: &str,
-    command_id: &str,
+    command_id: Option<String>,
     active_turn_id: Option<&str>,
     secrets: &[String],
 ) -> Result<Option<TurnFacts>> {
     if active_turn_id == Some(turn_id) {
         return Ok(Some(TurnFacts {
-            command_id: command_id.to_owned(),
+            command_id,
             turn_id: turn_id.to_owned(),
             status: Some("inProgress".to_owned()),
             final_text: None,
@@ -2829,7 +2948,7 @@ async fn read_owned_turn(
         return Ok(None);
     };
     Ok(Some(TurnFacts {
-        command_id: command_id.to_owned(),
+        command_id,
         turn_id: turn_id.to_owned(),
         status: Some(status),
         final_text,

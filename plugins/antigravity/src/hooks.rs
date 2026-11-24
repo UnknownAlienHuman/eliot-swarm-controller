@@ -48,14 +48,11 @@ pub const DEFAULT_HOOK_NAME: &str = "eliot-system-context";
 
 /// Build the named-group hook configuration owned by an Antigravity instance.
 pub fn hooks_json(group_name: &str, command: &str) -> serde_json::Value {
+    let handler = serde_json::json!([{"type": "command", "command": command}]);
     serde_json::json!({
         (group_name): {
-            "PreInvocation": [
-                {
-                    "type": "command",
-                    "command": command
-                }
-            ]
+            "PreInvocation": handler.clone(),
+            "Stop": handler,
         }
     })
 }
@@ -77,16 +74,32 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Hook invocation payload received on stdin from the vendor runner.
 ///
-/// Matches official Antigravity specification (https://antigravity.google/docs/hooks/)
-/// and installed AGY 1.5.2 protojson camelCase encoding.
+/// Matches the hook wire fields observed on AGY 1.5.14. `PreInvocation`
+/// carries invocation counters; `Stop` carries terminationReason and error.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookInput {
     pub conversation_id: String,
-    pub invocation_num: u64,
-    pub initial_num_steps: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_num: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_num_steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
+}
+
+impl HookInput {
+    pub fn is_stop(&self) -> bool {
+        self.termination_reason.is_some()
+    }
+
+    pub fn starts_execution(&self) -> bool {
+        !self.is_stop() && self.invocation_num == Some(0)
+    }
 }
 
 /// Helper origin identity alias carried through IPC queries.
@@ -143,11 +156,7 @@ impl HookStep {
 #[serde(rename_all = "camelCase")]
 pub struct IpcQuery {
     pub token: String,
-    pub conversation_id: String,
-    pub invocation_num: u64,
-    pub initial_num_steps: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcript_path: Option<String>,
+    pub input: HookInput,
     pub origin: HelperOrigin,
 }
 
@@ -262,15 +271,8 @@ impl HookServer {
                 continue;
             }
 
-            let input = HookInput {
-                conversation_id: query.conversation_id,
-                invocation_num: query.invocation_num,
-                initial_num_steps: query.initial_num_steps,
-                transcript_path: query.transcript_path,
-            };
-
             return Ok(HookCallback {
-                input,
+                input: query.input,
                 origin: query.origin,
                 parts: Some((reader, write_half)),
                 token: Arc::clone(&self.token),
@@ -418,10 +420,7 @@ pub async fn run_helper() -> Result<()> {
 
     let query = IpcQuery {
         token: token.clone(),
-        conversation_id: input.conversation_id,
-        invocation_num: input.invocation_num,
-        initial_num_steps: input.initial_num_steps,
-        transcript_path: input.transcript_path,
+        input,
         origin,
     };
 

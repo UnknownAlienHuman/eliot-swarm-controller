@@ -43,6 +43,7 @@ impl NativeStdioConfig for MuseStdioConfig {
     /// Oversized-frame diagnosis records only these exact names.
     const OVERSIZED_KNOWN_METHODS: &'static [&'static str] = &[
         "turn/started",
+        "turn/modelAttemptStarted",
         "turn/completed",
         "item/started",
         "item/updated",

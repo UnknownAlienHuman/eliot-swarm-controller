@@ -337,6 +337,40 @@ the native PreInvocation point, not an ACP steer method or an `active_turn`
 inject. Controlled families remain session/turn/message/tool, with
 `hook.before_model` owned by the existing turn family.
 
+## Self-started turns
+
+When an Antigravity background task ends, AGY can resume the session without an
+ACP `session/prompt`. `PreInvocation` with `invocationNum: 0` starts a
+commandless native turn only when no prompt is outstanding. The adapter commits
+`turn.started` with `native_trigger: "PreInvocation"` before returning the hook
+response; later ACP updates and `hook.before_model` facts use that local turn id.
+
+`Stop` carries `terminationReason` and optional `error`, outside the ACP frame
+order. The adapter sends a fenced read-only `session/list` and settles the turn
+only after that exact reply is consumed behind earlier ACP updates.
+`NO_TOOL_CALL`, `model_stop` and `max_steps_exceeded` complete normally; `ERROR`
+or a non-empty `error` fails; an unfamiliar reason remains `unknown`.
+`fullyIdle` and `continuationActive` do not predict another wake or terminal.
+
+An open call can become a background task after a successful terminal. It is declared with
+`native_auto_background: true` and `native_wake_scope: "process_tree"` on
+`tool.started`. Its later native completion commits `tool.background_ended` for
+the original turn. Swarm does not add a second wake for its process tree.
+A successful terminal with a tracked background call reports
+`native_followup_pending`, so an Eliot Goal waits for the native follow-up.
+Each background completion reports whether tracked tasks remain. Failed,
+cancelled and unconfirmed turns close their open calls with unknown tool outcomes.
+
+A send received while this native turn is open stays in the shared daemon queue;
+the plugin does not merge it into the native turn or emit `turn.input_bound`.
+Interrupt sends `session/cancel` and waits for a native terminal. An unanswered
+cancel or the shared native inactivity deadline commits `turn.unknown`. A
+later exact `Stop` that passes the read fence settles the retained turn and
+releases the send gate.
+The [native wake gate](../spec/automation.md#automatic-background-process-wake)
+can direct an immediate `session/cancel` for the exact commandless wake before
+the adapter returns its first hook response.
+
 ## Facts and recovery
 
 The terminal `session/prompt` response (`stopReason`) is authoritative

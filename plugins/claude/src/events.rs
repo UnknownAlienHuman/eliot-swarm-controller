@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
+    time::Duration,
 };
 use tokio::{
     sync::{mpsc, oneshot, watch},
@@ -69,6 +70,7 @@ pub(crate) struct EventStatus {
     /// The active turn is self-started and no send has bound to it, so it
     /// can take one input and its facts name no command.
     pub native_unbound: bool,
+    pub wake_cancel_pending: bool,
     pub last_turn: Option<TurnFacts>,
     pub failure: Option<String>,
     pub batch_unknown: bool,
@@ -594,17 +596,38 @@ impl EventHandle {
         turn_id: String,
         context: Vec<ContextItem>,
     ) -> Result<oneshot::Receiver<TurnOutcome>> {
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        self.actor
-            .call(|registered| Control::ExpectTurn {
-                command_id,
-                turn_id,
-                context,
-                registered,
-                outcome: outcome_tx,
-            })
-            .await??;
-        Ok(outcome_rx)
+        let mut status = self.actor.watch().clone();
+        loop {
+            status
+                .wait_for(|view| {
+                    !view.wake_cancel_pending || view.failure.is_some() || view.stopped
+                })
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "unavailable",
+                        "Claude event task closed before input registration",
+                    )
+                })?;
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            match self
+                .actor
+                .call(|registered| Control::ExpectTurn {
+                    command_id: command_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: context.clone(),
+                    registered,
+                    outcome: outcome_tx,
+                })
+                .await?
+            {
+                Ok(()) => return Ok(outcome_rx),
+                // The actor did not reserve this input. A wake that started
+                // after the watch check can only defer this pre-write step.
+                Err(error) if error.code == "wake_cancel_pending" => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Withdraw a pending turn whose input was proven never dispatched
@@ -1087,6 +1110,12 @@ impl EventProcessor {
                 "Claude event source has an unresolved gap",
             ));
         }
+        if self.status.wake_cancel_pending {
+            return Err(Error::new(
+                "wake_cancel_pending",
+                "Claude is cancelling a guarded native wake",
+            ));
+        }
         self.pending_turn = Some(PendingTurn {
             command_id,
             turn_id,
@@ -1437,15 +1466,28 @@ impl EventProcessor {
         self.native_rate_limit_event = None;
         self.final_text = None;
         self.empty_after_tool_hooks = 0;
-        self.publish_now();
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.started");
-        self.commit_event(
-            "turn.started",
-            native_id,
-            json!({"turn_id": turn_id, "native_trigger": "task-notification"}),
-        )
-        .await
+        let cancel = self
+            .stream_source()
+            .commit_native_wake(native_id, &turn_id, "task-notification")
+            .await?;
+        self.status.wake_cancel_pending = cancel.is_some();
+        self.publish_now();
+        if cancel.is_some() {
+            let native = self.native.as_ref().ok_or_else(|| {
+                Error::new("unknown", "Claude wake cancellation lost its native client")
+            })?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if let Err(error) = native.control("interrupt", json!({}), deadline).await {
+                let _ = native
+                    .shutdown_input(Instant::now() + Duration::from_secs(5))
+                    .await;
+                return Err(error);
+            }
+            self.interrupted_turn = Some(turn_id);
+        }
+        Ok(())
     }
 
     /// Facts of a self-started turn with no bound send name no command.
@@ -1680,6 +1722,7 @@ impl EventProcessor {
     ) -> Result<()> {
         self.status.active_command_id = Some(command_id.clone());
         self.status.native_unbound = false;
+        self.status.wake_cancel_pending = false;
         self.active_input = Some(input_id.clone());
         self.publish_now();
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
@@ -3496,6 +3539,7 @@ impl EventProcessor {
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
         self.status.native_unbound = false;
+        self.status.wake_cancel_pending = false;
         self.last_input = self.active_input.take();
         self.native_prefix_ended = false;
         self.interrupted_turn = None;
@@ -3673,6 +3717,7 @@ impl EventProcessor {
         self.status.active_command_id = None;
         self.status.active_turn_id = None;
         self.status.native_unbound = false;
+        self.status.wake_cancel_pending = false;
         self.active_input = None;
         self.native_prefix_ended = false;
         self.prefix_usage = None;

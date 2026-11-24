@@ -11,6 +11,7 @@ use eliot_core::api::{
 use serde::{Deserialize, Serialize};
 
 const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
+const NATIVE_FOLLOWUP_WINDOW_MS: i64 = 5 * 60 * 1_000;
 
 /// A Swarm note: an `inject` from a Swarm principal. An inject from the Owner
 /// or a manager is never one, whatever its delivery state.
@@ -1346,6 +1347,32 @@ impl Store {
             .is_some_and(|row| row.state.status == GoalStatus::Active))
     }
 
+    /// Release expired background-work holds on active Goals. The idle
+    /// driver reoffers the retained idle subject when any hold expires.
+    pub fn expire_goal_native_followups(&mut self, now: i64) -> Result<bool> {
+        self.ensure_writer_healthy()?;
+        let result = self
+            .connection
+            .execute(
+                "UPDATE turns SET native_followup_pending = 0
+             WHERE native_followup_pending = 1 AND completed_at <= ?1
+               AND rowid IN (
+                   SELECT (
+                       SELECT t.rowid FROM turns t INDEXED BY turns_agent_result_order
+                       WHERE t.agent = a.id AND t.generation = a.generation
+                       ORDER BY t.insertion_seq DESC LIMIT 1
+                   )
+                   FROM goals g JOIN agents a ON a.id = g.agent AND a.generation = g.generation
+                   WHERE g.mode = 'eliot' AND json_extract(g.state, '$.status') = 'active'
+               )",
+                [now.saturating_sub(NATIVE_FOLLOWUP_WINDOW_MS)],
+            )
+            .map(|changed| changed > 0)
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Active non-cadenced Eliot Goals bound to their Agent's current
     /// generation. The Router applies the same enablement checks as the
     /// event path before reserving a round on the retained idle subject.
@@ -1543,6 +1570,7 @@ impl Store {
                 agent_num,
                 &agent_row,
                 agent_row.generation,
+                now,
             )?,
             max_seq,
             turn_count,
@@ -2361,7 +2389,8 @@ impl Store {
             return Err(Error::new("stale_round", "goal round key was already used"));
         }
         require_key_form(&row, key)?;
-        if let Some(refusal) = idle_round_refusal(&tx, agent_num, &agent_row, row.generation)? {
+        if let Some(refusal) = idle_round_refusal(&tx, agent_num, &agent_row, row.generation, now)?
+        {
             return Err(refusal);
         }
         // Re-validate the exact spent-budget binding in this transaction:
@@ -2669,12 +2698,6 @@ impl Store {
                 }
             }
         }
-        if let Some(source) = first_unhealthy_open_source(&tx, agent_num, row.generation)? {
-            return Err(Error::new(
-                "stale_round",
-                format!("source {source} left healthy during the round"),
-            ));
-        }
         let agent_row = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
         if let Some(history) = &commit.check_history
@@ -2691,26 +2714,9 @@ impl Store {
                 "Goal check history does not match the frozen project and argv",
             ));
         }
-        if count_agent_commands(&tx, agent_num, row.generation, true)? > 0 {
-            return Err(Error::new(
-                "stale_round",
-                "an unknown command appeared during the round",
-            ));
-        }
-        if count_agent_commands(&tx, agent_num, row.generation, false)? > 0 {
-            return Err(Error::new(
-                "stale_round",
-                "a command opened during the round",
-            ));
-        }
-        if agent_row.active_turn.is_some() {
-            return Err(Error::new("stale_round", "a turn started during the round"));
-        }
-        if !agent_row.pending.is_empty() {
-            return Err(Error::new(
-                "stale_round",
-                "a request opened during the round",
-            ));
+        if let Some(refusal) = idle_round_refusal(&tx, agent_num, &agent_row, row.generation, now)?
+        {
+            return Err(Error::new("stale_round", *refusal.message));
         }
         let turn_count = count_turns(&tx, agent_num, row.generation)?;
         let mut counters = row.state.counters.clone();
@@ -3787,6 +3793,7 @@ fn idle_round_refusal(
     agent_num: i64,
     agent: &Agent,
     generation: i64,
+    now: i64,
 ) -> Result<Option<Error>> {
     if agent.state != AgentState::Idle {
         return Ok(Some(Error::new(
@@ -3820,6 +3827,34 @@ fn idle_round_refusal(
     }
     if count_agent_commands(connection, agent_num, generation, false)? > 0 {
         return Ok(Some(Error::new("busy", "Agent has open commands")));
+    }
+    if !send_outcome_gate_open(connection, agent_num, generation)? {
+        return Ok(Some(Error::new(
+            "bad_state",
+            "resolve unsettled turns before the goal round",
+        )));
+    }
+    let native_followup_pending: bool = connection
+        .query_row(
+            "SELECT COALESCE((
+                 SELECT native_followup_pending = 1 AND completed_at > ?3
+                 FROM turns INDEXED BY turns_agent_result_order
+                 WHERE agent = ?1 AND generation = ?2
+                 ORDER BY insertion_seq DESC LIMIT 1
+             ), 0)",
+            params![
+                agent_num,
+                generation,
+                now.saturating_sub(NATIVE_FOLLOWUP_WINDOW_MS)
+            ],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if native_followup_pending {
+        return Ok(Some(Error::new(
+            "busy",
+            "the harness reported pending native follow-up work",
+        )));
     }
     Ok(None)
 }
@@ -4101,7 +4136,7 @@ pub(crate) fn stuck_goal_round_args(
     if row.state.status != GoalStatus::Active
         || agent_row.observe_only
         || row.generation != agent_row.generation
-        || idle_round_refusal(connection, agent_num, &agent_row, row.generation)?.is_some()
+        || idle_round_refusal(connection, agent_num, &agent_row, row.generation, now)?.is_some()
     {
         return Ok(None);
     }

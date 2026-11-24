@@ -353,10 +353,10 @@ The Store commits event, next projection and derived facts atomically, then publ
 
 ### Self-started native turns
 
-A harness can start a turn with no Eliot input, as Claude Code does when its own
-background task ends. The adapter reports `turn.started` with `native_trigger` and no
-`command_id`, using the native run's id as the turn id. `native_trigger` is
-the positive native start signal, such as Claude's `task-notification`.
+A harness can start a turn with no Eliot input when its own background work wakes
+the session (#907, #916). The adapter reports `turn.started` with `native_trigger`
+and no `command_id`. The id identifies that native run in this generation. The
+trigger names the positive native start signal.
 The Agent is `busy`, and the turn is an ordinary `turns` row with no starting command, so
 results, usage, Goal turn counts, checks and background wakes read it like any other
 turn. No command is invented. Facts of this turn omit `command_id`, and Store accepts
@@ -364,9 +364,9 @@ that only for the exact running turn that has a trigger and no bound send.
 
 One Agent generation never runs two overlapping turns. Input follows one rule:
 
-- While the Agent is `busy` in a self-started turn with no bound send, the next `send`
-  dispatches at once. A `waiting` turn, or one that already has a bound send, queues
-  later input as usual.
+- While a self-started turn is active, new sends queue in the ordinary input lane.
+  An adapter with the `accepts_send_during_native_turn` capability may accept the
+  first send into a `busy`, unbound turn. It must prove that input's association.
 - The adapter's exact input association commits `turn.input_bound
   {command_id, turn_id, input_id}`. One transaction applies the send on that turn and
   records it as the turn's starting command. Later facts of the turn name that command.

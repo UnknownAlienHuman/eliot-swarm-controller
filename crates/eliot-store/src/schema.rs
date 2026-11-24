@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = REPEAT_FAILURE_ALERTS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = NATIVE_FOLLOWUP_SCHEMA_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -10,6 +10,7 @@ const WORK_TASK_BINDINGS_VERSION: i64 = 117;
 const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
 const MODEL_MISMATCH_HOLD_VERSION: i64 = 119;
 const REPEAT_FAILURE_ALERTS_VERSION: i64 = 120;
+const NATIVE_FOLLOWUP_SCHEMA_VERSION: i64 = 121;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -40,7 +41,31 @@ impl Store {
         self.migrate_after_42(current)?;
         self.migrate_work_truth(current)?;
         self.migrate_model_mismatch_hold(current)?;
-        self.migrate_repeat_failure_alerts(current)
+        self.migrate_repeat_failure_alerts(current)?;
+        if current < NATIVE_FOLLOWUP_SCHEMA_VERSION {
+            self.migrate_native_followup()?;
+        }
+        Ok(())
+    }
+
+    fn migrate_native_followup(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(
+            "ALTER TABLE turns ADD COLUMN native_followup_pending INTEGER NOT NULL DEFAULT 0
+                 CHECK (native_followup_pending IN (0, 1));
+             ALTER TABLE turns ADD COLUMN native_wake_cancel_reason TEXT;
+             ALTER TABLE agents ADD COLUMN native_wake_interrupted_generation INTEGER;",
+        )
+        .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [NATIVE_FOLLOWUP_SCHEMA_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     // Keep the debug-build migration frames small enough for Windows.

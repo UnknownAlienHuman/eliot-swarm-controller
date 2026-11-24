@@ -6,9 +6,9 @@ use super::{
     validate_limit, wakes::unique_wake_command_id,
 };
 use eliot_core::{
-    BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_PRINCIPAL, InjectPoint, ProcessIdentity,
-    ProcessRecord, ProcessState, SubmitCommand, TurnOutcome, TurnState,
-    api::AgentBackgroundWakeView,
+    BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_PRINCIPAL, InjectPoint,
+    NATIVE_WAKE_SCOPE_PROCESS_TREE, ProcessIdentity, ProcessRecord, ProcessState, SubmitCommand,
+    TurnOutcome, TurnState, api::AgentBackgroundWakeView,
 };
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde_json::json;
@@ -76,6 +76,10 @@ pub struct BackgroundWakeToolWindow {
     /// The harness still runs this call as its own background task and will
     /// wake itself when the task ends.
     pub harness_waiting: bool,
+    /// The plugin declared that this wake covers the call's whole process
+    /// tree (`native_wake_scope = process_tree`). Otherwise a process that
+    /// outlives the task stays an ordinary candidate.
+    pub harness_wake_covers_tree: bool,
 }
 
 /// Everything the Router needs to pick a candidate, read in one short
@@ -88,6 +92,22 @@ pub struct BackgroundWakeArmContext {
     pub tool_windows: Vec<BackgroundWakeToolWindow>,
     /// Identities that already had an automatic wake in this generation.
     pub woken: HashSet<ProcessIdentity>,
+}
+
+/// How `tool.started` says a harness may run the call as its own task.
+const BACKGROUND_NONE: i64 = 0;
+/// `native_background`: the call returned and its task continues.
+const BACKGROUND_TASK: i64 = 1;
+/// `native_auto_background`: the call becomes a task if still open at turn end.
+const BACKGROUND_IF_OPEN: i64 = 2;
+
+/// One bounded `tool.started` or `tool.completed` row of a completing turn.
+struct ToolEdge {
+    item_id: String,
+    at: i64,
+    native_clock: bool,
+    background: i64,
+    wake_covers_tree: bool,
 }
 
 impl Store {
@@ -150,13 +170,17 @@ impl Store {
         // The newest native tool calls of this completing turn. Each kind reads
         // its own partial-index range, newest first, so a long turn keeps the
         // calls most likely to have left a process running.
-        let read_tool_times = |kind: &str| -> Result<Vec<(String, i64, bool, bool)>> {
+        let read_tool_times = |kind: &str| -> Result<Vec<ToolEdge>> {
             let sql = format!(
                 "SELECT json_extract(data, '$.item_id'),
                         CASE json_type(data, '$.native_at_ms')
                             WHEN 'integer' THEN json_extract(data, '$.native_at_ms') ELSE ts END,
                         json_type(data, '$.native_at_ms') IS 'integer',
-                        json_extract(data, '$.native_background') IS 1
+                        CASE WHEN json_extract(data, '$.native_background') IS 1 THEN {BACKGROUND_TASK}
+                             WHEN json_extract(data, '$.native_auto_background') IS 1 THEN {BACKGROUND_IF_OPEN}
+                             ELSE {BACKGROUND_NONE} END,
+                        json_extract(data, '$.native_wake_scope')
+                            IS '{NATIVE_WAKE_SCOPE_PROCESS_TREE}'
                  FROM events INDEXED BY events_tool_turn
                  WHERE agent = ?1 AND generation = ?2
                    AND kind = '{kind}'
@@ -170,14 +194,22 @@ impl Store {
             let rows = statement
                 .query_map(
                     params![agent_num, generation, turn_id, MAX_TOOL_WINDOWS],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok(ToolEdge {
+                            item_id: row.get(0)?,
+                            at: row.get(1)?,
+                            native_clock: row.get(2)?,
+                            background: row.get(3)?,
+                            wake_covers_tree: row.get(4)?,
+                        })
+                    },
                 )
                 .map_err(sql_error)?;
             rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
         };
         let completed: HashMap<String, (i64, bool)> = read_tool_times("tool.completed")?
             .into_iter()
-            .map(|(item_id, completed_at, native, _)| (item_id, (completed_at, native)))
+            .map(|edge| (edge.item_id, (edge.at, edge.native_clock)))
             .collect();
         // Harness background tasks that have ended. The kind has few rows, so
         // a bounded newest-first scan of its index stays short.
@@ -203,19 +235,25 @@ impl Store {
             .map_err(sql_error)?;
         context.tool_windows = read_tool_times("tool.started")?
             .into_iter()
-            .map(|(item_id, started_at, native_start, native_background)| {
-                let task_end = ended.get(&item_id).copied();
-                let call_end = completed.get(&item_id).copied();
+            .map(|start| {
+                let task_end = ended.get(&start.item_id).copied();
+                let call_end = completed.get(&start.item_id).copied();
+                let call_end_at = call_end.map(|(at, _)| at);
+                let (completed_at, harness_waiting) = match start.background {
+                    BACKGROUND_TASK => (task_end, task_end.is_none()),
+                    // A call with no `tool.completed` in its turn became a
+                    // harness task. Even after it ends, the harness has
+                    // already woken itself for that task.
+                    BACKGROUND_IF_OPEN => (call_end_at, call_end.is_none()),
+                    _ => (call_end_at, false),
+                };
                 BackgroundWakeToolWindow {
-                    completed_at: if native_background {
-                        task_end
-                    } else {
-                        call_end.map(|(at, _)| at)
-                    },
-                    native_clock: native_start && call_end.is_none_or(|(_, native)| native),
-                    harness_waiting: native_background && task_end.is_none(),
-                    item_id,
-                    started_at,
+                    completed_at,
+                    native_clock: start.native_clock && call_end.is_none_or(|(_, native)| native),
+                    harness_waiting,
+                    harness_wake_covers_tree: harness_waiting && start.wake_covers_tree,
+                    item_id: start.item_id,
+                    started_at: start.at,
                 }
             })
             .collect();

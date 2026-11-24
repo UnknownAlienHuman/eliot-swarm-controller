@@ -50,6 +50,7 @@ const ID_PREFIX: &str = "agy";
 pub(crate) enum FencedKind {
     Prompt,
     Load,
+    StopBarrier,
 }
 
 /// One ACP stream record for the event task, in wire order.
@@ -70,6 +71,11 @@ pub(crate) enum AgyFrame {
     /// The reply of a fenced `session/load` call: everything before it
     /// on the wire is validated load history, everything after is live.
     LoadResponse {
+        request_id: String,
+        result: Result<Value>,
+    },
+    /// Ordered read-only barrier after an Antigravity `Stop` hook.
+    StopBarrierResponse {
         request_id: String,
         result: Result<Value>,
     },
@@ -238,6 +244,10 @@ impl AgyProcess {
 }
 
 impl AgyClient {
+    pub(crate) async fn shutdown_input(&self, deadline: Instant) -> Result<()> {
+        self.writer.shutdown_input(deadline).await
+    }
+
     /// One correlated ACP request/response round trip.
     pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
         self.call_inner(method, params, deadline)
@@ -548,6 +558,10 @@ fn classify_agy_frame(
             return PumpAction::Emit(match kind {
                 FencedKind::Prompt => AgyFrame::PromptResponse(result),
                 FencedKind::Load => AgyFrame::LoadResponse {
+                    request_id: key,
+                    result,
+                },
+                FencedKind::StopBarrier => AgyFrame::StopBarrierResponse {
                     request_id: key,
                     result,
                 },

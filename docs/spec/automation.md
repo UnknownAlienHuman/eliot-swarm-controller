@@ -964,11 +964,10 @@ started inside a native tool call of that completing turn: the first process sti
 running from the newest such call. A process started
 outside every tool call, such as a harness notify helper at turn end, never arms.
 A process from an earlier turn does not arm either. While the harness still runs a
-call as its own background task (`native_background` on `tool.started`, Claude
-`run_in_background`), a process bound only to that call does not arm, because the
-harness wakes itself when that task ends. When `tool.background_ended` commits for
-a completed turn, Swarm inspects custody again and arms for a process that outlived
-the task. Swarm retains one `waiting`
+call as its own background task, Swarm leaves the wake to the harness. The
+[candidate rules](monitoring.md#background-process-wake-candidates) use the
+adapter's task and wake-scope facts to determine whether a survivor can arm when
+`tool.background_ended` commits. Swarm retains one `waiting`
 row in `background_process_wakes`. Nothing arms when the turn ended with a stop or
 interrupt, when it ran no native tool (including a turn started by a wake), or
 when the Agent has an open or same-turn
@@ -979,6 +978,14 @@ only while the Agent has no active turn (or that same turn) and no newer turn ha
 started. An Agent declares a long-lived server with `emit` topic
 `background.server` and data `pid` or `command`. A matching process and its shell
 ancestors never arm. The arm reads only bounded fields under a short Store lock.
+
+A dispatched Owner or Agent interrupt suppresses commandless native wakes in
+that generation until the next Owner or Agent SEND binds to a turn. An already
+queued SEND keeps its position and starts after the cancelled wake settles.
+At a commandless turn start, Store checks this interrupt fence and the frozen
+profile's durable model and provider holds. The committed start records the
+reason for any required cancellation. The adapter sends the exact native
+cancel before processing further wake output.
 
 When that exact process identity exits, Swarm delivers one note in the
 [shared insertion frame](#inject-context-at-the-safe-point) at the soonest point.
@@ -2017,7 +2024,14 @@ time-based driver fires them.
 The daemon also drives active Eliot-mode Goals automatically on idle: when a
 generation commits an idle event, the driver starts one round with the event
 seq as an idle key through the same `goal round` path — same probe, gates,
-check custody and conditional commit — under a fresh owner mutation id. It
+check custody and conditional commit — under a fresh owner mutation id. A
+self-started native turn blocks the idle gate like any other running turn. The
+gate also waits for pending native follow-up work and unsettled turns in that
+generation. A confirmed background-task end with no remaining follow-up clears
+the hold. Unconfirmed follow-up holds expire five minutes after the terminal;
+the driver reoffers the retained idle key on its next expiry pass. The same
+gate is evaluated at the round's final commit, so
+a native wake invalidates a round that was already in flight (#916). The driver
 skips cadenced Goals (slot-keyed), paused or terminal Goals, drifted
 generations, and anything while automation is draining; it waits while an
 active native Goal drives. The driver starts each automatic round in its own task

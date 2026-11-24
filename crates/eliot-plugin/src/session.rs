@@ -1171,7 +1171,7 @@ pub struct StreamSource<'a> {
 impl StreamSource<'_> {
     /// Send one native record and wait for the host's outcome.
     pub async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
-        self.commit_event_with_refusal(kind, native_id, data)
+        self.commit_event_ack(kind, native_id, data)
             .await
             .map(|_| ())
     }
@@ -1201,16 +1201,34 @@ impl StreamSource<'_> {
         native_id: String,
         data: Value,
     ) -> Result<Option<PermissionRefusal>> {
-        self.commit_event_with_refusal("request.opened", native_id, data)
+        self.commit_event_ack("request.opened", native_id, data)
             .await
+            .map(|ack| ack.permission_refusal)
     }
 
-    async fn commit_event_with_refusal(
+    /// Commit the exact commandless start and obtain the daemon's decision
+    /// before the adapter handles the wake's next native frame.
+    pub async fn commit_native_wake(
+        &mut self,
+        native_id: String,
+        turn_id: &str,
+        trigger: &str,
+    ) -> Result<Option<eliot_core::NativeWakeCancellation>> {
+        self.commit_event_ack(
+            "turn.started",
+            native_id,
+            json!({"turn_id": turn_id, "native_trigger": trigger}),
+        )
+        .await
+        .map(|ack| ack.native_wake_cancel)
+    }
+
+    async fn commit_event_ack(
         &mut self,
         kind: &str,
         native_id: String,
         data: Value,
-    ) -> Result<Option<PermissionRefusal>> {
+    ) -> Result<eliot_core::BatchAck> {
         if *self.writes_blocked {
             return Err(Error::new(
                 "unknown",
@@ -1225,6 +1243,9 @@ impl StreamSource<'_> {
             .get("turn_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let native_wake = kind == "turn.started"
+            && data["native_trigger"].is_string()
+            && data["command_id"].is_null();
         let batch = SourceBatch {
             batch_id: format!("{native_id}:batch"),
             agent_id: self.agent_id.to_owned(),
@@ -1258,31 +1279,28 @@ impl StreamSource<'_> {
                 return Err(error);
             }
         };
-        let Some(refusal) = ack.permission_refusal else {
-            return Ok(None);
-        };
-        if kind != "request.opened"
-            || refusal.agent_id != self.agent_id
-            || refusal.generation != self.generation
-            || request_id.as_deref() != Some(refusal.request_id.as_str())
-            || turn_id.as_deref() != Some(refusal.turn_id.as_str())
-        {
+        if ack.permission_refusal.as_ref().is_some_and(|refusal| {
+            kind != "request.opened"
+                || refusal.agent_id != self.agent_id
+                || refusal.generation != self.generation
+                || request_id.as_deref() != Some(refusal.request_id.as_str())
+                || turn_id.as_deref() != Some(refusal.turn_id.as_str())
+        }) || ack.native_wake_cancel.as_ref().is_some_and(|cancel| {
+            !native_wake || turn_id.as_deref() != Some(cancel.turn_id.as_str())
+        }) {
             *self.writes_blocked = true;
             *self.source_unknown = true;
             *self.failure = Some(format!(
-                "{} permission refusal acknowledgement binding is unknown",
+                "{} event acknowledgement binding is unknown",
                 self.harness
             ));
             *self.batch_unknown = true;
             return Err(Error::new(
                 "unknown",
-                format!(
-                    "{} permission refusal acknowledgement binding is invalid",
-                    self.harness
-                ),
+                format!("{} event acknowledgement binding is invalid", self.harness),
             ));
         }
-        Ok(Some(refusal))
+        Ok(ack)
     }
 
     /// Commit one turn-bound `message.completed`. A blank native reply (its

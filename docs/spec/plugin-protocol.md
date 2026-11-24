@@ -758,10 +758,28 @@ context is never retried or moved to a later point.
 A turn the harness started by itself follows the
 [self-started turn contract](core.md#self-started-native-turns). The adapter commits
 `turn.started` with `native_trigger` and no `command_id`, then omits `command_id` from
-that turn's facts until a send binds. A send it accepts during that turn reports its
-exact association with `turn.input_bound`, and the applied response names the turn it
-joined. Exact-turn `agent.snapshot` uses the session's start command as the session
-selector for an unbound turn, and the returned turn facts omit `command_id`.
+that turn's facts until a send binds. The host queues new sends unless the adapter
+declares it can bind one into the open native turn. When the harness accepts a send
+into that turn, the adapter reports the exact association with `turn.input_bound`,
+and the applied response names the turn it joined. Exact-turn `agent.snapshot`
+uses the session's start command as the session selector for an unbound turn, and
+the returned turn facts omit `command_id`.
+
+The ACK for a commandless `turn.started` can carry `native_wake_cancel` for
+that exact turn. Store retains the same reason on the journaled start. The
+adapter performs the exact cancel before processing further wake output.
+Store repeats the directive on a duplicate ACK only while the same wake is
+active. A retired wake's directive is dropped and the drop is journaled.
+
+A send already admitted by the harness into its native queue replies
+`state: "queued"` with the exact native turn id. The host keeps it dispatched
+until the matching `turn.started` commits its input association.
+
+When a terminal supplies positive evidence that the harness still has work that
+will drive a follow-up, the adapter sets `turn.completed.data.native_followup_pending`
+to `true`. `tool.background_ended` may carry the same field with the remaining
+session state. An explicit false clears the hold. The Goal's idle gate bounds
+each hold from the committed terminal and reevaluates at the next native lifecycle.
 
 `turn.completed.data.native_error` optionally summarizes an available native error as
 `{message,truncated}`. Redact known secrets with `SecretPolicy` before bounding its

@@ -717,6 +717,15 @@ impl Router {
         match response {
             Ok(value) => {
                 let response_state = value.get("state").and_then(Value::as_str);
+                if response_state == Some("queued")
+                    && value["turn_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.trim().is_empty())
+                {
+                    // The native harness owns this input now. Keep the send
+                    // dispatched until its exact turn.started associates it.
+                    return true;
+                }
                 if let Some(state) = match response_state {
                     Some("rejected") => Some(CommandState::Rejected),
                     Some("failed") => Some(CommandState::Failed),

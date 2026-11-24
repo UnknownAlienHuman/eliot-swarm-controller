@@ -65,6 +65,32 @@ the `1.4.0` harness baseline. Owned sessions require a non-empty
 
 ## Native mapping
 
+Verified 2026-11-23 against the offline stable schema embedded in installed Muse
+Code `1.4.25-R9361.1`. `turn/started` requires `sessionId`, `commandId`,
+`turnId`, `sourceRange`, and `viewCursor`; `turn/completed` requires
+`sessionId`, `sourceRange`, `terminal`, `turnId`, and `viewCursor`, with
+aggregate `usage` optional. A
+`turn/started.commandId` registered before Eliot dispatches `turn/start` stays
+bound to that exact send and must match its acknowledgement and turn. An
+otherwise unbound start on the owned session is a native trigger: Eliot emits
+`turn.started` with `native_trigger: "muse.turn/started"` and the exact
+`turn_id`, omitting Eliot `command_id`. The Muse command id remains private
+matching evidence. An exact `turn/modelAttemptStarted` also proves that an
+otherwise unbound turn is running. Only pre-readiness events and facts of an
+identified pending Eliot input use the early-event buffer. Idle view items
+and background completion receipts do not accumulate there.
+
+Each `turn/start` requests `ifBusy: "queue"`. If a native run starts while an
+input is being dispatched, its independent turn id stays visible. The accepted
+queued input keeps the native acknowledgement's turn id. Eliot associates it
+only after the earlier turn ends and that input emits its exact `turn/started`.
+The shared [native wake gate](../spec/automation.md#automatic-background-process-wake)
+cancels an exact commandless run after an explicit interrupt or while the
+profile has a durable hold. The adapter sends `turn/cancel` immediately and
+retains queued inputs for their own turns. Each turn captures the verified
+session selector in force at its start, including sends admitted into the
+native queue before the selector changed.
+
 The installed `turn/steer` result must echo the submitted `commandId`, the exact
 `expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported
 MSP schema). A malformed result or contradictory echo is a diagnostic
@@ -179,14 +205,12 @@ summed across the turn's model completions, and maps to `TurnUsage` at
 counters project (`inputTokens`, `outputTokens`, `reasoningTokens`,
 `cacheReadTokens`/`cacheWriteTokens`); `cachedTokens` is
 provider-convention-dependent (inside or beside `inputTokens`) and never
-mapped, and no total is derived. The per-completion `session/tokenUsage`
-events (raw counters plus server-derived counted-once
-`promptTokens`/`totalTokens` and the session `cumulative` block with
-`cost`), and the `session/contextUsage`
-(`usedTokens`/`windowTokens`/`pressure`) occupancy triple, are
-session-scoped facts: not turn expenditure, so repeated
-completions can never inflate the terminal count. The adapter folds them
-into the retained `SessionUsage` snapshot and commits it as `session.usage`
+mapped, and no total is derived. Per-completion `session/tokenUsage` carries
+an exact `turnId` and raw `usage`; its server-derived counted-once
+`promptTokens`/`totalTokens`, cumulative block with `cost`, and the
+`session/contextUsage` (`usedTokens`/`windowTokens`/`pressure`) occupancy
+triple remain session-scoped. The adapter folds those session fields into the
+retained `SessionUsage` snapshot and commits it as `session.usage`
 when accepted (sources `muse:session/tokenUsage` and
 `muse:session/contextUsage`), with `observed_at` captured at acceptance:
 the `cumulative` counted-once prompt/output/cache counters replace the
@@ -194,10 +218,13 @@ retained cumulative counters. Store projects uncached input by removing
 cache reads from the cumulative prompt total. The server-computed
 estimated `cost.usd` maps with unit `usd_estimate`, and each context
 notification replaces both context counters (absent members become null,
-never keeping the previous window). Missing counters stay
-null. Live 2026-11-14: real turns commit `turn.completed` with no `usage`
-field at all, so these session notifications are the only usage signal for
-this harness; session facts never derive per-turn usage.
+never keeping the previous window). Missing counters stay null. When
+`turn/completed.usage` is absent, observed `session/tokenUsage.usage` model
+completions with the exact turn id and a replay-deduplicated view identity supply
+the turn's fallback counters. Before the send acknowledgement, the adapter
+holds the sample by its own native turn id and uses it when the acknowledgement
+confirms that id. A counter missing on an observed completion stays
+unavailable in the aggregate. Session cumulative totals remain session-scoped.
 
 ## Observation and recovery
 

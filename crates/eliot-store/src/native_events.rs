@@ -290,6 +290,15 @@ pub(super) fn persist_effects(
     {
         provider_events.push(event);
     }
+    if native_event.kind == "tool.background_ended"
+        && native_event.data["native_followup_pending"].as_bool() == Some(false)
+    {
+        db!(tx.execute(
+            "UPDATE turns SET native_followup_pending = 0
+             WHERE agent = ?1 AND generation = ?2 AND native_followup_pending = 1",
+            params![agent_num, generation],
+        ));
+    }
     if matches!(
         native_event.kind.as_str(),
         "hook.before_tool" | "hook.after_tool" | "hook.before_model"
@@ -459,7 +468,8 @@ fn persist_turn_associated(
             .execute(
                 "UPDATE turns SET start_command_id = ?1
                  WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4 AND state = 'running'
-                   AND native_trigger IS NOT NULL AND start_command_id IS NULL",
+                   AND native_trigger IS NOT NULL AND start_command_id IS NULL
+                   AND native_wake_cancel_reason IS NULL",
                 params![command_id, agent_num, generation, turn_id],
             )
             .map_err(sql_error)?;
@@ -501,6 +511,13 @@ fn persist_turn_associated(
                 native_trigger: None,
             },
         )?;
+    }
+    if explicit_input_principal(&command.command.principal) {
+        db!(tx.execute(
+            "UPDATE agents SET native_wake_interrupted_generation = NULL
+             WHERE id = ?1 AND native_wake_interrupted_generation = ?2",
+            params![agent_num, generation],
+        ));
     }
     // A SEND dispatched before Stop may acquire its exact turn after Stop
     // dispatch. Capture the association before any drained session terminal
@@ -602,6 +619,51 @@ fn persist_turn_associated(
     Ok(command_events)
 }
 
+pub(super) fn explicit_input_principal(principal: &str) -> bool {
+    principal == "owner" || principal.starts_with("agent:")
+}
+
+pub(super) fn native_wake_cancellation(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    agent: &Agent,
+    turn_id: &str,
+) -> Result<Option<core::NativeWakeCancellation>> {
+    let (reason, message) = match provider_holds::require_unheld_tx(tx, agent) {
+        Err(error) if error.code == "provider_held" => {
+            let reason = if error.failure_where.as_deref() == Some("provider.model_mismatch") {
+                "model_mismatch"
+            } else {
+                "provider_held"
+            };
+            (reason, *error.message)
+        }
+        Err(error) => return Err(error),
+        Ok(()) => {
+            let suppressed: bool = tx
+                .query_row(
+                    "SELECT native_wake_interrupted_generation IS ?1 FROM agents WHERE id = ?2",
+                    params![agent.generation, agent_num],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if !suppressed {
+                return Ok(None);
+            }
+            (
+                "after_interrupt",
+                "An explicit interrupt suppressed native wakes until the next explicit input."
+                    .to_owned(),
+            )
+        }
+    };
+    Ok(Some(core::NativeWakeCancellation {
+        turn_id: turn_id.to_owned(),
+        reason: reason.to_owned(),
+        message,
+    }))
+}
+
 /// Record a turn the harness started by itself. It runs under the current
 /// configuration revision and has no command until a send binds to it.
 fn persist_native_turn_started(
@@ -615,6 +677,7 @@ fn persist_native_turn_started(
         generation,
         now,
         next_agent,
+        native_event,
         ..
     } = scope;
     if load_turn(tx, agent_num, generation, turn_id)?.is_some() {
@@ -648,7 +711,15 @@ fn persist_native_turn_started(
                 .and_then(Value::as_str),
             native_trigger: Some(trigger),
         },
-    )
+    )?;
+    if let Some(reason) = native_event.data["native_wake_cancel"]["reason"].as_str() {
+        db!(tx.execute(
+            "UPDATE turns SET native_wake_cancel_reason = ?1
+             WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4",
+            params![reason, agent_num, generation, turn_id],
+        ));
+    }
+    Ok(())
 }
 
 /// A turn fact without a command is valid only for the exact running
@@ -1230,6 +1301,8 @@ fn persist_turn_terminal(
                 .and_then(Value::as_str)
         })
         .flatten();
+    let native_followup_pending = native_event.kind == "turn.completed"
+        && native_event.data["native_followup_pending"].as_bool() == Some(true);
     let changed = tx
         .execute(
             "UPDATE turns SET state = ?1, status = COALESCE(?2, status),
@@ -1239,8 +1312,9 @@ fn persist_turn_terminal(
                               usage = COALESCE(?7, usage),
                               preceded_by = COALESCE(?8, preceded_by),
                               native_error_message = COALESCE(?9, native_error_message),
-                              effective_model = COALESCE(?10, effective_model)
-             WHERE agent = ?11 AND generation = ?12 AND turn_id = ?13",
+                              effective_model = COALESCE(?10, effective_model),
+                              native_followup_pending = ?11
+             WHERE agent = ?12 AND generation = ?13 AND turn_id = ?14",
             params![
                 turn_state_name(state),
                 status,
@@ -1252,6 +1326,7 @@ fn persist_turn_terminal(
                 preceded_by,
                 native_error_message,
                 effective_model,
+                native_followup_pending,
                 agent_num,
                 generation,
                 turn_id,
