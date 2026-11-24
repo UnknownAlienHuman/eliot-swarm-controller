@@ -521,6 +521,30 @@ impl Router {
                         &format!("plugin.{harness}.command.start"),
                     );
                     value["native_start_refused"] = Value::Bool(native_start_refused);
+                    // A bound `failed` response with no native subject proves
+                    // that start was refused before a session existed. Keep a
+                    // typed reason/location on the durable command outcome so
+                    // Store can select only this safe Resume recovery case.
+                    if native_start_refused
+                        && dispatched.verb == "resume"
+                        && let Some(reason) = value
+                            .get("code")
+                            .or_else(|| value.get("reason"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                    {
+                        let reason = reason.to_owned();
+                        let location = value
+                            .get("where")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("plugin.start.native_refusal")
+                            .to_owned();
+                        value["restart_resume_refusal"] = json!({
+                            "reason": reason,
+                            "where": location,
+                        });
+                    }
                     let _ = self.settle(id, CommandState::Failed, Some(value)).await;
                 } else {
                     let artifact_snapshot =
