@@ -61,13 +61,13 @@ impl Router {
                         && goal.generation == generation
                         && goal.definition == *definition =>
                 {
-                    Some(store.turn_insertion_evidence(
+                    store.turn_insertion_evidence(
                         turn,
                         event.seq,
                         workspace,
                         &definition.check,
                         goal.revision,
-                    )?)
+                    )?
                 }
                 _ => None,
             };

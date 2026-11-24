@@ -95,6 +95,7 @@ impl Store {
     }
 
     /// Retained edits and passing checks for one turn's latest observed edit.
+    /// An absent result means the start of the turn cannot be established.
     pub fn turn_insertion_evidence(
         &self,
         turn: &Turn,
@@ -102,11 +103,26 @@ impl Store {
         workspace: &str,
         check: &[String],
         goal_revision: i64,
-    ) -> Result<TurnInsertionEvidence> {
+    ) -> Result<Option<TurnInsertionEvidence>> {
         let agent = parse_agent_id(&turn.agent)?;
         let Some(started) = turn.started_at else {
-            return Ok(TurnInsertionEvidence::default());
+            return Ok(None);
         };
+        let covered: bool = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN pruned_through = 0 THEN 1 ELSE EXISTS (
+                SELECT 1 FROM events INDEXED BY events_agent
+                WHERE agent = ?1 AND generation = ?2 AND seq > pruned_through AND seq < ?3
+                  AND kind = 'turn.started' AND json_extract(data, '$.turn_id') = ?4
+             ) END FROM rule_history_coverage WHERE singleton = 1",
+                params![agent, turn.generation, through, turn.turn_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !covered {
+            return Ok(None);
+        }
         let mut statement = self
             .connection
             .prepare(
@@ -137,37 +153,20 @@ impl Store {
             .map_err(sql_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql_error)?;
-        // A surviving attribution row can prove an edit whose event was
-        // pruned. Retained check evidence must follow the pruned prefix.
         let git_edit: Option<i64> = self
             .connection
             .query_row(
-                "SELECT COALESCE(
-                    (SELECT seq FROM events INDEXED BY events_agent
-                     WHERE agent = ?1 AND generation = ?2 AND seq < ?3 AND ts >= ?4
-                       AND source = 'git' AND json_extract(data, '$.workspace') = ?5
-                       AND (kind = 'file.changed' OR (kind = 'git.changed' AND (
-                            json_array_length(data, '$.dirty') > 0
-                            OR json_array_length(data, '$.committed_paths') > 0)))
-                     ORDER BY seq DESC LIMIT 1),
-                    (SELECT pruned_through FROM rule_history_coverage
-                     WHERE singleton = 1 AND pruned_through > 0 AND EXISTS (
-                        SELECT 1 FROM agent_edits AS edit
-                        WHERE edit.agent = ?1 AND edit.generation = ?2 AND edit.workspace = ?5
-                          AND edit.updated_at BETWEEN ?4 AND ?6
-                          AND NOT EXISTS (
-                            SELECT 1 FROM events AS retained INDEXED BY events_agent
-                            WHERE retained.agent = edit.agent AND retained.generation = edit.generation
-                              AND retained.ts = edit.updated_at
-                              AND retained.source = 'git' AND retained.kind = 'file.changed'
-                              AND json_extract(retained.data, '$.workspace') = edit.workspace
-                              AND json_extract(retained.data, '$.path') = edit.path
-                          )
-                     ))
-                 )",
-                params![agent, turn.generation, through, started, workspace, turn.completed_at],
+                "SELECT seq FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2 AND seq < ?3 AND ts >= ?4
+               AND source = 'git' AND json_extract(data, '$.workspace') = ?5
+               AND (kind = 'file.changed' OR (kind = 'git.changed' AND (
+                    json_array_length(data, '$.dirty') > 0
+                    OR json_array_length(data, '$.committed_paths') > 0)))
+             ORDER BY seq DESC LIMIT 1",
+                params![agent, turn.generation, through, started, workspace],
                 |row| row.get(0),
             )
+            .optional()
             .map_err(sql_error)?;
         let last_edit = edits.first().map(|(seq, _)| *seq).max(git_edit);
         let mut evidence = TurnInsertionEvidence {
@@ -176,7 +175,7 @@ impl Store {
             passing_check: false,
         };
         let Some(last_edit) = last_edit else {
-            return Ok(evidence);
+            return Ok(Some(evidence));
         };
         let check = check.join(" ");
         // An unflagged command well below the byte cap cannot be a truncated
@@ -228,7 +227,7 @@ impl Store {
                 last_edit, goal_revision],
             |row| row.get(0),
         ).map_err(sql_error)?;
-        Ok(evidence)
+        Ok(Some(evidence))
     }
 
     pub fn render_injection(&self, command: &Command, text: &str) -> Result<String> {
