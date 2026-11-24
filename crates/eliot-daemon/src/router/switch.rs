@@ -345,7 +345,7 @@ impl Router {
                     self.publish_locked(&change.events);
                 }
                 if let Some((reason, kind)) = reason_kind
-                    && let Some(message) = routing::handoff_waiting_message(&error)
+                    && let Some(message) = routing::handoff_waiting_message(&error, reason)
                 {
                     let candidate = eliot_store::AutomaticHandoff {
                         agent: source,
@@ -514,6 +514,17 @@ impl Router {
                 ));
             }
             if let Some((_, choice, identity)) = provider_route {
+                if continuation.is_some_and(|value| {
+                    value.reason == HandoffReason::ProviderResponseWithheld
+                }) && eliot_core::same_codex_provider_route(
+                    &source.profile_snapshot,
+                    &prepared.request.args["profile_snapshot"],
+                ) {
+                    return Err(Error::new(
+                        "not_allowed",
+                        "successor resolved to the Codex provider route that withheld the response",
+                    ));
+                }
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity
                 {

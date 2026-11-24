@@ -3,6 +3,7 @@ use super::*;
 use crate::config::{
     QuotaUnknownPolicy, profile_quota_reserve_percent, profile_quota_unknown_policy,
 };
+use eliot_core::api::HandoffReason;
 use eliot_core::{RouteQuotaStatus, RouteSkip, RouteSkipReason, RoutingDecision};
 
 #[derive(Clone, Copy, Default)]
@@ -81,7 +82,7 @@ struct AvailableRoute {
 
 /// Who may succeed a source whose successor no Owner chose by hand.
 pub(super) struct HandoffRoute {
-    pub(super) reason: eliot_core::api::HandoffReason,
+    pub(super) reason: HandoffReason,
     pub(super) kind: Option<eliot_core::ProviderRestrictionKind>,
     /// A role a manager asked for, in place of the source's own.
     pub(super) role: Option<String>,
@@ -89,19 +90,29 @@ pub(super) struct HandoffRoute {
     pub(super) allowed: Option<Vec<String>>,
 }
 
-pub(super) fn handoff_waiting_message(error: &Error) -> Option<String> {
-    if let Some(decision) = error.routing.as_deref() {
+pub(super) fn handoff_waiting_message(error: &Error, reason: HandoffReason) -> Option<String> {
+    let message = if let Some(decision) = error.routing.as_deref() {
         let skipped = decision
             .skipped
             .iter()
             .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
             .collect::<Vec<_>>()
             .join(", ");
-        return Some(format!(
-            "No eligible successor in routing.handoff_fallback. {skipped}"
-        ));
-    }
-    (error.code == "handoff_unavailable").then(|| (*error.message).clone())
+        let source = decision
+            .source
+            .strip_prefix("settings.")
+            .unwrap_or(&decision.source);
+        format!("No eligible successor in {source}. {skipped}")
+    } else if error.code == "handoff_unavailable" {
+        (*error.message).clone()
+    } else {
+        return None;
+    };
+    Some(if reason == HandoffReason::ProviderResponseWithheld {
+        format!("Provider withheld the response. {message}")
+    } else {
+        message
+    })
 }
 
 fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<String>> {
@@ -115,6 +126,14 @@ fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<Strin
     Err(Error::new("handoff_unavailable", reason))
 }
 
+fn withheld_role(source: &Agent) -> Option<&str> {
+    source
+        .profile_choice
+        .as_ref()
+        .map(|choice| choice.role.as_str())
+        .filter(|role| *role != "handoff_fallback")
+}
+
 #[derive(Default)]
 struct RoutePreflight {
     preview: bool,
@@ -126,6 +145,7 @@ struct RoutePreflight {
     provider_authority: Option<[u8; 32]>,
     provider_source: Option<Value>,
     handoff_source: Option<Value>,
+    skip_source_provider_route: bool,
     handoff_allowed: Option<Vec<String>>,
     /// Source profile when a sandboxed successor could not commit here.
     handoff_no_commit: Option<String>,
@@ -430,9 +450,37 @@ impl Router {
     /// The daemon follows the Owner's continuation list. A manager's explicit
     /// role request uses that role and remains bounded by child authority.
     fn handoff_candidates(&self, source: &Agent, route: &HandoffRoute) -> Result<Vec<String>> {
-        use eliot_core::api::HandoffReason;
         let routing = crate::config::load_routing_config(&self.inner.data_root)?;
-        let mut list = if let Some(role) = route.role.as_deref() {
+        let mut list = if route.reason == HandoffReason::ProviderResponseWithheld {
+            if !self.inner.attention.provider_refusal.enabled {
+                return Err(Error::new(
+                    "handoff_unavailable",
+                    "Automatic provider reactions are disabled",
+                ));
+            }
+            if !routing.auto_handoff() {
+                return Err(Error::new(
+                    "handoff_unavailable",
+                    "Automatic handoff is disabled",
+                ));
+            }
+            if let Some(role) = withheld_role(source) {
+                if !routing.provider_failover() {
+                    return Err(Error::new(
+                        "handoff_unavailable",
+                        "Provider failover is disabled for role-routed launches",
+                    ));
+                }
+                let candidates = routing.candidates(role).unwrap_or_default();
+                let next = candidates
+                    .iter()
+                    .position(|profile| *profile == source.profile)
+                    .map_or(0, |index| index + 1);
+                candidates[next..].to_vec()
+            } else {
+                automatic_fallback(routing)?
+            }
+        } else if let Some(role) = route.role.as_deref() {
             routing.candidates(role).unwrap_or_default().to_vec()
         } else {
             automatic_fallback(routing)?
@@ -461,12 +509,14 @@ impl Router {
         source: &Agent,
         route: &HandoffRoute,
     ) -> Result<(String, Value)> {
-        use eliot_core::api::HandoffReason;
         let candidates = self.handoff_candidates(source, route)?;
-        let role = route
-            .role
-            .clone()
-            .unwrap_or_else(|| "handoff_fallback".to_owned());
+        let role = if route.reason == HandoffReason::ProviderResponseWithheld {
+            withheld_role(source)
+        } else {
+            route.role.as_deref()
+        }
+        .unwrap_or("handoff_fallback")
+        .to_owned();
         let mut skipped: Vec<RouteSkip> = source
             .profile_choice
             .iter()
@@ -487,6 +537,7 @@ impl Router {
                 source.profile,
                 route.kind.map_or("quota", |kind| kind.as_str())
             ),
+            HandoffReason::ProviderResponseWithheld => "Provider withheld the response".to_owned(),
             HandoffReason::SessionLost => format!("the {} session ended", source.profile),
             HandoffReason::Routing | HandoffReason::Request => {
                 format!("the work moved from {}", source.profile)
@@ -516,6 +567,7 @@ impl Router {
             provider_switch: true,
             prefer_candidate_order: route.role.is_none(),
             handoff_source: Some(source.profile_snapshot.clone()),
+            skip_source_provider_route: route.reason == HandoffReason::ProviderResponseWithheld,
             handoff_allowed: route.allowed.clone(),
             handoff_no_commit: (!can_commit).then(|| source.profile.clone()),
             ..RoutePreflight::default()
@@ -741,10 +793,15 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if let Some(source) = &preflight.handoff_source
-            && eliot_core::handoff_authority_refusal(source, &snapshot).is_some()
-        {
-            return Ok(Err(RouteSkipReason::WiderAuthority));
+        if let Some(source) = &preflight.handoff_source {
+            if preflight.skip_source_provider_route
+                && eliot_core::same_codex_provider_route(source, &snapshot)
+            {
+                return Ok(Err(RouteSkipReason::ProviderFailure));
+            }
+            if eliot_core::handoff_authority_refusal(source, &snapshot).is_some() {
+                return Ok(Err(RouteSkipReason::WiderAuthority));
+            }
         }
         if preflight
             .handoff_no_commit

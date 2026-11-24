@@ -788,24 +788,25 @@ impl Router {
         crate::logging::record(&self.secret_policy_snapshot(), name, &[], Some(error));
     }
 
-    /// Move owed work off a held or ended session, by policy. Nothing is
-    /// reserved until a successor is actually eligible.
+    /// Move owed work off a held or ended session or a withheld response.
+    /// Nothing is reserved until a successor is actually eligible.
     pub(crate) async fn run_automatic_handoffs(&self) -> Result<()> {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Ok(());
         }
         let routing = crate::config::load_routing_config(&self.inner.data_root)?;
-        if !routing.auto_handoff() {
-            return Ok(());
-        }
         let candidates = self.inner.store.lock().await.automatic_handoff_candidates(
             self.inner.started_at_ms,
             now_ms(),
             HANDOFF_BATCH,
+            routing.auto_handoff(),
         )?;
         for candidate in candidates {
             let enabled = match candidate.reason {
                 HandoffReason::ProviderHold => self.inner.attention.provider_refusal.enabled,
+                // Check the route even when automation is disabled so the
+                // Owner sees the outstanding provider decision.
+                HandoffReason::ProviderResponseWithheld => true,
                 _ => self.inner.attention.agent_lost.enabled,
             };
             if enabled && let Err(error) = self.admit_automatic_handoff(&candidate).await {
@@ -827,7 +828,8 @@ impl Router {
             .route_handoff(&mut probe, &candidate.agent, &route)
             .await
         {
-            let Some(message) = super::routing::handoff_waiting_message(&error) else {
+            let Some(message) = super::routing::handoff_waiting_message(&error, candidate.reason)
+            else {
                 return Err(error);
             };
             let mut store = self.inner.store.lock().await;

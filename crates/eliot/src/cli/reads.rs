@@ -145,15 +145,21 @@ fn print_work_truth(work: &eliot_core::api::AgentWorkTruthView) {
     }
     if let Some(handoff) = &work.handoff {
         let why = handoff.reason.map_or("handoff", |reason| reason.as_str());
+        let uncertainty = if handoff.uncertain {
+            "; last turn may have left partial effects"
+        } else {
+            ""
+        };
         match (&handoff.continued_to, handoff.message.as_deref()) {
+            (Some(agent), Some(message))
+                if handoff.reason
+                    == Some(eliot_core::api::HandoffReason::ProviderResponseWithheld) =>
+            {
+                println!("{message} ({agent}){uncertainty}");
+            }
             (Some(agent), _) => println!(
-                "Handoff ({why}): continued on {agent} ({}){}",
-                handoff.profile.as_deref().unwrap_or("unknown profile"),
-                if handoff.uncertain {
-                    "; last turn may have left partial effects"
-                } else {
-                    ""
-                }
+                "Handoff ({why}): continued on {agent} ({}){uncertainty}",
+                handoff.profile.as_deref().unwrap_or("unknown profile")
             ),
             (None, Some(message)) => println!("Handoff ({why}): {}. {message}", handoff.state),
             (None, None) => println!("Handoff ({why}): {}", handoff.state),
