@@ -47,6 +47,14 @@ pub struct OwnerInboxSweep {
     pub retired_snoozes: Vec<OwnerInboxItemRef>,
 }
 
+pub struct OwnerProjection {
+    pub items: Vec<OwnerInboxItem>,
+    pub liveness: SwarmLiveness,
+    pub command_without_dispatcher: CommandWithoutDispatcherStatus,
+    pub goals_without_progress: usize,
+    pub repeated_failure_inbox_items: usize,
+}
+
 pub(crate) fn is_reportable(item: &OwnerInboxItem, now: i64, confirmed: &StuckStates) -> bool {
     item.kind != OwnerInboxKind::Stuck
         // A persisted interrupted fence already establishes the wait.
@@ -113,34 +121,12 @@ impl Store {
         )
     }
 
+    /// Fleet counts include snoozed items. The inbox contains visible items.
     pub fn read_owner_projection(
         path: &Path,
         now: i64,
         confirmed: &StuckStates,
-    ) -> Result<(
-        Vec<OwnerInboxItem>,
-        SwarmLiveness,
-        CommandWithoutDispatcherStatus,
-    )> {
-        let (items, liveness, command_without_dispatcher, _, _) =
-            Self::read_owner_projection_with_health(path, now, confirmed)?;
-        Ok((items, liveness, command_without_dispatcher))
-    }
-
-    /// Return the shared owner projection and fleet counts derived before
-    /// snoozed inbox rows are removed. Existing inbox callers keep the original
-    /// projection tuple through `read_owner_projection`.
-    pub fn read_owner_projection_with_health(
-        path: &Path,
-        now: i64,
-        confirmed: &StuckStates,
-    ) -> Result<(
-        Vec<OwnerInboxItem>,
-        SwarmLiveness,
-        CommandWithoutDispatcherStatus,
-        usize,
-        usize,
-    )> {
+    ) -> Result<OwnerProjection> {
         read_inbox_snapshot(path, |connection| {
             let (mut items, mut liveness) = super::owner_inbox::project(connection, now)?;
             items.retain(|item| {
@@ -190,14 +176,8 @@ impl Store {
                 .count();
             let repeated_failure_inbox_items = items
                 .iter()
-                .filter(|item| {
-                    item.kind == OwnerInboxKind::Stuck
-                        && item.reason == super::owner_inbox::REPEATED_FAILURE_REASON
-                        && item.subject.starts_with("repeat:")
-                })
-                .map(|item| item.subject.as_str())
-                .collect::<HashSet<_>>()
-                .len();
+                .filter(|item| item.reason == super::owner_inbox::REPEATED_FAILURE_REASON)
+                .count();
             let snoozes = inbox_snoozes(connection)?;
             let snoozed = snoozes
                 .iter()
@@ -206,13 +186,13 @@ impl Store {
             items.retain(|item| {
                 !snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
             });
-            Ok((
+            Ok(OwnerProjection {
                 items,
                 liveness,
                 command_without_dispatcher,
                 goals_without_progress,
                 repeated_failure_inbox_items,
-            ))
+            })
         })
     }
 

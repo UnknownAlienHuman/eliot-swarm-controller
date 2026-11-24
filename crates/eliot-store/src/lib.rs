@@ -233,7 +233,7 @@ mod native_events;
 mod observer;
 mod owner_decisions;
 mod owner_inbox;
-pub use owner_decisions::{OwnerDecisionAdmission, StuckStates};
+pub use owner_decisions::{OwnerDecisionAdmission, OwnerProjection, StuckStates};
 mod observer_live;
 mod organization;
 mod processes;
