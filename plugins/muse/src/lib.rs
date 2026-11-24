@@ -6,6 +6,7 @@ pub(crate) mod catalog_presentation;
 mod events;
 mod host;
 pub mod install;
+mod instructions;
 mod native;
 mod quota;
 

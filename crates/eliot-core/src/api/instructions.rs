@@ -7,6 +7,68 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+/// One adapter-owned project instruction path in the composed inventory.
+/// Catalog order and primary fallback order are independent stable ranks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstructionInventoryPath {
+    pub path: &'static str,
+    pub inventory_rank: u8,
+    pub primary_rank: u8,
+}
+
+impl InstructionInventoryPath {
+    pub fn validate(&self) -> Result<()> {
+        if !safe_relative_path(self.path) {
+            return Err(Error::new(
+                "invalid",
+                "instruction inventory path is not a safe relative path",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sort and validate adapter instruction paths without embedding native names.
+pub(super) fn normalize_instruction_inventory(
+    inventory: &[InstructionInventoryPath],
+) -> Result<Vec<InstructionInventoryPath>> {
+    if inventory.is_empty() || inventory.len() > u8::MAX as usize {
+        return Err(Error::new(
+            "invalid",
+            "instruction inventory has an invalid number of paths",
+        ));
+    }
+    let mut normalized = inventory.to_vec();
+    for path in &normalized {
+        path.validate()?;
+    }
+    normalized.sort_by_key(|path| path.inventory_rank);
+    if normalized.iter().enumerate().any(|(index, path)| {
+        path.inventory_rank as usize != index
+            || normalized[..index]
+                .iter()
+                .any(|prior| prior.path == path.path)
+    }) {
+        return Err(Error::new(
+            "invalid",
+            "instruction inventory paths or catalog ranks are duplicated or incomplete",
+        ));
+    }
+    let mut primary_ranks: Vec<_> = normalized.iter().map(|path| path.primary_rank).collect();
+    primary_ranks.sort_unstable();
+    if primary_ranks
+        .iter()
+        .enumerate()
+        .any(|(index, rank)| *rank as usize != index)
+    {
+        return Err(Error::new(
+            "invalid",
+            "instruction inventory primary ranks are duplicated or incomplete",
+        ));
+    }
+    Ok(normalized)
+}
+
 /// Evidence level for whether a selected native harness reads one candidate.
 /// Documented and Conditional are not runtime-consumption receipts.
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,20 +106,9 @@ pub struct InstructionDeliveryView {
     pub source_workspace: Option<String>,
     /// The primary instruction candidate used for automatic delivery.
     pub primary_path: String,
-    /// Fixed, bounded root instruction candidates and their launch-time facts.
+    /// Composed, bounded root instruction candidates and their launch-time facts.
     pub files: Vec<InstructionFileView>,
 }
-
-/// Stable union of the project instruction paths supported by the native adapters.
-pub const INSTRUCTION_FILE_PATHS: [&str; 7] = [
-    "AGENTS.md",
-    "AGENTS.override.md",
-    "CLAUDE.md",
-    "CLAUDE.local.md",
-    ".claude/CLAUDE.md",
-    ".claude/CLAUDE.local.md",
-    "GEMINI.md",
-];
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,8 +151,12 @@ pub struct InstructionFileView {
 
 impl InstructionDeliveryView {
     pub fn validate(&self) -> Result<()> {
-        if !INSTRUCTION_FILE_PATHS.contains(&self.primary_path.as_str())
-            || self.files.len() != INSTRUCTION_FILE_PATHS.len()
+        super::HarnessCapabilities::require_registered()?;
+        let inventory = super::HarnessCapabilities::project_instruction_inventory();
+        if self.files.len() != inventory.len()
+            || !inventory
+                .iter()
+                .any(|candidate| candidate.path == self.primary_path)
             || self
                 .source_workspace
                 .as_deref()
@@ -114,9 +169,10 @@ impl InstructionDeliveryView {
         }
         let mut seen = BTreeSet::new();
         for file in &self.files {
-            if !INSTRUCTION_FILE_PATHS.contains(&file.path.as_str())
+            if !inventory
+                .iter()
+                .any(|candidate| candidate.path == file.path)
                 || !seen.insert(file.path.as_str())
-                || file.path.chars().any(char::is_control)
                 || file.sha256.as_deref().is_some_and(|digest| {
                     digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
@@ -136,4 +192,16 @@ impl InstructionDeliveryView {
         }
         Ok(())
     }
+}
+
+fn safe_relative_path(path: &str) -> bool {
+    !path.trim().is_empty()
+        && !path.starts_with('/')
+        && !path.starts_with('\\')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
 }

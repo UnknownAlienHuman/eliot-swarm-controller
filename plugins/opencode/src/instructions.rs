@@ -1,7 +1,10 @@
 //! OpenCode native project and user instruction discovery declarations.
 
+use eliot_core::api::InstructionInventoryPath;
 use eliot_core::api::InstructionReadStatus::{Conditional, Documented};
 use eliot_core::api::harness::{ProjectInstructionRead, UserInstructionFiles};
+
+pub(super) const INSTRUCTION_INVENTORY: &[InstructionInventoryPath] = &[];
 
 pub(super) const PROJECT_READ: Option<ProjectInstructionRead> = Some(ProjectInstructionRead {
     paths: &[("AGENTS.md", Documented), ("CLAUDE.md", Conditional)],
