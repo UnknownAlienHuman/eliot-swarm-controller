@@ -15,7 +15,7 @@ use std::{ffi::OsStr, io, process::ExitStatus, process::Stdio, sync::Arc, time::
 use tokio::process::Command;
 use tokio::{
     io::AsyncWriteExt,
-    process::{ChildStdin, ChildStdout},
+    process::ChildStdin,
     sync::watch,
     task::JoinHandle,
     time::{Instant, sleep_until, timeout_at},
@@ -645,7 +645,7 @@ struct SettledProcess {
     stop: StopReason,
     quiescent: bool,
     stdin_finished: bool,
-    stdout: Option<StdoutCapture>,
+    stdout: Option<BoundedCapture>,
     stderr: StderrSnapshot,
     custody: CustodyGuarantee,
 }

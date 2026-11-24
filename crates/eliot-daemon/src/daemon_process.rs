@@ -26,10 +26,6 @@ pub(crate) async fn capture_bounded<R: AsyncRead + Unpin>(
 }
 
 #[cfg(any(windows, target_os = "linux"))]
-#[expect(
-    clippy::disallowed_types,
-    reason = "Shared family quiescence must use the owned child custody handle."
-)]
 pub(crate) async fn wait_family_empty(
     child: &mut OwnedChild,
     timeout: std::time::Duration,

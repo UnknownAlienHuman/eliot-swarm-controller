@@ -134,7 +134,7 @@ fn profiles(document: &DocumentMut) -> Option<&dyn TableLike> {
     document.as_table().get("profiles")?.as_table_like()
 }
 
-fn profile(document: &DocumentMut, name: &str) -> Option<&dyn TableLike> {
+fn profile<'a>(document: &'a DocumentMut, name: &str) -> Option<&'a dyn TableLike> {
     profiles(document)?.get(name)?.as_table_like()
 }
 
@@ -150,7 +150,10 @@ fn profiles_mut(document: &mut DocumentMut) -> Result<&mut dyn TableLike, String
         .ok_or_else(|| "profiles is not a TOML table.".to_owned())
 }
 
-fn profile_mut(document: &mut DocumentMut, name: &str) -> Result<&mut dyn TableLike, String> {
+fn profile_mut<'a>(
+    document: &'a mut DocumentMut,
+    name: &str,
+) -> Result<&'a mut dyn TableLike, String> {
     profiles_mut(document)?
         .get_mut(name)
         .and_then(Item::as_table_like_mut)
