@@ -633,6 +633,76 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Read the last refusal's exact generation for a passive quota check.
+    pub fn quota_hold_target(&self, hold: &ProviderHold) -> Result<Option<Agent>> {
+        self.ensure_committed_reads()?;
+        let binding: Option<(i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT agent, generation FROM events
+                 WHERE kind='provider.hold_updated' AND ts >= ?1
+                   AND json_extract(data,'$.scope')=?2 AND agent IS NOT NULL
+                   AND generation IS NOT NULL
+                 ORDER BY seq DESC LIMIT 1",
+                params![hold.held_since, hold.scope],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some((agent, generation)) = binding else {
+            return Ok(None);
+        };
+        Ok(load_agent_by_num(&self.connection, agent)?.filter(|agent| {
+            agent.generation == generation
+                && core::frozen_provider_scope(agent).is_ok_and(|scope| scope == hold.scope)
+        }))
+    }
+
+    /// Commit a passive quota release only against the unchanged held row.
+    pub fn clear_observed_quota_hold(
+        &mut self,
+        expected: &ProviderHold,
+        observed_at_ms: i64,
+        now: i64,
+    ) -> Result<Vec<core::Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            if !expected.uses_passive_quota_readback()
+                || expected.state != ProviderHoldState::Held
+                || expected.probe_outcome_unknown
+                || observed_at_ms <= expected.updated_at
+                || observed_at_ms > now
+            {
+                return Ok(Vec::new());
+            }
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if get(&tx, &expected.scope)?.as_ref() != Some(expected)
+                || !admin::clear_hold_tx(&tx, &expected.scope, None)?
+            {
+                return Ok(Vec::new());
+            }
+            let event = super::insert_daemon_event(
+                &tx,
+                now,
+                "provider.hold_cleared",
+                "provider",
+                None,
+                None,
+                json!({
+                    "scope": expected.scope, "kind": expected.kind,
+                    "reason": "provider_quota_available", "observed_at_ms": observed_at_ms,
+                }),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(vec![event])
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     /// Pace background preparation failures without moving the deadline for
     /// a caller's launch or counting the failure as a provider attempt.
     pub fn defer_provider_probe(
@@ -643,7 +713,10 @@ impl Store {
     ) -> Result<Vec<core::Event>> {
         self.ensure_writer_healthy()?;
         let reason = match reason {
-            "profile_unavailable" | "unsafe_profile" | "probe_admission_failed" => reason,
+            "profile_unavailable"
+            | "unsafe_profile"
+            | "probe_admission_failed"
+            | "quota_unavailable" => reason,
             _ => "probe_unavailable",
         };
         let result = (|| {
@@ -922,7 +995,8 @@ fn automatic_probe_due(hold: &ProviderHold, now: i64) -> bool {
     matches!(
         hold.kind,
         ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
-    ) && hold.state == ProviderHoldState::Held
+    ) && !hold.uses_passive_quota_readback()
+        && hold.state == ProviderHoldState::Held
         && hold.probe_command.is_none()
         && hold.retry_after.is_none()
         && !automatic_probe_paused(hold)

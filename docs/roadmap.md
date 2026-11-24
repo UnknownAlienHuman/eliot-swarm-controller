@@ -939,8 +939,8 @@ of the explicitly selected release scope.
       `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
       these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
       each window a limit, its share left and when it resets, a refusal in
-      plain words, Muse's "Shown after a Muse turn" until observed, then "as of
-      HH:MM", and the composer's usage ring, which opens Codex's usage popover
+      plain words, Muse's allowance tier and "as of HH:MM" when reported,
+      and the composer's usage ring, which opens Codex's usage popover
       over the composer with Manage usage), need the k92
       daemon contract and say so on an older daemon. Details and monitor speak
       plain words and hide empty rows (`swarm why`'s origin line stays);
@@ -1003,6 +1003,10 @@ of the explicitly selected release scope.
       provider HTTP 403; Antigravity returned real windows before a later HTTP 401.
       Native first-token time is not exposed by the consumed completed-message
       surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
+
+  - [x] **Muse native allowance.** On a private Windows stand with Muse Code
+    1.4.25, two Owner quota calls returned the same provider windows. The
+    process log recorded one native read and one cache hit. Zero model turns.
 
 ## M1 — Memory one-shot inference (#199)
 

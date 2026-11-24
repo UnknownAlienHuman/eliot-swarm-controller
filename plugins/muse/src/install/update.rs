@@ -39,9 +39,7 @@ pub(super) fn due_launcher_update() -> Option<LauncherUpdate> {
         (INTERVAL_ENV, interval.to_string()),
         ("MUSE_LOGIN", "0".to_owned()),
     ];
-    if let Some(channel) = read_marker(&root.join(".muse-channel"))
-        .filter(|channel| matches!(channel.as_str(), "muse-stable" | "muse-canary"))
-    {
+    if let Some(channel) = installed_channel() {
         environment.push(("MUSE_CHANNEL", channel));
     }
     Some(LauncherUpdate {
@@ -49,6 +47,11 @@ pub(super) fn due_launcher_update() -> Option<LauncherUpdate> {
         args: &["--version"],
         environment,
     })
+}
+
+pub(crate) fn installed_channel() -> Option<String> {
+    read_marker(&Path::new(LAUNCHER_DIR).join(".muse-channel"))
+        .filter(|channel| matches!(channel.as_str(), "muse-stable" | "muse-canary"))
 }
 
 fn read_marker(path: &Path) -> Option<String> {

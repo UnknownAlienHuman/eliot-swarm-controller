@@ -843,17 +843,22 @@ current full-access posture. Implementation:
 (`apply_adhoc_access`).
 
 
-## Observed subscription quota
+## Subscription allowance
 
-Meta supplies subscription usage during a turn, not through a provider quota
-endpoint. When the native MSP forwards `usage/changed`, the plugin retains only
-the typed 5-hour/weekly percentages, resets and original `observedAtMs` as
-`quota.observed` under the exact generation's session source. `harness.quota`
-reads the newest exact-profile observation and labels it "observed during a turn".
-A native `usage/read` observation is also accepted, under `details.usage`; an
-empty read or unsupported MSP method returns `unsupported` with that reason.
-No synthetic usage, probing turn or account identity is persisted. The pattern
-reference is OpenCodex 2.84.0 `muse-subscription-usage.ts`; no code was copied.
+`swarm quota --harness muse` runs the native `usage --json` read through the
+Windows vendor PowerShell launcher with `TBH_CREDENTIAL_BACKEND=file`. The
+launcher invokes the installed build using the existing sign-in. Swarm owns
+and bounds that process, and Muse handles its own credentials. The command
+starts no model turn. Muse Code 1.4.25 reports the allowance from its
+rate-limited subscription key-mint response.
+
+The plugin translates the valid 5-hour and weekly windows and uses the vendor
+timestamp and display tier when available. A partial pair cannot confirm
+available headroom. A native unavailability reason is shown without an allowance
+measurement. MSP `usage/changed` continues to emit `quota.observed`
+under the exact generation's session source. Both feed the same quota
+projection. The [API contract](../spec/api.md) owns freshness and read spacing,
+and [monitoring](../spec/monitoring.md#provider-holds) owns hold release.
 ## Follow-up turns after a settled turn (k167 E44, E46, E47)
 
 E44: before dispatching another turn on a degraded view, the host checks for

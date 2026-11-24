@@ -574,6 +574,14 @@ pub const UNATTRIBUTED_PROVIDER_HOLD_REASON: &str =
 pub const MAX_PROVIDER_RESET_HORIZON_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
 
 impl ProviderHold {
+    /// This subscription hold is eligible for a read-only allowance check.
+    pub fn uses_passive_quota_readback(&self) -> bool {
+        self.kind == ProviderRestrictionKind::Quota
+            && self.source.as_ref().is_some_and(|source| {
+                crate::api::HarnessCapabilities::of(&source.harness).reads_retained_quota
+            })
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_provider_scope(&self.scope)?;
         let mismatch = self

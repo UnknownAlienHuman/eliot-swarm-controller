@@ -2443,7 +2443,7 @@ integration report `unsupported`.
 These provider readers return `details.windows`: at most 32
 [`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
 `{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
-in 0..100; reset time is Unix milliseconds or null when absent. Windows identify
+at or above zero (Muse can report over 100); reset time is Unix milliseconds or null when absent. Windows identify
 5-hour, weekly and model-scoped limits when supplied; Eliot never invents limits
 or reset times. Routing and the catalogue consume every reader through one
 typed projection carrying provider, scope, observation time, verdict
@@ -2477,8 +2477,7 @@ carry their own selection and do not borrow ad-hoc hold or quota evidence.
 `provider` or `environment`. A failed read remains `status:"supported"` with
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
 sources remain `unsupported` with a concrete reason. Native JSON-RPC method-not-found
-(`-32601`) remains `unsupported`, naming the checked `account/rateLimits/read`
-or `usage/read` method; it is not a supported environment failure. The transport disables
+(`-32601`) remains `unsupported`, naming the checked native method. The HTTP transport disables
 redirects, bounds each HTTP request to eight seconds and each response to 1 MiB;
 credential reads are bounded to 256 KiB. Quota calls wait at most eight seconds
 for one of the existing four metadata-reader permits, so a five-harness Usage
@@ -2486,18 +2485,25 @@ refresh can complete without an arbitrary fifth-read rejection. The wait starts
 no process; shutdown/capacity failure remains an environment error. OpenCode's
 native Console operation may refresh its active connection while resolving it.
 
-Muse has no provider endpoint. The plugin projects MSP `usage/changed` as the
-session-family `quota.observed` event; Store retains the typed observation, and
-`harness.quota` selects the latest observation under the exact frozen profile.
-Its `fetched_at_ms` remains the native `observedAtMs`, and `note` says "observed
-during a turn". `usage/read` can also return that last native observation, exposed
-under `details.usage`. Routing and `models.catalog` consume the retained
-`windows[]`, live `usage` and legacy `window`/`weekly` shapes through one
-normalized projection, alongside the other four harnesses' readers, so an
-exhausted window skips the route exactly when the catalogue would refuse to
-call it available. With no observation, or no installed MSP method, Muse
-returns `unsupported` and its reason. No quota query starts a turn, performs
-inference or polls Agents. CLI: `swarm quota --harness H [--profile P]`.
+Muse uses [native `usage --json`](../harnesses/muse.md#subscription-allowance).
+The daemon shares one in-flight allowance read per file-backed sign-in. A
+completed read, including a vendor failure or timeout, starts a five-minute
+interval before the next read. Local capacity refusals, cancellation and reader
+unavailability allow the next caller to retry without recording a failure.
+The shared read has its own deadline. A caller whose wait
+expires gets the available cached or retained observation, or unavailable while
+the read continues. The cache retains the last good allowance on a read failure.
+A native unavailable reason supersedes older windows and identifies sign-in
+requirements with `details.code: "auth_required"`. `harness.quota` compares the
+reading with MSP `quota.observed` for the verified frozen route and returns the
+newer observation in `details.windows`, with `details.tier` when known. A failure
+note accompanies windows only if the failure is newer than those windows.
+`fetched_at_ms` uses the native timestamp or the receipt time when `asOfMs` is
+absent. An allowance timestamp up to 30 seconds ahead is clamped to the receipt
+time. Stale values remain visible to the Owner and
+expire for routing, catalogue availability and hold release. No quota query
+starts a turn, performs inference or polls Agents. Run
+`swarm quota --harness H [--profile P]` from the CLI.
 
 The quota response includes the effective [Owner reserve](configuration.md#owner-quota-reserve-872)
 and `swarm quota` displays it with the recommended setting of 20%. For current

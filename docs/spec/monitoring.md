@@ -947,6 +947,13 @@ Each uninterrupted hold allows six automatic probe admissions. The final slot re
 `provider.hold_probe_budget_exhausted`. The Owner can see the scope in
 `daemon.status.provider_probe_attention` and use the existing hold controls.
 A provider-supplied reset still clears the hold when due.
+For due Muse subscription-quota holds, maintenance reads the native allowance
+through the shared [quota path](api.md). Fresh account-wide headroom observed
+after the refusal clears the exact unchanged hold and wakes launch arbitration.
+The ordinary resume and handoff paths then see the released scope. A failed,
+stale or exhausted read keeps the hold and defers the next background check.
+This check needs the refusing generation's verified route and replaces
+automatic model probes for these holds. Unresolved probes remain fenced.
 Each admitted probe records `provider.hold_probe_started` and known
 completion records `provider.hold_probe_finished`. A successful exact-turn native
 completion with no restriction clears the hold. A known failure keeps the hold,

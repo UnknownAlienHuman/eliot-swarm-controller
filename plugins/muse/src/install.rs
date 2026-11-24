@@ -4,6 +4,8 @@
 
 #[cfg(windows)]
 mod update;
+#[cfg(windows)]
+pub(crate) use update::installed_channel;
 
 use eliot_core as core;
 use eliot_plugin::install::{

@@ -2,11 +2,10 @@
 //! composer's usage indicator. `details` is provider-verbatim, so windows
 //! are found by shape, at most three levels deep:
 //!
-//! * Codex `rateLimits.primary/secondary` and Muse `usage.window/weekly`
+//! * Codex `rateLimits.primary/secondary`
 //!   (`usedPercent`, `windowDurationMins`, `resetsAt` seconds or
 //!   `resetsAtMs`), as `plugins/codex/src/discovery.rs`
-//!   `project_rate_limits` and `plugins/muse/src/native/types.rs` project
-//!   them;
+//!   `project_rate_limits` projects them;
 //! * the Anthropic OAuth usage buckets k92 reads for Claude Code
 //!   (`five_hour`, `seven_day`, model-scoped `seven_day_<model>`:
 //!   `utilization` percent, `resets_at` RFC 3339; OpenCodex
@@ -103,20 +102,15 @@ pub fn plan(reply: &HarnessQuotaResponse) -> Option<String> {
     if reply.status != HARNESS_QUOTA_SUPPORTED {
         return None;
     }
-    let plan = reply
-        .details
-        .as_ref()?
-        .get("rateLimits")?
-        .get("planType")?
-        .as_str()?
-        .trim();
+    let details = reply.details.as_ref()?;
+    if reply.harness == "muse" {
+        return details.get("tier")?.as_str().map(str::to_owned);
+    }
+    let plan = details.pointer("/rateLimits/planType")?.as_str()?.trim();
     (!plan.is_empty() && plan != "unknown").then(|| sentence(&plan.replace(['_', '-'], " ")))
 }
 
-/// What a read without windows says, in plain words: "Shown after a Muse
-/// turn" until Muse reports usage, "OpenCode: provider refused the quota
-/// read (HTTP 403)", or why the harness has no quota. `label` names the
-/// harness.
+/// A plain-language status for a read without windows. `label` names the harness.
 pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
     let note = reply.note.as_deref().unwrap_or("").trim();
     let details = reply.details.as_ref();
@@ -125,6 +119,9 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
         .and_then(Value::as_str)
         == Some("error");
     if failed {
+        if reply.harness == "muse" && !note.is_empty() {
+            return format!("{label}: {note}");
+        }
         let provider = details
             .and_then(|details| details.get("origin"))
             .and_then(Value::as_str)
@@ -138,9 +135,6 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
             (None, false) => format!("{label}: quota not read, the harness could not be asked"),
         };
     }
-    if reply.harness == "muse" && reply.status != HARNESS_QUOTA_SUPPORTED {
-        return "Shown after a Muse turn".to_owned();
-    }
     if reply.status == eliot_core::api::harness::HARNESS_QUOTA_UNSUPPORTED {
         return if note.is_empty() {
             format!("{label}: no quota read is supported")
@@ -151,11 +145,10 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
     format!("{label}: no quota windows reported")
 }
 
-/// "as of 14:05" (local time) for a read observed during a turn (Muse),
-/// whose values age until the next turn.
+/// "as of 14:05" (local time) for a Muse subscription allowance observation.
 pub fn observed_note(reply: &HarnessQuotaResponse) -> Option<String> {
     use chrono::TimeZone;
-    if reply.harness != "muse" || reply.status != HARNESS_QUOTA_SUPPORTED {
+    if reply.harness != "muse" || reply.details.as_ref()?.get("observedAtMs").is_none() {
         return None;
     }
     chrono::Local
