@@ -1161,11 +1161,16 @@ impl Store {
             "command_ids_digest": command_ids_digest,
         });
         let marker_json = encode_json(&marker)?;
-        db!(tx.execute(
-            "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-             VALUES (?1, ?2, 'hook.event', ?3, ?4, ?5)",
-            params![consumer_id, principal, payload_digest, marker_json, now],
-        ));
+        insert_write_tx(
+            &tx,
+            consumer_id,
+            &principal,
+            "hook.event",
+            &payload_digest,
+            &marker_json,
+            now,
+        )
+        .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change {
             value: selected,

@@ -21,8 +21,8 @@
 use super::{
     Change, CommandRecord, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding,
     command_state_name, commit_transaction, decode_json, encode_json, insert_daemon_command_event,
-    insert_daemon_event, load_agent_by_num, load_command_record, load_turn, sql_error,
-    turn_state_name, update_command_state, validate_id_age, write_binding,
+    insert_daemon_event, insert_write_tx, load_agent_by_num, load_command_record, load_turn,
+    sql_error, turn_state_name, update_command_state, validate_id_age, write_binding,
 };
 use eliot_core::is_start_verb;
 use eliot_core::{
@@ -1453,11 +1453,5 @@ fn insert_resolution_write(
             "resolution result exceeds 64 KiB",
         ));
     }
-    tx.execute(
-        "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, principal, method, payload_digest, result_json, now],
-    )
-    .map_err(sql_error)?;
-    Ok(())
+    insert_write_tx(tx, id, principal, method, payload_digest, &result_json, now).map_err(sql_error)
 }

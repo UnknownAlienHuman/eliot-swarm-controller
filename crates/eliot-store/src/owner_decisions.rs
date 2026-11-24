@@ -1,6 +1,7 @@
 use super::{
     Error, Result, Store, TransactionBehavior, canonical, command_binding, commit_transaction,
-    decode_json, digest_id_bound, encode_json, sql_error, validate_id_age, write_binding,
+    decode_json, digest_id_bound, encode_json, insert_write_tx, sql_error, validate_id_age,
+    write_binding,
 };
 use eliot_core::api::{
     CommandWithoutDispatcherStatus, OwnerAction, OwnerDecideRequest, OwnerInboxItem,
@@ -355,12 +356,8 @@ impl Store {
         if result.len() > super::MAX_EVENT_BYTES {
             return Err(Error::new("frame_too_large", "owner choice exceeds 64 KiB"));
         }
-        tx.execute(
-            "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-             VALUES (?1, 'owner', ?2, ?3, ?4, ?5)",
-            params![request.id, METHOD, digest, result, now],
-        )
-        .map_err(sql_error)?;
+        insert_write_tx(&tx, &request.id, "owner", METHOD, &digest, &result, now)
+            .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)?;
         Ok(admission)
     }

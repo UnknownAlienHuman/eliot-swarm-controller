@@ -479,12 +479,9 @@ impl Store {
         prepare_delete_tree_tx(&tx, &members)?;
         tx.execute_batch("DELETE FROM deleted_agents; DELETE FROM deleted_commands;")
             .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
-             VALUES (?1,'owner','agent.delete',?2,?3,?4)",
-            params![id, digest, encode_json(&agent_delete_pending_value())?, now],
-        )
-        .map_err(sql_error)?;
+        let result = encode_json(&agent_delete_pending_value())?;
+        insert_write_tx(&tx, id, "owner", "agent.delete", &digest, &result, now)
+            .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)
     }
 
@@ -782,11 +779,8 @@ impl Store {
             deleted: archived.is_none(),
         })
         .map_err(|_| Error::new("internal", "Agent tree result encoding failed"))?;
-        let receipt = tx.execute(
-            "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
-             VALUES (?1,'owner',?2,?3,?4,?5)",
-            params![id, method, digest, encode_json(&result)?, now],
-        );
+        let result_json = encode_json(&result)?;
+        let receipt = insert_write_tx(&tx, id, "owner", method, &digest, &result_json, now);
         if archived.is_some() {
             db!(receipt);
             commit_transaction(tx, &self.write_faulted)?;

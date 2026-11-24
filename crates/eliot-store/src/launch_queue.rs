@@ -135,13 +135,8 @@ fn insert_receipt(
     now: i64,
 ) -> Result<()> {
     validate_id_age(id, now)?;
-    tx.execute(
-        "INSERT INTO writes(id,principal,method,payload_digest,result,created_at)
-         VALUES (?1,?2,?3,?4,?5,?6)",
-        params![id, principal, method, digest, encode_json(result)?, now],
-    )
-    .map_err(sql_error)?;
-    Ok(())
+    let result_json = encode_json(result)?;
+    insert_write_tx(tx, id, principal, method, digest, &result_json, now).map_err(sql_error)
 }
 
 impl Store {

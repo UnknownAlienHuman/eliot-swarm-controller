@@ -2988,8 +2988,11 @@ fn rule_action_counts(
 ) -> Result<(i64, Option<i64>, i64)> {
     limit.validate()?;
     let since = now.saturating_sub(limit.window_ms);
+    let rate_agent = rate_agent.filter(|_| limit.per == core::api::RuleLimitScope::Agent);
     let (scoped, last_action_at) = match limit.per {
-        core::api::RuleLimitScope::Rule => tx
+        // Missing event Agents and targetless non-launch actions have no Agent bucket.
+        core::api::RuleLimitScope::Agent if rate_agent.is_none() => (0, None),
+        core::api::RuleLimitScope::Rule | core::api::RuleLimitScope::Agent => tx
             .query_row(
                 "SELECT COUNT(*), MAX(action.created_at)
                  FROM commands action
@@ -3010,49 +3013,20 @@ fn rule_action_counts(
                                  AND parent.ordinal IS NOT NULL)
                          )
                          AND action.principal = root.principal
+                         AND (
+                             ?5 IS NULL
+                             OR (action.verb = 'launch' AND COALESCE(
+                                 json_extract(root.args, '$.rate_agent'),
+                                 (SELECT agent FROM events
+                                  WHERE seq = json_extract(root.args, '$.event_seq'))
+                             ) = ?5)
+                             OR (action.verb != 'launch' AND action.target = ?5)
+                         )
                    )",
-                params![since, now, principal, rule],
+                params![since, now, principal, rule, rate_agent],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(sql_error)?,
-        core::api::RuleLimitScope::Agent => match rate_agent {
-            // Missing event Agents and targetless non-launch actions have no Agent bucket.
-            None => (0, None),
-            Some(rate_agent) => tx
-                .query_row(
-                    "SELECT COUNT(*), MAX(action.created_at)
-                     FROM commands action
-                     JOIN commands parent ON parent.id = action.parent_command
-                     WHERE action.link_kind = 'rule_action' AND action.ordinal IS NOT NULL
-                       AND action.created_at >= ?1 AND action.created_at <= ?2
-                       AND EXISTS (
-                           SELECT 1 FROM commands root
-                           WHERE root.principal = ?3
-                             AND root.verb IN ('rule','timer.run','rule.catch_up')
-                             AND json_extract(root.args, '$.rule') = ?4
-                             AND (
-                                 root.id = parent.id
-                                 OR (parent.verb = 'run'
-                                     AND parent.parent_command = root.id
-                                     AND parent.principal = root.principal
-                                     AND parent.link_kind = 'rule_action'
-                                     AND parent.ordinal IS NOT NULL)
-                             )
-                             AND action.principal = ?3
-                             AND (
-                                 (action.verb = 'launch' AND COALESCE(
-                                     json_extract(root.args, '$.rate_agent'),
-                                     (SELECT agent FROM events
-                                      WHERE seq = json_extract(root.args, '$.event_seq'))
-                                 ) = ?5)
-                                 OR (action.verb != 'launch' AND action.target = ?5)
-                             )
-                       )",
-                    params![since, now, principal, rule, rate_agent],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(sql_error)?,
-        },
         core::api::RuleLimitScope::Key => {
             let rate_key = rate_key.ok_or_else(|| {
                 Error::new(

@@ -402,11 +402,53 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
     };
     let index_file = private_index.as_ref().map(TemporaryGitIndex::path);
     if let Some(index_file) = index_file {
-        let read_tree_args = ["read-tree", frozen.head_oid.as_str()];
-        let initialized = match git
+        for args in [["read-tree", frozen.head_oid.as_str()], ["add", "--all"]] {
+            let staged = match git
+                .workspace_effect_command_with_index(
+                    root,
+                    &args,
+                    index_file,
+                    timeout,
+                    Arc::clone(&secret_policy),
+                    cancellation.clone(),
+                )
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    return execution(
+                        CommandState::Rejected,
+                        "native_not_dispatched",
+                        json!({}),
+                        None,
+                    );
+                }
+            };
+            match effect_exit(&staged) {
+                Some(0) if effect_quiescent(&staged) => {}
+                _ if effect_failed_definitely(&staged) => {
+                    return execution(
+                        CommandState::Failed,
+                        "git_publish_stage_failed",
+                        json!({"code":"git_publish_stage_failed"}),
+                        None,
+                    );
+                }
+                _ => {
+                    return execution(
+                        CommandState::Unknown,
+                        "git_publish_stage_outcome_unknown",
+                        json!({"code":"git_publish_stage_outcome_unknown"}),
+                        None,
+                    );
+                }
+            }
+        }
+
+        let staged_diff = match git
             .workspace_effect_command_with_index(
                 root,
-                &read_tree_args,
+                &["diff", "--cached", "--quiet"],
                 index_file,
                 timeout,
                 Arc::clone(&secret_policy),
@@ -424,107 +466,8 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                 );
             }
         };
-        match effect_exit(&initialized) {
-            Some(0) if effect_quiescent(&initialized) => {}
-            _ if effect_failed_definitely(&initialized) => {
-                return execution(
-                    CommandState::Failed,
-                    "git_publish_stage_failed",
-                    json!({"code":"git_publish_stage_failed"}),
-                    None,
-                );
-            }
-            _ => {
-                return execution(
-                    CommandState::Unknown,
-                    "git_publish_stage_outcome_unknown",
-                    json!({"code":"git_publish_stage_outcome_unknown"}),
-                    None,
-                );
-            }
-        }
-    }
-    let stage_args = ["add", "--all"];
-    let staged = if let Some(index_file) = index_file {
-        Some(
-            match git
-                .workspace_effect_command_with_index(
-                    root,
-                    &stage_args,
-                    index_file,
-                    timeout,
-                    Arc::clone(&secret_policy),
-                    cancellation.clone(),
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    return execution(
-                        CommandState::Rejected,
-                        "native_not_dispatched",
-                        json!({}),
-                        None,
-                    );
-                }
-            },
-        )
-    } else {
-        None
-    };
-    if let Some(staged) = &staged {
-        match effect_exit(staged) {
-            Some(0) if effect_quiescent(staged) => {}
-            _ if effect_failed_definitely(staged) => {
-                return execution(
-                    CommandState::Failed,
-                    "git_publish_stage_failed",
-                    json!({"code":"git_publish_stage_failed"}),
-                    None,
-                );
-            }
-            _ => {
-                return execution(
-                    CommandState::Unknown,
-                    "git_publish_stage_outcome_unknown",
-                    json!({"code":"git_publish_stage_outcome_unknown"}),
-                    None,
-                );
-            }
-        }
-    }
-
-    let diff_args = ["diff", "--cached", "--quiet"];
-    let staged_diff = if let Some(index_file) = index_file {
-        Some(
-            match git
-                .workspace_effect_command_with_index(
-                    root,
-                    &diff_args,
-                    index_file,
-                    timeout,
-                    Arc::clone(&secret_policy),
-                    cancellation.clone(),
-                )
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    return execution(
-                        CommandState::Rejected,
-                        "native_not_dispatched",
-                        json!({}),
-                        None,
-                    );
-                }
-            },
-        )
-    } else {
-        None
-    };
-    if let Some(staged_diff) = &staged_diff {
-        match effect_exit(staged_diff) {
-            Some(0) if effect_quiescent(staged_diff) => {
+        match effect_exit(&staged_diff) {
+            Some(0) if effect_quiescent(&staged_diff) => {
                 return execution(
                     CommandState::Applied,
                     "git_publish_no_changes",
@@ -532,8 +475,8 @@ pub(crate) async fn execute(context: GitPublishExecutionContext<'_>) -> GitPubli
                     None,
                 );
             }
-            Some(1) if effect_quiescent(staged_diff) => {}
-            _ if effect_failed_definitely(staged_diff) => {
+            Some(1) if effect_quiescent(&staged_diff) => {}
+            _ if effect_failed_definitely(&staged_diff) => {
                 return execution(
                     CommandState::Failed,
                     "git_publish_index_read_failed",

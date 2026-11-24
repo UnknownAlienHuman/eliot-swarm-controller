@@ -2,8 +2,8 @@
 
 use super::{
     Error, Result, Store, canonical, command_binding, commit_transaction, digest_id_bound,
-    encode_json, format_agent_id, load_agent_by_num, load_command_record, load_turn,
-    parse_agent_id, process_record_from_row, sql_error, validate_id_age, validate_limit,
+    encode_json, format_agent_id, insert_write_tx, load_agent_by_num, load_command_record,
+    load_turn, parse_agent_id, process_record_from_row, sql_error, validate_id_age, validate_limit,
     validate_ulid, workspace, write_binding, write_exists,
 };
 use eliot_core::{
@@ -237,17 +237,14 @@ impl Store {
             ],
         )
         .map_err(sql_error)?;
-        tx.execute(
-            "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request.id,
-                principal,
-                AGENT_WAKE_METHOD,
-                payload_digest,
-                result,
-                now,
-            ],
+        insert_write_tx(
+            &tx,
+            &request.id,
+            principal,
+            AGENT_WAKE_METHOD,
+            payload_digest,
+            &result,
+            now,
         )
         .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)?;
