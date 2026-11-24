@@ -1,7 +1,10 @@
 //! Read-only comparison with documented native user instruction files.
 
 use eliot_core::Result;
-use eliot_core::api::{MAX_OWNER_RULES_BYTES, OwnerRulesGlobalFile, OwnerRulesGlobalFileStatus};
+use eliot_core::api::{
+    HarnessCapabilities, MAX_OWNER_RULES_BYTES, OwnerRulesGlobalFile, OwnerRulesGlobalFileStatus,
+    SUPPORTED_HARNESSES,
+};
 use std::{
     fs::{self, File},
     io::{self, Read},
@@ -17,52 +20,32 @@ pub(super) fn check(data_root: &Path) -> Result<Vec<OwnerRulesGlobalFile>> {
         return Ok(Vec::new());
     };
     let home = absolute_env_path(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
-    let codex = absolute_env_path("CODEX_HOME").or_else(|| home.as_ref().map(|p| p.join(".codex")));
-    let claude =
-        absolute_env_path("CLAUDE_CONFIG_DIR").or_else(|| home.as_ref().map(|p| p.join(".claude")));
-    let opencode =
-        absolute_env_path("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|p| p.join(".config")));
-    let antigravity = home.map(|p| p.join(".gemini"));
-    let files = [
-        (
-            "codex",
-            codex.as_ref().map(|p| p.join("AGENTS.override.md")),
-        ),
-        ("codex", codex.map(|p| p.join("AGENTS.md"))),
-        ("claude", claude.map(|p| p.join("CLAUDE.md"))),
-        ("opencode", opencode.map(|p| p.join("opencode/AGENTS.md"))),
-        (
-            "antigravity",
-            antigravity.as_ref().map(|p| p.join("AGENTS.md")),
-        ),
-        (
-            "antigravity",
-            antigravity.as_ref().map(|p| p.join("GEMINI.md")),
-        ),
-        (
-            "antigravity",
-            antigravity.as_ref().map(|p| p.join("config/AGENTS.md")),
-        ),
-        (
-            "antigravity",
-            antigravity.map(|p| p.join("config/GEMINI.md")),
-        ),
-    ];
-    Ok(files
-        .into_iter()
-        .filter_map(|(harness, path)| {
-            let path = path?;
+    let mut files = Vec::new();
+    for &harness in SUPPORTED_HARNESSES {
+        let Some(declaration) = HarnessCapabilities::of(harness).user_instruction_files else {
+            continue;
+        };
+        let Some(root) = declaration
+            .root_override_env
+            .and_then(absolute_env_path)
+            .or_else(|| home.as_ref().map(|path| path.join(declaration.home_subdir)))
+        else {
+            continue;
+        };
+        for relative in declaration.paths {
+            let path = root.join(relative);
             let display = eliot_core::display_path(&path.to_string_lossy());
             if display.chars().any(char::is_control) {
-                return None;
+                continue;
             }
-            Some(OwnerRulesGlobalFile {
+            files.push(OwnerRulesGlobalFile {
                 harness: harness.to_owned(),
                 path: display,
                 status: compare(&path, rules.as_bytes()),
-            })
-        })
-        .collect())
+            });
+        }
+    }
+    Ok(files)
 }
 
 fn absolute_env_path(name: &str) -> Option<PathBuf> {

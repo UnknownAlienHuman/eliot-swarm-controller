@@ -1,6 +1,9 @@
 //! Opencode native adapter capability declaration.
 
-use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
+use eliot_core::api::harness::UserInstructionFiles;
+use eliot_core::api::{
+    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
+};
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
@@ -9,6 +12,19 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         manager_preference: Some(2),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
+        project_instruction_read: Some(|path, _, _| {
+            let status = match path {
+                "AGENTS.md" => InstructionReadStatus::Documented,
+                "CLAUDE.md" => InstructionReadStatus::Conditional,
+                _ => InstructionReadStatus::Unknown,
+            };
+            (status, None)
+        }),
+        user_instruction_files: Some(UserInstructionFiles {
+            root_override_env: Some("XDG_CONFIG_HOME"),
+            home_subdir: ".config",
+            paths: &["opencode/AGENTS.md"],
+        }),
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::Workspace),
         resume_config: true,
         manifest_extra_verbs: &["models"],

@@ -333,12 +333,11 @@ file convention. Partial means the file exceeds the documented or profile-select
 native byte limit. Conditional means documented behavior depends on settings, precedence
 or exclusions that this launch did not prove; not_native means the active Eliot
 adapter configuration does not enable that reader; unknown means no supported
-conclusion. These are not claims that a model consumed the file. In particular,
-Claude Code 2.1.277 and later document AGENTS.md reading when no applicable
-CLAUDE.md, .claude/CLAUDE.md, or CLAUDE.local.md takes precedence, subject to
-project-instruction settings, plugins, telemetry/version and excludes. The frozen
-Claude cmd_version is exposed where available, but this inventory does not claim
-per-launch native consumption. The managed Claude adapter leaves project memory
+conclusion. These statuses describe the adapter's configured reading behavior.
+The Claude adapter reports AGENTS.md as conditional because native reading
+depends on project-instruction settings, precedence, plugins and exclusions.
+The inventory retains the installed Claude version where available as provenance.
+The managed Claude adapter leaves project memory
 enabled, so `CLAUDE.md`, `.claude/CLAUDE.md` and `CLAUDE.local.md` use documented
 native delivery. Only the separate print inference path passes empty
 `--setting-sources`. Muse's current launch args omit `--trust-workspace`, so its

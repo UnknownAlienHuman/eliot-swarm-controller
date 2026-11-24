@@ -55,6 +55,16 @@ pub enum NativeArchiveBinding {
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
 type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
+type ProjectInstructionRead =
+    fn(&str, &serde_json::Value, Option<u64>) -> (super::InstructionReadStatus, Option<String>);
+
+/// Locations of the adapter's documented user instruction files.
+#[derive(Clone, Copy, Debug)]
+pub struct UserInstructionFiles {
+    pub root_override_env: Option<&'static str>,
+    pub home_subdir: &'static str,
+    pub paths: &'static [&'static str],
+}
 
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
@@ -113,6 +123,10 @@ pub struct HarnessCapabilities {
     pub provider_probe: bool,
     /// The adapter's delivery mechanism for committed owner rules.
     pub owner_rules_delivery: super::OwnerRulesDeliveryMethod,
+    /// Native project instruction-file behavior for the frozen profile.
+    pub project_instruction_read: Option<ProjectInstructionRead>,
+    /// User instruction files that doctor may compare with committed owner rules.
+    pub user_instruction_files: Option<UserInstructionFiles>,
     /// MCP identity comes only from data-root values, not the full target
     /// environment.
     pub data_root_only_mcp: bool,

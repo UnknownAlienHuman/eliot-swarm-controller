@@ -2,10 +2,8 @@
 
 use super::sources::{self, SourceReadError};
 use eliot_core::api::{
-    INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus, InstructionFileView,
-    InstructionReadStatus, InstructionSourceStatus,
-    inference::sha256_hex,
-    native_profile::{CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override},
+    HarnessCapabilities, INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus,
+    InstructionFileView, InstructionReadStatus, InstructionSourceStatus, inference::sha256_hex,
 };
 use eliot_plugin::MAX_EVENT_BYTES;
 use serde_json::Value;
@@ -44,6 +42,7 @@ pub(super) fn append_owner_rules(
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {
     let root = workspace.and_then(|workspace| std::fs::canonicalize(workspace).ok());
     let source_workspace = workspace.map(ToOwned::to_owned);
+    let native_read = HarnessCapabilities::of(harness).project_instruction_read;
     let mut remaining = MAX_CATALOG_BYTES;
     let files = INSTRUCTION_FILE_PATHS
         .iter()
@@ -52,10 +51,10 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
                 Some(root) => catalog_file(root, path, &mut remaining),
                 None => empty_file(path, InstructionFileStatus::WorkspaceUnavailable),
             };
-            let (native_read_status, native_read_version) =
-                native_read(harness, path, profile, file.size_bytes);
-            file.native_read_status = native_read_status;
-            file.native_read_version = native_read_version;
+            if let Some(native_read) = native_read {
+                (file.native_read_status, file.native_read_version) =
+                    native_read(path, profile, file.size_bytes);
+            }
             file
         })
         .collect::<Vec<_>>();
@@ -224,72 +223,6 @@ fn empty_file(path: &str, status: InstructionFileStatus) -> InstructionFileView 
         delivery_status: InstructionSourceStatus::NotNeeded,
         delivery_redacted: false,
     }
-}
-
-fn native_read(
-    harness: &str,
-    path: &str,
-    profile: &Value,
-    size_bytes: Option<u64>,
-) -> (InstructionReadStatus, Option<String>) {
-    let version = profile
-        .get("cmd_version")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-    let status = match (harness, path) {
-        ("claude", "AGENTS.md") => match version.as_deref().and_then(version_at_least_2_1_277) {
-            Some(true) => InstructionReadStatus::Conditional,
-            Some(false) => InstructionReadStatus::NotNative,
-            None => InstructionReadStatus::Unknown,
-        },
-        ("claude", "CLAUDE.md" | "CLAUDE.local.md" | ".claude/CLAUDE.md") => {
-            InstructionReadStatus::Documented
-        }
-        ("codex", "AGENTS.md" | "AGENTS.override.md") => {
-            let limit = profile
-                .as_object()
-                .and_then(codex_project_doc_override)
-                .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES);
-            match limit {
-                0 => InstructionReadStatus::NotNative,
-                limit if size_bytes.is_some_and(|size| size > limit) => {
-                    InstructionReadStatus::Partial
-                }
-                _ => InstructionReadStatus::Documented,
-            }
-        }
-        ("muse", "AGENTS.md" | "AGENTS.override.md") => InstructionReadStatus::NotNative,
-        ("opencode", "AGENTS.md") => InstructionReadStatus::Documented,
-        ("opencode", "CLAUDE.md") => InstructionReadStatus::Conditional,
-        ("antigravity", "GEMINI.md") => InstructionReadStatus::Unknown,
-        _ => InstructionReadStatus::Unknown,
-    };
-    let version = if harness == "claude"
-        && matches!(
-            path,
-            "AGENTS.md"
-                | "CLAUDE.md"
-                | "CLAUDE.local.md"
-                | ".claude/CLAUDE.md"
-                | ".claude/CLAUDE.local.md"
-        ) {
-        version
-    } else {
-        None
-    };
-    (status, version)
-}
-
-fn version_at_least_2_1_277(version: &str) -> Option<bool> {
-    let mut pieces = version
-        .split_whitespace()
-        .next()?
-        .split('.')
-        .map(str::parse::<u64>);
-    let major = pieces.next()?.ok()?;
-    let minor = pieces.next()?.ok()?;
-    let patch = pieces.next()?.ok()?;
-    Some((major, minor, patch) >= (2, 1, 277))
 }
 
 pub(super) fn apply_delivery(capture: &mut Capture, delivery: super::sources::SourceDelivery) {

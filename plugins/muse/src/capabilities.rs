@@ -2,13 +2,21 @@
 
 use eliot_core::InjectPoint;
 use eliot_core::api::harness::NativeAccessBounds;
-use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
+        project_instruction_read: Some(|path, _, _| {
+            let status = if matches!(path, "AGENTS.md" | "AGENTS.override.md") {
+                InstructionReadStatus::NotNative
+            } else {
+                InstructionReadStatus::Unknown
+            };
+            (status, None)
+        }),
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,

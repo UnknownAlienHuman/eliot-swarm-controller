@@ -1,7 +1,7 @@
 //! Antigravity native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::NativeAccessBounds;
+use eliot_core::api::harness::{NativeAccessBounds, UserInstructionFiles};
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
 use serde_json::Value;
 
@@ -10,6 +10,16 @@ pub fn declaration() -> HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         prepared_mcp_config: true,
+        user_instruction_files: Some(UserInstructionFiles {
+            root_override_env: None,
+            home_subdir: ".gemini",
+            paths: &[
+                "AGENTS.md",
+                "GEMINI.md",
+                "config/AGENTS.md",
+                "config/GEMINI.md",
+            ],
+        }),
         reader_executable_discovery: true,
         resume_config: true,
         guard_refusal_point: Some(InjectPoint::TurnSafePoint),

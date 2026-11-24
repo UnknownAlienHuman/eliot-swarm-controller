@@ -147,6 +147,8 @@ capabilities to prepare launches and validate runtime manifests. The shared
 install engine reads the adapter's candidate search, executable identity and
 verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
+Adapters declare their project instruction-file behavior and the user instruction
+paths that doctor compares with committed owner rules.
 
 ## Host requests
 

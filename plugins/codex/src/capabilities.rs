@@ -1,8 +1,11 @@
 //! Codex native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::NativeAccessBounds;
-use eliot_core::api::{HarnessCapabilities, InputTokenAccounting};
+use eliot_core::api::harness::{NativeAccessBounds, UserInstructionFiles};
+use eliot_core::api::native_profile::{
+    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override,
+};
+use eliot_core::api::{HarnessCapabilities, InputTokenAccounting, InstructionReadStatus};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
@@ -13,6 +16,12 @@ pub fn declaration() -> HarnessCapabilities {
         manager_preference: Some(0),
         provider_probe: true,
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
+        project_instruction_read: Some(project_instruction_read),
+        user_instruction_files: Some(UserInstructionFiles {
+            root_override_env: Some("CODEX_HOME"),
+            home_subdir: ".codex",
+            paths: &["AGENTS.override.md", "AGENTS.md"],
+        }),
         requires_pass_env: true,
         requires_frozen_store_inputs: true,
         native_discovery: true,
@@ -31,6 +40,27 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
         ..HarnessCapabilities::default()
     }
+}
+
+fn project_instruction_read(
+    path: &str,
+    profile: &Value,
+    size_bytes: Option<u64>,
+) -> (InstructionReadStatus, Option<String>) {
+    use InstructionReadStatus::{Documented, NotNative, Partial, Unknown};
+    if !matches!(path, "AGENTS.md" | "AGENTS.override.md") {
+        return (Unknown, None);
+    }
+    let limit = profile
+        .as_object()
+        .and_then(codex_project_doc_override)
+        .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES);
+    let status = match limit {
+        0 => NotNative,
+        limit if size_bytes.is_some_and(|size| size > limit) => Partial,
+        _ => Documented,
+    };
+    (status, None)
 }
 
 fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
