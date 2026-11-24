@@ -3,11 +3,11 @@ use super::*;
 use crate::git_monitor::GitBinding;
 #[cfg(windows)]
 use crate::platform::script_file::CleanupTree;
-use crate::platform::script_file::directory_identity;
+use crate::platform::script_file::{Directory, directory_identity};
 use crate::workspace_git::containment::{BranchClassification, classify_branch};
 use eliot_core::FailureOrigin;
 use eliot_core::api::*;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use tokio::time::timeout;
 
 mod delete;
@@ -17,6 +17,7 @@ mod projects;
 const CLEANUP_BACKFILL_BATCH: usize = 8;
 const CLEANUP_BACKFILL_LIMIT: usize = 1_024;
 const CLEANUP_BACKFILL_BUDGET: Duration = Duration::from_secs(8);
+const CLEANUP_ABSENCE_OBSERVATION_BUDGET: Duration = Duration::from_secs(25);
 const CLEANUP_PLAN_MAX_PREFLIGHT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
@@ -2121,9 +2122,12 @@ impl Router {
         Ok(())
     }
 
-    fn cleanup_directory_absent(&self, artifact: &ArtifactView) -> Result<bool> {
+    fn observe_cleanup_directory_absence(
+        &self,
+        artifact: &ArtifactView,
+    ) -> Result<Option<(PathBuf, Directory)>> {
         if is_stand_artifact(artifact) {
-            return Ok(false);
+            return Ok(None);
         }
         let path = Path::new(&artifact.path);
         validate_cleanup_path(path)?;
@@ -2143,7 +2147,7 @@ impl Router {
             }
         }
         let Some(missing) = missing else {
-            return Ok(false);
+            return Ok(None);
         };
         let canonical = eliot_core::verbatim_path(path);
         let data_root = self
@@ -2158,7 +2162,12 @@ impl Router {
             ));
         }
         require_cleanup_outside_native_home(&canonical)?;
-        Ok(crate::workspace_git::observe_worktree_absence(missing)?.is_some())
+        Ok(crate::workspace_git::observe_worktree_absence(missing)?
+            .map(|parent| (missing.to_path_buf(), parent)))
+    }
+
+    fn cleanup_directory_absent(&self, artifact: &ArtifactView) -> Result<bool> {
+        Ok(self.observe_cleanup_directory_absence(artifact)?.is_some())
     }
 
     async fn cleanup_preflight(
@@ -2554,7 +2563,20 @@ impl Router {
                 "artifact has not expired",
             ));
         }
-        if self.cleanup_directory_absent(artifact)? {
+        if let Some((missing, parent)) = self.observe_cleanup_directory_absence(artifact)? {
+            let absence_deadline = Instant::now() + CLEANUP_ABSENCE_OBSERVATION_BUDGET;
+            {
+                let store = self.inner.store.lock().await;
+                if !store.cleanup_authorized(principal, artifact)?
+                    || !store.cleanup_agent_quiescent(artifact)?
+                {
+                    return Err(Error::new(
+                        "agent_not_quiescent",
+                        "cleanup authority or generation changed",
+                    ));
+                }
+            }
+            crate::workspace_git::wait_for_absence_grace(absence_deadline).await?;
             let store = self.inner.store.lock().await;
             if !store.cleanup_authorized(principal, artifact)?
                 || !store.cleanup_agent_quiescent(artifact)?
@@ -2564,9 +2586,17 @@ impl Router {
                     "cleanup authority or generation changed",
                 ));
             }
-            if self.cleanup_directory_absent(artifact)? {
-                return Ok(0);
-            }
+            crate::workspace_git::confirm_worktree_absence(&missing, &parent).map_err(|error| {
+                if error.code == "worktree_present" {
+                    Error::new(
+                        "identity_changed",
+                        "artifact reappeared during absence verification",
+                    )
+                } else {
+                    error
+                }
+            })?;
+            return Ok(0);
         }
         if item.reason == "already_absent" {
             return Err(Error::new(

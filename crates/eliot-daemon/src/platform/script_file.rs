@@ -461,7 +461,7 @@ impl CleanupTree {
                 check(&child, true)?;
                 self.visit(child, depth + 1, deadline)?;
             } else {
-                let len = cleanup_file_len(&child)?;
+                let len = check_cleanup_file(&child)?;
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
                 self.entries.push(child);
             }
@@ -556,7 +556,7 @@ pub(crate) fn protected_cleanup_name(name: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn cleanup_file_len(file: &File) -> Result<u64> {
+fn check_cleanup_file(file: &File) -> Result<u64> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
