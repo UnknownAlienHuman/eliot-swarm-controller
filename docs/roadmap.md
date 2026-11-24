@@ -939,8 +939,8 @@ of the explicitly selected release scope.
       `agent.archive`/`agent.delete` and Show archived filters `agent.list`:
       these, and Claude/Antigravity/OpenCode/Muse quota windows (read by shape,
       each window a limit, its share left and when it resets, a refusal in
-      plain words, Muse's "Shown after a Muse turn" until observed, then "as of
-      HH:MM", and the composer's usage ring, which opens Codex's usage popover
+      plain words, Muse's allowance tier and "as of HH:MM" when reported,
+      and the composer's usage ring, which opens Codex's usage popover
       over the composer with Manage usage), need the k92
       daemon contract and say so on an older daemon. Details and monitor speak
       plain words and hide empty rows (`swarm why`'s origin line stays);

@@ -1103,15 +1103,24 @@ impl Store {
     pub fn latest_quota_observation(
         &self,
         harness: &str,
+        route_identity: &str,
         snapshot: &Value,
+        now: i64,
     ) -> Result<Option<core::api::harness::QuotaObservation>> {
         let row: Option<String> = self
             .connection
             .query_row(
                 "SELECT e.data FROM events e JOIN agents a ON a.id=e.agent
-             WHERE e.kind='quota.observed' AND a.harness=?1 AND a.profile_snapshot=?2
+             WHERE e.kind='quota.observed' AND a.harness=?1 AND a.generation=e.generation
+               AND json_extract(a.profile_snapshot,'$.native_route_identity')=?2
+               AND json_extract(a.profile_snapshot,'$.account') IS json_extract(?3,'$.account')
+               AND json_extract(a.profile_snapshot,'$.pass_env') IS json_extract(?3,'$.pass_env')
+               AND json_extract(a.profile_snapshot,'$.api_key_env') IS json_extract(?3,'$.api_key_env')
+               AND json_extract(a.profile_snapshot,'$.literal_env') IS json_extract(?3,'$.literal_env')
+               AND json_extract(a.profile_snapshot,'$.route_binding') IS json_extract(?3,'$.route_binding')
+               AND json_extract(e.data,'$.observation.observedAtMs') <= ?4
              ORDER BY json_extract(e.data,'$.observation.observedAtMs') DESC,e.seq DESC LIMIT 1",
-                params![harness, encode_json(snapshot)?],
+                params![harness, route_identity, encode_json(snapshot)?, now],
                 |r| r.get(0),
             )
             .optional()

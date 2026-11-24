@@ -325,10 +325,8 @@ impl PluginHost {
 
     /// Read-only native account quota for `harness.quota`. A dedicated
     /// metadata reader calls the harness's own `quota.read` with no session,
-    /// no turn and no inference. Only Codex (`account/rateLimits/read` plus
-    /// `account/usage/read`) and Muse (`usage/read`) expose a read-only
-    /// quota surface; other harnesses stay `unsupported` without spawning a
-    /// reader.
+    /// no turn and no inference. Each adapter owns its native read and
+    /// response translation.
     pub(crate) async fn quota(
         &self,
         profile: Value,

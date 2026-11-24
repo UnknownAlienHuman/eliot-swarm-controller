@@ -37,6 +37,7 @@ mod project_assignment;
 mod project_broadcast;
 pub(crate) mod project_checks;
 mod provider_resilience;
+mod quota;
 mod repeat_failures;
 mod resolution;
 mod routing;
@@ -197,6 +198,7 @@ struct RouterInner {
     assignment_observations: Mutex<crate::automation::assignment::Observations>,
     rule_source_files: Mutex<HashMap<String, HashMap<String, String>>>,
     catalog_cache: Mutex<catalog::CatalogCache>,
+    allowance_reads: Mutex<quota::AllowanceReads>,
     profile_cache: Mutex<crate::config::ProfileCache>,
     catalog_aggregate_lock: AsyncMutex<()>,
     var_writes: Mutex<coordination::VarWriteQueue>,
@@ -474,6 +476,7 @@ impl Router {
                 assignment_observations: Mutex::default(),
                 rule_source_files: Mutex::new(HashMap::new()),
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
+                allowance_reads: Mutex::new(quota::AllowanceReads::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_aggregate_lock: AsyncMutex::new(()),
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),

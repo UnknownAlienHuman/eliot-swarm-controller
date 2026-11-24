@@ -82,11 +82,14 @@ impl DesktopApp {
                 format!("{label} · {provider}")
             };
             let read = self.settings.quotas.get(harness);
-            let observed = read
-                .and_then(|result| result.as_ref().ok())
-                .and_then(crate::quota::observed_note);
+            let quota = read.and_then(|result| result.as_ref().ok());
+            let observed = quota.and_then(crate::quota::observed_note);
+            let tier = quota
+                .filter(|_| harness == "muse")
+                .and_then(crate::quota::plan);
             let metadata = [
                 entry.and_then(|entry| entry.version.as_deref()),
+                tier.as_deref(),
                 observed.as_deref(),
             ]
             .into_iter()

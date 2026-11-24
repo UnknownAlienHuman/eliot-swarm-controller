@@ -162,7 +162,7 @@ impl Router {
         available: usize,
     ) -> Result<Vec<ProviderProbeWork>> {
         let now = now_ms();
-        let candidates = {
+        let (candidates, holds) = {
             let mut store = self.inner.store.lock().await;
             let events = store.release_expired_provider_holds(now, 64)?;
             self.publish_locked(&events);
@@ -178,12 +178,46 @@ impl Router {
             if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                 return Ok(Vec::new());
             }
-            store
-                .due_provider_probes(now, available.min(eliot_store::PROVIDER_PROBE_BATCH_LIMIT))?
+            let candidates = store
+                .due_provider_probes(now, available.min(eliot_store::PROVIDER_PROBE_BATCH_LIMIT))?;
+            let scopes = candidates
+                .iter()
+                .map(|candidate| candidate.scope.clone())
+                .collect::<Vec<_>>();
+            let holds = store.provider_holds_for_scopes(&scopes)?;
+            (candidates, holds)
         };
 
         let mut started = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            if let Some(hold) = holds.get(&candidate.scope)
+                && hold.kind == eliot_core::ProviderRestrictionKind::Quota
+                && hold.source.as_ref().is_some_and(|source| {
+                    HarnessCapabilities::of(&source.harness).reads_retained_quota
+                })
+            {
+                match self.recheck_quota_hold(hold).await {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        "provider.quota_hold_read_failed",
+                        &[("scope", &hold.scope)],
+                        Some(&error),
+                    ),
+                }
+                let mut store = self.inner.store.lock().await;
+                if store
+                    .provider_holds_for_scopes(std::slice::from_ref(&hold.scope))?
+                    .get(&hold.scope)
+                    == Some(hold)
+                {
+                    let deferred =
+                        store.defer_provider_probe(&hold.scope, now_ms(), "quota_unavailable")?;
+                    self.publish_locked(&deferred);
+                }
+                continue;
+            }
             match self.start_provider_probe(&candidate).await {
                 Ok(work) => started.push(work),
                 Err(error) => {
@@ -210,6 +244,35 @@ impl Router {
             }
         }
         Ok(started)
+    }
+
+    async fn recheck_quota_hold(&self, hold: &eliot_core::ProviderHold) -> Result<bool> {
+        let Some(agent) = self.inner.store.lock().await.quota_hold_target(hold)? else {
+            return Ok(false);
+        };
+        let quota = self
+            .quota_for_snapshot(
+                agent.harness,
+                Some(agent.profile_snapshot),
+                agent.profile,
+                std::time::Instant::now() + Duration::from_secs(25),
+            )
+            .await?;
+        let now = now_ms();
+        let Some(projection) = super::catalog::projected_quota(&quota, None, now)
+            .filter(|projection| projection.available)
+        else {
+            return Ok(false);
+        };
+        let mut store = self.inner.store.lock().await;
+        let released = store.clear_observed_quota_hold(hold, projection.observed_at_ms, now)?;
+        self.publish_locked(&released);
+        if released.is_empty() {
+            return Ok(false);
+        }
+        self.signal_progress();
+        self.signal_launch_arbitration();
+        Ok(true)
     }
 
     async fn start_provider_probe(

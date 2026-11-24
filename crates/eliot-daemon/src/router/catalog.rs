@@ -373,15 +373,14 @@ impl Router {
     /// explicit supported/unsupported/unknown status, cached per account.
     /// Starts no model turn, performs no inference and never polls per
     /// Agent. Codex reads `account/rateLimits/read` (plus `account/usage/read`
-    /// when useful) and Muse reads `usage/read` through a dedicated metadata
+    /// when useful) and Muse reads `usage --json` through a dedicated metadata
     /// reader; Claude reads the CLI OAuth usage endpoint, OpenCode reads the
     /// Go account usage endpoint, and Antigravity reads
     /// `retrieveUserQuotaSummary`. Every reader projects provider quota
     /// signals into `details`: Codex keeps its `rateLimits` shape, the other
-    /// four use `windows[]` with `usedPercent`/`resetsAtMs` (Muse live reads
-    /// nest the same windows under `usage`, retained Muse observations carry
-    /// `windows[]` directly). Routing and the catalogue consume all five
-    /// through one normalized projection ([`catalog::project_quota`]).
+    /// four use `windows[]` with `usedPercent`/`resetsAtMs`. Routing and the
+    /// catalogue consume all five through one normalized projection
+    /// ([`catalog::project_quota`]).
     /// A method-not-found or schema mismatch stays `unsupported` or `unknown`
     /// naming the checked method; no numbers are fabricated. A quota failure
     /// never selects another model or account.
@@ -525,6 +524,29 @@ impl Router {
             .await?;
             crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
+        if HarnessCapabilities::of(&harness).reads_retained_quota {
+            let mut response = HarnessQuotaResponse {
+                harness,
+                scope,
+                credential,
+                fetched_at_ms: now_ms(),
+                ttl_ms: catalog::CATALOG_TTL_MS,
+                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
+                note: None,
+                details: None,
+                effective_reserve_percent: 0,
+                reserve_readback: None,
+                observed_usage: Vec::new(),
+            };
+            let route_verified = self
+                .read_allowance(profile, route, &mut response, deadline.into())
+                .await?;
+            request.validate_response(&response)?;
+            return Ok(catalog::ScopedQuota {
+                response,
+                route_verified,
+            });
+        }
         let cache_key = catalog::canonical_cache_identity(
             &label,
             &profile,
@@ -532,33 +554,6 @@ impl Router {
             &route.environment,
         );
         let route_verified = cache_key.is_some();
-        if eliot_core::api::HarnessCapabilities::of(&harness).reads_retained_quota
-            && route_verified
-            && let Some(observation) = self
-                .inner
-                .store
-                .lock()
-                .await
-                .latest_quota_observation(&harness, &profile)?
-        {
-            return Ok(catalog::ScopedQuota {
-                route_verified,
-                response: HarnessQuotaResponse {
-                    harness,
-                    scope,
-                    credential,
-                    fetched_at_ms: observation.observed_at_ms,
-                    ttl_ms: catalog::CATALOG_TTL_MS,
-                    status: "supported".to_owned(),
-                    note: Some("Muse subscription usage observed during a turn".to_owned()),
-                    details: Some(json!({"windows": observation.windows, "state": "ready",
-                        "origin": "provider", "source": "Muse MSP usage/changed"})),
-                    effective_reserve_percent: 0,
-                    reserve_readback: None,
-                    observed_usage: Vec::new(),
-                },
-            });
-        }
         if let Some(hit) = cache_key.as_deref().and_then(|key| {
             self.inner
                 .catalog_cache
@@ -616,18 +611,6 @@ impl Router {
                             .unwrap_or("Read-only native/provider quota values")
                             .to_owned(),
                     );
-                    if HarnessCapabilities::of(&harness).reads_retained_quota {
-                        if let Some(at) = details
-                            .pointer("/usage/observedAtMs")
-                            .and_then(Value::as_i64)
-                        {
-                            response.fetched_at_ms = at;
-                        } else {
-                            response.status = "unsupported".to_owned();
-                            response.details = None;
-                            response.note=Some("Muse MSP usage/read has no observed subscription usage; no turn is started to obtain quota".to_owned());
-                        }
-                    }
                 } else {
                     response.details = Some(
                         json!({"state":"error","origin":"provider","error":"native quota schema unavailable"}),

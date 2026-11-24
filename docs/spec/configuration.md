@@ -1380,7 +1380,7 @@ readback behind that rule is
 credential identity) and the separate `harness.quota` (timestamp, scope and
 an explicit supported/unsupported/unknown status with provider-verbatim
 `details` when supported: Codex `account/rateLimits/read` plus
-`account/usage/read` when useful, Muse `usage/read`; never secrets or
+`account/usage/read` when useful, Muse `usage --json`; never secrets or
 personal data, deduplicated per account); neither performs an inference
 probe nor polls per Agent.
 

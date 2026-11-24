@@ -100,6 +100,11 @@ window mapping and truthful absence patterns; never import OAuth refresh,
 account management, synthetic backoff, the proxy application or its UI. Native
 credential locations/schemas were verified against the installed CLI/keyring.
 
+Muse allowance readback uses OpenCodex 2.100.8 (`@bitkyc08/opencodex`, MIT),
+`src/providers/muse-key-quota.ts` and `src/providers/muse-subscription-usage.ts`,
+as **pattern only** for per-account spacing, in-flight sharing, failure backoff
+and stream observations. The Muse adapter invokes the vendor CLI.
+
 ## Reuse procedure
 
 For a dependency, add the narrow needed features and use its API. For extraction, copy
