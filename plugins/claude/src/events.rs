@@ -1142,25 +1142,15 @@ impl EventProcessor {
             if self.should_buffer(front) {
                 break;
             }
-            let Some(record) = self.buffer.pop_front() else {
-                break;
-            };
+            let record = self.buffer.pop_front().expect("buffer head was checked");
             if let Err(error) = self.process_record(record).await {
-                let error = self
+                return Err(self
                     .stream_source()
                     .buffered_failure(
                         error,
                         "Buffered Claude native record could not be normalized",
                     )
-                    .await;
-                if error.failure_where.as_deref() == Some("plugin.events.put") {
-                    return Err(error);
-                }
-                self.status.source_unknown = true;
-                if self.status.failure.is_none() {
-                    self.status.failure = Some(error.message.to_string());
-                }
-                return Err(error);
+                    .await);
             }
             if self.writes_blocked {
                 break;
@@ -1212,12 +1202,7 @@ impl EventProcessor {
             return;
         }
         // An association may have unblocked buffered assistant text.
-        if let Err(error) = self.flush_buffer().await
-            && error.failure_where.as_deref() != Some("plugin.events.put")
-            && self.status.failure.is_none()
-        {
-            self.status.failure = Some(*error.message);
-        }
+        let _ = self.flush_buffer().await;
     }
 
     async fn process_record(&mut self, record: Value) -> Result<()> {

@@ -1019,12 +1019,8 @@ impl EventProcessor {
                         if self.status.failure.is_none() {
                             self.status.failure = Some(*error.message);
                         }
-                    } else if let Err(error) = self.flush_buffer().await
-                        && error.failure_where.as_deref() != Some("plugin.events.put")
-                        && self.status.failure.is_none()
-                    {
-                        self.status.failure = Some(*error.message);
-                        self.status.source_unknown = true;
+                    } else {
+                        let _ = self.flush_buffer().await;
                     }
                 }
             }
@@ -1768,9 +1764,7 @@ impl EventProcessor {
             if self.should_buffer(&front.event_type) {
                 break;
             }
-            let Some(envelope) = self.buffer.pop_front() else {
-                break;
-            };
+            let envelope = self.buffer.pop_front().expect("buffer head was checked");
             if let Err(error) = self.process_envelope(envelope).await {
                 return Err(self
                     .stream_source()
