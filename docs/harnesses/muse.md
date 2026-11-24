@@ -92,6 +92,10 @@ The Contributor model can be hidden from the public picker, so its absence
 does not prevent attempting the exact selector on the native catalogue route.
 Swarm disables auto-update in its owned host process and leaves Contributor
 mode and disclosure consent under the Owner's native configuration.
+On 2026-11-24, Muse 1.4.25-R9361.1 preserved the `tbh` profile and still
+returned the base model, both with native settings and with the process
+override `--contributor-mode on`. A qualified Contributor route on this
+release remains unproven.
 
 Model proof comes from the exact session's MSP `log/subscribe` live stream
 (`rawLog`). The adapter binds each provider success record to the active
