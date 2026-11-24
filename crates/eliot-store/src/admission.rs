@@ -1,10 +1,6 @@
 use super::*;
 use eliot_core::{is_attachment_verb, is_request_reply_verb, is_start_verb};
 
-/// Local topic reserved for the internal attention producer. Public `emit`
-/// commands cannot use it; only the internal `attention.emit` verb admits it.
-pub(super) const ATTENTION_RESERVED_TOPIC: &str = "agent.attention";
-
 pub(super) fn command_semantic_payload(request: &SubmitCommand, mut args: Value) -> Result<Value> {
     // The resolved Goal is daemon-owned. Replays still bind the original
     // explicit Goal fields and opt-out reason carried by the caller.
@@ -626,16 +622,10 @@ fn require_no_agent_bindings(
     preparation: &Option<WorkspacePreparationInput>,
     message: &str,
 ) -> Result<()> {
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
+    if preparation.is_some() {
         return Err(Error::new("invalid", message));
     }
-    Ok(())
+    request.validate_no_agent_bindings(message)
 }
 
 /// Record a validated targetless command and its admission event.
@@ -737,70 +727,6 @@ fn admit_git_publish_tx(
     admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
-/// Admit one targetless `notify`/`emit` definition.
-fn admit_notify_emit_tx(
-    tx: &Transaction<'_>,
-    principal: &str,
-    request: &SubmitCommand,
-    payload_digest: &[u8],
-    preparation: &Option<WorkspacePreparationInput>,
-    now: i64,
-    events: &mut Vec<Event>,
-) -> Result<Option<String>> {
-    require_no_agent_bindings(
-        request,
-        preparation,
-        "notify/emit are targetless commands without Agent bindings",
-    )?;
-    if request.verb == "notify" {
-        serde_json::from_value::<core::api::NotifyDefinitionArgs>(request.args.clone())
-            .map_err(|_| Error::new("invalid", "notify definition is malformed"))?
-            .validate()?;
-    } else {
-        let definition =
-            serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
-                .map_err(|_| Error::new("invalid", "emit definition is malformed"))?;
-        definition.validate()?;
-        if matches!(
-            definition.topic.as_str(),
-            ATTENTION_RESERVED_TOPIC | "agent.attention_step"
-        ) {
-            return Err(Error::new(
-                "invalid",
-                "monitoring topics are reserved for the internal attention producer",
-            ));
-        }
-    }
-    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
-}
-
-/// Admit one internal `attention.emit`: the reserved topic only.
-fn admit_attention_emit_tx(
-    tx: &Transaction<'_>,
-    principal: &str,
-    request: &SubmitCommand,
-    payload_digest: &[u8],
-    preparation: &Option<WorkspacePreparationInput>,
-    now: i64,
-    events: &mut Vec<Event>,
-) -> Result<Option<String>> {
-    require_no_agent_bindings(
-        request,
-        preparation,
-        "attention.emit is a targetless command without Agent bindings",
-    )?;
-    let definition = serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
-        .map_err(|_| Error::new("invalid", "attention.emit definition is malformed"))?;
-    definition.validate()?;
-    if definition.topic != ATTENTION_RESERVED_TOPIC {
-        return Err(Error::new(
-            "invalid",
-            "attention.emit carries only the reserved attention topic",
-        ));
-    }
-    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
-}
-
 /// Admit one rule-derived `mail.send`/`var.set` definition.
 #[allow(
     clippy::too_many_arguments,
@@ -822,18 +748,11 @@ fn admit_rule_action_tx(
             "mail.send/var.set commands must be admitted by an event-rule firing",
         ));
     }
-    if request.target.is_some()
-        || request.expected_generation.is_some()
-        || request.expected_turn_id.is_some()
-        || request.request_id.is_some()
-        || request.probe
-        || preparation.is_some()
-    {
-        return Err(Error::new(
-            "invalid",
-            "mail.send/var.set are targetless commands without Agent bindings",
-        ));
-    }
+    require_no_agent_bindings(
+        request,
+        preparation,
+        "mail.send/var.set are targetless commands without Agent bindings",
+    )?;
     if request.verb == "mail.send" {
         let definition =
             serde_json::from_value::<core::api::MailDefinitionArgs>(request.args.clone())
@@ -867,12 +786,7 @@ fn admit_rule_action_tx(
             )
         })?;
     }
-    events.push(admit_command(
-        tx,
-        &CommandInsert::targetless_admitted(principal, request, payload_digest, now),
-        json!({"command_id": request.id, "verb": request.verb}),
-    )?);
-    Ok(None)
+    admit_targetless_tx(tx, principal, request, payload_digest, now, events)
 }
 
 /// Admit one `launch`: new Agent row, creation events, and optional linked
@@ -2255,7 +2169,7 @@ fn admit_start_postlude_tx(
 pub(super) fn submit_tx(
     tx: &Transaction<'_>,
     principal: &str,
-    request: SubmitCommand,
+    request: impl Into<CommandSubmission>,
     preparation: Option<WorkspacePreparationInput>,
     now: i64,
     derived_rule: bool,
@@ -2265,7 +2179,7 @@ pub(super) fn submit_tx(
     submit_tx_mode(
         tx,
         principal,
-        request,
+        request.into(),
         preparation,
         now,
         derived_rule,
@@ -2299,7 +2213,7 @@ pub(super) fn submit_switch_launch_tx(
     submit_tx_mode(
         tx,
         principal,
-        request,
+        request.into(),
         preparation,
         now,
         derived_rule,
@@ -2319,7 +2233,16 @@ pub(super) fn submit_restart_resume_tx(
 ) -> Result<Admission> {
     let command_id = request.id.clone();
     let admission = submit_tx_mode(
-        tx, "owner", request, None, now, false, limits, policy, true, false,
+        tx,
+        "owner",
+        request.into(),
+        None,
+        now,
+        false,
+        limits,
+        policy,
+        true,
+        false,
     )?;
     if admission.is_new {
         super::result_page::record_restart_resume_intent_tx(tx, &command_id)?;
@@ -2334,7 +2257,7 @@ pub(super) fn submit_restart_resume_tx(
 fn submit_tx_mode(
     tx: &Transaction<'_>,
     principal: &str,
-    mut request: SubmitCommand,
+    submission: CommandSubmission,
     preparation: Option<WorkspacePreparationInput>,
     now: i64,
     derived_rule: bool,
@@ -2343,6 +2266,7 @@ fn submit_tx_mode(
     restart_resume: bool,
     linked_switch_launch: bool,
 ) -> Result<Admission> {
+    let CommandSubmission { mut request, event } = submission;
     if linked_switch_launch && request.verb != "launch" {
         return Err(Error::new(
             "bad_state",
@@ -2459,24 +2383,25 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "notify" | "emit" => admit_notify_emit_tx(
-            tx,
-            principal,
-            &request,
-            &payload_digest,
-            &preparation,
-            now,
-            &mut events,
-        )?,
-        "attention.emit" => admit_attention_emit_tx(
-            tx,
-            principal,
-            &request,
-            &payload_digest,
-            &preparation,
-            now,
-            &mut events,
-        )?,
+        "notify" | "emit" | "attention.emit" => {
+            let binding_error = if request.verb == "attention.emit" {
+                "attention.emit is a targetless command without Agent bindings"
+            } else {
+                "notify/emit are targetless commands without Agent bindings"
+            };
+            require_no_agent_bindings(&request, &preparation, binding_error)?;
+            if event.is_none() {
+                core::api::UserEventCommand::decode(&request.verb, request.args.clone())
+                    .map_err(|_| {
+                        Error::new(
+                            "invalid",
+                            format!("{} definition is malformed", request.verb),
+                        )
+                    })?
+                    .validate_admission()?;
+            }
+            admit_targetless_tx(tx, principal, &request, &payload_digest, now, &mut events)?
+        }
         "mail.send" | "var.set" => admit_rule_action_tx(
             tx,
             principal,

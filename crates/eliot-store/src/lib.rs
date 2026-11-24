@@ -637,10 +637,7 @@ impl Store {
         request: SubmitCommand,
         now: i64,
     ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, None, now, false);
-        self.fault_on_persistence_error(&result);
-        result
+        self.submit_with_context(principal, request, None, SubmissionContext::default(), now)
     }
 
     /// Admit one internal restart Resume only while its durable restart
@@ -669,7 +666,7 @@ impl Store {
             ));
         }
         self.ensure_writer_healthy()?;
-        let result = self.submit_inner("owner", request, None, now, true);
+        let result = self.submit_restart_resume_inner(request, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -679,7 +676,7 @@ impl Store {
     pub fn submit_with_context(
         &mut self,
         principal: &str,
-        request: SubmitCommand,
+        request: impl Into<CommandSubmission>,
         preparation: Option<WorkspacePreparationInput>,
         context: SubmissionContext<'_>,
         now: i64,
@@ -689,10 +686,9 @@ impl Store {
             owner_process,
             ..
         } = context;
-        if remote.is_none() && owner_process.is_none() {
-            return self.submit_inner_checked(principal, request, preparation, now);
+        if remote.is_some() || owner_process.is_some() {
+            context.validate(principal)?;
         }
-        context.validate(principal)?;
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -752,19 +748,6 @@ impl Store {
             ));
         }
         Ok(None)
-    }
-
-    fn submit_inner_checked(
-        &mut self,
-        principal: &str,
-        request: SubmitCommand,
-        preparation: Option<WorkspacePreparationInput>,
-        now: i64,
-    ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, preparation, now, false);
-        self.fault_on_persistence_error(&result);
-        result
     }
 
     /// Resolve a targetless Git fetch retry using only its caller-authored
@@ -888,41 +871,23 @@ impl Store {
         }
         Ok(None)
     }
-    fn submit_inner(
+    fn submit_restart_resume_inner(
         &mut self,
-        principal: &str,
         request: SubmitCommand,
-        preparation: Option<WorkspacePreparationInput>,
         now: i64,
-        restart_idle_resume: bool,
     ) -> Result<Admission> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let limits = self.hierarchy_limits;
-        let mut admission = if restart_idle_resume {
-            admission::submit_restart_resume_tx(
-                &tx,
-                request,
-                now,
-                limits,
-                self.capacity_policy.as_deref(),
-            )?
-        } else {
-            admission::submit_tx(
-                &tx,
-                principal,
-                request,
-                preparation,
-                now,
-                false,
-                limits,
-                self.capacity_policy.as_deref(),
-            )?
-        };
-        if restart_idle_resume
-            && admission.is_new
+        let mut admission = admission::submit_restart_resume_tx(
+            &tx,
+            request,
+            now,
+            self.hierarchy_limits,
+            self.capacity_policy.as_deref(),
+        )?;
+        if admission.is_new
             && let (Some(agent), Some(generation)) = (
                 admission.command.target.as_deref(),
                 admission.command.generation,
@@ -5120,6 +5085,37 @@ pub struct SubmissionContext<'a> {
     pub owner_process: Option<&'a OwnerProcess>,
     /// Internal admission provenance for a deferred launch.
     pub owner_automation: bool,
+}
+
+/// A durable envelope with any local event already decoded at preflight.
+/// Keeping both private binds the validation to the original digest input.
+pub struct CommandSubmission {
+    request: SubmitCommand,
+    event: Option<core::api::UserEventCommand>,
+}
+
+impl CommandSubmission {
+    pub fn user_event(request: SubmitCommand) -> Result<Self> {
+        let event = core::api::UserEventCommand::decode(&request.verb, request.args.clone())?;
+        event.validate_admission()?;
+        Ok(Self {
+            request,
+            event: Some(event),
+        })
+    }
+
+    pub fn request(&self) -> &SubmitCommand {
+        &self.request
+    }
+}
+
+impl From<SubmitCommand> for CommandSubmission {
+    fn from(request: SubmitCommand) -> Self {
+        Self {
+            request,
+            event: None,
+        }
+    }
 }
 
 impl SubmissionContext<'_> {

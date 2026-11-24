@@ -1572,12 +1572,8 @@ impl Router {
                 .await;
             return;
         }
-        if is_user_event_verb(dispatched.verb.as_str()) {
+        if is_user_event_verb(&dispatched.verb) || dispatched.verb == "attention.emit" {
             self.execute_user_event_command(&id, dispatched).await;
-            return;
-        }
-        if dispatched.verb == "attention.emit" {
-            self.execute_attention_event_command(&id, dispatched).await;
             return;
         }
         if dispatched.verb == "mail.send" {

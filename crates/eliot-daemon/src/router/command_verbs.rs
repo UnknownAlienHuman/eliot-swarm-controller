@@ -11,7 +11,7 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnOutcome, TurnState,
-    api::{FrozenGitFetch, ProjectRegistrationView},
+    api::{FrozenGitFetch, ProjectRegistrationView, UserEventCommand},
 };
 use eliot_plugin::session::native_no_write;
 use serde_json::{Value, json};
@@ -300,17 +300,26 @@ impl Router {
         self.signal_progress();
     }
 
-    /// Execute a dispatched local `notify`/`emit`: commit its validated DTO
-    /// as one persisted `x.user.*` event together with its Applied
-    /// settlement in a single Store transaction, publishing the committed
-    /// batch in order while still serialized with the writer. No external
-    /// send.
+    /// Decode the retained command and atomically commit the event and settlement.
     pub(super) async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
-        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
-        {
-            Ok(kind_data) => kind_data,
+        let decoded =
+            UserEventCommand::decode(&dispatched.verb, dispatched.args).and_then(|event| {
+                let (kind, data) = event.event()?;
+                Ok((
+                    matches!(event, UserEventCommand::AttentionEmit(_)),
+                    kind,
+                    data,
+                ))
+            });
+        let (attention, kind, mut data) = match decoded {
+            Ok(event) => event,
             Err(error) => {
-                let error = self.sanitized_failure(&error, "router.dispatch.user_event_gate");
+                let location = if dispatched.verb == "attention.emit" {
+                    "router.dispatch.attention_gate"
+                } else {
+                    "router.dispatch.user_event_gate"
+                };
+                let error = self.sanitized_failure(&error, location);
                 self.settle(
                     id,
                     CommandState::Rejected,
@@ -325,7 +334,7 @@ impl Router {
         // `emit` verb: admission rejects it, and a retained pre-fix command
         // that still reaches execution is rejected here. Only the internal
         // `attention.emit` verb below may use the bound commit.
-        if kind == super::ATTENTION_USER_EVENT_KIND {
+        if !attention && kind == super::ATTENTION_USER_EVENT_KIND {
             let error = self.sanitized_failure(
                 &Error::new(
                     "invalid",
@@ -350,51 +359,11 @@ impl Router {
         self.redact_native_value(&mut data);
         let committed = {
             let mut store = self.inner.store.lock().await;
-            let result = store.commit_user_event_applied(id, &kind, data, now_ms());
-            if let Ok(change) = &result
-                && !change.events.is_empty()
-            {
-                self.publish_locked(&change.events);
-            }
-            result
-        };
-        if let Err(error) = committed {
-            self.settle(
-                id,
-                CommandState::Unknown,
-                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
-            )
-            .await;
-        }
-        self.signal_progress();
-    }
-
-    /// Execute a dispatched internal `attention.emit` command: commit its
-    /// validated report as one bound `x.user.agent.attention` event with its
-    /// Applied settlement in a single Store transaction. The Store admits the
-    /// `attention.emit` verb only from the internal attention producer, and
-    /// the bound commit additionally requires that verb, so a public emit
-    /// can never acquire an authoritative subject binding.
-    pub(super) async fn execute_attention_event_command(&self, id: &str, dispatched: Command) {
-        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
-        {
-            Ok(kind_data) => kind_data,
-            Err(error) => {
-                let error = self.sanitized_failure(&error, "router.dispatch.attention_gate");
-                self.settle(
-                    id,
-                    CommandState::Rejected,
-                    Some(self.command_error_outcome(&error, "code")),
-                )
-                .await;
-                self.signal_progress();
-                return;
-            }
-        };
-        self.redact_native_value(&mut data);
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result = store.commit_attention_event_applied(id, &kind, data, now_ms());
+            let result = if attention {
+                store.commit_attention_event_applied(id, &kind, data, now_ms())
+            } else {
+                store.commit_user_event_applied(id, &kind, data, now_ms())
+            };
             if let Ok(change) = &result
                 && !change.events.is_empty()
             {

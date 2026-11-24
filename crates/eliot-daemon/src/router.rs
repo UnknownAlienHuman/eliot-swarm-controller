@@ -96,28 +96,27 @@ use eliot_core::{
         AgentSummary, CommandChildrenRequest, CommandChildrenResponse, CommandGetRequest,
         CommandSubmitRequest, CommandSubmitResponse, CrashMarker, DaemonShutdownRequest,
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
-        EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
-        EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
-        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessCheckOutcome,
-        HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,
-        HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        EventsBoundsRequest, EventsFilter, EventsReadRequest, EventsReadResponse,
+        EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish, GitFetchDefinitionArgs,
+        GitPublishTrigger, GitView, HarnessCheckOutcome, HarnessDoctorRequest,
+        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
+        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
-        NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
-        ObserveHeavyRequest, ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest,
-        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
-        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
-        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult,
-        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
-        is_supported_harness,
+        ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
+        ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
+        ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
+        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
+        SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
+        TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
+        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
 use eliot_store::{
-    Admission, AgentListFilter, OwnerProcess, ProjectRegistrationInput, RestartResumeCandidate,
-    RuleProcessingState, SubmissionContext, TimerDefinitionInput, TimerSlotAdmission,
-    TimerSlotCommit,
+    Admission, AgentListFilter, CommandSubmission, OwnerProcess, ProjectRegistrationInput,
+    RestartResumeCandidate, RuleProcessingState, SubmissionContext, TimerDefinitionInput,
+    TimerSlotAdmission, TimerSlotCommit,
 };
 use serde_json::{Value, json};
 use std::{
@@ -1727,22 +1726,23 @@ impl Router {
         {
             return Ok(result);
         }
-        if is_user_event_verb(request.verb.as_str())
-            && let Err(error) = Self::validate_user_event_request(&request)
-        {
-            let mut retry = replay_request.clone();
-            if let Some(result) = self
-                .replay_command_submission(&mut retry, principal, remote)
-                .await?
-            {
-                return Ok(result);
+        let (submission, workspace) = match async {
+            if is_user_event_verb(&request.verb) {
+                request.validate_no_agent_bindings(
+                    "notify/emit must be targetless and have no Agent or request bindings",
+                )?;
+                let submission = CommandSubmission::user_event(request)?;
+                self.check_command_admission_mode(&submission.request().verb)?;
+                self.reject_secret_command_args(submission.request())?;
+                Ok((submission, None))
+            } else {
+                let PreparedSubmission { request, workspace } = self
+                    .prepare_submission_after_authorization(request, principal, false, true)
+                    .await?;
+                Ok((request.into(), workspace))
             }
-            return Err(error);
         }
-
-        let prepared = match self
-            .prepare_submission_after_authorization(request, principal, false, true)
-            .await
+        .await
         {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1760,7 +1760,7 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             let principal = principal_name(principal);
             let submitted =
-                self.admit_prepared_submission(&mut store, &principal, prepared, context);
+                self.admit_submission(&mut store, &principal, submission, workspace, context);
             match submitted {
                 Ok(admission) => {
                     if !admission.events.is_empty() {
@@ -1822,17 +1822,29 @@ impl Router {
         context: SubmissionContext<'_>,
     ) -> Result<Admission> {
         let PreparedSubmission { request, workspace } = prepared;
+        self.admit_submission(store, principal, request.into(), workspace, context)
+    }
+
+    fn admit_submission(
+        &self,
+        store: &mut eliot_store::Store,
+        principal: &str,
+        submission: CommandSubmission,
+        workspace: Option<WorkspacePreparationInput>,
+        context: SubmissionContext<'_>,
+    ) -> Result<Admission> {
+        let request = submission.request();
         if let Some(admission) =
-            store.replay_command_submission(principal, &request, context.remote)?
+            store.replay_command_submission(principal, request, context.remote)?
         {
             return Ok(admission);
         }
         owner_inbox::check_binding(store)?;
         self.check_command_admission_mode(&request.verb)?;
         if request.verb == "answer" {
-            validate_answer_request(store, &request)?;
+            validate_answer_request(store, request)?;
         }
-        store.submit_with_context(principal, request, workspace, context, now_ms())
+        store.submit_with_context(principal, submission, workspace, context, now_ms())
     }
 
     fn check_command_admission_mode(&self, verb: &str) -> Result<()> {
@@ -2308,36 +2320,6 @@ impl Router {
                 "git.fetch admission result could not be encoded",
             )
         })
-    }
-
-    /// Validate one targetless local `notify`/`emit` submission. Admission
-    /// secret checks run in the shared preparation path; execution commits
-    /// exactly this validated DTO as one persisted `x.user.*` event. The
-    /// reserved attention topic is rejected here: only the internal
-    /// attention producer (verb `attention.emit`) may use the bound commit.
-    fn validate_user_event_request(request: &SubmitCommand) -> Result<()> {
-        if request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
-            return Err(Error::new(
-                "invalid",
-                "notify/emit must be targetless and have no Agent or request bindings",
-            ));
-        }
-        let (kind, _) = user_event_kind_data(&request.verb, &request.args)?;
-        if matches!(
-            kind.as_str(),
-            ATTENTION_USER_EVENT_KIND | eliot_core::ATTENTION_STEP_KIND
-        ) {
-            return Err(Error::new(
-                "invalid",
-                "monitoring topics are reserved for the internal attention producer",
-            ));
-        }
-        Ok(())
     }
 
     /// Submit one internal attention event command (verb `attention.emit`).
@@ -3377,23 +3359,7 @@ impl Router {
                 request.args["instruction_sources"] = json!(delivered);
             }
         }
-        // Emit data and variable values are arbitrary JSON: their object keys
-        // can smuggle a known credential past the values-only check. Block
-        // keys before admission; never persist or log the offending key.
-        let secret_hit = if matches!(
-            request.verb.as_str(),
-            "notify" | "emit" | "attention.emit" | "mail.send" | "var.set"
-        ) {
-            contains_known_secret_including_keys(&request.args, &self.inner.secrets)
-        } else {
-            contains_known_secret(&request.args, &self.inner.secrets)
-        };
-        if secret_hit {
-            return Err(Error::new(
-                "secret_in_payload",
-                "durable command text contains a known credential",
-            ));
-        }
+        self.reject_secret_command_args(&request)?;
         if let Some(input) = &workspace {
             let metadata = serde_json::to_value(input)
                 .map_err(|_| Error::new("internal", "workspace input could not be encoded"))?;
@@ -3430,6 +3396,25 @@ impl Router {
         self.refresh_model_hold_for_submission(&request, principal)
             .await;
         Ok(PreparedSubmission { request, workspace })
+    }
+
+    fn reject_secret_command_args(&self, request: &SubmitCommand) -> Result<()> {
+        // User-event data and coordination values can have arbitrary keys.
+        let secret_hit = if matches!(
+            request.verb.as_str(),
+            "notify" | "emit" | "attention.emit" | "mail.send" | "var.set"
+        ) {
+            contains_known_secret_including_keys(&request.args, &self.inner.secrets)
+        } else {
+            contains_known_secret(&request.args, &self.inner.secrets)
+        };
+        if secret_hit {
+            return Err(Error::new(
+                "secret_in_payload",
+                "durable command text contains a known credential",
+            ));
+        }
+        Ok(())
     }
 
     async fn verify_native_control_target(&self, request: &SubmitCommand) -> Result<()> {
@@ -8497,41 +8482,6 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
 
 /// Persisted kind of the internal attention event.
 pub(crate) const ATTENTION_USER_EVENT_KIND: &str = "x.user.agent.attention";
-
-/// Map one validated local `notify`/`emit`/`attention.emit` DTO to its
-/// persisted event kind and bounded payload. Shared by admission and
-/// execution so both read the same DTO exactly once. The internal
-/// `attention.emit` verb carries the same DTO as `emit`; only the producer
-/// (not the kind) differs, and admission keeps them apart.
-fn user_event_kind_data(verb: &str, args: &Value) -> Result<(String, Value)> {
-    match verb {
-        "notify" => {
-            let definition = eliot_core::api::discovery::decode_params_at::<NotifyDefinitionArgs>(
-                args.clone(),
-                "params.args",
-            )?;
-            definition.validate()?;
-            let mut data = json!({"message": definition.message});
-            if let Some(title) = definition.title {
-                data["title"] = Value::String(title);
-            }
-            Ok(("x.user.notify".to_owned(), data))
-        }
-        "emit" | "attention.emit" => {
-            let definition = eliot_core::api::discovery::decode_params_at::<EmitDefinitionArgs>(
-                args.clone(),
-                "params.args",
-            )?;
-            definition.validate()?;
-            let mut data = json!({"data": definition.data});
-            if let Some(key) = definition.key {
-                data["key"] = Value::String(key);
-            }
-            Ok((format!("x.user.{}", definition.topic), data))
-        }
-        _ => Err(Error::new("invalid", "not a local user-event verb")),
-    }
-}
 
 fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {
     let args = request
