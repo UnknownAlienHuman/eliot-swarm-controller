@@ -41,10 +41,10 @@ pub mod radius {
     pub const BUBBLE: f64 = brand::RADIUS_LARGE_INCREASED;
     pub const BUBBLE_TAIL: f64 = brand::RADIUS_EXTRA_SMALL;
     /// The Stop square inside the FAB.
-    pub const STOP: f64 = 3.0;
-    pub const STATUS_MARK: f64 = 2.0;
+    pub const STOP: f64 = brand::RADIUS_STOP_MARK;
+    pub const STATUS_MARK: f64 = brand::RADIUS_STATUS_MARK;
     /// Check boxes keep the M3 corner.
-    pub const CHECK_BOX: f64 = 2.0;
+    pub const CHECK_BOX: f64 = brand::RADIUS_CHECKBOX;
 }
 
 /// Heights in DIPs: Material 3's desktop density, as compact as Codex.
@@ -68,9 +68,9 @@ pub mod height {
     /// The header's status pill.
     pub const BADGE: f64 = brand::SIZE_STATUS_PILL;
     /// A form row: its label and its 32-DIP control.
-    pub const FORM_ROW: f64 = 40.0;
+    pub const FORM_ROW: f64 = brand::SIZE_FORM_ROW;
     /// A picker row with a supporting line under its title.
-    pub const TWO_LINE_ROW: f64 = 48.0;
+    pub const TWO_LINE_ROW: f64 = brand::SIZE_TWO_LINE_ROW;
     pub const SUGGESTION: f64 = brand::SIZE_NEW_TASK;
 }
 
@@ -106,7 +106,7 @@ pub mod spacing {
     /// Icon-to-label gap inside a chip.
     pub const CHIP_GAP: f64 = brand::SPACE_CHIP_GAP;
     /// Leading padding of WinUI's text field template.
-    pub const FIELD_LEADING_INSET: f64 = 10.0;
+    pub const FIELD_LEADING_INSET: f64 = brand::SPACE_FIELD_LEADING;
     /// A row's inset from its pill and the gap from its icon to its label
     /// ("every sidebar row starts its icon at 10 DIP inside an 8-DIP
     /// gutter").
@@ -136,20 +136,27 @@ pub mod icon {
     /// A chip's or row's chevron, inline status icons.
     pub const CHEVRON: f64 = brand::SIZE_ICON_XS;
     /// The Stop square in the FAB.
-    pub const STOP: f64 = 12.0;
+    pub const STOP: f64 = brand::SIZE_STOP_MARK;
 }
 
-/// The design's motion: emphasized easing, 150 ms for states, 250 ms for a
-/// popover's entrance (a fade and a 4-DIP rise).
+/// The brand book's motion (Material 3 Expressive springs; until they run
+/// as springs, their settle times with the emphasized easing): state
+/// colors and the press feedback on effects-fast (a storyboard over the
+/// 347-ms spatial-fast settle time would read as a slow press; the press
+/// morph moves to the spatial-fast spring with the motion increment), the
+/// ripple on effects-slow, popovers moving into place on spatial with a
+/// 4-DIP rise.
 pub mod motion {
-    pub const STATE_MS: u64 = 150;
-    pub const PRESS_MS: u64 = 100;
-    pub const RIPPLE_MS: u64 = 300;
-    pub const POPOVER_MS: u64 = 250;
+    use super::brand;
+
+    pub const STATE_MS: u64 = brand::EFFECTS_FAST_MS;
+    pub const PRESS_MS: u64 = brand::EFFECTS_FAST_MS;
+    pub const RIPPLE_MS: u64 = brand::EFFECTS_SLOW_MS;
+    pub const POPOVER_MS: u64 = brand::SPATIAL_MS;
     /// How far a popover rises into place while it fades in.
-    pub const POPOVER_RISE: f64 = 4.0;
-    pub const PRESS_SCALE: f64 = 0.97;
-    pub const FAB_PRESS_SCALE: f64 = 0.94;
+    pub const POPOVER_RISE: f64 = brand::SIZE_POPOVER_RISE;
+    pub const PRESS_SCALE: f64 = brand::SCALE_PRESS;
+    pub const FAB_PRESS_SCALE: f64 = brand::SCALE_PRESS_ACTION;
     pub const EMPHASIZED: &str = crate::brand::EASING_EMPHASIZED;
     pub const DECELERATE: &str = crate::brand::EASING_EMPHASIZED_DECELERATE;
 }
@@ -164,10 +171,12 @@ pub mod state {
     /// Disabled selection marks and other non-text affordances.
     pub const DISABLED_CONTENT: f64 = brand::DISABLED_CONTENT;
     pub const SCRIM: f64 = brand::SCRIM_OPACITY;
-    pub const PLOT_STUB_OPACITY: f64 = 0.72;
+    pub const PLOT_STUB_OPACITY: f64 = brand::PLOT_STUB_OPACITY;
 }
 
-/// Widths and the few fixed sizes of the shell.
+/// Layout: the shell's widths, columns, limits and window size. Component
+/// sizes, shapes and motion are the brand book's (the modules above); a
+/// constant here only places things.
 pub mod layout {
     /// The sidebar, and the Settings navigation that replaces it.
     pub const SIDEBAR_WIDTH: f64 = crate::brand::SIZE_SIDEBAR;
@@ -241,15 +250,15 @@ pub mod layout {
     /// A dropdown inside the hand-off dialog.
     pub const DIALOG_PICKER_WIDTH: f64 = 136.0;
     /// A status dot in a row.
-    pub const DOT: f64 = 8.0;
+    pub const DOT: f64 = crate::brand::SIZE_DOT_WAIT;
     /// The dot of the header's status pill.
-    pub const BADGE_DOT: f64 = 6.0;
+    pub const BADGE_DOT: f64 = crate::brand::SIZE_DOT;
     /// Dividers.
     pub const HAIRLINE: f64 = crate::brand::SIZE_HAIRLINE;
     /// Extend the ripple past the control so its final frame fills the shape.
     pub const RIPPLE_INSET: f64 = 24.0;
     pub const FOCUS_RING: f64 = crate::brand::SIZE_FOCUS_RING;
-    pub const STATUS_STROKE: f64 = 1.5;
+    pub const STATUS_STROKE: f64 = crate::brand::SIZE_STATUS_STROKE;
     /// The indeterminate progress bar of a running turn.
     pub const PROGRESS_WIDTH: f64 = 160.0;
     /// A monitor chart's plot, and the stub of an unknown sample.
@@ -278,13 +287,17 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
-    /// A switch's pill: WinUI's ToggleSwitch template keeps a 154-DIP
-    /// content area after it, so a bare switch is sized to the pill.
-    pub const SWITCH_WIDTH: f64 = 40.0;
+    /// Layout exception, not a brand value: a bare switch is sized to the
+    /// pill WinUI's own ToggleSwitch template draws (40 DIPs; the template
+    /// keeps a 154-DIP content area after it). The brand book's 52 × 32
+    /// switch (`size-switch-width`, `size-switch-height`) needs the
+    /// re-templated style of the D11 styles increment, which then takes the
+    /// tokens and removes this constant.
+    pub const WINUI_SWITCH_PILL_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
-    pub const RING: f64 = 16.0;
+    pub const RING: f64 = crate::brand::SIZE_RING_SM;
     /// The composer's usage ring.
     pub const USAGE_RING: f64 = crate::brand::SIZE_RING;
     /// The neutral usage ring's stroke (the progress ring's track).
-    pub const USAGE_RING_STROKE: f64 = 2.0;
+    pub const USAGE_RING_STROKE: f64 = crate::brand::SIZE_RING_STROKE;
 }
