@@ -292,7 +292,7 @@ pub(crate) fn verify_stand_codex_route(
         && CODEX_STORE_SELECTORS.iter().all(|&name| {
             environment
                 .and_then(|env| env.get(name))
-                .is_some_and(&matches_home)
+                .is_some_and(matches_home)
         })
         && profile
             .get("native_store_binding")
