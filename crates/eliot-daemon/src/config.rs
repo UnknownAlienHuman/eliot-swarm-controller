@@ -265,8 +265,23 @@ pub(crate) fn verify_stand_codex_route(
     let Some(home) = stand_codex_home(data_root)? else {
         return Ok(());
     };
-    crate::stand_cleanup::check_directory_chain(&home)?;
     let home = canonical_stand_codex_home(&home)?;
+    match std::fs::symlink_metadata(home.join("config.toml")) {
+        Ok(metadata) if metadata.is_file() && !crate::platform::is_reparse_point(&metadata) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(core::Error::new(
+                "not_allowed",
+                "stand Codex config.toml must be a regular file without links",
+            ));
+        }
+        Err(error) => {
+            return Err(core::Error::new(
+                "platform_io",
+                format!("inspect stand Codex config: {error}"),
+            ));
+        }
+    }
     let matches_home = |value: &Value| {
         value.as_str().is_some_and(|path| {
             let path = Path::new(path);
@@ -310,7 +325,6 @@ pub(crate) fn capture_native_store_inputs(
                 format!("create stand Codex home: {error}"),
             ));
         }
-        crate::stand_cleanup::check_directory_chain(&home)?;
         let names = profile["pass_env"].as_array_mut().ok_or_else(|| {
             core::Error::new("invalid", "resolved profile pass_env must be an array")
         })?;
@@ -323,42 +337,18 @@ pub(crate) fn capture_native_store_inputs(
     } else {
         None
     };
-    capture_native_store_inputs_inner(
-        profile,
-        |name| match &home {
-            Some(home)
-                if CODEX_STORE_SELECTORS
-                    .iter()
-                    .any(|key| env_name_matches(name, key)) =>
-            {
-                Some(home.as_os_str().to_owned())
-            }
-            _ => std::env::var_os(name),
-        },
-        |name| std::env::var_os(name),
-    )
-}
 
-fn canonical_stand_codex_home(path: &Path) -> core::Result<PathBuf> {
-    path.canonicalize().map_err(|error| {
-        core::Error::new("platform_io", format!("resolve stand Codex home: {error}"))
-    })
-}
-
-fn capture_native_store_inputs_inner(
-    profile: &mut Value,
-    mut selector_lookup: impl FnMut(&str) -> Option<OsString>,
-    mut credential_lookup: impl FnMut(&str) -> Option<OsString>,
-) -> core::Result<()> {
     let names = profile
         .get("pass_env")
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
     for &selector in CODEX_STORE_SELECTORS {
-        let selected = admitted_selector(names, selector);
+        let selected = home
+            .as_ref()
+            .map(|path| path.as_os_str().to_owned())
+            .or_else(|| admitted_selector(names, selector).and_then(std::env::var_os));
         let value = selected
-            .and_then(&mut selector_lookup)
             .map(|value| {
                 value.into_string().map(Value::String).map_err(|_| {
                     core::Error::new("invalid", "native store selector is not valid Unicode")
@@ -380,7 +370,7 @@ fn capture_native_store_inputs_inner(
                 && !claude_model_selector(profile, name)
         })
         .chain(profile["api_key_env"].as_str())
-        .filter_map(&mut credential_lookup)
+        .filter_map(std::env::var_os)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
     // Keep resolved credentials only in this temporary policy; snapshot data
@@ -397,7 +387,7 @@ fn capture_native_store_inputs_inner(
                     .as_str()
                     .map(str::to_owned));
             }
-            selector_lookup(name)
+            std::env::var_os(name)
                 .map(|value| {
                     value.into_string().map_err(|_| {
                         core::Error::new("invalid", "native route selector is not valid Unicode")
@@ -417,6 +407,13 @@ fn capture_native_store_inputs_inner(
     // The augmented snapshot is bounded by the existing Store admission/frame
     // checks. This capture proves inputs, never an effective native root/scope.
     Ok(())
+}
+
+fn canonical_stand_codex_home(path: &Path) -> core::Result<PathBuf> {
+    crate::stand_cleanup::check_directory_chain(path)?;
+    path.canonicalize().map_err(|error| {
+        core::Error::new("platform_io", format!("resolve stand Codex home: {error}"))
+    })
 }
 
 /// Freeze an Agent's exact build output directory when the profile admits it
