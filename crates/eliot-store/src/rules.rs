@@ -955,14 +955,14 @@ impl Store {
             event_seq,
             &request,
         )? {
-            (!bound || !valid_inject_request(&request))
-                .then(|| "rule_action_binding_invalid".to_owned())
+            (!bound || validated_rule_inject_point(&request).is_none())
+                .then_some("rule_action_binding_invalid")
         } else {
             rule_action_binding_error(&trigger, event_seq, &request)
         };
         if let Some(code) = binding_error {
             request.id = key.child_id.clone();
-            let error = Error::new(code.clone(), code);
+            let error = Error::new(code, code);
             return reject_rule_event(tx, &self.write_faulted, &key, &error, now);
         }
         validate_rule_key_inputs(
@@ -2205,9 +2205,6 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
     if is_coordination_verb(request.verb.as_str()) {
         return valid_targetless_coordination_request(request);
     }
-    if request.verb == "inject" {
-        return valid_inject_request(request);
-    }
     if request.verb == "compact" {
         return valid_compact_rule_action_request(request);
     }
@@ -2250,7 +2247,7 @@ fn valid_event_rule_action_request(request: &SubmitCommand) -> bool {
             .is_some_and(|args| args.len() == 1 && args.get("text").is_some_and(Value::is_string))
 }
 
-fn valid_inject_request(request: &SubmitCommand) -> bool {
+fn validated_rule_inject_point(request: &SubmitCommand) -> Option<core::InjectPoint> {
     if request.validate().is_err()
         || !request
             .target
@@ -2262,15 +2259,13 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
         || request.request_id.is_some()
         || request.probe
     {
-        return false;
+        return None;
     }
     if !request.args.is_object() {
-        return false;
+        return None;
     }
-    let Ok(args) = serde_json::from_value::<eliot_core::InjectArgs>(request.args.clone()) else {
-        return false;
-    };
-    match args.point {
+    let args = serde_json::from_value::<core::InjectArgs>(request.args.clone()).ok()?;
+    let valid = match args.point {
         eliot_core::InjectPoint::Soonest => true,
         eliot_core::InjectPoint::NextInput => request.expected_turn_id.is_none(),
         eliot_core::InjectPoint::TurnSafePoint => request
@@ -2278,7 +2273,8 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
             .as_deref()
             .is_some_and(|turn_id| !turn_id.is_empty()),
         eliot_core::InjectPoint::ActiveTurn => request.expected_turn_id.is_some(),
-    }
+    };
+    valid.then_some(args.point)
 }
 
 fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
@@ -2360,9 +2356,9 @@ pub(super) fn rule_run_action_binding_error(
     revision: i64,
     event_seq: i64,
     request: &SubmitCommand,
-) -> Result<Option<String>> {
+) -> Result<Option<&'static str>> {
     if !valid_targetless_rule_run_request(request) {
-        return Ok(Some("rule_action_binding_invalid".to_owned()));
+        return Ok(Some("rule_action_binding_invalid"));
     }
     match scripts::validate_rule_run_context_tx(
         tx,
@@ -2373,7 +2369,7 @@ pub(super) fn rule_run_action_binding_error(
         &request.args,
     ) {
         Ok(()) => Ok(None),
-        Err(error) if error.code == "invalid" => Ok(Some("rule_action_binding_invalid".to_owned())),
+        Err(error) if error.code == "invalid" => Ok(Some("rule_action_binding_invalid")),
         Err(error) => Err(error),
     }
 }
@@ -2817,21 +2813,33 @@ fn rule_action_binding_error(
     event: &StoredRuleTrigger,
     event_seq: i64,
     request: &SubmitCommand,
-) -> Option<String> {
-    if !valid_event_rule_action_request(request) {
-        return Some("rule_action_binding_invalid".to_owned());
-    }
+) -> Option<&'static str> {
+    let needs_turn = if request.verb == "inject" {
+        let Some(point) = validated_rule_inject_point(request) else {
+            return Some("rule_action_binding_invalid");
+        };
+        // The retained `at` alias has always required the event's turn binding.
+        request.args.get("point").is_none() || point != core::InjectPoint::NextInput
+    } else {
+        if !valid_event_rule_action_request(request) {
+            return Some("rule_action_binding_invalid");
+        }
+        matches!(
+            request.verb.as_str(),
+            "interrupt" | "steer" | "approve" | "deny" | "answer" | "switch"
+        )
+    };
     if request.verb == "git.publish" {
         let Ok(frozen) =
             serde_json::from_value::<core::api::FrozenGitPublish>(request.args.clone())
         else {
-            return Some("rule_action_binding_invalid".to_owned());
+            return Some("rule_action_binding_invalid");
         };
         return (event.kind != "project.check.passed"
             || frozen.source_event_seq != event_seq
             || event.agent.map(format_agent_id).as_deref() != Some(frozen.agent.as_str())
             || event.generation != Some(frozen.generation))
-        .then(|| "rule_action_binding_invalid".to_owned());
+        .then_some("rule_action_binding_invalid");
     }
     if matches!(
         request.verb.as_str(),
@@ -2848,16 +2856,12 @@ fn rule_action_binding_error(
     }
     if request.target != event.agent.map(format_agent_id)
         || request.expected_generation != event.generation
-        || ((matches!(
-            request.verb.as_str(),
-            "interrupt" | "steer" | "approve" | "deny" | "answer" | "switch"
-        ) || (request.verb == "inject" && request.args["point"] != "next_input"))
-            && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
+        || (needs_turn && request.expected_turn_id.as_deref() != event.turn_id.as_deref())
         || (is_request_reply_verb(request.verb.as_str())
             && (event.kind != "request.opened"
                 || request.request_id.as_deref() != event.request_id.as_deref()))
     {
-        return Some("rule_action_binding_invalid".to_owned());
+        return Some("rule_action_binding_invalid");
     }
     None
 }
