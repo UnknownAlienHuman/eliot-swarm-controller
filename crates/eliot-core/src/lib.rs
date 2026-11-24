@@ -583,6 +583,15 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Retain the selector admitted by the native session separately from a
+    /// model named by the provider on any one turn.
+    pub fn set_admitted_model(&mut self, model: String) {
+        if let Some(Value::Object(effective)) = self.effective.as_mut() {
+            effective.insert("admitted_model".to_owned(), Value::String(model.clone()));
+            effective.insert("model".to_owned(), Value::String(model));
+        }
+    }
+
     pub fn is_automatic_provider_probe(&self) -> bool {
         self.chat
             && !self.observe_only
@@ -2342,7 +2351,14 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 next.native_ref = Some(native_ref);
             }
             if let Some(effective) = optional_effective(event)? {
+                let admitted = api::HarnessCapabilities::of(&agent.harness)
+                    .provider_response_model_verification
+                    .then(|| effective["model"].as_str().map(str::to_owned))
+                    .flatten();
                 next.effective = Some(effective);
+                if let Some(model) = admitted {
+                    next.set_admitted_model(model);
+                }
             }
             next.state = AgentState::Idle;
         }
@@ -2351,11 +2367,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 return Err(bad_state(event, "turn.started requires an idle Agent"));
             }
             let turn_id = required_text(event, "turn_id")?;
-            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
-                && let Some(Value::Object(effective)) = next.effective.as_mut()
-            {
-                effective.insert("model".to_owned(), Value::Null);
-                effective.insert("model_verified".to_owned(), Value::Bool(false));
+            if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification {
+                record_unverified_provider_model(&mut next, None);
             }
             if let Some(trigger) = optional_native_trigger(event)? {
                 if event.data.get("command_id").is_some() {
@@ -2430,7 +2443,10 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 } else if event.data["model_unverified_reason"].as_str()
                     == Some(routing::PROVIDER_MODEL_UNNAMED)
                 {
-                    record_unnamed_provider_model(&mut next);
+                    record_unverified_provider_model(
+                        &mut next,
+                        Some(routing::PROVIDER_MODEL_UNNAMED),
+                    );
                 } else {
                     record_serving_model(&mut next, required_text(event, "model")?);
                 }
@@ -2587,7 +2603,7 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 && event.data["model_unverified_reason"].as_str()
                     == Some(routing::PROVIDER_MODEL_UNNAMED)
             {
-                record_unnamed_provider_model(&mut next);
+                record_unverified_provider_model(&mut next, Some(routing::PROVIDER_MODEL_UNNAMED));
             }
             // A harness-observed MCP inventory rides the terminal the same
             // way an observed model rides its message: merged as the only
@@ -2748,14 +2764,23 @@ fn record_serving_model(agent: &mut Agent, model: String) {
     }
 }
 
-fn record_unnamed_provider_model(agent: &mut Agent) {
+fn record_unverified_provider_model(agent: &mut Agent, reason: Option<&str>) {
     if let Some(Value::Object(effective)) = agent.effective.as_mut() {
-        effective.insert("model".to_owned(), Value::Null);
+        let model = effective
+            .get("admitted_model")
+            .or_else(|| agent.profile_snapshot.get("model"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        effective.insert("model".to_owned(), model);
         effective.insert("model_verified".to_owned(), Value::Bool(false));
-        effective.insert(
-            "model_unverified_reason".to_owned(),
-            Value::String(routing::PROVIDER_MODEL_UNNAMED.to_owned()),
-        );
+        if let Some(reason) = reason {
+            effective.insert(
+                "model_unverified_reason".to_owned(),
+                Value::String(reason.to_owned()),
+            );
+        } else {
+            effective.remove("model_unverified_reason");
+        }
     }
 }
 

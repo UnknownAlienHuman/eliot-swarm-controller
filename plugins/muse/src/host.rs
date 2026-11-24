@@ -72,9 +72,14 @@ fn project_model_catalog(
                 _ => None,
             };
             let is_default = entry.is_default == Some(true);
+            let display_name = entry
+                .model_id
+                .strip_suffix("-contributor")
+                .map(|id| format!("{id} (Contributor)"))
+                .or(entry.display_label);
             serde_json::json!({
                 "id": entry.model_id,
-                "display_name": entry.display_label.as_deref().and_then(eliot_core::api::harness::native_model_display_name),
+                "display_name": display_name.as_deref().and_then(eliot_core::api::harness::native_model_display_name),
                 "default": is_default,
                 "efforts": efforts,
             })
@@ -869,7 +874,7 @@ impl MusePlugin {
             .as_deref()
             .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
         let effective = json!({
-            "model": Value::Null,
+            "model": effective_model.clone(),
             "model_provider": native_session.provider_id.clone(),
             "model_verified": false,
             "cwd": native_session.workspace_root.clone(),
@@ -2342,6 +2347,10 @@ impl MusePlugin {
                 "Muse model/list still returned an empty catalogue",
             )));
         }
+        catalogue::include_cached_contributors(
+            &mut host.catalogue,
+            Path::new(&host.identity.muse_home),
+        );
         let (models, default_id) = project_model_catalog(host.catalogue.models);
         Ok(json!({"models": models, "default": default_id}))
     }

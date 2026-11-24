@@ -1029,11 +1029,16 @@ harness proves what its native turn request carried (Codex reports the
 carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
 `effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
-record on the bound turn. Muse clears model verification on each turn and
-sets it only on a matching foreground provider response. Missing evidence
-keeps the turn successful if its native outcome succeeds and exposes
-`model_unverified_reason`. A mismatch keeps the effective model unset and
-names both IDs in the profile hold, the Owner inbox and `diagnose`
+record on the bound turn. Muse exposes the requested selector in `effective.model`
+as unverified at readiness. The `admitted_model` field retains the selector
+from the native session or the turn's bound configuration revision. On a turn
+lacking provider model evidence, including an exact echo, `effective.model`
+shows that selector, `model_verified` is false, and `model_unverified_reason`
+explains the missing evidence. `swarm show` displays the model and the reason
+when present. The turn retains its native outcome. Muse verifies
+the model only on matching foreground provider evidence. An explicit mismatch
+keeps the effective model unset and names both IDs in the profile hold, the
+Owner inbox and `diagnose`
 (`swarm why`). A later verified response clears stale mismatch metadata.
 Values no turn
 re-proves stay at their admission readback; no value is ever presented as
@@ -2372,18 +2377,19 @@ for explicit paths. Inventory, model discovery, quota and launch resolve one
 `agy` executable. They screen it for the vendor CLI module before running
 bounded `acp --help` and version checks. An IDE executable is refused.
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
-harness's own read-only catalogue (Codex/Muse native `model/list`, OpenCode
-native `opencode models` provider/model ids verbatim, Antigravity
+harness's own read-only catalogue (Codex native `model/list`, Muse native
+`model/list` plus cached vendor Contributor rows, OpenCode native
+`opencode models` provider/model ids verbatim for unscoped reads, Antigravity
 `agy models`; Claude prefers the native `initialize` inventory — selectable
 values with display names and per-model effort levels, no provenance marker —
 and reports the documented aliases and full model ids plus the CLI default,
 each entry carrying `source = "documented_alias"` with `unknown` availability,
 only when the native inventory is unavailable). Each model keeps its native
-`id` and carries an optional `display_name` from the vendor catalogue. The
-plugin preserves the name verbatim when it is non-blank, contains no control
-characters and is at most 512 UTF-8 bytes. Launch and configure catalogues
-display the name when present and the native ID otherwise. Selection in both
-catalogues uses the native ID only.
+`id` and carries an optional `display_name`. Muse labels Contributor choices
+as such. Other vendor display names are preserved when they are non-blank,
+contain no control characters and are at most 512 UTF-8 bytes. Launch and
+configure catalogues display the name when present and the native ID otherwise.
+Selection in both catalogues uses the native ID only.
 The `catalogue`
 member is `native` for a live read (including the Claude native `initialize`
 inventory), `aliases` for the Claude documented-alias fallback when the native
@@ -2400,8 +2406,9 @@ An optional `profile` selects the native route/account
 means ad-hoc daemon defaults. An optional `agent` (exclusive with `profile`)
 selects the controlled Agent's frozen route. For OpenCode it reads the
 owned generation's live session catalogue on every call and reports any read
-failure. Without an Agent, OpenCode discovery is a launch preview and may take
-an existing absolute `workspace` to apply that directory's configuration.
+failure. An unscoped OpenCode read uses native configuration and auth in place.
+A named OpenCode profile reads an isolated preview of its launch inventory.
+Both may take an existing absolute `workspace` to apply that directory's configuration.
 The Agent's harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are

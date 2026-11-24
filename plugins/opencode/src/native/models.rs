@@ -1,7 +1,8 @@
 //! Read-only OpenCode model catalogue from the frozen native child.
 //!
-//! The plugin runs its frozen snapshot `cmd` with `api model.list --standalone`
-//! against a private XDG store: no session, no turn and no inference. The
+//! The plugin runs `models --standalone` for canonical catalogue membership
+//! and `api model.list --standalone` for metadata or scoped launch previews.
+//! Neither creates a session or runs inference. The
 //! bounded child mechanics (exact argv, stdin null, piped
 //! stdout with an output cap, stderr discarded, kill-and-reap under a
 //! deadline, static error strings) live in
@@ -30,6 +31,45 @@ use tokio::time::Instant;
 
 /// Maximum catalogue ids, mirroring `MAX_HARNESS_MODELS` in Core.
 pub(crate) const MAX_MODELS: usize = 1024;
+
+/// Read canonical CLI membership in the order reported by the installed native binary.
+pub(crate) async fn run_canonical_models(
+    program: &OsStr,
+    deadline: Instant,
+    context: &ReaderContext<'_>,
+) -> Result<Vec<String>> {
+    let mut command = context.command(program);
+    command.args(["models", "--standalone"]);
+    let text = run_bounded_utf8(
+        command,
+        512 * 1024,
+        deadline,
+        &BoundedReadLabels {
+            start: "OpenCode models could not start",
+            deadline: "OpenCode models did not finish before its deadline",
+            unreadable: "OpenCode models output was unreadable",
+            status: "OpenCode models did not return a catalogue",
+        },
+    )
+    .await?;
+    let mut ids = Vec::new();
+    for id in text.lines().filter(|line| !line.trim().is_empty()) {
+        if !valid_model_id(id) || !id.contains('/') {
+            return Err(Error::new(
+                "source_integrity",
+                "OpenCode models catalogue is malformed",
+            ));
+        }
+        ids.push(id.to_owned());
+        if ids.len() > MAX_MODELS {
+            return Err(Error::new(
+                "source_integrity",
+                "OpenCode models catalogue exceeds 1024 entries",
+            ));
+        }
+    }
+    Ok(ids)
+}
 
 /// Exact argv for the read-only native model inventory. OpenCode runs this
 /// against the reader's isolated XDG config/data roots, after transferring
