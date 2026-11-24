@@ -2,13 +2,26 @@
 
 use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, NativeQuotaReadback,
+    QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        quota_readback: Some(NativeQuotaReadback {
+            projection: QuotaProjectionFormat::Windows,
+            method: "quota.read",
+            description: |_| "Antigravity account quota; provider read-only values",
+            unsupported_note: None,
+            route_refusal: Some(|_, environment| {
+                ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"]
+                    .into_iter()
+                    .any(|name| environment.get(name).and_then(Value::as_str).is_some_and(|text| !text.is_empty()))
+                    .then_some("Antigravity profile selects external auth; native keyring quota would describe another route")
+            }),
+        }),
         adhoc_launch: Some(AdhocLaunchDefaults {
             permissions: |snapshot, access| {
                 snapshot.insert(

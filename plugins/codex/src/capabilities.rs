@@ -2,7 +2,8 @@
 
 use eliot_core::InjectPoint;
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, NativeAccessBounds,
+    NativeQuotaReadback, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
     CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, CodexApprovalPolicy, CodexPermissions,
@@ -13,6 +14,20 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        quota_readback: Some(NativeQuotaReadback {
+            projection: QuotaProjectionFormat::RateLimits,
+            method: "account/rateLimits/read",
+            description: |_| "Codex account/rateLimits/read; provider read-only values",
+            unsupported_note: Some(
+                "Installed Codex app-server does not support account/rateLimits/read",
+            ),
+            route_refusal: Some(|profile, _| {
+                profile.get("route_binding").is_some_and(|value| !value.is_null()).then_some(
+                    "Codex profile routes through an adopted proxy; ChatGPT account limits would describe the direct route",
+                )
+            }),
+        }),
+        adhoc_effort: Some(AdhocEffort::Freeform),
         adhoc_launch: Some(AdhocLaunchDefaults {
             permissions: adhoc_permissions,
             mcp: eliot_core::McpPolicy::Inherit,
@@ -39,7 +54,7 @@ pub fn declaration() -> HarnessCapabilities {
         reconcile_unfinished_tools: true,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::FrozenStore),
         agent_identity_env: true,
-        launch_default_resolution: true,
+        launch_default_policy: LaunchDefaultPolicy::NativeMarkedDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         compact: true,
         observed_families: eliot_core::OBSERVED_ROLLOUT_FAMILIES,

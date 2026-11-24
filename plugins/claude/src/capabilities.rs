@@ -1,16 +1,31 @@
 //! Claude native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, NativeAccessBounds, NativeQuotaReadback,
+    QuotaProjectionFormat, UserInstructionFiles,
 };
-use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
+use eliot_core::api::native_profile::{
+    CLAUDE_EFFORT_LEVELS, CodexApprovalPolicy, CodexPermissions,
+};
 use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
+    CLAUDE_EXTERNAL_ROUTE_MARKERS, ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting,
+    InstructionReadStatus,
 };
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        quota_readback: Some(NativeQuotaReadback {
+            projection: QuotaProjectionFormat::Windows,
+            method: "quota.read",
+            description: |_| "Claude CLI OAuth usage; provider read-only values",
+            unsupported_note: None,
+            route_refusal: Some(external_quota_route),
+        }),
+        adhoc_effort: Some(AdhocEffort::Choices {
+            values: CLAUDE_EFFORT_LEVELS,
+            refusal: "unknown Claude effort level (low, medium, high, xhigh, or max)",
+        }),
         adhoc_launch: Some(AdhocLaunchDefaults {
             permissions: adhoc_permissions,
             mcp: eliot_core::McpPolicy::Minimal,
@@ -44,6 +59,15 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         ..HarnessCapabilities::default()
     }
+}
+
+fn external_quota_route(_: &Value, environment: &Value) -> Option<&'static str> {
+    environment.as_object()?.iter().any(|(name, value)| {
+        value.as_str().is_some_and(|text| !text.is_empty())
+            && CLAUDE_EXTERNAL_ROUTE_MARKERS.iter().any(|marker| {
+                name.as_str() == *marker || (cfg!(windows) && name.eq_ignore_ascii_case(marker))
+            })
+    }).then_some("Claude profile route is external or ambiguous; CLI OAuth quota would describe an unverified route")
 }
 
 fn adhoc_permissions(

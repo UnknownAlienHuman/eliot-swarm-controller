@@ -1,13 +1,26 @@
 //! Muse native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::{AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds};
+use eliot_core::api::harness::{
+    AdhocAccess, AdhocEffort, AdhocLaunchDefaults, LaunchDefaultPolicy, NativeAccessBounds,
+    NativeQuotaReadback, QuotaProjectionFormat,
+};
 use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        quota_readback: Some(NativeQuotaReadback {
+            projection: QuotaProjectionFormat::UsagePair,
+            method: "usage/read",
+            description: |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
+            unsupported_note: Some(
+                "Installed Muse MSP does not support usage/read and has no retained subscription observation",
+            ),
+            route_refusal: None,
+        }),
+        adhoc_effort: Some(AdhocEffort::Freeform),
         adhoc_launch: Some(AdhocLaunchDefaults {
             permissions: adhoc_permissions,
             mcp: eliot_core::McpPolicy::Inherit,
@@ -28,7 +41,7 @@ pub fn declaration() -> HarnessCapabilities {
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
-        launch_default_resolution: true,
+        launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
         allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,

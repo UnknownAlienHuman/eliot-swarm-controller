@@ -71,7 +71,7 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
 /// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
-pub const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+pub use core::api::native_profile::CLAUDE_EFFORT_LEVELS;
 
 /// Provenance marker for the frozen Claude catalogue entries below: the ids
 /// are documented aliases and full model names, not a live native read.

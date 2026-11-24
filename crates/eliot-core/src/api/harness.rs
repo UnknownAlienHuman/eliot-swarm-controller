@@ -108,11 +108,53 @@ pub struct AdhocLaunchDefaults {
     pub installed_profile_mcp: crate::McpPolicy,
 }
 
+/// Reasoning effort accepted by an ad-hoc launch.
+#[derive(Clone, Copy, Debug)]
+pub enum AdhocEffort {
+    Freeform,
+    Choices {
+        values: &'static [&'static str],
+        refusal: &'static str,
+    },
+}
+
+/// Resolution of an omitted launch model from native catalogue evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaunchDefaultPolicy {
+    #[default]
+    None,
+    NativeMarkedDefault,
+    OmitForServerDefault,
+}
+
+/// Native evidence the daemon can project into shared quota windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaProjectionFormat {
+    RateLimits,
+    IntegrationWindows,
+    UsagePair,
+    Windows,
+}
+
+type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
+
+/// Adapter readback shape and route preflight for provider quota.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeQuotaReadback {
+    pub projection: QuotaProjectionFormat,
+    pub method: &'static str,
+    pub description: fn(&serde_json::Value) -> &'static str,
+    pub unsupported_note: Option<&'static str>,
+    pub route_refusal: Option<QuotaRouteRefusal>,
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
+    /// `None` when the adapter has no ad-hoc effort mapping.
+    pub adhoc_effort: Option<AdhocEffort>,
     /// Translates native permission selectors for cross-harness handoff.
     pub native_access_bounds: Option<NativeAccessReader>,
     /// Workspace-write sessions need extra Git metadata roots to commit.
@@ -206,10 +248,12 @@ pub struct HarnessCapabilities {
     pub native_archive: Option<NativeArchiveBinding>,
     /// Read quota evidence retained from an actual turn.
     pub reads_retained_quota: bool,
+    /// Native shapes accepted for read-only quota projection.
+    pub quota_readback: Option<NativeQuotaReadback>,
     /// Passes the Agent identity variables to the native process.
     pub agent_identity_env: bool,
     /// Resolves a default for a launch command that omits model.
-    pub launch_default_resolution: bool,
+    pub launch_default_policy: LaunchDefaultPolicy,
     /// Injection point for a guard refusal on a live stream, if any.
     pub guard_refusal_point: Option<crate::InjectPoint>,
     /// Manifest verbs this adapter may declare without implementing.

@@ -3722,7 +3722,9 @@ impl Router {
         snapshot: &mut Value,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        if !HarnessCapabilities::of(harness).launch_default_resolution {
+        if HarnessCapabilities::of(harness).launch_default_policy
+            == eliot_core::api::harness::LaunchDefaultPolicy::None
+        {
             return Ok(());
         }
         // Routed Codex profiles keep their own rule: the Responses route
