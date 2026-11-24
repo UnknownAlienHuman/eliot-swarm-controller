@@ -29,6 +29,11 @@ use eliot_core::api::{
     ORGANIZATION_CHANGED_KIND, OrgGroupView, OrgRowChange, OrganizationChangedEvent,
     ReparentRequest, ReparentResponse, SwitchRequest, SwitchResponse, UsageSummaryRequest,
     UsageSummaryResponse,
+    auth_login::{
+        AuthDesktopClaimRequest, AuthDesktopClaimResponse, AuthDesktopPollRequest,
+        AuthDesktopPollResponse, AuthDesktopReportRequest, AuthDesktopReportResponse,
+        AuthLoginRequest, AuthLoginResponse,
+    },
 };
 use eliot_core::{Command, Error, Result};
 use futures_util::StreamExt;
@@ -685,6 +690,47 @@ pub async fn owner_decide(
 ) -> Result<eliot_core::api::OwnerDecideResponse> {
     request.validate()?;
     eliot_daemon::client_call_typed(data_dir, "owner.decide", request).await
+}
+
+/// Queue native sign-in for one harness, optionally bound to the inbox
+/// revision shown by the desktop. This is a direct Owner action, not an
+/// `owner.decide` choice.
+pub async fn auth_login(
+    data_dir: &Path,
+    harness: &str,
+    revision: Option<String>,
+) -> Result<AuthLoginResponse> {
+    let request = AuthLoginRequest {
+        harness: harness.to_owned(),
+        revision,
+    };
+    eliot_daemon::client_call_typed(data_dir, "auth.login", &request).await
+}
+
+/// Read native login work for the interactive Owner desktop.
+pub async fn auth_desktop_poll(data_dir: &Path) -> Result<AuthDesktopPollResponse> {
+    eliot_daemon::client_call_typed(data_dir, "auth.desktop.poll", &AuthDesktopPollRequest {}).await
+}
+
+/// Claim one exact native login task after the desktop is ready to launch it.
+pub async fn auth_desktop_claim(
+    data_dir: &Path,
+    harness: &str,
+    revision: &str,
+) -> Result<AuthDesktopClaimResponse> {
+    let request = AuthDesktopClaimRequest {
+        harness: harness.to_owned(),
+        revision: revision.to_owned(),
+    };
+    eliot_daemon::client_call_typed(data_dir, "auth.desktop.claim", &request).await
+}
+
+/// Report one native login probe or the outcome of its exact console attempt.
+pub async fn auth_desktop_report(
+    data_dir: &Path,
+    request: &AuthDesktopReportRequest,
+) -> Result<AuthDesktopReportResponse> {
+    eliot_daemon::client_call_typed(data_dir, "auth.desktop.report", request).await
 }
 
 pub async fn read_command(data_dir: &Path, id: &str) -> Result<Command> {

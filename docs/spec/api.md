@@ -739,8 +739,8 @@ Errors include
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
 
 `auth_required` on a failed Claude start means the native CLI reported it
-was signed out before any session or prompt was dispatched. The retained
-message names the executable and the command the owner can run to sign in.
+was signed out before any session or prompt was dispatched. Swarm records
+the failure and queues the [Owner sign-in](#owner-harness-sign-in).
 
 `capacity_unavailable` is a pre-effect rejection from a retained prior-generation
 reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement
@@ -774,22 +774,21 @@ the result through the bounded desktop sign-in DTOs. The CLI request itself neve
 opens a headless vendor process or asserts that the desktop action completed.
 
 The daemon retains one durable automatic claim per harness outage until a positive
-read-only probe closes it. An explicit request for open work reports `open`; a request
+read-only probe closes it. An explicit request for open work reports `open`. A request
 inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
 eligible only after five minutes have passed since the last claim and the prior launch
-is known closed or failed. An active or uncertain attempt stays fenced. The exact claim
-and attempt are durable (Store schema 122). If no desktop is present, work remains
-queued. After restart, the interactive desktop reconciles the retained attempt with a
-read-only status probe and reports against the exact peer, harness, revision and attempt.
-The daemon never repeats a vendor login because an RPC reply, desktop connection or
-daemon process was lost. Existing harness-auth holds remain bound to their
-harness/revision until a positive readback settles them.
+is known closed or failed. Store schema 122 retains the claim across daemon restarts.
+The running companion keeps its process handle across reconnects. A lost claim reply
+or a lost companion leaves the launch fenced while its outcome is uncertain. Swarm
+publishes `x.user.notify` when the desktop confirms the sign-in console is open.
+A signed-in probe clears the inbox item and wakes launch arbitration. Scoped provider
+auth holds clear only when bound to the same verified native sign-out and sign-in.
 
-The desktop bridge keeps vendor credentials in the Owner's native configuration or
-OS credential store. Login argv, environment, stdin, Store rows, events, and diagnostics
-contain no token, password, OAuth code, or credential-file content. Vendor status
-commands are read-only and run in that same interactive desktop context; successful
-sign-in is reported only from their positive result. Each harness's supported command
+The native vendor handles the console, browser and credential storage. Swarm passes
+fixed argv and leaves the console streams with the vendor. It never collects passwords,
+codes, tokens or credential-file contents for sign-in. The status command runs in
+the same desktop context and returns only its classified result to the daemon.
+Each harness's supported command
 and explicit unsupported boundary is owned by the [plugin protocol](plugin-protocol.md#owner-sign-in).
 
 ## Agent and daemon read views

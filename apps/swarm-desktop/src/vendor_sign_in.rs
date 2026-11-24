@@ -3,13 +3,12 @@
 use eliot_core::api::{
     HarnessCapabilities,
     auth_login::{
-        AuthDesktopClaimRequest, AuthDesktopClaimResponse, AuthDesktopPollRequest,
-        AuthDesktopPollResponse, AuthDesktopReportRequest, AuthDesktopReportResponse,
+        AuthDesktopClaimResponse, AuthDesktopReportRequest, AuthDesktopReportResponse,
         AuthDesktopState,
     },
     harness::{NativeAuthCheck, NativeAuthState},
 };
-use eliot_daemon::{VendorLoginConsole, client_call_typed, start_vendor_login_console};
+use eliot_daemon::{VendorLoginConsole, start_vendor_login_console};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -93,12 +92,7 @@ async fn run() {
             next_probe.clear();
             previous_data_dir = Some(data_dir.clone());
         }
-        let pending = client_call_typed::<_, AuthDesktopPollResponse>(
-            &data_dir,
-            "auth.desktop.poll",
-            &AuthDesktopPollRequest {},
-        )
-        .await;
+        let pending = crate::client::auth_desktop_poll(&data_dir).await;
         let Ok(pending) = pending else {
             continue;
         };
@@ -136,24 +130,16 @@ async fn run() {
             let Some(command) = capability.login.filter(|_| work.can_claim) else {
                 continue;
             };
-            let request = AuthDesktopClaimRequest {
-                harness: work.harness,
-                revision: work.revision,
-            };
-            let claimed = client_call_typed::<_, AuthDesktopClaimResponse>(
-                &data_dir,
-                "auth.desktop.claim",
-                &request,
-            )
-            .await;
+            let claimed =
+                crate::client::auth_desktop_claim(&data_dir, &work.harness, &work.revision).await;
             if let Ok(AuthDesktopClaimResponse {
                 attempt: Some(attempt),
             }) = claimed
             {
                 let mut attempt = Attempt {
                     data_dir: data_dir.clone(),
-                    harness: request.harness,
-                    revision: request.revision,
+                    harness: work.harness,
+                    revision: work.revision,
                     attempt,
                     console: start_vendor_login_console(command).ok(),
                     open_reported: false,
@@ -173,9 +159,8 @@ async fn report(
     attempt: Option<&str>,
     state: AuthDesktopState,
 ) -> eliot_core::Result<AuthDesktopReportResponse> {
-    client_call_typed(
+    crate::client::auth_desktop_report(
         data_dir,
-        "auth.desktop.report",
         &AuthDesktopReportRequest {
             harness: harness.to_owned(),
             revision: revision.to_owned(),

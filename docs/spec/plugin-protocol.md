@@ -123,19 +123,17 @@ reader reaps the owned helper on a deadline or read failure.
 
 Harness sign-in runs only from the local Owner's interactive desktop session. The CLI's
 `auth.login` call queues or reopens Owner work; it does not launch a vendor executable.
-The desktop polls bounded `AuthDesktopWork` rows, claims only rows with `can_claim`,
-and binds each claim to the exact harness, revision and attempt. A `probe` row runs only
-the read-only status command. A `sign_in` action runs the vendor login command in the
-Owner session. The desktop reports `signed_in`, `signed_out`, `open`, `closed` or
-`failed` against the exact desktop peer and claim. Only positive read-only status
-readback clears the corresponding existing auth hold.
+The desktop polls bounded `AuthDesktopWork` rows. A `probe` runs the read-only status
+command. A claim with `can_claim` authorizes one login invocation bound to the exact
+harness, revision and attempt. A typed sign-in refusal can queue this work automatically.
+The desktop reports `signed_in` or `signed_out` for the exact revision and `open`,
+`closed` or `failed` for the exact attempt. A verified sign-out followed by a positive
+read-only status can clear a bound provider auth hold.
 
-Every login executable uses fixed argument vectors with no credential argument,
-credential environment value or secret stdin. The desktop leaves the Owner's native
-configuration and OS credential store in place; it does not copy authentication files
-into an Agent profile or Eliot data. Interactive vendor output and user-entered values
-are not persisted in Store, events, command results or logs. A lost desktop/RPC result
-does not authorize another login invocation. Durable claims and the five-minute retry
+Every login invocation uses fixed argument vectors and the Owner's native configuration.
+The new console gives the vendor its own interactive streams. Swarm does not capture
+interactive vendor output, user-entered values or authentication files. Durable claims
+and the five-minute retry
 cooldown fence one automatic attempt per harness outage; an explicit retry requires
 five elapsed minutes and a known closed or failed prior launch.
 
@@ -144,7 +142,7 @@ five elapsed minutes and a known closed or failed prior launch.
 | Codex | `login` | `login status` | The Owner's existing native Codex sign-in is used in place. |
 | Claude Code | `auth login` | `auth status --json` | Parse the JSON status even when the vendor command exits nonzero. |
 | Muse | `login` | `usage --json` | Invoke through the installed vendor PowerShell launcher; the public wrapper prepends an incompatible flag. |
-| OpenCode | `auth login` | `auth list --format json` | The native integration picker may select browser, API-key or local options; browser OAuth is not guaranteed. Confirmation covers recorded provider connections only. |
+| OpenCode | `auth login --standalone` | `auth list --format json --standalone` | The native picker supports browser, API-key and local integrations. Confirmation covers recorded provider connections only. |
 | Antigravity | `unsupported` | `unsupported` | Installed AGY 1.5.16 exposes no auth/login subcommand; return `unsupported` without starting a process or substituting another flow. |
 
 The Muse 1.4.25, OpenCode 2.2.7 and Antigravity 1.5.16 observations above were
