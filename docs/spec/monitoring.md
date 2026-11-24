@@ -697,6 +697,9 @@ has complete status and a usable base. It reports files changed, insertions and 
 against that workspace base; a missing or partial work probe leaves the field null.
 These are workspace measurements, not per-Agent authorship facts when more than one
 non-terminal Agent admits the checkout.
+When Git confirms HEAD equals the frozen base, committed paths are empty. A complete,
+clean status in that case also provides zero work counts and the empty diff digest
+directly. The probe still rechecks index and status before publishing the view.
 
 Executable Git filters are disabled, and applicable filter
 attributes make raw status partial; bounded attribution-path coverage can also make a
