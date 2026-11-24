@@ -40,10 +40,9 @@ use crate::native::{
     types::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord, assistant_call_input,
-        assistant_context_used, assistant_model, assistant_text, assistant_tool_use_count,
-        assistant_tool_use_ids, assistant_tool_uses, attach_mcp_readback, frame_context_window,
-        init_mcp_servers, result_session_usage, result_usage, transcript_bytes_in,
-        transcript_config_roots, user_tool_results,
+        assistant_model, assistant_text, assistant_tool_use_count, assistant_tool_use_ids,
+        assistant_tool_uses, attach_mcp_readback, init_mcp_servers, result_session_usage,
+        result_usage, transcript_config_roots, transcript_usage_in, user_tool_results,
     },
 };
 
@@ -494,14 +493,8 @@ struct EventProcessor {
     /// next turn terminal so the reducer merges it into the effective set;
     /// absent until the first post-input init arrives.
     init_mcp_servers: Option<Vec<InitMcpServer>>,
-    /// Model context window from the owned stream's `system`/`init` record
-    /// where the harness reports one. Retained on observation and merged
-    /// into the terminal session fact when the result frame carries none;
-    /// absent until observed, never guessed.
-    init_context_window: Option<(String, i64)>,
-    /// Latest main-thread assistant call's exact native context usage for
-    /// the active turn. Reset at turn boundaries; missing usage stays absent.
-    latest_context_sample: Option<(String, i64)>,
+    /// Served model and native message ID of the latest main-thread call.
+    latest_context_message: Option<(String, String)>,
     first_call_usage: FirstCallUsage,
     closed: bool,
     native: Option<ClaudeClient>,
@@ -973,8 +966,7 @@ impl EventProcessor {
             native_provider_restriction: None,
             native_rate_limit_event: None,
             init_mcp_servers: None,
-            init_context_window: None,
-            latest_context_sample: None,
+            latest_context_message: None,
             first_call_usage: FirstCallUsage::default(),
             closed: false,
             status_tx,
@@ -1438,7 +1430,7 @@ impl EventProcessor {
         self.status.active_turn_id = Some(turn_id.clone());
         self.status.native_unbound = true;
         self.active_input = None;
-        self.latest_context_sample = None;
+        self.latest_context_message = None;
         self.first_call_usage = FirstCallUsage::default();
         self.native_failure = None;
         self.native_provider_restriction = None;
@@ -1473,10 +1465,6 @@ impl EventProcessor {
         if record.get("subtype").and_then(Value::as_str) != Some("init") {
             return;
         }
-        self.init_context_window = record["model"]
-            .as_str()
-            .map(str::to_owned)
-            .zip(frame_context_window(record));
         let Some(servers) = init_mcp_servers(record) else {
             return;
         };
@@ -1630,7 +1618,7 @@ impl EventProcessor {
                 self.status.active_command_id = Some(command_id.clone());
                 self.status.active_turn_id = Some(turn_id.clone());
                 self.active_input = Some(turn_id.clone());
-                self.latest_context_sample = None;
+                self.latest_context_message = None;
                 self.first_call_usage = FirstCallUsage::default();
                 self.native_failure = None;
                 self.native_provider_restriction = None;
@@ -1784,8 +1772,13 @@ impl EventProcessor {
         self.first_call_usage
             .observe(model_output, assistant_call_input(record));
         if main_thread {
-            self.latest_context_sample = if model_output {
-                model.clone().zip(assistant_context_used(record))
+            self.latest_context_message = if model_output {
+                model.clone().zip(
+                    record["message"]["id"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned),
+                )
             } else {
                 None
             };
@@ -3449,25 +3442,25 @@ impl EventProcessor {
         // main-thread single-call context, cumulative `modelUsage` counters,
         // cumulative `total_cost_usd`, and model window where reported), held
         // for the session fact that commits after the accepted terminal.
-        // Occupancy comes only from the exact active turn's latest assistant
-        // message usage; the window prefers the result's matching model.
-        // Transcript size is a read-only exact-filename scan, never a guessed
-        // slug. If all native fields are absent, no session fact is emitted.
+        // The stream binds the latest assistant message. Its finalized
+        // transcript entry provides occupancy and the result supplies capacity.
+        let session_id = self.status.session_id.clone().unwrap_or_default();
+        let roots = transcript_config_roots();
+        let latest_message = self.latest_context_message.take();
+        let latest_model = latest_message.as_ref().map(|(model, _)| model.clone());
+        let transcript = tokio::task::spawn_blocking(move || {
+            transcript_usage_in(&roots, &session_id, latest_message)
+        })
+        .await
+        .ok()
+        .flatten();
         let mut session_usage = result_session_usage(
             record,
-            self.latest_context_sample.as_ref(),
-            self.init_context_window.as_ref(),
+            latest_model.as_deref(),
+            transcript.and_then(|(_, context)| context),
         );
         if let Some(usage) = session_usage.as_mut() {
-            let session_id = self.status.session_id.clone().unwrap_or_default();
-            if !session_id.is_empty() {
-                let roots = transcript_config_roots();
-                usage.session_file_bytes =
-                    tokio::task::spawn_blocking(move || transcript_bytes_in(&roots, &session_id))
-                        .await
-                        .ok()
-                        .flatten();
-            }
+            usage.session_file_bytes = transcript.map(|(size, _)| size);
         }
         let final_text = self.final_text.take();
         if self.empty_after_tool_hooks > 0 {
@@ -3505,7 +3498,6 @@ impl EventProcessor {
         self.status.native_unbound = false;
         self.last_input = self.active_input.take();
         self.native_prefix_ended = false;
-        self.latest_context_sample = None;
         self.interrupted_turn = None;
         self.tool_use_turns.clear();
         self.cancelled_hook_requests.clear();

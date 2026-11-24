@@ -971,9 +971,8 @@ portion written to cache. `total_tokens` is uncached input + cached input +
 output when all three are proven. Reported subtotals carry explicit coverage.
 When a harness includes cache hits in its input total or reports cache
 creation separately, the corresponding cache counter establishes the input
-adjustment. With a missing split, the observed input count stays available
-and the cache counter and complete total stay unavailable. This also applies
-to retained history.
+adjustment. With a missing split, uncached input and the complete total stay
+unavailable. This also applies to cumulative counters and retained history.
 Context occupancy and cumulative cost belong to session facts. A terminal
 without native turn counters or a first-call measurement keeps null usage.
 
@@ -996,7 +995,10 @@ boundary. A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens` carries an actual
-per-call context count and may be retained without a known capacity;
+per-call context count and may be retained without a known capacity. When
+derived from call counters, it includes fresh input, cache creation, cache
+reads, and output including reasoning, each counted once. It measures the
+recorded call's footprint. The next request may have a different context.
 `context_window_tokens` is optional. Shared usage logic reuses an observed window
 when the adapter binds the reading to the same model or native turn. Ratio-based
 occupancy is available only for a positive window with a value between zero and

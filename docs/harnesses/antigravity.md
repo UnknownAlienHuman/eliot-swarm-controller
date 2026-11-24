@@ -364,9 +364,12 @@ attribution, so occupancy changes (compaction can reduce `used`) can never
 read as token expenditure. The adapter folds `usage_update` into the
 retained `SessionUsage` snapshot and commits it as `session.usage` when
 accepted (source `antigravity:usage_update`), with `observed_at` captured at
-acceptance: `used`/`size` replace the retained context
-counters and a supplied cost replaces the retained cumulative cost with
-its verbatim unit. No cumulative input/output/cache counters exist on the `usage_update`
+acceptance. An update reporting `used` or `size` replaces the context pair,
+with any missing member left null. ACP defines a full context observation with
+both fields. When Antigravity supplies cost alone, the adapter retains the previous
+context observation and updates cumulative cost with its verbatim unit.
+[ACP session usage](https://agentclientprotocol.com/rfds/session-usage.md).
+No cumulative input/output/cache counters exist on the `usage_update`
 surface (`cumulative_tokens` stays null), and occupancy/cost are never
 mapped to `TurnUsage`: the session stream alone cannot supply per-turn
 usage. Per-turn usage arrives only on the terminal prompt response above.

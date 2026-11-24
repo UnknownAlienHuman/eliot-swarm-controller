@@ -115,7 +115,7 @@ pub(crate) struct ObserveThresholds {
 #[derive(Debug, Default)]
 struct ObserveTracker {
     episodes: HashMap<String, OpenHeavyEpisode>,
-    warned_growth: HashSet<&'static str>,
+    warned_growth: Option<&'static str>,
     emitted_heavy: HashSet<String>,
     harness: Option<String>,
     session_usage: Option<SessionUsage>,
@@ -2313,8 +2313,7 @@ impl Monitoring {
             let ceiling_growth = target.context_ceiling_tokens.and_then(|ceiling| {
                 let used = usage
                     .as_ref()
-                    .and_then(|usage| usage.context_used_tokens)
-                    .filter(|used| *used >= 0)?;
+                    .and_then(SessionUsage::valid_context_used_tokens)?;
                 (used > ceiling).then(|| {
                     (
                         "context_ceiling",
@@ -2339,25 +2338,23 @@ impl Monitoring {
                 )
                 .map(|warn| (warn.basis_name(), warn.payload()))
             });
-            match growth {
-                Some((basis, payload)) => {
-                    if tracker.warned_growth.insert(basis) {
-                        growth_events.push((eliot_core::SESSION_GROWTH_KIND, payload));
-                    }
+            let basis = growth.as_ref().map(|(basis, _)| *basis);
+            if tracker.warned_growth != basis {
+                if let Some(previous) = tracker.warned_growth {
+                    growth_events.push((
+                        eliot_core::SESSION_GROWTH_KIND,
+                        serde_json::json!({
+                            "basis": previous,
+                            "warn": false,
+                            "message": "session growth warning cleared",
+                            "level": eliot_core::OBSERVE_LEVEL_STANDARD,
+                        }),
+                    ));
                 }
-                None => {
-                    for basis in tracker.warned_growth.drain().collect::<Vec<_>>() {
-                        growth_events.push((
-                            eliot_core::SESSION_GROWTH_KIND,
-                            serde_json::json!({
-                                "basis": basis,
-                                "warn": false,
-                                "message": "session growth cleared; signal is back under threshold",
-                                "level": eliot_core::OBSERVE_LEVEL_STANDARD,
-                            }),
-                        ));
-                    }
+                if let Some((_, payload)) = growth {
+                    growth_events.push((eliot_core::SESSION_GROWTH_KIND, payload));
                 }
+                tracker.warned_growth = basis;
             }
         }
         if heavy.is_empty() && growth_events.is_empty() {

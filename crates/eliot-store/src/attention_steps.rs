@@ -127,34 +127,49 @@ impl Store {
         &self,
         agent: &str,
         generation: i64,
+        current_basis: &str,
     ) -> Result<Option<(i64, Option<String>)>> {
         let agent = parse_agent_id(agent)?;
         let latest = self
             .connection
             .query_row(
-                "SELECT seq, json_extract(data, '$.turn_id'),
-                        COALESCE(json_extract(data, '$.warn'), 1),
-                        json_extract(data, '$.ratio')
+                "SELECT seq, data
                  FROM events WHERE agent = ?1 AND generation = ?2 AND kind = ?3
                    AND kind IN ('session.growth', 'x.user.agent.attention_step')
                  ORDER BY seq DESC LIMIT 1",
                 params![agent, generation, core::SESSION_GROWTH_KIND],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, bool>(2)?,
-                        row.get::<_, Option<f64>>(3)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
             .map_err(sql_error)?;
-        Ok(latest.and_then(|(seq, turn, active, ratio)| {
-            // A reported occupancy above capacity is not a verified signal
-            // for mutating the session. File size is independently measured.
-            (active && ratio.is_none_or(|ratio| ratio <= 1.0)).then_some((seq, turn))
-        }))
+        let Some((seq, data)) = latest else {
+            return Ok(None);
+        };
+        let data: Value = serde_json::from_str(&data)
+            .map_err(|_| Error::new("internal", "invalid retained session growth event"))?;
+        if data
+            .get("warn")
+            .is_some_and(|warn| warn.as_bool() != Some(true))
+            || data["basis"].as_str() != Some(current_basis)
+        {
+            return Ok(None);
+        }
+        let measured = match current_basis {
+            "context_ratio" => {
+                data["context_used_tokens"]
+                    .as_i64()
+                    .zip(data["context_window_tokens"].as_i64())
+                    .is_some_and(|(used, window)| window > 0 && (0..=window).contains(&used))
+                    && data["ratio"]
+                        .as_f64()
+                        .is_some_and(|ratio| (0.0..=1.0).contains(&ratio))
+            }
+            "session_file_bytes" => data["session_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            _ => false,
+        };
+        Ok(measured.then(|| (seq, data["turn_id"].as_str().map(str::to_owned))))
     }
 
     /// Reserve one reaction before any command may be sent. A lost response

@@ -207,12 +207,14 @@ sum at `main_loop_turn` scope, with each counter available when every
 included message supplies it. The Store folds cache creation into
 uncached input and reasoning into output when projecting these counters.
 The newest assistant message in that exact input-to-idle slice also supplies a
-per-call context count when `input`, `cache.read` and `cache.write` are all present:
-their checked sum is committed as `session.usage.context_used_tokens` with
-`source = "opencode:assistant_message_tokens"` and no context window. Missing
-counters stay unknown. This is one latest call sample, not a turn or session total;
-it supports an absolute profile context ceiling, while context-ratio checks remain
-unavailable without a reported window.
+per-call context count when `input`, `cache.read`, `cache.write`, `output`
+and `reasoning` are all present. Their checked sum is committed as
+`session.usage.context_used_tokens` with `source = "opencode:assistant_message_tokens"`
+and no context window. A terminal without a complete sample clears that context
+count. The sum matches OpenCode's measured compaction anchor for the latest
+model call. It supports an absolute profile context ceiling. Ratio checks
+require a reported window.
+[OpenCode 2.2.7 compaction](https://github.com/anomalyco/opencode/blob/fedc6f208aa2bd54c1019227214568083f6380ad/packages/core/src/session/compaction.ts).
 
 ## Source ownership and recovery
 
