@@ -197,7 +197,8 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
 /// Frozen Codex response route across aliases. Use the account and the selector
 /// that supplies credentials for this route. Never hash or retain a credential.
 pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
-    if snapshot["harness"] != "codex" {
+    let capabilities = crate::api::HarnessCapabilities::for_harness(snapshot["harness"].as_str()?)?;
+    if !capabilities.provider_response_withholding {
         return None;
     }
     let account = snapshot["account"].as_str();
