@@ -83,9 +83,17 @@ impl CommandGuardPolicy {
 
     pub(crate) fn refusal(&self, commands: &[String]) -> Option<&str> {
         for command in commands {
+            let segments: Vec<_> = command_segments(command)
+                .map(|segment| (segment, windows_executable_form(segment)))
+                .collect();
             for rule in &self.rules {
                 if rule.matcher.is_match(command)
-                    || command_segments(command).any(|segment| rule.matcher.is_match(segment))
+                    || segments.iter().any(|(segment, canonical)| {
+                        rule.matcher.is_match(segment)
+                            || canonical
+                                .as_ref()
+                                .is_some_and(|text| rule.matcher.is_match(text))
+                    })
                 {
                     return Some(rule.refusal.as_str());
                 }
@@ -93,6 +101,33 @@ impl CommandGuardPolicy {
         }
         None
     }
+}
+
+/// Retain arguments verbatim while also matching the Windows executable's
+/// bare name. Quoted paths can contain spaces. No shell expansion is performed.
+fn windows_executable_form(segment: &str) -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let (executable, rest) =
+        if let Some(quote) = segment.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
+            let (executable, rest) = segment[1..].split_once(quote)?;
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            (executable, rest)
+        } else {
+            segment.split_at(segment.find(char::is_whitespace).unwrap_or(segment.len()))
+        };
+    let basename = executable.rsplit(['/', '\\']).next()?;
+    let stem = basename
+        .get(basename.len().saturating_sub(4)..)
+        .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        .map_or(basename, |_| &basename[..basename.len() - 4]);
+    if stem.is_empty() || stem.len() + rest.len() == segment.len() {
+        return None;
+    }
+    Some(format!("{stem}{rest}"))
 }
 
 /// Match unquoted shell list separators without interpreting or executing
