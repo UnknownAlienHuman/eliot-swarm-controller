@@ -1147,6 +1147,7 @@ impl Store {
                 &next,
             )?;
             if !observed
+                && !resolves_recovered
                 && batch.source == "stream"
                 && let Some(event) =
                     provider_response_withheld_event_tx(&tx, &next, native_event, now)?

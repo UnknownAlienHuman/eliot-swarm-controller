@@ -382,7 +382,16 @@ fn require_handoff_bounds(
     workspace: Option<&str>,
     profile: Option<&str>,
     requested_by: Option<&str>,
+    reason: Option<HandoffReason>,
 ) -> Result<()> {
+    if reason == Some(HandoffReason::ProviderResponseWithheld)
+        && core::same_codex_provider_route(&source.profile_snapshot, successor)
+    {
+        return Err(Error::new(
+            "not_allowed",
+            "successor resolved to the Codex provider route that withheld the response",
+        ));
+    }
     if let Some(reason) = core::handoff_authority_refusal(&source.profile_snapshot, successor) {
         return Err(Error::new(
             "not_allowed",
@@ -1476,6 +1485,7 @@ impl Store {
                     request.args.get("workspace").and_then(Value::as_str),
                     request.args.get("profile").and_then(Value::as_str),
                     requested_by.as_deref(),
+                    continuation.map(|value| value.reason),
                 )?;
             }
             if let Some(held_since) = continuation.and_then(|value| value.held_since)
@@ -1762,6 +1772,7 @@ impl Store {
                             destination.workspace.as_deref(),
                             Some(destination.profile.as_str()),
                             requested_by.as_deref(),
+                            handoff_reason,
                         )?;
                     }
                     let source_num = parse_agent_id(&request.from)?;

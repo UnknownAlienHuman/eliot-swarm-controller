@@ -352,6 +352,7 @@ impl Router {
                         reason,
                         kind,
                         held_since: None,
+                        withheld_event_seq: None,
                     };
                     if let Ok(events) = store.record_handoff_waiting(&candidate, &message, now_ms())
                     {
@@ -514,17 +515,6 @@ impl Router {
                 ));
             }
             if let Some((_, choice, identity)) = provider_route {
-                if continuation.is_some_and(|value| {
-                    value.reason == HandoffReason::ProviderResponseWithheld
-                }) && eliot_core::same_codex_provider_route(
-                    &source.profile_snapshot,
-                    &prepared.request.args["profile_snapshot"],
-                ) {
-                    return Err(Error::new(
-                        "not_allowed",
-                        "successor resolved to the Codex provider route that withheld the response",
-                    ));
-                }
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity
                 {

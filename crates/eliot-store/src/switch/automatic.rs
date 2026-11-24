@@ -27,15 +27,6 @@ pub struct AutomaticHandoff {
     pub kind: Option<core::ProviderRestrictionKind>,
     pub held_since: Option<i64>,
     pub withheld_event_seq: Option<i64>,
-    pub withheld_turn_id: Option<String>,
-    pub withheld_task_command: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-struct WithheldWork {
-    event_seq: i64,
-    turn_id: String,
-    task_command: String,
 }
 
 fn lineage_for(
@@ -334,58 +325,35 @@ pub(super) fn hold_is_current(tx: &Connection, agent: &Agent, held_since: i64) -
     Ok(current == Some(held_since))
 }
 
-fn withheld_binding_is_current(
+fn current_withheld_turn(
     connection: &Connection,
     agent: &Agent,
-    work: &WithheldWork,
-) -> Result<bool> {
+    event_seq: i64,
+) -> Result<Option<String>> {
     let agent_num = parse_agent_id(&agent.id)?;
     connection
         .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM events e
+            "SELECT t.turn_id FROM events e
                  JOIN turns t ON t.agent = e.agent AND t.generation = e.generation
                    AND t.turn_id = json_extract(e.data, '$.turn_id')
-                 JOIN commands c ON c.id = ?4
-                 WHERE e.seq = ?5 AND e.kind = 'provider.response_withheld'
+                 JOIN commands c ON c.id = json_extract(e.data, '$.task_command')
+                 WHERE e.seq = ?3 AND e.kind = 'provider.response_withheld'
                    AND e.source = 'provider' AND e.agent = ?1 AND e.generation = ?2
-                   AND json_extract(e.data, '$.turn_id') = ?3
-                   AND json_extract(e.data, '$.task_command') = ?4
-                   AND t.start_command_id = ?4 AND t.state = 'completed'
+                   AND t.start_command_id = c.id AND t.state = 'completed'
                    AND t.outcome = 'failure' AND t.resolution_source IS NULL
                    AND t.insertion_seq = (
                        SELECT MAX(latest.insertion_seq) FROM turns latest
                        WHERE latest.agent = t.agent AND latest.generation = t.generation
                    )
                    AND c.target = ?1 AND c.generation = ?2 AND c.verb = 'send'
-                   AND c.turn_id = ?3 AND c.state = 'applied'
+                   AND c.turn_id = t.turn_id AND c.state = 'applied'
                    AND (SELECT COUNT(*) FROM turns bound
                         WHERE bound.agent = ?1 AND bound.generation = ?2
-                          AND bound.start_command_id = ?4) = 1
-                   AND (SELECT COUNT(*) FROM events duplicate
-                        WHERE duplicate.agent = ?1 AND duplicate.generation = ?2
-                          AND duplicate.kind = 'provider.response_withheld'
-                          AND json_extract(duplicate.data, '$.turn_id') = ?3) = 1
-                   AND (SELECT COUNT(*) FROM events duplicate
-                        WHERE duplicate.agent = ?1 AND duplicate.generation = ?2
-                          AND duplicate.kind = 'provider.response_withheld'
-                          AND json_extract(duplicate.data, '$.task_command') = ?4) = 1
-                   AND NOT EXISTS(
-                       SELECT 1 FROM events resolved
-                       WHERE resolved.agent = ?1 AND resolved.generation = ?2
-                         AND resolved.kind = 'turn.resolved'
-                         AND json_extract(resolved.data, '$.turn_id') = ?3
-                   )
-             )",
-            params![
-                agent_num,
-                agent.generation,
-                work.turn_id,
-                work.task_command,
-                work.event_seq
-            ],
+                          AND bound.start_command_id = c.id) = 1",
+            params![agent_num, agent.generation, event_seq],
             |row| row.get(0),
         )
+        .optional()
         .map_err(sql_error)
 }
 
@@ -431,7 +399,7 @@ fn owed_work(
     connection: &Connection,
     agent: &Agent,
     reason: HandoffReason,
-    withheld: Option<&WithheldWork>,
+    withheld_turn: Option<&str>,
     limits: core::api::HierarchyLimits,
     now: i64,
 ) -> Result<Option<OwedWork>> {
@@ -512,9 +480,7 @@ fn owed_work(
             )
             .map_err(sql_error)?,
         (HandoffReason::SessionLost, Some(_)) => true,
-        (HandoffReason::ProviderResponseWithheld, Some(turn)) => {
-            withheld.is_some_and(|work| work.turn_id == turn)
-        }
+        (HandoffReason::ProviderResponseWithheld, Some(turn)) => withheld_turn == Some(turn),
         _ => false,
     };
     if commands.is_empty() && !goal_active && !turn_owed {
@@ -595,8 +561,7 @@ impl Store {
         let mut withheld = self
             .connection
             .prepare_cached(
-                "SELECT a.id, e.seq, json_extract(e.data, '$.turn_id'),
-                        json_extract(e.data, '$.task_command')
+                "SELECT a.id, e.seq
                  FROM events e INDEXED BY events_kind
                  JOIN agents a ON a.id = e.agent AND a.generation = e.generation
                  JOIN turns t ON t.agent = a.id AND t.generation = a.generation
@@ -604,6 +569,8 @@ impl Store {
                  WHERE e.kind = 'provider.response_withheld' AND e.source = 'provider'
                    AND a.state IN ('idle','lost','failed') AND a.chat = 0
                    AND a.observe_only = 0 AND a.archived = 0 AND a.project <> ''
+                   AND NOT EXISTS(SELECT 1 FROM agent_successors s
+                                  WHERE s.agent = a.id AND s.generation = a.generation)
                    AND t.insertion_seq = (
                        SELECT MAX(latest.insertion_seq) FROM turns latest
                        WHERE latest.agent = t.agent AND latest.generation = t.generation
@@ -612,38 +579,23 @@ impl Store {
             )
             .map_err(sql_error)?;
         let withheld = withheld
-            .query_map([WITHHELD_SCAN_LIMIT], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            })
+            .query_map([WITHHELD_SCAN_LIMIT], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
-        for (id, event_seq, turn_id, task_command) in withheld {
+        for (id, event_seq) in withheld {
             if !withheld_agents.contains(&id) {
                 withheld_agents.push(id);
             }
             if candidates.len() == limit {
                 break;
             }
-            let (Some(turn_id), Some(task_command)) = (turn_id, task_command) else {
-                continue;
-            };
             let Some(agent) = load_agent_by_num(&self.connection, id)? else {
                 continue;
             };
-            let work = WithheldWork {
-                event_seq,
-                turn_id,
-                task_command,
-            };
-            if !withheld_binding_is_current(&self.connection, &agent, &work)? {
+            let Some(turn_id) = current_withheld_turn(&self.connection, &agent, event_seq)? else {
                 continue;
-            }
+            };
             if agent.is_terminal()
                 && handoff::session_exit_blocker(&self.connection, &agent)?.is_some()
             {
@@ -678,7 +630,7 @@ impl Store {
                 &self.connection,
                 &agent,
                 HandoffReason::ProviderResponseWithheld,
-                Some(&work),
+                Some(&turn_id),
                 self.hierarchy_limits,
                 now,
             )?
@@ -689,9 +641,7 @@ impl Store {
                     reason: HandoffReason::ProviderResponseWithheld,
                     kind: None,
                     held_since: None,
-                    withheld_event_seq: Some(work.event_seq),
-                    withheld_turn_id: Some(work.turn_id),
-                    withheld_task_command: Some(work.task_command),
+                    withheld_event_seq: Some(event_seq),
                 });
             }
         }
@@ -801,8 +751,6 @@ impl Store {
                     kind,
                     held_since,
                     withheld_event_seq: None,
-                    withheld_turn_id: None,
-                    withheld_task_command: None,
                 });
             }
         }
@@ -833,23 +781,14 @@ impl Store {
             else {
                 return Ok(none());
             };
-            let withheld = if candidate.reason == HandoffReason::ProviderResponseWithheld {
-                let (Some(event_seq), Some(turn_id), Some(task_command)) = (
-                    candidate.withheld_event_seq,
-                    candidate.withheld_turn_id.as_deref(),
-                    candidate.withheld_task_command.as_deref(),
-                ) else {
+            let withheld_turn = if candidate.reason == HandoffReason::ProviderResponseWithheld {
+                let Some(event_seq) = candidate.withheld_event_seq else {
                     return Ok(none());
                 };
-                let work = WithheldWork {
-                    event_seq,
-                    turn_id: turn_id.to_owned(),
-                    task_command: task_command.to_owned(),
-                };
-                if !withheld_binding_is_current(&tx, &agent, &work)? {
+                let Some(turn_id) = current_withheld_turn(&tx, &agent, event_seq)? else {
                     return Ok(none());
-                }
-                Some(work)
+                };
+                Some(turn_id)
             } else {
                 None
             };
@@ -876,7 +815,7 @@ impl Store {
                 &tx,
                 &agent,
                 candidate.reason,
-                withheld.as_ref(),
+                withheld_turn.as_deref(),
                 self.hierarchy_limits,
                 now,
             )?
