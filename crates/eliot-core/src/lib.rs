@@ -2354,7 +2354,11 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
                 && let Some(Value::Object(effective)) = next.effective.as_mut()
             {
-                effective.insert("model".to_owned(), Value::Null);
+                // Muse's session.ready model is its native-admitted selector;
+                // keep it visible while this turn's response remains unverified.
+                if agent.harness != "muse" {
+                    effective.insert("model".to_owned(), Value::Null);
+                }
                 effective.insert("model_verified".to_owned(), Value::Bool(false));
             }
             if let Some(trigger) = optional_native_trigger(event)? {
@@ -2750,7 +2754,11 @@ fn record_serving_model(agent: &mut Agent, model: String) {
 
 fn record_unnamed_provider_model(agent: &mut Agent) {
     if let Some(Value::Object(effective)) = agent.effective.as_mut() {
-        effective.insert("model".to_owned(), Value::Null);
+        // Preserve Muse's admitted selector as display data; the missing
+        // provider response still leaves it unverified.
+        if agent.harness != "muse" {
+            effective.insert("model".to_owned(), Value::Null);
+        }
         effective.insert("model_verified".to_owned(), Value::Bool(false));
         effective.insert(
             "model_unverified_reason".to_owned(),

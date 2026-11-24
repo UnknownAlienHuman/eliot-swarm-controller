@@ -874,7 +874,7 @@ impl MusePlugin {
             .as_deref()
             .is_some_and(|approval| effective_approval.as_deref() == Some(approval));
         let effective = json!({
-            "model": Value::Null,
+            "model": effective_model.clone(),
             "model_provider": native_session.provider_id.clone(),
             "model_verified": false,
             "cwd": native_session.workspace_root.clone(),
