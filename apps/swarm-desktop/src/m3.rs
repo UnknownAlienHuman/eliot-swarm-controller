@@ -322,11 +322,17 @@ pub fn steer_button(palette: Palette) -> Button {
     send_button(palette).resource_overrides(palette.steer_fab())
 }
 
-/// The New task button: `primary-container`, 40 DIPs.
+/// The New task button: `primary-container`, 40 DIPs, the square
+/// button's `radius-medium` (the card pressable style: its corner, its
+/// 12-DIP inset and its `elevation-1` under the pointer).
 pub fn new_task_button(palette: Palette) -> Button {
-    row(palette, false)
+    Button::new()
         .resource_overrides(palette.new_task())
+        .style(ButtonStyle::Accent)
+        .height(height::NEW_TASK)
         .min_height(height::NEW_TASK)
+        .horizontal_alignment(HorizontalAlignment::Stretch)
+        .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
 
 /// Stop's mark: a filled 12-DIP square in `on-error`.
