@@ -2894,9 +2894,12 @@ impl Router {
                     json!({"expected_tip": tip})
                 }
             };
+            // Cleanup already rechecked the caller and exact subtree item
+            // under the Store lock. The derived command runs through the
+            // daemon's Owner-only removal lane; the job retains its caller.
             let admission = self.admit_prepared_submission(
                 &mut store,
-                principal,
+                "owner",
                 PreparedSubmission {
                     request,
                     workspace: None,

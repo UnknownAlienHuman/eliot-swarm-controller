@@ -63,7 +63,10 @@ it between kept and safe without moving the revision), or an unresolvable
 cursor rejects the continued page as stale. Automatic retirement filters the exact Agent,
 generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project
-or all. Terminal means Stopped or Failed with no open native source, pending
+or all. A manager's admitted cleanup job retains the manager principal. After
+rechecking that authority and the selected artifact, the daemon issues the
+derived worktree removal through the same guarded command as local Owner removal.
+Direct `worktree.remove` remains Owner-only. Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
 Clean managed worktrees require exact reciprocal Git/common-directory identity.
 Tracked changes and untracked or ignored paths outside frozen scratch paths keep the

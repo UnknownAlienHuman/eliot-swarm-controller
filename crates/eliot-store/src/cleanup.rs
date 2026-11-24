@@ -1143,7 +1143,7 @@ impl Store {
                     continue;
                 };
                 if command.verb != "worktree.remove"
-                    || command.principal != principal
+                    || (command.principal != "owner" && command.principal != principal)
                     || command.target.as_deref() != Some(artifact.agent.as_str())
                     || command.generation != Some(artifact.generation)
                     || command.state != CommandState::Applied
