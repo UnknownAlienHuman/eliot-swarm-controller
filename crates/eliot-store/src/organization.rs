@@ -66,7 +66,7 @@ fn organization_watermark(conn: &Connection) -> Result<i64> {
     .map_err(sql_error)
 }
 
-fn decode_tags(raw: &str) -> Result<Vec<String>> {
+pub(super) fn decode_tags(raw: &str) -> Result<Vec<String>> {
     let tags: Vec<String> = serde_json::from_str(raw)
         .map_err(|_| Error::new("source_integrity", "stored tags invalid"))?;
     if tags.len() > eliot_core::api::MAX_ORG_TAGS {
@@ -188,7 +188,7 @@ fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Resul
 /// A legacy Agent whose retained project label is a checkout path groups
 /// under the registration of that exact path, without rewriting the
 /// retained label; two registrations on one path stay unplaced (ambiguous).
-fn organization_group() -> String {
+pub(super) fn organization_group() -> String {
     let path = checkout_key_sql("a.project");
     let checkout = checkout_key_sql("r.checkout");
     format!(
