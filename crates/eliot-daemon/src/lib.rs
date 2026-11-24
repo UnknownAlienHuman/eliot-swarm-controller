@@ -50,9 +50,10 @@ pub use daemon::{
     CallTimings, DaemonStartupFailure, MAX_RPC_FRAME_BYTES, StoreCompactionOutcome,
     StoreCompactionSpaceEstimate, client_call, client_call_measured, client_call_typed,
     client_call_with_agent_identity, client_call_with_agent_mcp_tool,
-    client_call_with_owner_credential, compact_store_offline, daemon_connect_hint,
-    daemon_failure_since, last_daemon_failure, last_daemon_phase, require_agent_identity, run,
-    wait_command, wait_terminal,
+    client_call_with_explicit_agent_mcp_tool, client_call_with_owner_credential,
+    compact_store_offline, daemon_connect_hint, daemon_failure_since, last_daemon_failure,
+    last_daemon_phase, require_agent_identity, run, run_for_update_with_agent_mcp_url,
+    run_with_agent_mcp_url, verify_explicit_agent_identity, wait_command, wait_terminal,
 };
 pub use daemon::{client_call_with_remote_context, client_call_with_remote_mcp_tool};
 pub use platform::data_dir::{

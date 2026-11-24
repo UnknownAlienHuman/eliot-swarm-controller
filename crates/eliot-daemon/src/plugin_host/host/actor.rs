@@ -369,6 +369,10 @@ async fn run_agent_startup(
     let start_params = AgentStartParams {
         agent_id: actor.agent.id.clone(),
         generation: actor.agent.generation,
+        agent_mcp_url: actor
+            .state
+            .upgrade()
+            .and_then(|state| state.agent_mcp_url.clone()),
         command_id: actor.start_command.id.clone(),
         owner_rules: actor.owner_rules.clone(),
         profile: Some({

@@ -117,13 +117,17 @@ on the owned stream and successful `initialize` readback. If managed hook policy
 disables hooks or excludes the supplied hook, the CLI can omit the session proof
 and readiness times out.
 
-Each owned Claude CLI launch also receives a private per-session `--mcp-config`
-file in the Eliot-created Agent instance directory. It registers the standard
-`swarm` tool through an `eliot-swarm` stdio server using the current Eliot executable and explicit
-`--data-dir <ELIOT_HOME> mcp --require-agent` arguments. The config contains no
-identity values; the server inherits the Agent id, generation, and token from
-the native process environment, and `--require-agent` fails closed. The file remains with
-the owned CLI and is removed after confirmed stop and drain.
+Each owned Claude CLI receives a private per-generation `--mcp-config` file
+registering the `swarm` tool as `eliot-swarm`. Eligible launches use the
+daemon's shared Streamable HTTP listener at `http://127.0.0.1:<port>/mcp`.
+The file carries the Agent ID, generation, and bearer credential. Every
+request verifies that exact identity through the local Agent-authenticated API.
+
+A configured proxy, a managed MCP policy, or a native setting that may
+redirect or restrict the connection keeps the generation-local
+`swarm mcp --require-agent` stdio registration. The config file is removed
+after confirmed stop and drain. Both transports use the same native arguments,
+MCP policy, and Agent authority.
 
 ### Worker MCP policy
 

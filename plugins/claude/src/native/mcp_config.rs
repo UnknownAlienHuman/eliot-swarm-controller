@@ -41,6 +41,7 @@ impl ClaudeMcpConfigFile {
         swarm_binary: &Path,
         data_root: &Path,
         environment: &[(OsString, OsString)],
+        agent_mcp_url: Option<&str>,
     ) -> Result<Self> {
         if !instance_dir.is_absolute() || !instance_dir.is_dir() {
             return Err(Error::new(
@@ -64,7 +65,7 @@ impl ClaudeMcpConfigFile {
         let data_dir = data_root
             .to_str()
             .ok_or_else(|| Error::new("invalid", "Claude MCP data-root path is not UTF-8"))?;
-        let environment = environment
+        let environment_json = environment
             .iter()
             .map(|(name, value)| {
                 (
@@ -73,15 +74,34 @@ impl ClaudeMcpConfigFile {
                 )
             })
             .collect::<serde_json::Map<_, _>>();
-        let config = json!({
-            "mcpServers": {
-                WORKER_SWARM_MCP_SERVER_NAME: {
-                    "command": command,
-                    "args": worker_swarm_mcp_args(data_dir),
-                    "env": environment,
-                }
-            }
-        });
+        let server = if let Some(url) = agent_mcp_url {
+            validate_agent_mcp_url(url)?;
+            let find = |name: &str| {
+                environment
+                    .iter()
+                    .find(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value.to_string_lossy().into_owned())
+            };
+            let agent_id = find("ELIOT_AGENT_ID").ok_or_else(|| {
+                Error::new("not_allowed", "Claude Agent MCP identity is incomplete")
+            })?;
+            let generation = find("ELIOT_AGENT_GENERATION").ok_or_else(|| {
+                Error::new("not_allowed", "Claude Agent MCP identity is incomplete")
+            })?;
+            let token = find("ELIOT_AGENT_TOKEN")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    Error::new("not_allowed", "Claude Agent MCP identity is incomplete")
+                })?;
+            json!({"type":"http", "url":url, "headers":{
+                "x-eliot-agent-id":agent_id,
+                "x-eliot-agent-generation":generation,
+                "Authorization":format!("Bearer {token}")
+            }})
+        } else {
+            json!({"command":command,"args":worker_swarm_mcp_args(data_dir),"env":environment_json})
+        };
+        let config = json!({"mcpServers": {WORKER_SWARM_MCP_SERVER_NAME: server}});
         let contents = serde_json::to_vec(&config)
             .map_err(|_| Error::new("internal", "Claude MCP config could not be encoded"))?;
         let path = instance_dir.join("claude-mcp-config.json");
@@ -97,6 +117,21 @@ impl ClaudeMcpConfigFile {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn validate_agent_mcp_url(url: &str) -> Result<()> {
+    let port = url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|url| url.strip_suffix("/mcp"))
+        .filter(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|port| port.parse::<u16>().ok());
+    if port.is_none_or(|port| port == 0) {
+        return Err(Error::new(
+            "not_allowed",
+            "Claude Agent MCP bridge URL must target 127.0.0.1 with an explicit port and /mcp path",
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for ClaudeMcpConfigFile {

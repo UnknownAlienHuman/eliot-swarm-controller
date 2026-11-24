@@ -5,7 +5,7 @@
 //! Owner transports and refuses sources it cannot scan. Daemon authentication
 //! owns the authority boundary.
 //! The native launch additionally denies the configured owner HTTP hostname
-//! across settings scopes; the daemon-generated Agent server stays stdio.
+//! across settings scopes.
 //!
 //! The scan covers the effective user settings/config root and the native
 //! workspace project/local scopes. Managed files, installed plugins and
@@ -210,6 +210,13 @@ fn refuse_unscanned_sources(root: &Path, connectors: Option<&str>) -> Result<()>
             return Err(incomplete(source));
         }
     }
+    if system_managed_settings_present()? {
+        return Err(incomplete("system managed settings"));
+    }
+    Ok(())
+}
+
+fn system_managed_settings_present() -> Result<bool> {
     let managed = if cfg!(windows) {
         Path::new(r"C:\Program Files\ClaudeCode")
     } else if cfg!(target_os = "macos") {
@@ -227,10 +234,71 @@ fn refuse_unscanned_sources(root: &Path, connectors: Option<&str>) -> Result<()>
             .try_exists()
             .map_err(|_| incomplete("system managed settings"))?
         {
-            return Err(incomplete("system managed settings"));
+            return Ok(true);
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Retain the native stdio representation when settings may redirect the
+/// request or select allowed MCP servers by command/URL.
+pub(crate) fn agent_http_allowed(workspace: &Path, config_dir: Option<&str>) -> bool {
+    if !matches!(system_managed_settings_present(), Ok(false)) {
+        return false;
+    }
+    let root = match config_dir {
+        Some(path) if Path::new(path).is_absolute() => PathBuf::from(path),
+        None => match owner_home() {
+            Some(home) => home.join(".claude"),
+            None => return false,
+        },
+        _ => return false,
+    };
+    if !matches!(root.join("remote-settings.json").try_exists(), Ok(false)) {
+        return false;
+    }
+    let project = workspace
+        .ancestors()
+        .find(|directory| directory.join(".git").exists())
+        .unwrap_or(workspace);
+    [
+        root.join("settings.json"),
+        project.join(".claude/settings.json"),
+        project.join(".claude/settings.local.json"),
+        workspace.join(".claude/settings.json"),
+        workspace.join(".claude/settings.local.json"),
+    ]
+    .into_iter()
+    .all(|path| {
+        match shared_scan::read_jsonc_document(&path, "Claude MCP settings", MAX_OWNER_SCAN_BYTES) {
+            Ok(None) => true,
+            Ok(Some(settings)) => {
+                ![
+                    "allowedMcpServers",
+                    "deniedMcpServers",
+                    "allowManagedMcpServersOnly",
+                    "managedMcpServers",
+                ]
+                .iter()
+                .any(|key| settings.get(*key).is_some())
+                    && settings.get("env").is_none_or(|env| {
+                        env.as_object().is_some_and(|env| {
+                            !env.keys().any(|key| {
+                                [
+                                    "HTTP_PROXY",
+                                    "HTTPS_PROXY",
+                                    "ALL_PROXY",
+                                    "CLAUDE_CONFIG_DIR",
+                                ]
+                                .iter()
+                                .any(|name| key.eq_ignore_ascii_case(name))
+                            })
+                        })
+                    })
+            }
+            Err(_) => false,
+        }
+    })
 }
 
 /// Read bounded source data without invoking the CLI or contacting servers.

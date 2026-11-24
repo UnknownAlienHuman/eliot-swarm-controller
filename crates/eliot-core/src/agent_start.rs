@@ -12,6 +12,9 @@ use serde_json::Value;
 pub struct AgentStartParams {
     pub agent_id: String,
     pub generation: i64,
+    /// Foreground daemon's runtime-only Agent MCP bridge URL, if enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_mcp_url: Option<String>,
     pub command_id: String,
     #[serde(default)]
     pub profile: Option<Value>,
@@ -74,6 +77,7 @@ impl AgentStartParams {
         Self {
             agent_id: agent_id.into(),
             generation,
+            agent_mcp_url: None,
             command_id: command_id.into(),
             profile: None,
             owner_rules: None,

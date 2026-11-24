@@ -385,6 +385,18 @@ requests carry fresh server-generated connection/call correlation without invent
 a session. `clientInfo` is untrusted and unused. No local Agent/PID or generation
 is created for a remote caller.
 
+The foreground daemon also owns one separate Agent-only HTTP listener on an
+ephemeral `127.0.0.1` port. Its runtime URL is passed to native plugin start
+requests and is never persisted. Claude uses this bridge only when its effective
+environment has no nonempty `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`; otherwise
+it retains the per-session stdio MCP server. Each POST requires exact
+`x-eliot-agent-id`, `x-eliot-agent-generation`, and `Authorization: Bearer`
+headers. The bridge verifies them through Agent-authenticated `api.identity`
+before rmcp dispatch and uses the same exact identity for every tool call. It
+has literal loopback Host/Origin guards, no Owner credential path, no session
+state, and no persistent registry; Store's generation token remains the
+authority for admission and retirement.
+
 The private owner credential authenticates the bridge's typed
 [`RemoteCallContext`](../../crates/eliot-core/src/remote_call.rs) to Router. Router
 revalidates its configured issuer/AUD, expiry and RPC call-id binding, applies the
