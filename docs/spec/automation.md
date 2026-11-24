@@ -1943,10 +1943,12 @@ The checker executable and identified interpreter scripts inside the workspace
 also join the check inputs. Swarm resolves bare program names with the check's
 executable lookup and tracks the resulting path when it is inside the workspace.
 Swarm skips recognized interpreter flags and their value arguments, including Python
-launcher version switches. An option with unknown arity leaves the entry point
-unverified. Swarm recognizes
-PowerShell positional scripts and `-File`, simple `cmd /c` batch-file
-invocations, and positional scripts for common interpreters. Python `-m`
+launcher version switches. A long option with an inline value (`--option=value`)
+does not consume the next token.
+Perl `-w` and attached include paths such as `-Ilib` are recognized, as are
+PowerShell `-nop` and `-f`. An option with unknown arity leaves the entry point
+unverified. Swarm recognizes PowerShell positional scripts and `-File`, simple
+`cmd /c` batch-file invocations, and positional scripts for common interpreters. Python `-m`
 resolves ordinary source modules and package entry points in the check directory.
 An ambiguous or unresolved interpreter entry point produces `scope_unverified`
 on a passing check. Checker options after the script, including values such as
@@ -1959,10 +1961,13 @@ reading Git, so changing a link's target or type, or making a previously absent 
 appear, counts as a checker-input change even when Git status omits it. A path-resolution
 error leaves the change set unverified.
 The persisted identity snapshot is optional and serde-defaulted, so old baselines
-remain readable without a database migration. A passing check against a baseline
-without the current identity rules is `scope_unverified` until the Owner records a
-new baseline with `set`. The legacy `check_files` view keeps its existing
-resolved-target list and DTO shape. An exact retry is answered from the retained result
+remain readable without a database migration. A version-3 identity baseline uses
+its recorded candidate selection and parser when replayed. A baseline predating
+identity recording continues to use its retained `check_files`, declared
+`check_inputs`, and Git scope; a fresh `set` or launch captures the latest identity
+baseline. An unrecognized identity version or an entry point that cannot be verified
+produces `scope_unverified`. The legacy `check_files` view
+keeps its existing resolved-target list and DTO shape. An exact retry reads the retained result
 before the workspace is read again. Each round, before the check, the daemon compares
 the workspace with that starting point. The Goal's work is the paths
 committed since the starting HEAD, the paths changed now, and every pre-existing change

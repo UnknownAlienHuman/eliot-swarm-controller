@@ -260,6 +260,13 @@ fn settle_restore_receipt(
     Ok(())
 }
 
+fn interrupted_restore() -> Error {
+    Error::new(
+        "unknown",
+        "checkpoint restore was interrupted; inspect the worktree",
+    )
+}
+
 /// What the next checkpoint of a generation starts from.
 #[derive(Clone, Debug, Default)]
 pub struct GitCheckpointBasis {
@@ -720,14 +727,7 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             }
-            settle_restore_receipt(
-                &tx,
-                id,
-                &Err(Error::new(
-                    "unknown",
-                    "checkpoint restore was interrupted; inspect the worktree",
-                )),
-            )?;
+            settle_restore_receipt(&tx, id, &Err(interrupted_restore()))?;
             commit_transaction(tx, &self.write_faulted)
         })();
         self.fault_on_persistence_error(&result);
@@ -789,11 +789,19 @@ impl Store {
                     "checkpoint restore writer exit is unproven",
                 ));
             }
+            // An already authorized abandonment can settle an interrupted
+            // restore whose original receipt has no outcome yet.
+            if abandon.is_some() {
+                settle_restore_receipt(&tx, restore_id, &Err(interrupted_restore()))?;
+            }
             let released = tx
                 .execute(
                     "DELETE FROM checkpoint_restore_intents WHERE id = ?1
-                 AND EXISTS (SELECT 1 FROM writes WHERE id = ?1 AND result <> 'null')",
-                    [restore_id],
+                     AND EXISTS (
+                         SELECT 1 FROM writes
+                         WHERE id = ?1 AND principal = 'owner' AND method = ?2 AND result <> 'null'
+                     )",
+                    params![restore_id, CHECKPOINT_RESTORE],
                 )
                 .map_err(sql_error)?;
             if released != 1 {

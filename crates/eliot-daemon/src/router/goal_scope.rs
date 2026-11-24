@@ -27,6 +27,7 @@ use std::{
 const LISTED_PATHS: usize = 20;
 /// Room a scope finding keeps in the 4 KiB Goal observation.
 const FINDING_BYTES: usize = 1536;
+const PREVIOUS_CHECK_IDENTITY_VERSION: u8 = 3;
 const CHECK_IDENTITY_VERSION: u8 = 4;
 
 /// The Goal's work since its starting point, or why it is not known.
@@ -98,7 +99,8 @@ impl Router {
         let definition = definition.clone();
         let workspace = workspace.to_owned();
         let (check_files, check_identity, changed) = tokio::task::spawn_blocking(move || {
-            let (check_files, identity) = check_files(&root, &definition, &workspace)?;
+            let (check_files, identity) =
+                check_files(&root, &definition, &workspace, CHECK_IDENTITY_VERSION)?;
             let changed = scope_digests(&root, state.changed.iter().map(String::as_str))
                 .map_err(unavailable)?;
             Ok::<_, Error>((check_files, identity, changed))
@@ -152,17 +154,24 @@ async fn scope_changes(
             "the workspace is not the Git root recorded at goal set",
         ));
     }
-    let check_identity = base
-        .check_identity
-        .as_ref()
-        .filter(|identity| identity.version == CHECK_IDENTITY_VERSION)
-        .ok_or_else(|| {
-            Error::new(
-                "unavailable",
-                "the Goal's checker identity was not recorded; set the Goal again",
-            )
-        })?;
-    if check_identity.unverified_entry_point {
+    let check_identity = match base.check_identity.as_ref() {
+        Some(identity)
+            if matches!(
+                identity.version,
+                PREVIOUS_CHECK_IDENTITY_VERSION | CHECK_IDENTITY_VERSION
+            ) =>
+        {
+            Some(identity)
+        }
+        Some(_) => {
+            return Err(Error::new(
+                "scope_unverified",
+                "the Goal's checker identity version is not supported",
+            ));
+        }
+        None => None,
+    };
+    if check_identity.is_some_and(|identity| identity.unverified_entry_point) {
         return Err(checker_entry_unverified());
     }
     let committed = match (&base.head, &state.head) {
@@ -179,16 +188,20 @@ async fn scope_changes(
     };
     let root = state.root.clone();
     let paths: Vec<String> = base.changed.keys().cloned().collect();
-    let baseline = check_identity.files.clone();
+    let baseline = check_identity.cloned();
     let definition = definition.clone();
     let workspace = workspace.to_owned();
     let (now, changed_check_files) = tokio::task::spawn_blocking(move || {
         let now = scope_digests(&root, paths.iter().map(String::as_str))?;
-        let (_, current) = check_files(&root, &definition, &workspace)?;
-        if current.unverified_entry_point {
-            return Err(checker_entry_unverified());
-        }
-        let changed_check_files = changed_check_identity_paths(&baseline, &current.files);
+        let changed_check_files = if let Some(baseline) = baseline {
+            let (_, current) = check_files(&root, &definition, &workspace, baseline.version)?;
+            if current.unverified_entry_point {
+                return Err(checker_entry_unverified());
+            }
+            changed_check_identity_paths(&baseline.files, &current.files)
+        } else {
+            BTreeSet::new()
+        };
         Ok::<_, Error>((now, changed_check_files))
     })
     .await
@@ -243,10 +256,7 @@ pub(super) fn changed_check_inputs<'a>(
     changed: &'a BTreeSet<String>,
 ) -> Vec<&'a str> {
     let globs = normalized(&definition.check_inputs);
-    let identity = base
-        .check_identity
-        .as_ref()
-        .filter(|identity| identity.version == CHECK_IDENTITY_VERSION);
+    let identity = base.check_identity.as_ref();
     changed
         .iter()
         .map(String::as_str)
@@ -327,20 +337,22 @@ fn check_files(
     root: &Path,
     definition: &GoalDefinition,
     workspace: &str,
+    version: u8,
 ) -> Result<(Vec<String>, GoalScopeCheckIdentity)> {
     let cwd = PathBuf::from(definition.check_cwd.as_deref().unwrap_or(workspace));
     let mut files = BTreeSet::new();
     let mut identities = BTreeMap::new();
     let mut operands = Vec::new();
     let mut unverified_entry_point = false;
+    let legacy_argv = version == PREVIOUS_CHECK_IDENTITY_VERSION;
     if let Some((program, args)) = definition.check.split_first() {
-        if !program::is_bare_program(program) {
+        if legacy_argv || !program::is_bare_program(program) {
             operands.push(PathBuf::from(program));
         }
-        if let Ok(executable) = program::resolve_program(program, Some(&cwd)) {
+        if !legacy_argv && let Ok(executable) = program::resolve_program(program, Some(&cwd)) {
             operands.push(executable);
         }
-        match interpreter_entry(program, args) {
+        match interpreter_entry(program, args, legacy_argv) {
             CheckerEntry::Executable => {}
             CheckerEntry::Path(path) => {
                 if path.is_empty() {
@@ -400,7 +412,7 @@ fn check_files(
         }
     }
     let identity = GoalScopeCheckIdentity {
-        version: CHECK_IDENTITY_VERSION,
+        version,
         unverified_entry_point,
         files: identities
             .into_iter()
@@ -412,7 +424,7 @@ fn check_files(
 
 fn checker_entry_unverified() -> Error {
     Error::new(
-        "unavailable",
+        "scope_unverified",
         "the checker interpreter entry point could not be verified",
     )
 }
@@ -424,7 +436,7 @@ enum CheckerEntry<'a> {
     Unverified,
 }
 
-fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> {
+fn interpreter_entry<'a>(program: &str, args: &'a [String], legacy_argv: bool) -> CheckerEntry<'a> {
     use CheckerEntry::{Executable, Path as Script, PythonModule, Unverified};
     let Some(name) = Path::new(program)
         .file_name()
@@ -534,7 +546,7 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
             }
             _ if node
                 && matches!(
-                    option_name,
+                    if legacy_argv { option } else { option_name },
                     "-r" | "--require"
                         | "--import"
                         | "--loader"
@@ -557,7 +569,8 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
                     return Unverified;
                 }
             }
-            "-noprofile" | "-nologo" | "-noninteractive" | "-sta" | "-mta" if powershell => {}
+            "-nop" | "-noprofile" | "-nologo" | "-noninteractive" | "-sta" | "-mta"
+                if powershell => {}
             "/d" | "/s" | "/q" | "/a" | "/u" | "/e:on" | "/e:off" | "/v:on" | "/v:off" if cmd => {}
             "--noprofile" | "--norc" | "--posix" | "--login" if shell => {}
             "--enable-source-maps" | "--no-warnings" | "--trace-warnings" | "--no-deprecation"
@@ -579,21 +592,41 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
             {
                 return Unverified;
             }
+            option
+                if matches!(name, "ruby" | "perl")
+                    && ["-I", "-r", "-M", "-m"].into_iter().any(|flag| {
+                        option
+                            .strip_prefix(flag)
+                            .is_some_and(|value| !value.is_empty())
+                    }) => {}
             "-I" | "-r" | "-M" | "-m" if matches!(name, "ruby" | "perl") => {
                 if args.next().is_none() {
                     return Unverified;
                 }
             }
+            option
+                if name == "perl"
+                    && option.starts_with('-')
+                    && option[1..].chars().all(|flag| {
+                        matches!(
+                            flag,
+                            'w' | 'W' | 'T' | 't' | 'U' | 'n' | 'p' | 'a' | 'l' | '0'..='9'
+                        )
+                    }) => {}
             "-r" | "-B" | "-R" | "-F" | "-E" | "-a" if name == "php" => return Unverified,
+            "-n" if name == "php" => {}
+            "-w" | "-W0" | "-W1" | "-W2" if name == "ruby" => {}
             "-d" | "-c" | "-z" if name == "php" => {
                 if args.next().is_none() {
                     return Unverified;
                 }
             }
             option if option.starts_with('-') || (cmd && option.starts_with('/')) => {
-                // Unknown option arity can make the next argv item an option
-                // value rather than a script path. Do not infer an entry point.
-                return Unverified;
+                // Preserve version 3 argv selection. The current parser can
+                // skip an inline long option without guessing about the next token.
+                if !(legacy_argv || (option_name.starts_with("--") && option_name != option)) {
+                    return Unverified;
+                }
             }
             _ if cmd => return Unverified,
             _ if powershell && !arg.to_ascii_lowercase().ends_with(".ps1") => return Unverified,
