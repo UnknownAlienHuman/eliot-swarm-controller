@@ -5,24 +5,12 @@ use std::{fs, path::Path};
 
 const SHARED_CRATES: &[&str] = &["eliot-core", "eliot-daemon", "eliot-store"];
 const HARNESS_NAMES: &[&str] = &["codex", "claude", "opencode", "muse", "antigravity"];
-// Existing profile parsing, catalogue and diagnostics code still uses these names.
-// Shrink the limits as the remaining vendor translations move to adapters.
+// Exact allowances for remaining configuration identity and display vocabulary.
 const EXISTING: &[(&str, usize)] = &[
-    ("eliot-core/src/api/harness.rs", 7),
-    ("eliot-core/src/observe.rs", 5),
-    ("eliot-daemon/src/adhoc.rs", 29),
-    ("eliot-daemon/src/bootstrap.rs", 1),
-    ("eliot-daemon/src/config.rs", 12),
-    ("eliot-daemon/src/config/profiles_edit.rs", 2),
-    ("eliot-daemon/src/harness_capabilities.rs", 5),
-    ("eliot-daemon/src/plugin_host/host.rs", 2),
-    ("eliot-daemon/src/plugin_host/host/discovery.rs", 8),
-    ("eliot-daemon/src/router.rs", 6),
-    ("eliot-daemon/src/router/catalog.rs", 46),
+    ("eliot-core/src/api/harness.rs", 6),
+    ("eliot-daemon/src/config.rs", 9),
+    ("eliot-daemon/src/router/catalog.rs", 8),
     ("eliot-daemon/src/router/discovery.rs", 5),
-    ("eliot-daemon/src/router/instructions.rs", 8),
-    ("eliot-daemon/src/router/owner_rules_doctor.rs", 8),
-    ("eliot-daemon/src/router/routing.rs", 1),
 ];
 
 fn main() {

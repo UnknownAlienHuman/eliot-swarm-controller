@@ -11,7 +11,7 @@ use eliot_plugin::install::{
     launcher_manifest_version,
 };
 use std::{
-    fs::File,
+    fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
 };
@@ -21,6 +21,10 @@ pub const LAUNCHER_DIR: &str = r"C:\Tools\MuseCode";
 
 /// Version-file names read inside the launcher directory, in order.
 pub const LAUNCHER_VERSION_FILES: &[&str] = &["muse-version", ".muse-version"];
+
+/// The launcher directory is small; refuse fallback discovery if it has
+/// grown beyond this bound instead of selecting from a partial enumeration.
+const MAX_LAUNCHER_DIRECTORY_ENTRIES: usize = 128;
 
 /// The Muse install declaration read by shared install code.
 pub fn discovery() -> InstallDiscovery {
@@ -101,12 +105,22 @@ pub(crate) fn model_hold_revision_for_path(path: &Path) -> Option<String> {
 }
 
 fn payload_version(path: &Path) -> Option<String> {
-    // Windows discovery has already tied this payload to the launcher
-    // manifest. Unix has no supported passive version source.
-    path.file_stem()?
-        .to_str()?
-        .strip_prefix("muse-bin-")
-        .map(str::to_owned)
+    if !cfg!(windows) {
+        return None;
+    }
+    let (expected, version) = manifest_payload(Path::new(LAUNCHER_DIR))?;
+    path.to_str()?
+        .eq_ignore_ascii_case(expected.to_str()?)
+        .then_some(version)
+}
+
+fn manifest_payload(directory: &Path) -> Option<(PathBuf, String)> {
+    let version = launcher_manifest_version(directory, LAUNCHER_VERSION_FILES)?;
+    let path = directory.join(format!("muse-bin-{version}.exe"));
+    fs::symlink_metadata(&path)
+        .ok()?
+        .is_file()
+        .then_some((path, version))
 }
 
 pub(crate) fn candidate_paths() -> core::Result<Vec<PathBuf>> {
@@ -137,28 +151,50 @@ fn candidate_paths_unix() -> core::Result<Vec<PathBuf>> {
 }
 
 fn candidate_paths_windows(launcher_dir: &Path) -> core::Result<Vec<PathBuf>> {
-    let version =
-        launcher_manifest_version(launcher_dir, LAUNCHER_VERSION_FILES).ok_or_else(|| {
-            core::Error::new(
-                "profile_error",
-                format!(
-                    "muse launcher version is unknown; searched {}",
-                    launcher_dir.join(".muse-version").to_string_lossy()
-                ),
-            )
-        })?;
-    let file_name = format!("muse-bin-{version}.exe");
-    let native = launcher_dir.join(&file_name);
-    if native.is_file() {
+    if let Some((native, _)) = manifest_payload(launcher_dir) {
         return Ok(vec![native]);
     }
-    Err(core::Error::new(
-        "profile_error",
-        format!(
-            "muse native executable for launcher version {version} was not found; searched {}",
-            native.to_string_lossy()
-        ),
-    ))
+
+    // A sole regular payload can launch without a verified version.
+    let refusal = |reason| {
+        core::Error::new(
+            "profile_error",
+            format!(
+                "muse native executable {reason}; searched {}",
+                launcher_dir.display()
+            ),
+        )
+    };
+    let entries = fs::read_dir(launcher_dir).map_err(|_| refusal("directory is unavailable"))?;
+    let mut selected = None;
+    for (index, entry) in entries.enumerate() {
+        if index == MAX_LAUNCHER_DIRECTORY_ENTRIES {
+            return Err(refusal("inventory exceeds the discovery bound"));
+        }
+        let entry = entry.map_err(|_| refusal("inventory could not be read"))?;
+        let name = entry.file_name().to_ascii_lowercase();
+        let is_payload = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("muse-bin-"))
+            .and_then(|suffix| suffix.strip_suffix(".exe"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.len() <= 64 && !suffix.chars().any(char::is_control)
+            });
+        if !is_payload {
+            continue;
+        }
+        let kind = entry
+            .file_type()
+            .map_err(|_| refusal("identity could not be read"))?;
+        if kind.is_symlink() || (kind.is_file() && selected.replace(entry.path()).is_some()) {
+            return Err(refusal(
+                "selection is ambiguous or redirects through a link",
+            ));
+        }
+    }
+    selected
+        .map(|path| vec![path])
+        .ok_or_else(|| refusal("was not found"))
 }
 
 fn searched_locations() -> Vec<String> {

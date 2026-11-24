@@ -1,19 +1,63 @@
 //! Muse native adapter capability declaration.
 
-use eliot_core::InjectPoint;
-use eliot_core::api::harness::NativeAccessBounds;
-use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use eliot_core::api::harness::{
+    AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeQuotaReadback,
+    NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
+};
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
+use eliot_core::api::{
+    ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus::NotNative,
+};
+use eliot_core::{InjectPoint, McpPolicy};
+use eliot_plugin::capabilities::{
+    adhoc_launch, instruction_files, quota_readback, sandbox_permissions,
+};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::FixedCredential("ambient"),
+        profile: ProfileCapabilities {
+            approval_field: Some("approval"),
+            native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
+            ..ProfileCapabilities::default()
+        },
+        model_reader: ModelReaderOptions {
+            budget_seconds: Some(60),
+            ..ModelReaderOptions::default()
+        },
+        quota_readback: Some(NativeQuotaReadback {
+            method: "usage/read",
+            unsupported_note: Some(
+                "Installed Muse MSP does not support usage/read and has no retained subscription observation",
+            ),
+            ..quota_readback(
+                QuotaProjectionFormat::UsagePair,
+                |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
+            )
+        }),
+        adhoc_effort: Some(AdhocEffort::Freeform),
+        adhoc_launch: Some(adhoc_launch(
+            sandbox_permissions(
+                true,
+                "approval",
+                ["onRequest", "promptUnmatched", "allowAll"],
+            ),
+            McpPolicy::Inherit,
+        )),
+        documentation_section: Some("docs/harnesses/muse.md#usage-attribution"),
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
+        project_instruction_read: Some(instruction_files(&[
+            ("AGENTS.md", NotNative),
+            ("AGENTS.override.md", NotNative),
+        ])),
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
-        launch_default_resolution: true,
+        launch_default_policy: LaunchDefaultPolicy::OmitForServerDefault,
         guard_refusal_point: Some(InjectPoint::ActiveTurn),
+        guard_refusal_choice_error: Some("Muse guarded request offers multiple refusal options"),
         allowed_configure_efforts: Some(&eliot_core::api::MUSE_REASONING_EFFORT_TIERS),
         configure_session_mode: ConfigureSessionMode::WhenModelPresent,
         configure_requires_idle_turn: true,
@@ -26,6 +70,9 @@ pub fn declaration() -> HarnessCapabilities {
         reads_retained_quota: true,
         view_projection_gap_recovery: true,
         native_child_families: &eliot_core::MUSE_NATIVE_CHILD_FAMILIES,
+        native_child_history_refusal: Some(
+            "native history is unsupported for Muse child observations",
+        ),
         executable_stems: &["muse"],
         version_prefixes: &["muse-code", "muse"],
         session_input_includes_cache_reads: true,

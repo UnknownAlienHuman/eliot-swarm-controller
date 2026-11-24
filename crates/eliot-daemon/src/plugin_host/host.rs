@@ -642,7 +642,7 @@ impl PluginHost {
             let cmd = agent.profile_snapshot["cmd"].as_str().unwrap_or("agy");
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
             let (program, _) =
-                crate::adhoc::reader_executable(cmd, "antigravity", deadline).await?;
+                crate::adhoc::reader_executable(cmd, &agent.harness, deadline).await?;
             agent.profile_snapshot["cmd"] = Value::String(program);
         }
         let key = AgentKey {
@@ -2768,7 +2768,7 @@ fn allow_compaction_gap(
         return Ok(false);
     }
     let Some(agent) = store.get_agent(&gap.agent_id)?.filter(|agent| {
-        agent.harness == "opencode"
+        HarnessCapabilities::of(&agent.harness).compaction_gap_recovery
             && agent.generation == gap.generation
             && agent.native_ref.as_deref() == Some(boundary.native_ref.as_str())
     }) else {

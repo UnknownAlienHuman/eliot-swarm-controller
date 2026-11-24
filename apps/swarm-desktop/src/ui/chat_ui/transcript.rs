@@ -122,11 +122,7 @@ impl DesktopApp {
                 .chat
                 .detail
                 .as_ref()
-                .filter(|detail| {
-                    eliot_core::api::ConfigureSupport::for_harness(&detail.harness)
-                        .model_refusal
-                        .is_none()
-                })
+                .filter(|detail| eliot_core::api::is_supported_harness(&detail.harness))
                 .map(|_| context.callback(|()| Message::Launch(LaunchMsg::OpenModel))),
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))

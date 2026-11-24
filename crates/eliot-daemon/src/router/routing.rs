@@ -900,15 +900,11 @@ pub(super) fn switch_account_identity(snapshot: &Value) -> Value {
 }
 
 fn native_installed(harness: &str, snapshot: &Value) -> bool {
-    if harness == "claude" {
-        if let Some(pin) = snapshot
-            .get("cmd")
-            .and_then(Value::as_str)
-            .filter(|cmd| !crate::adhoc::is_latest_claude_selector(cmd))
-        {
+    if crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd {
+        if let Some(pin) = crate::adhoc::explicit_profile_command(snapshot, harness) {
             return eliot_plugin::install::is_native_executable(std::path::Path::new(pin));
         }
-        return crate::adhoc::claude_candidate_available();
+        return crate::adhoc::ranked_candidate_available(harness);
     }
     let cmd = snapshot
         .get("cmd")

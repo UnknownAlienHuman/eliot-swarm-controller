@@ -1559,15 +1559,15 @@ impl Router {
         let first = approvals
             .next()
             .ok_or_else(|| Error::new("unsupported", "guarded request offers no refusal option"))?;
-        let choice_id = match subject.harness.as_str() {
-            "muse" if approvals.next().is_none() => Some(first.id),
-            "muse" => {
-                return Err(Error::new(
-                    "unsupported",
-                    "Muse guarded request offers multiple refusal options",
-                ));
+        let choice_id = if let Some(message) =
+            HarnessCapabilities::of(&subject.harness).guard_refusal_choice_error
+        {
+            if approvals.next().is_some() {
+                return Err(Error::new("unsupported", message));
             }
-            _ => None,
+            Some(first.id)
+        } else {
+            None
         };
         let mut deny = SubmitCommand::new(ulid::Ulid::new().to_string(), "deny");
         deny.target = Some(agent.clone());
@@ -3722,7 +3722,9 @@ impl Router {
         snapshot: &mut Value,
         deadline: std::time::Instant,
     ) -> Result<()> {
-        if !HarnessCapabilities::of(harness).launch_default_resolution {
+        if HarnessCapabilities::of(harness).launch_default_policy
+            == eliot_core::api::harness::LaunchDefaultPolicy::None
+        {
             return Ok(());
         }
         // Routed Codex profiles keep their own rule: the Responses route
@@ -3909,15 +3911,23 @@ impl Router {
             // blocking pool. Shape is validated with the frozen snapshot
             // below.
             let profile_name = crate::adhoc::adhoc_profile_name(&harness);
+            let install = eliot_plugin::install::discovery_for(&harness)?;
             let (cmd, selected_version) = match explicit_cmd.as_deref() {
-                Some(cmd) if harness == "muse" => {
+                Some(cmd)
+                    if matches!(
+                        install.strategy,
+                        eliot_plugin::install::InstallStrategy::MetadataVersion(_)
+                    ) =>
+                {
                     let cmd = crate::adhoc::validate_native_cmd(&profile_name, cmd)?;
                     let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
                     let (cmd, version) =
                         crate::adhoc::reader_executable(&cmd, &harness, deadline).await?;
                     (Some(cmd), version)
                 }
-                Some(_) if harness != "claude" => (explicit_cmd, None),
+                Some(_) if !crate::adhoc::has_ranked_install_candidates(&harness) => {
+                    (explicit_cmd, None)
+                }
                 selector => {
                     let candidate =
                         crate::adhoc::resolve_profile_command(&profile_name, &harness, selector)
@@ -4115,7 +4125,7 @@ impl Router {
         }
         if command_bound {
             let cmd = crate::adhoc::explicit_profile_command(&snapshot, &harness);
-            if harness == "claude" && cmd.is_none() {
+            if crate::adhoc::has_ranked_install_candidates(&harness) && cmd.is_none() {
                 return Err(Error::new(
                     "bad_state",
                     "inherited Claude snapshot has no frozen executable path",
@@ -5101,11 +5111,11 @@ impl Router {
             .filter(|native_ref| !native_ref.is_empty())
             .ok_or_else(|| Error::new("bad_state", "Agent has no native reference"))?;
 
-        if agent.origin == AgentOrigin::Native && agent.harness == "muse" {
-            return Err(Error::new(
-                "unsupported",
-                "native history is unsupported for Muse child observations",
-            ));
+        if agent.origin == AgentOrigin::Native
+            && let Some(message) =
+                HarnessCapabilities::of(&agent.harness).native_child_history_refusal
+        {
+            return Err(Error::new("unsupported", message));
         }
 
         // This is a private native read. It is deliberately not reduced, stored,
@@ -8324,7 +8334,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             }
         }
         if let Some(access) = args.get("access").and_then(Value::as_str) {
-            crate::adhoc::validate_adhoc_access(access)?;
+            eliot_core::api::harness::AdhocAccess::parse(access)?;
         }
     } else {
         for field in ["model", "effort", "auth", "access"] {

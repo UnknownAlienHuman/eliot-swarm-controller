@@ -325,20 +325,13 @@ pub(crate) fn list(data_root: &Path, policy: &SecretPolicy) -> core::Result<Prof
                 permissions: entry.permissions.clone(),
                 // The display policy is the harness-native resolved value, never the raw entry fallback: a launchable profile must not advertise a policy the frozen snapshot omits.
                 approval_policy: resolved.as_ref().ok().and_then(|snapshot| {
-                    match entry.harness.trim() {
-                        "muse" => snapshot
-                            .get("approval")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        "claude" => snapshot
-                            .get("permission_mode")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        _ => snapshot
-                            .get("approval_policy")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    }
+                    let field = super::ProfileCapabilities::of(entry.harness.trim())
+                        .approval_field
+                        .unwrap_or("approval_policy");
+                    snapshot
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
                 }),
                 control: entry.control.clone(),
                 proxy: entry.proxy.clone(),

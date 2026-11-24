@@ -1856,7 +1856,7 @@ async fn send_held_frame<Frame>(
                     result = &mut send => {
                         return if result.is_err() { HeldSend::Closed } else { HeldSend::Sent };
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = crate::retry::wait_until(Some(deadline)) => {
                         return HeldSend::DeadlineOverflow;
                     }
                 }
@@ -2169,7 +2169,7 @@ where
                     // cannot starve it.
                     biased;
                     line = next_native_line(&mut reader) => line,
-                    _ = tokio::time::sleep_until(deadline) => continue,
+                    _ = crate::retry::wait_until(Some(deadline)) => continue,
                 }
             }
             None => {

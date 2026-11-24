@@ -8,8 +8,156 @@
 //! `crates/eliot-daemon/src/adhoc.rs`).
 
 use eliot_core as core;
-use std::path::{Path, PathBuf};
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+/// Stage and atomically publish one exclusively owned file without replacing
+/// an existing destination. The staged contents are synced before publication.
+pub fn write_new_file(
+    path: &Path,
+    contents: &[u8],
+    create_error: impl FnOnce() -> core::Error,
+    write_error: impl FnOnce() -> core::Error,
+) -> core::Result<()> {
+    let Some(filename) = path.file_name() else {
+        return Err(create_error());
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return Err(create_error());
+    };
+    let target = parent.join(filename);
+    let temporary = parent.join(format!(".eliot-install.{}.tmp", ulid::Ulid::new()));
+    let Ok(mut file) = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+    else {
+        return Err(create_error());
+    };
+    let write_result = file.write_all(contents).and_then(|()| file.sync_all());
+    if write_result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(&temporary);
+        return Err(write_error());
+    }
+    drop(file);
+    if publish_new_file(&temporary, &target).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(create_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn publish_new_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    match fs::hard_link(temporary, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary);
+            Ok(())
+        }
+        // A dangling symlink also owns the destination name.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => publish_no_replace_rename(temporary, target),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[allow(
+    unsafe_code,
+    reason = "Unix no-replace rename requires the native filesystem API."
+)]
+fn publish_no_replace_rename(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+
+    let source =
+        CString::new(temporary.as_os_str().as_bytes()).map_err(|_| ErrorKind::InvalidInput)?;
+    let destination =
+        CString::new(target.as_os_str().as_bytes()).map_err(|_| ErrorKind::InvalidInput)?;
+    // SAFETY: Both buffers are NUL-terminated and live for the call. The flags
+    // forbid replacing any destination entry, even a dangling symlink.
+    let result = unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            ) == 0
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            ) == 0
+        }
+    };
+    if result {
+        Ok(())
+    } else {
+        Err(Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
+fn publish_no_replace_rename(_temporary: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
+    reason = "Atomic no-replace rename uses the Windows filesystem API."
+)]
+fn publish_new_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW};
+
+    let mut source: Vec<u16> = temporary.as_os_str().encode_wide().collect();
+    let mut destination: Vec<u16> = target.as_os_str().encode_wide().collect();
+    if source.contains(&0) || destination.contains(&0) {
+        return Err(std::io::ErrorKind::InvalidInput.into());
+    }
+    source.push(0);
+    destination.push(0);
+    // SAFETY: Both buffers are NUL-terminated and live for the whole call.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 static INSTALL_DECLARATIONS: OnceLock<HashMap<&'static str, InstallDiscovery>> = OnceLock::new();
 

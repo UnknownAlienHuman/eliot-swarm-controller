@@ -2,11 +2,10 @@
 
 Optional L6 adapter. One warm `agy acp` process belongs to one Eliot Agent
 generation and custody unit. Source: [google-antigravity/antigravity-cli](https://github.com/google-antigravity/antigravity-cli).
-The manifest's native version (`1.5.2`) is diagnostic metadata, not a
-startup version gate. The ACP `protocolVersion` returned at initialization is
-retained as metadata, not checked for equality with a pinned value. Startup
-still validates the exact session binding, advertised selectors and config
-readbacks needed by this adapter.
+The manifest reports the adapter package version. The ACP `protocolVersion`
+returned at initialization is retained as diagnostic metadata. Startup
+validates the exact session binding, advertised selectors and config readbacks
+needed by this adapter.
 
 ## Native identity and transport
 
@@ -243,8 +242,8 @@ reply is unknown and never rewritten. Answer remains `unsupported`.
 
 ## System context and steer hooks
 
-The Antigravity CLI hooks documentation (accessed 2026-11-07; adapter
-version metadata is 1.5.2) defines named hook groups. `PreInvocation` input
+The Antigravity CLI hooks documentation (accessed 2026-11-07) defines named
+hook groups. `PreInvocation` input
 includes `conversationId`, zero-indexed `invocationNum`, and
 `initialNumSteps` (trajectory step count). The current recommended output is
 `{"injectSteps":[{"systemMessage":{"systemMessage":"..."}}]}`;

@@ -55,18 +55,210 @@ pub enum NativeArchiveBinding {
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
 type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
+/// Evidence available for native project instruction-file reading.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProjectInstructionRead {
+    pub paths: &'static [(&'static str, super::InstructionReadStatus)],
+    pub report_version: bool,
+    pub byte_limit: Option<fn(&serde_json::Value) -> u64>,
+}
+
+/// Locations of the adapter's documented user instruction files.
+#[derive(Clone, Copy, Debug)]
+pub struct UserInstructionFiles {
+    pub root_override_env: Option<&'static str>,
+    pub home_subdir: &'static str,
+    pub paths: &'static [&'static str],
+}
+
+/// Access levels accepted by an Owner's ad-hoc launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdhocAccess {
+    Ask,
+    Auto,
+    Full,
+}
+
+impl AdhocAccess {
+    pub fn parse(access: &str) -> Result<Self> {
+        match access.trim() {
+            "ask" => Ok(Self::Ask),
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            _ => Err(Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
+}
+
+/// Native permission fields selected by the three ad-hoc access levels.
+#[derive(Clone, Copy, Debug)]
+pub enum AdhocPermissions {
+    Sandbox {
+        full_changes_sandbox: bool,
+        field: &'static str,
+        values: [&'static str; 3],
+    },
+    FullFlag(&'static str),
+    RefuseFull(&'static str),
+}
+
+/// Model and auth syntax for an ad-hoc launch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AdhocModel {
+    #[default]
+    NativeDefault,
+    Explicit,
+    ProviderIntegration,
+}
+
+/// Defaults the native adapter can enforce for a launch without a saved profile.
+#[derive(Clone, Copy, Debug)]
+pub struct AdhocLaunchDefaults {
+    pub permissions: AdhocPermissions,
+    pub model: AdhocModel,
+    pub mcp: crate::McpPolicy,
+    pub pass_env: &'static [&'static str],
+    pub installed_profile_mcp: crate::McpPolicy,
+}
+
+/// Reasoning effort accepted by an ad-hoc launch.
+#[derive(Clone, Copy, Debug)]
+pub enum AdhocEffort {
+    Freeform,
+    Choices {
+        values: &'static [&'static str],
+        refusal: &'static str,
+    },
+}
+
+/// Resolution of an omitted launch model from native catalogue evidence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LaunchDefaultPolicy {
+    #[default]
+    None,
+    NativeMarkedDefault,
+    OmitForServerDefault,
+}
+
+/// Native evidence the daemon can project into shared quota windows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaProjectionFormat {
+    RateLimits,
+    IntegrationWindows,
+    UsagePair,
+    Windows,
+}
+
+type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
+
+/// Adapter readback shape and route preflight for provider quota.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeQuotaReadback {
+    pub projection: QuotaProjectionFormat,
+    pub method: &'static str,
+    pub adhoc_integration: Option<&'static str>,
+    pub description: fn(&serde_json::Value) -> &'static str,
+    pub unsupported_note: Option<&'static str>,
+    pub route_refusal: Option<QuotaRouteRefusal>,
+}
+
+/// A documented model list usable when a verified native read is unavailable.
+#[derive(Clone, Copy, Debug)]
+pub struct DocumentedModelCatalog {
+    pub entries: fn() -> Vec<HarnessModelEntry>,
+    pub note: &'static str,
+    pub unverified_route: &'static str,
+    pub empty_native_inventory: &'static str,
+}
+
+/// Requirements for a dedicated native catalogue reader.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ModelReaderOptions {
+    pub budget_seconds: Option<u64>,
+    pub separate_variant_reader: bool,
+    pub interruption_code: Option<&'static str>,
+}
+
+/// Native profile vocabulary used by the daemon and the desktop editor.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProfileCapabilities {
+    pub model_pin_selectors: bool,
+    pub route_selectors_resolved: bool,
+    pub route_scope_secret_names: &'static [&'static str],
+    pub config_dir_credential: bool,
+    pub latest_cmd: bool,
+    pub script_wrapper_cmd: bool,
+    pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
+    pub local_provider: bool,
+    pub project_doc_max_bytes: bool,
+    /// Native approval selector in profile summaries. The default field is `approval_policy`.
+    pub approval_field: Option<&'static str>,
+    pub native_subagents_policy: Option<super::native_profile::NativeSubagentsPolicy>,
+}
+
+impl ProfileCapabilities {
+    pub fn of(harness: &str) -> Self {
+        HarnessCapabilities::of(harness).profile
+    }
+}
+
+/// How an adapter binds and describes its native provider route.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum NativeRoute {
+    #[default]
+    Unspecified,
+    FixedCredential(&'static str),
+    ResponsesProxy {
+        reserved_providers: &'static [&'static str],
+    },
+    AuthIntegration,
+}
+
+impl NativeRoute {
+    pub fn reserves_proxy_provider(self, name: &str) -> bool {
+        match self {
+            Self::ResponsesProxy { reserved_providers } => reserved_providers
+                .iter()
+                .any(|provider| name.eq_ignore_ascii_case(provider)),
+            _ => false,
+        }
+    }
+}
 
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
+    /// Native profile vocabulary supplied by this adapter.
+    pub profile: ProfileCapabilities,
+    pub native_route: NativeRoute,
+    /// How to freeze a launch without a saved profile and seed its installed preset.
+    pub adhoc_launch: Option<AdhocLaunchDefaults>,
+    /// `None` when the adapter has no ad-hoc effort mapping.
+    pub adhoc_effort: Option<AdhocEffort>,
     /// Translates native permission selectors for cross-harness handoff.
     pub native_access_bounds: Option<NativeAccessReader>,
     /// Workspace-write sessions need extra Git metadata roots to commit.
     pub workspace_write_commit_roots: bool,
     /// Accepts the `compact` verb and emits a compact hint on session growth.
     pub compact: bool,
+    /// Native compaction exposes a recoverable boundary after a stream gap.
+    pub compaction_gap_recovery: bool,
     /// `harness.models` accepts a `workspace` launch-preview argument.
     pub models_workspace_preview: bool,
+    /// Published native aliases used when a verified live catalogue is unavailable.
+    pub documented_models: Option<DocumentedModelCatalog>,
+    pub model_reader: ModelReaderOptions,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,
     /// The native model refusal permits cleanup before any initial turn work.
@@ -97,6 +289,8 @@ pub struct HarnessCapabilities {
     pub observed_live_families: &'static [&'static str],
     /// Observation stream families supported for registered native children.
     pub native_child_families: &'static [&'static str],
+    /// Exact refusal for native child history when only its live facts are available.
+    pub native_child_history_refusal: Option<&'static str>,
     /// Process executable stems owned by this harness runtime.
     pub executable_stems: &'static [&'static str],
     /// Product prefixes stripped when normalizing `--version` strings.
@@ -113,6 +307,10 @@ pub struct HarnessCapabilities {
     pub provider_probe: bool,
     /// The adapter's delivery mechanism for committed owner rules.
     pub owner_rules_delivery: super::OwnerRulesDeliveryMethod,
+    /// Native project instruction-file behavior for the frozen profile.
+    pub project_instruction_read: Option<ProjectInstructionRead>,
+    /// User instruction files that doctor may compare with committed owner rules.
+    pub user_instruction_files: Option<UserInstructionFiles>,
     /// MCP identity comes only from data-root values, not the full target
     /// environment.
     pub data_root_only_mcp: bool,
@@ -148,17 +346,25 @@ pub struct HarnessCapabilities {
     pub native_archive: Option<NativeArchiveBinding>,
     /// Read quota evidence retained from an actual turn.
     pub reads_retained_quota: bool,
+    /// Native shapes accepted for read-only quota projection.
+    pub quota_readback: Option<NativeQuotaReadback>,
     /// Passes the Agent identity variables to the native process.
     pub agent_identity_env: bool,
     /// Resolves a default for a launch command that omits model.
-    pub launch_default_resolution: bool,
+    pub launch_default_policy: LaunchDefaultPolicy,
     /// Injection point for a guard refusal on a live stream, if any.
     pub guard_refusal_point: Option<crate::InjectPoint>,
+    /// A guarded denial requires one uniquely identified native option.
+    pub guard_refusal_choice_error: Option<&'static str>,
     /// Manifest verbs this adapter may declare without implementing.
     pub manifest_extra_verbs: &'static [&'static str],
     /// Hot-start manager order among harnesses that can deny native subagents;
     /// lower is preferred.
     pub manager_preference: Option<u8>,
+    /// Documentation section describing this adapter's native sources.
+    pub documentation_section: Option<&'static str>,
+    /// Exact configure refusal when reasoning effort cannot change mid-session.
+    pub configure_effort_refusal: Option<&'static str>,
 }
 
 type Declarations = Box<[(&'static str, HarnessCapabilities)]>;
@@ -183,6 +389,17 @@ pub fn register_harness_capabilities(
             "built-in adapter declarations do not match supported harnesses",
         ));
     }
+    if declarations.iter().any(|(_, capabilities)| {
+        capabilities
+            .documentation_section
+            .is_none_or(|section| section.trim().is_empty())
+            || capabilities.profile.native_subagents_policy.is_none()
+    }) {
+        return Err(Error::new(
+            "internal",
+            "built-in adapter declaration is missing its documentation section or native-subagent policy",
+        ));
+    }
     BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
         Error::new(
             "internal",
@@ -192,13 +409,10 @@ pub fn register_harness_capabilities(
 }
 
 impl HarnessCapabilities {
-    fn registered() -> Option<&'static Declarations> {
-        let entries = BUILTIN_CAPABILITIES.get();
-        debug_assert!(
-            entries.is_some(),
-            "built-in adapter capabilities must be registered"
-        );
-        entries
+    fn registered() -> &'static Declarations {
+        BUILTIN_CAPABILITIES
+            .get()
+            .expect("built-in adapter capabilities must be registered at the entry point")
     }
 
     /// Require registration before the daemon can open its Store.
@@ -218,7 +432,7 @@ impl HarnessCapabilities {
 
     /// Capabilities of a supported native harness, or `None` for any other name.
     pub fn for_harness(harness: &str) -> Option<Self> {
-        Self::registered()?
+        Self::registered()
             .iter()
             .find_map(|(name, caps)| (*name == harness).then_some(*caps))
     }
@@ -226,20 +440,23 @@ impl HarnessCapabilities {
     /// Whether `stem` (lowercased executable basename without extension) belongs
     /// to one of the supported harness executables.
     pub fn is_harness_executable_stem(stem: &str) -> bool {
-        Self::registered().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|(_, caps)| caps.executable_stems.contains(&stem))
-        })
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.executable_stems.contains(&stem))
     }
 
     /// Whether `family` belongs to any supported harness's native-child grant.
     pub fn is_native_child_family(family: &str) -> bool {
-        Self::registered().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|(_, caps)| caps.native_child_families.contains(&family))
-        })
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.native_child_families.contains(&family))
+    }
+
+    /// Whether the name would collide with a built-in provider on an adopted route.
+    pub fn is_reserved_proxy_provider(name: &str) -> bool {
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.native_route.reserves_proxy_provider(name))
     }
 }
 
@@ -612,11 +829,10 @@ impl ConfigureSupport {
                 effort_refusal: Some(reason),
             };
         }
+        let capabilities = HarnessCapabilities::for_harness(harness).unwrap_or_default();
         Self {
             model_refusal: None,
-            effort_refusal: (harness == "claude").then(|| {
-                "Claude effort applies only at launch and cannot change mid-session (launch_only)".to_owned()
-            }),
+            effort_refusal: capabilities.configure_effort_refusal.map(str::to_owned),
         }
     }
 }
@@ -1258,9 +1474,8 @@ impl ModelsCatalogResponse {
     }
 }
 
-/// Provider for one catalogue id: OpenCode and Antigravity models carry a
-/// provider prefix or group; Codex is openai, Claude is anthropic, Muse is
-/// meta. Documented in `docs/spec/configuration.md` (access mapping).
+/// Provider display label for a model catalogue ID, also used by the desktop
+/// without loading the adapter registry.
 pub fn catalog_provider(harness: &str, id: &str) -> String {
     if let Some((provider, _)) = id.split_once('/')
         && !provider.trim().is_empty()

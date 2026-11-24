@@ -19,9 +19,7 @@ fn env_value<'a>(environment: &'a Value, name: &str) -> Option<&'a str> {
 /// using the core-owned marker list shared with the daemon guard.
 fn require_native_oauth_settings(settings: &Value) -> Result<()> {
     let settings_env = &settings["env"];
-    if CLAUDE_EXTERNAL_ROUTE_MARKERS
-        .iter()
-        .any(|marker| env_value(settings_env, marker).is_some_and(|text| !text.is_empty()))
+    if uses_external_route(settings_env)
         || env_value(settings_env, "CLAUDE_CONFIG_DIR").is_some()
         || env_value(settings_env, "CLAUDE_CODE_OAUTH_TOKEN").is_some()
         || settings.get("apiKeyHelper").is_some()
@@ -31,6 +29,10 @@ fn require_native_oauth_settings(settings: &Value) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn uses_external_route(environment: &Value) -> bool {
+    q::has_nonempty_env_marker(environment, CLAUDE_EXTERNAL_ROUTE_MARKERS)
 }
 
 fn subscription_status(status: &Value) -> bool {

@@ -498,6 +498,9 @@ the connected product. Keep results in the PR/CI, not a permanent audit/readines
       instruction-file discovery, and native diagnostics (#932). Keep native
       translation in adapters and let the daemon own routing and settlement.
       Remove the corresponding shared-source name exceptions as those paths move.
+      Keep adapter Rust source near the reviewed line counts. Antigravity 9,345,
+      Claude 9,481, Codex 16,438, Muse 13,161, and OpenCode 15,235. Share repeated
+      mechanisms and retain the supported behavior.
 - [x] Daemon update preflights a Store snapshot, fences admission, and starts the
       replacement or rolls back on the same schema. Deadline Stops use ordinary
       custody and promptless continuation in parent-first order (#836).

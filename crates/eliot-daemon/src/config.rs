@@ -9,6 +9,7 @@
 //! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
 //! route selectors are bound by digest and resolved only in the process environment.
 use crate::harness_capabilities::ProfileCapabilities;
+use core::api::harness::NativeRoute;
 use core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
     CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
@@ -2206,6 +2207,7 @@ fn snapshot_from_entry(
             ),
         ],
     )?;
+    // The configured identity selects the vocabulary of the named TOML profile.
     if harness == "muse" {
         return muse_snapshot_from_entry(name, entry, table_offset, source);
     }
@@ -2355,13 +2357,19 @@ fn validate_profile_tail(
             } else {
                 reject_script_wrapper(name, cmd, source, table_offset)?
             };
-            Some(if harness == "claude" {
-                require_native_claude_cmd(name, cmd, source, table_offset)?
-            } else if harness == "antigravity" {
-                require_native_antigravity_cmd(name, cmd, source, table_offset)?
-            } else {
-                cmd
-            })
+            if let Some(refusal) = ProfileCapabilities::of(harness).command_refusal
+                && let Some(message) = refusal(&cmd)
+            {
+                return Err(profile_field_error(
+                    source,
+                    table_offset,
+                    name,
+                    "cmd",
+                    message,
+                    "profile_error",
+                ));
+            }
+            Some(cmd)
         }
         // Named profiles follow the installed native executable at launch.
         // An explicit `cmd` remains a user pin; when omitted, daemon discovery
@@ -2967,14 +2975,15 @@ fn bind_route_and_capacity(
     }
 
     if let Some(proxy_name) = entry.proxy.as_deref() {
-        if entry.harness.trim() != "codex" {
+        let route = core::api::HarnessCapabilities::of(entry.harness.trim()).native_route;
+        if !matches!(route, NativeRoute::ResponsesProxy { .. }) {
             return Err(fail(
                 "proxy",
-                "adopted proxy routes require the Codex harness",
+                "this harness does not support adopted Responses proxies",
             ));
         }
         validate_profile_name(proxy_name).map_err(|_| fail("proxy", "invalid proxy reference"))?;
-        if is_builtin_codex_provider(proxy_name) {
+        if route.reserves_proxy_provider(proxy_name) {
             return Err(fail(
                 "proxy",
                 "proxy name collides with a builtin Codex provider",
@@ -3053,19 +3062,6 @@ fn bind_route_and_capacity(
     snapshot["capacity_scopes"] = serde_json::to_value(scopes)
         .map_err(|_| fail("max_live", "capacity scopes could not be encoded"))?;
     Ok(snapshot)
-}
-
-fn is_builtin_codex_provider(name: &str) -> bool {
-    [
-        "openai",
-        "amazon-bedrock",
-        "amazon-bedrock-runtime",
-        "ollama",
-        "lmstudio",
-        "ollama-chat",
-    ]
-    .iter()
-    .any(|provider| name.eq_ignore_ascii_case(provider))
 }
 
 fn default_scratch() -> Vec<String> {
@@ -3355,74 +3351,6 @@ fn reject_script_wrapper(
             profile,
             "cmd",
             "must name one native executable path, not a .cmd/.bat/.ps1 wrapper",
-            "profile_error",
-        ));
-    }
-    Ok(cmd)
-}
-
-/// Claude is a native executable: its cmd must be an absolute path (no PATH
-/// lookup, so no bare `claude`), and on Windows it must name the `.exe`
-/// itself. A script wrapper (`.js` here, `.cmd`/`.bat`/`.ps1` above) would
-/// orphan the real CLI on stop, when only the wrapper PID is owned.
-fn require_native_claude_cmd(
-    profile: &str,
-    cmd: String,
-    source: &str,
-    offset: usize,
-) -> core::Result<String> {
-    if !std::path::Path::new(&cmd).is_absolute() {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must be an absolute native executable path, not a bare command name",
-            "profile_error",
-        ));
-    }
-    let lower = cmd.to_ascii_lowercase();
-    if lower.ends_with(".js") {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must name the native executable, not a .js script wrapper",
-            "profile_error",
-        ));
-    }
-    if cfg!(windows) && !lower.ends_with(".exe") {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must name the native .exe, not a script wrapper",
-            "profile_error",
-        ));
-    }
-    Ok(cmd)
-}
-
-/// Antigravity is the protocol-capable `agy` CLI only: a cmd pointing at the
-/// `Antigravity` IDE executable (or any other file name) is refused at save
-/// time with a typed error, so catalog discovery can never launch the IDE as
-/// a version probe. PATH `agy` binaries additionally prove protocol
-/// capability through their `--version` output before any discovery use.
-fn require_native_antigravity_cmd(
-    profile: &str,
-    cmd: String,
-    source: &str,
-    offset: usize,
-) -> core::Result<String> {
-    if !eliot_plugin::install::cli_identity_matches(&cmd, "agy") {
-        return Err(profile_field_error(
-            source,
-            offset,
-            profile,
-            "cmd",
-            "must name the native `agy` CLI, not the Antigravity IDE executable (which does not implement the ACP/model CLI and is never launched); install the `agy` CLI and put it on PATH",
             "profile_error",
         ));
     }

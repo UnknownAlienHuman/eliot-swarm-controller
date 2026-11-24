@@ -31,7 +31,7 @@ platform to build first.
 | --- | --- | --- |
 | `eliot-core` | ids, verbs, events, pure reducer | data/error crates; no I/O, database, runtime or vendor SDK |
 | `eliot-store` | migrations, one writer, bounded queries | core + SQLite |
-| `eliot-plugin` | small wire types/framing shared by host and plugins | core + transport/serialization; no Store |
+| `eliot-plugin` | shared wire types, framing and native lifecycle mechanisms | core + transport/serialization; no Store |
 | `eliot-daemon` | API, router, bus, process/plugin ownership | core, store, plugin protocol |
 | `plugins/*` (codex, claude, opencode, Muse, antigravity) | harness translation and native readback, one process per Agent generation | plugin protocol; no daemon/Store dependency |
 | `apps/swarm-desktop` | optional Windows companion UI | daemon API and `settings.*` only; keeps no other preference store |
@@ -66,6 +66,11 @@ contracts; file size alone is not a reason to remove them or add another integri
 
 All five native adapters use the same protocol through their `plugins/*` process;
 the desktop is an optional client on the daemon API and `settings.*`.
+Adapters declare the capabilities that govern shared control paths when the binary is
+composed. Shared code resolves the declaration from the configured identity, then uses
+its capabilities to prepare and validate operations. Keep vendor request and response
+translation with the adapter, reusable native lifecycle mechanics in `eliot-plugin`,
+and routing, admission and durable settlement in the daemon and Store.
 
 ## Memory inference boundary
 

@@ -120,6 +120,9 @@ fn main() {
         Err(error) if !error.use_stderr() => error.exit(),
         Err(error) => startup::fatal(error.to_string().trim_end()),
     };
+    if let Err(error) = eliot::register_harness_capabilities() {
+        startup::fatal(&error.to_string());
+    }
     let workspace = args
         .workspace
         .map(|workspace| {

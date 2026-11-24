@@ -13,7 +13,7 @@
 //! default at start and reports the effective value through its existing
 //! readback; no substitution is ever made for an unavailable requested model.
 
-use core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
+use core::api::harness::{AdhocAccess, AdhocModel, HarnessCapabilities, ProfileCapabilities};
 use eliot_core as core;
 use eliot_plugin::install::{
     InstallDiscovery, InstallStrategy, cli_identity_matches, discovery_for, find_on_path,
@@ -71,97 +71,20 @@ fn validate_adhoc_model(model: &str) -> core::Result<String> {
 /// Closed Claude Code `--effort` vocabulary, mirroring the profile freeze
 /// (`claude_snapshot_from_entry` in config.rs): `claude --help` documents
 /// `--effort <level>` and the frozen profile accepts exactly these levels.
-pub const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-
-/// Provenance marker for the frozen Claude catalogue entries below: the ids
-/// are documented aliases and full model names, not a live native read.
-pub const CLAUDE_CATALOGUE_SOURCE: &str = "documented_alias";
-
-/// Frozen Claude Code `--model` aliases from the vendor model configuration
-/// ([Model configuration](https://code.claude.com/docs/en/model-config),
-/// checked 2026-11-16; installed CLI 2.1.325 `--help` names `fable`,
-/// `opus` and `sonnet` as examples): `best` resolves like `opus`; `fable`
-/// selects the Fable model; `sonnet[1m]`/`opus[1m]` request the 1M context
-/// window; `opusplan` runs plan mode on Opus then executes on Sonnet, with
-/// the documented `opusplan[1m]` variant for 1M context in both phases.
-/// `default` is deliberately absent: the doc marks it a special value that
-/// clears any override rather than a model alias, and omitting `--model`
-/// already selects the CLI default (read back from initialize/stream).
-pub const CLAUDE_DOCUMENTED_ALIASES: &[&str] = &[
-    "best",
-    "fable",
-    "sonnet",
-    "opus",
-    "haiku",
-    "sonnet[1m]",
-    "opus[1m]",
-    "opusplan",
-    "opusplan[1m]",
-];
-
-/// Frozen full Claude model ids, each shown in the same vendor doc as a
-/// `/model`, `--model`, settings, fallback or allowlist selection
-/// (checked 2026-11-16): pinning a version instead of following an alias.
-/// `claude-haiku-5-5` is documented as `Its model ID is ... To use it, run
-/// /model claude-haiku-5-5 ... or claude --model claude-haiku-5-5`.
-pub const CLAUDE_DOCUMENTED_MODEL_IDS: &[&str] = &[
-    "claude-fable-5-2",
-    "claude-fable-5-1",
-    "claude-fable-5",
-    "claude-opus-5-5",
-    "claude-opus-5",
-    "claude-opus-4-8",
-    "claude-opus-4-8[1m]",
-    "claude-opus-4-6",
-    "claude-opus-4-6[1m]",
-    "claude-opus-4-1",
-    "claude-sonnet-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-6[1m]",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-5-20250929",
-    "claude-haiku-5-5",
-    "claude-haiku-4-5",
-];
-
-/// Build the frozen `harness.models` entries for Claude. No native
-/// catalogue exists (verified read-only against installed 2.1.325 on
-/// 2026-11-16: no `models` subcommand, `--model` names aliases or a full
-/// model name, settings `model`/`availableModels` is an allowlist rather
-/// than an inventory, and the stream-json `initialize` reply reports only
-/// the session model), so the documented aliases and full ids above are
-/// returned verbatim, each marked `documented_alias` with the CLI effort
-/// vocabulary attached. Availability is never asserted here: quota stays
-/// unsupported for Claude, so the unified catalogue reads `unknown`.
-pub(crate) fn claude_documented_models() -> Vec<core::api::HarnessModelEntry> {
-    let efforts: Vec<String> = CLAUDE_EFFORT_LEVELS
-        .iter()
-        .map(|effort| (*effort).to_owned())
-        .collect();
-    CLAUDE_DOCUMENTED_ALIASES
-        .iter()
-        .chain(CLAUDE_DOCUMENTED_MODEL_IDS.iter())
-        .map(|id| core::api::HarnessModelEntry {
-            id: (*id).to_owned(),
-            display_name: None,
-            default: false,
-            efforts: Some(efforts.clone()),
-            default_effort: None,
-            source: Some(CLAUDE_CATALOGUE_SOURCE.to_owned()),
-        })
-        .collect()
-}
+pub use core::api::native_profile::CLAUDE_EFFORT_LEVELS;
 
 fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     // OpenCode efforts are the installed per-model `Model.Variant` ids
     // (the TUI "Variant" switch), so any well-formed value freezes and the
     // live native catalogue proves membership at launch.
-    if !matches!(harness, "codex" | "muse" | "claude" | "opencode") {
-        return Err(core::Error::new(
-            "unsupported",
-            format!("the {harness} slice has no reasoning-effort mapping"),
-        ));
-    }
+    let adhoc_effort = core::api::HarnessCapabilities::of(harness)
+        .adhoc_effort
+        .ok_or_else(|| {
+            core::Error::new(
+                "unsupported",
+                format!("the {harness} slice has no reasoning-effort mapping"),
+            )
+        })?;
     let trimmed = effort.trim();
     if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(char::is_control) {
         return Err(core::Error::new(
@@ -169,134 +92,12 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
             "ad-hoc effort must be non-empty, at most 128 characters and contain no controls",
         ));
     }
-    if harness == "claude" && !CLAUDE_EFFORT_LEVELS.contains(&trimmed) {
-        return Err(core::Error::new(
-            "profile_error",
-            "unknown Claude effort level (low, medium, high, xhigh, or max)",
-        ));
+    if let core::api::harness::AdhocEffort::Choices { values, refusal } = adhoc_effort
+        && !values.contains(&trimmed)
+    {
+        return Err(core::Error::new("profile_error", refusal));
     }
     Ok(trimmed.to_owned())
-}
-
-/// Ad-hoc access levels for Owner launch: `ask` routes every tool or
-/// permission request to the Owner through the existing pending-request
-/// path (`swarm approve`/`deny`); `auto` lets the harness apply its safe
-/// automatic posture; `full` selects the harness's full-access posture,
-/// exactly the current full-access profiles. Documented in
-/// `docs/spec/configuration.md` (access mapping) and per harness in
-/// `docs/harnesses/*.md`.
-pub(crate) const ADHOC_ACCESS_LEVELS: &[&str] = &["ask", "auto", "full"];
-
-pub(crate) fn validate_adhoc_access(access: &str) -> core::Result<String> {
-    let trimmed = access.trim();
-    if ADHOC_ACCESS_LEVELS.contains(&trimmed) {
-        Ok(trimmed.to_owned())
-    } else {
-        Err(core::Error::new(
-            "invalid",
-            "ad-hoc access must be ask, auto or full",
-        ))
-    }
-}
-
-/// Freeze the native permission result for one access level into the ad-hoc
-/// snapshot. The frozen native fields are exactly the profile fields a
-/// stored full-access profile uses, so launch-time effective settings report
-/// the same values. `ask` always routes approvals through the existing
-/// pending-request path; levels a harness cannot express refuse with a typed
-/// `unsupported` instead of silently weakening.
-fn apply_adhoc_access(
-    snapshot: &mut Map<String, Value>,
-    harness: &str,
-    access: &str,
-    profile_name: &str,
-) -> core::Result<()> {
-    snapshot.insert("access".to_owned(), Value::String(access.to_owned()));
-    let invalid = || core::Error::new("invalid", "ad-hoc access must be ask, auto or full");
-    let text = |value: &str| Value::String(value.to_owned());
-    match harness {
-        "codex" => {
-            let (permissions, approval_policy) = match access {
-                "ask" => (
-                    CodexPermissions::WorkspaceWrite,
-                    CodexApprovalPolicy::OnRequest,
-                ),
-                "auto" => (CodexPermissions::WorkspaceWrite, CodexApprovalPolicy::Never),
-                "full" => (
-                    CodexPermissions::DangerFullAccess,
-                    CodexApprovalPolicy::Never,
-                ),
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
-            snapshot.insert("approval_policy".to_owned(), text(approval_policy.as_str()));
-            Ok(())
-        }
-        "claude" => {
-            // The frozen `permission_mode` is the CLI `--permission-mode`
-            // argv the Claude plugin pushes; `manual` routes `can_use_tool`
-            // through the pending-request path, `auto` approves safe edits,
-            // `bypassPermissions` is the full-access posture.
-            let mode = match access {
-                "ask" => "manual",
-                "auto" => "auto",
-                "full" => "bypassPermissions",
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("permission_mode".to_owned(), text(mode));
-            Ok(())
-        }
-        "muse" => {
-            let (approval, permissions) = match access {
-                "ask" => ("onRequest", CodexPermissions::WorkspaceWrite),
-                "auto" => ("promptUnmatched", CodexPermissions::WorkspaceWrite),
-                "full" => ("allowAll", CodexPermissions::DangerFullAccess),
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("approval".to_owned(), text(approval));
-            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
-            Ok(())
-        }
-        "opencode" => match access {
-            // OpenCode exposes no verified distinct native permission knob
-            // today: ask and auto share the native permission-reply surface
-            // (permission requests stay pending for the Owner). `full` has no
-            // full-access profile mapping, so it refuses instead of silently
-            // widening.
-            "ask" | "auto" => Ok(()),
-            "full" => Err(core::Error::new(
-                "unsupported",
-                "the opencode slice has no full-access permission mapping",
-            )),
-            _ => Err(invalid()),
-        },
-        "antigravity" => {
-            // `false` keeps the ACP `session/request_permission` round-trip
-            // that bridges to `swarm approve`/`deny`; `true` is the
-            // full-access skip flag.
-            let skip = match access {
-                "ask" | "auto" => false,
-                "full" => true,
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(skip));
-            Ok(())
-        }
-        _ => Err(core::Error::new(
-            "unsupported",
-            format!("unsupported launch harness {harness}"),
-        )),
-    }
-    .map_err(|error| {
-        if error.code == "invalid" {
-            error
-        } else {
-            core::Error::new(
-                error.code.clone(),
-                format!("ad-hoc {profile_name}: {}", error.message),
-            )
-        }
-    })
 }
 
 /// Longest accepted ad-hoc auth selector, in bytes. Mirrors the plugin's
@@ -308,7 +109,10 @@ const MAX_AUTH_SELECTOR_BYTES: usize = 128;
 /// integration, so only it accepts `--auth`. The syntax mirrors the
 /// profile's `auth_integration` selector.
 pub(crate) fn validate_adhoc_auth(harness: &str, auth: &str) -> core::Result<String> {
-    if harness != "opencode" {
+    if !HarnessCapabilities::of(harness)
+        .adhoc_launch
+        .is_some_and(|defaults| defaults.model == AdhocModel::ProviderIntegration)
+    {
         return Err(core::Error::new(
             "unsupported",
             format!("the {harness} slice has no auth-integration mapping"),
@@ -357,6 +161,14 @@ pub(crate) fn adhoc_snapshot(
     access: Option<&str>,
 ) -> core::Result<Value> {
     let harness = validate_adhoc_harness(harness)?;
+    let defaults = HarnessCapabilities::of(&harness)
+        .adhoc_launch
+        .ok_or_else(|| {
+            core::Error::new(
+                "unsupported",
+                format!("unsupported launch harness {harness}"),
+            )
+        })?;
     let model = model
         .filter(|value| !value.trim().is_empty())
         .map(validate_adhoc_model)
@@ -378,14 +190,14 @@ pub(crate) fn adhoc_snapshot(
                 .transpose()?,
         ),
     };
-    if harness == "antigravity" && model.is_none() && !catalogue_only {
+    if defaults.model == AdhocModel::Explicit && model.is_none() && !catalogue_only {
         return Err(core::Error::new(
             "profile_error",
             "ad-hoc antigravity launch requires an explicit model",
         ));
     }
     if let Some(model) = model.as_deref()
-        && harness == "opencode"
+        && defaults.model == AdhocModel::ProviderIntegration
         && split_provider_model(model).is_none()
     {
         return Err(core::Error::new(
@@ -396,7 +208,7 @@ pub(crate) fn adhoc_snapshot(
 
     let access = access
         .filter(|value| !value.trim().is_empty())
-        .map(validate_adhoc_access)
+        .map(AdhocAccess::parse)
         .transpose()?;
     if catalogue_only && access.is_some() {
         return Err(core::Error::new(
@@ -407,98 +219,31 @@ pub(crate) fn adhoc_snapshot(
     let profile_name = adhoc_profile_name(&harness);
     let mut snapshot = Map::new();
     snapshot.insert("harness".to_owned(), Value::String(harness.clone()));
-    match harness.as_str() {
-        "codex" => {
-            if let Some(cmd) = cmd {
-                let validated = validate_native_cmd(&profile_name, &cmd)?;
-                snapshot.insert("cmd".to_owned(), Value::String(validated));
-            }
-        }
-        "claude" => {
-            let cmd = cmd.ok_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "ad-hoc claude launch requires a discovered native cmd",
-                )
-            })?;
-            let validated = validate_claude_cmd(&profile_name, &cmd)?;
-            snapshot.insert("cmd".to_owned(), Value::String(validated));
-        }
-        "muse" => {
-            let cmd = cmd.ok_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "ad-hoc muse launch requires a discovered native cmd",
-                )
-            })?;
-            let validated = validate_native_cmd(&profile_name, &cmd)?;
-            snapshot.insert("cmd".to_owned(), Value::String(validated));
-        }
-        "opencode" => {
-            let cmd = cmd.ok_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "ad-hoc opencode launch requires a discovered native cmd",
-                )
-            })?;
-            let validated = validate_native_cmd(&profile_name, &cmd)?;
-            // Launch only: an explicit selector freezes verbatim; an omitted
-            // one defaults to the model provider prefix only on an exact
-            // auth-list id match, and anything else refuses before spawning.
-            // Catalogue snapshots (`AdhocAuth::Skip`) freeze no selector: the
-            // read transfers no credential. The plugin's pre-serve transfer
-            // gate is unchanged: it still requires the frozen integration to
-            // hold exactly one canonical credential.
-            let selector = match auth {
-                None => None,
-                Some(explicit) => Some(match explicit {
-                    Some(selector) => selector,
-                    None => {
-                        let ids = opencode_auth_ids(&validated).ok_or_else(|| {
-                            core::Error::new(
-                                "profile_error",
-                                "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
-                            )
-                        })?;
-                        resolve_opencode_default(model.as_deref(), &ids)?
-                    }
-                }),
+    if let Some(cmd) = cmd {
+        let validated = validate_profile_cmd(&profile_name, &harness, &cmd)?;
+        if defaults.model == AdhocModel::ProviderIntegration
+            && let Some(explicit) = auth
+        {
+            let selector = match explicit {
+                Some(selector) => selector,
+                None => {
+                    let ids = opencode_auth_ids(&validated).ok_or_else(|| {
+                        core::Error::new(
+                            "profile_error",
+                            "ad-hoc opencode launch needs --auth <integration>; the native auth list could not be read",
+                        )
+                    })?;
+                    resolve_opencode_default(model.as_deref(), &ids)?
+                }
             };
-            snapshot.insert("cmd".to_owned(), Value::String(validated));
-            if let Some(selector) = selector {
-                snapshot.insert("auth_integration".to_owned(), Value::String(selector));
-            }
+            snapshot.insert("auth_integration".to_owned(), Value::from(selector));
         }
-        "antigravity" => {
-            let cmd = cmd.ok_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "ad-hoc antigravity launch requires a discovered native cmd",
-                )
-            })?;
-            let validated = validate_native_cmd(&profile_name, &cmd)?;
-            // CLI identity before any launch: an IDE-named cmd is refused
-            // here, never spawned as an agent server.
-            if !cli_identity_matches_decl(&harness, &validated) {
-                return Err(core::Error::new(
-                    "profile_error",
-                    format!(
-                        "ad-hoc {profile_name}: cmd points at the Antigravity IDE ({validated}), which does not implement the required native ACP/model CLI and is never launched; use the `agy` CLI"
-                    ),
-                ));
-            }
-            snapshot.insert("cmd".to_owned(), Value::String(validated));
-            snapshot.insert(
-                "dangerously_skip_permissions".to_owned(),
-                Value::Bool(false),
-            );
-        }
-        _ => {
-            return Err(core::Error::new(
-                "unsupported",
-                format!("unsupported launch harness {harness}"),
-            ));
-        }
+        snapshot.insert("cmd".to_owned(), Value::from(validated));
+    } else if !matches!(discovery_for(&harness)?.strategy, InstallStrategy::ByName) {
+        return Err(core::Error::new(
+            "profile_error",
+            format!("ad-hoc {harness} launch requires a discovered native cmd"),
+        ));
     }
     if let Some(model) = model {
         snapshot.insert("model".to_owned(), Value::String(model));
@@ -506,29 +251,21 @@ pub(crate) fn adhoc_snapshot(
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort));
     }
-    if matches!(harness.as_str(), "codex" | "claude" | "muse") {
-        snapshot.insert(
-            "permissions".to_owned(),
-            Value::String(CodexPermissions::default().as_str().to_owned()),
-        );
-        snapshot.insert(
-            "approval_policy".to_owned(),
-            Value::String(CodexApprovalPolicy::default().as_str().to_owned()),
-        );
+    if let Some(access) = access {
+        snapshot.insert("access".to_owned(), Value::from(access.as_str()));
     }
-    // Access mapping overwrites the safe defaults above with the exact
-    // native permission result for the requested level, freezing both the
-    // level and its native fields. Omitted access keeps the safe defaults.
-    if let Some(access) = access.as_deref() {
-        apply_adhoc_access(&mut snapshot, &harness, access, &profile_name)?;
-    }
-    // Claude can enforce the same isolated MCP policy as a saved profile.
-    let mcp = if harness == "claude" {
-        "minimal"
-    } else {
-        "inherit"
-    };
-    snapshot.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
+    eliot_plugin::capabilities::apply_adhoc_permissions(
+        &mut snapshot,
+        access,
+        defaults.permissions,
+    )
+    .map_err(|error| {
+        core::Error::new(
+            error.code.clone(),
+            format!("ad-hoc {profile_name}: {}", error.message),
+        )
+    })?;
+    snapshot.insert("mcp".to_owned(), Value::from(defaults.mcp.as_str()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));
     let native_subagents = crate::config::native_subagents_default(&harness).ok_or_else(|| {
@@ -541,12 +278,7 @@ pub(crate) fn adhoc_snapshot(
         "native_subagents".to_owned(),
         Value::String(native_subagents.to_owned()),
     );
-    let pass_env = if harness == "claude" {
-        json!(["CLAUDE_CONFIG_DIR"])
-    } else {
-        json!([])
-    };
-    snapshot.insert("pass_env".to_owned(), pass_env);
+    snapshot.insert("pass_env".to_owned(), json!(defaults.pass_env));
     snapshot.insert("scratch".to_owned(), json!(["target/", "node_modules/"]));
     snapshot.insert(
         "capacity_scopes".to_owned(),
@@ -574,20 +306,14 @@ pub(crate) fn validate_native_cmd(profile: &str, cmd: &str) -> core::Result<Stri
 /// Claude cmd rule: absolute native path, never a bare name or wrapper.
 /// A wrapper would orphan the real CLI on stop, when only the wrapper PID
 /// is owned.
-fn validate_claude_cmd(profile: &str, cmd: &str) -> core::Result<String> {
+fn validate_profile_cmd(profile: &str, harness: &str, cmd: &str) -> core::Result<String> {
     let cmd = validate_native_cmd(profile, cmd)?;
-    if !Path::new(&cmd).is_absolute() {
+    if let Some(refusal) = ProfileCapabilities::of(harness).command_refusal
+        && let Some(message) = refusal(&cmd)
+    {
         return Err(core::Error::new(
             "profile_error",
-            format!(
-                "ad-hoc {profile}: cmd must be an absolute native executable path, not a bare command name"
-            ),
-        ));
-    }
-    if cfg!(windows) && !cmd.to_ascii_lowercase().ends_with(".exe") {
-        return Err(core::Error::new(
-            "profile_error",
-            format!("ad-hoc {profile}: cmd must name the native .exe, not a script wrapper"),
+            format!("ad-hoc {profile}: cmd {message}"),
         ));
     }
     Ok(cmd)
@@ -632,13 +358,6 @@ pub(crate) async fn blocking_discovery<T: Send + 'static>(
 /// Harnesses without an identity gate accept any resolved executable.
 /// Adapter-owned declarations are registered in `eliot_plugin::install` by
 /// the `eliot` composition root; the daemon holds no per-harness branch.
-fn cli_identity_matches_decl(harness: &str, cmd: &str) -> bool {
-    discovery_for(harness).is_ok_and(|decl| {
-        decl.cli_identity
-            .is_none_or(|stem| cli_identity_matches(cmd, stem))
-    })
-}
-
 /// Resolve the installed executable from the owning plugin's declaration.
 /// Codex's default launch keeps its native PATH resolution; readers pin the
 /// resolved executable before probing.
@@ -733,23 +452,42 @@ pub(crate) fn profile_command_exists(cmd: &str) -> bool {
     })
 }
 
-/// Discover native Claude CLI installations and probe their versions.
-/// Enumeration comes from the Claude plugin's install declaration; the
-/// bounded `--version` probe loop stays shared here.
-pub(crate) fn discover_claude_candidates(deadline: Instant) -> Vec<core::api::HarnessCandidate> {
-    let paths = discovery_for("claude")
-        .ok()
-        .and_then(|decl| (decl.candidates)().ok())
-        .unwrap_or_default();
+/// Whether the adapter declares a ranked native install inventory.
+pub(crate) fn has_ranked_install_candidates(harness: &str) -> bool {
+    discovery_for(harness)
+        .is_ok_and(|decl| matches!(decl.strategy, InstallStrategy::NewestVerified))
+}
+
+/// Probe all candidates from a ranked adapter, newest and parseable versions
+/// first. Failed or unparseable probes remain in the candidate list as
+/// unverified entries, matching Claude's existing inventory behavior.
+pub(crate) fn discover_ranked_candidates(
+    harness: &str,
+    deadline: Instant,
+) -> Vec<core::api::HarnessCandidate> {
+    let Ok(decl) = discovery_for(harness) else {
+        return Vec::new();
+    };
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return Vec::new();
+    }
+    let paths = (decl.candidates)().unwrap_or_default();
     probe_candidate_paths_with(paths, |cmd| {
         probe_native_version(cmd, None, deadline).ok().flatten()
     })
 }
 
-/// Select the newest verified Claude candidate through the shared
-/// newest-verified engine over the plugin's declaration.
-fn discover_verified_claude(deadline: Instant) -> core::Result<core::api::HarnessCandidate> {
-    let decl = discovery_for("claude")?;
+fn discover_ranked_candidate(
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<core::api::HarnessCandidate> {
+    let decl = discovery_for(harness)?;
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return Err(core::Error::new(
+            "unsupported",
+            "native install declaration does not rank candidates",
+        ));
+    }
     discover_newest_verified(&decl, deadline)
 }
 
@@ -768,12 +506,15 @@ fn verified_candidate_from_candidates(
     })
 }
 
-pub(crate) fn is_latest_claude_selector(cmd: &str) -> bool {
+pub(crate) fn is_latest_selector(cmd: &str) -> bool {
     cmd.trim().eq_ignore_ascii_case("latest")
 }
 
-pub(crate) fn claude_candidate_available() -> bool {
-    discovery_for("claude").ok().is_some_and(|decl| {
+pub(crate) fn ranked_candidate_available(harness: &str) -> bool {
+    if !has_ranked_install_candidates(harness) {
+        return false;
+    }
+    discovery_for(harness).ok().is_some_and(|decl| {
         (decl.candidates)()
             .unwrap_or_default()
             .iter()
@@ -807,7 +548,7 @@ pub(crate) fn missing_profile_command_refusal(
     configured_cmd: &str,
     replacement: Option<&core::api::HarnessCandidate>,
 ) -> core::Error {
-    let fallback = if harness == "claude" {
+    let fallback = if crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd {
         format!(
             "omit cmd from profiles.{profile} to follow the installed version, or use {}",
             claude_latest_settings_command(profile)
@@ -879,9 +620,10 @@ pub(crate) fn inherit_profile_command(
 }
 
 pub(crate) fn explicit_profile_command<'a>(snapshot: &'a Value, harness: &str) -> Option<&'a str> {
-    snapshot["cmd"]
-        .as_str()
-        .filter(|cmd| !(harness == "claude" && is_latest_claude_selector(cmd)))
+    snapshot["cmd"].as_str().filter(|cmd| {
+        !(crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd
+            && is_latest_selector(cmd))
+    })
 }
 
 pub(crate) async fn resolve_profile_command_until(
@@ -890,8 +632,8 @@ pub(crate) async fn resolve_profile_command_until(
     cmd: Option<&str>,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
-    if harness == "claude" {
-        return resolve_claude_profile_command_until(profile, cmd, deadline).await;
+    if crate::harness_capabilities::ProfileCapabilities::of(harness).latest_cmd {
+        return resolve_ranked_profile_command_until(profile, harness, cmd, deadline).await;
     }
     let Some(cmd) = cmd else {
         return discover_profile_command_candidate(harness, deadline).await;
@@ -924,47 +666,47 @@ async fn discover_profile_command_candidate(
     Ok(core::api::HarnessCandidate { cmd, version })
 }
 
-async fn resolve_claude_profile_command_until(
+async fn resolve_ranked_profile_command_until(
     profile: &str,
+    harness: &str,
     cmd: Option<&str>,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
     let profile = profile.to_owned();
+    let harness = harness.to_owned();
     let cmd = cmd.map(str::to_owned);
     blocking_discovery(deadline, move || {
-        resolve_claude_profile_command_sync(&profile, cmd.as_deref(), deadline)
+        resolve_ranked_profile_command_sync(&profile, &harness, cmd.as_deref(), deadline)
     })
     .await?
 }
 
-fn resolve_claude_profile_command_sync(
+fn resolve_ranked_profile_command_sync(
     profile: &str,
+    harness: &str,
     cmd: Option<&str>,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
-    if let Some(cmd) = cmd.filter(|cmd| !is_latest_claude_selector(cmd)) {
-        let cmd = validate_claude_cmd(profile, cmd)?;
+    if let Some(cmd) = cmd.filter(|cmd| !is_latest_selector(cmd)) {
+        let cmd = validate_profile_cmd(profile, harness, cmd)?;
         if is_native_executable(Path::new(&cmd)) {
             return Ok(core::api::HarnessCandidate {
                 version: probe_native_version(&cmd, None, deadline).ok().flatten(),
                 cmd,
             });
         }
-        let candidates = discover_claude_candidates(deadline);
-        return Err(missing_claude_profile_command(profile, &cmd, &candidates));
+        let candidates = discover_ranked_candidates(harness, deadline);
+        let replacement = verified_candidate_from_candidates(&candidates);
+        return Err(missing_profile_command_refusal(
+            profile,
+            harness,
+            &cmd,
+            replacement,
+        ));
     }
 
-    discover_verified_claude(deadline)
+    discover_ranked_candidate(harness, deadline)
         .map_err(|error| core::Error::new(error.code, format!("{profile}: {}", error.message)))
-}
-
-fn missing_claude_profile_command(
-    profile: &str,
-    cmd: &str,
-    candidates: &[core::api::HarnessCandidate],
-) -> core::Error {
-    let replacement = verified_candidate_from_candidates(candidates);
-    missing_profile_command_refusal(profile, "claude", cmd, replacement)
 }
 
 pub(crate) fn claude_latest_settings_command(profile: &str) -> String {
@@ -983,35 +725,35 @@ fn shell_quote_settings_arg(value: &str) -> String {
     }
 }
 
-/// Inventory entry for Claude from one candidate pass, so `harness.list`
-/// does not enumerate and version every install twice.
-pub(crate) fn claude_installation(candidates: &[core::api::HarnessCandidate]) -> Value {
+/// Inventory entry derived from the same ranked candidates displayed to the caller.
+pub(crate) fn ranked_installation(
+    harness: &str,
+    candidates: &[core::api::HarnessCandidate],
+) -> Value {
+    let decl = match discovery_for(harness) {
+        Ok(decl) => decl,
+        Err(error) => return installation_error(harness, error),
+    };
+    if !matches!(decl.strategy, InstallStrategy::NewestVerified) {
+        return installation_error(
+            harness,
+            core::Error::new(
+                "unsupported",
+                "native install declaration does not rank candidates",
+            ),
+        );
+    }
     if let Some(best) = verified_candidate_from_candidates(candidates) {
         let version = best.version.clone().map_or(Value::Null, Value::String);
         json!({
-            "harness": "claude",
+            "harness": harness,
             "installed": true,
             "cmd": best.cmd.clone(),
             "version": version,
         })
     } else {
-        let error = discovery_for("claude")
-            .ok()
-            .map(|decl| (decl.not_found)(!candidates.is_empty(), &(decl.searched)()))
-            .unwrap_or_else(|| {
-                core::Error::new(
-                    "profile_error",
-                    "Standalone Claude CLI was not found; select a native executable explicitly with --cmd",
-                )
-            });
-        json!({
-            "harness": "claude",
-            "installed": false,
-            "cmd": Value::Null,
-            "version": Value::Null,
-            "error": error.message,
-            "code": error.code,
-        })
+        let error = (decl.not_found)(!candidates.is_empty(), &(decl.searched)());
+        installation_error(harness, error)
     }
 }
 /// Resolve and check the exact executable before any probe. An IDE symlink
@@ -1138,14 +880,15 @@ pub(crate) async fn reader_executable(
     .await?
 }
 
-/// Select the newest Claude reader with a successful parseable `--version`
-/// under the caller's deadline, reusing its version from the same pass.
-pub(crate) async fn claude_reader_executable(
+/// Resolve the newest verified reader and reuse its observed version.
+pub(crate) async fn ranked_reader_executable(
+    harness: &str,
     deadline: Instant,
 ) -> core::Result<core::api::HarnessCandidate> {
+    let harness = harness.to_owned();
     blocking_discovery(deadline, move || {
-        let best = discover_verified_claude(deadline)?;
-        let cmd = resolve_native_executable(&best.cmd, "claude")?;
+        let best = discover_ranked_candidate(&harness, deadline)?;
+        let cmd = resolve_native_executable(&best.cmd, &harness)?;
         Ok(core::api::HarnessCandidate {
             cmd,
             version: best.version.clone(),

@@ -27,5 +27,5 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))'.dependencies]
 libc.workspace = true

@@ -7,6 +7,14 @@ tree; no TypeScript Agent SDK, no Node.
 
 ## Sources and unresolved facts
 
+Swarm reports project `AGENTS.md` native-read status as `unknown`. The
+stream-json initialization and prelaunch metadata do not prove the loader's
+effective settings, precedence or exclusions. Swarm can supply the file through
+its normal first-input source delivery. The CLI version is recorded as
+provenance. Managed sessions keep the documented native `CLAUDE.md` convention.
+Claude's [project memory documentation](https://code.claude.com/docs/en/memory#agents-md)
+describes selection settings and `/memory` inspection inside an active session.
+
 The stream-json record shapes were verified against the installed CLI
 (`claude -p --input-format stream-json --output-format stream-json --verbose`,
 Claude Code 2.1.278): [headless](https://code.claude.com/docs/en/headless),

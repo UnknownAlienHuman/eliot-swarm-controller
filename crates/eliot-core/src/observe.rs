@@ -647,14 +647,9 @@ pub fn evaluate_session_growth(
 /// The harness doc section with the native sources each adapter translates.
 /// `swarm doctor` points here when the Owner needs the harness background.
 pub fn harness_doc_section(harness: &str) -> &'static str {
-    match harness {
-        "codex" => "docs/harnesses/codex.md#sources",
-        "claude" => "docs/harnesses/claude-code.md#sources-and-unresolved-facts",
-        "muse" => "docs/harnesses/muse.md#usage-attribution",
-        "opencode" => "docs/harnesses/opencode.md#working-profile",
-        "antigravity" => "docs/harnesses/antigravity.md#native-identity-and-transport",
-        _ => "docs/harnesses/README.md",
-    }
+    crate::api::HarnessCapabilities::for_harness(harness)
+        .and_then(|capabilities| capabilities.documentation_section)
+        .unwrap_or("docs/harnesses/README.md")
 }
 
 /// Canonical version text for installed-vs-checked comparison: trimmed,

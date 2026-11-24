@@ -124,9 +124,12 @@ reader reaps the owned helper on a deadline or read failure.
 An initial plugin may declare:
 
 The [`PluginManifest`](../../crates/eliot-plugin/src/protocol.rs) DTO owns the manifest
-field catalog. The manifest carries the adapter package version. Swarm reads
-the installed vendor version through install discovery and reports its check in
-[`harness.doctor`](monitoring.md#heavy-work-session-growth-and-harness-checks).
+field catalog. Its version identifies the adapter package. Swarm reads the installed
+vendor version through install discovery and reports it with the last check for that
+version in [`harness.doctor`](monitoring.md#heavy-work-session-growth-and-harness-checks).
+A newly observed installation is eligible for explicit launches and reports
+`not_checked` until qualified. The separate automatic-routing policy can defer a
+route after a failed check.
 
 `proxy` remains a string capability. "none" remains valid for direct native
 adapters (for example direct Codex). A controlled Codex profile with an adopted Responses route
@@ -144,6 +147,20 @@ capabilities to prepare launches and validate runtime manifests. The shared
 install engine reads the adapter's candidate search, executable identity and
 verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
+Adapters declare their project instruction-file behavior and the user instruction
+paths that doctor compares with committed owner rules.
+The controller and offline desktop settings editor register the same profile
+capabilities from the built-in adapters before using them. Store entry points
+return an error when registration is missing. Adapter declarations identify
+adopted proxy support, catalogue route labels, and the native approval field.
+Claude `AGENTS.md` is `unknown` at prelaunch because the adapter cannot establish
+which project instructions the native loader will select. Swarm's normal project
+source delivery applies, and any installed version is provenance.
+They also declare ad-hoc access mappings and the MCP and environment defaults
+used by ad-hoc launches and installed profile presets.
+Catalogue reader stages and native quota readback formats come from the same
+declarations. The daemon owns reader custody, route verification, cache identity
+and the use of quota evidence for routing.
 
 ## Host requests
 
@@ -921,6 +938,14 @@ Contain owned children before tools run; use absolute deadlines. Drain buffered 
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
+Use the shared [`retry`](../../crates/eliot-plugin/src/retry.rs) module for readiness
+polls and absolute deadline waits. Adapters translate native resume readback into shared
+preflight evidence. They translate exact native provider refusals into the common
+restriction fact so the daemon and Store can apply hold policy. Shared file installation
+syncs an exclusive temporary file beside the destination before publishing it. On Unix,
+a failed hard link can fall back to a native no-replace rename where supported.
+Publication refuses an existing destination and requires a safe filesystem primitive.
+
 All adapters follow the shared [native data rule](../../crates/eliot-plugin/src/native_data.rs).
 Skip extra fields. Decode an unfamiliar enum value as `Other` and emit a diagnostic.
 Record an unfamiliar event as a `session.native_unclassified` native fact and keep
@@ -929,7 +954,9 @@ native discriminator, without the raw payload. They have no lifecycle, authority
 outcome semantics. A terminal record with an unfamiliar outcome cannot establish
 success, failure or interruption. Preserve frame integrity and exact binding checks.
 Detect native capabilities from advertised or observed behavior. Installed version
-strings are diagnostic metadata and do not select a decoder or gate a session.
+strings are diagnostic metadata. Choose native formats from the advertised methods,
+schema or fields present in the data. Check the feature or authority required for the
+specific operation before dispatch.
 
 Codex skip-lists the known high-volume notifications `item/agentMessage/delta`,
 `item/commandExecution/outputDelta`, `item/fileChange/outputDelta`, `item/plan/delta`,

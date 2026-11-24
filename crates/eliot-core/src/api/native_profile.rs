@@ -5,6 +5,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Claude's closed reasoning-effort vocabulary for frozen profiles.
+pub const CLAUDE_EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 /// Native subagent policy for one built-in harness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeSubagentsPolicy {
