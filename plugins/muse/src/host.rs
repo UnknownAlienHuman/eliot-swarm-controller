@@ -1229,6 +1229,10 @@ impl MusePlugin {
             ));
         }
         session.expected_model = Some(requested_model.clone());
+        session
+            .events
+            .remember_expected_model(requested_model.clone())
+            .await?;
         Ok(with_model_catalogue_diagnostic(
             json!({
                 "state": "applied",

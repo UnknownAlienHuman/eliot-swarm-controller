@@ -727,6 +727,7 @@ impl MusePlugin {
                 session.native_scope.clone(),
                 native_session.session_id.clone(),
                 effective.clone(),
+                session.expected_model.clone(),
             )
             .await
         {

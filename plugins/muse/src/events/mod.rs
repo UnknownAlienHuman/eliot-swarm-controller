@@ -296,6 +296,11 @@ enum Control {
         native_scope: String,
         session_id: String,
         effective: Value,
+        expected_model: Option<String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ExpectedModel {
+        model: String,
         reply: oneshot::Sender<Result<()>>,
     },
     AssociateTurn {
@@ -485,6 +490,7 @@ fn native_notification_turn_id(params: &Value) -> Option<&str> {
         .get("turnId")
         .and_then(Value::as_str)
         .or_else(|| params.pointer("/item/turnId").and_then(Value::as_str))
+        .or_else(|| provider::signal(params).map(|signal| signal.turn_id))
 }
 
 /// Store identities acknowledged during the active turn, independently of
@@ -547,6 +553,7 @@ struct EventProcessor {
     provider_subscription: Option<u64>,
     model_hold_settings_path: Option<PathBuf>,
     turn_model: TurnModel,
+    session_expected_model: Option<String>,
     status: EventStatus,
     buffer: VecDeque<BufferedFrame>,
     buffer_bytes: usize,
@@ -713,14 +720,21 @@ impl EventHandle {
         native_scope: String,
         session_id: String,
         effective: Value,
+        expected_model: Option<String>,
     ) -> Result<()> {
         self.send(|reply| Control::Ready {
             native_scope,
             session_id,
             effective,
+            expected_model,
             reply,
         })
         .await
+    }
+
+    pub async fn remember_expected_model(&self, model: String) -> Result<()> {
+        self.send(|reply| Control::ExpectedModel { model, reply })
+            .await
     }
 
     pub async fn associate_turn(&self, send: SendAssociation, queued: bool) -> Result<bool> {
@@ -874,6 +888,7 @@ impl EventProcessor {
             provider_subscription: None,
             model_hold_settings_path: config.model_hold_settings_path,
             turn_model: TurnModel::default(),
+            session_expected_model: None,
             status: EventStatus::default(),
             buffer: VecDeque::new(),
             buffer_bytes: 0,
@@ -962,10 +977,17 @@ impl EventProcessor {
                 native_scope,
                 session_id,
                 effective,
+                expected_model,
                 reply,
             } => {
+                self.session_expected_model = expected_model;
                 let result = self.ready(native_scope, session_id, effective).await;
                 let _ = reply.send(result);
+                true
+            }
+            Control::ExpectedModel { model, reply } => {
+                self.session_expected_model = Some(model);
+                let _ = reply.send(Ok(()));
                 true
             }
             Control::AssociateTurn {
@@ -1632,12 +1654,8 @@ impl EventProcessor {
         if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
             data["effort"] = json!(effort);
         }
-        self.turn_model = TurnModel {
-            expected: model,
-            ..TurnModel::default()
-        };
-        self.status.provider_model_turn = None;
-        self.status.model_mismatch = None;
+        self.session_expected_model = model;
+        self.reset_turn_model();
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
@@ -1671,6 +1689,7 @@ impl EventProcessor {
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = native_command_id;
         self.turn_completion_usage = None;
+        self.reset_turn_model();
         let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
         self.commit_event(
             "turn.started",
@@ -1684,6 +1703,15 @@ impl EventProcessor {
         self.messages = TurnMessages::default();
         self.apply_stashed_entries().await?;
         Ok(())
+    }
+
+    fn reset_turn_model(&mut self) {
+        self.turn_model = TurnModel {
+            expected: self.session_expected_model.clone(),
+            ..TurnModel::default()
+        };
+        self.status.provider_model_turn = None;
+        self.status.model_mismatch = None;
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
