@@ -6,7 +6,7 @@ use eliot_core::api::{HARNESS_READ_TTL_MS, HarnessQuotaResponse, harness::QuotaO
 use eliot_core::{Error, FailureOrigin, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 
 const READ_INTERVAL: Duration = Duration::from_millis(HARNESS_READ_TTL_MS);
@@ -67,44 +67,12 @@ impl AllowanceReads {
     }
 }
 
-/// Scope the read to the vendor's effective file-backed sign-in. Profile labels,
-/// model choices and upgrades of the launcher binary do not select accounts.
-fn account_key(harness: &str, environment: &Value) -> Option<String> {
-    let env = |name: &str| {
-        environment
-            .as_object()?
-            .iter()
-            .find(|(key, _)| {
-                key.as_str() == name || (cfg!(windows) && key.eq_ignore_ascii_case(name))
-            })?
-            .1
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-    };
-    let config_home = match env("XDG_CONFIG_HOME") {
-        Some(path) => Path::new(path).to_path_buf(),
-        None => Path::new(env(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?).join(".config"),
-    };
-    if !config_home.is_absolute() {
-        return None;
-    }
-    // Canonicalize the directory when present to collapse aliases without
-    // resolving or opening any credential file.
-    let path = config_home.canonicalize().unwrap_or(config_home);
-    let path = path.to_str()?;
-    let key = if cfg!(windows) {
-        path.to_lowercase()
-    } else {
-        path.to_owned()
-    };
-    Some(format!("{harness}:{key}"))
-}
-
 impl Router {
     pub(super) async fn read_allowance(
         &self,
         profile: Value,
         route: MetadataRoute,
+        readback: eliot_core::api::harness::RetainedQuotaReadback,
         response: &mut HarnessQuotaResponse,
         deadline: Instant,
     ) -> Result<(bool, Option<Error>)> {
@@ -116,14 +84,15 @@ impl Router {
                 )),
             ));
         };
-        let scope_harness = response.harness.clone();
+        let harness = response.harness.clone();
         let scope_environment = route.environment.clone();
+        let account_key = readback.account_key;
         let key = crate::adhoc::blocking_discovery(deadline.into(), move || {
-            account_key(&scope_harness, &scope_environment)
+            account_key(&scope_environment)
         })
         .await;
         let key = match key {
-            Ok(Some(key)) => key,
+            Ok(Some(key)) => format!("{harness}:{key}"),
             Ok(None) => {
                 return Ok((
                     false,
@@ -157,6 +126,7 @@ impl Router {
                 let harness = response.harness.clone();
                 let profile = profile.clone();
                 let account = entry.clone();
+                let unavailable = readback.unavailable;
                 // The refresh owns its slot through cleanup and cache settlement.
                 // A caller that runs out of time can still read the cache.
                 let task = tokio::spawn(async move {
@@ -172,7 +142,7 @@ impl Router {
                         .plugin_host
                         .quota(profile, route.environment, Instant::now() + READ_BUDGET)
                         .await
-                        .and_then(allowance_details);
+                        .and_then(|raw| allowance_details(raw, unavailable));
                     let mut read = account.cached.lock_recover();
                     match result {
                         Err(error)
@@ -235,7 +205,7 @@ impl Router {
         {
             let tier = details.as_ref().and_then(|item| item.get("tier")).cloned();
             details = Some(json!({
-                "state": "ready", "origin": "provider", "source": "Muse MSP usage/changed",
+                "state": "ready", "origin": "provider", "source": readback.source,
                 "observedAtMs": observation.observed_at_ms, "windows": observation.windows,
             }));
             if let (Some(details), Some(tier)) = (&mut details, tier) {
@@ -245,15 +215,13 @@ impl Router {
         if let Some(details) = details {
             response.fetched_at_ms = observed_at(&details).expect("validated allowance timestamp");
             response.note = Some(
-                match (
-                    failure.is_some_and(|failure| failure.at_ms > response.fetched_at_ms),
-                    details["source"].as_str(),
-                ) {
-                    (true, _) => "Last subscription allowance; latest read failed",
-                    (false, Some("Muse MSP usage/changed")) => {
-                        "Muse subscription usage observed during a turn"
-                    }
-                    _ => "Muse subscription allowance from usage --json",
+                if failure.is_some_and(|failure| failure.at_ms > response.fetched_at_ms) {
+                    "Last subscription allowance; latest read failed"
+                } else {
+                    eliot_core::api::HarnessCapabilities::of(&response.harness)
+                        .quota_readback
+                        .map(|readback| (readback.description)(&details))
+                        .unwrap_or("Native subscription allowance")
                 }
                 .to_owned(),
             );
@@ -276,7 +244,10 @@ fn observed_at(details: &Value) -> Option<i64> {
     details.get("observedAtMs")?.as_i64()
 }
 
-fn allowance_details(mut raw: Value) -> Result<AllowanceReading> {
+fn allowance_details(
+    mut raw: Value,
+    unavailable: fn(&str, &str) -> Option<Error>,
+) -> Result<AllowanceReading> {
     let mut details = raw["details"].take();
     let invalid = || {
         Error::new(
@@ -287,17 +258,8 @@ fn allowance_details(mut raw: Value) -> Result<AllowanceReading> {
     match details["state"].as_str() {
         Some("unavailable") => {
             let reason = details["reason"].as_str().ok_or_else(invalid)?;
-            let error = match details["code"].as_str() {
-                Some("auth_required") => Error::new("auth_required", reason).with_origin(
-                    FailureOrigin::Environment,
-                    "Muse usage requires native sign-in",
-                ),
-                Some("quota_unavailable") => {
-                    eliot_plugin::quota::provider("Muse reported no subscription allowance")
-                        .with_message(reason)
-                }
-                _ => return Err(invalid()),
-            };
+            let code = details["code"].as_str().ok_or_else(invalid)?;
+            let error = unavailable(code, reason).ok_or_else(invalid)?;
             return Ok(AllowanceReading::Unavailable(error));
         }
         Some("ready") => {}

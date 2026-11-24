@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub(crate) mod allowance;
 pub mod capabilities;
 pub(crate) mod catalog_presentation;
 mod events;
