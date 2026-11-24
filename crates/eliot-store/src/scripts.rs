@@ -115,9 +115,6 @@ impl Store {
         let mut events = Vec::new();
         let mut child_ids = Vec::with_capacity(actions.len());
         for (index, mut action) in actions.into_iter().enumerate() {
-            if action.verb == "emit" && !action.args.is_object() {
-                return Err(invalid_script_action());
-            }
             action.validate()?;
             if !action.id.is_empty() || !valid_script_output_action_request(&action) {
                 return Err(invalid_script_action());

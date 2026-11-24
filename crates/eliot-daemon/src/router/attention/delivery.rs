@@ -7,7 +7,6 @@ use eliot_core::api::{
     UserEventCommand,
 };
 use eliot_core::{Agent, AgentState, AttentionStep, CommandState, Error, Result};
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -162,7 +161,7 @@ async fn is_own_loss_emit(router: &Router, delivery: &FrozenReport) -> Result<bo
         return Ok(false);
     };
     Ok(args.topic == ATTENTION_TOPIC
-        && AttentionEventBinding::deserialize(&args.data).is_ok_and(|binding| {
+        && AttentionEventBinding::from_report(&args.data).is_some_and(|binding| {
             binding.incident_id.as_deref() == Some(delivery.report.incident_id.as_str())
         }))
 }

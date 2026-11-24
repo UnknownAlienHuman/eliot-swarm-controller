@@ -15,14 +15,70 @@ pub const ATTENTION_EVENT_KIND: &str = "x.user.agent.attention";
 
 /// The binding carried by every internal attention report, including compact
 /// reports. Other report fields are preserved in the event payload.
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
+#[serde(default)]
 pub struct AttentionEventBinding {
+    #[serde(deserialize_with = "read_attention_field")]
     pub incident_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
     pub agent_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
     pub generation: Option<i64>,
+    #[serde(deserialize_with = "read_attention_field")]
     pub turn_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
     pub reason: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
     pub phase: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttentionReportObject {
+    #[serde(flatten)]
+    binding: AttentionEventBinding,
+}
+
+impl AttentionEventBinding {
+    pub fn from_report(report: &Value) -> Option<Self> {
+        AttentionReportObject::deserialize(report)
+            .ok()
+            .map(|report| report.binding)
+    }
+
+    /// Preserve the distinction between a missing report and a present report
+    /// without a usable Agent binding, including previously retained payloads.
+    pub fn from_event_data(data: &Value) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct EventData {
+            #[serde(default, deserialize_with = "read_present_attention_report")]
+            data: Option<AttentionEventBinding>,
+        }
+        EventData::deserialize(data).ok()?.data
+    }
+}
+
+fn read_present_attention_report<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<AttentionEventBinding>, D::Error> {
+    let report: Option<AttentionReportObject> = read_attention_field(deserializer)?;
+    Ok(Some(
+        report.map(|report| report.binding).unwrap_or_default(),
+    ))
+}
+
+fn read_attention_field<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field<T> {
+        Typed(T),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Field::deserialize(deserializer)? {
+        Field::Typed(value) => Some(value),
+        Field::Other(_) => None,
+    })
 }
 
 /// Local event commands after decoding the durable command envelope.

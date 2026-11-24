@@ -4,7 +4,6 @@ use eliot_core::{
     api::{ATTENTION_EVENT_KIND, AttentionEventBinding, UserEventCommand},
     is_attachment_verb, is_start_verb,
 };
-use serde::Deserialize;
 
 pub enum UserEventDispatch {
     Applied(Vec<Event>),
@@ -2194,13 +2193,7 @@ fn settle_stopped_turn_unknown_tx(
 
 /// Bind the report to its current subject in the event transaction.
 fn bind_attention_event_tx(tx: &Transaction<'_>, data: &mut Value) -> Result<(i64, i64)> {
-    #[derive(Deserialize)]
-    struct EventData {
-        data: Option<AttentionEventBinding>,
-    }
-    let report = EventData::deserialize(&*data)
-        .ok()
-        .and_then(|event| event.data)
+    let report = AttentionEventBinding::from_event_data(data)
         .ok_or_else(|| Error::new("invalid", "attention event data must carry its report"))?;
     let agent_id = report
         .agent_id

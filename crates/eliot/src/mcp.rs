@@ -437,7 +437,7 @@ fn tool_definition() -> Tool {
 /// Committed event kinds delivered to HTTP sessions. Anything else is
 /// skipped after advancing the cursor, so one task observes the whole
 /// committed log without fanning out.
-const NOTIFY_EVENT_KINDS: [&str; 2] = ["x.user.notify", "x.user.agent.attention"];
+const NOTIFY_EVENT_KINDS: [&str; 2] = ["x.user.notify", eliot_core::api::ATTENTION_EVENT_KIND];
 const NOTIFY_PAGE_SIZE: usize = 100;
 const NOTIFY_WAIT_MS: u64 = 1_000;
 const NOTIFY_LOGGER: &str = "eliot";
@@ -688,7 +688,7 @@ fn normalize_owner_event(event: &Event) -> Option<(LoggingLevel, Value)> {
             }
             Some((LoggingLevel::Info, payload))
         }
-        "x.user.agent.attention" => {
+        eliot_core::api::ATTENTION_EVENT_KIND => {
             let report = event.data.get("data")?;
             let incident_id = report.get("incident_id")?.as_str()?;
             let phase = report.get("phase")?.as_str()?;
