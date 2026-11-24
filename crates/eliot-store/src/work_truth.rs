@@ -1121,6 +1121,62 @@ impl Store {
         Ok(value.flatten())
     }
 
+    /// Capture bounded original Owner input rows in Store admission order.
+    /// The Git task record keeps them after command retention or another switch.
+    pub fn task_owner_corrections(
+        &self,
+        agent: &str,
+        generation: i64,
+        task: &str,
+        policy: &core::SecretPolicy,
+    ) -> Result<(Vec<crate::TaskInstruction>, usize)> {
+        self.ensure_committed_reads()?;
+        const LIMIT: u32 = 64;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT c.id, COUNT(*) OVER () FROM commands c
+             WHERE c.target = ?1 AND c.generation = ?2 AND c.principal = 'owner'
+               AND c.id <> ?3 AND c.verb IN ('send', 'steer', 'inject')
+               AND c.state NOT IN ('rejected', 'cancelled')
+               AND c.link_kind IS NOT 'handoff' AND c.link_kind IS NOT 'rule_action'
+               AND json_type(c.args, '$.text') = 'text'
+               AND NOT EXISTS (SELECT 1 FROM commands t WHERE t.id = ?3
+                 AND t.target = c.target AND t.generation = c.generation
+                 AND (c.created_at, c.rowid) <= (t.created_at, t.rowid))
+               AND NOT EXISTS (SELECT 1 FROM writes w WHERE w.method = 'goal.round'
+                 AND json_extract(w.result, '$.continuation_id') = c.id)
+             ORDER BY c.created_at DESC, c.rowid DESC LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![parse_agent_id(agent)?, generation, task, LIMIT],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .map_err(sql_error)?;
+        let mut corrections = Vec::new();
+        let mut omitted = 0;
+        for row in rows {
+            let (id, total) = row.map_err(sql_error)?;
+            omitted = usize::try_from(total.saturating_sub(i64::from(LIMIT)).max(0))
+                .unwrap_or(usize::MAX);
+            if !self.command_is_owner_authored(&id)? {
+                continue;
+            }
+            let command = load_command(&self.connection, &id)?
+                .ok_or_else(|| Error::new("source_integrity", "task correction disappeared"))?;
+            let text = required_string(&command.args, "text")?;
+            if let Some(input) =
+                crate::TaskInstruction::from_command(&command, policy.redact_text(&text))
+            {
+                corrections.push(input);
+            }
+        }
+        corrections.reverse();
+        Ok((corrections, omitted))
+    }
+
     pub(super) fn work_task_binding(
         connection: &Connection,
         agent: &str,

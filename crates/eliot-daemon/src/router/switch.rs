@@ -56,6 +56,17 @@ fn reuse_retained_checkout(
 }
 
 impl Router {
+    async fn reject_switch_input(&self, id: &str, error: &Error) {
+        let policy = self.secret_policy_snapshot();
+        let mut store = self.inner.store.lock().await;
+        if let Ok(change) = store.fail_switch_preparation(id, error, &policy, now_ms()) {
+            self.publish_locked(&change.events);
+            log_refusal(&policy, id, &error.code, &error.message);
+        }
+        self.signal_progress();
+        self.signal_launch_arbitration();
+    }
+
     async fn switch_live_checkout_snapshot(&self) -> Result<Vec<SwitchLiveCheckout>> {
         let inputs = {
             let store = self.inner.store.lock().await;
@@ -363,6 +374,19 @@ impl Router {
                 return;
             }
         };
+        let task = if provider_failure.is_some() {
+            Ok(eliot_store::BriefFacts::default())
+        } else {
+            self.prepare_handoff_task(&source, Some(&request.task_command))
+                .await
+        };
+        let task = match task {
+            Ok(task) => task,
+            Err(error) => {
+                self.reject_switch_input(id, &error).await;
+                return;
+            }
+        };
         self.clone()
             .process_command(source_stop_command, None)
             .await;
@@ -400,9 +424,13 @@ impl Router {
         }
         // Capture the source only after Store and native custody prove the
         // exact process family is gone, and before any successor launch.
-        let facts = self
-            .handoff_git_facts(&request.from, Some(&request.task_command))
-            .await;
+        let facts = match self.finish_handoff_facts(&source, task).await {
+            Ok(facts) => facts,
+            Err(error) => {
+                self.reject_switch_input(id, &error).await;
+                return;
+            }
+        };
         let source_clean = match source.workspace.as_deref() {
             None => Some(true),
             Some(workspace) => match crate::git_monitor::GitProbe::new() {
@@ -710,7 +738,12 @@ impl Router {
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
                 if let Some(handoff) = &change.value.handoff {
-                    self.queue_handoff_task_card(&mut store, handoff, &change.events);
+                    self.queue_handoff_task_card(
+                        &mut store,
+                        handoff,
+                        &change.events,
+                        facts.applied_task_text(),
+                    );
                     for child in &handoff.children {
                         self.schedule_command(child.clone(), None);
                     }

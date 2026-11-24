@@ -64,7 +64,9 @@ engine, second scheduler or critic loop.
 - [x] **A2 Exact brief and required sources.** The launch/send brief carries the
       result, required reading, write area, explicit limits and the check; named
       sources are delivered with path and version or their absence is explicit;
-      limits survive handoff and continuation.
+      the Git task record preserves the original input and ordered Owner
+      corrections across continuation. Briefs expose omitted inputs and reserve
+      the mandatory task and source budget before a switch dispatches.
 - [x] **A3 Change scope and checker trust.** A Goal's `scope` and
       `check_inputs` get a starting point at `set`, or after workspace setup
       and before first input when installed by launch; each round the daemon,
@@ -80,7 +82,8 @@ engine, second scheduler or critic loop.
       `dirty_digest`; a failed or capped read never extends the no-progress
       streak.
 - [x] **A6 Short handoff state.** The handoff brief carries Git, file-system
-      and Store facts with the current instruction and limits.
+      and Store facts with the bound task, current limits and ordered Owner
+      corrections. The successor continues from those facts and the files on disk.
 - [x] **A7 Goal cost budget.** `max_cost` budgets the native session cost
       since the latest snapshot selected at `set` or a launch-zero baseline
       in its verbatim unit;

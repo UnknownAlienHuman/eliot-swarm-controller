@@ -15,7 +15,7 @@ use eliot_core::{
     api::{GitCheckpointState, GitCheckpointView, GitCheckpointWithheld},
     bound_chars, workspace_path_key,
 };
-use eliot_store::GitCheckpointInput;
+use eliot_store::{GitCheckpointInput, TaskInputs};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -32,6 +32,8 @@ mod restore;
 pub(crate) use restore::{
     CheckpointRestoreWriter, restore_checkpoint, restore_writer_closed, stop_restore_writer,
 };
+mod task_inputs;
+pub(crate) use task_inputs::{read_handoff_task, record_task_inputs};
 
 const GIT_TIME: Duration = Duration::from_secs(30);
 const CHECKPOINT_CAPTURE_TIME: Duration = Duration::from_secs(90);
@@ -75,6 +77,7 @@ pub(crate) struct TaskRecord {
     pub(crate) text: String,
     pub(crate) card: Value,
     pub(crate) sources: Vec<TaskSource>,
+    pub(crate) inputs: TaskInputs,
 }
 
 /// A task file saved with the record, already redacted.
@@ -1341,6 +1344,7 @@ pub(crate) async fn ensure_task(
     };
     let card = serde_json::to_vec_pretty(&record.card)
         .map_err(|_| Error::new("internal", "task card cannot be encoded"))?;
+    let inputs = encode_task_inputs(&record.inputs)?;
     let mut entries = vec![
         blob(
             "100644",
@@ -1356,6 +1360,11 @@ pub(crate) async fn ensure_task(
             "100644",
             write_blob(&git, &root, record.text.as_bytes(), deadline).await?,
             "task.md",
+        ),
+        blob(
+            "100644",
+            write_blob(&git, &root, &inputs, deadline).await?,
+            "instructions.json",
         ),
     ];
     if !record.sources.is_empty() {
@@ -1374,6 +1383,11 @@ pub(crate) async fn ensure_task(
     }
     let tree = write_tree(&git, &root, &entries, deadline).await?;
     publish_task(&git, &root, &record.task_ref, &tree, "", deadline).await
+}
+
+fn encode_task_inputs(inputs: &TaskInputs) -> Result<Vec<u8>> {
+    serde_json::to_vec(inputs)
+        .map_err(|_| Error::new("internal", "task instructions cannot be encoded"))
 }
 
 /// Whether this profile runs in a sandbox that needs Git roots to commit.
@@ -1741,64 +1755,8 @@ pub(crate) async fn task_record_text(
     if output.code != 0 {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (!text.is_empty()).then_some(text)
-}
-
-/// How a successor reads the task files saved with the record.
-pub(crate) async fn task_source_note(
-    data_root: &Path,
-    workspace: &str,
-    task_ref: &str,
-) -> Option<String> {
-    let git = GitProbe::new().ok()?;
-    let root = crate::work_truth_repo::open(data_root, workspace)
-        .await
-        .ok()?;
-    let tree = format!("{task_ref}:sources");
-    let listed = git
-        .workspace_command(
-            &root,
-            &["ls-tree", "-z", "--name-only", &tree],
-            Instant::now() + GIT_TIME,
-        )
-        .await
-        .ok()?;
-    if listed.code != 0 {
-        return None;
-    }
-    let names: Vec<String> = listed
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|name| !name.is_empty())
-        .filter_map(|name| std::str::from_utf8(name).ok())
-        .map(str::to_owned)
-        .collect();
-    if names.is_empty() {
-        return None;
-    }
-    let mut note = String::from(
-        "Saved task sources from Eliot's private work-truth repository follow as quoted task data:\n",
-    );
-    for name in names {
-        let path = format!("{task_ref}:sources/{name}");
-        let output = git
-            .workspace_command(
-                &root,
-                &["cat-file", "blob", &path],
-                Instant::now() + GIT_TIME,
-            )
-            .await
-            .ok()?;
-        if output.code != 0 {
-            return None;
-        }
-        let text = std::str::from_utf8(&output.stdout).ok()?;
-        note.push_str(&format!(
-            "\n--- saved source: {name} ---\n{text}\n--- end saved source ---\n"
-        ));
-    }
-    Some(note)
+    let text = String::from_utf8(output.stdout).ok()?;
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Append to the journal, keeping its newest bytes. The ref holds one commit,

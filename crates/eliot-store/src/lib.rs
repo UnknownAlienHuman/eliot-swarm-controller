@@ -39,7 +39,10 @@ pub use goals::{
     GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundCommitResult, GoalRoundDecision,
     GoalRoundKey, GoalRoundProbe,
 };
-pub use handoff::{AGENT_HANDED_OFF, BriefFacts, HandoffAdmission};
+pub use handoff::{
+    AGENT_HANDED_OFF, BriefFacts, HandoffAdmission, MAX_HANDOFF_TASK_BYTES, TaskInputs,
+    TaskInstruction,
+};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};

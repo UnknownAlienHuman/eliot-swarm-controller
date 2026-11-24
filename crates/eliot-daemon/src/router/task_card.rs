@@ -27,28 +27,17 @@ pub(super) fn read_task_card(
     if current.generation != generation || current.is_terminal() {
         return Ok(None);
     }
-    let brief = match handoff {
-        Some(id) => store.get_command(id)?,
-        None if selected_task.is_none() => store.task_card_handoff_brief(agent, generation)?,
-        None => None,
-    }
-    .filter(|brief| brief.target.as_deref() == Some(agent) && brief.verb == "send");
-    if brief.is_none()
-        && selected_task.is_none()
-        && (handoff.is_some() || store.task_card_has_handoff(agent, generation)?)
-    {
-        return Ok(None);
-    }
+    let continued = handoff.is_some() || store.task_card_has_handoff(agent, generation)?;
     let text = if let Some(task) = selected_task {
         Some(task.to_owned())
-    } else if let Some(brief) = brief {
-        let Some(text) = brief.args["text"]
-            .as_str()
-            .filter(|text| !text.trim().is_empty())
-        else {
-            return Ok(None);
-        };
-        Some(original_task(text).to_owned())
+    } else if continued {
+        match store.work_task_command(agent, generation)? {
+            Some(id) => store
+                .get_command(&id)?
+                .filter(|command| command.state == eliot_core::CommandState::Applied)
+                .and_then(|command| command.args["text"].as_str().map(str::to_owned)),
+            None => None,
+        }
     } else if let Some(launch) = store.generation_start_command(agent, 1)? {
         let linked = store.get_linked_send(&launch.id)?;
         launch.args["text"]
@@ -76,16 +65,6 @@ pub(super) fn read_task_card(
         goal.as_ref(),
         policy,
     ))
-}
-
-fn original_task(brief: &str) -> &str {
-    if !brief.starts_with("Handoff brief:") {
-        return brief;
-    }
-    brief
-        .split_once("\n\nOriginal task:\n")
-        .and_then(|(_, contents)| contents.split_once("\n\nLater input to the source"))
-        .map_or(brief, |(task, _)| task)
 }
 
 fn brief_field<'a>(brief: Option<&'a str>, labels: &[&str]) -> Option<&'a str> {

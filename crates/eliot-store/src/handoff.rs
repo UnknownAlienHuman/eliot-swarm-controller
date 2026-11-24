@@ -17,11 +17,66 @@ pub struct BriefFacts {
     pub git: Option<String>,
     /// Exact original SEND bound to the task record read for this brief.
     pub task_command: Option<String>,
+    pub task_ref: Option<String>,
     /// Where the task's own saved files can be read, shown with the task.
     pub task_note: Option<String>,
+    pub saved_sources: Option<usize>,
     /// The task text from the Git record, used when the Store retains none.
     pub task_text: Option<String>,
+    pub task_inputs: TaskInputs,
 }
+
+impl BriefFacts {
+    pub fn applied_task_text(&self) -> Option<&str> {
+        self.task_inputs
+            .original
+            .as_ref()
+            .filter(|original| original.state == CommandState::Applied)
+            .and(self.task_text.as_deref())
+    }
+}
+
+/// Exact retained command provenance, independent of prior rendered briefs.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TaskInstruction {
+    pub command_id: String,
+    pub source: String,
+    pub generation: i64,
+    pub principal: String,
+    pub verb: String,
+    pub state: CommandState,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+}
+
+impl TaskInstruction {
+    pub fn from_command(command: &Command, text: String) -> Option<Self> {
+        Some(Self {
+            command_id: command.id.clone(),
+            source: command.target.clone()?,
+            generation: command.generation?,
+            principal: command.principal.clone(),
+            verb: command.verb.clone(),
+            state: command.state,
+            text,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TaskInputs {
+    pub original: Option<TaskInstruction>,
+    pub corrections: Vec<TaskInstruction>,
+    /// Known omissions by source generation, so recapture does not double-count.
+    pub omitted: std::collections::BTreeMap<String, usize>,
+    pub history_incomplete: bool,
+    #[serde(default)]
+    pub history_unresolved: bool,
+}
+
+/// Allow fixed H2 framing and Store facts even when all optional excerpts
+/// have been reduced to completeness markers.
+pub const MAX_HANDOFF_TASK_BYTES: usize = MAX_TEXT_BYTES - 32 * 1024;
 
 /// Bound on following a chain of same-worktree handoffs.
 const MAX_SUCCESSOR_CHAIN: usize = 64;
@@ -35,6 +90,10 @@ pub struct HandoffAdmission {
 }
 
 impl Store {
+    pub fn handoff_history_unresolved(&self, agent: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        brief::has_unverified_instructions(&self.connection, agent)
+    }
     /// Find the task turn before any commandless native continuations.
     /// An intervening failed or unbound ordinary turn still blocks handoff.
     pub fn latest_handoff_task_turn(&self, agent: &str, generation: i64) -> Result<Option<Turn>> {
@@ -763,6 +822,20 @@ pub(super) fn handoff_tx(
     }
     quiescent(tx, &to, true)?;
     let input_principal = manager_caller.as_ref().map(|_| principal);
+    if let HandoffInput::Brief { facts, .. } | HandoffInput::Continuation { facts, .. } = input
+        && let (Some(command), Some(reference)) = (&facts.task_command, &facts.task_ref)
+    {
+        let selected = Store::selected_work_task_command(tx, &from.id, from.generation)?;
+        let bound = Store::work_task_binding(tx, &from.id, from.generation, command)?;
+        if selected.as_deref() != Some(command)
+            || bound.as_ref().map(|(reference, _)| reference.as_str()) != Some(reference)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "the source Git task binding changed after handoff preparation",
+            ));
+        }
+    }
     let task = if matches!(input, HandoffInput::ProviderRetry) {
         source_task(tx, &from, &request.task_command, input_principal)?
     } else if from_switch {
@@ -784,7 +857,7 @@ pub(super) fn handoff_tx(
         task.as_ref()
             .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))
     };
-    let (brief_text, brief_truncated) = match input {
+    let built = match input {
         HandoffInput::Brief { facts, .. } => brief::build(
             tx,
             request,
@@ -837,7 +910,10 @@ pub(super) fn handoff_tx(
                 .get("text")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Error::new("source_integrity", "retry task text missing"))?;
-            (text.to_owned(), false)
+            brief::BuiltBrief {
+                text: text.to_owned(),
+                ..brief::BuiltBrief::default()
+            }
         }
     };
     let mut events = Vec::new();
@@ -900,7 +976,10 @@ pub(super) fn handoff_tx(
         conflicts_truncated,
         goal_revision,
         reparented,
-        brief_truncated,
+        brief_truncated: built.truncated,
+        brief_omitted_instructions: built.omitted_instructions,
+        brief_history_incomplete: built.history_incomplete,
+        brief_saved_sources: built.saved_sources,
         brief_state: CommandState::Accepted,
         successor_gate: "queued_until_brief_applied".into(),
     };
@@ -955,7 +1034,7 @@ pub(super) fn handoff_tx(
         child.target = Some(to.id.clone());
         child.expected_generation = Some(to.generation);
         let (child_principal, args) = if ordinal == 0 {
-            (principal, json!({"text":brief_text}))
+            (principal, json!({"text":built.text}))
         } else {
             let original = &originals[ordinal - 1];
             (original.principal.as_str(), original.args.clone())
@@ -988,6 +1067,15 @@ pub(super) fn handoff_tx(
         Some(from.generation),
         json!({"handoff": request.id, "to": to.id, "to_generation": to.generation}),
     )?);
+    if matches!(
+        input,
+        HandoffInput::Brief {
+            discover: false,
+            ..
+        }
+    ) {
+        super::work_truth::inherit_work_task_tx(tx, &from, &to, &transfers, now)?;
+    }
     super::result_page::record_handoff_origin_tx(tx, parse_agent_id(&to.id)?, to.generation)?;
     refresh_parent_tx(tx, &brief_command, now)?;
     let parent = load_command(tx, &request.id)?
