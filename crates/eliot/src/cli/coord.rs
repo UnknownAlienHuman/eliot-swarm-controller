@@ -65,13 +65,18 @@ pub(crate) async fn run_cmd(
                 .map_err(|_| Failure::new(4, "stop settlement response is invalid"))?;
             print_value_or_human(&value, json_output, || {
                 println!(
-                    "Historical settlement {}: {} proven stop(s), {} exact request-reply receipt(s), {} stop(s) still awaiting proof.",
+                    "Historical settlement {}: {} proven stop(s), {} linked interrupt fallback(s), {} exact request-reply receipt(s), {} stop(s) still awaiting proof.",
                     if response.applied {
                         "applied"
                     } else {
                         "preview"
                     },
                     response.stops.len(),
+                    response
+                        .stops
+                        .iter()
+                        .filter(|stop| stop.interrupt_fallback.is_some())
+                        .count(),
                     response.request_replies.len(),
                     response.awaiting_proof.len()
                 );
@@ -88,6 +93,14 @@ pub(crate) async fn run_cmd(
                             .map(|turn| format!(" · interrupted turn {turn}"))
                             .unwrap_or_default()
                     );
+                    if let Some(fallback) = &stop.interrupt_fallback {
+                        println!(
+                            "    Owner interrupt {} → applied by fallback stop · turn {} · {}",
+                            fallback.command_id,
+                            fallback.turn_id.as_deref().unwrap_or("<idle>"),
+                            fallback.reason
+                        );
+                    }
                 }
                 for command in &response.awaiting_proof {
                     println!("  Awaiting process or reader proof: {command}");
