@@ -88,7 +88,6 @@ impl ClaudeMcpConfigFile {
         eliot_plugin::install::write_new_file(
             &path,
             &contents,
-            eliot_plugin::install::OwnedFileDurability::Sync,
             || Error::new("platform_io", "could not create Claude MCP config"),
             || Error::new("platform_io", "could not write Claude MCP config"),
         )?;

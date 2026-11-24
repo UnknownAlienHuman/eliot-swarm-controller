@@ -1552,7 +1552,6 @@ pub(crate) fn stage_hook_config(
     if let Err(error) = eliot_plugin::install::write_new_file(
         &path,
         &bytes,
-        eliot_plugin::install::OwnedFileDurability::Flush,
         || {
             Error::new(
                 "io_error",
@@ -1606,7 +1605,6 @@ pub(crate) fn stage_hook_config(
             eliot_plugin::install::write_new_file(
                 &target,
                 text.as_bytes(),
-                eliot_plugin::install::OwnedFileDurability::Flush,
                 || {
                     Error::new(
                         "io_error",

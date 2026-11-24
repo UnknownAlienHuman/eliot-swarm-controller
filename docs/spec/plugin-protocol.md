@@ -942,8 +942,9 @@ Use the shared [`retry`](../../crates/eliot-plugin/src/retry.rs) module for read
 polls and absolute deadline waits. Adapters translate native resume readback into shared
 preflight evidence. They translate exact native provider refusals into the common
 restriction fact so the daemon and Store can apply hold policy. Shared file installation
-writes hook and configuration files to an exclusive temporary file beside the destination.
-It publishes the completed file atomically and refuses to overwrite an existing file.
+syncs an exclusive temporary file beside the destination before publishing it. On Unix,
+a failed hard link can fall back to a native no-replace rename where supported.
+Publication refuses an existing destination and requires a safe filesystem primitive.
 
 All adapters follow the shared [native data rule](../../crates/eliot-plugin/src/native_data.rs).
 Skip extra fields. Decode an unfamiliar enum value as `Other` and emit a diagnostic.

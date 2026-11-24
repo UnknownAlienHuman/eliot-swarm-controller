@@ -16,20 +16,11 @@ use std::{
     sync::OnceLock,
 };
 
-/// Durability requested by the adapter after writing an owned file.
-#[derive(Clone, Copy)]
-pub enum OwnedFileDurability {
-    Flush,
-    Sync,
-}
-
 /// Stage and atomically publish one exclusively owned file without replacing
-/// an existing destination. Adapter-specific errors and durability remain at
-/// the call site.
+/// an existing destination. The staged contents are synced before publication.
 pub fn write_new_file(
     path: &Path,
     contents: &[u8],
-    durability: OwnedFileDurability,
     create_error: impl FnOnce() -> core::Error,
     write_error: impl FnOnce() -> core::Error,
 ) -> core::Result<()> {
@@ -52,10 +43,7 @@ pub fn write_new_file(
     else {
         return Err(create_error());
     };
-    let write_result = file.write_all(contents).and_then(|()| match durability {
-        OwnedFileDurability::Flush => file.flush(),
-        OwnedFileDurability::Sync => file.sync_all(),
-    });
+    let write_result = file.write_all(contents).and_then(|()| file.sync_all());
     if write_result.is_err() {
         drop(file);
         let _ = fs::remove_file(&temporary);
@@ -66,15 +54,79 @@ pub fn write_new_file(
         let _ = fs::remove_file(&temporary);
         return Err(create_error());
     }
-    #[cfg(not(windows))]
-    let _ = fs::remove_file(&temporary);
     Ok(())
 }
 
 #[cfg(not(windows))]
 fn publish_new_file(temporary: &Path, target: &Path) -> std::io::Result<()> {
-    // A same-directory link publishes without replacing an existing target.
-    fs::hard_link(temporary, target)
+    match fs::hard_link(temporary, target) {
+        Ok(()) => {
+            let _ = fs::remove_file(temporary);
+            Ok(())
+        }
+        // A dangling symlink also owns the destination name.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => publish_no_replace_rename(temporary, target),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[allow(
+    unsafe_code,
+    reason = "Unix no-replace rename requires the native filesystem API."
+)]
+fn publish_no_replace_rename(temporary: &Path, target: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+
+    let source =
+        CString::new(temporary.as_os_str().as_bytes()).map_err(|_| ErrorKind::InvalidInput)?;
+    let destination =
+        CString::new(target.as_os_str().as_bytes()).map_err(|_| ErrorKind::InvalidInput)?;
+    // SAFETY: Both buffers are NUL-terminated and live for the call. The flags
+    // forbid replacing any destination entry, even a dangling symlink.
+    let result = unsafe {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            ) == 0
+        }
+        #[cfg(target_os = "macos")]
+        {
+            libc::renameatx_np(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            ) == 0
+        }
+    };
+    if result {
+        Ok(())
+    } else {
+        Err(Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(
+    windows,
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos"
+)))]
+fn publish_no_replace_rename(_temporary: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace rename is unavailable on this platform",
+    ))
 }
 
 #[cfg(windows)]
