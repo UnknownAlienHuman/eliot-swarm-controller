@@ -540,11 +540,10 @@ impl DesktopApp {
                 }
             }
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
-                // The composer's usage indicator reads every harness's quota
-                // once the daemon answers (Usage's Refresh reads again).
-                if self.settings.quotas.is_empty() {
-                    self.load_quotas(context);
-                }
+                // No quota read here: a harness's quota read can start the
+                // vendor's own process, so the limits are read only while
+                // their screen is open (the Usage popover, Settings › Usage)
+                // and on Refresh (skeleton 2.4).
                 if list_epoch != self.nav.list_epoch {
                     return;
                 }
@@ -877,14 +876,19 @@ impl DesktopApp {
             },
             ShellMsg::SchemeObserved(scheme) => {
                 let before = self.palette();
+                let contrast_before = self.appearance.high_contrast;
                 self.appearance.dark = scheme == ColorScheme::Dark;
                 // High Contrast (and animation effects) through the reading
                 // the settings hook keeps, so its next comparison starts
-                // from what the window shows and never sends a no-op.
+                // from what the window shows and never sends a no-op, and
+                // through their one writer, which rebuilds on a change.
                 let (high_contrast, animations) = crate::shortcuts::read_accessibility();
-                self.appearance.high_contrast = high_contrast;
-                self.palette_changed(before, context);
                 self.accessibility_changed(high_contrast, animations, context);
+                // A Light/Dark change alone (a High Contrast change was
+                // rebuilt above).
+                if high_contrast == contrast_before {
+                    self.palette_changed(before, context);
+                }
                 // The first observation colors the title bar even when the
                 // palette is the starting one.
                 self.sync_title_bar();
@@ -1205,7 +1209,8 @@ impl DesktopApp {
     }
 
     /// Windows changed High Contrast or animation effects (Reactor 0.100.0
-    /// reports neither; `crate::shortcuts` hears Windows announce it).
+    /// reports neither; `crate::shortcuts` hears Windows announce it, and a
+    /// scheme change reads them too). The one writer of both.
     /// Either rebuilds the tree, keyed by both, with new controls that keep
     /// what was typed.
     fn accessibility_changed(
@@ -2485,7 +2490,7 @@ impl DesktopApp {
                 .then(|| (format!("Show more ({loaded} of {total})"), !reading)),
             show_archived: self.nav.show_archived,
             agents: AgentsEntry {
-                working: fleet.running,
+                line: fleet.compact(self.nav.agents_total, self.nav.archived),
                 summary: fleet.summary(self.nav.agents_total, self.nav.archived),
                 open: self.panel == Panel::Monitor,
             },

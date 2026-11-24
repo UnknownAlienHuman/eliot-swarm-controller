@@ -93,11 +93,12 @@ pub(super) struct TaskEntry {
     pub(super) age: String,
 }
 
-/// The Agents row: the tasks working now, the fleet's counts in words and
-/// whether the fleet view (the Monitor pane) is open.
+/// The Agents row: the fleet's line (at most two counts, the most urgent
+/// first: "2 working · 1 needs attention"), its counts in full and whether
+/// the fleet view (the Monitor pane) is open.
 #[derive(Clone, PartialEq)]
 pub(super) struct AgentsEntry {
-    pub(super) working: usize,
+    pub(super) line: String,
     pub(super) summary: String,
     pub(super) open: bool,
 }
@@ -1038,8 +1039,9 @@ fn inbox_row(
     )
 }
 
-/// The Agents row: the `hub` icon, "Agents" and "N working"; it opens the
-/// fleet view (the Monitor pane). Its name carries every count.
+/// The Agents row: the `hub` icon, "Agents" and the fleet's line ("3
+/// working", as on main: the most urgent two counts); it opens the fleet
+/// view (the Monitor pane). Its name carries every count.
 fn agents_row(
     agents: &AgentsEntry,
     context: &mut ViewContext<Sidebar>,
@@ -1062,11 +1064,9 @@ fn agents_row(
                 0.0,
                 false,
                 None,
-                if agents.working > 0 {
-                    m3::trailing(format!("{} working", agents.working), open).into()
-                } else {
-                    View::empty()
-                },
+                m3::trailing(agents.line.clone(), open)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into(),
             ))
             .tooltip(agents.summary.clone()),
     )
