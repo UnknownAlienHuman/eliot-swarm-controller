@@ -9,6 +9,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    event_buffer::{BufferedRpcFrame as BufferedNativeFrame, EarlyEventBuffer},
     native_child::{ChildAction, binding_from_ack, is_admission_rejection, register_child},
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     protocol::{MAX_COMMAND_ID_BYTES, MAX_TEXT_BYTES},
@@ -56,8 +57,7 @@ use crate::native::{
 };
 
 const CONTROL_QUEUE: usize = 16;
-const EARLY_EVENT_LIMIT: usize = 128;
-const EARLY_EVENT_BYTES: usize = 256 * 1024;
+const MAX_MESSAGES_AWAITING_MODEL: usize = 128;
 const MAX_PENDING_NATIVE_TURN_STARTS: usize = 1;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MUSE_NATIVE_TURN_TRIGGER: &str = "muse.turn/started";
@@ -458,25 +458,6 @@ fn with_decide_diag(mut outcome: Value, error_code: Option<i64>, diag: &DecideVi
     outcome
 }
 
-#[derive(Clone)]
-enum BufferedNativeFrame {
-    Notification {
-        method: String,
-        params: Value,
-    },
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
-    },
-}
-
-#[derive(Clone)]
-struct BufferedFrame {
-    frame: BufferedNativeFrame,
-    size: usize,
-}
-
 fn buffered_frame_turn_id(frame: &BufferedNativeFrame) -> Option<&str> {
     let params = match frame {
         BufferedNativeFrame::Notification { params, .. }
@@ -554,8 +535,7 @@ struct EventProcessor {
     turn_model: TurnModel,
     session_expected_model: Option<String>,
     status: EventStatus,
-    buffer: VecDeque<BufferedFrame>,
-    buffer_bytes: usize,
+    buffer: EarlyEventBuffer<BufferedNativeFrame>,
     pending_native_starts: HashMap<String, String>,
     queued_send: Option<SendAssociation>,
     uncertain_native_starts: HashSet<String>,
@@ -889,8 +869,7 @@ impl EventProcessor {
             turn_model: TurnModel::default(),
             session_expected_model: None,
             status: EventStatus::default(),
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
+            buffer: EarlyEventBuffer::new(),
             pending_native_starts: HashMap::new(),
             queued_send: None,
             uncertain_native_starts: HashSet::new(),
@@ -1256,7 +1235,6 @@ impl EventProcessor {
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
-                    self.buffer_bytes = 0;
                     self.defer_gap("Muse native events remained unassociated at stream end");
                 }
                 if !self.pending_requests.is_empty() {
@@ -1409,7 +1387,7 @@ impl EventProcessor {
 
     fn discard_buffered_native_start(&mut self, native_command_id: &str) -> (bool, Option<String>) {
         let turn_id = self.buffer.iter().find_map(|buffered| {
-            let BufferedNativeFrame::Notification { method, params } = &buffered.frame else {
+            let BufferedNativeFrame::Notification { method, params } = buffered else {
                 return None;
             };
             (method == "turn/started"
@@ -1422,59 +1400,30 @@ impl EventProcessor {
             })
             .flatten()
         });
-        let found_start = self.buffer.iter().any(|buffered| {
-            matches!(&buffered.frame,
+        let matches_start = |buffered: &BufferedNativeFrame| {
+            matches!(buffered,
                 BufferedNativeFrame::Notification { method, params }
                     if method == "turn/started"
                         && params.get("commandId").and_then(Value::as_str)
                             == Some(native_command_id))
-        });
-        if !found_start {
+        };
+        if !self.buffer.iter().any(matches_start) {
             return (false, None);
         }
-        let mut retained = VecDeque::with_capacity(self.buffer.len());
-        let mut retained_bytes = 0usize;
-        while let Some(buffered) = self.buffer.pop_front() {
-            let start_matches = matches!(&buffered.frame,
-                BufferedNativeFrame::Notification { method, params }
-                    if method == "turn/started"
-                        && params.get("commandId").and_then(Value::as_str)
-                            == Some(native_command_id));
+        self.buffer.retain(|buffered| {
             let turn_matches = turn_id
                 .as_deref()
-                .is_some_and(|turn_id| buffered_frame_turn_id(&buffered.frame) == Some(turn_id));
-            if !start_matches && !turn_matches {
-                retained_bytes = retained_bytes.saturating_add(buffered.size);
-                retained.push_back(buffered);
-            }
-        }
-        self.buffer = retained;
-        self.buffer_bytes = retained_bytes;
+                .is_some_and(|turn_id| buffered_frame_turn_id(buffered) == Some(turn_id));
+            !matches_start(buffered) && !turn_matches
+        });
         (true, turn_id)
     }
 
     fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
-        let encoded = match &frame {
-            BufferedNativeFrame::Notification { method, params } => {
-                serde_json::to_vec(&json!({"method": method, "params": params}))
-            }
-            BufferedNativeFrame::Request { id, method, params } => {
-                serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
-            }
-        };
-        let size = encoded
-            .map(|bytes| bytes.len())
-            .unwrap_or_else(|_| EARLY_EVENT_BYTES.saturating_add(1));
-        if self.buffer.len() >= EARLY_EVENT_LIMIT
-            || self.buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
-        {
+        if !self.buffer.try_push(frame) {
             self.buffer.clear();
-            self.buffer_bytes = 0;
             self.defer_gap("Muse early-event buffer exceeded its bound");
-            return;
         }
-        self.buffer_bytes = self.buffer_bytes.saturating_add(size);
-        self.buffer.push_back(BufferedFrame { frame, size });
     }
 
     async fn ready(
@@ -1582,7 +1531,7 @@ impl EventProcessor {
             return Ok(false);
         };
         let started = self.buffer.iter().any(|frame| {
-            matches!(&frame.frame, BufferedNativeFrame::Notification { method, params }
+            matches!(frame, BufferedNativeFrame::Notification { method, params }
                 if method == "turn/started"
                     && params["commandId"].as_str() == Some(send.native_command_id.as_str())
                     && params["turnId"].as_str() == Some(send.turn_id.as_str())
@@ -1714,9 +1663,8 @@ impl EventProcessor {
 
     async fn flush_buffer(&mut self) -> Result<()> {
         self.flush_buffered_health().await?;
-        while let Some(frame) = self.buffer.pop_front() {
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            let should_buffer = match &frame.frame {
+        while let Some(frame) = self.buffer.front() {
+            let should_buffer = match frame {
                 BufferedNativeFrame::Notification { method, params } => {
                     !should_bypass_parent_buffer(
                         self.status.ready,
@@ -1730,15 +1678,12 @@ impl EventProcessor {
                 }
             };
             if should_buffer {
-                self.buffer.push_front(frame);
-                self.buffer_bytes = self
-                    .buffer_bytes
-                    .saturating_add(self.buffer.front().map_or(0, |item| item.size));
                 break;
             }
+            let frame = self.buffer.pop_front().expect("buffer head was checked");
             // Buffered flushes already run inside frame/control processing,
             // so they must not re-enter the live queues.
-            self.process_buffered_frame(frame.frame).await?;
+            self.process_buffered_frame(frame).await?;
             if self.writes_blocked {
                 break;
             }
@@ -1752,20 +1697,15 @@ impl EventProcessor {
         if self.status.session_id.is_none() {
             return Ok(());
         }
-        while let Some(index) = self.buffer.iter().position(|frame| {
+        while let Some(frame) = self.buffer.take_first(|frame| {
             matches!(
-                &frame.frame, BufferedNativeFrame::Notification { method, .. }
+                frame, BufferedNativeFrame::Notification { method, .. }
                     if method == "session/viewHealthChanged"
             )
         }) {
-            let frame = self
-                .buffer
-                .remove(index)
-                .ok_or_else(|| Error::new("internal", "Muse buffered health frame disappeared"))?;
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
             // Buffered flushes already run inside frame/control processing,
             // so they must not re-enter the live queues.
-            self.process_buffered_frame(frame.frame).await?;
+            self.process_buffered_frame(frame).await?;
             if self.writes_blocked {
                 break;
             }
@@ -1783,27 +1723,10 @@ impl EventProcessor {
             }
         };
         if let Err(error) = result {
-            // The host settles a definite write rejection. Preserve its
-            // structured error instead of inventing an unknown outcome.
-            if error.failure_where.as_deref() == Some("plugin.events.put") {
-                return Err(error);
-            }
-            self.status.source_unknown = true;
-            if !self.gap_reported
-                && !self.writes_blocked
-                && error.failure_where.as_deref() != Some("plugin.events.put")
-            {
-                let _ = self
-                    .record_gap("Buffered Muse native frame could not be normalized")
-                    .await;
-            }
-            if self.status.failure.is_none() {
-                self.status.failure = Some(*error.message);
-            }
-            return Err(Error::new(
-                "unknown",
-                "Buffered Muse event outcome is unresolved",
-            ));
+            return Err(self
+                .stream_source()
+                .buffered_failure(error, "Buffered Muse native frame could not be normalized")
+                .await);
         }
         Ok(())
     }
@@ -3002,7 +2925,7 @@ impl EventProcessor {
                     if self.status.model_mismatch.is_none() {
                         let bytes = self.messages.awaiting_bytes.saturating_add(text.len());
                         if bytes > MAX_TEXT_BYTES
-                            || self.messages.awaiting_model.len() >= EARLY_EVENT_LIMIT
+                            || self.messages.awaiting_model.len() >= MAX_MESSAGES_AWAITING_MODEL
                         {
                             return self
                                 .record_gap(

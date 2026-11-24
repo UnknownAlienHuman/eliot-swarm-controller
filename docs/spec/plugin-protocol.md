@@ -502,6 +502,13 @@ kind/family, timestamp, exact correlations and bounded data. The daemon computes
 canonical event/batch digests, excluding transport ids/timing; cursor is compared too.
 A source permits at most one unacknowledged batch. Keep later input in a bounded spool.
 
+Codex, Claude, Muse and OpenCode also hold early native facts pending exact
+association in the shared [early-event buffer](../../crates/eliot-plugin/src/event_buffer.rs).
+An unassociated head stays in place. Explicit adapter operations such as removing a
+cancelled hook or reading independent Muse session health preserve the order of the
+remaining facts. On overflow Claude retains the bounded prefix and marks the source
+unknown. Codex, Muse and OpenCode discard the queue and defer a gap.
+
 Host validates generation/owner/correlations and accepts either a wholly new batch or
 an exact duplicate of its last committed batch. Commit events, current projections,
 derived facts, cursor and last-batch acknowledgement together before replying/publishing.
@@ -516,6 +523,10 @@ adapter stops publishing and the daemon retires the reader and records the missi
 coverage. Adapters do not reconcile or retry event writes through `source.state`.
 
 The host records gaps and health from rejected batches for authorized source owners.
+A buffered commit rejected at `plugin.events.put` returns the original structured
+error and leaves gap settlement to the host. Any other buffered processing failure
+marks the source outcome unknown and attempts a gap if publication is still possible.
+The adapter does not replay the failed fact.
 A rejected `session.ready` before input can fail the start definitively. A rejected
 write after native input dispatch leaves the native outcome unknown unless separately
 proven. The exact dispatched command/turn binding still fences fresh input until

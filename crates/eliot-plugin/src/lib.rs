@@ -3,6 +3,7 @@ pub mod capabilities;
 pub mod debug;
 pub mod edit_path;
 pub mod event_actor;
+pub mod event_buffer;
 mod file_identity;
 pub mod install;
 pub mod native_child;

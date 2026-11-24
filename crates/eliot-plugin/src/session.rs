@@ -1169,6 +1169,25 @@ pub struct StreamSource<'a> {
 }
 
 impl StreamSource<'_> {
+    /// Keep the host's evidence for a definitive rejection. Any other buffered
+    /// processing failure leaves coverage unresolved at this sequence boundary.
+    pub async fn buffered_failure(&mut self, error: Error, gap_reason: &str) -> Error {
+        if error.failure_where.as_deref() == Some("plugin.events.put") {
+            return error;
+        }
+        *self.source_unknown = true;
+        if !*self.gap_reported && !*self.writes_blocked {
+            let _ = self.record_gap(gap_reason).await;
+        }
+        if self.failure.is_none() {
+            *self.failure = Some(*error.message);
+        }
+        Error::new(
+            "unknown",
+            format!("Buffered {} event outcome is unresolved", self.harness),
+        )
+    }
+
     /// Send one native record and wait for the host's outcome.
     pub async fn commit_event(&mut self, kind: &str, native_id: String, data: Value) -> Result<()> {
         self.commit_event_ack(kind, native_id, data)
