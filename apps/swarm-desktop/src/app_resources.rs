@@ -95,6 +95,22 @@ fn layer(color: Rgb8, opacity: f64) -> Value {
 }
 
 /// A brush WinUI draws as nothing.
+/// A brand-book color token (`0xAARRGGBB`) without its alpha.
+fn rgb(argb: u32) -> Rgb8 {
+    Rgb8::new((argb >> 16) as u8, (argb >> 8) as u8, argb as u8)
+}
+
+/// A menu's or popup's edge: `overlay-border` in the dark themes, none in
+/// the light ones.
+fn edge(s: &Roles) -> Value {
+    let v = s.scheme.overlay_border;
+    if v >> 24 == 0 {
+        clear(s)
+    } else {
+        opaque(rgb(v))
+    }
+}
+
 fn clear(s: &Roles) -> Value {
     Value::Brush(s.surface, 0)
 }
@@ -293,7 +309,7 @@ fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
             "ListViewItemForegroundSelectedPointerOver",
             "ListViewItemForegroundSelectedPressed",
         ],
-        opaque(s.text),
+        opaque(s.on_selected),
     ));
     all.extend(every(
         &[
@@ -310,14 +326,14 @@ fn lists(s: &Roles) -> Vec<(&'static str, Value)> {
 /// darkens on hover and becomes a 2-DIP primary line when focused.
 fn text_field(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("TextControlBorderBrush", opaque(s.border)),
+        ("TextControlBorderBrush", opaque(s.field_outline)),
         ("TextControlBorderBrushPointerOver", opaque(s.text)),
         ("TextControlBorderBrushFocused", opaque(s.primary)),
         (
             "TextControlBorderBrushDisabled",
             layer(s.text, state::DISABLED_CONTAINER),
         ),
-        ("TextControlElevationBorderBrush", opaque(s.border)),
+        ("TextControlElevationBorderBrush", opaque(s.field_outline)),
         ("TextControlElevationBorderFocusedBrush", opaque(s.primary)),
         (
             "TextControlBackgroundPointerOver",
@@ -388,7 +404,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
     let selected_hover = s.selected.mix(s.text, state::HOVER);
     let selected_pressed = s.selected.mix(s.text, state::PRESSED);
     let mut all = vec![
-        ("ComboBoxBorderBrush", opaque(s.border)),
+        ("ComboBoxBorderBrush", opaque(s.field_outline)),
         ("ComboBoxBorderBrushPointerOver", opaque(s.text)),
         ("ComboBoxBorderBrushPressed", opaque(s.primary)),
         (
@@ -396,7 +412,10 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             layer(s.text, state::DISABLED_CONTAINER),
         ),
         ("ComboBoxBackgroundBorderBrushFocused", opaque(s.primary)),
-        ("ComboBoxBackgroundBorderBrushUnfocused", opaque(s.border)),
+        (
+            "ComboBoxBackgroundBorderBrushUnfocused",
+            opaque(s.field_outline),
+        ),
         ("ComboBoxBorderThemeThickness", uniform(layout::HAIRLINE)),
         ("ComboBoxForegroundDisabled", opaque(s.secondary_text)),
         (
@@ -421,7 +440,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             "ComboBoxFocusedDropDownBackgroundPointerPressed",
             layer(s.text, state::PRESSED),
         ),
-        ("ComboBoxDropDownBackground", opaque(s.tonal)),
+        ("ComboBoxDropDownBackground", opaque(s.menu)),
         ("ComboBoxDropDownForeground", opaque(s.text)),
         (
             "ComboBoxItemBackgroundPointerOver",
@@ -510,7 +529,7 @@ fn dropdown(s: &Roles) -> Vec<(&'static str, Value)> {
             "ComboBoxItemForegroundSelectedPressed",
             "ComboBoxItemForegroundSelectedPointerOver",
         ],
-        opaque(s.text),
+        opaque(s.on_selected),
     ));
     all
 }
@@ -704,7 +723,10 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
         opaque(s.on_primary),
     ));
     all.extend([
-        ("ToggleSwitchFillOff", opaque(s.container)),
+        (
+            "ToggleSwitchFillOff",
+            opaque(rgb(s.scheme.surface_container_highest)),
+        ),
         (
             "ToggleSwitchFillOnPointerOver",
             opaque(s.primary.mix(s.on_primary, state::HOVER)),
@@ -767,16 +789,13 @@ fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
 /// that read `OverlayCornerRadius` (flyouts, the combo-box list).
 fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = vec![
-        ("MenuFlyoutPresenterBackground", opaque(s.tonal)),
-        ("NumberBoxPopupBackground", opaque(s.tonal)),
-        ("NumberBoxPopupBorderBrush", opaque(s.outline)),
+        ("MenuFlyoutPresenterBackground", opaque(s.menu)),
+        ("NumberBoxPopupBackground", opaque(s.menu)),
+        ("NumberBoxPopupBorderBrush", edge(s)),
         ("NumberBoxPopupIndicatorForeground", opaque(s.variant)),
-        ("AutoSuggestBoxSuggestionsListBackground", opaque(s.tonal)),
-        (
-            "AutoSuggestBoxSuggestionsListBorderBrush",
-            opaque(s.outline),
-        ),
-        ("MenuFlyoutPresenterBorderBrush", opaque(s.outline)),
+        ("AutoSuggestBoxSuggestionsListBackground", opaque(s.menu)),
+        ("AutoSuggestBoxSuggestionsListBorderBrush", edge(s)),
+        ("MenuFlyoutPresenterBorderBrush", edge(s)),
         ("MenuFlyoutSeparatorBackground", opaque(s.outline)),
         (
             "MenuFlyoutItemBackgroundPointerOver",
@@ -815,8 +834,11 @@ fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
         // The M3 scrim: black at 32%.
         ("ContentDialogSmokeFill", layer(SHADOW_COLOR, state::SCRIM)),
         ("ContentDialogBorderWidth", uniform(0.0)),
-        ("ToolTipBackground", opaque(s.text)),
-        ("ToolTipForeground", opaque(s.surface)),
+        ("ToolTipBackground", opaque(rgb(s.scheme.inverse_surface))),
+        (
+            "ToolTipForeground",
+            opaque(rgb(s.scheme.inverse_on_surface)),
+        ),
         ("ControlCornerRadius", Value::Radius(radius::FIELD)),
         ("OverlayCornerRadius", Value::Radius(radius::CONTAINER)),
     ];

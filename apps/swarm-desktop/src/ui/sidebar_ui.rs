@@ -200,7 +200,7 @@ impl Component for Sidebar {
         let home = input.home;
         let mut nav: Vec<KeyedView> = vec![KeyedView::new(
             format!("new-task:{home}"),
-            m3::row(palette, home)
+            m3::new_task_button(palette)
                 .automation_name("New task (Ctrl+N)")
                 .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
                 .content(m3::nav_content(m3::glyph::NEW_TASK, "New task", "Ctrl+N")),

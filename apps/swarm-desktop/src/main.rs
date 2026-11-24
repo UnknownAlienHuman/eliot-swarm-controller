@@ -58,6 +58,11 @@ mod winrt;
 
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod attachments;
+#[allow(
+    dead_code,
+    reason = "the brand book defines tokens the desktop does not use yet"
+)]
+mod brand;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]
 mod chat;
 #[cfg_attr(not(windows), allow(dead_code, reason = "used only by the Windows UI"))]

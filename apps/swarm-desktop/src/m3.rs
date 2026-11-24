@@ -402,7 +402,8 @@ pub fn icon_button(palette: Palette) -> Button {
         .style(ButtonStyle::Subtle)
 }
 
-/// The composer's FAB (Send, Stop, Steer): a raised 36-DIP circle.
+/// The composer's main action (Send; Stop and Steer recolor it): a raised
+/// 40-DIP square at the medium corner.
 pub fn send_button(palette: Palette) -> Button {
     Button::new()
         .resource_overrides(palette.filled())
@@ -416,13 +417,30 @@ pub fn send_icon() -> View {
     icon(glyph::ARROW_UP)
 }
 
-/// Stop's mark: a filled 12-DIP square in the on-primary role.
+/// The composer's Stop turn: the 40-DIP action in `error`.
+pub fn stop_button(palette: Palette) -> Button {
+    send_button(palette).resource_overrides(palette.stop_fab())
+}
+
+/// The composer's Steer: the 40-DIP action in `tertiary`.
+pub fn steer_button(palette: Palette) -> Button {
+    send_button(palette).resource_overrides(palette.steer_fab())
+}
+
+/// The New task button: `primary-container`, 40 DIPs.
+pub fn new_task_button(palette: Palette) -> Button {
+    row(palette, false)
+        .resource_overrides(palette.new_task())
+        .min_height(height::NEW_TASK)
+}
+
+/// Stop's mark: a filled 12-DIP square in `on-error`.
 pub fn stop_mark(palette: Palette) -> View {
     Border::new()
         .width(icon_size::STOP)
         .height(icon_size::STOP)
         .corner_radius(radius::STOP)
-        .background(palette.on_primary())
+        .background(palette.on_error())
         .horizontal_alignment(HorizontalAlignment::Center)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
@@ -901,11 +919,13 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
 pub fn composer_card(palette: Palette, place: Grid, content: impl Into<View>) -> View {
     lifted(
         palette,
-        crate::theme::elevation::Level::Three,
+        crate::theme::elevation::Level::One,
         radius::COMPOSER,
         place,
         Border::new()
             .background(palette.composer())
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::uniform(layout::HAIRLINE))
             .corner_radius(radius::COMPOSER)
             .padding(Thickness::new(
                 spacing::MD,
@@ -1170,12 +1190,13 @@ pub fn link_content(label: &str) -> View {
         ))
 }
 
-/// A popover or in-window menu: the composer role, the container corner,
-/// a 4-DIP inset (lift it with [`lifted`] at level 2).
+/// A popover or in-window menu: the menu role (`surface-container`), the
+/// container corner, the dark themes' overlay border, a 4-DIP inset (lift
+/// it with [`lifted`] at level 2).
 pub fn popover(palette: Palette) -> Border {
     Border::new()
-        .background(palette.composer())
-        .border_brush(palette.outline())
+        .background(palette.menu())
+        .border_brush(palette.overlay_border())
         .border_thickness(Thickness::uniform(layout::HAIRLINE))
         .corner_radius(radius::CONTAINER)
         .padding(Thickness::uniform(spacing::XS))
