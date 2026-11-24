@@ -1080,22 +1080,15 @@ impl Store {
                 && native_event.kind == "turn.started"
                 && let Some(turn) = next.active_turn.as_deref()
             {
-                let selected_model: Option<String> = tx
+                let selected_model = tx
                     .query_row(
-                        "SELECT json_extract(config.effective, '$.model')
-                         FROM turns AS turn JOIN agent_config AS config ON
-                           config.agent = turn.agent AND config.generation = turn.generation
-                           AND config.revision = turn.config_revision
-                         WHERE turn.agent = ?1 AND turn.generation = ?2 AND turn.turn_id = ?3",
+                        "SELECT effective_model FROM turns
+                         WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
                         params![agent_num, batch.generation, turn],
                         |row| row.get(0),
                     )
-                    .optional()
-                    .map_err(sql_error)?
-                    .flatten();
-                if let Some(model) = selected_model {
-                    next.set_admitted_model(model);
-                }
+                    .map_err(sql_error)?;
+                next.set_admitted_model(selected_model);
             }
             command_events.extend(effects);
             if resolves_recovered {

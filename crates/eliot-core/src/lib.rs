@@ -583,12 +583,12 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Retain the selector admitted by the native session separately from a
-    /// model named by the provider on any one turn.
-    pub fn set_admitted_model(&mut self, model: String) {
+    /// Retain the exact turn selector separately from provider model evidence.
+    pub fn set_admitted_model(&mut self, model: Option<String>) {
         if let Some(Value::Object(effective)) = self.effective.as_mut() {
-            effective.insert("admitted_model".to_owned(), Value::String(model.clone()));
-            effective.insert("model".to_owned(), Value::String(model));
+            let model = model.map_or(Value::Null, Value::String);
+            effective.insert("admitted_model".to_owned(), model.clone());
+            effective.insert("model".to_owned(), model);
         }
     }
 
@@ -2350,15 +2350,15 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if let Some(native_ref) = optional_native_ref(event)? {
                 next.native_ref = Some(native_ref);
             }
-            if let Some(effective) = optional_effective(event)? {
-                let admitted = api::HarnessCapabilities::of(&agent.harness)
-                    .provider_response_model_verification
-                    .then(|| effective["model"].as_str().map(str::to_owned))
-                    .flatten();
-                next.effective = Some(effective);
-                if let Some(model) = admitted {
-                    next.set_admitted_model(model);
+            if let Some(mut effective) = optional_effective(event)? {
+                if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+                    && let Value::Object(fields) = &mut effective
+                {
+                    let model = fields.get("model").cloned().unwrap_or(Value::Null);
+                    fields.insert("session_admitted_model".to_owned(), model.clone());
+                    fields.insert("admitted_model".to_owned(), model);
                 }
+                next.effective = Some(effective);
             }
             next.state = AgentState::Idle;
         }
@@ -2768,7 +2768,6 @@ fn record_unverified_provider_model(agent: &mut Agent, reason: Option<&str>) {
     if let Some(Value::Object(effective)) = agent.effective.as_mut() {
         let model = effective
             .get("admitted_model")
-            .or_else(|| agent.profile_snapshot.get("model"))
             .cloned()
             .unwrap_or(Value::Null);
         effective.insert("model".to_owned(), model);

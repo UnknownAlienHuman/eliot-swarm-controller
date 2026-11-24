@@ -175,8 +175,23 @@ impl Store {
 
     pub fn fill_turn_readback(&self, agent: &Agent, turn: &mut Turn) -> Result<()> {
         turn.config = self.turn_config_view(agent, turn)?;
-        if eliot_core::api::HarnessCapabilities::of(&agent.harness).backfill_failed_turn_readback
-            && turn.outcome == Some(TurnOutcome::Failure)
+        let capabilities = eliot_core::api::HarnessCapabilities::of(&agent.harness);
+        if capabilities.provider_response_model_verification
+            && turn.effective_model.is_none()
+            && turn.config_revision > 0
+            && turn.outcome == Some(TurnOutcome::Success)
+            && turn.resolution_source.is_none()
+        {
+            // Older successful turns did not persist the overlay selector.
+            // A mismatch clears the persisted field and never succeeds.
+            turn.effective_model = retained_provider_selector(
+                &self.connection,
+                agent,
+                turn.generation,
+                turn.config_revision,
+            )?;
+        }
+        if capabilities.backfill_failed_turn_readback && turn.outcome == Some(TurnOutcome::Failure)
         {
             // Older rows predate the retained failure fields. Recover the
             // exact terminal diagnostic while its event is still available.
@@ -315,6 +330,55 @@ impl Store {
     }
 }
 
+/// Select the latest explicit effective selector at or before this revision.
+/// Older effort-only overlays can have null models. Their starting point is
+/// the native session's readiness readback, which is stable across turns.
+pub(super) fn retained_provider_selector(
+    connection: &Connection,
+    agent: &Agent,
+    generation: i64,
+    revision: i64,
+) -> Result<Option<String>> {
+    let agent_num = parse_agent_id(&agent.id)?;
+    if revision > 0 {
+        let model = connection
+            .query_row(
+                "SELECT json_extract(effective, '$.model') FROM agent_config
+                 WHERE agent = ?1 AND generation = ?2 AND revision <= ?3
+                   AND json_type(effective, '$.model') = 'text'
+                 ORDER BY revision DESC LIMIT 1",
+                params![agent_num, generation, revision],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if model.is_some() {
+            return Ok(model);
+        }
+    }
+    if generation == agent.generation
+        && let Some(model) = agent
+            .effective
+            .as_ref()
+            .and_then(|effective| effective.get("session_admitted_model"))
+    {
+        return Ok(model.as_str().map(str::to_owned));
+    }
+    // Existing generations may only have the seed in their readiness event.
+    connection
+        .query_row(
+            "SELECT json_extract(data, '$.effective.model')
+             FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'session.ready' AND source = 'stream'
+             ORDER BY seq DESC LIMIT 1",
+            params![agent_num, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|model| model.flatten())
+        .map_err(sql_error)
+}
+
 pub(super) fn apply_agent_config_tx(
     tx: &Transaction<'_>,
     record: &CommandRecord,
@@ -390,7 +454,14 @@ pub(super) fn apply_agent_config_tx(
     let previous_revision = current_config_revision_tx(tx, agent_num, generation)?;
     if capabilities.configure_carries_previous_overlay {
         let previous = get_agent_config_tx(tx, agent_num, generation, previous_revision)?;
-        if requested["model"].is_null() {
+        if requested["model"].is_null() && capabilities.provider_response_model_verification {
+            resolved_effective["model"] = json!(retained_provider_selector(
+                tx,
+                &agent,
+                generation,
+                previous_revision,
+            )?);
+        } else if requested["model"].is_null() {
             let model = previous
                 .as_ref()
                 .and_then(|config| config.model.as_deref())

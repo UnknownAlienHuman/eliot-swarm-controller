@@ -1403,6 +1403,12 @@ a resolved effort the overlay left absent, the turn association records it on
 the overlay's effective values while the requested values stay exactly what
 the owner asked.
 
+Muse effort-only revisions inherit the preceding selector, starting with the
+selector admitted at native session readiness. A turn stores the selector
+from its bound revision as `effective_model`. The Agent shows that selector
+with `model_verified: false` when the provider gives no independent model
+evidence. An explicit mismatch clears the turn's effective model.
+
 A `resume` starts its new generation by explicitly inheriting the previous
 generation's latest overlay as its own revision 1 with provenance
 `inherited_from` (same requested and effective values, `command_id` naming
