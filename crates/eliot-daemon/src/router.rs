@@ -202,7 +202,8 @@ struct RouterInner {
     catalog_cache: Mutex<catalog::CatalogCache>,
     allowance_reads: Mutex<quota::AllowanceReads>,
     profile_cache: Mutex<crate::config::ProfileCache>,
-    catalog_aggregate_lock: AsyncMutex<()>,
+    catalog_refresh: tokio::sync::Notify,
+    catalog_updates: tokio::sync::watch::Sender<catalog::AggregateUpdate>,
     var_writes: Mutex<coordination::VarWriteQueue>,
     var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
@@ -486,7 +487,8 @@ impl Router {
                 catalog_cache: Mutex::new(catalog::CatalogCache::default()),
                 allowance_reads: Mutex::new(quota::AllowanceReads::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
-                catalog_aggregate_lock: AsyncMutex::new(()),
+                catalog_refresh: tokio::sync::Notify::new(),
+                catalog_updates: tokio::sync::watch::channel(None).0,
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),
                 var_worker: AsyncMutex::new(None),
                 plugin_host,
@@ -786,6 +788,7 @@ impl Router {
             "auth.desktop.report" => self.auth_desktop_report(&params).await,
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
+            "models.catalog.watch" => self.models_catalog_watch(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.archive" => {
                 require_owner(&principal)?;
@@ -3722,14 +3725,13 @@ impl Router {
 
     /// Freeze the daemon-owned launch default for a Codex or Muse snapshot
     /// that omits its model: resolve the native default through the
-    /// existing catalogue reader (cache hit or live read), then retain it
+    /// existing shared catalogue read, then retain it
     /// separately from the caller's omitted request, so the plugins
     /// translate an already-decided launch. `requested.model` stays null;
     /// the effective model is the frozen `daemon_model` (Codex) or the
     /// server default (Muse). Muse defers to the server default, so only
-    /// an empty catalogue refuses there. A live-read failure leaves the
-    /// snapshot untouched for the plugin's native read, so passive freeze
-    /// work can never fail a launch its readers could serve. Explicit
+    /// an empty catalogue refuses there. A read failure leaves the
+    /// snapshot untouched for the plugin's native admission. Explicit
     /// models, routed Codex profiles (the Responses route requires an
     /// explicit model id) and other harnesses pass through untouched.
     async fn resolve_launch_default(
@@ -3763,19 +3765,10 @@ impl Router {
         {
             return Ok(());
         }
-        // The existing reader decides (cache hit or live native read) under
-        // the canonical executable/version/route key, so a changed `cmd`
-        // never reuses a stale entry. Ad-hoc launches share the catalogue's
-        // `adhoc` label, never `adhoc-<harness>`.
+        // Ad-hoc launches share the catalogue's executable/version/route
+        // key and its `adhoc` label.
         let response = match self
-            .models_for_snapshot(
-                harness,
-                Some(snapshot.clone()),
-                cache_label,
-                None,
-                None,
-                deadline,
-            )
+            .launch_catalogue(harness, snapshot.clone(), cache_label, deadline)
             .await
         {
             Ok(response) => response,

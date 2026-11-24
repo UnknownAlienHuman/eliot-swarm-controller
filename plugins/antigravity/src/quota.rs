@@ -85,9 +85,12 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
 }
 
 #[cfg(windows)]
+pub(crate) const KEYRING_TARGET: &str = "gemini:antigravity";
+
+#[cfg(windows)]
 fn keyring_credential() -> Result<Value> {
     q::windows_credential_json(
-        "gemini:antigravity",
+        KEYRING_TARGET,
         [
             "Antigravity native keyring credential is unavailable",
             "Antigravity native keyring credential exceeds its bound",

@@ -14,6 +14,11 @@ use serde_json::Value;
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
+            root_env: "XDG_CONFIG_HOME",
+            default_root: ".config",
+            files: &["muse/auth.json", "muse/settings.json"],
+        }),
         model_catalogue_presentation: Some(
             crate::catalog_presentation::model_catalogue_presentation,
         ),

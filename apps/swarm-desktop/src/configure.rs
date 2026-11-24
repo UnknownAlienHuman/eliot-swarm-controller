@@ -280,6 +280,7 @@ pub fn change(
 /// for this Agent, not the unified catalogue of new tasks.
 pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
     ModelsCatalogResponse {
+        revision: None,
         harnesses: vec![HarnessEntry {
             harness: reply.harness.clone(),
             installed: true,
@@ -314,7 +315,8 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
         next: None,
         fetched_at_ms: reply.fetched_at_ms,
         ttl_ms: reply.ttl_ms,
-        failures: Vec::new(),
+        stale: reply.stale,
+        failures: reply.refresh_failure.iter().cloned().collect(),
     }
 }
 

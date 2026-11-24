@@ -15,7 +15,9 @@
 use std::path::Path;
 
 use eliot_core::AgentState;
-use eliot_core::api::harness::MAX_CATALOG_LIMIT;
+use eliot_core::api::harness::{
+    MAX_CATALOG_LIMIT, ModelsCatalogWatchRequest, ModelsCatalogWatchResponse,
+};
 use eliot_core::api::{
     AgentListRequest, ArchivedFilter, DaemonStatusRequest, DaemonStatusResponse,
     HarnessQuotaRequest, HarnessQuotaResponse, ManagedWorkspaceView, ModelsCatalogRequest,
@@ -221,11 +223,35 @@ const CATALOG_MAX_PAGES: usize = 100;
 
 /// The unified model catalogue for the composer's picker: every installed
 /// harness with its version, and the models read page by page until the
-/// daemon reports the end (`next` absent). A listing that changed between
-/// pages fails with the daemon's stale-cursor error instead of mixing two
-/// listings; the picker's next open reads it again. The daemon caches and
-/// coalesces the native reads.
+/// daemon reports the end (`next` absent). If its snapshot revision changes
+/// during paging, restart the listing once; never mix pages from two revisions.
+/// The daemon caches and coalesces the native reads.
 pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
+    match read_models_catalog(data_dir).await {
+        Err(error)
+            if error.code == "invalid"
+                && error
+                    .message
+                    .contains("catalogue cursor is no longer in the listing") =>
+        {
+            read_models_catalog(data_dir).await
+        }
+        result => result,
+    }
+}
+
+pub async fn models_catalog_watch(
+    data_dir: &Path,
+    revision: Option<String>,
+) -> Result<ModelsCatalogWatchResponse> {
+    let params = ModelsCatalogWatchRequest { revision };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "models.catalog.watch", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
+async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut request = ModelsCatalogRequest {
         query: None,
         after: None,
@@ -241,9 +267,16 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
         next = page.next.clone();
         match whole.as_mut() {
             Some(whole) => {
+                if whole.revision != page.revision {
+                    return Err(Error::new(
+                        "invalid",
+                        "catalogue cursor is no longer in the listing; restart from the first page",
+                    ));
+                }
                 whole.models.extend(page.models);
                 // Every page repeats the aggregate's failed harnesses.
                 whole.failures = page.failures;
+                whole.stale |= page.stale;
             }
             None => whole = Some(page),
         }

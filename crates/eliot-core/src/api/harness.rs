@@ -230,6 +230,17 @@ pub struct ModelReaderOptions {
     pub interruption_code: Option<&'static str>,
 }
 
+/// Local metadata that changes when an adapter's effective login changes.
+#[derive(Clone, Copy, Debug)]
+pub enum ModelLoginSource {
+    Files {
+        root_env: &'static str,
+        default_root: &'static str,
+        files: &'static [&'static str],
+    },
+    Keyring(fn() -> Option<u64>),
+}
+
 /// Native profile vocabulary used by the daemon and the desktop editor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
@@ -328,6 +339,7 @@ pub struct HarnessCapabilities {
     pub documented_models: Option<DocumentedModelCatalog>,
     pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
+    pub model_login_source: Option<ModelLoginSource>,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,
     /// The native model refusal permits cleanup before any initial turn work.
@@ -886,6 +898,12 @@ pub struct HarnessModelsResponse {
     pub fetched_at_ms: i64,
     /// Freshness bound in milliseconds for this entry.
     pub ttl_ms: u64,
+    /// The catalogue is being served past its freshness bound.
+    #[serde(default)]
+    pub stale: bool,
+    /// The last settled refresh failure for this stale catalogue, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_failure: Option<ModelsCatalogFailure>,
     /// Nonsecret credential identity the read ran under (an environment
     /// name, integration name or ambient marker; never a secret value).
     pub credential: String,
@@ -988,6 +1006,15 @@ impl HarnessModelsResponse {
         validate_scope(&self.scope)?;
         validate_credential(&self.credential)?;
         validate_freshness(self.fetched_at_ms, self.ttl_ms)?;
+        if let Some(failure) = &self.refresh_failure {
+            failure.validate()?;
+            if !self.stale || failure.harness != self.harness {
+                return Err(Error::new(
+                    "invalid",
+                    "refresh failure must match the stale harness catalogue",
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -1459,6 +1486,9 @@ impl ModelsCatalogEntry {
 /// Response for `models.catalog`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsCatalogResponse {
+    /// Revision of the daemon's settled aggregate, shared by every page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     /// Every installed harness with its version and status.
     pub harnesses: Vec<HarnessEntry>,
     /// The bounded page of unified models, sorted by harness, id and profile.
@@ -1466,15 +1496,58 @@ pub struct ModelsCatalogResponse {
     /// Cursor after the last model on this page; absent at the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-    /// Milliseconds since the Unix epoch when the aggregate was completed.
+    /// Milliseconds since the Unix epoch of the oldest included catalogue read.
     pub fetched_at_ms: i64,
     /// Freshness bound in milliseconds for the aggregate.
     pub ttl_ms: u64,
-    /// Installed harnesses whose catalogue read failed while this aggregate
-    /// was built (repeated on every page). Such an aggregate is partial: it
-    /// is not cached, so the next call reads the failed harness again.
+    /// The aggregate is being served past its freshness bound.
+    #[serde(default)]
+    pub stale: bool,
+    /// Installed harnesses whose catalogue read failed during refresh
+    /// (repeated on every page).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<ModelsCatalogFailure>,
+}
+
+/// Wait for a settled aggregate newer than the desktop's current revision.
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsCatalogWatchRequest {
+    pub revision: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct ModelsCatalogWatchResponse {
+    /// The new revision, or no change within the bounded wait.
+    pub revision: Option<String>,
+}
+
+impl ModelsCatalogWatchRequest {
+    pub fn validate(&self) -> Result<()> {
+        validate_catalog_revision(self.revision.as_deref())
+    }
+
+    pub fn validate_response(&self, reply: &ModelsCatalogWatchResponse) -> Result<()> {
+        self.validate()?;
+        validate_catalog_revision(reply.revision.as_deref())?;
+        if reply.revision.is_some() && reply.revision == self.revision {
+            return Err(Error::new(
+                "invalid",
+                "catalogue watch returned its current revision",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_catalog_revision(revision: Option<&str>) -> Result<()> {
+    if let Some(revision) = revision
+        && (!matches!(revision.as_bytes().first(), Some(b'0'..=b'7'))
+            || super::agent_lifecycle::validate_ulid(revision).is_err())
+    {
+        return Err(Error::new("invalid", "catalogue revision must be a ULID"));
+    }
+    Ok(())
 }
 
 /// Maximum `models.catalog` failure message length in bytes.

@@ -723,6 +723,19 @@ async fn spawn_workers(
 
     let (worker_stop, _) = watch::channel(false);
     let mut workers = JoinSet::new();
+    let catalog_router = router.clone();
+    workers.spawn(crate::daemon::workers::supervise(
+        "catalog_refresh",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        move |shutdown: watch::Receiver<bool>| {
+            let router = catalog_router.clone();
+            async move {
+                let result = router.run_catalog_refresh(shutdown.clone()).await;
+                crate::daemon::workers::from_result(result, &shutdown)
+            }
+        },
+    ));
     let attention_router = router.clone();
     let attention_reporter = worker_reporter.clone();
     let attention_factory = move |shutdown: watch::Receiver<bool>| {

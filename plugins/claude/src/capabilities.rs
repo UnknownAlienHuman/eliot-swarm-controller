@@ -14,6 +14,11 @@ use serde_json::Value;
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
+            root_env: "CLAUDE_CONFIG_DIR",
+            default_root: ".claude",
+            files: &[".credentials.json"],
+        }),
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
                 resolve: || auth_command(&["auth", "login"]),

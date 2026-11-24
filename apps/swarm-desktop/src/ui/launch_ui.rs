@@ -26,6 +26,8 @@ use crate::picker::{self, Choice, Item, Pick, Row};
 use crate::settings::Access;
 use crate::shortcuts::{Popover as HookPopover, PopoverKey};
 use eliot_core::api::ModelsCatalogResponse;
+use eliot_core::api::harness::ModelsCatalogWatchResponse;
+use std::path::PathBuf;
 
 /// A popover above the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +66,8 @@ pub(super) enum LaunchMsg {
     /// `routing.preview` for the default role.
     PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
     /// `models.catalog`, every page.
-    CatalogLoaded(Box<Fallible<ModelsCatalogResponse>>),
+    CatalogLoaded(PathBuf, Box<Fallible<ModelsCatalogResponse>>),
+    CatalogWatchLoaded(PathBuf, Box<Fallible<ModelsCatalogWatchResponse>>),
     /// A failed harness's Retry: read the catalogue again.
     CatalogRetry,
     /// Open a popover, or close it when it is the one open.
@@ -226,6 +229,11 @@ pub(super) struct LaunchState {
     /// The unified catalogue, once read.
     pub(super) catalog: Option<Fallible<ModelsCatalogResponse>>,
     pub(super) catalog_loading: bool,
+    pub(super) catalog_data_dir: Option<PathBuf>,
+    pub(super) catalog_watch_pending: bool,
+    pub(super) catalog_watch_revision: Option<String>,
+    /// A failed refresh stays visible with the last successful catalogue.
+    pub(super) catalog_refresh_error: Option<String>,
     /// What routing would pick for a new task now (advisory).
     pub(super) preview: Option<Fallible<eliot_core::RoutingDecision>>,
     pub(super) preview_loading: bool,
@@ -407,7 +415,7 @@ impl DesktopApp {
         let presets = self.launch.allowed();
         let auto_detail = self.launch.auto_detail();
         let preset_current = self.preset_choice();
-        picker::rows(&picker::Inputs {
+        let mut rows = picker::rows(&picker::Inputs {
             catalog: self.launch.catalog.as_ref(),
             query: &self.launch.query,
             prefs: &self.prefs,
@@ -420,7 +428,39 @@ impl DesktopApp {
             auto_detail: &auto_detail,
             efforts: &self.launch.efforts,
             claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
-        })
+        });
+        if let Some(error) = self.launch.catalog_refresh_error.as_deref() {
+            // The cached catalogue remains usable, but make a failed refresh
+            // visible and retryable in the picker's existing status row.
+            rows.retain(|row| !matches!(row, Row::Note { key, .. } if key == "error"));
+            rows.push(Row::Failure {
+                key: "catalog-refresh".to_owned(),
+                text: format!("Model catalogue refresh failed: {error}"),
+            });
+        }
+        let only_harness = self
+            .launch
+            .preset_target()
+            .map(|(_, harness)| harness.as_str());
+        if let Some(Ok(catalog)) = self.launch.catalog.as_ref() {
+            for failure in &catalog.failures {
+                if only_harness.is_some_and(|harness| harness != failure.harness.as_str()) {
+                    continue;
+                }
+                let key = format!("failure:{}", failure.harness);
+                if rows
+                    .iter()
+                    .any(|row| matches!(row, Row::Failure { key: row_key, .. } if row_key == &key))
+                {
+                    continue;
+                }
+                rows.push(Row::Failure {
+                    key,
+                    text: picker::failure_text(picker::harness_label(&failure.harness), failure),
+                });
+            }
+        }
+        rows
     }
 
     /// The preset picker's current choice: the preset's model and effort.
@@ -485,17 +525,39 @@ impl DesktopApp {
     pub(super) fn launch_update(&mut self, msg: LaunchMsg, context: &ComponentContext<Self>) {
         match msg {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
-            LaunchMsg::CatalogLoaded(reply) => {
+            LaunchMsg::CatalogLoaded(data_dir, reply) => {
                 self.launch.catalog_loading = false;
-                // Stale while revalidating: a failed refresh keeps the last
-                // catalogue it read and says why.
-                match (*reply, self.launch.catalog.as_ref()) {
-                    (Err(error), Some(Ok(_))) => {
-                        self.set_status(format!("Models not refreshed: {error}"));
+                if self.data_dir.as_ref().ok() != Some(&data_dir) {
+                    self.ensure_catalog_watch(context);
+                    return;
+                }
+                match *reply {
+                    Ok(catalog) => {
+                        // The daemon serves stale rows only for the current source.
+                        self.launch.catalog_watch_revision = catalog.revision.clone();
+                        self.launch.catalog = Some(Ok(catalog));
+                        self.launch.catalog_refresh_error = None;
                     }
-                    (reply, _) => self.launch.catalog = Some(reply),
+                    Err(error) => {
+                        if !matches!(self.launch.catalog.as_ref(), Some(Ok(_))) {
+                            self.launch.catalog = Some(Err(error.clone()));
+                        }
+                        self.launch.catalog_refresh_error = Some(error);
+                    }
                 }
                 self.keep_highlight();
+            }
+            LaunchMsg::CatalogWatchLoaded(data_dir, reply) => {
+                self.launch.catalog_watch_pending = false;
+                if self.data_dir.as_ref().ok() == Some(&data_dir)
+                    && self.unified_catalog_picker_visible()
+                    && !self.launch.catalog_loading
+                    && let Ok(response) = *reply
+                    && let Some(revision) = response.revision
+                    && self.launch.catalog_watch_revision.as_ref() != Some(&revision)
+                {
+                    self.load_catalog_inner(context, true);
+                }
             }
             LaunchMsg::CatalogRetry => {
                 // The Agent picker's Retry re-reads live state: opencode
@@ -747,6 +809,7 @@ impl DesktopApp {
                 }
             }
         }
+        self.ensure_catalog_watch(context);
     }
 
     /// The `[desktop]` preferences arrived: a new task starts with the most
@@ -852,6 +915,7 @@ impl DesktopApp {
             }
             Pop::Usage => crate::shortcuts::set_popover(HookPopover::Menu),
         }
+        self.ensure_catalog_watch(context);
     }
 
     /// A press on the composer's message field (the pointer hook's report,
@@ -1142,18 +1206,64 @@ impl DesktopApp {
 
     /// Read the unified model catalogue (every page) on a worker.
     pub(super) fn load_catalog(&mut self, context: &ComponentContext<Self>) {
+        self.load_catalog_inner(context, false);
+    }
+
+    fn load_catalog_inner(&mut self, context: &ComponentContext<Self>, from_watch: bool) {
         if self.launch.catalog_loading {
             return;
         }
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        if self.launch.catalog_data_dir.as_ref() != Some(&data_dir) {
+            self.launch.catalog_data_dir = Some(data_dir.clone());
+            self.launch.catalog = None;
+            self.launch.catalog_refresh_error = None;
+            self.launch.catalog_watch_revision = None;
+        }
         self.launch.catalog_loading = true;
-        let _task = context.spawn_background(move |_| {
-            Message::Launch(LaunchMsg::CatalogLoaded(Box::new(
-                client::block_on(config_client::models_catalog(&data_dir))
-                    .map_err(|error| error.to_string()),
-            )))
+        let _task = context.spawn_background(move |cancel| {
+            let result = client::block_on(config_client::models_catalog(&data_dir))
+                .map_err(|error| error.to_string());
+            // A transient page read must leave the revision pending, without
+            // immediately requesting the same revision again in a loop.
+            if from_watch && result.is_err() {
+                let _ = feed::backoff(10_000, &|| cancel.is_cancelled());
+            }
+            Message::Launch(LaunchMsg::CatalogLoaded(data_dir, Box::new(result)))
+        });
+    }
+
+    fn unified_catalog_picker_visible(&self) -> bool {
+        matches!(self.launch.open, Some(Pop::Model | Pop::Manage))
+            && (self.main == Main::Conversation && self.selected_agent_id().is_none()
+                || self.main == Main::Settings && self.launch.preset.is_some())
+    }
+
+    fn ensure_catalog_watch(&mut self, context: &ComponentContext<Self>) {
+        if !self.unified_catalog_picker_visible()
+            || self.launch.catalog_loading
+            || self.launch.catalog_watch_pending
+        {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.launch.catalog_data_dir.as_ref() != Some(&data_dir) {
+            self.load_catalog(context);
+            return;
+        }
+        let revision = self.launch.catalog_watch_revision.clone();
+        self.launch.catalog_watch_pending = true;
+        let _task = context.spawn_background(move |cancel| {
+            let result = client::block_on(config_client::models_catalog_watch(&data_dir, revision))
+                .map_err(|error| error.to_string());
+            if result.is_err() {
+                let _ = crate::feed::backoff(10_000, &|| cancel.is_cancelled());
+            }
+            Message::Launch(LaunchMsg::CatalogWatchLoaded(data_dir, Box::new(result)))
         });
     }
 

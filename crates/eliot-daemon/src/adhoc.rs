@@ -30,8 +30,34 @@ pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
 pub(crate) const DISCOVERY_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 use std::time::{Duration, Instant};
 
+pub(crate) const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone)]
+pub(crate) struct DiscoveryFailure {
+    pub(crate) until: Instant,
+    pub(crate) error: core::Error,
+    exponent: u8,
+}
+
+impl DiscoveryFailure {
+    pub(crate) fn next(previous: Option<&Self>, error: core::Error) -> Self {
+        let exponent = previous.map_or(0, |failure| failure.exponent.saturating_add(1).min(5));
+        Self {
+            until: Instant::now()
+                + (DISCOVERY_RETRY_INTERVAL * (1 << exponent)).min(DISCOVERY_RETRY_MAX),
+            exponent,
+            error,
+        }
+    }
+}
+
 pub(crate) fn discovery_timeout() -> core::Error {
     core::Error::new("timeout", "native discovery deadline elapsed")
+}
+
+pub(crate) fn caller_discovery_timed_out(error: &core::Error, deadline: Instant) -> bool {
+    error.code == "timeout" && Instant::now() >= deadline
 }
 
 fn discovery_remaining(deadline: Instant) -> core::Result<Duration> {
@@ -937,6 +963,12 @@ pub(crate) struct InstallationFingerprint {
     metadata_version: Option<String>,
 }
 
+impl InstallationFingerprint {
+    pub(crate) fn first_program(&self) -> Option<&str> {
+        self.executables.first().map(|key| key.program.as_str())
+    }
+}
+
 /// Check the current installation without starting a native CLI. A ranked
 /// adapter can change its choice when any of its candidates changes.
 pub(crate) fn installation_fingerprint(
@@ -988,6 +1020,17 @@ pub(crate) struct VersionKey {
 }
 
 impl VersionKey {
+    pub(crate) fn for_reader(program: &str, harness: &str) -> Option<Self> {
+        Self::read(&resolve_native_executable(program, harness).ok()?, None)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        let Ok(metadata) = Path::new(&self.program).metadata() else {
+            return false;
+        };
+        self.modified == metadata.modified().ok() && self.size == metadata.len()
+    }
+
     pub(crate) fn read(program: &str, verify: Option<&InstallDiscovery>) -> Option<Self> {
         let metadata = Path::new(program).metadata().ok()?;
         Some(Self {
@@ -1007,6 +1050,7 @@ type VersionCache = std::collections::HashMap<VersionKey, (Option<String>, Insta
 #[derive(Default)]
 struct VersionProbes {
     cache: VersionCache,
+    failures: std::collections::HashMap<VersionKey, DiscoveryFailure>,
     inflight: std::collections::HashMap<VersionKey, std::sync::Arc<InflightVersionProbe>>,
 }
 
@@ -1020,7 +1064,7 @@ struct InflightVersionProbe {
 }
 
 enum VersionProbeRole {
-    Cached(Option<String>),
+    Cached(VersionResult),
     Leader(std::sync::Arc<InflightVersionProbe>),
     Follower(std::sync::Arc<InflightVersionProbe>),
 }
@@ -1048,12 +1092,17 @@ fn probe_native_version(
     }
     let key = VersionKey::read(program, verify).ok_or_else(native_cmd_unavailable)?;
     let leader = match version_inflight_join(&key) {
-        VersionProbeRole::Cached(result) => return Ok(result),
+        VersionProbeRole::Cached(result) => return result,
         VersionProbeRole::Leader(probe) => probe,
         VersionProbeRole::Follower(probe) => return version_inflight_wait(&probe, deadline),
     };
     let result = probe_version_uncached(program, verify, deadline);
-    version_inflight_finish(key, &leader, result.clone());
+    // A caller that used up its own budget should not suppress a later probe.
+    // The capability and version commands' own timeouts still back off.
+    let caller_timed_out = result
+        .as_ref()
+        .is_err_and(|error| caller_discovery_timed_out(error, deadline));
+    version_inflight_finish(key, &leader, result.clone(), caller_timed_out);
     result
 }
 
@@ -1062,7 +1111,12 @@ fn version_inflight_join(key: &VersionKey) -> VersionProbeRole {
     if let Some((version, at)) = probes.cache.get(key)
         && at.elapsed() < VERSION_CACHE_TTL
     {
-        return VersionProbeRole::Cached(version.clone());
+        return VersionProbeRole::Cached(Ok(version.clone()));
+    }
+    if let Some(failure) = probes.failures.get(key)
+        && Instant::now() < failure.until
+    {
+        return VersionProbeRole::Cached(Err(failure.error.clone()));
     }
     if let Some(probe) = probes.inflight.get(key) {
         return VersionProbeRole::Follower(probe.clone());
@@ -1087,10 +1141,16 @@ fn version_inflight_wait(probe: &InflightVersionProbe, deadline: Instant) -> Ver
     }
 }
 
-fn version_inflight_finish(key: VersionKey, probe: &InflightVersionProbe, result: VersionResult) {
+fn version_inflight_finish(
+    key: VersionKey,
+    probe: &InflightVersionProbe,
+    result: VersionResult,
+    caller_timed_out: bool,
+) {
     let mut probes = VERSION_PROBES.lock_recover();
     probes.inflight.remove(&key);
     if let Ok(version) = &result {
+        probes.failures.remove(&key);
         if probes.cache.len() >= VERSION_CACHE_MAX {
             probes
                 .cache
@@ -1100,6 +1160,21 @@ fn version_inflight_finish(key: VersionKey, probe: &InflightVersionProbe, result
             }
         }
         probes.cache.insert(key, (version.clone(), Instant::now()));
+    } else if let Err(error) = &result
+        && !caller_timed_out
+    {
+        let failure = DiscoveryFailure::next(probes.failures.get(&key), error.clone());
+        if !probes.failures.contains_key(&key)
+            && probes.failures.len() >= VERSION_CACHE_MAX
+            && let Some(oldest) = probes
+                .failures
+                .iter()
+                .min_by_key(|(_, failure)| failure.until)
+                .map(|(key, _)| key.clone())
+        {
+            probes.failures.remove(&oldest);
+        }
+        probes.failures.insert(key, failure);
     }
     *probe.state.lock_recover() = Some(result);
     probe.ready.notify_all();

@@ -504,7 +504,8 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
 | `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
-| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical DTOs](../../crates/eliot-core/src/api/harness.rs) define requests, entries, failures and quota vocabulary. Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible. A partial listing supports continuation and the next first page retries failed reads. An `after` cursor missing from the current listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles caching, discovery and page availability. |
+| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An `after` cursor from a replaced listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
+| `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
@@ -2406,14 +2407,24 @@ Candidate `version` retains the bounded raw first line when available, or is
 null when the probe is unavailable. Inventory presence does not make an
 executable eligible for automatic Claude selection; that requires a successful
 `--version` probe with a parseable numeric version.
-Inventory and native discovery run on the blocking pool. `models.catalog`
-checks the current settings revision and native executable identities on each
-read. Fresh pages reuse the aggregate without launching native discovery
-processes. A changed installation, new settings, expiry, or a first page
-after a partial listing rebuilds the aggregate. The 90-second deadline covers
-waiting for a rebuild, inventory, per-harness reads, and waiting for the Store
-to read holds. Expiry during a per-harness read can return a partial catalogue.
-A Store lock timeout or failed hold read returns an RPC error. Cold version
+The daemon begins refreshing when the catalogue is requested. An aggregate
+read on a cold or changed source joins the shared refresh within its discovery
+deadline. The desktop keeps its current list while that read settles.
+The daemon rechecks settings, installations and login revisions before
+publishing a new aggregate and projects current holds for each page. For
+recently requested catalogues it refreshes before expiry. Each page carries
+the settled revision. The open desktop picker watches for a new revision and
+loads it while keeping the current rows visible. Whole-aggregate failures,
+native reader failures and executable discovery failures back off from 30 seconds
+up to 15 minutes. Executable discovery shares this cooldown with quota reads.
+A caller's elapsed discovery deadline does not add to that cooldown. On the
+unified catalogue path, a whole-aggregate cooldown also defers its settings
+and inventory checks. Background work stops after five
+minutes without demand and discovery admission closes at shutdown.
+An expired snapshot for the same key may be served with `stale = true`.
+The aggregate can retain last-good rows for an unavailable source and reports
+its failure on every page. A Store lock timeout or failed hold read returns
+an RPC error. Cold version
 lookup and election are atomic for the resolved
 binary. Followers share its result within their deadline. On Unix the
 resolved payload must have an ELF or Mach-O header before a probe, including
@@ -2462,17 +2473,27 @@ opaque route identity verified against the exact private environment supplied
 to the reader. The private key also binds the account, integration, full
 configured endpoint and executable. Missing selectors, admitted unset
 selectors and admitted empty values are distinct. Concurrent model cache
-misses for the same verified scope and executable share one native read,
-including across `harness.models`, `models.catalog`, and launch preflight.
-The daemon starts the shared read with its own discovery budget, subject to
-the native reader's limit. Every caller, including the one that starts the
-read, waits only until its own deadline. The reader remains under daemon
-custody until cleanup settles, and only validated successful
-responses populate the cache. Legacy and unverified routes, previews with
-an explicit `workspace`, and live session reads bypass this sharing.
+misses for the same verified scope and executable share one native read.
+For verified sources, `harness.models` returns a matching cached response and
+refreshes it after expiry. A cold read and launch default preflight start or
+join the shared native read within their own deadlines. Last-good data is
+marked `stale = true` during refresh and includes `refresh_failure` when a
+settled refresh failure permits stale reuse. A verified route without a
+verified executable version returns `unavailable` or the documented alias
+fallback. The daemon gives each shared read its own budget, subject to the
+native reader's limit, and retains custody through cleanup. Validated
+successful responses populate the cache. Known file-backed login changes,
+the Windows Antigravity keyring revision and resolved Swarm sign-in reports
+invalidate old catalogue results. A source whose login revision cannot be
+observed has a hard 90-second freshness limit for both direct and aggregate
+reads. Concurrent previews of the same verified source and canonical
+workspace share their in-flight read. Later requests for that source and
+workspace reuse the result for up to 30 seconds. Unverified sources return
+`unavailable` or documented aliases without starting a model reader. Exact
+live session catalogue reads continue to use the owned generation.
 Public `scope` names the profile and route without
-private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`
-and a nonsecret `credential` reference. Native model IDs remain verbatim.
+private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`,
+`stale` and a nonsecret `credential` reference. Native model IDs remain verbatim.
 `harness.quota` (`HarnessQuotaRequest`/`HarnessQuotaResponse`) is an Owner-only,
 read-only provider quota query. `harness` and optional `profile` keep their current
 contract. The response retains `harness`, `scope`, `credential` (nonsecret names),
