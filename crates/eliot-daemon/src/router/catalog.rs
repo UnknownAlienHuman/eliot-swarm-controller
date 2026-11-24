@@ -7,8 +7,9 @@
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
 use eliot_core::api::harness::NativeRoute;
 use eliot_core::api::{
-    HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry,
-    HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
+    HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry, HarnessListResponse,
+    HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
+    ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest, ModelsCatalogResponse,
     SUPPORTED_HARNESSES,
 };
 use eliot_core::{Error, Result};
@@ -28,55 +29,55 @@ impl Router {
         let request: eliot_core::api::HarnessListRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
-        Self::harness_inventory(Instant::now() + crate::adhoc::DISCOVERY_BUDGET).await
+        let response =
+            Self::harness_inventory(Instant::now() + crate::adhoc::DISCOVERY_BUDGET).await?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness list could not be encoded"))
     }
 
-    async fn harness_inventory(deadline: Instant) -> Result<Value> {
+    async fn harness_inventory(deadline: Instant) -> Result<HarnessListResponse> {
         // Filesystem presence plus bounded `--version` probes is blocking
         // work: run it on the blocking pool so slow native CLIs never stall
         // async command/event service. Ranked candidates are enumerated once
         // and reused for both the entry and candidate list.
-        let harnesses: Vec<eliot_core::api::HarnessEntry> =
-            crate::adhoc::blocking_discovery(deadline, move || {
-                let mut harnesses = Vec::new();
-                for harness in SUPPORTED_HARNESSES {
-                    let ranked = crate::adhoc::has_ranked_install_candidates(harness);
-                    let ranked_candidates = if ranked {
-                        crate::adhoc::discover_ranked_candidates(harness, deadline)
-                    } else {
-                        Vec::new()
-                    };
-                    let entry = if ranked {
-                        crate::adhoc::ranked_installation(harness, &ranked_candidates)
-                    } else {
-                        crate::adhoc::harness_installation(harness, deadline)
-                    };
-                    let candidates = (!ranked_candidates.is_empty()).then_some(ranked_candidates);
-                    harnesses.push(eliot_core::api::HarnessEntry {
-                        harness: (*harness).to_owned(),
-                        installed: entry
-                            .get("installed")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
-                        version: entry
-                            .get("version")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
-                        error: entry
-                            .get("error")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        candidates,
-                    });
-                }
-                harnesses
-            })
-            .await?;
-        let response = eliot_core::api::HarnessListResponse { harnesses };
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "harness list could not be encoded"))
+        let harnesses: Vec<HarnessEntry> = crate::adhoc::blocking_discovery(deadline, move || {
+            let mut harnesses = Vec::new();
+            for harness in SUPPORTED_HARNESSES {
+                let ranked = crate::adhoc::has_ranked_install_candidates(harness);
+                let ranked_candidates = if ranked {
+                    crate::adhoc::discover_ranked_candidates(harness, deadline)
+                } else {
+                    Vec::new()
+                };
+                let entry = if ranked {
+                    crate::adhoc::ranked_installation(harness, &ranked_candidates)
+                } else {
+                    crate::adhoc::harness_installation(harness, deadline)
+                };
+                let candidates = (!ranked_candidates.is_empty()).then_some(ranked_candidates);
+                harnesses.push(HarnessEntry {
+                    harness: (*harness).to_owned(),
+                    installed: entry
+                        .get("installed")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    cmd: entry.get("cmd").and_then(Value::as_str).map(str::to_owned),
+                    version: entry
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    code: entry.get("code").and_then(Value::as_str).map(str::to_owned),
+                    error: entry
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    candidates,
+                });
+            }
+            harnesses
+        })
+        .await?;
+        Ok(HarnessListResponse { harnesses })
     }
     /// Resolve a named profile or an ad-hoc snapshot with its discovered version.
     async fn resolve_catalog_snapshot(
@@ -187,23 +188,20 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        self.harness_models_until(
-            params,
-            principal,
-            Instant::now() + crate::adhoc::DISCOVERY_BUDGET,
-        )
-        .await
+        let deadline = Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
+        require_owner(principal)?;
+        let request: HarnessModelsRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        let response = self.harness_models_until(request, deadline).await?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "harness models could not be encoded"))
     }
 
     async fn harness_models_until(
         &self,
-        params: &Value,
-        principal: &Principal,
+        request: HarnessModelsRequest,
         deadline: Instant,
-    ) -> Result<Value> {
-        require_owner(principal)?;
-        let request: eliot_core::api::HarnessModelsRequest =
-            eliot_core::api::discovery::decode_params(params.clone())?;
+    ) -> Result<HarnessModelsResponse> {
         request.validate()?;
         let harness = request.harness.trim().to_owned();
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
@@ -264,8 +262,7 @@ impl Router {
             .await?
         };
         request.validate_response(&response)?;
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "harness models could not be encoded"))
+        Ok(response)
     }
 
     pub(super) async fn models_for_snapshot(
@@ -486,9 +483,10 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         let deadline = Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
-        let (harness, snapshot, label) = self
-            .resolve_quota_target(params, principal, deadline)
-            .await?;
+        require_owner(principal)?;
+        let request: HarnessQuotaRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
         let evidence = self
             .quota_for_snapshot(harness, snapshot.clone(), label.clone(), deadline)
             .await?;
@@ -531,26 +529,19 @@ impl Router {
 
     async fn harness_quota_until(
         &self,
-        params: &Value,
-        principal: &Principal,
+        request: HarnessQuotaRequest,
         deadline: Instant,
     ) -> Result<catalog::ScopedQuota> {
-        let (harness, snapshot, label) = self
-            .resolve_quota_target(params, principal, deadline)
-            .await?;
+        let (harness, snapshot, label) = self.resolve_quota_target(request, deadline).await?;
         self.quota_for_snapshot(harness, snapshot, label, deadline)
             .await
     }
 
     async fn resolve_quota_target(
         &self,
-        params: &Value,
-        principal: &Principal,
+        request: HarnessQuotaRequest,
         deadline: Instant,
     ) -> Result<(String, Option<Value>, String)> {
-        require_owner(principal)?;
-        let request: eliot_core::api::HarnessQuotaRequest =
-            eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let harness = request.harness.trim().to_owned();
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
@@ -766,37 +757,19 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         let deadline = Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
-        self.models_catalog_until(
-            params,
-            principal,
-            deadline,
-            Self::harness_inventory(deadline),
-            |params| async move {
-                self.harness_models_until(&params, principal, deadline)
-                    .await
-            },
-            |params| async move { self.harness_quota_until(&params, principal, deadline).await },
-        )
-        .await
-    }
-
-    async fn models_catalog_until<ModelsRead, QuotaRead>(
-        &self,
-        params: &Value,
-        principal: &Principal,
-        deadline: Instant,
-        inventory: impl Future<Output = Result<Value>> + Send,
-        read_models: impl Fn(Value) -> ModelsRead + Send,
-        read_quota: impl Fn(Value) -> QuotaRead + Send,
-    ) -> Result<Value>
-    where
-        ModelsRead: Future<Output = Result<Value>> + Send,
-        QuotaRead: Future<Output = Result<catalog::ScopedQuota>> + Send,
-    {
-        use eliot_core::api::{ModelsCatalogEntry, ModelsCatalogFailure, ModelsCatalogRequest};
         require_owner(principal)?;
         let request: ModelsCatalogRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
+        let response = self.models_catalog_until(&request, deadline).await?;
+        serde_json::to_value(response)
+            .map_err(|_| Error::new("internal", "unified catalogue could not be encoded"))
+    }
+
+    async fn models_catalog_until(
+        &self,
+        request: &ModelsCatalogRequest,
+        deadline: Instant,
+    ) -> Result<ModelsCatalogResponse> {
         request.validate()?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
@@ -818,11 +791,7 @@ impl Router {
                 .await
                 .map_err(|_| crate::adhoc::discovery_timeout())?;
         // Harness inventory with versions for the aggregate key.
-        let harnesses_value = inventory.await?;
-        let harnesses_response: eliot_core::api::HarnessListResponse =
-            serde_json::from_value(harnesses_value)
-                .map_err(|_| Error::new("internal", "harness list could not be decoded"))?;
-        let harnesses = harnesses_response.harnesses;
+        let harnesses = Self::harness_inventory(deadline).await?.harnesses;
         let key = catalog::aggregate_key(&harnesses);
         let now = now_ms();
         if let Some(hit) =
@@ -832,7 +801,7 @@ impl Router {
                 .get_aggregate(&key, now, after.is_some())
         {
             return Self::catalog_page(
-                &request,
+                request,
                 &hit.harnesses,
                 &hit.models,
                 &hit.failures,
@@ -890,13 +859,21 @@ impl Router {
             }
             // Reuse the per-scope cached `harness.models` path so one live
             // native read serves every caller until its TTL lapses.
-            let params = json!({"harness": harness});
+            let models_request = HarnessModelsRequest {
+                harness: harness.to_owned(),
+                profile: None,
+                agent: None,
+                workspace: None,
+            };
             // A slow read past the request deadline fails open into the
             // partial aggregate instead of holding the coalescing lock.
-            let models_read =
-                tokio::time::timeout_at(discovery_deadline, read_models(params.clone())).await;
+            let models_read = tokio::time::timeout_at(
+                discovery_deadline,
+                self.harness_models_until(models_request, deadline),
+            )
+            .await;
             let ad_hoc_response = match models_read {
-                Ok(Ok(value)) => Some(value),
+                Ok(Ok(response)) => Some(response),
                 Ok(Err(error)) => {
                     // The aggregate names the failed harness with its typed
                     // error instead of silently listing no models for it.
@@ -922,19 +899,24 @@ impl Router {
                 }
             };
             let mut ad_hoc_quota_for_cache: Option<catalog::ScopedQuota> = None;
-            if let Some(response_value) = ad_hoc_response {
-                let response: eliot_core::api::HarnessModelsResponse =
-                    serde_json::from_value(response_value).map_err(|_| {
-                        Error::new("internal", "harness models could not be decoded")
-                    })?;
+            if let Some(response) = ad_hoc_response {
                 let held = held_harness(harness);
                 let quota = if response.credential == "auth:available" {
                     None
                 } else {
-                    tokio::time::timeout_at(discovery_deadline, read_quota(params))
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
+                    tokio::time::timeout_at(
+                        discovery_deadline,
+                        self.harness_quota_until(
+                            HarnessQuotaRequest {
+                                harness: harness.to_owned(),
+                                profile: None,
+                            },
+                            deadline,
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
                 };
                 for model in response.models {
                     models.push(catalog::catalog_entry(
@@ -970,11 +952,19 @@ impl Router {
                         break;
                     }
                     attempted += 1;
-                    let scoped = json!({"harness": harness, "profile": name});
-                    let scoped_read =
-                        tokio::time::timeout_at(discovery_deadline, read_models(scoped)).await;
-                    let scoped_value = match scoped_read {
-                        Ok(Ok(value)) => value,
+                    let scoped = HarnessModelsRequest {
+                        harness: harness.to_owned(),
+                        profile: Some(name.clone()),
+                        agent: None,
+                        workspace: None,
+                    };
+                    let scoped_read = tokio::time::timeout_at(
+                        discovery_deadline,
+                        self.harness_models_until(scoped, deadline),
+                    )
+                    .await;
+                    let scoped_response = match scoped_read {
+                        Ok(Ok(response)) => response,
                         Ok(Err(_)) => {
                             preview_failed.push(name.clone());
                             continue;
@@ -984,16 +974,6 @@ impl Router {
                                 "catalogue discovery budget elapsed; profile preview incomplete ({attempted} of {total} named profiles)"
                             ));
                             break;
-                        }
-                    };
-                    let scoped_response = match serde_json::from_value::<
-                        eliot_core::api::HarnessModelsResponse,
-                    >(scoped_value)
-                    {
-                        Ok(response) => response,
-                        Err(_) => {
-                            preview_failed.push(name.clone());
-                            continue;
                         }
                     };
                     let configured = self
@@ -1073,7 +1053,7 @@ impl Router {
                 ttl_ms,
             });
         Self::catalog_page(
-            &request,
+            request,
             &harnesses,
             &models,
             &failures,
@@ -1099,25 +1079,15 @@ impl Router {
         after: Option<&str>,
         fetched_at_ms: i64,
         ttl_ms: u64,
-    ) -> Result<Value> {
-        use eliot_core::api::{ModelsCatalogResponse, catalog_matches};
+    ) -> Result<ModelsCatalogResponse> {
+        use eliot_core::api::catalog_matches;
+        // The aggregate is sorted once before caching; filtering preserves the
+        // same order for every page and continuation cursor.
         let mut filtered: Vec<eliot_core::api::ModelsCatalogEntry> = models
             .iter()
             .filter(|entry| catalog_matches(entry, query))
             .cloned()
             .collect();
-        filtered.sort_by(|left, right| {
-            (
-                left.harness.as_str(),
-                left.id.as_str(),
-                left.profile.as_deref(),
-            )
-                .cmp(&(
-                    right.harness.as_str(),
-                    right.id.as_str(),
-                    right.profile.as_deref(),
-                ))
-        });
         let start = match after {
             None => 0,
             Some(cursor) => filtered
@@ -1147,8 +1117,7 @@ impl Router {
             failures: failures.to_owned(),
         };
         request.validate_response(&response)?;
-        serde_json::to_value(response)
-            .map_err(|_| Error::new("internal", "unified catalogue could not be encoded"))
+        Ok(response)
     }
 }
 
