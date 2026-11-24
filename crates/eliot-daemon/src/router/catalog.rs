@@ -162,31 +162,16 @@ impl Router {
                     "harness does not match the selected profile",
                 ));
             }
-            let cmd = snapshot["cmd"].as_str();
-            let resolve = crate::adhoc::resolve_profile_command_until(name, harness, cmd, deadline);
-            let candidate = if quota {
-                resolve.await?
-            } else {
-                self.catalog_discovery(
-                    harness,
-                    CatalogDiscoverySource::Profile(name.to_owned(), cmd.map(str::to_owned)),
-                    deadline,
-                    resolve,
-                )
-                .await?
-            };
+            let candidate = self
+                .catalog_profile_command(name, harness, snapshot["cmd"].as_str(), deadline)
+                .await?;
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
             return Ok((Some(snapshot), name.to_owned(), None));
         }
         let (cmd, discovered) = if !quota && crate::adhoc::has_ranked_install_candidates(harness) {
             let resolve = crate::adhoc::ranked_reader_executable(harness, deadline);
             match self
-                .catalog_discovery(
-                    harness,
-                    CatalogDiscoverySource::Installed,
-                    deadline,
-                    resolve,
-                )
+                .catalog_discovery(harness, CatalogDiscoverySource::Ranked, deadline, resolve)
                 .await
             {
                 Ok(candidate) => (Some(candidate.cmd.clone()), Some(candidate)),
@@ -199,18 +184,14 @@ impl Router {
                 Err(error) => return Err(error),
             }
         } else {
-            let resolve = crate::adhoc::discover_cmd_until(harness, deadline);
-            let cmd = if quota {
-                resolve.await?
-            } else {
-                self.catalog_discovery(
+            let cmd = self
+                .catalog_discovery(
                     harness,
                     CatalogDiscoverySource::Installed,
                     deadline,
-                    resolve,
+                    crate::adhoc::discover_cmd_until(harness, deadline),
                 )
-                .await?
-            };
+                .await?;
             (cmd, None)
         };
         let mut snapshot = crate::adhoc::adhoc_snapshot(
@@ -237,6 +218,22 @@ impl Router {
         Ok((Some(snapshot), "adhoc".to_owned(), discovered))
     }
 
+    async fn catalog_profile_command(
+        &self,
+        label: &str,
+        harness: &str,
+        cmd: Option<&str>,
+        deadline: Instant,
+    ) -> Result<HarnessCandidate> {
+        self.catalog_discovery(
+            harness,
+            CatalogDiscoverySource::Profile(label.to_owned(), cmd.map(str::to_owned)),
+            deadline,
+            crate::adhoc::resolve_profile_command_until(label, harness, cmd, deadline),
+        )
+        .await
+    }
+
     /// Key the cooldown before resolving the executable, including failures
     /// for which no executable fingerprint can be constructed.
     async fn catalog_discovery<T>(
@@ -261,6 +258,12 @@ impl Router {
             return Err(failure.error.clone());
         }
         let result = discover.await;
+        if result
+            .as_ref()
+            .is_err_and(|error| crate::adhoc::caller_discovery_timed_out(error, deadline))
+        {
+            return result;
+        }
         *failure = result
             .as_ref()
             .err()
@@ -547,7 +550,9 @@ impl Router {
                 let mut response = catalog::native_models_response(
                     &harness, &cmd, scope, credential, provenance, &raw,
                 )?;
-                if !login_tracked {
+                if source == "workspace" {
+                    response.ttl_ms = WORKSPACE_MODEL_TTL_MS;
+                } else if !login_tracked {
                     response.ttl_ms = UNTRACKED_LOGIN_TTL_MS;
                 }
                 response.validate()?;
@@ -623,17 +628,6 @@ impl Router {
             let result = match cache.model_reads.get(&key).and_then(ModelRead::in_flight) {
                 Some(in_flight) => in_flight,
                 None => {
-                    if cache
-                        .model_reads
-                        .get(&key)
-                        .and_then(|read| read.suppress_until)
-                        .is_some_and(|until| Instant::now() < until)
-                    {
-                        return Err(Error::new(
-                            "busy",
-                            "workspace model catalogue was just read; retry after its 30-second read interval",
-                        ));
-                    }
                     if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                         return Err(catalog_shutting_down());
                     }
@@ -649,7 +643,6 @@ impl Router {
                         ModelRead {
                             running: Some(result.clone()),
                             failure: failure.clone(),
-                            suppress_until: None,
                         },
                     );
                     let router = self.clone();
@@ -674,23 +667,8 @@ impl Router {
                             return;
                         }
                         if let Ok(response) = &result {
-                            if key.workspace.is_some() {
-                                // Workspace-local settings are mutable and do not have a
-                                // verified identity. Only current waiters share this result.
-                                cache.model_reads.insert(
-                                    key,
-                                    ModelRead {
-                                        running: None,
-                                        failure: None,
-                                        suppress_until: Some(
-                                            Instant::now() + DISCOVERY_RETRY_INTERVAL,
-                                        ),
-                                    },
-                                );
-                            } else {
-                                cache.insert_models(key.clone(), response.clone());
-                                cache.model_reads.remove(&key);
-                            }
+                            cache.insert_models(key.clone(), response.clone());
+                            cache.model_reads.remove(&key);
                         } else if let Err(error) = &result {
                             cache.model_reads.insert(
                                 key,
@@ -700,7 +678,6 @@ impl Router {
                                         failure.as_ref(),
                                         error.clone(),
                                     )),
-                                    suppress_until: None,
                                 },
                             );
                         }
@@ -875,13 +852,9 @@ impl Router {
             });
         }
         if HarnessCapabilities::of(&harness).reader_executable_discovery {
-            let candidate = crate::adhoc::resolve_profile_command_until(
-                &label,
-                &harness,
-                profile["cmd"].as_str(),
-                deadline,
-            )
-            .await?;
+            let candidate = self
+                .catalog_profile_command(&label, &harness, profile["cmd"].as_str(), deadline)
+                .await?;
             crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
         let retained_quota = HarnessCapabilities::of(&harness).retained_quota;
@@ -1160,6 +1133,7 @@ impl Router {
         let router = self.clone();
         crate::adhoc::blocking_discovery(deadline, move || {
             let root = &router.inner.data_root;
+            let stand_codex_home = router.inner.stand_codex_home.as_deref();
             let auth_revision = router.inner.catalog_cache.lock_recover().auth_revision;
             let settings_revision = crate::config::settings::current_revision(root)?;
             let installations = SUPPORTED_HARNESSES
@@ -1184,7 +1158,7 @@ impl Router {
                         )
                         .ok()
                     })
-                    .and_then(|snapshot| catalog_source_scope("adhoc", snapshot));
+                    .and_then(|snapshot| catalog_source_scope("adhoc", snapshot, stand_codex_home));
                 adhoc.push(scope);
                 if HarnessCapabilities::of(harness).models_preview_auth_integrations {
                     previews.extend(
@@ -1198,8 +1172,9 @@ impl Router {
                                         harness,
                                     )
                                 });
-                                let scope = snapshot
-                                    .and_then(|snapshot| catalog_source_scope(&name, snapshot));
+                                let scope = snapshot.and_then(|snapshot| {
+                                    catalog_source_scope(&name, snapshot, stand_codex_home)
+                                });
                                 PreviewSource {
                                     name,
                                     scope,
@@ -1563,6 +1538,7 @@ const CATALOG_REFRESH_LEAD_MS: u64 = 105_000;
 /// Serve cached catalogue/quota entries for this long after the native read.
 pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 const UNTRACKED_LOGIN_TTL_MS: u64 = 90_000;
+const WORKSPACE_MODEL_TTL_MS: u64 = 30_000;
 
 const PARTIAL_AGGREGATE_TTL_MS: u64 = DISCOVERY_RETRY_INTERVAL.as_millis() as u64;
 
@@ -1614,9 +1590,12 @@ fn apply_source_age(
     }
 }
 
-fn catalog_source_scope(label: &str, mut snapshot: Value) -> Option<ModelSourceIdentity> {
-    crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))
-        .ok()?;
+fn catalog_source_scope(
+    label: &str,
+    mut snapshot: Value,
+    stand_codex_home: Option<&std::path::Path>,
+) -> Option<ModelSourceIdentity> {
+    crate::config::capture_native_store_inputs(&mut snapshot, stand_codex_home).ok()?;
     let route = crate::router::plugin_host::metadata_route(&snapshot).ok()?;
     model_source_identity(
         label,
@@ -1970,6 +1949,7 @@ pub(crate) struct CatalogCache {
 #[derive(Hash, PartialEq, Eq)]
 enum CatalogDiscoverySource {
     Installed,
+    Ranked,
     Profile(String, Option<String>),
     Reader(String),
 }
@@ -1981,7 +1961,6 @@ pub(super) type AggregateUpdate = Option<Result<Arc<CachedAggregate>>>;
 struct ModelRead {
     running: Option<watch::Receiver<Option<Result<HarnessModelsResponse>>>>,
     failure: Option<DiscoveryFailure>,
-    suppress_until: Option<Instant>,
 }
 
 impl ModelRead {
@@ -2144,9 +2123,6 @@ impl CatalogCache {
             .iter()
             .filter(|(_, read)| {
                 read.in_flight().is_none()
-                    && read
-                        .suppress_until
-                        .is_none_or(|until| Instant::now() >= until)
                     && read
                         .failure
                         .as_ref()

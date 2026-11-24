@@ -2416,8 +2416,10 @@ recently requested catalogues it refreshes before expiry. Each page carries
 the settled revision. The open desktop picker watches for a new revision and
 loads it while keeping the current rows visible. Whole-aggregate failures,
 native reader failures and executable discovery failures back off from 30 seconds
-up to 15 minutes. A whole-aggregate cooldown also gates settings and inventory
-checks. Background work stops after five
+up to 15 minutes. Executable discovery shares this cooldown with quota reads.
+A caller's elapsed discovery deadline does not add to that cooldown. On the
+unified catalogue path, a whole-aggregate cooldown also defers its settings
+and inventory checks. Background work stops after five
 minutes without demand and discovery admission closes at shutdown.
 An expired snapshot for the same key may be served with `stale = true`.
 The aggregate can retain last-good rows for an unavailable source and reports
@@ -2485,9 +2487,8 @@ the Windows Antigravity keyring revision and resolved Swarm sign-in reports
 invalidate old catalogue results. A source whose login revision cannot be
 observed has a hard 90-second freshness limit for both direct and aggregate
 reads. Concurrent previews of the same verified source and canonical
-workspace share their in-flight read. After a successful workspace preview,
-the same key returns `busy` for 30 seconds. Workspace-specific results live
-only for the callers waiting on that read. Unverified sources return
+workspace share their in-flight read. Later requests for that source and
+workspace reuse the result for up to 30 seconds. Unverified sources return
 `unavailable` or documented aliases without starting a model reader. Exact
 live session catalogue reads continue to use the owned generation.
 Public `scope` names the profile and route without

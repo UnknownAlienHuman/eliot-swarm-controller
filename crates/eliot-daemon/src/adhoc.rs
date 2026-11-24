@@ -56,6 +56,10 @@ pub(crate) fn discovery_timeout() -> core::Error {
     core::Error::new("timeout", "native discovery deadline elapsed")
 }
 
+pub(crate) fn caller_discovery_timed_out(error: &core::Error, deadline: Instant) -> bool {
+    error.code == "timeout" && Instant::now() >= deadline
+}
+
 fn discovery_remaining(deadline: Instant) -> core::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -1095,8 +1099,9 @@ fn probe_native_version(
     let result = probe_version_uncached(program, verify, deadline);
     // A caller that used up its own budget should not suppress a later probe.
     // The capability and version commands' own timeouts still back off.
-    let caller_timed_out =
-        Instant::now() >= deadline && result.as_ref().is_err_and(|error| error.code == "timeout");
+    let caller_timed_out = result
+        .as_ref()
+        .is_err_and(|error| caller_discovery_timed_out(error, deadline));
     version_inflight_finish(key, &leader, result.clone(), caller_timed_out);
     result
 }
