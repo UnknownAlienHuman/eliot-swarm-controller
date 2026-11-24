@@ -1408,6 +1408,11 @@ selector admitted at native session readiness. A turn stores the selector
 from its bound revision as `effective_model`. The Agent shows that selector
 with `model_verified: false` when the provider gives no independent model
 evidence. An explicit mismatch clears the turn's effective model.
+For an older turn with no stored model, Store fills the selector once when
+the exact native start is retained, the selector is recoverable from that
+generation and revision, and the journal contains no mismatch for that turn.
+This applies at revision 0 and across running and terminal states. A missing
+start or selector leaves `effective_model` absent.
 
 A `resume` starts its new generation by explicitly inheriting the previous
 generation's latest overlay as its own revision 1 with provenance

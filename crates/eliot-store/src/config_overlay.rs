@@ -176,21 +176,6 @@ impl Store {
     pub fn fill_turn_readback(&self, agent: &Agent, turn: &mut Turn) -> Result<()> {
         turn.config = self.turn_config_view(agent, turn)?;
         let capabilities = eliot_core::api::HarnessCapabilities::of(&agent.harness);
-        if capabilities.provider_response_model_verification
-            && turn.effective_model.is_none()
-            && turn.config_revision > 0
-            && turn.outcome == Some(TurnOutcome::Success)
-            && turn.resolution_source.is_none()
-        {
-            // Older successful turns did not persist the overlay selector.
-            // A mismatch clears the persisted field and never succeeds.
-            turn.effective_model = retained_provider_selector(
-                &self.connection,
-                agent,
-                turn.generation,
-                turn.config_revision,
-            )?;
-        }
         if capabilities.backfill_failed_turn_readback && turn.outcome == Some(TurnOutcome::Failure)
         {
             // Older rows predate the retained failure fields. Recover the
