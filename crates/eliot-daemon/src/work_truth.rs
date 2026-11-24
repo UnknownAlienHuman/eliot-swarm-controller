@@ -30,7 +30,8 @@ use tokio::time::Instant;
 
 mod restore;
 pub(crate) use restore::{
-    CheckpointRestoreWriter, restore_checkpoint, restore_writer_closed, stop_restore_writer,
+    CheckpointRestoreWriter, observe_restore_writer, restore_checkpoint, restore_writer_closed,
+    stop_restore_writer,
 };
 mod task_inputs;
 pub(crate) use task_inputs::{read_handoff_task, record_task_inputs};

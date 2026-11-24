@@ -91,6 +91,44 @@ pub struct CheckpointRestoreIntent {
     pub writer_identity: Option<core::ProcessIdentity>,
 }
 
+#[derive(Deserialize, Serialize)]
+pub struct CheckpointRestoreWriterObservation {
+    pub state: core::ProcessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<core::ProcessIdentity>,
+}
+
+#[derive(Deserialize)]
+struct CheckpointRestoreFailure {
+    #[serde(flatten)]
+    error: Error,
+    #[serde(default)]
+    writer_at_abandonment: Option<CheckpointRestoreWriterObservation>,
+}
+
+impl CheckpointRestoreFailure {
+    fn into_error(mut self) -> Error {
+        if let Some(writer) = self.writer_at_abandonment {
+            let state = match writer.state {
+                core::ProcessState::Running => "running",
+                core::ProcessState::Exited => "exited",
+                core::ProcessState::Unknown => "unverified",
+            };
+            let mut message = format!("restore reservation abandoned with writer state {state}");
+            if let Some(identity) = writer.identity {
+                message.push_str(&format!(
+                    " (PID {}, start time {})",
+                    identity.pid, identity.start_time,
+                ));
+            }
+            message.push_str(". ");
+            message.push_str(&self.error.message);
+            self.error.message = Box::new(message);
+        }
+        self.error
+    }
+}
+
 pub(super) fn require_no_checkpoint_restore(conn: &Connection, workspace: &str) -> Result<()> {
     if checkpoint_restore_overlaps(conn, workspace)? {
         return Err(Error::new(
@@ -184,14 +222,18 @@ fn checkpoint_restore_receipt(
             "checkpoint restore id is already bound",
         ));
     }
-    let outcome: Option<Result<CheckpointRestoreResponse>> = serde_json::from_str(&saved)
-        .map_err(|_| Error::new("source_integrity", "checkpoint restore receipt is invalid"))?;
-    Ok(Some(outcome.unwrap_or_else(|| {
-        Err(Error::new(
-            "unknown",
-            "checkpoint restore effect has no retained outcome",
-        ))
-    })))
+    let outcome: Option<std::result::Result<CheckpointRestoreResponse, CheckpointRestoreFailure>> =
+        serde_json::from_str(&saved)
+            .map_err(|_| Error::new("source_integrity", "checkpoint restore receipt is invalid"))?;
+    Ok(Some(outcome.map_or_else(
+        || {
+            Err(Error::new(
+                "unknown",
+                "checkpoint restore effect has no retained outcome",
+            ))
+        },
+        |outcome| outcome.map_err(CheckpointRestoreFailure::into_error),
+    )))
 }
 
 fn require_restore_intent_update(changed: rusqlite::Result<usize>) -> Result<()> {
@@ -216,6 +258,13 @@ fn settle_restore_receipt(
     )
     .map_err(sql_error)?;
     Ok(())
+}
+
+fn interrupted_restore() -> Error {
+    Error::new(
+        "unknown",
+        "checkpoint restore was interrupted; inspect the worktree",
+    )
 }
 
 /// What the next checkpoint of a generation starts from.
@@ -678,14 +727,7 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             }
-            settle_restore_receipt(
-                &tx,
-                id,
-                &Err(Error::new(
-                    "unknown",
-                    "checkpoint restore was interrupted; inspect the worktree",
-                )),
-            )?;
+            settle_restore_receipt(&tx, id, &Err(interrupted_restore()))?;
             commit_transaction(tx, &self.write_faulted)
         })();
         self.fault_on_persistence_error(&result);
@@ -697,10 +739,10 @@ impl Store {
         action_id: &str,
         restore_id: &str,
         writer_closed: bool,
-        abandon_reason: Option<&str>,
+        abandon: Option<(&str, CheckpointRestoreWriterObservation)>,
         now: i64,
     ) -> Result<Value> {
-        let method = if abandon_reason.is_some() {
+        let method = if abandon.is_some() {
             "checkpoint.restore.abandon"
         } else {
             "checkpoint.restore.release"
@@ -708,7 +750,7 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let mut payload = json!({"restore_id": restore_id});
-            if let Some(reason) = abandon_reason {
+            if let Some((reason, _)) = &abandon {
                 require_nonempty(reason, "restore abandonment reason")?;
                 if reason.len() > 1024 {
                     return Err(Error::new(
@@ -741,17 +783,25 @@ impl Store {
                     "restore release id is already bound",
                 ));
             }
-            if !writer_closed && abandon_reason.is_none() {
+            if !writer_closed && abandon.is_none() {
                 return Err(Error::new(
                     "busy",
                     "checkpoint restore writer exit is unproven",
                 ));
             }
+            // An already authorized abandonment can settle an interrupted
+            // restore whose original receipt has no outcome yet.
+            if abandon.is_some() {
+                settle_restore_receipt(&tx, restore_id, &Err(interrupted_restore()))?;
+            }
             let released = tx
                 .execute(
                     "DELETE FROM checkpoint_restore_intents WHERE id = ?1
-                 AND EXISTS (SELECT 1 FROM writes WHERE id = ?1 AND result <> 'null')",
-                    [restore_id],
+                     AND EXISTS (
+                         SELECT 1 FROM writes
+                         WHERE id = ?1 AND principal = 'owner' AND method = ?2 AND result <> 'null'
+                     )",
+                    params![restore_id, CHECKPOINT_RESTORE],
                 )
                 .map_err(sql_error)?;
             if released != 1 {
@@ -761,9 +811,25 @@ impl Store {
                 ));
             }
             let mut response = json!({"restore_id": restore_id, "released": true});
-            if let Some(reason) = abandon_reason {
+            if let Some((reason, writer)) = abandon {
+                let writer = serde_json::to_value(writer).map_err(|_| {
+                    Error::new("internal", "cannot encode restore writer observation")
+                })?;
+                let updated = tx.execute(
+                    "UPDATE writes SET result = json_set(result, '$.Err.writer_at_abandonment', json(?2))
+                     WHERE id = ?1 AND principal = 'owner' AND method = ?3
+                        AND json_type(result, '$.Err') = 'object'",
+                    params![restore_id, encode_json(&writer)?, CHECKPOINT_RESTORE],
+                ).map_err(sql_error)?;
+                if updated != 1 {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "checkpoint restore has no retained failure",
+                    ));
+                }
                 response["abandoned"] = json!(true);
                 response["reason"] = json!(reason);
+                response["writer_at_abandonment"] = writer;
             }
             coordination::retain_write_tx(
                 &tx, action_id, "owner", method, &digest, &response, now,

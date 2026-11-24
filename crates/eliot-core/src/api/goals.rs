@@ -588,7 +588,7 @@ impl GoalCounters {
 pub struct GoalScopeCheckIdentity {
     /// Version of the retained checker-path identity contract.
     pub version: u8,
-    /// Non-flag argv paths and their resolution state at baseline capture.
+    /// Checker paths and their resolution state at baseline capture.
     pub files: Vec<GoalScopeCheckFile>,
     /// The interpreter's entry point could not be identified safely.
     #[serde(default)]
@@ -631,8 +631,8 @@ pub struct GoalScopeBase {
     /// Resolved workspace targets shown by the legacy Goal view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_files: Vec<String>,
-    /// Versioned path identity snapshot. Missing means this is a legacy
-    /// baseline that cannot safely prove checker identity.
+    /// Versioned path identity snapshot. Legacy baselines without an identity
+    /// use their recorded workspace targets and declared check inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_identity: Option<GoalScopeCheckIdentity>,
 }

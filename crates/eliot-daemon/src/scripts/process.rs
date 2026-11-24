@@ -376,7 +376,7 @@ async fn run_owned_process_inner(
     let observer: Option<CustodyObserver> = None;
     #[cfg(target_os = "linux")]
     if let Some(lease) = &lease
-        && let Some(identity) = child.integration_root_identity()
+        && let Some(identity) = child.linux_root_identity()
         && lease.record_process(&identity).await.is_err()
     {
         let quiescent = terminate_and_wait(&mut child, observer.as_ref()).await;
