@@ -678,7 +678,7 @@ fn normalize_live_event(
             // the sole (fallback) evidence for a provider hold on this path.
             if !aborted
                 && let Some(evidence) =
-                    super::native::types::response_withheld_evidence_from_message(message)
+                    crate::native::types::response_withheld_evidence_from_message(message)
             {
                 data["provider_response_withheld"] = Value::Bool(true);
                 data["provider_response_withheld_evidence"] = json!(evidence);
@@ -1400,7 +1400,7 @@ fn project_line(
                     .payload
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .and_then(super::native::types::response_withheld_evidence_from_message);
+                    .and_then(crate::native::types::response_withheld_evidence_from_message);
                 let mut entry = json!({
                     "turn_id": turn_id,
                     "status": if line.payload.get("error").is_some_and(|error| !error.is_null()) {"failed"} else {"completed"},
