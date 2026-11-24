@@ -471,7 +471,7 @@ pub enum StoreOpenPhase {
 
 enum ReceiptWrite<'a> {
     Ordinary(&'a str),
-    SealedRestart,
+    SealedRestart(&'a [(String, i64)]),
 }
 
 impl Store {
@@ -1057,7 +1057,6 @@ impl Store {
             semantic_payload,
             result,
             now,
-            &[],
         );
         self.fault_on_persistence_error(&outcome);
         outcome.map(|(admission, _)| admission)
@@ -1078,11 +1077,10 @@ impl Store {
         let outcome = self.record_write_inner(
             id,
             principal,
-            ReceiptWrite::SealedRestart,
+            ReceiptWrite::SealedRestart(native_sources),
             semantic_payload,
             result,
             now,
-            native_sources,
         );
         self.fault_on_persistence_error(&outcome);
         outcome
@@ -1096,11 +1094,12 @@ impl Store {
         semantic_payload: &Value,
         result: &Value,
         now: i64,
-        native_sources: &[(String, i64)],
     ) -> Result<(WriteAdmission, Vec<Event>)> {
-        let (method, seal) = match intent {
-            ReceiptWrite::Ordinary(method) => (method, false),
-            ReceiptWrite::SealedRestart => ("daemon.shutdown", true),
+        let (method, seal, native_sources) = match intent {
+            ReceiptWrite::Ordinary(method) => (method, false, &[][..]),
+            ReceiptWrite::SealedRestart(native_sources) => {
+                ("daemon.shutdown", true, native_sources)
+            }
         };
         require_nonempty(principal, "principal")?;
         require_nonempty(method, "method")?;

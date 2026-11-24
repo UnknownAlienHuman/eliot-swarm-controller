@@ -6881,10 +6881,6 @@ impl Router {
                 now_ms(),
                 &self.inner.plugin_host.live_source_generations(),
             )
-        } else if request.backup {
-            store
-                .record_restart_and_seal(&request.id, &owner, &payload, &result, now_ms(), &[])
-                .map(|admission| (admission.0, Vec::new()))
         } else {
             store
                 .record_write(
