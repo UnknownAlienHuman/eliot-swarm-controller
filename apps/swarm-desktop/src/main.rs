@@ -32,6 +32,8 @@ mod configure;
 #[cfg(windows)]
 mod file_dialog;
 #[cfg(windows)]
+mod fonts;
+#[cfg(windows)]
 mod m3;
 #[cfg(windows)]
 mod monitor_view;

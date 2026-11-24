@@ -94,7 +94,6 @@ fn layer(color: Rgb8, opacity: f64) -> Value {
     Value::Brush(color, alpha(opacity))
 }
 
-/// A brush WinUI draws as nothing.
 /// A brand-book color token (`0xAARRGGBB`) without its alpha.
 fn rgb(argb: u32) -> Rgb8 {
     Rgb8::new((argb >> 16) as u8, (argb >> 8) as u8, argb as u8)
@@ -111,6 +110,7 @@ fn edge(s: &Roles) -> Value {
     }
 }
 
+/// A brush WinUI draws as nothing.
 fn clear(s: &Roles) -> Value {
     Value::Brush(s.surface, 0)
 }
@@ -954,7 +954,7 @@ pub fn styles_xaml() -> String {
     let font = format!(
         "<Setter Property=\"FontFamily\" Value=\"{}\"/>\
          <Setter Property=\"FontSize\" Value=\"{}\"/>",
-        text::FAMILY,
+        crate::fonts::families().text,
         text::BODY.size,
     );
     let min_height = format!("<Setter Property=\"MinHeight\" Value=\"{min}\"/>");
@@ -1117,7 +1117,7 @@ pub fn styles_xaml() -> String {
            </Setter.Value></Setter>\
          </Style>\
          </ResourceDictionary>",
-        family = text::FAMILY,
+        family = crate::fonts::families().text,
         font_size = text::BODY.size,
         switch_width = layout::SWITCH_WIDTH,
         combo_box = templates::combo_box(),
@@ -1155,7 +1155,27 @@ fn native(work: impl FnOnce(&OwnEntries) -> windows_core::Result<()>) -> Result<
     run().map_err(|error| format!("{error} ({:#010X})", error.code().0))
 }
 
+/// The icon font for a scheme: Eliot Symbols at grade -25 on dark themes,
+/// grade 0 otherwise (and under High Contrast). WinUI's `FontIcon` does
+/// not read `SymbolThemeFontFamily` from the application's own entries
+/// (observed live), so an implicit `FontIcon` style sets the family; the
+/// key still serves the templates that name it (the combo box chevron).
+fn symbols_xaml(scheme: Option<&Roles>) -> String {
+    let fonts = crate::fonts::families();
+    let family = match scheme {
+        Some(scheme) if scheme.dark => &fonts.symbols_dark,
+        _ => &fonts.symbols,
+    };
+    format!(
+        "{XAML_ROOT}\
+         <FontFamily x:Key=\"SymbolThemeFontFamily\">{family}</FontFamily>\
+         <Style TargetType=\"FontIcon\"><Setter Property=\"FontFamily\" Value=\"{family}\"/></Style>\
+         </ResourceDictionary>"
+    )
+}
+
 fn write_scheme(own: &OwnEntries, scheme: Option<&Roles>) -> windows_core::Result<()> {
+    insert_parsed(own, &symbols_xaml(scheme))?;
     match scheme {
         Some(scheme) => insert_parsed(own, &dictionary_xaml(scheme)),
         None => {

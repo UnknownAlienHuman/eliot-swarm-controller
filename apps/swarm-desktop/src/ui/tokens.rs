@@ -74,13 +74,10 @@ pub mod height {
     pub const SUGGESTION: f64 = brand::SIZE_NEW_TASK;
 }
 
-/// The type roles, from Google's Material 3 type scale in the brand book.
-/// Segoe UI Variable is the Windows fallback until the shipped Roboto
-/// files load.
+/// The type roles, from Google's Material 3 type scale in the brand book,
+/// set in Roboto (`crate::fonts`).
 pub mod text {
     use super::brand;
-
-    pub const FAMILY: &str = "Segoe UI Variable";
 
     pub use brand::TypeStyle;
 
