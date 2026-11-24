@@ -2931,6 +2931,14 @@ impl Router {
                     CommandState::Applied => return Ok(0),
                     CommandState::Unknown => return Err(unknown()),
                     state if state.is_terminal() => {
+                        if state == CommandState::Failed
+                            && command
+                                .outcome
+                                .as_ref()
+                                .is_some_and(eliot_store::Store::worktree_failure_may_have_effect)
+                        {
+                            return Err(unknown());
+                        }
                         let refusal = command
                             .outcome
                             .as_ref()

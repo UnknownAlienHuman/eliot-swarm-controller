@@ -53,6 +53,21 @@ impl Store {
             let mut events = Vec::new();
             for id in ids {
                 let parent = switch_parent(&tx, &id)?;
+                if parent.state == CommandState::Rejected {
+                    if release_rejected_switch_fence_tx(&tx, &parent, now)? {
+                        events.push(insert_daemon_command_event(
+                            &tx,
+                            now,
+                            "switch.checkout_released",
+                            None,
+                            None,
+                            &parent.id,
+                            json!({"command_id": parent.id, "resolution_source": "restart_custody",
+                                "reason": "Rejected switch reservation recovered.", "state": "rejected"}),
+                        )?);
+                    }
+                    continue;
+                }
                 if let Some(pending) = release_plan(&tx, &parent, false)? {
                     release_tx(&tx, &parent, pending, None, now, &mut events)?;
                 }
@@ -77,6 +92,60 @@ impl Store {
             )
             .map_err(sql_error)
     }
+}
+
+/// Rejected switches never transfer checkout ownership. Recover only the exact
+/// source row retained by the command; a mismatched row remains fenced for
+/// explicit investigation.
+pub(crate) fn release_rejected_switch_fence_tx(
+    tx: &Transaction<'_>,
+    parent: &Command,
+    now: i64,
+) -> Result<bool> {
+    let retained = decode_switch(parent.args.clone())?;
+    let Some(source_key) = retained.source_checkout_key.as_deref() else {
+        return Ok(false);
+    };
+    let source_num = parse_agent_id(&retained.request.from)?;
+    let owner: Option<(i64, i64)> = tx
+        .query_row(
+            "SELECT agent, generation FROM switch_checkout_owners
+             WHERE checkout_key=?1 AND switch_command=?2",
+            params![source_key, parent.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if owner != Some((source_num, retained.request.from_generation)) {
+        return Ok(false);
+    }
+    tx.execute(
+        "UPDATE switch_checkout_owners SET switch_command=NULL, updated_at=?1
+         WHERE checkout_key=?2 AND switch_command=?3 AND agent=?4 AND generation=?5",
+        params![
+            now,
+            source_key,
+            parent.id,
+            source_num,
+            retained.request.from_generation
+        ],
+    )
+    .map_err(sql_error)?;
+    if let Some(target_key) = retained.target_checkout_key.as_deref()
+        && target_key != source_key
+    {
+        tx.execute(
+            "DELETE FROM switch_checkout_owners
+             WHERE checkout_key=?1 AND switch_command=?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM commands WHERE parent_command=?2 AND verb='launch'
+                     AND state IN ('accepted','queued','dispatched','unknown','applied')
+               )",
+            params![target_key, parent.id],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn owner_release_switch_fence_tx(

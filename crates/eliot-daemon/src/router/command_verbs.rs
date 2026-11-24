@@ -1287,6 +1287,19 @@ impl Router {
                 return false;
             }
         }
+        #[cfg(windows)]
+        if agent.state == eliot_core::AgentState::Failed
+            && self
+                .terminal_stop_noop_summary(id, agent, &dispatched)
+                .await
+                .is_none()
+        {
+            let _ = self
+                .inner
+                .plugin_host
+                .prove_failed_generation_exit(agent)
+                .await;
+        }
         if let Some(summary) = self
             .terminal_stop_noop_summary(id, agent, &dispatched)
             .await
@@ -1509,13 +1522,16 @@ impl Router {
                     && command.generation == Some(agent.generation) => {}
             _ => return None,
         }
-        let proof = match store.owned_exit_proof(&agent.id, agent.generation) {
-            Ok(proof) if proof.is_complete() => proof,
-            _ => return None,
-        };
+        let proof = store.owned_exit_proof(&agent.id, agent.generation).ok()?;
+        let failed_basis = store
+            .failed_generation_exit_basis(&agent.id, agent.generation)
+            .ok()?;
+        if !proof.is_complete() && failed_basis.is_none() {
+            return None;
+        }
         Some(json!({
             "state": "applied",
-            "stop_basis": "owned_process_exit",
+            "stop_basis": failed_basis.as_deref().unwrap_or("owned_process_exit"),
             "process_custody_exit_proven": proof.process_custody_exited,
             "native_source_drain_proven": proof.native_source_drained,
             "native_session_end_observed": false,

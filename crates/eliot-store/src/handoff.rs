@@ -1096,6 +1096,10 @@ pub(super) fn session_exit_blocker(tx: &Connection, agent: &Agent) -> Result<Opt
     if let Some(blocker) = agent_lifecycle::custody_blocker_tx(tx, num, false, None)? {
         return Ok(Some(blocker));
     }
+    if super::failed_custody::failed_generation_exit_basis_tx(tx, num, agent.generation)?.is_some()
+    {
+        return Ok(None);
+    }
     let proof = capacity::owned_exit_proof_tx(tx, num, agent.generation)?;
     if proof.is_complete() {
         return Ok(None);

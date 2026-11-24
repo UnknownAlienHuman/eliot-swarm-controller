@@ -943,6 +943,12 @@ fn subtree_members_tx(connection: &Connection, root: &str) -> Result<(Vec<Subtre
                       AND t.turn_id = c.turn_id AND t.state IN ('running', 'unknown')
                 ),
                 (EXISTS(SELECT 1 FROM workspaces w WHERE w.start_command_id = c.id)
+                  OR (c.verb = 'worktree.remove' AND c.state = 'failed'
+                      AND (json_extract(c.outcome,'$.native_git_write_dispatched') = 1
+                        OR (json_extract(c.outcome,'$.native_git_write_dispatched') IS NULL
+                            AND COALESCE(json_extract(c.outcome,'$.result.code'),
+                                         json_extract(c.outcome,'$.code'))
+                                IN ('platform_io','store_io','source_integrity'))))
                   OR EXISTS(SELECT 1 FROM project_transfers p WHERE p.launch_command = c.id)
                   OR EXISTS(SELECT 1 FROM switch_checkout_owners f
                             WHERE f.switch_command = c.id OR f.switch_command = c.parent_command)

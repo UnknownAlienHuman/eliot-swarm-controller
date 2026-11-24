@@ -155,6 +155,16 @@ pub(super) fn workspace_removal_fence_tx(
                     "applied worktree removal does not match the retained workspace phase",
                 ));
             }
+            CommandState::Failed
+                if command
+                    .command
+                    .outcome
+                    .as_ref()
+                    .is_some_and(worktree_failure_may_have_effect)
+                    || marker.is_some_and(worktree_failure_may_have_effect) =>
+            {
+                return Ok(Some(command_id.to_owned()));
+            }
             CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
                 if matches!(
                     workspace.phase,
@@ -172,7 +182,9 @@ pub(super) fn workspace_removal_fence_tx(
         && !(matches!(
             workspace.phase,
             WorkspacePhase::Ready | WorkspacePhase::Failed
-        ) && marker.is_some_and(|marker| marker["result"]["state"] == "failed"))
+        ) && marker.is_some_and(|marker| {
+            marker["result"]["state"] == "failed" && !worktree_failure_may_have_effect(marker)
+        }))
     {
         // A retained marker can prove a refusal after command pruning.
         // Missing or uncertain settlement stays fenced.
@@ -181,9 +193,9 @@ pub(super) fn workspace_removal_fence_tx(
 
     let mut statement = connection
         .prepare(
-            "SELECT id, generation, args FROM commands
+            "SELECT id, generation, args, state, outcome FROM commands
              WHERE target = ?1 AND verb = 'worktree.remove'
-               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown', 'failed')
              ORDER BY created_at, id",
         )
         .map_err(sql_error)?;
@@ -193,11 +205,22 @@ pub(super) fn workspace_removal_fence_tx(
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(sql_error)?;
     for retained in rows {
-        let (command_id, generation, args) = retained.map_err(sql_error)?;
+        let (command_id, generation, args, state, outcome) = retained.map_err(sql_error)?;
+        if state == "failed" {
+            let outcome = outcome.as_deref().map(decode_json).transpose()?;
+            if !outcome
+                .as_ref()
+                .is_some_and(worktree_failure_may_have_effect)
+            {
+                continue;
+            }
+        }
         let args: Value = serde_json::from_str(&args).map_err(|_| {
             Error::new(
                 "source_integrity",
@@ -231,6 +254,25 @@ pub(super) fn workspace_removal_fence_tx(
     }
 
     Ok(None)
+}
+
+fn worktree_failure_may_have_effect(outcome: &Value) -> bool {
+    let dispatched = outcome
+        .get("native_git_write_dispatched")
+        .and_then(Value::as_bool);
+    let result = outcome.get("result").unwrap_or(outcome);
+    dispatched == Some(true)
+        || (dispatched.is_none()
+            && matches!(
+                result["code"].as_str(),
+                Some("platform_io" | "store_io" | "source_integrity")
+            ))
+}
+
+impl Store {
+    pub fn worktree_failure_may_have_effect(outcome: &Value) -> bool {
+        worktree_failure_may_have_effect(outcome)
+    }
 }
 
 /// Rebind the operational receipt and Git artifacts to the successor's exact

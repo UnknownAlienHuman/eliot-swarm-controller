@@ -151,6 +151,11 @@ generation before failing it, closing unstarted sources and releasing its reserv
 in the same transaction. Errors after a child may have been created retain their
 ordinary uncertainty until owned process exit and reader drain are proven. A conflicting
 existing Job is never adopted or terminated by this failed start.
+Failed generations retain the custody closure basis by Agent and generation.
+The daemon can verify the exact local Windows Job and retained process identities.
+Owner method `agent.custody.resolve` records an explicit assertion for the
+current Failed generation after its native publication authority has closed.
+The assertion is distinguished from an OS-observed exit in the Stop receipt.
 If Store rejects the no-spawn proof, ordinary plugin-error settlement records unknown
 and retains capacity; a concurrent authoritative terminal settlement is preserved.
 A successful no-spawn settlement clears that generation's recorded custody name, so it cannot

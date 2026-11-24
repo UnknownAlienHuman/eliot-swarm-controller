@@ -11,7 +11,10 @@ use super::{Principal, Router, contains_known_secret_including_keys, require_own
 use crate::{common::now_ms, router::SecretSet};
 use eliot_core::{
     Agent, Error, Result,
-    api::{CommandResolveRequest, SettleStoppedRequest, TurnResolveRequest},
+    api::{
+        CommandResolveRequest, FailedCustodyResolveRequest, SettleStoppedRequest,
+        TurnResolveRequest,
+    },
 };
 use eliot_store::TurnInactiveProof;
 use serde::de::DeserializeOwned;
@@ -84,6 +87,31 @@ fn turn_inactive_proof(
 }
 
 impl Router {
+    pub(super) async fn failed_custody_resolve(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        let request = decode_resolve_request(
+            params,
+            principal,
+            &self.inner.secrets,
+            "agent.custody.resolve",
+            "failed custody resolution",
+            FailedCustodyResolveRequest::validate,
+        )?;
+        let change = self
+            .inner
+            .plugin_host
+            .resolve_failed_custody(&request)
+            .await?;
+        self.publish_locked(&change.events);
+        self.signal_progress();
+        self.signal_launch_arbitration();
+        serde_json::to_value(change.value)
+            .map_err(|_| Error::new("internal", "custody resolution could not be encoded"))
+    }
+
     pub(super) async fn command_settle_stopped(
         &self,
         params: &Value,

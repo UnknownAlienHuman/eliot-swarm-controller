@@ -8,6 +8,7 @@ mod autonomy;
 mod canonical;
 mod capacity;
 mod control_failures;
+mod failed_custody;
 mod launch_queue;
 mod launch_refusal;
 mod launch_result;

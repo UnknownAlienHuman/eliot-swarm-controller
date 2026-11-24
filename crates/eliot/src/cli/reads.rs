@@ -215,6 +215,19 @@ pub(crate) async fn run_show(
             if let Some(workspace) = &agent.workspace {
                 println!("Workspace: {workspace}");
             }
+            if let Some(failure) = &response.last_resume_failure {
+                println!(
+                    "Resume failed (generation {}, command {}): {}{}",
+                    failure.generation,
+                    failure.command_id,
+                    failure.reason,
+                    failure
+                        .detail
+                        .as_deref()
+                        .map(|detail| format!(" — {detail}"))
+                        .unwrap_or_default(),
+                );
+            }
             if let Some(turn) = &agent.active_turn {
                 println!("Active turn: {turn}");
             }

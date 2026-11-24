@@ -8,7 +8,9 @@ use eliot_core::api::{
 mod automatic;
 mod recovery;
 pub use automatic::{AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING};
-pub(super) use recovery::{has_releasable_switch_fence, owner_release_switch_fence_tx};
+pub(super) use recovery::{
+    has_releasable_switch_fence, owner_release_switch_fence_tx, release_rejected_switch_fence_tx,
+};
 
 const METHOD: &str = "swarm.switch";
 const PROVIDER_FAILURE: &str = "provider_failure";

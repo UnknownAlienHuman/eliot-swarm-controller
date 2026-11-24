@@ -840,6 +840,13 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub last_control_failure: Option<AgentControlFailure>,
+    /// Latest retained failed Owner Resume across this Agent's generations.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "optional_object"
+    )]
+    pub last_resume_failure: Option<AgentResumeFailure>,
     /// Where this generation's work is recorded in Git, and its latest handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_truth: Option<AgentWorkTruthView>,
@@ -918,6 +925,78 @@ impl AgentControlFailure {
             || self.generation < 0
         {
             return Err(Error::new("invalid", "Agent control failure is malformed"));
+        }
+        Ok(())
+    }
+}
+
+/// A retained Owner Resume failure, including the safe native detail when present.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentResumeFailure {
+    pub command_id: String,
+    pub state: CommandState,
+    pub generation: i64,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl AgentResumeFailure {
+    const TEXT_MAX_BYTES: usize = 1024;
+
+    /// Project the exact retained failed Resume command without inventing an outcome.
+    pub fn from_command(command: &Command) -> Result<Self> {
+        if command.principal != "owner"
+            || command.verb != "resume"
+            || !matches!(command.state, CommandState::Rejected | CommandState::Failed)
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "retained Resume failure does not match its command scope",
+            ));
+        }
+        let generation = command.generation.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "retained Resume failure has no generation",
+            )
+        })?;
+        let outcome = command.outcome.as_ref();
+        let pick = |fields: &[&str]| {
+            fields.iter().find_map(|field| {
+                outcome
+                    .and_then(|value| value[*field].as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+        };
+        let reason = pick(&["reason", "cause", "code"]).unwrap_or("resume_failed");
+        let detail =
+            pick(&["message"]).map(|value| crate::bound_chars(value, Self::TEXT_MAX_BYTES));
+        let failure = Self {
+            command_id: command.id.clone(),
+            state: command.state,
+            generation,
+            reason: crate::bound_chars(reason, Self::TEXT_MAX_BYTES),
+            detail,
+        };
+        failure.validate()?;
+        Ok(failure)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.command_id.trim().is_empty()
+            || self.command_id.len() > 256
+            || !matches!(self.state, CommandState::Rejected | CommandState::Failed)
+            || self.generation < 0
+            || self.reason.trim().is_empty()
+            || self.reason.len() > Self::TEXT_MAX_BYTES
+            || self.detail.as_ref().is_some_and(|detail| {
+                detail.trim().is_empty() || detail.len() > Self::TEXT_MAX_BYTES
+            })
+        {
+            return Err(Error::new("invalid", "Agent Resume failure is malformed"));
         }
         Ok(())
     }

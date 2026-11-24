@@ -86,9 +86,11 @@ impl Slot {
             .as_ref()
             .is_none_or(|state| state.command_id != command_id)
         {
+            let may_have_begun = removal.as_ref().is_some_and(|state| state.may_have_begun)
+                || native_removal_may_have_begun(preparation);
             *removal = Some(RemovalProgress {
                 command_id: command_id.to_owned(),
-                may_have_begun: native_removal_may_have_begun(preparation),
+                may_have_begun,
             });
         }
     }

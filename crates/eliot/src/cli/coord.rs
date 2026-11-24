@@ -41,6 +41,38 @@ pub(crate) async fn run_cmd(
     id: Option<String>,
 ) -> Result<u8, Failure> {
     match command {
+        CmdCommand::ResolveCustody {
+            agent,
+            generation,
+            reason,
+        } => {
+            let request = eliot_core::api::FailedCustodyResolveRequest {
+                id: mutation_id(id)?,
+                agent,
+                generation,
+                reason,
+            };
+            request.validate().map_err(Failure::for_mutation)?;
+            let response: eliot_core::api::FailedCustodyResolveResponse =
+                eliot_daemon::client_call_typed(&data_dir, "agent.custody.resolve", &request)
+                    .await
+                    .map_err(Failure::for_mutation)?;
+            if response.id != request.id
+                || response.agent != request.agent
+                || response.generation != generation
+            {
+                return Err(Failure::new(
+                    4,
+                    "custody resolution response binding differs",
+                ));
+            }
+            print_value(
+                &serde_json::to_value(response)
+                    .map_err(|_| Failure::new(4, "invalid custody resolution receipt"))?,
+                json_output,
+            );
+            Ok(0)
+        }
         CmdCommand::SettleStopped(CmdSettleStoppedArgs { apply, after }) => {
             let request = SettleStoppedRequest {
                 id: mutation_id(id)?,

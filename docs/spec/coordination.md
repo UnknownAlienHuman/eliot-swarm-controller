@@ -33,7 +33,10 @@ The 4,096 active-artifact limit applies to new Agent registrations and counts
 registered and uncertain rows. Bound ownership roots and settled tombstones
 consume zero registration slots. Daemon-owned custody records for a launch or
 its managed workspace and native session commit even when the registration limit
-is reached. Daemon status shows the counts and the Owner inbox warns at 80 percent.
+is reached. Daemon custody inserts have a 512-active-row bound per Agent
+generation. Exact repeats preserve the original binding. An ID collision
+with a different binding fails visibly. Daemon status shows the counts and
+the Owner inbox warns at 80 percent.
 Bounded maintenance prunes expired previews and settled plans and reclaims
 unreferenced tombstones. It preserves uncertain attempts, native-session fences
 and the inventory sequence high-water row.
@@ -141,6 +144,8 @@ artifact. An accepted or uncertain worktree removal fences its exact workspace
 through the retained command and workspace marker. New cleanup pages and stale
 plans keep it with `prior_cleanup_attempt` until exact readback or Owner
 reconciliation settles the removal. The original receipt remains readable.
+A removal failure after possible Git or filesystem effects is `unknown`.
+Legacy `failed` rows with unresolved effect evidence retain the same fence.
 Uncertain attempts fence
 resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
@@ -1271,6 +1276,17 @@ its fence row is cleared; while the parent is Dispatched, the linked launch bypa
 ordinary owner check and its matching switch fence. The durable `switch_checkout_owners`
 row stores the canonical checkout key, current Agent and any in-flight switch; a
 successful handoff moves ownership to B in the H2 transaction.
+Rejection clears the exact switch reservation in the settlement transaction.
+Startup reconciles matching stranded rejected reservations. The canonical
+owner and its custody checks still govern subsequent checkout admission.
+
+A stop for a Failed generation can use exact no-spawn proof or daemon-verified
+closure of the local Windows Job and retained process identities. When that
+proof is unavailable, the Owner can use
+`swarm cmd resolve-custody A --generation N --reason TEXT` after verifying
+the whole process family's exit. The Store retains the exact generation, proof
+basis and reason. Switch and handoff consume that closure while independently
+checking native sources, workspace helpers and unresolved work.
 `agent_successors` retains the same-checkout transfer after event retention. A same-checkout
 transfer records the successor even when the caller explicitly repeats the workspace path.
 A second switch from a retired owner is refused and names the current Agent to switch instead. From then on the source

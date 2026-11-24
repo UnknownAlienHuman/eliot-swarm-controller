@@ -1406,6 +1406,14 @@ pub(crate) enum CmdCommand {
     Children(CmdChildrenArgs),
     /// Resolve an unknown command to its owner-asserted terminal state.
     Resolve(CmdResolveArgs),
+    /// Assert that an exact Failed Agent generation's entire process family exited.
+    ResolveCustody {
+        agent: String,
+        #[arg(long)]
+        generation: i64,
+        #[arg(long)]
+        reason: String,
+    },
     /// Preview or settle historical stops, linked Owner interrupt fallbacks and exact native reply receipts.
     SettleStopped(CmdSettleStoppedArgs),
     /// Withdraw one undispatched handoff input with no native effect.
