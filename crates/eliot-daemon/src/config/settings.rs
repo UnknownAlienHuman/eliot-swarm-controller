@@ -11,6 +11,7 @@ use eliot_store::Store;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
     borrow::Cow,
+    cell::LazyCell,
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
@@ -89,7 +90,7 @@ fn section_json(source: &str, name: &str) -> core::Result<JsonValue> {
     match toml::from_str::<toml::Table>(source) {
         Ok(parsed) => section_value(&parsed, name),
         Err(_) => {
-            let (parsed, invalid) = recovered_sections(source);
+            let (parsed, invalid) = recovered_sections(&profiles_edit::split_blocks(source));
             if invalid.contains_key(name) {
                 return Err(core::Error::new(
                     "profile_error",
@@ -134,8 +135,9 @@ fn source_offset_from_message(source: &str, message: &str) -> Option<usize> {
 
 fn section_for_error(source: &str, error: &core::Error) -> Option<SettingsSection> {
     if let Some(offset) = source_offset_from_message(source, &error.message)
-        && let Some(section) = profiles_edit::section_at_offset(source, offset)
-        && let Some(section) = setting_section(&section)
+        && let Some(section) =
+            profiles_edit::section_at_offset(&profiles_edit::split_blocks(source), offset)
+                .and_then(setting_section)
     {
         return Some(section);
     }
@@ -220,12 +222,14 @@ fn add_section_error_issue(
     }
 }
 
-fn recovered_sections(source: &str) -> (toml::Table, BTreeMap<String, String>) {
+fn recovered_sections(
+    blocks: &[profiles_edit::Block<'_>],
+) -> (toml::Table, BTreeMap<String, String>) {
     let mut table = toml::Table::new();
     let mut invalid = BTreeMap::new();
     for section in SettingsSection::ALL {
         let name = section_name(section);
-        let Some(section_source) = profiles_edit::section_source(source, name) else {
+        let Some(section_source) = profiles_edit::section_from_blocks(blocks, name) else {
             continue;
         };
         match toml::from_str::<toml::Table>(&section_source) {
@@ -243,8 +247,12 @@ fn recovered_sections(source: &str) -> (toml::Table, BTreeMap<String, String>) {
 }
 
 fn project_source_sections(source: &str, sections: &[&str]) -> String {
+    project_source_blocks(&profiles_edit::split_blocks(source), sections)
+}
+
+fn project_source_blocks(blocks: &[profiles_edit::Block<'_>], sections: &[&str]) -> String {
     let mut projected = String::new();
-    for block in profiles_edit::split_blocks(source) {
+    for block in blocks {
         if block
             .section
             .as_deref()
@@ -272,6 +280,7 @@ fn decode_settings_config(
 fn read_projection<'a>(
     source: &'a str,
     document: Option<&toml::Spanned<DeTable<'a>>>,
+    recovery_blocks: &[profiles_edit::Block<'_>],
     sections: &[&str],
 ) -> (Cow<'a, str>, core::Result<FileConfig>) {
     if let Some(document) = document {
@@ -286,7 +295,7 @@ fn read_projection<'a>(
             decode_settings_config(source, toml::Spanned::new(document.span(), selected)),
         );
     }
-    let projected = project_source_sections(source, sections);
+    let projected = project_source_blocks(recovery_blocks, sections);
     let config =
         toml::from_str(&projected).map_err(|error| super::map_toml_error(&projected, error));
     (Cow::Owned(projected), config)
@@ -475,16 +484,18 @@ pub(crate) fn read_snapshot(
     let requested: BTreeSet<_> = sections.iter().copied().collect();
     let mut issues = Vec::new();
     let mut unreadable_sections = BTreeSet::new();
-    let (document, table, invalid_sections) = match DeTable::parse(source).and_then(|document| {
-        let table = toml::Table::deserialize(Deserializer::from(document.clone()))?;
-        Ok((document, table))
-    }) {
-        Ok((document, table)) => (Some(document), table, BTreeMap::new()),
+    let blocks = LazyCell::new(|| profiles_edit::split_blocks(source));
+    let (parsed, syntax_errors) = DeTable::parse_recoverable(source);
+    let table = match syntax_errors.first() {
+        Some(error) => Err(error.clone()),
+        None => toml::Table::deserialize(Deserializer::from(parsed.clone())),
+    };
+    let (document, table, invalid_sections) = match table {
+        Ok(table) => (Some(&parsed), table, BTreeMap::new()),
         Err(error) => {
             let offset = error.span().map(|span| span.start);
             let section = offset
-                .and_then(|offset| profiles_edit::section_at_offset(source, offset))
-                .as_deref()
+                .and_then(|offset| profiles_edit::section_at_offset(&blocks, offset))
                 .and_then(setting_section);
             if let Some(section) = section {
                 unreadable_sections.insert(section_name(section).to_owned());
@@ -498,7 +509,7 @@ pub(crate) fn read_snapshot(
             {
                 add_issue(&mut issues, issue);
             }
-            let (table, invalid_sections) = recovered_sections(source);
+            let (table, invalid_sections) = recovered_sections(&blocks);
             unreadable_sections.extend(invalid_sections.keys().cloned());
             for (name, reason) in &invalid_sections {
                 let Some(section) = setting_section(name) else {
@@ -520,7 +531,11 @@ pub(crate) fn read_snapshot(
             (None, table, invalid_sections)
         }
     };
-    let document = document.as_ref();
+    let recovery_blocks = if document.is_none() {
+        blocks.as_slice()
+    } else {
+        &[]
+    };
 
     let mut strict_config = None;
     let mut full_invalid = document.is_none();
@@ -555,7 +570,8 @@ pub(crate) fn read_snapshot(
                 continue;
             }
             let dependencies = validation_dependencies(*section);
-            let (projected, config) = read_projection(source, document, dependencies);
+            let (projected, config) =
+                read_projection(source, document, recovery_blocks, dependencies);
             let unreadable = config.is_err();
             if let Err(error) = config.and_then(|config| {
                 validate_config_shape(&config)?;
@@ -575,34 +591,40 @@ pub(crate) fn read_snapshot(
     }
 
     let profile_config = strict_config.or_else(|| {
-        let (_, config) = read_projection(source, document, &["profiles", "accounts", "proxies"]);
+        let (_, config) = read_projection(
+            source,
+            document,
+            recovery_blocks,
+            &["profiles", "accounts", "proxies"],
+        );
         config
             .ok()
             .filter(|config| validate_config_shape(config).is_ok())
     });
-    let profiles_inline = document.is_some_and(|document| {
-        document.get_ref().iter().any(|(key, _)| {
-            if key.get_ref() != "profiles" {
-                return false;
+    let profile_reason =
+        profiles_edit::profile_source_problem(source, parsed.get_ref(), document.is_none(), || {
+            if invalid_sections.contains_key("profiles")
+                || unreadable_sections.contains("profiles")
+                || profiles_edit::profile_syntax_fault(&blocks, &syntax_errors)
+            {
+                return Err(());
             }
-            let prefix = source[..key.span().start].rsplit('\n').next().unwrap_or("");
-            !prefix
-                .trim_start_matches('\u{FEFF}')
-                .trim()
-                .starts_with('[')
+            Ok(table.get("profiles").cloned())
         })
-    });
-    let profile_reason = profiles_edit::editability(
-        source,
-        &table,
-        profiles_inline,
-        profile_config.as_ref(),
-        policy,
-    );
+        .or_else(|| {
+            let has_text_secret = |text: &str| {
+                text.contains(eliot_core::api::REDACTION_MARKER) || policy.contains_text(text)
+            };
+            let raw_secret = has_text_secret(source)
+                && profiles_edit::section_from_blocks(&blocks, "profiles")
+                    .is_some_and(|text| has_text_secret(&text));
+            profiles_edit::editability(raw_secret, &table, profile_config.as_ref(), policy)
+        });
     let profiles_withheld = profile_reason.is_some();
     if let Some(reason) = profile_reason
         && requested.contains(&SettingsSection::Profiles)
     {
+        issues.retain(|issue| issue.section != Some(SettingsSection::Profiles));
         add_issue(
             &mut issues,
             SettingsReadIssue {
@@ -704,7 +726,7 @@ pub(crate) fn read_snapshot(
             continue;
         }
         let name = section_name(section);
-        let (source_section, config) = read_projection(source, document, &[name]);
+        let (source_section, config) = read_projection(source, document, recovery_blocks, &[name]);
         issue.removable = invalid_sections.contains_key(name)
             || table.get(name).is_some_and(|value| !value.is_table())
             || config.is_err()
@@ -980,8 +1002,32 @@ pub(crate) fn prepare_candidate(
         ));
     }
     let original = original_file.as_deref().unwrap_or_default();
+    let blocks = profiles_edit::split_blocks(original);
+    if sections.contains_key(&SettingsSection::Profiles) {
+        let (parsed, errors) = DeTable::parse_recoverable(original);
+        if let Some(reason) = profiles_edit::profile_source_problem(
+            original,
+            parsed.get_ref(),
+            !errors.is_empty(),
+            || {
+                if profiles_edit::profile_syntax_fault(&blocks, &errors) {
+                    return Err(());
+                }
+                profiles_edit::section_from_blocks(&blocks, "profiles")
+                    .map(|source| {
+                        let mut table: toml::Table = toml::from_str(&source).map_err(|_| ())?;
+                        Ok(table.remove("profiles"))
+                    })
+                    .transpose()
+                    .map(Option::flatten)
+            },
+        ) {
+            return Err(core::Error::new("not_allowed", reason));
+        }
+    }
     let candidate = splice_sections(
         original,
+        &blocks,
         &replacements(sections, policy, has_desktop_section(original))?,
     );
     if candidate.len() > MAX_CONFIG_BYTES {
@@ -1441,10 +1487,14 @@ fn restart_required_for_change(
 
 /// Replace selected top-level tables while keeping every other source block
 /// verbatim. `split_blocks` keeps nested tables under their top-level owner.
-fn splice_sections(source: &str, replacements: &BTreeMap<String, String>) -> String {
+fn splice_sections(
+    source: &str,
+    blocks: &[profiles_edit::Block<'_>],
+    replacements: &BTreeMap<String, String>,
+) -> String {
     let mut out = String::with_capacity(source.len());
     let mut inserted = BTreeSet::new();
-    for block in profiles_edit::split_blocks(source) {
+    for block in blocks {
         match block
             .section
             .as_deref()

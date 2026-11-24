@@ -1721,9 +1721,11 @@ only a successful `configure` changes a live Agent's next-turn model/effort. Dae
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
 restart after the save.
 
-`settings.read` reads one file revision outside the Store lock. It parses valid TOML
-once, using the same span-bearing tree for strict validation and section projection.
-A syntax error triggers recovery of independently readable blocks.
+The `settings.read` RPC reads and validates one file revision before locking the Store
+for history. It parses valid TOML once for strict validation and section projection.
+Located diagnostics and possible literal secrets require a table-header scan. Malformed
+TOML uses the header spans to independently parse readable section blocks and their
+validation dependencies.
 The API returns every safely readable section plus bounded issues for sections
 that fail parsing, validation or the daemon's redaction policy. A TOML syntax diagnostic
 identifies the affected top-level section when the parser can locate it; other section
@@ -1738,6 +1740,8 @@ including while another section is invalid.
 daemon validates the changed section and its dependencies with the same strict parser
 and validators used for launch configuration. Parsed table headers identify source
 blocks, so bracket-like text inside a value does not affect which bytes are replaced.
+Profile blocks that cannot be separated safely are withheld with `not_allowed` and
+must be repaired directly in the file before a profile replacement can proceed.
 The writer preserves all unselected source blocks
 and reports remaining issues on the next read. A section cannot be saved when its own
 validation fails; an unrelated broken section does not hide or block a usable section.

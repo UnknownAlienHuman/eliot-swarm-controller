@@ -15,7 +15,9 @@ use std::path::Path;
 
 use eliot_core::SecretPolicy;
 use eliot_core::api::{MAX_LISTED_PROFILES, ProfileListResponse, ProfileSummary, REDACTION_MARKER};
+use serde::Deserialize;
 use serde_json::Value;
+use toml::de::{DeTable, ValueDeserializer};
 use toml_parser::{
     Source,
     parser::{Event, EventKind, parse_document},
@@ -107,9 +109,13 @@ pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
 
 /// The bytes owned by one top-level section, retained in source order.
 pub(super) fn section_source(source: &str, name: &str) -> Option<String> {
+    section_from_blocks(&split_blocks(source), name)
+}
+
+pub(super) fn section_from_blocks(blocks: &[Block<'_>], name: &str) -> Option<String> {
     let mut found = false;
     let mut text = String::new();
-    for block in split_blocks(source) {
+    for block in blocks {
         if block.section.as_deref() == Some(name) {
             found = true;
             text.push_str(block.text);
@@ -120,34 +126,76 @@ pub(super) fn section_source(source: &str, name: &str) -> Option<String> {
 
 /// The top-level section that owns a byte offset, when the offset falls
 /// inside a table block.
-pub(super) fn section_at_offset(source: &str, offset: usize) -> Option<String> {
+pub(super) fn section_at_offset<'a>(blocks: &'a [Block<'_>], offset: usize) -> Option<&'a str> {
     let mut start = 0;
-    for block in split_blocks(source) {
+    for (index, block) in blocks.iter().enumerate() {
         let end = start + block.text.len();
-        if offset >= start && (offset < end || (offset == end && end == source.len())) {
-            return block.section.clone();
+        if offset >= start && (offset < end || (offset == end && index + 1 == blocks.len())) {
+            return block.section.as_deref();
         }
         start = end;
     }
     None
 }
 
+/// Prove that replacing the table blocks would account for all profiles.
+/// Recovery must agree with the whole document's profile tree and must not
+/// have assigned a syntax fault to a profile block.
+pub(super) fn profile_source_problem(
+    source: &str,
+    document: &DeTable<'_>,
+    has_syntax_error: bool,
+    recover_profiles: impl FnOnce() -> Result<Option<toml::Value>, ()>,
+) -> Option<&'static str> {
+    let profiles = document.iter().find(|(key, _)| key.get_ref() == "profiles");
+    if let Some((key, _)) = profiles {
+        let before = &source[..key.span().start];
+        if !before
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('\u{FEFF}')
+            .trim_start()
+            .starts_with('[')
+        {
+            return Some(
+                "profiles are defined outside [profiles.*] tables; edit config.toml directly",
+            );
+        }
+    }
+    if !has_syntax_error {
+        return None;
+    }
+    let recovered =
+        profiles.map(|(_, value)| toml::Value::deserialize(ValueDeserializer::from(value.clone())));
+    if let Ok(isolated) = recover_profiles()
+        && let Ok(recovered) = recovered.transpose()
+        && recovered == isolated
+    {
+        return None;
+    }
+    Some(
+        "the [profiles.*] sections cannot be separated from the rest of the file; edit config.toml directly",
+    )
+}
+
+pub(super) fn profile_syntax_fault(blocks: &[Block<'_>], errors: &[toml::de::Error]) -> bool {
+    errors.iter().any(|error| {
+        error
+            .span()
+            .and_then(|span| section_at_offset(blocks, span.start))
+            == Some("profiles")
+    })
+}
+
 /// Why the profile settings cannot be safely exposed. The typed configuration
 /// and readback values are decoded from the same parsed document.
 pub(super) fn editability(
-    source: &str,
+    raw_secret: bool,
     table: &toml::Table,
-    profiles_inline: bool,
     config: Option<&super::FileConfig>,
     policy: &SecretPolicy,
 ) -> Option<&'static str> {
-    if profiles_inline {
-        return Some("profiles are defined outside [profiles.*] tables; edit config.toml directly");
-    }
-    let has_text_secret =
-        |text: &str| text.contains(REDACTION_MARKER) || policy.contains_text(text);
-    let raw_secret = has_text_secret(source)
-        && section_source(source, "profiles").is_some_and(|text| has_text_secret(&text));
     let decoded_secret = table
         .get("profiles")
         .and_then(|profiles| serde_json::to_value(profiles).ok())
