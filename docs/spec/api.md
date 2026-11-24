@@ -1422,11 +1422,13 @@ with its echoed current value. On the natively-switching harnesses the
 Router switches the live native session through the owned plugin first and
 stores the overlay only after native proof, then settles `applied` with the
 requested values, the monotonically increasing `config_revision` for the
-generation and `application:"next_turn"`. Claude and Muse retain `accepted_model`
-as the next-turn selector, with `effective.model` null and `model_verified`
-false in the configure outcome. The next bound Claude assistant record or
-Muse provider response updates the Agent's observed serving model. Muse
-reports carried effort at the next turn association.
+generation and `application:"next_turn"`. A Claude or Muse model switch
+reports `accepted_model` as the next-turn selector, with `effective.model`
+null and `model_verified` false in the configure outcome. A Muse effort-only
+configure reports the inherited selector in `effective.model` and leaves
+`requested.model` null. The next bound Claude assistant record or Muse
+provider response updates the Agent's observed serving model. Muse reports
+carried effort at the next turn association.
 OpenCode and Antigravity report verified native values from their readback
 or echo. A proven validation refusal settles `rejected`. An ambiguous
 native effect or a Store commit failure after the effect settles

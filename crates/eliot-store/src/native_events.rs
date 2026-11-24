@@ -486,6 +486,8 @@ fn persist_turn_associated(
                 format!("turn {turn_id} already exists in this Agent generation"),
             ));
         }
+        let effective_model =
+            turn_start_model(tx, next_agent, generation, command.config_revision)?;
         insert_turn(
             tx,
             TurnInsert {
@@ -503,11 +505,7 @@ fn persist_turn_associated(
                 usage: None,
                 config_revision: command.config_revision,
                 preceded_by: None,
-                effective_model: (command.config_revision == 0)
-                    .then_some(next_agent.effective.as_ref())
-                    .flatten()
-                    .and_then(|effective| effective.get("model"))
-                    .and_then(Value::as_str),
+                effective_model: effective_model.as_deref(),
                 native_trigger: None,
             },
         )?;
@@ -687,6 +685,7 @@ fn persist_native_turn_started(
         ));
     }
     let config_revision = current_config_revision_tx(tx, agent_num, generation)?;
+    let effective_model = turn_start_model(tx, next_agent, generation, config_revision)?;
     insert_turn(
         tx,
         TurnInsert {
@@ -704,11 +703,7 @@ fn persist_native_turn_started(
             usage: None,
             config_revision,
             preceded_by: None,
-            effective_model: (config_revision == 0)
-                .then_some(next_agent.effective.as_ref())
-                .flatten()
-                .and_then(|effective| effective.get("model"))
-                .and_then(Value::as_str),
+            effective_model: effective_model.as_deref(),
             native_trigger: Some(trigger),
         },
     )?;
@@ -720,6 +715,24 @@ fn persist_native_turn_started(
         ));
     }
     Ok(())
+}
+
+fn turn_start_model(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    generation: i64,
+    revision: i64,
+) -> Result<Option<String>> {
+    if eliot_core::api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
+    {
+        return config_overlay::retained_provider_selector(tx, agent, generation, revision);
+    }
+    Ok((revision == 0)
+        .then_some(agent.effective.as_ref())
+        .flatten()
+        .and_then(|effective| effective.get("model"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
 }
 
 /// A turn fact without a command is valid only for the exact running

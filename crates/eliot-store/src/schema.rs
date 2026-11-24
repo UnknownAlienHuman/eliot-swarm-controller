@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = NATIVE_FOLLOWUP_SCHEMA_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = MUSE_TURN_MODEL_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -11,6 +11,7 @@ const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
 const MODEL_MISMATCH_HOLD_VERSION: i64 = 119;
 const REPEAT_FAILURE_ALERTS_VERSION: i64 = 120;
 const NATIVE_FOLLOWUP_SCHEMA_VERSION: i64 = 121;
+const MUSE_TURN_MODEL_VERSION: i64 = 122;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -45,7 +46,25 @@ impl Store {
         if current < NATIVE_FOLLOWUP_SCHEMA_VERSION {
             self.migrate_native_followup()?;
         }
+        if current < MUSE_TURN_MODEL_VERSION {
+            self.migrate_muse_turn_models()?;
+        }
         Ok(())
+    }
+
+    fn migrate_muse_turn_models(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(include_str!("../migrations/muse_turn_models.sql"))
+            .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [MUSE_TURN_MODEL_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     fn migrate_native_followup(&mut self) -> Result<()> {
