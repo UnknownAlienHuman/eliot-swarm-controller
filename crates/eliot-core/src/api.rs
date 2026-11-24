@@ -61,8 +61,9 @@ pub(crate) use string_list::deserialize_string_list;
 
 pub use agent_requests::{
     AgentEditsRequest, AgentGetRequest, AgentGitRequest, AgentListRequest, AgentPatchDigestRequest,
-    AgentProcessesRequest, AgentStatsRequest, DaemonPanicTestRequest, DaemonStatusRequest,
-    DiagnoseRequest, ProjectDiscoverRequest, decode_recent_cursor, encode_recent_cursor,
+    AgentProcessesRequest, AgentStatsRequest, DaemonPanicTestRequest, DaemonSidebarRequest,
+    DaemonStatusRequest, DiagnoseRequest, ProjectDiscoverRequest, decode_recent_cursor,
+    encode_recent_cursor,
 };
 pub use agent_views::{
     AGENT_LIST_STATES, AGENT_NOTICE_MESSAGE_CHARS, AGENT_PREVIEW_CHARS, AgentBackgroundWakeView,
@@ -72,9 +73,9 @@ pub use agent_views::{
     AgentWorkTruthView, AttentionStepReadback, AutomaticCleanupPolicy, AutomaticCleanupSweep,
     AutomaticCleanupView, ChildProcessCounts, CloudMcpCustody, CloudMcpHealth, CloudMcpStatus,
     CommandWithoutDispatcherStatus, CrashMarker, DaemonBuildIdentity, DaemonHealthSummary,
-    DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse, DiagnoseStep,
-    DiskUsageDirectory, DiskUsageView, DrainReport, GitCheckpointState, GitCheckpointView,
-    GitCheckpointWithheld, GitCredentialHelper, MAX_DIAGNOSE_ATTENTION_STEPS,
+    DaemonPanicTestResponse, DaemonSidebarResponse, DaemonStatusResponse, DiagnoseResponse,
+    DiagnoseStep, DiskUsageDirectory, DiskUsageView, DrainReport, GitCheckpointState,
+    GitCheckpointView, GitCheckpointWithheld, GitCredentialHelper, MAX_DIAGNOSE_ATTENTION_STEPS,
     MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS,
     MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES, NativeDiagnosticCounts,
     NativeNotice, NativeNoticeKind, OwnedProcessKind, OwnedProcessSummary,

@@ -2324,7 +2324,7 @@ pub struct DiskUsageView {
     pub artifacts: DiskUsageDirectory,
     pub worktrees: DiskUsageDirectory,
     pub plugins: DiskUsageDirectory,
-    /// Age of the last completed measurement attempt, if one exists.
+    /// Time since the last published measurement attempt began, if one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_age_ms: Option<u64>,
     /// A measurement is in progress. The displayed buckets may be cached.
@@ -2357,6 +2357,13 @@ pub struct DaemonHealthSummary {
     pub active_repeat_windows: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeated_failure_inbox_items: Option<usize>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonSidebarResponse {
+    pub owner_inbox: BTreeMap<super::OwnerInboxKind, usize>,
+    pub profile_command_issues: Vec<super::ProfileCommandIssue>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

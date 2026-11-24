@@ -1411,14 +1411,26 @@ retention view reports the `eliot.db` main and WAL sizes, the configured
 windows and `pruned_through`, along with the SQLite auto-vacuum mode,
 total pages and reusable pages. The disk usage view reports logical bytes under
 `artifacts/`, `worktrees/` and `plugins/` and skips link and reparse targets.
-Status calls share one asynchronous scan. After completion, the next status
-call can start a refresh once the greater of five minutes and 64 times the
-elapsed scan time has passed. Pending refreshes serve the previous snapshot.
-Clients can request its `snapshot_age_ms` and `refreshing` state with
-`disk_usage_freshness: true`. Until the first snapshot completes, status waits
-up to 500 ms and can report `busy`. Each bucket has a cooperative deadline of
-three seconds and a 500,000-entry budget. A bucket that hits either limit
-reports `busy` with no byte total. An unreadable bucket reports `unavailable`.
+Status calls share one asynchronous scan. The walk resumes after each step of
+at most 25,000 entries or 100 ms of cooperative work. Steps in a bucket pause
+for at least 200 ms or 16 times the preceding step's elapsed time, whichever
+is greater. The iterator advances across steps until the bucket is complete.
+A bucket with an unreadable path, a replaced active directory or more than
+128 active directory levels reports an error without a byte total. The total
+estimates logical bytes observed over the scan window and includes unregistered
+directories. Windows pins paths
+while opening directory iterators. Linux opens them relative to directory
+handles. Other platforms report existing buckets as unavailable because
+they lack a supported handle-relative enumerator.
+
+After completion, a status call can start the next refresh once the greater
+of five minutes and 64 times the previous scan's active time has passed.
+Pending refreshes serve the previous snapshot. Before the first snapshot,
+status waits up to 500 ms and can report `busy`. CLI status and desktop
+Storage request `snapshot_age_ms` and `refreshing` with
+`disk_usage_freshness: true` and show them with the totals. Age runs from the
+start of the published scan. The desktop's ten-second sidebar poll uses
+`daemon.sidebar` for Owner inbox counts and profile command issues.
 Before #729,
 Swarm's managed launch assigned each worktree a flat `worktrees/<ULID>/` path.
 Those paths share the same size accounting as project-named worktrees. A flat

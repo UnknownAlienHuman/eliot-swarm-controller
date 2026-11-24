@@ -100,8 +100,45 @@ impl Directory {
             // through its descriptor so enumeration uses the opened object.
             std::fs::read_dir(format!("/proc/self/fd/{}", self.handle().as_raw_fd()))
         }
+        #[cfg(windows)]
+        {
+            std::fs::read_dir(&self.path)
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "no handle-relative directory enumeration on this platform",
+        ))
+    }
+
+    pub(crate) fn entry_metadata(
+        &self,
+        entry: &std::fs::DirEntry,
+    ) -> std::io::Result<std::fs::Metadata> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            // A saved iterator may have been opened through a different fd.
+            // Use the currently pinned parent for each no-follow stat.
+            let parent = format!("/proc/self/fd/{}", self.handle().as_raw_fd());
+            std::fs::symlink_metadata(Path::new(&parent).join(entry.file_name()))
+        }
         #[cfg(not(target_os = "linux"))]
-        std::fs::read_dir(&self.path)
+        entry.metadata()
+    }
+
+    /// Identities from the current directory back to the measurement root.
+    pub(crate) fn directory_identities(
+        &self,
+        depth: usize,
+    ) -> std::io::Result<Vec<eliot_plugin::FileIdentity>> {
+        self.chain
+            .iter()
+            .rev()
+            .take(depth)
+            .map(eliot_plugin::file_identity)
+            .collect()
     }
 
     /// Open just this child relative to its existing parent handle. The

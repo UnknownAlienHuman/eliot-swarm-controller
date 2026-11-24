@@ -15,6 +15,7 @@ mod coordination;
 mod diagnose;
 mod digests;
 pub(crate) mod discovery;
+mod disk_usage;
 mod goal_scope;
 mod goals;
 mod handoff;
@@ -702,6 +703,12 @@ impl Router {
                     eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
                 self.status(request.disk_usage_freshness).await
+            }
+            "daemon.sidebar" => {
+                require_owner(&principal)?;
+                let _: eliot_core::api::DaemonSidebarRequest =
+                    eliot_core::api::discovery::decode_params(params)?;
+                self.sidebar_status().await
             }
             "autonomy.get" => {
                 require_owner(&principal)?;

@@ -847,6 +847,10 @@ pub struct DaemonStatusRequest {
     pub disk_usage_freshness: bool,
 }
 
+#[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonSidebarRequest {}
+
 /// Debug-only forced daemon panic for crash-capture tests. Compiled out of
 /// release builds together with its router arm.
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

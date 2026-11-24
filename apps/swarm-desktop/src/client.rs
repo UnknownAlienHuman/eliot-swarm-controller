@@ -187,11 +187,29 @@ pub async fn cleanup_plan_page(
 
 /// A validated daemon status snapshot for the Worktrees cleanup surface.
 pub async fn daemon_status(data_dir: &Path) -> Result<DaemonStatusResponse> {
-    let request = DaemonStatusRequest::default();
+    let request = DaemonStatusRequest {
+        disk_usage_freshness: true,
+    };
     request.validate()?;
-    let response = eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+    let response = match eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await
+    {
+        Ok(response) => response,
+        Err(error) if lacks_disk_usage_freshness(&error) => {
+            let legacy_request = DaemonStatusRequest::default();
+            eliot_daemon::client_call_typed(data_dir, "daemon.status", &legacy_request).await?
+        }
+        Err(error) => return Err(error),
+    };
     request.validate_response(&response)?;
     Ok(response)
+}
+
+fn lacks_disk_usage_freshness(error: &Error) -> bool {
+    error.code == "invalid"
+        && error
+            .details
+            .as_deref()
+            .is_some_and(|details| details.field == "params.<unknown-field>")
 }
 
 async fn typed_call<Req: serde::Serialize, Resp: serde::de::DeserializeOwned>(
@@ -663,22 +681,29 @@ pub async fn owner_inbox(
     eliot_daemon::client_call_typed(data_dir, "owner.inbox", &request).await
 }
 
-#[derive(Clone, Debug)]
-pub struct SidebarStatus {
-    pub owner_inbox: std::collections::BTreeMap<eliot_core::api::OwnerInboxKind, usize>,
-    pub profile_command_issues: Vec<eliot_core::api::ProfileCommandIssue>,
-}
+pub async fn sidebar_status(data_dir: &Path) -> Result<eliot_core::api::DaemonSidebarResponse> {
+    use eliot_core::api::{DaemonSidebarRequest, DaemonSidebarResponse, ProfileCommandIssue};
 
-pub async fn sidebar_status(data_dir: &Path) -> Result<SidebarStatus> {
-    let request = eliot_core::api::DaemonStatusRequest::default();
-    request.validate()?;
-    let status: eliot_core::api::DaemonStatusResponse =
-        eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
-    request.validate_response(&status)?;
-    Ok(SidebarStatus {
-        owner_inbox: status.owner_inbox,
-        profile_command_issues: status.profile_command_issues,
-    })
+    let request = DaemonSidebarRequest::default();
+    let status: DaemonSidebarResponse =
+        match eliot_daemon::client_call_typed(data_dir, "daemon.sidebar", &request).await {
+            Err(error)
+                if error.code == "unsupported"
+                    && error.message.starts_with("Method unavailable.") =>
+            {
+                let request = DaemonStatusRequest::default();
+                let status: DaemonStatusResponse =
+                    eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
+                request.validate_response(&status)?;
+                DaemonSidebarResponse {
+                    owner_inbox: status.owner_inbox,
+                    profile_command_issues: status.profile_command_issues,
+                }
+            }
+            result => result?,
+        };
+    ProfileCommandIssue::validate_list(&status.profile_command_issues)?;
+    Ok(status)
 }
 
 /// Decide one inbox item (`owner.decide`): an offered choice, `recommended`
