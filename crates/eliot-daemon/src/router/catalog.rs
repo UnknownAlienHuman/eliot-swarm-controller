@@ -320,9 +320,9 @@ impl Router {
             let harness = harness.to_owned();
             let scope = scope.clone();
             let credential = credential.clone();
-            let read = async move {
+            let read = move |read_deadline: Instant| async move {
                 let raw = host
-                    .models(profile, route.environment, workspace, deadline.into())
+                    .models(profile, route.environment, workspace, read_deadline.into())
                     .await?;
                 let provenance = if raw["provenance"] == "preview" {
                     "preview"
@@ -337,7 +337,7 @@ impl Router {
             };
             match cache_key {
                 Some(key) => self.coalesced_models_read(key, deadline, read).await,
-                None => read.await,
+                None => read(deadline).await,
             }
         }
         .await;
@@ -359,13 +359,16 @@ impl Router {
         }
     }
 
-    async fn coalesced_models_read(
+    async fn coalesced_models_read<F>(
         &self,
         key: ModelsCacheKey,
-        deadline: Instant,
-        read: impl Future<Output = Result<HarnessModelsResponse>> + Send + 'static,
-    ) -> Result<HarnessModelsResponse> {
-        let (mut result, joined) = {
+        wait_deadline: Instant,
+        read: impl FnOnce(Instant) -> F,
+    ) -> Result<HarnessModelsResponse>
+    where
+        F: Future<Output = Result<HarnessModelsResponse>> + Send + 'static,
+    {
+        let mut result = {
             let mut cache = self.inner.catalog_cache.lock_recover();
             if let Some(hit) = cache.get_models(&key, now_ms()) {
                 return Ok(hit);
@@ -376,11 +379,12 @@ impl Router {
                 .model_reads
                 .retain(|_, read| read.has_changed().is_ok());
             if let Some(in_flight) = cache.model_reads.get(&key) {
-                (in_flight.clone(), true)
+                in_flight.clone()
             } else {
                 let (publish, result) = watch::channel(None);
                 cache.model_reads.insert(key.clone(), result.clone());
                 let router = self.clone();
+                let read = read(Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
                 // Own the read through native cleanup even if any caller drops
                 // its wait. The plugin host still tracks it for daemon shutdown.
                 tokio::spawn(async move {
@@ -392,18 +396,13 @@ impl Router {
                     publish.send_replace(Some(result));
                     cache.model_reads.remove(&key);
                 });
-                (result, false)
+                result
             }
         };
-        let settled = if joined {
-            tokio::time::timeout_at(deadline.into(), result.wait_for(Option::is_some))
+        let settled =
+            tokio::time::timeout_at(wait_deadline.into(), result.wait_for(Option::is_some))
                 .await
-                .map_err(|_| crate::adhoc::discovery_timeout())?
-        } else {
-            // As with a direct read, the initiating caller gets the native
-            // result after cleanup, including an unconfirmed cleanup error.
-            result.wait_for(Option::is_some).await
-        };
+                .map_err(|_| crate::adhoc::discovery_timeout())?;
         settled
             .ok()
             .and_then(|result| result.as_ref().cloned())

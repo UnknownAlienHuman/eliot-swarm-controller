@@ -2460,8 +2460,10 @@ configured endpoint and executable. Missing selectors, admitted unset
 selectors and admitted empty values are distinct. Concurrent model cache
 misses for the same verified scope and executable share one native read,
 including across `harness.models`, `models.catalog`, and launch preflight.
-Each joining caller has its own wait deadline. The reader remains under
-daemon custody until cleanup settles, and only validated successful
+The daemon starts the shared read with its own discovery budget, subject to
+the native reader's limit. Every caller, including the one that starts the
+read, waits only until its own deadline. The reader remains under daemon
+custody until cleanup settles, and only validated successful
 responses populate the cache. Legacy and unverified routes, previews with
 an explicit `workspace`, and live session reads bypass this sharing.
 Public `scope` names the profile and route without
