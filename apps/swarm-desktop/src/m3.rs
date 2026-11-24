@@ -24,6 +24,7 @@ use std::cell::Cell;
 
 use windows_reactor::*;
 
+use crate::shadow::ShadowHost;
 use crate::theme::winui::Palette;
 use crate::theme::{self, StatusTone};
 use crate::ui::tokens::text::{self as style, TypeStyle};
@@ -228,76 +229,47 @@ pub fn label(value: &str) -> TextBlock {
     text(value.to_owned(), style::BUTTON).margin(Thickness::xy(spacing::MD - spacing::ROW, 0.0))
 }
 
-/// `view` lifted off its surface at `level`: the theme's lift (Material's
-/// key and ambient shadows, or the true-black themes' ring) drawn under it
-/// on a corner of `radius` (WinUI's `ThemeShadow` draws nothing outside a
-/// popup without receivers, which Reactor 0.100.0 cannot add). `place` is
-/// the grid that sizes and places it, so the lift follows the view.
+/// `view` lifted off its surface at `elevation-1`, on a corner of
+/// `radius`: a real shadow under it ([`ShadowHost`], whose layers the
+/// owner keeps on the theme's, [`elevation_layers`]) or, in the true-black
+/// themes, the 1-DIP ring. `place` is the grid that sizes and places both,
+/// so the lift follows the view; under High Contrast nothing lifts.
 pub fn lifted(
     palette: Palette,
-    level: crate::theme::elevation::Level,
+    shadow: &ShadowHost,
     radius: f64,
     place: Grid,
     view: impl Into<View>,
 ) -> View {
-    use crate::theme::elevation::{self, Band};
-    let Some(roles) = palette.roles() else {
-        return place.keyed_children(vec![KeyedView::new("content", view.into())]);
+    let lift: View = match palette.roles().map(|roles| roles.lift) {
+        Some(crate::theme::Lift::Shadow(_)) => shadow.view().into(),
+        Some(crate::theme::Lift::Ring(color)) => Border::new()
+            .corner_radius(radius + layout::HAIRLINE)
+            .margin(Thickness::uniform(-layout::HAIRLINE))
+            .background(Brush::Solid(crate::theme::winui::color(color)))
+            .into(),
+        None => View::empty(),
     };
-    let paint = |band: Band, tint: crate::theme::Rgb8, opacity: f64| {
-        let brush = Brush::Solid(Color::argb(
-            (opacity * band.share * 255.0).round() as u8,
-            tint.r,
-            tint.g,
-            tint.b,
-        ));
-        let border = Border::new()
-            .corner_radius((radius + band.reach).max(0.0))
-            .margin(Thickness::new(
-                -band.reach,
-                band.offset - band.reach,
-                -band.reach,
-                -band.offset - band.reach,
-            ));
-        match band.width {
-            None => border.background(brush),
-            Some(width) => border
-                .border_brush(brush)
-                .border_thickness(Thickness::uniform(width)),
-        }
-    };
-    let bands: Vec<Border> = match roles.lift {
-        crate::theme::Lift::Shadow { key, ambient } => {
-            let (key, ambient) = (key[level.index()], ambient[level.index()]);
-            let [key_bands, ambient_bands] = elevation::level_bands(level);
-            let shadow = |bands: &'static [Band], opacity| {
-                bands
-                    .iter()
-                    .map(move |band| paint(*band, crate::theme::SHADOW_COLOR, opacity))
-            };
-            shadow(ambient_bands, ambient)
-                .chain(shadow(key_bands, key))
-                .collect()
-        }
-        // A ring theme: one hairline around the element, no blur.
-        crate::theme::Lift::Ring(color) => vec![paint(
-            Band {
-                reach: layout::HAIRLINE,
-                width: None,
-                offset: 0.0,
-                share: 1.0,
-            },
-            color,
-            1.0,
-        )],
-    };
-    let mut cells: Vec<KeyedView> = bands
-        .into_iter()
-        .enumerate()
-        .map(|(index, band)| KeyedView::new(format!("lift:{index}"), band))
-        .collect();
-    cells.push(KeyedView::new("content", view.into()));
-    place.keyed_children(cells)
+    place.keyed_children(vec![
+        KeyedView::new("lift", lift),
+        KeyedView::new("content", view.into()),
+    ])
+}
+
+/// The brand book's `elevation-1` layers in `palette`'s theme: none in the
+/// true-black themes (their ring is drawn by [`lifted`]) and under High
+/// Contrast.
+pub fn elevation_layers(palette: Palette) -> &'static [crate::brand::Shadow] {
+    match palette.roles().map(|roles| roles.lift) {
+        Some(crate::theme::Lift::Shadow(layers)) => layers,
+        _ => &[],
+    }
+}
+
+/// The night themes' glow behind the composer's main action
+/// (`glow-shadow`); none elsewhere and under High Contrast.
+pub fn glow_layers(palette: Palette) -> &'static [crate::brand::Shadow] {
+    palette.roles().map_or(&[], |roles| roles.glow)
 }
 
 fn button(overrides: ResourceOverrides) -> Button {
@@ -842,12 +814,18 @@ pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) 
         )
 }
 
-/// The composer card: the composer role, the 20-DIP corner, lifted to
-/// level 3, padded 12/12/10/16. `place` sizes it.
-pub fn composer_card(palette: Palette, place: Grid, content: impl Into<View>) -> View {
+/// The composer card: the composer role, the extra-large corner, lifted
+/// to `elevation-1` (`shadow`, its owner's), padded 12/12/10/16. `place`
+/// sizes it.
+pub fn composer_card(
+    palette: Palette,
+    shadow: &ShadowHost,
+    place: Grid,
+    content: impl Into<View>,
+) -> View {
     lifted(
         palette,
-        crate::theme::elevation::Level::One,
+        shadow,
         radius::COMPOSER,
         place,
         Border::new()

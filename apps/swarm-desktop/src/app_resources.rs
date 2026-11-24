@@ -71,8 +71,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use windows_sys::core::BOOL;
 
 use crate::theme::{Rgb8, Roles, SHADOW_COLOR, Theme, state};
-use crate::ui::tokens::{height, layout, motion, radius, spacing, text};
-use crate::winrt::{Getter, InspectableSlots, get, winrt_interface};
+use crate::ui::tokens::{height, layout, motion, radius, spacing, switch, text, wave};
+use crate::winrt::{Getter, InspectableSlots, UiColor, get, winrt_interface};
 
 /// A theme resource value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,7 +130,6 @@ fn every(keys: &[&'static str], value: Value) -> Vec<(&'static str, Value)> {
 /// The WinUI keys this window sets for one color scheme, with their values.
 pub fn entries(s: &Roles) -> Vec<(&'static str, Value)> {
     let mut all = accent(s);
-    all.extend(lift(s));
     all.extend(buttons(s));
     all.extend(lists(s));
     all.extend(text_field(s));
@@ -138,33 +137,6 @@ pub fn entries(s: &Roles) -> Vec<(&'static str, Value)> {
     all.extend(selection_controls(s));
     all.extend(overlays(s));
     all
-}
-
-/// The brushes of the templates' drawn lift (`templates::LIFT_KEY` and
-/// friends): the theme's key and ambient shadow opacity (each band of
-/// `theme::elevation` takes its share), the ring of the true-black themes,
-/// the night themes' glow.
-fn lift(s: &Roles) -> Vec<(&'static str, Value)> {
-    use crate::theme::Lift;
-    let (key, ambient, ring) = match s.lift {
-        Lift::Shadow { key, ambient } => (
-            key.map(|opacity| layer(SHADOW_COLOR, opacity)),
-            ambient.map(|opacity| layer(SHADOW_COLOR, opacity)),
-            clear(s),
-        ),
-        Lift::Ring(color) => ([clear(s); 2], [clear(s); 2], opaque(color)),
-    };
-    let glow = s
-        .glow
-        .map_or(clear(s), |glow| layer(glow.color, glow.alpha));
-    vec![
-        (templates::LIFT_KEY[0], key[0]),
-        (templates::LIFT_KEY[1], key[1]),
-        (templates::LIFT_AMBIENT[0], ambient[0]),
-        (templates::LIFT_AMBIENT[1], ambient[1]),
-        (templates::LIFT_RING, ring),
-        (templates::GLOW, glow),
-    ]
 }
 
 /// The accent ramp and accent fills (checked boxes, progress, selection).
@@ -210,6 +182,10 @@ fn accent(s: &Roles) -> Vec<(&'static str, Value)> {
         // key (the Windows accent otherwise), and its track.
         ("ProgressRingForegroundThemeBrush", opaque(s.primary)),
         ("ProgressRingBackgroundThemeBrush", opaque(s.container)),
+        // The progress bar (`templates::progress_bar`): the wave or the
+        // determinate indicator in primary on the secondary-container track.
+        ("ProgressBarForeground", opaque(s.primary)),
+        ("ProgressBarBackground", opaque(s.selected)),
         // The M3 focus indicator: secondary, on the surface.
         ("FocusStrokeColorOuter", Value::Color(s.primary)),
         ("FocusStrokeColorInner", Value::Color(s.surface)),
@@ -701,85 +677,28 @@ fn selection_controls(s: &Roles) -> Vec<(&'static str, Value)> {
     all
 }
 
-/// Switches in M3 switch roles: selected, a primary track with an
-/// on-primary handle; unselected, a surface-container-highest track with an
-/// outline border and an outline handle; disabled at 12% / 38% on-surface.
+/// Switches in M3 switch roles, the keys the switch template
+/// (`templates::toggle_switch`) reads: off, a surface-container-highest
+/// track with an outline ring and an outline knob; on, a primary track with
+/// an on-primary knob; disabled at 12% / 38% on-surface.
 fn switches(s: &Roles) -> Vec<(&'static str, Value)> {
-    let mut all = every(
-        &[
-            "ToggleSwitchFillOn",
-            "ToggleSwitchStrokeOn",
-            "ToggleSwitchStrokeOnPointerOver",
-            "ToggleSwitchStrokeOnPressed",
-        ],
-        opaque(s.primary),
-    );
-    all.extend(every(
-        &[
-            "ToggleSwitchKnobFillOn",
-            "ToggleSwitchKnobFillOnPointerOver",
-            "ToggleSwitchKnobFillOnPressed",
-        ],
-        opaque(s.on_primary),
-    ));
-    all.extend([
+    let disabled_track = layer(s.text, state::DISABLED_CONTAINER);
+    let disabled_knob = layer(s.text, state::DISABLED_CONTENT);
+    vec![
         (
             "ToggleSwitchFillOff",
             opaque(rgb(s.scheme.surface_container_highest)),
         ),
-        (
-            "ToggleSwitchFillOnPointerOver",
-            opaque(s.primary.mix(s.on_primary, state::HOVER)),
-        ),
-        (
-            "ToggleSwitchFillOnPressed",
-            opaque(s.primary.mix(s.on_primary, state::PRESSED)),
-        ),
-        (
-            "ToggleSwitchFillOffPointerOver",
-            opaque(s.container.mix(s.text, state::HOVER)),
-        ),
-        (
-            "ToggleSwitchFillOffPressed",
-            opaque(s.container.mix(s.text, state::PRESSED)),
-        ),
-        (
-            "ToggleSwitchContentForegroundDisabled",
-            opaque(s.secondary_text),
-        ),
-        (
-            "ToggleSwitchHeaderForegroundDisabled",
-            opaque(s.secondary_text),
-        ),
-    ]);
-    all.extend(every(
-        &[
-            "ToggleSwitchStrokeOff",
-            "ToggleSwitchStrokeOffPointerOver",
-            "ToggleSwitchStrokeOffPressed",
-            "ToggleSwitchKnobFillOff",
-            "ToggleSwitchKnobFillOffPointerOver",
-            "ToggleSwitchKnobFillOffPressed",
-        ],
-        opaque(s.border),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchFillOnDisabled",
-            "ToggleSwitchStrokeOffDisabled",
-            "ToggleSwitchStrokeOnDisabled",
-        ],
-        layer(s.text, state::DISABLED_CONTAINER),
-    ));
-    all.extend(every(
-        &[
-            "ToggleSwitchKnobFillOffDisabled",
-            "ToggleSwitchKnobFillOnDisabled",
-        ],
-        layer(s.text, state::DISABLED_CONTENT),
-    ));
-    all.push(("ToggleSwitchFillOffDisabled", clear(s)));
-    all
+        ("ToggleSwitchStrokeOff", opaque(s.field_outline)),
+        ("ToggleSwitchKnobFillOff", opaque(s.field_outline)),
+        ("ToggleSwitchFillOn", opaque(s.primary)),
+        ("ToggleSwitchKnobFillOn", opaque(s.on_primary)),
+        ("ToggleSwitchFillOffDisabled", clear(s)),
+        ("ToggleSwitchStrokeOffDisabled", disabled_track),
+        ("ToggleSwitchFillOnDisabled", disabled_track),
+        ("ToggleSwitchKnobFillOffDisabled", disabled_knob),
+        ("ToggleSwitchKnobFillOnDisabled", disabled_knob),
+    ]
 }
 
 /// Menus and popups: menus on surface-container (M3 menu), the dialog on
@@ -929,11 +848,14 @@ pub fn dictionary_xaml(scheme: &Roles) -> String {
 /// - implicit `Button`: every labelled button, row, chip and segment
 ///   (control corner, 12-DIP content inset, 32 DIPs, body weight);
 /// - `SubtleButtonStyle`: icon buttons (control corner, no padding);
-/// - `TextBlockButtonStyle`: the one circle, the icon-only Send button;
+/// - `TextBlockButtonStyle`: the composer's 40-DIP square action;
 /// - `AccentButtonStyle`: suggestion cards and tool rows with hover lift.
 ///
-/// Switches carry no On/Off words and no 154-DIP minimum: a Manage
-/// models row ends in the bare switch (OpenCode's dialog).
+/// Switches are Google's 52 × 32 switch (`templates::toggle_switch`) with
+/// no On/Off words: a Manage models row ends in the bare switch
+/// (OpenCode's dialog). A progress bar is the brand book's wave
+/// (`templates::progress_bar`). `animations` is Windows' animation
+/// effects: off, every template change is instant and the wave is still.
 ///
 /// Text fields never offer Windows text
 /// prediction or spell check (`IsTextPredictionEnabled`,
@@ -942,7 +864,7 @@ pub fn dictionary_xaml(scheme: &Roles) -> String {
 /// corner and height, check boxes the M3 default corner, menu items the control
 /// height, menus the container corner and dialogs their larger corner. The
 /// native templates retain each control's focus, input and selection behavior.
-pub fn styles_xaml() -> String {
+pub fn styles_xaml(animations: bool) -> String {
     use templates::{Lift, Look, button};
     let (pill, field, container, dialog, check, fab_radius) = (
         radius::PILL,
@@ -973,21 +895,25 @@ pub fn styles_xaml() -> String {
     let template = |look: Look| {
         format!(
             "<Setter Property=\"Template\"><Setter.Value>{}</Setter.Value></Setter>",
-            button(look)
+            button(look, animations)
         )
     };
-    // Rows, chips, segments and labelled buttons: flat pills. Icon buttons
-    // use the same state animation on a circle.
+    // Rows, chips, segments and labelled buttons: flat pills whose corner
+    // goes to radius-small while pressed. Icon buttons use the same state
+    // animation on a circle.
     let flat = template(Look {
         lift: Lift::Flat,
         press: motion::PRESS_SCALE,
         radius: pill,
+        morph: true,
     });
-    // The FAB: level 1 at rest, 2 under the pointer, a press to 0.94.
+    // The composer's action: flat (its night glow is a shadow in the
+    // composer), a press to 0.94, the medium corner to radius-small.
     let fab = template(Look {
-        lift: Lift::Fab,
+        lift: Lift::Flat,
         press: motion::FAB_PRESS_SCALE,
         radius: fab_radius,
+        morph: true,
     });
     // Card pressables (suggestion cards, tool rows): the card corner,
     // lifting to level 1 under the pointer, a press to 0.97.
@@ -995,6 +921,7 @@ pub fn styles_xaml() -> String {
         lift: Lift::Hover,
         press: motion::PRESS_SCALE,
         radius: container,
+        morph: false,
     });
     // The transcript is the app's only ScrollView: anchored at its far
     // (bottom) edge, WinUI keeps it at the end while it is there and the
@@ -1074,6 +1001,12 @@ pub fn styles_xaml() -> String {
            <Setter Property=\"OnContent\" Value=\"\"/>\
            <Setter Property=\"OffContent\" Value=\"\"/>\
            <Setter Property=\"MinWidth\" Value=\"0\"/>\
+           <Setter Property=\"FocusVisualMargin\" Value=\"-{focus_ring}\"/>\
+           <Setter Property=\"Template\"><Setter.Value>{toggle_switch}</Setter.Value></Setter>\
+         </Style>\
+         <Style TargetType=\"ProgressBar\">\
+           <Setter Property=\"MinHeight\" Value=\"{wave_height}\"/>\
+           <Setter Property=\"Template\"><Setter.Value>{progress_bar}</Setter.Value></Setter>\
          </Style>\
          <Style TargetType=\"ContentDialog\">\
            {font}\
@@ -1135,19 +1068,24 @@ pub fn styles_xaml() -> String {
          </ResourceDictionary>",
         family = crate::fonts::families().text,
         font_size = text::BODY.size,
-        switch_width = layout::WINUI_SWITCH_PILL_WIDTH,
+        switch_width = switch::WIDTH,
+        focus_ring = layout::FOCUS_RING,
+        toggle_switch = templates::toggle_switch(animations),
+        wave_height = wave::HEIGHT,
+        progress_bar = templates::progress_bar(animations),
         combo_box = templates::combo_box(),
     )
 }
 
-/// Install the styles and the roles of the window's scheme (`None` under
-/// High Contrast). Called once, on the UI thread, after Reactor merged
-/// `XamlControlsResources` and before the first controls are created
-/// (Reactor's `on_launched` installs those resources, then mounts the
-/// component), so every control resolves these from its first template.
-pub fn install(scheme: Option<&Roles>) -> Result<(), String> {
+/// Install the styles (with Windows' animation effects on or off) and the
+/// roles of the window's scheme (`None` under High Contrast). Called once,
+/// on the UI thread, after Reactor merged `XamlControlsResources` and
+/// before the first controls are created (Reactor's `on_launched` installs
+/// those resources, then mounts the component), so every control resolves
+/// these from its first template.
+pub fn install(scheme: Option<&Roles>, animations: bool) -> Result<(), String> {
     native(|own| {
-        insert_parsed(own, &styles_xaml())?;
+        insert_parsed(own, &styles_xaml(animations))?;
         write_scheme(own, scheme)
     })
 }
@@ -1158,6 +1096,13 @@ pub fn install(scheme: Option<&Roles>) -> Result<(), String> {
 /// controls resolve the new values.
 pub fn apply_scheme(scheme: Option<&Roles>) -> Result<(), String> {
     native(|own| write_scheme(own, scheme))
+}
+
+/// Rewrite the styles when Windows turns animation effects on or off; the
+/// window then rebuilds its controls (the tree is keyed by the setting too),
+/// and the new controls take the new templates.
+pub fn apply_animations(animations: bool) -> Result<(), String> {
+    native(|own| insert_parsed(own, &styles_xaml(animations)))
 }
 
 type OwnEntries = IMap<IInspectable, IInspectable>;
@@ -1193,8 +1138,30 @@ fn symbols_xaml(scheme: Option<&Roles>) -> String {
     )
 }
 
+/// A card's lift for a scheme (`templates::LIFT_SHADOW`, `LIFT_RING`):
+/// WinUI's shadow in the shadowed themes, the 1-DIP `lift-ring` in the
+/// true-black ones, neither under High Contrast. Written for every scheme,
+/// as the card template reads both keys.
+fn lift_xaml(scheme: Option<&Roles>) -> String {
+    use crate::theme::Lift;
+    let (shadow, ring) = match scheme.map(|scheme| (scheme.lift, scheme.surface)) {
+        Some((Lift::Shadow(_), surface)) => (1, hex(surface, 0)),
+        Some((Lift::Ring(color), _)) => (0, hex(color, 255)),
+        None => (0, hex(SHADOW_COLOR, 0)),
+    };
+    format!(
+        "{XAML_ROOT}\
+         <x:Double x:Key=\"{shadow_key}\">{shadow}</x:Double>\
+         <SolidColorBrush x:Key=\"{ring_key}\" Color=\"{ring}\"/>\
+         </ResourceDictionary>",
+        shadow_key = templates::LIFT_SHADOW,
+        ring_key = templates::LIFT_RING,
+    )
+}
+
 fn write_scheme(own: &OwnEntries, scheme: Option<&Roles>) -> windows_core::Result<()> {
     insert_parsed(own, &symbols_xaml(scheme))?;
+    insert_parsed(own, &lift_xaml(scheme))?;
     match scheme {
         Some(scheme) => insert_parsed(own, &dictionary_xaml(scheme)),
         None => {
@@ -1299,36 +1266,6 @@ fn load_xaml(xaml: &str) -> windows_core::Result<IInspectable> {
     }
     // SAFETY: Load returned one owned reference.
     Ok(unsafe { IInspectable::from_raw(out) })
-}
-
-/// `Windows.UI.Color`, the value of the title bar's color properties.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct UiColor {
-    a: u8,
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl windows_core::imp::TypeKind for UiColor {
-    type TypeKind = windows_core::imp::CopyType;
-}
-
-impl windows_core::RuntimeType for UiColor {
-    const SIGNATURE: windows_core::imp::ConstBuffer =
-        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.UI.Color;u1;u1;u1;u1)");
-}
-
-impl From<Rgb8> for UiColor {
-    fn from(value: Rgb8) -> Self {
-        Self {
-            a: 255,
-            r: value.r,
-            g: value.g,
-            b: value.b,
-        }
-    }
 }
 
 /// `IAppWindowTitleBar` setter slots (`Microsoft.UI.winmd`, Windows App SDK

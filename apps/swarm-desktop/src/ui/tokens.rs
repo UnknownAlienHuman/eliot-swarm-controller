@@ -24,6 +24,8 @@ pub mod radius {
     pub const PILL: f64 = super::height::CONTROL / 2.0;
     /// A chip or segment.
     pub const CHIP: f64 = brand::RADIUS_SMALL;
+    /// Every button and icon button while pressed.
+    pub const PRESSED: f64 = brand::RADIUS_SMALL;
     /// The composer's 40-DIP main action and New task.
     pub const FAB: f64 = brand::RADIUS_MEDIUM;
     /// The header's 24-DIP status pill: full.
@@ -139,22 +141,68 @@ pub mod icon {
     pub const STOP: f64 = brand::SIZE_STOP_MARK;
 }
 
-/// The brand book's motion (Material 3 Expressive springs; until they run
-/// as springs, their settle times with the emphasized easing): state
-/// colors and the press feedback on effects-fast (a storyboard over the
-/// 347-ms spatial-fast settle time would read as a slow press; the press
-/// morph moves to the spatial-fast spring with the motion increment), the
-/// ripple on effects-slow. A popover's entrance is its WinUI flyout's own.
+/// The brand book's motion (Material 3 Expressive springs), which the
+/// control templates sample into key frames: the press scale, the pressed
+/// corner and the switch's knob on spatial-fast, state layers on
+/// effects-fast; the ripple grows on effects-slow's settle time with the
+/// emphasized easing. A popover's entrance is its WinUI flyout's own.
 pub mod motion {
     use super::brand;
 
-    pub const STATE_MS: u64 = brand::EFFECTS_FAST_MS;
-    pub const PRESS_MS: u64 = brand::EFFECTS_FAST_MS;
+    /// A Material spring: damping ratio, stiffness (unit mass, per second
+    /// squared) and its settle time, the brand book's `-ms` token.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct Spring {
+        pub damping: f64,
+        pub stiffness: f64,
+        pub settle_ms: u64,
+    }
+
+    /// Press changes of buttons, switches and segments.
+    pub const SPATIAL_FAST: Spring = Spring {
+        damping: brand::SPATIAL_FAST_DAMPING,
+        stiffness: brand::SPATIAL_FAST_STIFFNESS,
+        settle_ms: brand::SPATIAL_FAST_MS,
+    };
+    /// State layers, hover and press colors.
+    pub const EFFECTS_FAST: Spring = Spring {
+        damping: brand::EFFECTS_FAST_DAMPING,
+        stiffness: brand::EFFECTS_FAST_STIFFNESS,
+        settle_ms: brand::EFFECTS_FAST_MS,
+    };
     pub const RIPPLE_MS: u64 = brand::EFFECTS_SLOW_MS;
     pub const PRESS_SCALE: f64 = brand::SCALE_PRESS;
     pub const FAB_PRESS_SCALE: f64 = brand::SCALE_PRESS_ACTION;
     pub const EMPHASIZED: &str = crate::brand::EASING_EMPHASIZED;
     pub const DECELERATE: &str = crate::brand::EASING_EMPHASIZED_DECELERATE;
+    /// The wave indicator's travel of one period.
+    pub const WAVE_MS: u64 = brand::WAVE_MS;
+}
+
+/// The switch: Google's 52 × 32 track, a 16-DIP knob off, 24 on and 28
+/// while pressed, a 2-DIP outline off, and the knob's state layer at the
+/// pointer target's size.
+pub mod switch {
+    use super::brand;
+
+    pub const WIDTH: f64 = brand::SIZE_SWITCH_WIDTH;
+    pub const HEIGHT: f64 = brand::SIZE_SWITCH_HEIGHT;
+    pub const KNOB: f64 = brand::SIZE_SWITCH_KNOB;
+    pub const KNOB_ON: f64 = brand::SIZE_SWITCH_KNOB_ON;
+    pub const KNOB_PRESSED: f64 = brand::SIZE_SWITCH_KNOB_PRESSED;
+    pub const OUTLINE: f64 = brand::SIZE_SWITCH_OUTLINE;
+    pub const STATE_LAYER: f64 = brand::SIZE_TARGET;
+}
+
+/// The wave indicator of a running turn and the straight track under it
+/// (and under a determinate bar).
+pub mod wave {
+    use super::brand;
+
+    pub const HEIGHT: f64 = brand::SIZE_WAVE_HEIGHT;
+    pub const LENGTH: f64 = brand::SIZE_WAVE_LENGTH;
+    pub const STROKE: f64 = brand::SIZE_WAVE_STROKE;
+    pub const TRACK: f64 = brand::SIZE_PROGRESS_TRACK;
 }
 
 /// State layers of the content color over a container.
@@ -282,13 +330,9 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
-    /// Layout exception, not a brand value: a bare switch is sized to the
-    /// pill WinUI's own ToggleSwitch template draws (40 DIPs; the template
-    /// keeps a 154-DIP content area after it). The brand book's 52 × 32
-    /// switch (`size-switch-width`, `size-switch-height`) needs the
-    /// re-templated style of the D11 styles increment, which then takes the
-    /// tokens and removes this constant.
-    pub const WINUI_SWITCH_PILL_WIDTH: f64 = 40.0;
+    /// How far the drawn wave reaches: the widest indeterminate bar it
+    /// fills (a 4K screen at 100 %); a bar clips it to its own width.
+    pub const WAVE_SPAN: f64 = 3840.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = crate::brand::SIZE_RING_SM;
     /// The composer's usage ring.

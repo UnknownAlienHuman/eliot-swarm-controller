@@ -56,7 +56,7 @@ that actually extracts code; do not install all these projects as dependencies.
 
 **Pattern only**, no code copied and no dependency added: the button template,
 shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.rs`,
-`theme::elevation` and `ui::tokens`.
+`shadow.rs` and `ui::tokens`.
 
 - [material-web](https://github.com/material-components/material-web) (`main`),
   Apache-2.0: the elevation levels of `elevation/internal/_elevation.scss` (key
@@ -69,11 +69,17 @@ shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.
   (license checked 2026-11-19): the pattern of Material styles as WinUI control
   templates over lightweight-styling keys. Its XAML is not imported: the
   desktop's templates read its own button families' keys.
-- WinUI's `ThemeShadow` was tried first and draws nothing outside a popup
-  without receivers (observed live), so shadows are drawn: each CSS
-  `box-shadow` of the design as its Gaussian falloff (σ = blur / 2) in
-  non-overlapping 1-DIP bands (`theme::elevation::bands`), checked against
-  the design board rendered by Edge (within 0.01 alpha per pixel).
+- **Shadows (D11, 2026-11-24, pattern only):** WinUI's `ThemeShadow` takes no
+  color or opacity; in the tree it now draws without receivers (observed
+  live on Windows App SDK WinUI 2.3.0; an earlier round saw nothing), and
+  the card template's hover lift uses it. The composer's `elevation-1` and
+  the night glow are Composition `DropShadow`s on Reactor's composition host
+  (`apps/swarm-desktop/src/shadow.rs`), after the pattern of the Windows
+  Community Toolkit's `AttachedCardShadow`
+  ([CommunityToolkit/Windows](https://github.com/CommunityToolkit/Windows),
+  MIT): a brushless sprite whose shadow is masked by a rounded rectangle
+  rendered through a `CompositionVisualSurface`. No code copied. The drawn
+  1-DIP bands they replace are removed.
 - **Extract (2026-11-21):** WinUI's default ComboBox `ControlTemplate`
   ([microsoft/microsoft-ui-xaml](https://github.com/microsoft/microsoft-ui-xaml)
   `controls/dev/ComboBox/ComboBox_themeresources.xaml` at `7cc6dcc1`, MIT,

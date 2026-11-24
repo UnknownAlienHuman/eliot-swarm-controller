@@ -184,8 +184,6 @@ pub(super) enum ShellMsg {
     StartupChosen(Startup),
     /// The re-created editors of this re-prime exist: give them their text.
     FieldsPrimed(u64),
-    /// The periodic High Contrast reading.
-    HighContrastRead(bool),
     /// Expand (true) or collapse an Agent's children.
     ExpandToggled(String, bool),
     /// Tree epoch, manager id and its direct-children page.
@@ -203,10 +201,6 @@ pub(super) enum ShellMsg {
     SidebarToggled,
 }
 
-/// Reactor 0.100.0 reports the window's Light/Dark scheme only, and a High
-/// Contrast theme can keep the same base scheme, so High Contrast is read
-/// at the monitor's cadence.
-const HIGH_CONTRAST_POLL_MS: u64 = 2_000;
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
 /// The sidebar's padding around its rows.
@@ -248,10 +242,12 @@ fn window_theme(choice: ThemeChoice) -> WindowTheme {
     }
 }
 
-/// The scheme the window actually shows, and High Contrast.
+/// The scheme the window actually shows, High Contrast, and whether
+/// Windows plays animations (the control templates' motion).
 pub(super) struct Appearance {
     pub(super) dark: bool,
     pub(super) high_contrast: bool,
+    pub(super) animations: bool,
 }
 
 impl Appearance {
@@ -259,6 +255,7 @@ impl Appearance {
         Self {
             dark: false,
             high_contrast: crate::accessibility::high_contrast_on(),
+            animations: crate::accessibility::animations_on(),
         }
     }
 
@@ -879,14 +876,6 @@ impl DesktopApp {
                     }
                 }
             }
-            ShellMsg::HighContrastRead(on) => {
-                if on != self.appearance.high_contrast {
-                    self.appearance.high_contrast = on;
-                    self.apply_scheme();
-                    self.reprime_fields(context);
-                }
-                self.watch_high_contrast(context);
-            }
             ShellMsg::ThemeChosen(theme) => {
                 let before = self.palette();
                 self.prefs.theme = theme;
@@ -1009,6 +998,12 @@ impl DesktopApp {
                         self.launch_update(LaunchMsg::Closed(epoch), context);
                         self.menu_update(MenuMsg::Closed(epoch), context);
                     }
+                    // Windows changed High Contrast or animation effects:
+                    // before the dialog arm, as the window follows either way.
+                    Shortcut::Accessibility {
+                        high_contrast,
+                        animations,
+                    } => self.accessibility_changed(high_contrast, animations, context),
                     // Before the dialog arm: the notice shows either way.
                     Shortcut::Panicked => {
                         self.alert(
@@ -1166,10 +1161,35 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         if self.palette() != before {
-            // The palette-keyed tree is rebuilt with new controls (an empty
-            // search box among them).
-            self.nav.search = Search::default();
+            // The palette-keyed tree is rebuilt with new controls; what was
+            // typed stays in the model and is drawn into them (the search
+            // text at once, the multi-line editors after a re-prime).
             self.apply_scheme();
+            self.reprime_fields(context);
+        }
+    }
+
+    /// Windows changed High Contrast or animation effects (Reactor 0.100.0
+    /// reports neither; `crate::shortcuts` hears Windows announce it).
+    /// Either rebuilds the tree, keyed by both, with new controls that keep
+    /// what was typed.
+    fn accessibility_changed(
+        &mut self,
+        high_contrast: bool,
+        animations: bool,
+        context: &ComponentContext<Self>,
+    ) {
+        if high_contrast != self.appearance.high_contrast {
+            self.appearance.high_contrast = high_contrast;
+            self.apply_scheme();
+            self.reprime_fields(context);
+        }
+        if animations != self.appearance.animations {
+            // New templates, which only new controls take.
+            self.appearance.animations = animations;
+            if let Err(error) = crate::app_resources::apply_animations(animations) {
+                self.set_status(format!("WinUI motion not applied: {error}"));
+            }
             self.reprime_fields(context);
         }
     }
@@ -1752,24 +1772,6 @@ impl DesktopApp {
         }
     }
 
-    /// Read High Contrast at its cadence and report only a change. Every
-    /// message re-renders the whole window (k209 measured 30 ms per render,
-    /// 70 ms with a 588-item chat open), so an unchanged reading posts
-    /// nothing.
-    pub(super) fn watch_high_contrast(&self, context: &ComponentContext<Self>) {
-        let shown = self.appearance.high_contrast;
-        let _task = context.spawn_background(move |cancel| {
-            let cancelled = || cancel.is_cancelled();
-            loop {
-                let ran = feed::backoff(HIGH_CONTRAST_POLL_MS, &cancelled);
-                let on = crate::accessibility::high_contrast_on();
-                if on != shown || !ran {
-                    return Message::Shell(ShellMsg::HighContrastRead(on));
-                }
-            }
-        });
-    }
-
     /// The main area's width from the window width, the sidebar (its rail
     /// when hidden, the Settings navigation in its place) and the open
     /// panel, or None until the first size observation.
@@ -2222,9 +2224,18 @@ impl DesktopApp {
         // the new palette. Keying the tree by palette rebuilds the native
         // controls on a scheme switch (rare) so every button takes the new
         // overrides; all view state is model-bound and is redrawn as it was.
-        let palette_key = palette.roles().map_or_else(
-            || "high-contrast".to_owned(),
-            |roles| format!("{:?}", roles.theme),
+        // Animation effects key it too: their templates are new styles.
+        let palette_key = format!(
+            "{}:{}",
+            palette.roles().map_or_else(
+                || "high-contrast".to_owned(),
+                |roles| format!("{:?}", roles.theme)
+            ),
+            if self.appearance.animations {
+                "motion"
+            } else {
+                "still"
+            },
         );
         Grid::new().keyed_children(vec![KeyedView::new(palette_key, window)])
     }

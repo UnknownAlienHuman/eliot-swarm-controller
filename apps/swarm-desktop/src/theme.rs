@@ -14,149 +14,6 @@
 #[cfg(windows)]
 pub use crate::tokens::state;
 
-/// The design's elevation: level 1 (the main card, the composer, a
-/// pressable under the pointer) and 2 (menus, popovers, the composer's
-/// action under the pointer), each
-/// Material Components' key and ambient shadow (offset, blur, spread, as
-/// CSS `box-shadow`). WinUI's `ThemeShadow` draws nothing outside a popup
-/// without receivers, so each shadow is drawn as the blur CSS renders: a
-/// Gaussian falloff (σ = blur / 2) centred on the spread edge, in 1-DIP
-/// bands that never overlap (a filled core, then rings), so a band's alpha
-/// is exactly its share of the theme's opacity and the falloff reads as
-/// one smooth shadow. The theme's [`super::Lift`] sets the opacity, or
-/// replaces the shadow with a 1-DIP ring.
-pub mod elevation {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum Level {
-        One,
-        Two,
-    }
-
-    /// One shadow in DIPs, as CSS `box-shadow` takes it (no x offset).
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Shadow {
-        pub offset: f64,
-        pub blur: f64,
-        pub spread: f64,
-    }
-
-    impl Level {
-        /// 0 for level 1, 1 for level 2.
-        pub const fn index(self) -> usize {
-            match self {
-                Level::One => 0,
-                Level::Two => 1,
-            }
-        }
-
-        /// The brand book's layers of this level in each theme (key first,
-        /// then ambient; one ring in the true-black themes).
-        pub const fn layers(self) -> [&'static [crate::brand::Shadow]; 6] {
-            match self {
-                Level::One => crate::brand::ELEVATION_1,
-                Level::Two => crate::brand::ELEVATION_2,
-            }
-        }
-    }
-
-    /// The key and the ambient shadow of `level`, as the brand book draws
-    /// them in the Light theme (every shadowed theme shares the geometry;
-    /// only the opacity differs, see [`super::Lift`]).
-    pub fn shadows(level: Level) -> [Shadow; 2] {
-        let geometry = |layer: &crate::brand::Shadow| Shadow {
-            offset: layer.y,
-            blur: layer.blur,
-            spread: layer.spread,
-        };
-        match level.layers()[0] {
-            [key, ambient, ..] => [geometry(key), geometry(ambient)],
-            _ => {
-                [Shadow {
-                    offset: 0.0,
-                    blur: 0.0,
-                    spread: 0.0,
-                }; 2]
-            }
-        }
-    }
-
-    /// The bands of `level`'s key and ambient shadows ([`bands`]), worked
-    /// out once per level: the in-tree lifts draw them on every render.
-    pub fn level_bands(level: Level) -> &'static [Vec<Band>; 2] {
-        static CACHE: [std::sync::OnceLock<[Vec<Band>; 2]>; 2] =
-            [const { std::sync::OnceLock::new() }; 2];
-        CACHE[level.index()].get_or_init(|| shadows(level).map(bands))
-    }
-
-    /// The night themes' glow around the composer's action: a centred blur
-    /// of `radius`.
-    pub const fn glow(radius: f64) -> Shadow {
-        Shadow {
-            offset: 0.0,
-            blur: radius,
-            spread: 0.0,
-        }
-    }
-
-    /// One drawn band of a shadow: its outer edge `reach` DIPs past the
-    /// element (negative inside it), its `width` (`None` for the filled
-    /// core), how far it falls and its share (0–1) of the shadow's opacity.
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    pub struct Band {
-        pub reach: f64,
-        pub width: Option<f64>,
-        pub offset: f64,
-        pub share: f64,
-    }
-
-    /// The standard normal distribution function (Abramowitz and Stegun
-    /// 7.1.26, absolute error below 1.5e-7).
-    fn phi(x: f64) -> f64 {
-        let z = x.abs() / std::f64::consts::SQRT_2;
-        let t = 1.0 / (1.0 + 0.327_591_1 * z);
-        let poly = t
-            * (0.254_829_592
-                + t * (-0.284_496_736
-                    + t * (1.421_413_741 + t * (-1.453_152_027 + t * 1.061_405_429))));
-        let erf = 1.0 - poly * (-z * z).exp();
-        0.5 * (1.0 + if x < 0.0 { -erf } else { erf })
-    }
-
-    /// `shadow` as 1-DIP bands: the core is filled from where the shadow
-    /// first shows past the element (its bottom edge, where the drop
-    /// uncovers it), then a ring per DIP out to the end of the blur. Each
-    /// band carries the falloff at its middle.
-    pub fn bands(shadow: Shadow) -> Vec<Band> {
-        let Shadow {
-            offset,
-            blur,
-            spread,
-        } = shadow;
-        let band = |edge: f64, width: Option<f64>| Band {
-            reach: spread + edge,
-            width,
-            offset,
-            share: if blur > 0.0 {
-                1.0 - phi((edge - 0.5) / (blur / 2.0))
-            } else {
-                1.0
-            },
-        };
-        let end = blur.ceil();
-        // Bands wholly under the element never show: start at the first
-        // edge past the drop (the element covers the shadow up to
-        // `spread + offset` inside its bottom edge).
-        let core = (-end).max((-(spread + offset)).floor() + 1.0).min(end);
-        let mut out = vec![band(core, None)];
-        let mut edge = core + 1.0;
-        while edge <= end {
-            out.push(band(edge, Some(1.0)));
-            edge += 1.0;
-        }
-        out
-    }
-}
-
 /// An opaque sRGB color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb8 {
@@ -229,22 +86,16 @@ impl Theme {
     }
 }
 
-/// How raised things lift off their surface: the brand book's shadows at
-/// each level's key and ambient opacity (index 0 is level 1), or
-/// (true-black themes) a hairline ring.
+/// How raised things lift off their surface, as the brand book draws
+/// `elevation-1` (the main card, the composer, a pressable under the
+/// pointer): Material's key and ambient shadow (offset, blur, spread and
+/// color as CSS `box-shadow`), drawn as real Composition shadows by
+/// `crate::shadow`; or, in the true-black themes, a 1-DIP ring. Menus,
+/// popovers and dialogs keep WinUI's own `ThemeShadow`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lift {
-    Shadow { key: [f64; 2], ambient: [f64; 2] },
+    Shadow(&'static [crate::brand::Shadow]),
     Ring(Rgb8),
-}
-
-/// A glow around the FAB (the night themes), drawn like a blur: `color`
-/// at `alpha` reaching `radius` DIPs past the circle.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Glow {
-    pub color: Rgb8,
-    pub alpha: f64,
-    pub radius: f64,
 }
 
 /// One theme's roles: the brand book's color tokens ([`crate::brand::Scheme`])
@@ -304,7 +155,9 @@ pub struct Roles {
     pub attention_container: Rgb8,
     pub on_attention_container: Rgb8,
     pub lift: Lift,
-    pub glow: Option<Glow>,
+    /// The night themes' glow behind the composer's main action
+    /// (`glow-shadow`); empty in the other themes.
+    pub glow: &'static [crate::brand::Shadow],
     /// A tool row or suggestion card (`surface-container-low`).
     pub tonal: Rgb8,
     /// A running tool row (`surface-container-high`).
@@ -333,29 +186,13 @@ impl Roles {
         let s = crate::brand::SCHEMES[index];
         let primary = rgb(s.primary);
         let dark = theme.dark();
-        // A hairline ring in the true-black themes, else each level's key
-        // and ambient shadow opacities.
-        let opacities = |layers: &[crate::brand::Shadow]| match layers {
-            [key, ambient, ..] => Some((alpha(key.color), alpha(ambient.color))),
-            _ => None,
+        // A true-black theme's level is one layer without blur or offset
+        // (`0 0 0 1px`): the ring. Every other theme's is its shadows.
+        let lift = match crate::brand::ELEVATION_1[index] {
+            [ring] if ring.blur == 0.0 && ring.y == 0.0 => Lift::Ring(rgb(ring.color)),
+            layers => Lift::Shadow(layers),
         };
-        let lift = match (
-            crate::brand::ELEVATION_1[index],
-            opacities(crate::brand::ELEVATION_1[index]),
-            opacities(crate::brand::ELEVATION_2[index]),
-        ) {
-            (_, Some((key1, ambient1)), Some((key2, ambient2))) => Lift::Shadow {
-                key: [key1, key2],
-                ambient: [ambient1, ambient2],
-            },
-            ([ring, ..], ..) => Lift::Ring(rgb(ring.color)),
-            _ => Lift::Ring(rgb(s.outline_variant)),
-        };
-        let glow = crate::brand::GLOW_SHADOW[index].first().map(|shadow| Glow {
-            color: rgb(shadow.color),
-            alpha: alpha(shadow.color),
-            radius: shadow.blur,
-        });
+        let glow = crate::brand::GLOW_SHADOW[index];
         let accent_ramp = if dark {
             [
                 primary.mix(BLACK, 0.8),
