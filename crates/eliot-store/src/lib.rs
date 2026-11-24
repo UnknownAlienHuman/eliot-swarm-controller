@@ -6615,6 +6615,15 @@ fn decode_pending_request(
     })
 }
 
+fn stale_generation_requests(tx: &Transaction<'_>, agent: i64, generation: i64) -> Result<()> {
+    db!(tx.execute(
+        "UPDATE pending_requests SET state = 'stale'
+         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
+        params![agent, generation],
+    ));
+    Ok(())
+}
+
 fn load_pending_request(
     connection: &Connection,
     agent: i64,

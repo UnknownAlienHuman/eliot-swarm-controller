@@ -1685,11 +1685,7 @@ pub(super) fn transition_lost_tx(
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
     ));
-    db!(tx.execute(
-        "UPDATE pending_requests SET state = 'stale'
-         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
-        params![agent_num, generation],
-    ));
+    stale_generation_requests(tx, agent_num, generation)?;
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'stale', updated_at = ?1
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
@@ -1855,11 +1851,7 @@ fn fail_start_tx(
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
     ));
-    db!(tx.execute(
-        "UPDATE pending_requests SET state = 'stale'
-         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
-        params![agent_num, generation],
-    ));
+    stale_generation_requests(tx, agent_num, generation)?;
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', health = 'error', updated_at = ?1
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",
@@ -2059,11 +2051,7 @@ fn stop_agent_tx(
          WHERE id = ?2 AND generation = ?3",
         params![now, agent_num, generation],
     ));
-    db!(tx.execute(
-        "UPDATE pending_requests SET state = 'stale'
-         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
-        params![agent_num, generation],
-    ));
+    stale_generation_requests(tx, agent_num, generation)?;
     db!(tx.execute(
         "UPDATE source_state SET state = 'closed', updated_at = ?1
          WHERE agent = ?2 AND generation = ?3 AND source NOT IN ('os', 'git', 'workspace_process')",

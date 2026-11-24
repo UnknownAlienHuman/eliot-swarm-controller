@@ -977,11 +977,7 @@ fn verify_frozen_registration(
     registration: &ProjectRegistrationView,
 ) -> Result<()> {
     registration.validate()?;
-    if registration.id != frozen.repository
-        || registration.revision != frozen.registration_revision
-        || registration.checkout != frozen.canonical_checkout
-        || registration.repo_common_dir != frozen.common_dir
-    {
+    if !frozen.matches_registration(registration) {
         return Err(Error::new(
             "not_allowed",
             "git.publish registration snapshot is stale",

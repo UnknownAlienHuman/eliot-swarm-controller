@@ -3,8 +3,8 @@
 //! These DTOs are pure data. Repository registration, transport construction,
 //! process ownership, Store admission, and effect settlement belong to callers.
 
-use super::agent_views::ProjectGitHubCliView;
-use crate::{Error, FrozenSetupFile, Result};
+use super::agent_views::{ProjectGitHubCliView, ProjectRegistrationView};
+use crate::{Agent, Error, FrozenSetupFile, Result, WorkspacePhase, WorkspacePreparation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
@@ -264,6 +264,35 @@ pub struct FrozenGitPublish {
 }
 
 impl FrozenGitPublish {
+    pub fn matches_registration(&self, registration: &ProjectRegistrationView) -> bool {
+        registration.id == self.repository
+            && registration.revision == self.registration_revision
+            && registration.checkout == self.canonical_checkout
+            && registration.repo_common_dir == self.common_dir
+    }
+
+    pub fn matches_managed_workspace(
+        &self,
+        registration: &ProjectRegistrationView,
+        agent: &Agent,
+        workspace: &WorkspacePreparation,
+    ) -> bool {
+        agent.id == self.agent
+            && agent.generation == self.generation
+            && agent.active_turn.is_none()
+            && agent.workspace.as_deref() == Some(self.workspace.as_str())
+            && workspace.agent == self.agent
+            && workspace.target_generation == self.generation
+            && workspace.phase == WorkspacePhase::Ready
+            && workspace.worktree_path == self.workspace
+            && workspace.worktree_path != registration.checkout
+            && workspace.project == registration.checkout
+            && workspace.repo_path == registration.checkout
+            && workspace.repo_common_dir == registration.repo_common_dir
+            && workspace.base_oid == self.base_oid
+            && workspace.requested_branch == self.branch
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_publish_literal(&self.repository, "repository", 128)?;
         self.check.validate()?;

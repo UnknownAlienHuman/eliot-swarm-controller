@@ -399,7 +399,7 @@ impl Store {
                 rule_action_binding_error(&trigger, action.event_seq, action_request)
             };
             if let Some(code) = binding_error {
-                rejected.push((action.event_seq, Error::new(code.clone(), code)));
+                rejected.push((action.event_seq, Error::new(code, code)));
                 continue;
             }
             if should_suppress_own_event_send_or_run_tx(

@@ -87,7 +87,7 @@ use eliot_core::{
     Agent, AgentOrigin, AgentState, Command, CommandState, Error, Event, FrozenScriptContext,
     FrozenScriptRun, NativeStoreBinding, Result, RunDefinitionArgs, ScriptProcessResult,
     SecretPolicy, SessionUsage, SubmitCommand, Turn, TurnOutcome, TurnState, WorkspacePhase,
-    WorkspacePreparationInput,
+    WorkspacePreparation, WorkspacePreparationInput,
     api::{
         AgentConfigView, AgentDiscoverRequest, AgentEditsRequest, AgentEditsResponse,
         AgentGetRequest, AgentGetResponse, AgentGitRequest, AgentGitResponse, AgentHistoryRequest,
@@ -104,12 +104,13 @@ use eliot_core::{
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
         ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
-        ObserveHeavyResponse, ProcessPageCursor, ProjectDiscoverRequest, ProjectRegistrationView,
-        ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest, RuleStateView,
-        SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode,
-        SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView,
-        TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult, WorkSummaryView,
-        WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap, is_supported_harness,
+        ObserveHeavyResponse, ProcessPageCursor, ProjectCheckPassed, ProjectDiscoverRequest,
+        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
+        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
+        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
+        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, WaitEntryResult,
+        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        is_supported_harness,
     },
 };
 use eliot_plugin::{MAX_EVENT_BYTES, sync::LockExt};
@@ -2543,32 +2544,14 @@ impl Router {
                 "git.publish project differs from its saved rule principal",
             ));
         }
-        let (registration, agent, workspace, event) = {
-            let store = self.inner.store.lock().await;
-            let registration = store
-                .get_project_registration("owner", &trigger.repository)?
-                .ok_or_else(|| {
-                    Error::new("not_allowed", "git.publish project is not registered")
-                })?;
-            let agent = store.get_agent(&trigger.agent)?.ok_or_else(|| {
-                Error::new("not_allowed", "git.publish Agent is no longer retained")
-            })?;
-            let workspace = store.get_workspace(&trigger.agent)?.ok_or_else(|| {
-                Error::new("not_allowed", "git.publish managed workspace is absent")
-            })?;
-            let mut events = store.read_events(
-                trigger.source_event_seq - 1,
-                1,
-                Some(trigger.source_event_seq),
-            )?;
-            let event = events
-                .pop()
-                .filter(|event| event.seq == trigger.source_event_seq)
-                .ok_or_else(|| {
-                    Error::new("not_found", "git.publish check event is not retained")
-                })?;
-            (registration, agent, workspace, event)
-        };
+        let (registration, agent, workspace, event) = self
+            .load_git_publish_facts(
+                &trigger.repository,
+                &trigger.agent,
+                trigger.source_event_seq,
+                "git.publish Agent is no longer retained",
+            )
+            .await?;
         if &registration != saved.as_ref()
             || expected_registration.is_some_and(|expected| expected != &registration)
             || event.kind != "project.check.passed"
@@ -2585,14 +2568,7 @@ impl Router {
                 "git.publish no longer matches its successful project check event",
             ));
         }
-        let check = serde_json::from_value::<eliot_core::api::ProjectCheckPassed>(event.data)
-            .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
-        if check != trigger.check {
-            return Err(Error::new(
-                "not_allowed",
-                "git.publish check evidence differs from its retained event",
-            ));
-        }
+        Self::verify_git_publish_check(event.data, &trigger.check)?;
         let frozen: FrozenGitPublish =
             crate::publication::freeze(&registration, &agent, &workspace, trigger).await?;
         request.args = serde_json::to_value(frozen)
@@ -2603,54 +2579,20 @@ impl Router {
 
     pub(crate) async fn verify_git_publish_state(&self, frozen: &FrozenGitPublish) -> Result<()> {
         frozen.validate()?;
-        let (registration, agent, workspace, event) = {
-            let store = self.inner.store.lock().await;
-            let registration = store
-                .get_project_registration("owner", &frozen.repository)?
-                .ok_or_else(|| {
-                    Error::new("not_allowed", "git.publish project is not registered")
-                })?;
-            let agent = store
-                .get_agent(&frozen.agent)?
-                .ok_or_else(|| Error::new("not_allowed", "git.publish Agent is not retained"))?;
-            let workspace = store.get_workspace(&frozen.agent)?.ok_or_else(|| {
-                Error::new("not_allowed", "git.publish managed workspace is absent")
-            })?;
-            let mut events = store.read_events(
-                frozen.source_event_seq - 1,
-                1,
-                Some(frozen.source_event_seq),
-            )?;
-            let event = events
-                .pop()
-                .filter(|event| event.seq == frozen.source_event_seq)
-                .ok_or_else(|| {
-                    Error::new("not_found", "git.publish check event is not retained")
-                })?;
-            (registration, agent, workspace, event)
-        };
-        if registration.id != frozen.repository
-            || registration.revision != frozen.registration_revision
-            || registration.checkout != frozen.canonical_checkout
-            || registration.repo_common_dir != frozen.common_dir
+        let (registration, agent, workspace, event) = self
+            .load_git_publish_facts(
+                &frozen.repository,
+                &frozen.agent,
+                frozen.source_event_seq,
+                "git.publish Agent is not retained",
+            )
+            .await?;
+        if !frozen.matches_registration(&registration)
             || !registration
                 .actions
                 .iter()
                 .any(|action| action == "git.publish")
-            || agent.id != frozen.agent
-            || agent.generation != frozen.generation
-            || agent.active_turn.is_some()
-            || agent.workspace.as_deref() != Some(frozen.workspace.as_str())
-            || workspace.agent != frozen.agent
-            || workspace.target_generation != frozen.generation
-            || workspace.phase != WorkspacePhase::Ready
-            || workspace.worktree_path != frozen.workspace
-            || workspace.worktree_path == registration.checkout
-            || workspace.project != registration.checkout
-            || workspace.repo_path != registration.checkout
-            || workspace.repo_common_dir != registration.repo_common_dir
-            || workspace.base_oid != frozen.base_oid
-            || workspace.requested_branch != frozen.branch
+            || !frozen.matches_managed_workspace(&registration, &agent, &workspace)
             || event.kind != "project.check.passed"
             || event.agent.as_deref() != Some(frozen.agent.as_str())
             || event.generation != Some(frozen.generation)
@@ -2665,9 +2607,38 @@ impl Router {
                 "git.publish project-check state changed before its effect",
             ));
         }
-        let check = serde_json::from_value::<eliot_core::api::ProjectCheckPassed>(event.data)
+        Self::verify_git_publish_check(event.data, &frozen.check)
+    }
+
+    async fn load_git_publish_facts(
+        &self,
+        repository: &str,
+        agent: &str,
+        event_seq: i64,
+        missing_agent: &str,
+    ) -> Result<(ProjectRegistrationView, Agent, WorkspacePreparation, Event)> {
+        let store = self.inner.store.lock().await;
+        let registration = store
+            .get_project_registration("owner", repository)?
+            .ok_or_else(|| Error::new("not_allowed", "git.publish project is not registered"))?;
+        let agent_record = store
+            .get_agent(agent)?
+            .ok_or_else(|| Error::new("not_allowed", missing_agent))?;
+        let workspace = store
+            .get_workspace(agent)?
+            .ok_or_else(|| Error::new("not_allowed", "git.publish managed workspace is absent"))?;
+        let event = store
+            .read_events(event_seq - 1, 1, Some(event_seq))?
+            .pop()
+            .filter(|event| event.seq == event_seq)
+            .ok_or_else(|| Error::new("not_found", "git.publish check event is not retained"))?;
+        Ok((registration, agent_record, workspace, event))
+    }
+
+    fn verify_git_publish_check(data: Value, expected: &ProjectCheckPassed) -> Result<()> {
+        let check: ProjectCheckPassed = serde_json::from_value(data)
             .map_err(|_| Error::new("source_integrity", "project check event data is invalid"))?;
-        if check != frozen.check {
+        if &check != expected {
             return Err(Error::new(
                 "not_allowed",
                 "git.publish check evidence differs from its retained event",

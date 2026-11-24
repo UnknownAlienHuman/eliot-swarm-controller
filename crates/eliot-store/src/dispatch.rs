@@ -300,11 +300,7 @@ fn dispatch_resume_tx(
          WHERE agent = ?2 AND generation = ?3 AND state = 'open' AND source NOT IN ('os', 'git', 'workspace_process')",
         params![now, agent_num, agent.generation],
     ));
-    db!(tx.execute(
-        "UPDATE pending_requests SET state = 'stale'
-         WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
-        params![agent_num, agent.generation],
-    ));
+    stale_generation_requests(tx, agent_num, agent.generation)?;
     let token = format!("{}{}", Ulid::new(), Ulid::new());
     let changed = db!(tx.execute(
         "UPDATE agents

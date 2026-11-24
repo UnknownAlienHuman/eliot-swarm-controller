@@ -1201,11 +1201,7 @@ impl Store {
                     "session_ended",
                     native_event.kind == "session.ended",
                 )?);
-                db!(tx.execute(
-                    "UPDATE pending_requests SET state = 'stale'
-                     WHERE agent = ?1 AND generation = ?2 AND state = 'pending'",
-                    params![agent_num, batch.generation],
-                ));
+                stale_generation_requests(&tx, agent_num, batch.generation)?;
             }
             if !observed {
                 update_agent_projection(&tx, &next)?;
