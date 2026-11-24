@@ -954,8 +954,11 @@ at most once per turn. Lifecycle notes can queue before the first linked input.
 
 A completed fast project check records a daemon event in the `project` family
 with kind `project.check.finished`, its triggering edit sequence and exit code.
-The turn-end reminder accepts a zero-exit receipt for the same generation and
-turn window when its triggering edit sequence covers the latest observed edit.
+If event retention pruned a file-change event, surviving attribution within the
+same turn still counts as an edit. Retained check evidence must follow the
+pruned prefix. The turn-end reminder accepts a zero-exit receipt for the same
+generation and turn window when its triggering edit sequence covers the latest
+observed edit.
 An exact native check must start after the latest edit and retain a matching
 successful completion. A zero exit counts, and native `completed` counts when
 the adapter reports no exit code. A reported failure status or nonzero exit

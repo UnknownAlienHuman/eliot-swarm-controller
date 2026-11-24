@@ -137,20 +137,37 @@ impl Store {
             .map_err(sql_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql_error)?;
+        // A surviving attribution row can prove an edit whose event was
+        // pruned. Retained check evidence must follow the pruned prefix.
         let git_edit: Option<i64> = self
             .connection
             .query_row(
-                "SELECT seq FROM events INDEXED BY events_agent
-             WHERE agent = ?1 AND generation = ?2 AND seq < ?3 AND ts >= ?4
-               AND source = 'git' AND json_extract(data, '$.workspace') = ?5
-               AND (kind = 'file.changed' OR (kind = 'git.changed' AND (
-                    json_array_length(data, '$.dirty') > 0
-                    OR json_array_length(data, '$.committed_paths') > 0)))
-             ORDER BY seq DESC LIMIT 1",
-                params![agent, turn.generation, through, started, workspace],
+                "SELECT COALESCE(
+                    (SELECT seq FROM events INDEXED BY events_agent
+                     WHERE agent = ?1 AND generation = ?2 AND seq < ?3 AND ts >= ?4
+                       AND source = 'git' AND json_extract(data, '$.workspace') = ?5
+                       AND (kind = 'file.changed' OR (kind = 'git.changed' AND (
+                            json_array_length(data, '$.dirty') > 0
+                            OR json_array_length(data, '$.committed_paths') > 0)))
+                     ORDER BY seq DESC LIMIT 1),
+                    (SELECT pruned_through FROM rule_history_coverage
+                     WHERE singleton = 1 AND pruned_through > 0 AND EXISTS (
+                        SELECT 1 FROM agent_edits AS edit
+                        WHERE edit.agent = ?1 AND edit.generation = ?2 AND edit.workspace = ?5
+                          AND edit.updated_at BETWEEN ?4 AND ?6
+                          AND NOT EXISTS (
+                            SELECT 1 FROM events AS retained INDEXED BY events_agent
+                            WHERE retained.agent = edit.agent AND retained.generation = edit.generation
+                              AND retained.ts = edit.updated_at
+                              AND retained.source = 'git' AND retained.kind = 'file.changed'
+                              AND json_extract(retained.data, '$.workspace') = edit.workspace
+                              AND json_extract(retained.data, '$.path') = edit.path
+                          )
+                     ))
+                 )",
+                params![agent, turn.generation, through, started, workspace, turn.completed_at],
                 |row| row.get(0),
             )
-            .optional()
             .map_err(sql_error)?;
         let last_edit = edits.first().map(|(seq, _)| *seq).max(git_edit);
         let mut evidence = TurnInsertionEvidence {
