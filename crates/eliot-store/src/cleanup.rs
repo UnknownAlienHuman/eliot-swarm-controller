@@ -453,11 +453,13 @@ impl Store {
                 })
                 .map_err(sql_error)?,
         };
-        let rank_of = |kind: ArtifactKind| {
-            if bulk && kind == ArtifactKind::NativeSession {
-                0
-            } else {
-                kind.cleanup_rank()
+        let rank_of = |kind: ArtifactKind, purpose: &str| {
+            match (bulk, kind, purpose) {
+                (true, ArtifactKind::NativeSession, _) => 0,
+                // Other directory preflights still need the Agent's chat
+                // workspace for their Git ownership checks.
+                (true, ArtifactKind::Other, "Swarm chat directory") => 1,
+                _ => kind.cleanup_rank(),
             }
         };
         let (mut rank, mut after_seq) = match page.inventory_rank {
@@ -465,12 +467,13 @@ impl Store {
             None => match page.artifact_after.as_deref() {
                 None => (0, None),
                 Some(id) => {
-                    let (kind, seq): (String, i64) = self
+                    let (kind, purpose, seq): (String, String, i64) = self
                         .connection
                         .query_row(
-                            "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
+                            "SELECT json_extract(body, '$.kind'), json_extract(body, '$.purpose'), seq
+                             FROM artifacts WHERE id = ?1",
                             [id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .map_err(|error| match error {
                             rusqlite::Error::QueryReturnedNoRows => {
@@ -485,7 +488,7 @@ impl Store {
                     if seq > snapshot {
                         return Err(Error::new("invalid", "cleanup continuation is stale"));
                     }
-                    (rank_of(kind), Some(seq))
+                    (rank_of(kind, &purpose), Some(seq))
                 }
             },
         };
@@ -532,7 +535,8 @@ impl Store {
                 let owned_root = include_ownership_roots
                     && matches!(caller, Sender::Owner)
                     && artifact.state == "ownership_root";
-                if rank_of(artifact.kind) != rank || (artifact.state != "registered" && !owned_root)
+                if rank_of(artifact.kind, &artifact.purpose) != rank
+                    || (artifact.state != "registered" && !owned_root)
                 {
                     continue;
                 }

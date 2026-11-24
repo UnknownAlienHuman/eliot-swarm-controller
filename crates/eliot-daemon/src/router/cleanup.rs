@@ -2341,7 +2341,10 @@ impl Router {
                     "forced shutdown interrupted cleanup",
                 ));
             }
-            let blocked_worktree = item.artifact.kind == ArtifactKind::Worktree
+            let workspace = item.artifact.kind == ArtifactKind::Worktree
+                || (matches!(mode, CleanupApplyMode::Bulk(_))
+                    && item.artifact.purpose == "Swarm chat directory");
+            let blocked_workspace = workspace
                 && item.reason != "already_absent"
                 && (matches!(mode, CleanupApplyMode::Bulk(blocked) if blocked.contains(
                     cleanup_tree_root(&item.artifact).unwrap_or(&item.artifact.agent)
@@ -2361,7 +2364,7 @@ impl Router {
                                 }))
                     }));
             let automatic = matches!(mode, CleanupApplyMode::Automatic);
-            let removal = if blocked_worktree {
+            let removal = if blocked_workspace {
                 Err(Error::new(
                     "native_session_kept",
                     "The tree's native session cleanup did not complete",

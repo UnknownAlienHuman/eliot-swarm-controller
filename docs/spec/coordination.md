@@ -184,8 +184,9 @@ tree settle as `skipped(native_session_kept)`. This also applies to a
 
 `cleanup.apply_all {id,scope?,project?,older_than?}` is an explicit Owner action that
 traverses the inventory on the daemon, with `all` as the default scope. It applies
-safe local candidates using the same attempt reservations and live rechecks, including
-native-session ordering across pages. Project registrations use current revision and
+safe local candidates using the same attempt reservations and live rechecks. It handles
+ordinary artifacts and native sessions before their worktrees or chat directories,
+including across pages. Project registrations use current revision and
 path checks for each batch. One explicit cleanup apply runs at a time. Read progress
 with `cleanup.status {id}` or repeat the original call with the same id and filters.
 The tally includes pages, inventory issue count, applied, skipped by reason, failed,
