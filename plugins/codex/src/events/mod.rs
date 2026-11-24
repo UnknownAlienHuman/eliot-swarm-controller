@@ -15,6 +15,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    event_buffer::{BufferedRpcFrame as BufferedNativeFrame, EarlyEventBuffer},
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     protocol::MAX_COMMAND_ID_BYTES,
     session::{
@@ -47,8 +48,6 @@ use crate::native::{
 };
 
 const CONTROL_QUEUE: usize = 16;
-const EARLY_EVENT_LIMIT: usize = 128;
-const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 128;
 const RESOLVED_REQUEST_HISTORY: usize = 128;
 const MAX_CHANGED_PATHS: usize = 1_000;
@@ -148,25 +147,6 @@ enum Control {
     },
 }
 
-#[derive(Clone)]
-enum BufferedNativeFrame {
-    Notification {
-        method: String,
-        params: Value,
-    },
-    Request {
-        id: Value,
-        method: String,
-        params: Value,
-    },
-}
-
-#[derive(Clone)]
-struct BufferedFrame {
-    frame: BufferedNativeFrame,
-    size: usize,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeReplyState {
     Available,
@@ -201,8 +181,7 @@ struct EventProcessor {
     generation: i64,
     secrets: Vec<String>,
     status: EventStatus,
-    buffer: VecDeque<BufferedFrame>,
-    buffer_bytes: usize,
+    buffer: EarlyEventBuffer<BufferedNativeFrame>,
     pending_requests: HashMap<String, PendingNativeRequest>,
     transport_requests: HashMap<String, String>,
     resolved_transport_ids: HashSet<String>,
@@ -424,8 +403,7 @@ impl EventProcessor {
             generation: config.generation,
             secrets: config.secrets,
             status: EventStatus::default(),
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
+            buffer: EarlyEventBuffer::new(),
             pending_requests: HashMap::new(),
             transport_requests: HashMap::new(),
             resolved_transport_ids: HashSet::new(),
@@ -585,20 +563,14 @@ impl EventProcessor {
                 if self.take_child_frame(&params, true) {
                     self.reject_child_request(id, &method, &params).await;
                 } else if !self.status.ready || self.status.active_turn_id.is_none() {
-                    self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Request { id, method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_request(id, method, params).await {
-                    self.status.source_unknown = true;
-                    if !self.gap_reported
-                        && !self.writes_blocked
-                        && error.failure_where.as_deref() != Some("plugin.events.put")
-                    {
-                        let _ = self
-                            .record_gap("Codex native request could not be normalized")
-                            .await;
-                    }
-                    if self.status.failure.is_none() {
-                        self.status.failure = Some(*error.message);
-                    }
+                    self.stream_source()
+                        .note_event_failure(&error, "Codex native request could not be normalized")
+                        .await;
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
@@ -607,23 +579,19 @@ impl EventProcessor {
                     return;
                 }
                 if self.should_buffer(&method, &params) {
-                    self.buffer_frame(BufferedNativeFrame::Notification { method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Notification { method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_notification(&method, params).await {
-                    self.status.source_unknown = true;
-                    if !self.gap_reported
-                        && !self.writes_blocked
-                        && error.failure_where.as_deref() != Some("plugin.events.put")
-                    {
-                        // Method and error code only: no native payload text.
-                        let reason = format!(
-                            "Codex {method} notification could not be normalized ({})",
-                            error.code
-                        );
-                        let _ = self.record_gap(&reason).await;
-                    }
-                    if self.status.failure.is_none() {
-                        self.status.failure = Some(*error.message);
-                    }
+                    // Method and error code only: no native payload text.
+                    let reason = format!(
+                        "Codex {method} notification could not be normalized ({})",
+                        error.code
+                    );
+                    self.stream_source()
+                        .note_event_failure(&error, &reason)
+                        .await;
                 }
             }
             None => {
@@ -635,7 +603,6 @@ impl EventProcessor {
                 }
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
-                    self.buffer_bytes = 0;
                     self.defer_gap("Codex native events remained unassociated at stream end");
                 }
                 if !self.pending_requests.is_empty() {
@@ -730,30 +697,6 @@ impl EventProcessor {
                 | "error"
         ) || (known_notification(method) && turn_activity_notification(method)))
             && (!self.status.ready || self.status.active_turn_id.is_none())
-    }
-
-    fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
-        let encoded = match &frame {
-            BufferedNativeFrame::Notification { method, params } => {
-                serde_json::to_vec(&json!({"method": method, "params": params}))
-            }
-            BufferedNativeFrame::Request { id, method, params } => {
-                serde_json::to_vec(&json!({"id": id, "method": method, "params": params}))
-            }
-        };
-        let size = encoded
-            .map(|bytes| bytes.len())
-            .unwrap_or_else(|_| EARLY_EVENT_BYTES.saturating_add(1));
-        if self.buffer.len() >= EARLY_EVENT_LIMIT
-            || self.buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
-        {
-            self.buffer.clear();
-            self.buffer_bytes = 0;
-            self.defer_gap("Codex early-event buffer exceeded its bound");
-            return;
-        }
-        self.buffer_bytes = self.buffer_bytes.saturating_add(size);
-        self.buffer.push_back(BufferedFrame { frame, size });
     }
 
     async fn ready(
@@ -1126,9 +1069,8 @@ impl EventProcessor {
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
-        while let Some(frame) = self.buffer.pop_front() {
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            let should_buffer = match &frame.frame {
+        while let Some(frame) = self.buffer.front() {
+            let should_buffer = match frame {
                 BufferedNativeFrame::Notification { method, params } => {
                     self.should_buffer(method, params)
                 }
@@ -1137,20 +1079,17 @@ impl EventProcessor {
                 }
             };
             if should_buffer {
-                self.buffer.push_front(frame);
-                self.buffer_bytes = self
-                    .buffer_bytes
-                    .saturating_add(self.buffer.front().map_or(0, |item| item.size));
                 break;
             }
-            let child = match &frame.frame {
+            let frame = self.buffer.pop_front().expect("buffer head was checked");
+            let child = match &frame {
                 BufferedNativeFrame::Notification { method, params } => {
                     self.take_child_frame(params, known_notification(method))
                 }
                 BufferedNativeFrame::Request { params, .. } => self.take_child_frame(params, true),
             };
             if child {
-                match frame.frame {
+                match frame {
                     BufferedNativeFrame::Request { id, method, params } => {
                         self.reject_child_request(id, &method, &params).await;
                     }
@@ -1160,7 +1099,7 @@ impl EventProcessor {
                 }
                 continue;
             }
-            let result = match frame.frame {
+            let result = match frame {
                 BufferedNativeFrame::Notification { method, params } => {
                     self.process_notification(&method, params).await
                 }
@@ -1169,22 +1108,10 @@ impl EventProcessor {
                 }
             };
             if let Err(error) = result {
-                self.status.source_unknown = true;
-                if error.failure_where.as_deref() == Some("plugin.events.put") {
-                    return Err(error);
-                }
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self
-                        .record_gap("Buffered Codex native frame could not be normalized")
-                        .await;
-                }
-                if self.status.failure.is_none() {
-                    self.status.failure = Some(*error.message);
-                }
-                return Err(Error::new(
-                    "unknown",
-                    "Buffered Codex event outcome is unresolved",
-                ));
+                return Err(self
+                    .stream_source()
+                    .buffered_failure(error, "Buffered Codex native frame could not be normalized")
+                    .await);
             }
             if self.writes_blocked {
                 break;

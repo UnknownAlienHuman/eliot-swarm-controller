@@ -13,6 +13,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    event_buffer::EarlyEventBuffer,
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
     session::{
@@ -26,7 +27,7 @@ use eliot_plugin::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet},
     path::PathBuf,
     time::Duration,
 };
@@ -48,8 +49,6 @@ use crate::native::{
 };
 
 const CONTROL_QUEUE: usize = 16;
-const EARLY_EVENT_LIMIT: usize = 128;
-const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_PENDING_REQUESTS: usize = 16;
 const MAX_PENDING_HOOKS: usize = 16;
 const MAX_TOOL_USE_BINDINGS: usize = 128;
@@ -172,12 +171,6 @@ enum Control {
     Close {
         reply: oneshot::Sender<()>,
     },
-}
-
-#[derive(Clone)]
-struct BufferedRecord {
-    record: Value,
-    size: usize,
 }
 
 struct PendingTurn {
@@ -433,8 +426,7 @@ struct EventProcessor {
     secrets: Vec<String>,
     workspace: PathBuf,
     status: EventStatus,
-    buffer: VecDeque<BufferedRecord>,
-    buffer_bytes: usize,
+    buffer: EarlyEventBuffer<Value>,
     gap_number: u64,
     pending_turn: Option<PendingTurn>,
     empty_after_tool_hooks: u64,
@@ -762,6 +754,9 @@ async fn run(
                 } else {
                     processor.buffer_record(record);
                 }
+                if frames.is_empty() {
+                    processor.report_pending_fault_gap().await;
+                }
             }
             changed = stream.changed(), if frames_open && stream_open => {
                 if changed.is_err() {
@@ -946,8 +941,7 @@ impl EventProcessor {
             secrets: config.secrets,
             workspace: config.workspace,
             status: EventStatus::default(),
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
+            buffer: EarlyEventBuffer::new(),
             gap_number: 0,
             pending_turn: None,
             empty_after_tool_hooks: 0,
@@ -1136,50 +1130,23 @@ impl EventProcessor {
     }
 
     fn buffer_record(&mut self, record: Value) {
-        let size = serde_json::to_string(&record).map_or(usize::MAX, |line| line.len());
-        if self.buffer.len() >= EARLY_EVENT_LIMIT
-            || self.buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
-            || size == usize::MAX
-        {
-            // Overflow is settled as a gap by the next commit path instead of
-            // inventing completion; mark the source now.
-            self.status.source_unknown = true;
-            if self.status.failure.is_none() {
-                self.status.failure = Some("Claude early event buffer overflowed".to_owned());
-            }
-            return;
-        }
-        self.buffer_bytes = self.buffer_bytes.saturating_add(size);
-        self.buffer.push_back(BufferedRecord { record, size });
+        self.buffer.push(record, &mut self.pending_fault_gap);
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
-        while let Some(frame) = self.buffer.pop_front() {
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            if self.should_buffer(&frame.record) {
-                self.buffer.push_front(frame);
-                if let Some(front) = self.buffer.front() {
-                    self.buffer_bytes = self.buffer_bytes.saturating_add(front.size);
-                }
+        while let Some(front) = self.buffer.front() {
+            if self.should_buffer(front) {
                 break;
             }
-            if let Err(error) = self.process_record(frame.record).await {
-                if error.failure_where.as_deref() == Some("plugin.events.put") {
-                    return Err(error);
-                }
-                self.status.source_unknown = true;
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self
-                        .record_gap("Buffered Claude native record could not be normalized")
-                        .await;
-                }
-                if self.status.failure.is_none() {
-                    self.status.failure = Some(*error.message);
-                }
-                return Err(Error::new(
-                    "unknown",
-                    "Buffered Claude event outcome is unresolved",
-                ));
+            let record = self.buffer.pop_front().expect("buffer head was checked");
+            if let Err(error) = self.process_record(record).await {
+                return Err(self
+                    .stream_source()
+                    .buffered_failure(
+                        error,
+                        "Buffered Claude native record could not be normalized",
+                    )
+                    .await);
             }
             if self.writes_blocked {
                 break;
@@ -1231,12 +1198,7 @@ impl EventProcessor {
             return;
         }
         // An association may have unblocked buffered assistant text.
-        if let Err(error) = self.flush_buffer().await
-            && error.failure_where.as_deref() != Some("plugin.events.put")
-            && self.status.failure.is_none()
-        {
-            self.status.failure = Some(*error.message);
-        }
+        let _ = self.flush_buffer().await;
     }
 
     async fn process_record(&mut self, record: Value) -> Result<()> {
@@ -2747,22 +2709,16 @@ impl EventProcessor {
     }
 
     fn remove_buffered_hook_callback(&mut self, request_id: &str) {
-        let mut removed_bytes = 0_usize;
-        self.buffer.retain(|frame| {
-            let request = frame.record.get("request");
-            let cancelled = frame.record.get("type").and_then(Value::as_str)
-                == Some("control_request")
-                && frame.record.get("request_id").and_then(Value::as_str) == Some(request_id)
+        self.buffer.retain(|record| {
+            let request = record.get("request");
+            let cancelled = record.get("type").and_then(Value::as_str) == Some("control_request")
+                && record.get("request_id").and_then(Value::as_str) == Some(request_id)
                 && request
                     .and_then(|request| request.get("subtype"))
                     .and_then(Value::as_str)
                     == Some("hook_callback");
-            if cancelled {
-                removed_bytes = removed_bytes.saturating_add(frame.size);
-            }
             !cancelled
         });
-        self.buffer_bytes = self.buffer_bytes.saturating_sub(removed_bytes);
     }
 
     fn cancel_hook_callbacks_for_turn(&mut self, turn_id: &str) {
@@ -3578,18 +3534,22 @@ impl EventProcessor {
         Ok(())
     }
 
+    async fn report_pending_fault_gap(&mut self) {
+        if !self.gap_reported
+            && !self.writes_blocked
+            && let Some(reason) = self.pending_fault_gap.take()
+        {
+            let _ = self.record_gap(&reason).await;
+        }
+    }
+
     async fn note_frames_drained(&mut self) {
         self.frames_drained = true;
         self.cancel_all_hook_callbacks();
         if self.planned_stop || self.closed {
             // A sticky record-local fault survives planned stop: flush its
             // gap before end-stop settlement instead of erasing it.
-            if let Some(reason) = self.pending_fault_gap.take()
-                && !self.gap_reported
-                && !self.writes_blocked
-            {
-                let _ = self.record_gap(&reason).await;
-            }
+            self.report_pending_fault_gap().await;
             self.finish_pending_end_stop().await;
             return;
         }
@@ -3638,35 +3598,17 @@ impl EventProcessor {
     }
 
     async fn note_stream_state(&mut self, state: StreamState) {
-        match state {
-            StreamState::Open => {}
-            StreamState::Overflow => {
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self
-                        .record_gap("Claude native event queue overflowed")
-                        .await;
-                }
-            }
-            StreamState::Malformed(fault) => {
-                // Active record-local fault: record its gap immediately with
-                // the safe typed label; keep it sticky for the planned-stop
-                // drain in case this immediate record is blocked.
-                let reason = format!(
-                    "Claude stream contained an invalid frame ({})",
-                    fault.describe()
-                );
-                if self.pending_fault_gap.is_none() {
-                    self.pending_fault_gap = Some(reason.clone());
-                }
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self.record_gap(&reason).await;
-                }
-            }
-            StreamState::Closed => {
-                // Settlement happens in `note_frames_drained` once the
-                // buffered tail is processed.
-            }
-        }
+        let reason = match state {
+            StreamState::Overflow => "Claude native event queue overflowed".to_owned(),
+            StreamState::Malformed(fault) => format!(
+                "Claude stream contained an invalid frame ({})",
+                fault.describe()
+            ),
+            // The close is settled in `note_frames_drained`.
+            StreamState::Open | StreamState::Closed => return,
+        };
+        self.pending_fault_gap.get_or_insert(reason);
+        self.report_pending_fault_gap().await;
     }
 
     async fn finish_stop(&mut self) -> Result<()> {
