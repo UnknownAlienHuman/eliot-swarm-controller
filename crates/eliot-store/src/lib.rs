@@ -205,6 +205,7 @@ macro_rules! db {
 
 mod admission;
 mod attention_lookup;
+pub use attention_lookup::AttentionVersionReader;
 mod attribution;
 mod command_children;
 mod config_overlay;

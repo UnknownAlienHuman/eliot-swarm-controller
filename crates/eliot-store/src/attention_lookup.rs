@@ -1,10 +1,36 @@
 use crate::{Store, event_from_record, event_record_from_row, sql_error};
 use eliot_core::{Event, Result, parse_agent_id};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::path::Path;
 
 const MAX_ATTENTION_HISTORY_TURNS: usize = eliot_core::api::MAX_ATTENTION_HISTORY;
 const MAX_ATTENTION_ACTIVITY_EVENTS_PER_TURN: usize = 1_024;
 const MAX_ATTENTION_PROFILE_PAIRS: usize = eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
+
+/// The version is comparable only on this same connection. It holds no read
+/// snapshot while the attention worker is idle, so it cannot pin the WAL.
+pub struct AttentionVersionReader {
+    connection: Connection,
+}
+
+impl AttentionVersionReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        let store = Store::open_read_only(path)?;
+        store
+            .connection
+            .execute_batch("ROLLBACK")
+            .map_err(sql_error)?;
+        Ok(Self {
+            connection: store.connection,
+        })
+    }
+
+    pub fn version(&self) -> Result<i64> {
+        self.connection
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct SuccessfulAttentionTurn {
@@ -311,13 +337,28 @@ fn successful_attention_turns(
     profile: &str,
     project: &str,
 ) -> Result<Vec<SuccessfulAttentionTurn>> {
+    // An Agent's newest successful turn is an upper bound on every eligible
+    // result it can contribute. Visit Agents in that order and stop once an
+    // unvisited Agent cannot displace the twentieth result, including ties.
+    let mut frontiers = connection
+        .prepare_cached(
+            "SELECT a.id, (
+                SELECT t.completed_at FROM turns AS t INDEXED BY attention_successful_turns
+                WHERE t.agent = a.id AND t.state = 'completed' AND t.outcome = 'success'
+                  AND t.started_at > 0 AND t.completed_at >= t.started_at
+                ORDER BY t.completed_at DESC, t.turn_id DESC LIMIT 1
+             ) AS newest
+             FROM agents AS a INDEXED BY agents_list_project
+             WHERE a.project = ?1 ORDER BY newest DESC, a.id DESC",
+        )
+        .map_err(sql_error)?;
+    let mut agents = frontiers.query([project]).map_err(sql_error)?;
     let mut statement = connection
-        .prepare(
+        .prepare_cached(
             "SELECT t.agent, t.generation, t.turn_id, t.started_at, t.completed_at,
                     started.seq, completed.seq,
                     json_extract(started.subject, '$.workspace')
-             FROM agents AS a INDEXED BY agents_list_project
-             CROSS JOIN turns AS t ON t.agent = a.id
+             FROM turns AS t INDEXED BY attention_successful_turns
              CROSS JOIN events AS started INDEXED BY attention_turn_endpoints
                ON started.agent = t.agent AND started.generation = t.generation
               AND started.kind = 'turn.started'
@@ -326,7 +367,8 @@ fn successful_attention_turns(
                ON completed.agent = t.agent AND completed.generation = t.generation
               AND completed.kind = 'turn.completed'
               AND json_extract(completed.data, '$.turn_id') = t.turn_id
-             WHERE a.project = ?2 AND t.state = 'completed' AND t.outcome = 'success'
+             WHERE t.agent = ?4 AND t.completed_at >= ?5
+               AND t.state = 'completed' AND t.outcome = 'success'
                AND t.started_at > 0 AND t.completed_at >= t.started_at
                AND started.seq < completed.seq
                AND json_extract(started.subject, '$.profile') = ?1
@@ -359,28 +401,57 @@ fn successful_attention_turns(
                      AND c.verb IN ('send', 'steer', 'inject', 'interrupt', 'approve', 'deny', 'answer')
                      AND c.state NOT IN ('rejected', 'cancelled')
                )
-             ORDER BY t.completed_at DESC, t.agent DESC, t.turn_id DESC LIMIT ?3",
+             ORDER BY t.completed_at DESC, t.turn_id DESC LIMIT ?3",
         )
         .map_err(sql_error)?;
-    let rows = statement
-        .query_map(
-            params![profile, project, MAX_ATTENTION_HISTORY_TURNS as i64],
-            |row| {
-                Ok(SuccessfulAttentionTurn {
-                    agent: row.get(0)?,
-                    generation: row.get(1)?,
-                    turn_id: row.get(2)?,
-                    started_at: row.get(3)?,
-                    completed_at: row.get(4)?,
-                    started_seq: row.get(5)?,
-                    completed_seq: row.get(6)?,
-                    workspace: row.get(7)?,
-                })
-            },
-        )
-        .map_err(sql_error)?;
-    rows.collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(sql_error)
+    let mut newest: Vec<SuccessfulAttentionTurn> = Vec::new();
+    while let Some(agent) = agents.next().map_err(sql_error)? {
+        let id: i64 = agent.get(0).map_err(sql_error)?;
+        let Some(at) = agent.get::<_, Option<i64>>(1).map_err(sql_error)? else {
+            break;
+        };
+        let cutoff = newest.get(MAX_ATTENTION_HISTORY_TURNS - 1);
+        if let Some(cutoff) = cutoff
+            && (at, id) < (cutoff.completed_at, cutoff.agent)
+        {
+            break;
+        }
+        let rows = statement
+            .query_map(
+                params![
+                    profile,
+                    project,
+                    MAX_ATTENTION_HISTORY_TURNS as i64,
+                    id,
+                    cutoff.map_or(0, |turn| turn.completed_at),
+                ],
+                |row| {
+                    Ok(SuccessfulAttentionTurn {
+                        agent: row.get(0)?,
+                        generation: row.get(1)?,
+                        turn_id: row.get(2)?,
+                        started_at: row.get(3)?,
+                        completed_at: row.get(4)?,
+                        started_seq: row.get(5)?,
+                        completed_seq: row.get(6)?,
+                        workspace: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(sql_error)?;
+        for row in rows {
+            newest.push(row.map_err(sql_error)?);
+        }
+        newest.sort_by(|left, right| {
+            (right.completed_at, right.agent, &right.turn_id).cmp(&(
+                left.completed_at,
+                left.agent,
+                &left.turn_id,
+            ))
+        });
+        newest.truncate(MAX_ATTENTION_HISTORY_TURNS);
+    }
+    Ok(newest)
 }
 
 fn attention_quiet_gap(

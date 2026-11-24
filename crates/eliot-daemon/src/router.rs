@@ -187,6 +187,7 @@ struct RouterInner {
     bus: Bus,
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
+    attention_threshold_cache: Mutex<attention::ThresholdCache>,
     background_wake_max_wait_ms: i64,
     /// Automatic handoff covers only sessions lost since this daemon started.
     started_at_ms: i64,
@@ -473,6 +474,7 @@ impl Router {
                 bus,
                 mail,
                 attention,
+                attention_threshold_cache: Mutex::default(),
                 background_wake_max_wait_ms,
                 started_at_ms: now_ms(),
                 owner_token,

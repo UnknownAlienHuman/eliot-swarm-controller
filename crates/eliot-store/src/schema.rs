@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = MAIL_PENDING_WAKE_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = MAIL_NOTICE_REVISION_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -14,6 +14,8 @@ const NATIVE_FOLLOWUP_SCHEMA_VERSION: i64 = 121;
 const MUSE_TURN_MODEL_VERSION: i64 = 122;
 const AUTH_LOGIN_SCHEMA_VERSION: i64 = 123;
 const MAIL_PENDING_WAKE_VERSION: i64 = 124;
+const ATTENTION_LOOKUPS_VERSION: i64 = 125;
+const MAIL_NOTICE_REVISION_VERSION: i64 = 126;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -57,7 +59,46 @@ impl Store {
         if current < MAIL_PENDING_WAKE_VERSION {
             self.migrate_mail_pending_wake()?;
         }
+        if current < ATTENTION_LOOKUPS_VERSION {
+            self.migrate_attention_lookups()?;
+        }
+        if current < MAIL_NOTICE_REVISION_VERSION {
+            self.migrate_mail_notice_revision()?;
+        }
         Ok(())
+    }
+
+    fn migrate_attention_lookups(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(
+            "CREATE INDEX attention_successful_turns ON turns(agent, completed_at DESC, turn_id DESC)
+             WHERE state = 'completed' AND outcome = 'success'
+               AND started_at > 0 AND completed_at >= started_at;",
+        ).map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [ATTENTION_LOOKUPS_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
+    }
+
+    fn migrate_mail_notice_revision(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(include_str!("../migrations/mail_notice_revision.sql"))
+            .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [MAIL_NOTICE_REVISION_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     fn migrate_mail_pending_wake(&mut self) -> Result<()> {

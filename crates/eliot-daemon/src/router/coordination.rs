@@ -543,10 +543,58 @@ const MAIL_REOFFER_INTERVAL: Duration = Duration::from_secs(2);
 /// Bounded recipient page per driver tick.
 const MAIL_REOFFER_PAGE: usize = 100;
 
-/// Periodically re-offer deferred mail wakes to Idle recipients past the
-/// normal notice cooldown. Each tick pages due recipients with unread mail
-/// and re-offers through the existing atomic claim; the claim stays
-/// authoritative, so races and suppressions are harmless no-ops.
+/// Keep a complete paged candidate read until Store inputs or its cutoff change.
+/// Live routing and claim gates are reapplied to cached recipients on each round.
+#[derive(Default)]
+struct MailReofferScan {
+    revision: Option<i64>,
+    started_at: i64,
+    after: Option<String>,
+    complete: bool,
+    next_cooldown_at: Option<i64>,
+    recipients: Vec<String>,
+    replay_at: usize,
+}
+
+impl MailReofferScan {
+    fn page(&mut self, store: &eliot_store::Store, now: i64) -> Result<Vec<String>> {
+        let revision = store.mail_notice_revision()?;
+        if self.complete
+            && self.revision == Some(revision)
+            && now >= self.started_at
+            && self.next_cooldown_at.is_none_or(|deadline| now < deadline)
+        {
+            let end = (self.replay_at + MAIL_REOFFER_PAGE).min(self.recipients.len());
+            let page = self.recipients[self.replay_at..end].to_vec();
+            self.replay_at = if end == self.recipients.len() { 0 } else { end };
+            return Ok(page);
+        }
+        if self.after.is_none() {
+            *self = Self {
+                revision: Some(revision),
+                started_at: now,
+                ..Self::default()
+            };
+        }
+        // Keep the initial revision and cutoff throughout the page walk. A
+        // commit or cooldown reached behind the cursor then forces a new walk.
+        let page = store.due_mail_notice_recipients(
+            self.after.as_deref(),
+            MAIL_REOFFER_PAGE,
+            self.started_at,
+        )?;
+        self.recipients.extend(page.iter().cloned());
+        if page.len() < MAIL_REOFFER_PAGE {
+            self.next_cooldown_at = store.next_mail_notice_cooldown(self.started_at)?;
+            self.complete = true;
+            self.after = None;
+        } else {
+            self.after = page.last().cloned();
+        }
+        Ok(page)
+    }
+}
+
 pub(crate) async fn run_mail_reoffer(
     router: Router,
     mut shutdown: watch::Receiver<bool>,
@@ -554,7 +602,7 @@ pub(crate) async fn run_mail_reoffer(
 ) -> Result<()> {
     let mut ticks = interval(MAIL_REOFFER_INTERVAL);
     ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut after: Option<String> = None;
+    let mut scan = MailReofferScan::default();
     reporter.running("mail_reoffer");
     loop {
         tokio::select! {
@@ -565,34 +613,25 @@ pub(crate) async fn run_mail_reoffer(
             }
             _ = ticks.tick() => {}
         }
-        let recipients = {
+        let page = {
             let store = router.inner.store.lock().await;
-            match store.due_mail_notice_recipients(after.as_deref(), MAIL_REOFFER_PAGE, now_ms()) {
-                Ok(recipients) => recipients,
-                Err(error) => {
-                    crate::logging::record(
-                        &eliot_core::SecretPolicy::default(),
-                        "daemon.mail_reoffer_query_failed",
-                        &[],
-                        Some(&error),
-                    );
-                    after = None;
-                    continue;
+            scan.page(&store, now_ms())
+        };
+        match page {
+            Ok(recipients) => {
+                for recipient in &recipients {
+                    router.reoffer_mail_notice(recipient).await;
                 }
             }
-        };
-        if recipients.is_empty() {
-            after = None;
-            continue;
+            Err(error) => {
+                crate::logging::record(
+                    &eliot_core::SecretPolicy::default(),
+                    "daemon.mail_reoffer_query_failed",
+                    &[],
+                    Some(&error),
+                );
+                scan = MailReofferScan::default();
+            }
         }
-        let short = recipients.len() < MAIL_REOFFER_PAGE;
-        for recipient in &recipients {
-            router.reoffer_mail_notice(recipient).await;
-        }
-        after = if short {
-            None
-        } else {
-            recipients.last().cloned()
-        };
     }
 }

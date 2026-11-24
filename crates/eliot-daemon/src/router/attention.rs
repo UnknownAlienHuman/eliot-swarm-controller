@@ -14,7 +14,7 @@ use eliot_core::api::{
     AttentionThreshold, AttentionThresholdPair, AttentionThresholdsResponse, SourceState,
 };
 use eliot_core::{Agent, AgentState, Result};
-use eliot_store::CodeProgressState;
+use eliot_store::{AttentionVersionReader, CodeProgressState, Store};
 use incidents::{
     activity_context, child_attention_activity, deliver_active_incident, desired_incident,
     freeze_loss_report, freeze_report, incident_id, loss_incident_id, loss_report_already_complete,
@@ -27,6 +27,7 @@ use observe::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
+    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -41,7 +42,6 @@ use tokio::{
 
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 const ATTENTION_THRESHOLD_FLOOR_SECS: i64 = eliot_core::api::MIN_ATTENTION_THRESHOLD_SECS;
-const ATTENTION_THRESHOLD_CACHE_TTL: Duration = Duration::from_secs(30);
 const ATTENTION_THRESHOLD_CACHE_MAX: usize = eliot_core::api::MAX_ATTENTION_THRESHOLD_PAIRS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -108,7 +108,6 @@ struct AttentionState {
     active_reconcile_cursor: usize,
     reserved_incidents: usize,
     config: crate::config::AttentionConfig,
-    threshold_cache: HashMap<AttentionPairKey, CachedAttentionThresholds>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -121,6 +120,27 @@ struct AttentionPairKey {
 struct CachedAttentionThresholds {
     thresholds: PairAttentionThresholds,
     refreshed_at: Instant,
+}
+
+#[derive(Default)]
+pub(super) struct ThresholdCache {
+    reader: Option<AttentionVersionReader>,
+    version: Option<i64>,
+    pairs: HashMap<AttentionPairKey, CachedAttentionThresholds>,
+}
+
+impl ThresholdCache {
+    fn synchronize(&mut self, path: &Path) -> Result<i64> {
+        if self.reader.is_none() {
+            self.reader = Some(AttentionVersionReader::open(path)?);
+        }
+        let version = self.reader.as_ref().unwrap().version()?;
+        if self.version != Some(version) {
+            self.pairs.clear();
+            self.version = Some(version);
+        }
+        Ok(version)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -352,7 +372,6 @@ fn pair_attention_thresholds(
 
 async fn pair_thresholds_for_agent(
     router: &Router,
-    state: &Arc<Mutex<AttentionState>>,
     agent: &Agent,
     config: crate::config::AttentionConfig,
 ) -> Result<PairAttentionThresholds> {
@@ -360,45 +379,46 @@ async fn pair_thresholds_for_agent(
         profile: agent.profile.clone(),
         project: agent.project.clone(),
     };
-    {
-        let state = state.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(cached) = state.threshold_cache.get(&key)
-            && cached.refreshed_at.elapsed() < ATTENTION_THRESHOLD_CACHE_TTL
-        {
+    let router = router.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = router.inner.data_root.join("eliot.db");
+        let mut cache = router
+            .inner
+            .attention_threshold_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let version = cache.synchronize(&path)?;
+        if let Some(cached) = cache.pairs.get(&key) {
             return Ok(cached.thresholds);
         }
-    }
-
-    let db_path = router.inner.data_root.join("eliot.db");
-    let profile = agent.profile.clone();
-    let project = agent.project.clone();
-    let (native_gaps_ms, git_gaps_ms) = tokio::task::spawn_blocking(move || {
-        let store = eliot_store::Store::open_read_only(&db_path)?;
-        let include_git = store.attention_pair_code_eligible(&profile, &project)?;
-        store.attention_quiet_gaps(&profile, &project, include_git)
+        let store = Store::open_read_only(&path)?;
+        let include_git = store.attention_pair_code_eligible(&key.profile, &key.project)?;
+        let (native_gaps_ms, git_gaps_ms) =
+            store.attention_quiet_gaps(&key.profile, &key.project, include_git)?;
+        let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
+        // The sampled data version must also cover the completed read snapshot.
+        if cache.synchronize(&path)? == version {
+            if cache.pairs.len() >= ATTENTION_THRESHOLD_CACHE_MAX
+                && let Some(oldest) = cache
+                    .pairs
+                    .iter()
+                    .min_by_key(|(_, cached)| cached.refreshed_at)
+                    .map(|(key, _)| key.clone())
+            {
+                cache.pairs.remove(&oldest);
+            }
+            cache.pairs.insert(
+                key,
+                CachedAttentionThresholds {
+                    thresholds,
+                    refreshed_at: Instant::now(),
+                },
+            );
+        }
+        Ok(thresholds)
     })
     .await
-    .map_err(|_| eliot_core::Error::new("internal", "attention threshold reader failed"))??;
-    let thresholds = pair_attention_thresholds(&native_gaps_ms, &git_gaps_ms, config);
-    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
-    if !state.threshold_cache.contains_key(&key)
-        && state.threshold_cache.len() >= ATTENTION_THRESHOLD_CACHE_MAX
-        && let Some(oldest) = state
-            .threshold_cache
-            .iter()
-            .min_by_key(|(_, cached)| cached.refreshed_at)
-            .map(|(key, _)| key.clone())
-    {
-        state.threshold_cache.remove(&oldest);
-    }
-    state.threshold_cache.insert(
-        key,
-        CachedAttentionThresholds {
-            thresholds,
-            refreshed_at: Instant::now(),
-        },
-    );
-    Ok(thresholds)
+    .map_err(|_| eliot_core::Error::new("internal", "attention threshold reader failed"))?
 }
 
 impl Router {
@@ -631,7 +651,7 @@ async fn inspect_agent(
     if captured.agent.observe_only {
         return Ok(());
     }
-    let thresholds = pair_thresholds_for_agent(router, &state, &captured.agent, config).await?;
+    let thresholds = pair_thresholds_for_agent(router, &captured.agent, config).await?;
     let no_progress_window = Duration::from_secs(thresholds.no_progress.threshold_secs as u64);
     let no_code_progress_window =
         Duration::from_secs(thresholds.no_code_progress.threshold_secs as u64);
