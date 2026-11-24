@@ -28,6 +28,7 @@ use eliot_core::{
 use eliot_plugin::{
     CommitSink, MAX_EVENT_BYTES, PeerClient,
     event_actor::EventActor,
+    event_buffer::EarlyEventBuffer,
     native_data::{UNCLASSIFIED_NATIVE_EVENT, unclassified},
     native_stdio::StreamState,
     protocol::{HookEvent, HookResponse},
@@ -63,8 +64,6 @@ use crate::native::{
 };
 
 const CONTROL_QUEUE: usize = 16;
-const EARLY_EVENT_LIMIT: usize = 128;
-const EARLY_EVENT_BYTES: usize = 256 * 1024;
 const MAX_MESSAGE_PAGES: usize = 4;
 const MAX_PENDING_REQUESTS: usize = 128;
 const MAX_RESOLVED_REQUESTS: usize = 128;
@@ -341,12 +340,6 @@ struct PendingContextHook {
     deadline: Instant,
 }
 
-#[derive(Clone)]
-struct BufferedEnvelope {
-    envelope: SseEnvelope,
-    size: usize,
-}
-
 struct PendingInbox {
     command_id: String,
     context: Vec<ContextItem>,
@@ -420,8 +413,7 @@ struct EventProcessor {
     generation: i64,
     secrets: Vec<String>,
     status: EventStatus,
-    buffer: VecDeque<BufferedEnvelope>,
-    buffer_bytes: usize,
+    buffer: EarlyEventBuffer<SseEnvelope>,
     gap_number: u64,
     accept_frames: bool,
     planned_stop: bool,
@@ -771,8 +763,7 @@ impl EventProcessor {
             generation: config.generation,
             secrets: config.secrets,
             status: EventStatus::default(),
-            buffer: VecDeque::new(),
-            buffer_bytes: 0,
+            buffer: EarlyEventBuffer::new(),
             gap_number: 0,
             accept_frames: true,
             planned_stop: false,
@@ -1029,6 +1020,7 @@ impl EventProcessor {
                             self.status.failure = Some(*error.message);
                         }
                     } else if let Err(error) = self.flush_buffer().await
+                        && error.failure_where.as_deref() != Some("plugin.events.put")
                         && self.status.failure.is_none()
                     {
                         self.status.failure = Some(*error.message);
@@ -1069,7 +1061,6 @@ impl EventProcessor {
                 self.accept_frames = false;
                 if !self.buffer.is_empty() {
                     self.buffer.clear();
-                    self.buffer_bytes = 0;
                     self.defer_gap("OpenCode native events remained unassociated at stream end");
                 }
                 if !self.planned_stop && self.loss_reason.is_none() {
@@ -1154,19 +1145,10 @@ impl EventProcessor {
     }
 
     fn buffer_envelope(&mut self, envelope: SseEnvelope) {
-        let size = serde_json::to_vec(&envelope)
-            .map(|bytes| bytes.len())
-            .unwrap_or_else(|_| EARLY_EVENT_BYTES.saturating_add(1));
-        if self.buffer.len() >= EARLY_EVENT_LIMIT
-            || self.buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
-        {
+        if !self.buffer.try_push(envelope) {
             self.buffer.clear();
-            self.buffer_bytes = 0;
             self.defer_gap("OpenCode early-event buffer exceeded its bound");
-            return;
         }
-        self.buffer_bytes = self.buffer_bytes.saturating_add(size);
-        self.buffer.push_back(BufferedEnvelope { envelope, size });
     }
 
     async fn ready(
@@ -1216,9 +1198,9 @@ impl EventProcessor {
     /// inbox, execution-start, tool-lifecycle and request facts. Terminals,
     /// lifecycle and status/detail events are history, not activity.
     fn preflight_activity(&self) -> bool {
-        self.buffer.iter().any(|frame| {
+        self.buffer.iter().any(|envelope| {
             matches!(
-                frame.envelope.event_type.as_str(),
+                envelope.event_type.as_str(),
                 "session.inbox.enqueued"
                     | "session.inbox.delivered"
                     | "session.inbox.cancelled"
@@ -1782,14 +1764,22 @@ impl EventProcessor {
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
-        while let Some(frame) = self.buffer.pop_front() {
-            self.buffer_bytes = self.buffer_bytes.saturating_sub(frame.size);
-            if self.should_buffer(&frame.envelope.event_type) {
-                self.buffer_bytes = self.buffer_bytes.saturating_add(frame.size);
-                self.buffer.push_front(frame);
-                return Ok(());
+        while let Some(front) = self.buffer.front() {
+            if self.should_buffer(&front.event_type) {
+                break;
             }
-            self.process_envelope(frame.envelope).await?;
+            let Some(envelope) = self.buffer.pop_front() else {
+                break;
+            };
+            if let Err(error) = self.process_envelope(envelope).await {
+                return Err(self
+                    .stream_source()
+                    .buffered_failure(
+                        error,
+                        "Buffered OpenCode native event could not be normalized",
+                    )
+                    .await);
+            }
         }
         Ok(())
     }
