@@ -596,17 +596,38 @@ impl EventHandle {
         turn_id: String,
         context: Vec<ContextItem>,
     ) -> Result<oneshot::Receiver<TurnOutcome>> {
-        let (outcome_tx, outcome_rx) = oneshot::channel();
-        self.actor
-            .call(|registered| Control::ExpectTurn {
-                command_id,
-                turn_id,
-                context,
-                registered,
-                outcome: outcome_tx,
-            })
-            .await??;
-        Ok(outcome_rx)
+        let mut status = self.actor.watch().clone();
+        loop {
+            status
+                .wait_for(|view| {
+                    !view.wake_cancel_pending || view.failure.is_some() || view.stopped
+                })
+                .await
+                .map_err(|_| {
+                    Error::new(
+                        "unavailable",
+                        "Claude event task closed before input registration",
+                    )
+                })?;
+            let (outcome_tx, outcome_rx) = oneshot::channel();
+            match self
+                .actor
+                .call(|registered| Control::ExpectTurn {
+                    command_id: command_id.clone(),
+                    turn_id: turn_id.clone(),
+                    context: context.clone(),
+                    registered,
+                    outcome: outcome_tx,
+                })
+                .await?
+            {
+                Ok(()) => return Ok(outcome_rx),
+                // The actor did not reserve this input. A wake that started
+                // after the watch check can only defer this pre-write step.
+                Err(error) if error.code == "wake_cancel_pending" => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Withdraw a pending turn whose input was proven never dispatched
@@ -1069,8 +1090,7 @@ impl EventProcessor {
                 "Claude turn association requires a ready exact session and turn",
             ));
         }
-        if (self.status.active_turn_id.is_some()
-            && (!self.status.native_unbound || self.status.wake_cancel_pending))
+        if (self.status.active_turn_id.is_some() && !self.status.native_unbound)
             || self.pending_turn.is_some()
         {
             return Err(Error::new(
@@ -1088,6 +1108,12 @@ impl EventProcessor {
             return Err(Error::new(
                 "unknown",
                 "Claude event source has an unresolved gap",
+            ));
+        }
+        if self.status.wake_cancel_pending {
+            return Err(Error::new(
+                "wake_cancel_pending",
+                "Claude is cancelling a guarded native wake",
             ));
         }
         self.pending_turn = Some(PendingTurn {

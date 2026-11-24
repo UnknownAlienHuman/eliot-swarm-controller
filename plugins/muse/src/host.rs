@@ -1426,6 +1426,41 @@ impl MusePlugin {
         {
             return Ok(rejected_control(&error.message));
         }
+        if let Some(model) = expected_model.as_deref()
+            && session.expected_model.as_deref() != Some(model)
+        {
+            // Store can resolve a configure through readback after the
+            // setter's reply was lost. Refresh our session selector from
+            // that same native evidence before admitting another input.
+            let selected = read_owned_session_value(
+                &session.native_client,
+                session.session_id.as_deref().unwrap_or_default(),
+                proof_deadline,
+            )
+            .await;
+            if selected
+                .as_ref()
+                .ok()
+                .and_then(|session| session.pointer("/session/modelId"))
+                .and_then(Value::as_str)
+                != Some(model)
+            {
+                return Ok(rejected_control(
+                    "Muse session/read did not confirm the accepted model for this input",
+                ));
+            }
+            if session
+                .events
+                .remember_expected_model(model.to_owned())
+                .await
+                .is_err()
+            {
+                return Ok(rejected_control(
+                    "Muse could not record the confirmed model before turn/start",
+                ));
+            }
+            session.expected_model = Some(model.to_owned());
+        }
         let effort = params
             .effort_override
             .clone()
@@ -1561,7 +1596,6 @@ impl MusePlugin {
                     turn_id: turn_id.clone(),
                     context: params.context,
                     effort: sent_effort,
-                    model: expected_model,
                 },
                 native_queued,
             )

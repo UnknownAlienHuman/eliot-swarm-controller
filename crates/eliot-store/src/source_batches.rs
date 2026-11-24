@@ -808,13 +808,38 @@ impl Store {
             if source.last_batch_digest.as_deref() == Some(batch_digest.as_slice())
                 && source.cursor == batch.cursor
             {
-                let native_wake_cancel = read_native_wake_cancellation(
+                let mut native_wake_cancel = read_native_wake_cancellation(
                     &tx,
                     agent_num,
                     batch.generation,
                     source.last_batch_first_seq.unwrap_or_default(),
                     source.last_batch_last_seq.unwrap_or_default(),
                 )?;
+                let mut events = Vec::new();
+                if native_wake_cancel.as_ref().is_some_and(|cancel| {
+                    projection.active_turn.as_deref() != Some(cancel.turn_id.as_str())
+                }) && let Some(cancel) = native_wake_cancel.take()
+                {
+                    let already_recorded: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                         WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.native_wake_cancel_dropped'
+                           AND json_extract(data, '$.turn_id') = ?3)",
+                        params![agent_num, batch.generation, cancel.turn_id],
+                        |row| row.get(0),
+                    ).map_err(sql_error)?;
+                    if !already_recorded {
+                        events.push(insert_daemon_event(
+                            &tx,
+                            now,
+                            "turn.native_wake_cancel_dropped",
+                            "turn",
+                            Some(agent_num),
+                            Some(batch.generation),
+                            json!({"turn_id": cancel.turn_id, "reason": "wake_no_longer_active",
+                                "cancel_reason": cancel.reason}),
+                        )?);
+                    }
+                }
                 let ack = BatchAck {
                     first_seq: source.last_batch_first_seq.ok_or_else(|| {
                         Error::new("internal", "source batch ack is missing its first sequence")
@@ -828,10 +853,7 @@ impl Store {
                     native_wake_cancel,
                 };
                 commit_source_batch(tx, &self.write_faulted)?;
-                return Ok(BatchCommit {
-                    ack,
-                    events: Vec::new(),
-                });
+                return Ok(BatchCommit { ack, events });
             }
             return Err(Error::new(
                 "source_integrity",

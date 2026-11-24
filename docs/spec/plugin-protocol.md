@@ -768,6 +768,8 @@ the returned turn facts omit `command_id`.
 The ACK for a commandless `turn.started` can carry `native_wake_cancel` for
 that exact turn. Store retains the same reason on the journaled start. The
 adapter performs the exact cancel before processing further wake output.
+Store repeats the directive on a duplicate ACK only while the same wake is
+active. A retired wake's directive is dropped and the drop is journaled.
 
 A send already admitted by the harness into its native queue replies
 `state: "queued"` with the exact native turn id. The host keeps it dispatched

@@ -539,7 +539,6 @@ pub(crate) struct SendAssociation {
     pub turn_id: String,
     pub context: Vec<ContextItem>,
     pub effort: Option<String>,
-    pub model: Option<String>,
 }
 
 struct EventProcessor {
@@ -1607,7 +1606,6 @@ impl EventProcessor {
             turn_id,
             context,
             effort,
-            model,
         } = send;
         if !self.status.ready
             || self.status.session_id.is_none()
@@ -1654,7 +1652,7 @@ impl EventProcessor {
         if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
             data["effort"] = json!(effort);
         }
-        self.reset_turn_model(model);
+        self.reset_turn_model();
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
@@ -1688,7 +1686,7 @@ impl EventProcessor {
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = native_command_id;
         self.turn_completion_usage = None;
-        self.reset_turn_model(self.session_expected_model.clone());
+        self.reset_turn_model();
         let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
         let cancellation = self
             .stream_source()
@@ -1705,9 +1703,9 @@ impl EventProcessor {
         Ok(())
     }
 
-    fn reset_turn_model(&mut self, expected: Option<String>) {
+    fn reset_turn_model(&mut self) {
         self.turn_model = TurnModel {
-            expected,
+            expected: self.session_expected_model.clone(),
             ..TurnModel::default()
         };
         self.status.provider_model_turn = None;

@@ -1855,9 +1855,7 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
     }
     // A self-started native turn with no send takes this input: Claude
     // merges it and the event task binds it to that exact turn.
-    if event_status.active_turn_id.is_some()
-        && (!event_status.native_unbound || event_status.wake_cancel_pending)
-    {
+    if event_status.active_turn_id.is_some() && !event_status.native_unbound {
         return Err(Error::new("busy", "Claude already has an active turn"));
     }
     if session.pending_turn.pending.is_some() {
@@ -1879,7 +1877,6 @@ async fn dispatch_send(
     content: String,
     context: Vec<ContextItem>,
 ) -> Result<Value> {
-    let deadline = Instant::now() + SEND_TIMEOUT;
     let turn_id = new_uuid();
     let outcome = match session
         .events
@@ -1895,6 +1892,7 @@ async fn dispatch_send(
             return Ok(result);
         }
     };
+    let deadline = Instant::now() + SEND_TIMEOUT;
     session.pending_turn.pending = Some(TurnWaiter { outcome });
     let input = OutboundUserInput {
         kind: "user",
