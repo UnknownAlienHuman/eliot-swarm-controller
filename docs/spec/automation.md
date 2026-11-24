@@ -248,8 +248,8 @@ selected namespace within retained history. A script outcome includes the observ
 code and the first bounded lines of redacted stderr when present. A refusal includes
 its triggering event sequence, time, code and message. The repeat counter groups failures
 by rule namespace, rule, code and message after normalizing whitespace, IDs and numbers.
-Three matching failures in one minute produce one `repeated` entry and one Owner notice.
-A saturated counter logs `daemon.rule_failure_counter_overflow` at most once per minute.
+Three matching failures in one minute produce one `repeated` entry. Owner notices and
+capacity overflow follow the [shared repeat-failure lifecycle](monitoring.md#views).
 
 Referenced script changes are semantic edits. Frozen content/path validation catches
 missed watcher notifications. Already admitted commands retain their original inputs.
