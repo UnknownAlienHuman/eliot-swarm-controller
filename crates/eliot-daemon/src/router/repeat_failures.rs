@@ -338,9 +338,9 @@ impl Router {
             agent: agent.to_owned(),
             verb: verb.to_owned(),
         };
-        let observed_at = super::now_ms();
         let reached_threshold = {
             let mut counter = self.inner.repeat_failures.lock_recover();
+            let observed_at = super::now_ms();
             let reached = counter
                 .increment(key.clone(), Instant::now(), 1, 0)
                 .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
@@ -491,10 +491,20 @@ impl Router {
         for (source, window) in closed {
             self.log_command_storm(source, window);
         }
-        let pending = std::mem::take(&mut self.inner.repeat_failures.lock_recover().pending_alerts);
-        if pending.is_empty() {
+        if self
+            .inner
+            .repeat_failures
+            .lock_recover()
+            .pending_alerts
+            .is_empty()
+        {
             return;
         }
+        let mut store = self.inner.store.lock().await;
+        let (pending, now) = {
+            let mut counter = self.inner.repeat_failures.lock_recover();
+            (std::mem::take(&mut counter.pending_alerts), super::now_ms())
+        };
         let policy = self.secret_policy_snapshot();
         let updates: Vec<_> = pending
             .into_iter()
@@ -511,8 +521,7 @@ impl Router {
                 })
             })
             .collect();
-        let mut store = self.inner.store.lock().await;
-        match store.update_repeat_alerts(&updates, super::now_ms()) {
+        match store.update_repeat_alerts(&updates, now) {
             Ok(events) => self.publish_locked(&events),
             Err(error) => crate::logging::record(
                 &policy,
@@ -652,12 +661,12 @@ impl Router {
             message: normalized_message(&message),
             evidence: failure.evidence.map(str::to_owned),
         });
-        let observed_at = super::now_ms();
-        let outcome = {
+        let (outcome, observed_at) = {
             let mut counter = self.inner.repeat_failures.lock_recover();
+            let observed_at = super::now_ms();
             let outcome = counter.record(key.clone());
             counter.queue_alert(key.clone(), observed_at, failure.goal, None);
-            outcome
+            (outcome, observed_at)
         };
         match outcome {
             RepeatOutcome::Quiet => return,

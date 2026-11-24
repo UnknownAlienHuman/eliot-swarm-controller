@@ -95,6 +95,23 @@ fn inbox_snoozes(connection: &Connection) -> Result<Vec<OwnerInboxItemRef>> {
     .collect()
 }
 
+fn repeat_occurrence_retained(connection: &Connection, row: &OwnerInboxItemRef) -> Result<bool> {
+    if row.kind == OwnerInboxKind::Stuck
+        && let Some(cause) = row.subject.strip_prefix("repeat:")
+    {
+        // The repeat worker can renew a quiet deadline from an observation
+        // queued before it elapsed. Keep the snooze until the row is removed.
+        return connection
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM repeat_failure_alerts WHERE cause = ?1)",
+                [cause],
+                |row| row.get(0),
+            )
+            .map_err(sql_error);
+    }
+    Ok(false)
+}
+
 fn read_inbox_snapshot<T>(path: &Path, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
     #[cfg(windows)]
     let path = &eliot_core::verbatim_path(path);
@@ -204,11 +221,17 @@ impl Store {
                 .iter()
                 .map(|item| (item.kind, item.subject.as_str()))
                 .collect::<HashSet<_>>();
-            let retired_snoozes = inbox_snoozes(connection)?
-                .into_iter()
-                .filter(|row| !subjects.contains(&(row.kind, row.subject.as_str())))
-                .take(64)
-                .collect();
+            let mut retired_snoozes = Vec::new();
+            for row in inbox_snoozes(connection)? {
+                if !subjects.contains(&(row.kind, row.subject.as_str()))
+                    && !repeat_occurrence_retained(connection, &row)?
+                {
+                    retired_snoozes.push(row);
+                    if retired_snoozes.len() == 64 {
+                        break;
+                    }
+                }
+            }
             let candidates = items
                 .iter()
                 .filter(|item| {
@@ -244,7 +267,9 @@ impl Store {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
             for row in rows {
-                if super::owner_inbox::project_item(&tx, row.kind, &row.subject, now)?.is_none() {
+                if !repeat_occurrence_retained(&tx, row)?
+                    && super::owner_inbox::project_item(&tx, row.kind, &row.subject, now)?.is_none()
+                {
                     tx.execute(
                         "DELETE FROM owner_inbox_snoozes WHERE kind=?1 AND subject=?2 AND revision=?3",
                         params![row.kind.as_str(), row.subject, row.revision],
