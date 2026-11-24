@@ -19,6 +19,7 @@ impl Store {
                 attempt TEXT,
                 retry_at INTEGER NOT NULL DEFAULT 0,
                 signed_out INTEGER NOT NULL,
+                verified_signed_out INTEGER NOT NULL DEFAULT 0,
                 resolved INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE harness_auth_holds (
@@ -86,6 +87,7 @@ impl Store {
                              first_seen=CASE WHEN ?6 THEN excluded.first_seen ELSE first_seen END,
                              signed_out=CASE WHEN ?6 THEN excluded.signed_out
                                              ELSE signed_out OR excluded.signed_out END,
+                             verified_signed_out=CASE WHEN ?6 THEN 0 ELSE verified_signed_out END,
                              resolved=0",
                         params![harness, new_revision, phase, now, !manual, reset],
                     ).map_err(sql_error)?;
@@ -167,12 +169,22 @@ impl Store {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self.connection.transaction().map_err(sql_error)?;
+            let verified_outage = matches!(report.state, SignedIn)
+                && tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM harness_auth
+                     WHERE harness=?1 AND revision=?2 AND verified_signed_out=1)",
+                        params![report.harness, report.revision],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .map_err(sql_error)?;
             let changed = match report.state {
                 SignedIn | SignedOut if report.attempt.is_none() => tx.execute(
                     "UPDATE harness_auth
                      SET resolved=?3, signed_out=NOT ?3,
+                         verified_signed_out=verified_signed_out OR NOT ?3,
                          phase=CASE WHEN ?3 AND phase='queued' THEN 'closed' ELSE phase END
-                     WHERE harness=?1 AND revision=?2 AND resolved=0 AND (?3 OR signed_out=0)",
+                     WHERE harness=?1 AND revision=?2 AND resolved=0 AND (?3 OR verified_signed_out=0)",
                     params![
                         report.harness,
                         report.revision,
@@ -197,7 +209,7 @@ impl Store {
             .map_err(sql_error)?;
             let resolved = changed == 1 && matches!(report.state, SignedIn);
             let mut events = if resolved {
-                clear_auth_holds(&tx, &report.harness, now)?
+                settle_auth_holds(&tx, &report.harness, verified_outage, now)?
             } else {
                 Vec::new()
             };
@@ -270,8 +282,13 @@ impl Store {
     }
 }
 
-fn clear_auth_holds(tx: &Transaction<'_>, harness: &str, now: i64) -> Result<Vec<Event>> {
-    let scopes = {
+fn settle_auth_holds(
+    tx: &Transaction<'_>,
+    harness: &str,
+    verified_outage: bool,
+    now: i64,
+) -> Result<Vec<Event>> {
+    let scopes = if verified_outage {
         let mut statement = tx
             .prepare(
                 "DELETE FROM provider_holds WHERE kind='auth' AND state='held'
@@ -287,6 +304,8 @@ fn clear_auth_holds(tx: &Transaction<'_>, harness: &str, now: i64) -> Result<Vec
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?
+    } else {
+        Vec::new()
     };
     tx.execute("DELETE FROM harness_auth_holds WHERE harness=?1", [harness])
         .map_err(sql_error)?;

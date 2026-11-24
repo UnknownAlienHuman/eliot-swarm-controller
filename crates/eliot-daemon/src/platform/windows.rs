@@ -62,11 +62,11 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::SystemInformation::{GetSystemTimeAsFileTime, GetTickCount64};
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateEventW, CreateProcessW,
-    DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW, TerminateProcess,
-    WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CreateEventW,
+    CreateProcessW, DETACHED_PROCESS, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes,
+    OpenProcess, OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, STARTUPINFOW,
+    TerminateProcess, WaitForSingleObject,
 };
 
 /// Availability is only a connect hint: another client may win the instance.
@@ -209,6 +209,74 @@ pub(crate) fn start_background_daemon_executable(executable: &Path, data_dir: &P
         CloseHandle(process.hProcess);
     }
     Ok(())
+}
+
+/// The exact process returned by the vendor console start in the desktop.
+pub struct VendorLoginConsole(OwnedHandle);
+
+impl VendorLoginConsole {
+    pub fn exited(&self) -> bool {
+        // SAFETY: the handle is owned for the lifetime of this console.
+        unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+    }
+}
+
+/// Run the adapter's credential-free login command from the interactive desktop.
+pub fn start_vendor_login_console(
+    command: eliot_core::api::harness::NativeAuthCommand,
+) -> Result<VendorLoginConsole> {
+    if !interactive_session(std::process::id()) {
+        return Err(Error::new(
+            "not_allowed",
+            "vendor login requires an active desktop session",
+        ));
+    }
+    let (executable, args) = (command.resolve)()
+        .filter(|(exe, _)| exe.is_absolute())
+        .ok_or_else(|| Error::new("unavailable", "installed vendor login command unavailable"))?;
+    let argv: Vec<_> = std::iter::once(executable.as_os_str())
+        .chain(args.iter().map(|arg| arg.as_os_str()))
+        .collect();
+    let command_line = windows_command_line(&argv)?;
+    let application = wide_path(&executable);
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..STARTUPINFOW::default()
+    };
+    let process = with_job_breakaway(|job_flags| {
+        let mut command_line = command_line.clone();
+        let mut process = PROCESS_INFORMATION::default();
+        // SAFETY: both UTF-16 arguments are terminated and all locals outlive
+        // the call. Windows supplies new console handles; no parent handles
+        // or desktop capture pipes are inherited.
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                CREATE_NEW_CONSOLE | job_flags,
+                null(),
+                null(),
+                &startup,
+                &mut process,
+            )
+        };
+        if created == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(process)
+        }
+    })
+    .map_err(|error| io_error("start vendor login console", error))?;
+    // SAFETY: both handles are returned uniquely owned by CreateProcessW.
+    unsafe {
+        CloseHandle(process.hThread);
+        Ok(VendorLoginConsole(OwnedHandle::from_raw_handle(
+            process.hProcess,
+        )))
+    }
 }
 
 /// Prefer breakaway from any enclosing Job. A private daemon can inherit
@@ -660,45 +728,45 @@ pub(crate) struct LocalPeer {
     process: Option<QueryHandle>,
 }
 
-impl LocalPeer {
-    pub(crate) fn is_interactive_desktop(&self) -> bool {
-        use windows_sys::Win32::System::RemoteDesktop::{
-            ProcessIdToSessionId, WTS_CONNECTSTATE_CLASS, WTSActive, WTSConnectState,
-            WTSFreeMemory, WTSQuerySessionInformationW,
-        };
+fn interactive_session(pid: u32) -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        ProcessIdToSessionId, WTS_CONNECTSTATE_CLASS, WTSActive, WTSConnectState, WTSFreeMemory,
+        WTSQuerySessionInformationW,
+    };
 
-        if !self
-            .image_path()
-            .as_deref()
-            .and_then(|image| Path::new(image).file_name())
-            .is_some_and(|name| name.eq_ignore_ascii_case("swarm-desktop.exe"))
+    let mut session = 0;
+    let mut buffer = null_mut();
+    let mut bytes = 0;
+    // SAFETY: each output pointer refers to its initialized writable local.
+    unsafe {
+        if ProcessIdToSessionId(pid, &mut session) == 0
+            || session == 0
+            || WTSQuerySessionInformationW(
+                null_mut(),
+                session,
+                WTSConnectState,
+                &mut buffer,
+                &mut bytes,
+            ) == 0
+            || buffer.is_null()
         {
             return false;
         }
-        let mut session = 0;
-        let mut buffer = null_mut();
-        let mut bytes = 0;
-        // SAFETY: each output pointer refers to its initialized writable local.
-        unsafe {
-            if ProcessIdToSessionId(self.pid, &mut session) == 0
-                || session == 0
-                || WTSQuerySessionInformationW(
-                    null_mut(),
-                    session,
-                    WTSConnectState,
-                    &mut buffer,
-                    &mut bytes,
-                ) == 0
-                || buffer.is_null()
-            {
-                return false;
-            }
-            // WTSConnectState returns one WTS_CONNECTSTATE_CLASS enum.
-            let active = bytes as usize >= size_of::<WTS_CONNECTSTATE_CLASS>()
-                && buffer.cast::<WTS_CONNECTSTATE_CLASS>().read_unaligned() == WTSActive;
-            WTSFreeMemory(buffer.cast());
-            active
-        }
+        // WTSConnectState returns one WTS_CONNECTSTATE_CLASS enum.
+        let active = bytes as usize >= size_of::<WTS_CONNECTSTATE_CLASS>()
+            && buffer.cast::<WTS_CONNECTSTATE_CLASS>().read_unaligned() == WTSActive;
+        WTSFreeMemory(buffer.cast());
+        active
+    }
+}
+
+impl LocalPeer {
+    pub(crate) fn is_interactive_desktop(&self) -> bool {
+        self.image_path()
+            .as_deref()
+            .and_then(|image| Path::new(image).file_name())
+            .is_some_and(|name| name.eq_ignore_ascii_case("swarm-desktop.exe"))
+            && interactive_session(self.pid)
     }
 
     pub(crate) fn process_id(&self) -> u32 {

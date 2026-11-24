@@ -18,11 +18,11 @@ pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
-                resolve: || auth_command(&["auth", "login"]),
+                resolve: || auth_command(&["auth", "login", "--standalone"]),
             }),
             signed_in_check: Some(NativeAuthCheck {
                 command: NativeAuthCommand {
-                    resolve: || auth_command(&["auth", "list", "--format", "json"]),
+                    resolve: || auth_command(&crate::native::auth::list_argv()),
                 },
                 classify: classify_auth_status,
             }),

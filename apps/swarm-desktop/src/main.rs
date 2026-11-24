@@ -48,6 +48,8 @@ mod startup;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
+mod vendor_sign_in;
+#[cfg(windows)]
 mod views;
 #[cfg(windows)]
 mod window_place;
@@ -140,7 +142,10 @@ fn main() {
         .transpose();
     let result = workspace
         .map_err(|error| error.to_string())
-        .and_then(ui::run);
+        .and_then(|workspace| {
+            vendor_sign_in::start();
+            ui::run(workspace)
+        });
     if let Err(error) = result {
         startup::fatal(&error);
     }
