@@ -1012,33 +1012,6 @@ pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 /// continuation pages of the listing that built it, for at most this long;
 /// every first page rebuilds it, so the failed harness is read again.
 pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
-/// Provenance note for an OpenCode catalogue read: the picker and the
-/// configure gate must never disagree, so the note always names which
-/// session-true source produced the list.
-fn opencode_catalog_note(provenance: &str) -> &'static str {
-    match provenance {
-        "session" => "Advisory OpenCode catalogue from the live session GET /api/model",
-        "preview" => {
-            "OpenCode launch preview using the profile's provider settings and auth; workspace and live provider state can change availability"
-        }
-        _ => "OpenCode catalogue from the installed CLI using native configuration and auth",
-    }
-}
-
-/// Muse catalogue note: the native `isDefault` marker names a marked row
-/// for display. An omitted `--model` always defers to the server default at
-/// launch (MSP `session/start.modelId`: "server default when omitted"),
-/// whether or not the catalogue marks a row.
-fn muse_catalog_note(default: Option<&str>) -> String {
-    match default {
-        Some(marked) if !marked.trim().is_empty() => format!(
-            "Muse model/list marks a row with the native isDefault marker ({marked}); an omitted --model still defers to the server default at launch"
-        ),
-        _ => "Muse model/list names no default marker; the server default applies at launch"
-            .to_owned(),
-    }
-}
-
 /// Shared preflight for a quota reader whose frozen route is external or
 /// ambiguous. The adapter declaration classifies only the frozen profile
 /// and reader environment and returns a nonsecret refusal reason. The daemon
@@ -1400,38 +1373,15 @@ fn native_models_response(
         .and_then(Value::as_str)
         .filter(|default| !default.trim().is_empty())
         .map(str::to_owned);
-    // These response labels describe the reader's provenance to the caller.
-    let (catalogue, note) = if harness == "muse" && entries.is_empty() {
-        (
-            "empty".to_owned(),
-            Some(format!(
-                "Muse model/list from {cmd} returned an empty catalogue after provider discovery"
-            )),
-        )
-    } else if harness == "muse" {
-        (
-            "native".to_owned(),
-            Some(muse_catalog_note(default.as_deref())),
-        )
-    } else if harness == "opencode" {
-        (
-            "native".to_owned(),
-            Some(opencode_catalog_note(provenance).to_owned()),
-        )
-    } else if harness == "antigravity" {
-        (
-            "native".to_owned(),
-            Some(
-                "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
-                    .to_owned(),
-            ),
-        )
-    } else {
-        ("native".to_owned(), None)
-    };
+    // Adapters own vendor-specific view notes; the daemon supplies only the
+    // shared default presentation when an adapter declares no callback.
+    let (catalogue, note) = HarnessCapabilities::of(harness)
+        .model_catalogue_presentation
+        .map(|present| present(cmd, provenance, entries.is_empty(), default.as_deref()))
+        .unwrap_or(("native", None));
     Ok(HarnessModelsResponse {
         harness: harness.to_owned(),
-        catalogue,
+        catalogue: catalogue.to_owned(),
         models: entries,
         default,
         note,

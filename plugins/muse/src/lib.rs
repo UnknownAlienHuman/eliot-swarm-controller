@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod capabilities;
+pub(crate) mod catalog_presentation;
 mod events;
 mod host;
 pub mod install;
