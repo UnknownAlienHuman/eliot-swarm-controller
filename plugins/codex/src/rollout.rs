@@ -669,7 +669,16 @@ fn normalize_live_event(
     let has_error = match payload.get("error") {
         None | Some(Value::Null) => false,
         Some(Value::Object(error)) => {
-            data["error"] = json!({"message":error.get("message").and_then(Value::as_str).ok_or_else(integrity)?});
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or_else(integrity)?;
+            data["error"] = json!({"message": message});
+            // Rollout errors carry only the message, so the exact sentence is
+            // the sole (fallback) evidence for a provider hold on this path.
+            if !aborted && super::native::types::is_provider_response_withheld_message(message) {
+                data["provider_response_withheld"] = Value::Bool(true);
+            }
             true
         }
         Some(_) => return Err(integrity()),
@@ -1383,6 +1392,11 @@ fn project_line(
                 return Err(integrity());
             }
             if view == "turns" {
+                let withheld = line
+                    .payload
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(super::native::types::is_provider_response_withheld_message);
                 entries.push(json!({
                     "turn_id": turn_id,
                     "status": if line.payload.get("error").is_some_and(|error| !error.is_null()) {"failed"} else {"completed"},
@@ -1390,6 +1404,7 @@ fn project_line(
                     "completed_at": completed_at.map(super::milliseconds).transpose()?,
                     "duration_ms": duration_ms,
                     "ordinal": line.ordinal,
+                    "provider_response_withheld": withheld,
                 }));
             }
             if active.is_some() {

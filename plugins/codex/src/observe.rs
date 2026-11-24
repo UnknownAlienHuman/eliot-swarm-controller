@@ -73,6 +73,16 @@ struct HistoryTurn {
     items: Vec<Value>,
     #[serde(default)]
     items_view: Option<String>,
+    #[serde(default)]
+    error: Option<HistoryTurnError>,
+}
+
+/// Only the required `TurnError.message` is read; the rest of the native error
+/// stays outside this readback projection.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryTurnError {
+    message: String,
 }
 
 struct SubjectRead {
@@ -908,6 +918,10 @@ impl ObserverSession {
                 "started_at": turn.started_at.map(milliseconds).transpose()?,
                 "completed_at": turn.completed_at.map(milliseconds).transpose()?,
                 "duration_ms": turn.duration_ms,
+                "provider_response_withheld": turn.status == "failed"
+                    && turn.error.as_ref().is_some_and(|error| {
+                        crate::native::types::is_provider_response_withheld_message(&error.message)
+                    }),
             });
             entries.push(value);
         }

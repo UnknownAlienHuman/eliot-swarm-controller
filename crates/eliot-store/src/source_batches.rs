@@ -43,16 +43,37 @@ fn provider_response_withheld_event_tx(
     {
         return Ok(None);
     }
-    let (Some(turn_id), Some(task_command)) = (
-        terminal.data["turn_id"].as_str(),
-        terminal.data["command_id"].as_str(),
-    ) else {
+    let Some(turn_id) = terminal.data["turn_id"].as_str() else {
         return Ok(None);
     };
+    let agent_num = parse_agent_id(&agent.id)?;
+    // Readback and backfill terminals carry no Eliot command, so bind the
+    // command the exact persisted turn was started under. A terminal that
+    // names a command must still match that binding.
+    let persisted_command: Option<String> = tx
+        .query_row(
+            "SELECT t.start_command_id FROM turns t
+             WHERE t.agent = ?1 AND t.generation = ?2 AND t.turn_id = ?3
+               AND (SELECT COUNT(*) FROM turns same
+                    WHERE same.agent = t.agent AND same.generation = t.generation
+                      AND same.turn_id = t.turn_id) = 1",
+            params![agent_num, agent.generation, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .flatten();
+    let Some(task_command) = persisted_command.as_deref() else {
+        return Ok(None);
+    };
+    if let Some(named) = terminal.data["command_id"].as_str()
+        && named != task_command
+    {
+        return Ok(None);
+    }
     if turn_id.is_empty() || task_command.is_empty() {
         return Ok(None);
     }
-    let agent_num = parse_agent_id(&agent.id)?;
     let exact_pending_turn: bool = tx
         .query_row(
             "SELECT EXISTS(
@@ -1148,7 +1169,7 @@ impl Store {
             )?;
             if !observed
                 && !resolves_recovered
-                && batch.source == "stream"
+                && matches!(batch.source.as_str(), "stream" | "observe" | "transcript")
                 && let Some(event) =
                     provider_response_withheld_event_tx(&tx, &next, native_event, now)?
             {
