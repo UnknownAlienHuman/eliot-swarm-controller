@@ -419,12 +419,22 @@ pub(crate) async fn run_msg(
 }
 
 pub(crate) async fn run_inbox(
-    OwnerInboxArgs { page, command }: OwnerInboxArgs,
+    OwnerInboxArgs {
+        page,
+        aged,
+        command,
+    }: OwnerInboxArgs,
     data_dir: PathBuf,
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
     if let Some(command) = command {
+        if aged {
+            return Err(Failure::new(
+                2,
+                "--aged is available on the Owner inbox read",
+            ));
+        }
         match command {
             OwnerInboxCommand::Decide { item, choice, args } => {
                 return decide_inbox(&data_dir, &item, choice, args, json_output, id).await;
@@ -486,11 +496,22 @@ pub(crate) async fn run_inbox(
         && std::env::var_os("ELIOT_AGENT_ID").is_none()
     {
         let request = OwnerInboxRequest { after, limit };
+        let method = if aged {
+            "owner.inbox.aged"
+        } else {
+            "owner.inbox"
+        };
         let response: OwnerInboxResponse =
-            eliot_daemon::client_call_typed(&data_dir, "owner.inbox", &request)
+            eliot_daemon::client_call_typed(&data_dir, method, &request)
                 .await
                 .map_err(Failure::for_read)?;
         return print_owner_inbox(&response, json_output);
+    }
+    if aged {
+        return Err(Failure::new(
+            2,
+            "--aged requires the Owner inbox without mail selectors",
+        ));
     }
     run_mail_inbox(
         InboxArgs {
@@ -843,8 +864,15 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
     if json_output {
         print_value(&value, true);
     } else {
+        if let Some(waiting) = response.waiting_over_24h {
+            println!("{waiting} Owner decisions waiting more than 24 hours.");
+        }
         if response.items.is_empty() {
-            println!("Owner inbox is clear.");
+            if response.waiting_over_24h.is_some_and(|count| count > 0) {
+                println!("No visible decisions on this page.");
+            } else {
+                println!("Owner inbox is clear.");
+            }
         }
         for item in &response.items {
             let seconds = item.age_ms / 1000;

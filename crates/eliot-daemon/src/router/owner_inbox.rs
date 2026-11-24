@@ -47,13 +47,23 @@ impl Router {
         .map_err(|_| Error::new("internal", "owner projection reader failed"))?
     }
 
-    pub(super) async fn owner_inbox(&self, params: &Value, principal: &Principal) -> Result<Value> {
+    pub(super) async fn owner_inbox(
+        &self,
+        params: &Value,
+        principal: &Principal,
+        aged_only: bool,
+    ) -> Result<Value> {
         require_owner(principal)?;
         let request: OwnerInboxRequest = decode_params(params.clone())?;
         let limit = request.effective_limit()?;
-        let items = self.read_owner_projection().await?.items;
+        let OwnerProjection {
+            items,
+            waiting_over_24h,
+            ..
+        } = self.read_owner_projection().await?;
         let mut items = items
             .into_iter()
+            .filter(|item| !aged_only || item.waiting_over_24h())
             .map(|item| (item.cursor(), item))
             .collect::<Vec<_>>();
         items.sort_unstable_by(|left, right| left.0.cmp(&right.0));
@@ -84,6 +94,7 @@ impl Router {
         serde_json::to_value(OwnerInboxResponse {
             items: visible,
             next,
+            waiting_over_24h: Some(waiting_over_24h),
         })
         .map_err(|_| Error::new("internal", "owner inbox could not be encoded"))
     }

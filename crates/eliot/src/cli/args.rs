@@ -1205,6 +1205,9 @@ pub(crate) struct InboxArgs {
 pub(crate) struct OwnerInboxArgs {
     #[command(flatten)]
     pub(crate) page: InboxArgs,
+    /// Show only visible Owner decisions waiting more than 24 hours.
+    #[arg(long)]
+    pub(crate) aged: bool,
     #[command(subcommand)]
     pub(crate) command: Option<OwnerInboxCommand>,
 }
@@ -1684,6 +1687,19 @@ pub(crate) enum RuleCommand {
         #[arg(long, value_name = "FILE")]
         file: PathBuf,
         /// Required when replacing an existing rule file.
+        #[arg(long, value_name = "SHA256")]
+        expected_revision: Option<String>,
+    },
+    /// Install the checked-worktree review recipe in a registered project.
+    InstallReview {
+        #[arg(long, value_name = "PROJECT")]
+        project: String,
+        #[arg(long, value_name = "PROFILE")]
+        author: String,
+        #[arg(long, value_name = "PROFILE")]
+        reviewer: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: String,
         #[arg(long, value_name = "SHA256")]
         expected_revision: Option<String>,
     },

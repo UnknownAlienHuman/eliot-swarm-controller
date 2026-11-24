@@ -50,6 +50,7 @@ pub struct OwnerInboxSweep {
 
 pub struct OwnerProjection {
     pub items: Vec<OwnerInboxItem>,
+    pub waiting_over_24h: usize,
     pub liveness: SwarmLiveness,
     pub command_without_dispatcher: CommandWithoutDispatcherStatus,
     pub goals_without_progress: usize,
@@ -139,7 +140,7 @@ impl Store {
         )
     }
 
-    /// Liveness and command-without-dispatcher counts include snoozed items.
+    /// Liveness, backlog age and command-without-dispatcher counts include snoozed items.
     /// Goal and repeated-failure counts reflect the visible inbox items.
     pub fn read_owner_projection(
         path: &Path,
@@ -148,8 +149,10 @@ impl Store {
     ) -> Result<OwnerProjection> {
         read_inbox_snapshot(path, |connection| {
             let (mut items, mut liveness) = super::owner_inbox::project(connection, now)?;
+            let mut waiting_over_24h = 0;
             items.retain(|item| {
                 if is_reportable(item, now, confirmed) {
+                    waiting_over_24h += usize::from(item.waiting_over_24h());
                     return true;
                 }
                 liveness.stuck = liveness.stuck.saturating_sub(1);
@@ -207,6 +210,7 @@ impl Store {
                 .count();
             Ok(OwnerProjection {
                 items,
+                waiting_over_24h,
                 liveness,
                 command_without_dispatcher,
                 goals_without_progress,

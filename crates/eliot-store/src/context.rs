@@ -70,6 +70,13 @@ pub(super) struct ContextConsumer<'a> {
     pub(super) point: InjectPoint,
 }
 
+#[derive(Default)]
+pub struct TurnInsertionEvidence {
+    pub native_paths: Vec<String>,
+    pub git_edit: bool,
+    pub passing_check: bool,
+}
+
 impl Store {
     pub fn session_ready_event(&self, agent: &str, generation: i64) -> Result<Option<Event>> {
         let record = self
@@ -87,21 +94,39 @@ impl Store {
         record.map(event_from_record).transpose()
     }
 
-    /// Retained native edit paths and observed check execution for one turn.
+    /// Retained edits and passing checks for one turn's latest observed edit.
+    /// An absent result means the start of the turn cannot be established.
     pub fn turn_insertion_evidence(
         &self,
         turn: &Turn,
         through: i64,
+        workspace: &str,
         check: &[String],
-    ) -> Result<(Vec<String>, bool)> {
+        goal_revision: i64,
+    ) -> Result<Option<TurnInsertionEvidence>> {
         let agent = parse_agent_id(&turn.agent)?;
         let Some(started) = turn.started_at else {
-            return Ok((Vec::new(), false));
+            return Ok(None);
         };
+        let covered: bool = self
+            .connection
+            .query_row(
+                "SELECT CASE WHEN pruned_through = 0 THEN 1 ELSE EXISTS (
+                SELECT 1 FROM events INDEXED BY events_agent
+                WHERE agent = ?1 AND generation = ?2 AND seq > pruned_through AND seq < ?3
+                  AND kind = 'turn.started' AND json_extract(data, '$.turn_id') = ?4
+             ) END FROM rule_history_coverage WHERE singleton = 1",
+                params![agent, turn.generation, through, turn.turn_id],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !covered {
+            return Ok(None);
+        }
         let mut statement = self
             .connection
             .prepare(
-                "SELECT path.value FROM events AS edit INDEXED BY events_agent
+                "SELECT edit.seq, path.value FROM events AS edit INDEXED BY events_agent
              JOIN json_each(CASE
                 WHEN edit.kind IN ('hook.after_tool', 'tool.file.edited') THEN json_array(CASE
                   WHEN json_extract(edit.data, '$.edit_path.kind') = 'relative' THEN json_extract(edit.data, '$.edit_path.path')
@@ -120,22 +145,52 @@ impl Store {
              ORDER BY edit.seq DESC LIMIT 128",
             )
             .map_err(sql_error)?;
-        let paths = statement
+        let edits = statement
             .query_map(
                 params![agent, turn.generation, through, turn.turn_id],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .map_err(sql_error)?
-            .collect::<std::result::Result<Vec<String>, _>>()
+            .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql_error)?;
-        let checked = self.connection.query_row(
+        let git_edit: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT seq FROM events INDEXED BY events_agent
+             WHERE agent = ?1 AND generation = ?2 AND seq < ?3 AND ts >= ?4
+               AND source = 'git' AND json_extract(data, '$.workspace') = ?5
+               AND (kind = 'file.changed' OR (kind = 'git.changed' AND (
+                    json_array_length(data, '$.dirty') > 0
+                    OR json_array_length(data, '$.committed_paths') > 0)))
+             ORDER BY seq DESC LIMIT 1",
+                params![agent, turn.generation, through, started, workspace],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let last_edit = edits.first().map(|(seq, _)| *seq).max(git_edit);
+        let mut evidence = TurnInsertionEvidence {
+            native_paths: edits.into_iter().map(|(_, path)| path).collect(),
+            git_edit: git_edit.is_some(),
+            passing_check: false,
+        };
+        let Some(last_edit) = last_edit else {
+            return Ok(Some(evidence));
+        };
+        let check = check.join(" ");
+        // An unflagged command well below the byte cap cannot be a truncated
+        // prefix. A UTF-8 boundary can back up by up to three bytes.
+        let short_check = check.len() < eliot_core::limits::MAX_TOOL_COMMAND_BYTES - 3;
+        evidence.passing_check = self.connection.query_row(
             "SELECT EXISTS (
                 SELECT 1 FROM events AS e INDEXED BY events_agent
                 JOIN events AS changed ON changed.seq = json_extract(e.data, '$.edit_seq')
-                WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq < ?3 AND e.ts >= ?4
-                  AND e.kind = 'project.check.finished' AND e.source = 'project'
+                WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq < ?3 AND e.seq > ?8 AND e.ts >= ?4
+                  AND e.kind = 'project.check.finished' AND e.source = 'daemon' AND e.family = 'project'
                   AND changed.agent = e.agent AND changed.generation = e.generation
-                  AND changed.ts >= ?4 AND json_type(e.data, '$.exit_code') = 'integer'
+                  AND changed.seq >= ?8 AND changed.seq < e.seq AND changed.ts >= ?4
+                  AND json_type(e.data, '$.exit_code') = 'integer'
+                  AND json_extract(e.data, '$.exit_code') = 0
              ) OR EXISTS (
                 SELECT 1 FROM events AS start INDEXED BY events_agent
                 JOIN events AS done INDEXED BY events_agent
@@ -144,18 +199,35 @@ impl Store {
                   AND done.kind = 'tool.completed' AND done.seq > start.seq AND done.seq < ?3
                   AND json_extract(done.data, '$.turn_id') = ?5
                   AND json_extract(done.data, '$.item_id') = json_extract(start.data, '$.item_id')
-                  AND (json_extract(done.data, '$.status') = 'completed'
-                       OR json_type(done.data, '$.exit_code') = 'integer')
-                WHERE start.agent = ?1 AND start.generation = ?2 AND start.seq < ?3 AND start.ts >= ?4
+                  AND LOWER(COALESCE(json_extract(done.data, '$.status'), '')) NOT IN
+                      ('error', 'failed', 'failure', 'declined', 'denied', 'cancelled', 'canceled',
+                       'interrupted', 'aborted', 'rejected', 'timed_out')
+                  AND ((json_type(done.data, '$.exit_code') = 'integer'
+                        AND json_extract(done.data, '$.exit_code') = 0)
+                       OR (COALESCE(json_type(done.data, '$.exit_code'), 'null') = 'null'
+                           AND json_extract(done.data, '$.status') = 'completed'))
+                WHERE start.agent = ?1 AND start.generation = ?2 AND start.seq < ?3
+                  AND start.seq > ?8 AND start.ts >= ?4
                   AND start.source = 'stream' AND start.native_id IS NOT NULL AND start.kind = 'tool.started'
                   AND json_extract(start.data, '$.turn_id') = ?5
-                  AND json_extract(start.data, '$.command_truncated') = 0
+                  AND (json_extract(start.data, '$.command_truncated') = 0
+                       OR (json_type(start.data, '$.command_truncated') IS NULL AND ?7))
                   AND json_extract(start.data, '$.command') = ?6
+             ) OR EXISTS (
+                SELECT 1 FROM events AS e INDEXED BY events_agent
+                WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq > ?8 AND e.ts >= ?4
+                  AND e.kind = 'goal.round' AND e.source = 'daemon'
+                  AND json_extract(e.data, '$.mode') = 'eliot'
+                  AND json_extract(e.data, '$.revision') + 1 = ?9
+                  AND json_extract(e.data, '$.outcome') = 'completed'
+                  AND json_type(e.data, '$.exit_code') = 'integer'
+                  AND json_extract(e.data, '$.exit_code') = 0
              )",
-            params![agent, turn.generation, through, started, turn.turn_id, check.join(" ")],
+            params![agent, turn.generation, through, started, turn.turn_id, check, short_check,
+                last_edit, goal_revision],
             |row| row.get(0),
         ).map_err(sql_error)?;
-        Ok((paths, checked))
+        Ok(Some(evidence))
     }
 
     pub fn render_injection(&self, command: &Command, text: &str) -> Result<String> {

@@ -148,7 +148,7 @@ impl Router {
                 }
                 InsertionFact::NoCheckBeforeEnd => self.queue_fact_note_locked(
                     &mut store, &captured, "no_check_before_end",
-                    "The turn changed files but no configured Goal check is recorded before the turn ended.", None,
+                    "The turn changed files and Swarm has no passing configured check covering the latest observed edit.", None,
                 )?,
             }
         }

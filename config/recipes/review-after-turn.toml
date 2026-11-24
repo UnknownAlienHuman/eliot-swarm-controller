@@ -1,6 +1,6 @@
 # Install in the registered checkout's .eliot/rules/ directory to enable review.
-# Approve launch, send and inject in the project registration. Replace
-# author-profile, reviewer-profile and C:/src/app. Use a distinct reviewer
+# Approve launch, send and inject in the project registration. Replace the
+# three quoted setup tokens or run swarm rule install-review. Use a distinct reviewer
 # profile with read-only native permissions, such as Codex with
 # permissions = "read-only" and approval_policy = "never".
 #
@@ -9,18 +9,18 @@
 # workspace to a separate registered reviewer checkout with no assignment.
 #
 # With no project check configured, replace the launch trigger below with:
-# on = { event = "turn.completed", match = { "subject.profile" = "author-profile", "data.outcome" = "success", "data.project_check" = "off", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
+# on = { event = "turn.completed", match = { "subject.profile" = "{{REVIEW_AUTHOR}}", "data.outcome" = "success", "data.project_check" = "off", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
 
 [[rule]]
 id = "review-after-turn"
-on = { event = "project.worktree.check.passed", match = { "subject.profile" = "author-profile", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
+on = { event = "project.worktree.check.passed", match = { "subject.profile" = "{{REVIEW_AUTHOR}}", "data.worktree.files" = { not = 0 }, "data.worktree.lines" = { at_most = 600 } } }
 once_per = "${data.worktree.fingerprint}"
 limit = { max = 2, per = "agent", window = "24h", min_interval = "2h" }
 
 [[rule.do]]
 action = "launch"
-profile = "reviewer-profile"
-workspace = "C:/src/app"
+profile = "{{REVIEW_REVIEWER}}"
+workspace = "{{REVIEW_WORKSPACE}}"
 require_worktree = true
 include_patch_digest = true
 no_policy = "Read-only review of a separately checked author worktree."

@@ -1047,8 +1047,13 @@ A registered project may define a static command refusal table with
 [[projects.ID.command_guards]]. Each entry has a pattern glob and a literal,
 single-line refusal. Globs match the full command supplied by a native
 permission request and each trimmed segment separated by unquoted, unescaped
-`;`, `|`, `&`, or a newline. Matching uses the supplied text without shell
-expansion. Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
+`;`, `|`, `&`, or a newline. On Windows each segment also matches using the
+executable basename without its `.exe` suffix, with the original arguments.
+The executable can follow a leading PowerShell `&` and can be quoted. For an
+unquoted drive-rooted, rooted or dot-relative path, the first valid `.exe`
+boundary can include spaces. Matching performs no shell expansion and leaves
+the command bodies of `cmd /c`, `pwsh -c` and `powershell -Command` opaque.
+Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
 text at most 512 bytes. The daemon freezes the registered project's table into each
 admitted launch after project discovery. It is evaluated only when a supported native
 permission request exposes the command.
@@ -1618,8 +1623,8 @@ switch keeps the executable bound to the source generation.
 #### Owner quota reserve (#872)
 
 Set `quota_reserve_percent` on a named profile to an integer from 0 through 100.
-It defaults to 0. The recommended reserve is 20, which keeps the final 20
-percentage points of each applicable provider window for the Owner. A new
+It defaults to 0. The Owner may configure a positive reserve to set aside that
+many percentage points of each applicable provider window. A new
 automatic launch skips the route with `quota_reserve` when current usage of any
 applicable window is strictly greater than `100 - quota_reserve_percent`.
 `quota_unknown = "admit"` is the default. Set it to `"hold"` to skip with

@@ -606,9 +606,14 @@ out of rule settings, argv, watch state and event payloads.
 
 ### Worktree review recipe
 
-Install [review-after-turn.toml](../../config/recipes/review-after-turn.toml) in the
-registered checkout's rules directory and approve the launch, initial send and inject
-actions. Use a distinct reviewer profile with native read-only permissions.
+Run `swarm rule install-review --project ID --author PROFILE --reviewer PROFILE --workspace PATH`
+to install [review-after-turn.toml](../../config/recipes/review-after-turn.toml)
+through the existing rule save API. To replace an existing file, supply its
+`--expected-revision` from `swarm rule read`. Approve launch, initial send and
+inject in the project registration. Use a distinct reviewer profile with native
+read-only permissions. The installer requires all three setup tokens to resolve
+before it saves the rule. The Owner explicitly installs the recipe because it
+launches a reviewer and delivers its result.
 An assigned project reserves launches for its current team. To review from a separate
 checkout in that case, install an Owner rule, constrain the author's project in the
 trigger, and give the reviewer an unassigned checkout.
@@ -930,8 +935,8 @@ weaker send. `inject` requires an event trigger and is unsupported for timers.
 
 Swarm uses the same insertion path for notes about a confirmed edit outside the
 worktree or the frozen Goal scope, repeated command failures, and a turn with edits
-and no observed configured check before completion. Swarm does not queue
-`no_check_before_end` when the Goal's check already ran after the turn started, or
+and no passing configured check covers its latest observed edit. Swarm does not queue
+`no_check_before_end` when passing check evidence covers that edit, or
 when the automatic driver's own enablement, key, probe and gates admit a round for
 that idle point (#904, #868, #881). A recorded Goal check has no `completed_at`
 upper bound: a round commits only while the Agent is idle, so its check lands after
@@ -952,10 +957,21 @@ after processing each event. A task card summarizes the retained task brief, bra
 at most 700 bytes. Swarm sends it after native compaction, resume, switch or handoff,
 at most once per turn. Lifecycle notes can queue before the first linked input.
 
-A completed fast project check records `project.check.finished` with its
-triggering edit sequence and exit code. Fact counters use later confirmed check,
-command or Git evidence where available. Without a confirming fact, correction
-remains unverified.
+A completed fast project check records a daemon event in the `project` family
+with kind `project.check.finished`, its triggering edit sequence and exit code.
+If the turn start falls within pruned event history, edit and check coverage
+for the turn are unknown and Swarm skips the reminder. The turn-end reminder
+accepts a zero-exit receipt for the same generation and turn window when its
+triggering edit sequence covers the latest observed edit.
+An exact native check must start after the latest edit and retain a matching
+successful completion. A zero exit counts, and native `completed` counts when
+the adapter reports no exit code. A reported failure status or nonzero exit
+does not count. A passing Goal round that settles the current Goal revision also
+counts after the latest edit, including when it settles after turn completion.
+Older native command events without a truncation flag count when the exact
+command is short enough to rule out truncation. Fact counters use later
+confirmed check, command or Git evidence where available. Without a confirming
+fact, correction remains unverified.
 
 For [#881 item 2](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/881),
 the next-input move at turn end substitutes for a Claude Stop hook. Pending

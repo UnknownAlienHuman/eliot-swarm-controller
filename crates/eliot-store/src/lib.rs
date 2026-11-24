@@ -30,7 +30,7 @@ pub use attribution::WhoWorkerRow;
 pub use capacity::{OwnedExitProof, RecordedProcess, RestartResumeCandidate, RetainedGeneration};
 pub use command_children::{CommandChildrenPage, history_expired};
 pub use config_overlay::AgentConfig;
-pub use context::{ContextDispatch, SendInput};
+pub use context::{ContextDispatch, SendInput, TurnInsertionEvidence};
 pub use coordination::{MailSendOutcome, MailSendResult, NoticeClaim};
 pub use digests::{DigestRegisterOutcome, DigestRow, DigestTurn};
 pub use fleet::{AgentListFilter, AgentListPage};
