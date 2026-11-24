@@ -1119,23 +1119,31 @@ impl Store {
         if self.write_faulted.get() {
             return Ok(Vec::new());
         }
+        // An unsettled action or linked SEND is the only way a rule child
+        // becomes runnable. Seek only the open rows.
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, principal, method, target, expected_generation, generation,
+                "WITH unsettled AS MATERIALIZED (
+                    SELECT id, parent_command, link_kind, ordinal, state
+                    FROM commands INDEXED BY commands_unsettled_created
+                    WHERE state IN ('accepted','queued','dispatched','unknown')
+                 )
+                 SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
                         created_at, updated_at, probe, selector, config_revision
                  FROM commands
-                 WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
-                   AND (
-                       state IN ('accepted','queued')
-                       OR (verb IN ('launch','resume') AND state = 'applied'
-                           AND EXISTS (
-                               SELECT 1 FROM commands input
-                               WHERE input.parent_command = commands.id
-                                 AND input.link_kind = 'send' AND input.ordinal = 0
-                                 AND input.state IN ('accepted','queued')
-                           ))
+                 WHERE id IN (
+                     SELECT id FROM unsettled
+                     WHERE state IN ('accepted','queued')
+                       AND link_kind = 'rule_action' AND ordinal IS NOT NULL
+                     UNION ALL
+                     SELECT start.id FROM unsettled input
+                     CROSS JOIN commands start ON start.id = input.parent_command
+                     WHERE input.state IN ('accepted','queued')
+                       AND input.link_kind = 'send' AND input.ordinal = 0
+                       AND start.link_kind = 'rule_action' AND start.ordinal IS NOT NULL
+                       AND start.verb IN ('launch','resume') AND start.state = 'applied'
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM commands earlier
