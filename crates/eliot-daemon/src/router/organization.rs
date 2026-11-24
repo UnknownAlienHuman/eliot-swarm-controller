@@ -21,9 +21,11 @@ impl Router {
         // Registered groups carry their project slot use beside the Owner
         // limit, read before the Store lock.
         let limits = crate::config::load_scope_limits(&self.inner.data_root)?;
-        let store = self.inner.store.lock().await;
-        let response =
-            store.chat_organization(&principal_name(principal), &request, &limits, now_ms())?;
+        let principal = principal_name(principal);
+        let response = {
+            let store = self.inner.store.lock().await;
+            store.chat_organization(&principal, &request, &limits, now_ms())?
+        };
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "organization could not be encoded"))
     }

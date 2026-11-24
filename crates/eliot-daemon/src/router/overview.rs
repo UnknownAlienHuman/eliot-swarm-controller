@@ -16,10 +16,12 @@ impl Router {
                 "project overview requires Owner or Agent authority",
             ));
         }
-        let store = self.inner.store.lock().await;
         let limits = crate::config::load_scope_limits(&self.inner.data_root)?;
-        let response =
-            store.project_overview(&limits, &request, &principal_name(principal), now_ms())?;
+        let principal = principal_name(principal);
+        let response = {
+            let store = self.inner.store.lock().await;
+            store.project_overview(&limits, &request, &principal, now_ms())?
+        };
         serde_json::to_value(response)
             .map_err(|_| Error::new("internal", "project overview could not be encoded"))
     }

@@ -583,6 +583,8 @@ reports its own snapshot watermark. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.
+`project.overview` and `chat.organization` read scope limits before their
+Store projections. Response encoding runs after the Store mutex is released.
 
 ### Chat organization
 
