@@ -218,9 +218,10 @@ Descendants wait for restart-affected ancestors to resume. A completed Owner
 Stop or a failed or rejected restart Resume ends automatic attempts for that
 generation.
 Eligibility requires exact custody closure and settled commands, requests,
-and Goal rounds for the prior generation. Idle continuation is selected only
-from the retained `owned_exit_before_restart` event, which Store writes after
-proving there was no active or unknown turn, pending request, or open command.
+and Goal rounds for the prior generation. Idle continuation uses retained
+`owned_exit_before_restart` evidence or a restart loss that captured the
+generation idle with no active turn ID. The Store rechecks closure and
+settled work before admitting a promptless Resume.
 Unresolved commands, turns, requests, Goal rounds, Owner Stops, or restart-
 affected ancestors continue to fence admission. The exact turn interrupted by
 the restart may remain unknown. The new generation keeps the native subject

@@ -27,8 +27,13 @@ const RESTART_INTERRUPTED_WORK: &str = "restart.kind = 'agent.lost'
 // `owned_exit_before_restart` is emitted only after Store proves the prior
 // generation was idle with no active/unknown turn, pending request, or open
 // command. That clean idle session is itself a continuation candidate.
-const RESTART_CLEAN_IDLE_SESSION: &str = "restart.kind = 'agent.stopped'
-    AND json_extract(restart.data, '$.reason') = 'owned_exit_before_restart'";
+const RESTART_CLEAN_IDLE_SESSION: &str = "(
+    (restart.kind = 'agent.stopped'
+        AND json_extract(restart.data, '$.reason') = 'owned_exit_before_restart')
+    OR (restart.kind = 'agent.lost'
+        AND json_extract(restart.data, '$.previous_state') = 'idle'
+        AND json_type(restart.data, '$.turn_id') IS NULL)
+)";
 const RESTART_UNDELIVERED_INPUT: &str = "json_extract(restart.data, '$.undelivered_input') IS 1";
 const RESTART_LINKED_LAUNCH_INPUT_VALID: &str = "EXISTS (
     SELECT 1 FROM commands send
