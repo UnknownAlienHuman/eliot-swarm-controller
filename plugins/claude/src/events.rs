@@ -3391,6 +3391,9 @@ impl EventProcessor {
                     json!({"code":"quota_exhausted", "message":"provider billing/quota refusal"});
             } else if let Some(error) = &error {
                 attach_native_error(&mut data, Some(error.message.as_str()), &secrets);
+                if let Some(native_error) = data["native_error"].as_object_mut() {
+                    native_error.insert("code".to_owned(), json!(error.code));
+                }
             }
             let failure_origin = error
                 .as_ref()
@@ -3893,6 +3896,10 @@ fn claude_api_failure(kind: &str, text: &str) -> Option<Error> {
             FailureOrigin::Harness,
             "native refusal without structured upstream evidence",
         ),
+        "api_error" => (
+            FailureOrigin::Unknown,
+            "assistant.error reported an unclassified API error",
+        ),
         _ => return None,
     };
     let message = if is_blank_native_text(text) {
@@ -3900,5 +3907,5 @@ fn claude_api_failure(kind: &str, text: &str) -> Option<Error> {
     } else {
         format!("{kind}: {}", text.trim())
     };
-    Some(Error::new("native_failure", message).with_origin(origin, evidence))
+    Some(Error::new(kind, message).with_origin(origin, evidence))
 }

@@ -179,7 +179,7 @@ fn project_requests(
                   AND e.generation=r.generation AND e.kind IN ('request.opened','request.resolved','request.closed')
                   AND json_extract(e.data,'$.request_id')=r.request_id),0)
          FROM pending_requests r JOIN agents a ON a.id=r.agent AND a.generation=r.generation
-         WHERE r.state='pending'", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
+         WHERE r.state='pending' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -292,7 +292,9 @@ fn project_unknown_commands(
                 EXISTS(SELECT 1 FROM commands parent
                   WHERE parent.id=c.parent_command AND c.link_kind='handoff'
                     AND parent.method='swarm.handoff')
-         FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')", "c.id=?1", bindings)?;
+         FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
+           AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
+                 AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -467,7 +469,7 @@ fn project_unknown_turns(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
                   AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id),0)
-         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown'", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
+         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -643,10 +645,8 @@ fn project_holds(
     Ok(())
 }
 
-/// Swarm's own harness self-check results (#932 item 3): one Owner inbox
-/// item per harness whose recorded outcome belongs to its current installed
-/// version, passed or the failed step with the vendor's error. Quota-deferred
-/// versions stay "not checked" and produce no item.
+/// One confirmed failure per blocked harness. A pending newer check keeps
+/// the last confirmed failure visible until a pass restores routing.
 fn project_harness_checks(
     db: &Connection,
     now: i64,
@@ -656,79 +656,54 @@ fn project_harness_checks(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
         db,
-        "SELECT harness, installed_version, outcome, checked_version, checked_at,
-                COALESCE(check_profile, ''), failure_step, failure_error
-         FROM harness_checks
-         WHERE outcome IN ('passed', 'failed') AND checked_version <> ''",
-        "('harness:' || harness)=?1",
+        "SELECT h.harness,
+                COALESCE(f.checked_version, h.checked_version),
+                COALESCE(f.checked_at, h.checked_at),
+                COALESCE(f.check_profile, h.check_profile, ''),
+                COALESCE(f.failure_step, h.failure_step),
+                COALESCE(f.failure_error, h.failure_error)
+         FROM harness_checks h
+         LEFT JOIN harness_check_history f
+           ON h.outcome <> 'failed' AND f.harness=h.harness AND f.version_key=(
+               SELECT old.version_key FROM harness_check_history old
+               WHERE old.harness=h.harness AND old.outcome='failed'
+               ORDER BY old.checked_at DESC, old.version_key LIMIT 1
+           )
+         WHERE h.automatic_blocked=1 AND (h.outcome='failed' OR f.version_key IS NOT NULL)",
+        "('harness:' || h.harness)=?1",
         bindings,
     )?;
     let rows = stmt
-        .query_map(bindings, |r| {
+        .query_map(bindings, |row| {
             Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<String>>(7)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (harness, installed, outcome, checked, checked_at, profile, step, error) =
-            row.map_err(sql_error)?;
-        if harness.trim().is_empty() || checked.trim().is_empty() {
-            return Err(crate::Error::new("corrupt", "invalid harness check fact"));
-        }
-        // The recorded outcome belongs to the current installed surface only
-        // when the versions fold together (`codex-cli 0.167.1` meets
-        // `0.167.1`); a stale record after a version change projects no item.
-        if !eliot_core::same_harness_version(&harness, &installed, &checked) {
-            continue;
-        }
-        let subject = format!("harness:{harness}");
-        let subject_revision = format!(
-            "checked:{checked}:profile:{profile}:step:{}",
-            step.as_deref().unwrap_or("-")
+        let (harness, checked, checked_at, profile, step, error) = row.map_err(sql_error)?;
+        tally(
+            stats,
+            &Mover::Asked {
+                reason: "harness_check_failed",
+                item: OwnerInboxKind::HarnessCheck,
+            },
         );
-        if outcome == eliot_core::OUTCOME_FAILED {
-            let (Some(step), Some(error)) = (step, error) else {
-                return Err(crate::Error::new("corrupt", "invalid harness check fact"));
-            };
-            tally(
-                stats,
-                &Mover::Asked {
-                    reason: "harness_check_failed",
-                    item: OwnerInboxKind::HarnessCheck,
-                },
-            );
-            items.push(item(
-                OwnerInboxKind::HarnessCheck,
-                subject,
-                subject_revision,
-                now,
-                checked_at,
-                &format!("harness {harness} {checked} self-check failed at {step}: {error}"),
-                None,
-                Vec::new(),
-            ));
-        } else if outcome == eliot_core::OUTCOME_PASSED {
-            items.push(item(
-                OwnerInboxKind::HarnessCheck,
-                subject,
-                subject_revision,
-                now,
-                checked_at,
-                &format!("harness {harness} {checked} self-check passed"),
-                None,
-                Vec::new(),
-            ));
-        } else {
-            return Err(crate::Error::new("corrupt", "invalid harness check fact"));
-        }
+        items.push(item(
+            OwnerInboxKind::HarnessCheck,
+            format!("harness:{harness}"),
+            format!("checked:{checked}:profile:{profile}:step:{step}"),
+            now,
+            checked_at,
+            &format!("harness {harness} {checked} self-check failed at {step}: {error}"),
+            None,
+            Vec::new(),
+        ));
     }
     Ok(())
 }
@@ -784,6 +759,7 @@ fn project_agents(
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
+            AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
             AND a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {

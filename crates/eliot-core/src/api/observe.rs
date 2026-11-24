@@ -368,6 +368,8 @@ pub struct DoctorHarnessEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_checked_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_step: Option<String>,
@@ -395,6 +397,15 @@ impl HarnessCheckOutcome {
             Self::Failed => crate::OUTCOME_FAILED,
         }
     }
+}
+
+/// Cached harness check readback for daemon status. Status needs no probe.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCheckStatus {
+    pub harness: String,
+    pub version: String,
+    pub outcome: HarnessCheckOutcome,
+    pub checked_at: Option<i64>,
 }
 
 /// An explicit profile command whose executable is absent.
@@ -470,6 +481,9 @@ impl DoctorHarnessEntry {
         if let Some(profile) = &self.check_profile {
             text(profile, "doctor check profile")?;
         }
+        if let Some(agent) = &self.check_agent {
+            crate::parse_agent_id(agent)?;
+        }
         match self.check_outcome {
             HarnessCheckOutcome::NotChecked => {
                 if self.checked_version.is_some()
@@ -487,6 +501,9 @@ impl DoctorHarnessEntry {
                     && reason != crate::NOT_CHECKED_QUOTA
                     && reason != crate::NOT_CHECKED_NO_CHEAP_PROFILE
                     && reason != crate::NOT_CHECKED_ROUTE_UNAVAILABLE
+                    && reason != crate::NOT_CHECKED_TRANSIENT
+                    && reason != crate::NOT_CHECKED_UNCONFIRMED
+                    && reason != crate::NOT_CHECKED_ATTEMPT_LIMIT
                 {
                     return Err(Error::new("invalid", "doctor unchecked reason is invalid"));
                 }

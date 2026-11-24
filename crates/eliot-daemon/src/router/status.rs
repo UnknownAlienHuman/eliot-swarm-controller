@@ -133,14 +133,30 @@ impl Router {
             unsettled_commands,
             unsettled_total,
             provider_probe_attention,
+            harness_checks,
         ) = {
             let store = self.inner.store.lock().await;
+            let harness_checks = store
+                .list_harness_checks()?
+                .into_iter()
+                .filter_map(|row| {
+                    let outcome = row.checked_outcome();
+                    let checked_at = row.version_checked().then_some(row.checked_at);
+                    Some(eliot_core::api::HarnessCheckStatus {
+                        harness: row.harness,
+                        version: row.installed_version?,
+                        outcome,
+                        checked_at,
+                    })
+                })
+                .collect();
             (
                 store.agent_count()?,
                 store.is_write_faulted(),
                 store.list_unsettled_commands(STATUS_BLOCKER_MAX)?,
                 store.count_unsettled_commands()?,
                 store.provider_probe_attention(STATUS_BLOCKER_MAX)?,
+                harness_checks,
             )
         };
         let mut unknown_commands = self.unknown_ids();
@@ -180,6 +196,7 @@ impl Router {
         };
         serde_json::to_value(DaemonStatusResponse {
             owner_inbox,
+            harness_checks,
             liveness,
             health: Some(DaemonHealthSummary {
                 goals_without_progress,

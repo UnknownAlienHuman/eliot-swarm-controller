@@ -4946,11 +4946,14 @@ impl Router {
                     })
             });
             let checked = row.as_ref().filter(|row| row.version_checked());
-            let check_outcome = match checked.map(|row| row.outcome.as_str()) {
-                Some(eliot_core::OUTCOME_PASSED) => HarnessCheckOutcome::Passed,
-                Some(eliot_core::OUTCOME_FAILED) => HarnessCheckOutcome::Failed,
-                _ => HarnessCheckOutcome::NotChecked,
-            };
+            let check_outcome = row
+                .as_ref()
+                .map_or(HarnessCheckOutcome::NotChecked, |row| row.checked_outcome());
+            let check_agent = version
+                .as_deref()
+                .map(|version| store.active_harness_check_agent(harness, version))
+                .transpose()?
+                .flatten();
             let contract_mismatch = store
                 .latest_event_data("harness_contract_mismatch")?
                 .and_then(|data| doctor_mismatch_text(&data));
@@ -4964,6 +4967,7 @@ impl Router {
                 check_profile: checked
                     .and_then(|row| row.check_profile.clone())
                     .filter(|profile| !profile.is_empty()),
+                check_agent,
                 not_checked_reason: if checked.is_none() && installed {
                     Some(
                         row.as_ref()

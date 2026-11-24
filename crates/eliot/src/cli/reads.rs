@@ -649,6 +649,9 @@ pub(crate) fn print_doctor_table(response: &HarnessDoctorResponse) {
         if let Some(mismatch) = &entry.contract_mismatch {
             println!("  contract mismatch: {mismatch}");
         }
+        if let Some(agent) = &entry.check_agent {
+            println!("  check Agent: {agent}");
+        }
     }
     for issue in &response.profile_command_issues {
         print_profile_command_issue(issue);

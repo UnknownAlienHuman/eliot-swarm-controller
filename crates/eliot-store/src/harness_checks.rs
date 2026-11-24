@@ -2,10 +2,10 @@
 //! version and when that version last passed Swarm's own scenario.
 //!
 //! A new installed version is always accepted and marked "not checked"; it is
-//! never refused. At most one recorded run exists per harness and version: a
+//! never refused. At most two attempts exist per harness and version: a
 //! terminal `passed`/`failed` outcome binds its version and never runs again,
-//! while a quota refusal stays "not checked" and may run again after the hold
-//! ends. A failure blocks automatic routing until a subsequent pass.
+//! while inconclusive outcomes can retry once. A repeated attributable failure
+//! blocks automatic routing until a subsequent pass.
 
 use super::{Error, Result, Store, commit_transaction, sql_error};
 use eliot_core::{
@@ -31,6 +31,15 @@ pub struct HarnessCheckRow {
 }
 
 impl HarnessCheckRow {
+    pub fn checked_outcome(&self) -> core::api::HarnessCheckOutcome {
+        use core::api::HarnessCheckOutcome;
+        match (self.version_checked(), self.outcome.as_str()) {
+            (true, OUTCOME_PASSED) => HarnessCheckOutcome::Passed,
+            (true, OUTCOME_FAILED) => HarnessCheckOutcome::Failed,
+            _ => HarnessCheckOutcome::NotChecked,
+        }
+    }
+
     /// True when the current installed version already has its recorded run.
     pub fn version_checked(&self) -> bool {
         let (Some(installed), Some(checked)) = (
@@ -96,42 +105,14 @@ fn check_step(step: &str) -> Result<()> {
     Ok(())
 }
 
-/// One recordable check outcome: the stored outcome plus its optional
-/// reason, failure step and vendor error.
-struct HarnessOutcome<'a> {
-    outcome: &'a str,
-    reason: Option<&'a str>,
-    step: Option<&'a str>,
-    error: Option<&'a str>,
-}
-
-impl<'a> HarnessOutcome<'a> {
-    fn passed() -> Self {
-        Self {
-            outcome: OUTCOME_PASSED,
-            reason: None,
-            step: None,
-            error: None,
-        }
-    }
-
-    fn failed(step: &'a str, error: &'a str) -> Self {
-        Self {
-            outcome: OUTCOME_FAILED,
-            reason: None,
-            step: Some(step),
-            error: Some(error),
-        }
-    }
-
-    fn quota() -> Self {
-        Self {
-            outcome: OUTCOME_NOT_CHECKED,
-            reason: Some(NOT_CHECKED_QUOTA),
-            step: None,
-            error: None,
-        }
-    }
+/// One step failure, with a stable key only when the vendor supplied an
+/// attributable refusal for this exact checked operation.
+pub struct HarnessCheckFailure<'a> {
+    pub step: &'a str,
+    pub message: &'a str,
+    pub key: Option<&'a str>,
+    pub quota: bool,
+    pub preflight: bool,
 }
 
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarnessCheckRow> {
@@ -274,10 +255,8 @@ impl Store {
         result
     }
 
-    /// Claim the single recorded run for one harness and version. Returns
-    /// false when that version already has its recorded run or a run already
-    /// started for it. A quota refusal releases the claim without recording
-    /// a run, so the version may run again after the hold ends.
+    /// Reserve a run before admitting any native launch. A crash cannot
+    /// replenish this version's budget or consume a third model run.
     pub fn claim_harness_check(
         &mut self,
         harness: &str,
@@ -318,10 +297,8 @@ impl Store {
                     |row| row.get(0),
                 )
                 .map_err(sql_error)?;
-            let same_attempted = attempted
-                .as_deref()
-                .is_some_and(|attempted| core::same_harness_version(harness, attempted, &version));
-            if current.version_checked()
+            if attempted.is_some()
+                || !current.check_due(now)
                 || current
                     .installed_version
                     .as_deref()
@@ -332,7 +309,21 @@ impl Store {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(false);
             }
-            if same_attempted {
+            let reserved = tx
+                .execute(
+                    "INSERT INTO harness_check_attempts(harness, version_key, attempts)
+                 VALUES (?1, ?2, 1)
+                 ON CONFLICT(harness, version_key) DO UPDATE SET attempts = attempts + 1
+                 WHERE attempts < ?3 AND retry_at <= ?4",
+                    params![
+                        harness,
+                        core::normalize_harness_version(harness, &version),
+                        core::HARNESS_CHECK_MAX_ATTEMPTS,
+                        now,
+                    ],
+                )
+                .map_err(sql_error)?;
+            if reserved == 0 {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(false);
             }
@@ -354,50 +345,96 @@ impl Store {
         harness: &str,
         version: &str,
         profile: &str,
-        outcome: HarnessOutcome<'_>,
+        failure: Option<HarnessCheckFailure<'_>>,
         now: i64,
     ) -> Result<()> {
         check_harness(harness)?;
         let version = bound_version(version)?;
-        if let Some(step) = outcome.step {
-            check_step(step)?;
-        }
-        let error = outcome.error.map(bound_error).transpose()?;
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            // A quota refusal consumes no run: the checked version stays empty
-            // and the claim is released, so the version runs again after the
-            // hold ends. Terminal outcomes bind their version and never rerun.
-            // Every record releases the claim: a served claim must never read
-            // as a live run.
-            let checked_version = if outcome.outcome == OUTCOME_NOT_CHECKED {
-                String::new()
+            let (outcome, reason, step, message) = if let Some(failure) = failure {
+                check_step(failure.step)?;
+                let version_key = core::normalize_harness_version(harness, &version);
+                let (attempts, first): (i64, Option<String>) = tx
+                    .query_row(
+                        "SELECT attempts, first_failure FROM harness_check_attempts
+                     WHERE harness = ?1 AND version_key = ?2",
+                        params![harness, version_key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(sql_error)?;
+                let confirmed = !failure.quota
+                    && attempts == core::HARNESS_CHECK_MAX_ATTEMPTS
+                    && failure.key.is_some()
+                    && first.as_deref() == failure.key;
+                if confirmed {
+                    (
+                        OUTCOME_FAILED,
+                        None,
+                        Some(failure.step),
+                        Some(bound_error(failure.message)?),
+                    )
+                } else {
+                    let attempts = attempts - i64::from(failure.quota && failure.preflight);
+                    let reason = if attempts >= core::HARNESS_CHECK_MAX_ATTEMPTS {
+                        core::NOT_CHECKED_ATTEMPT_LIMIT
+                    } else if failure.quota {
+                        NOT_CHECKED_QUOTA
+                    } else if failure.key.is_some() {
+                        core::NOT_CHECKED_UNCONFIRMED
+                    } else {
+                        core::NOT_CHECKED_TRANSIENT
+                    };
+                    let cooldown = if failure.quota {
+                        HARNESS_CHECK_QUOTA_RETRY_SECS
+                    } else {
+                        core::HARNESS_CHECK_RETRY_SECS
+                    };
+                    tx.execute(
+                        "UPDATE harness_check_attempts SET attempts = ?3, retry_at = ?4,
+                            first_failure = CASE WHEN ?3 = 1 AND NOT ?6 THEN ?5 ELSE first_failure END
+                         WHERE harness = ?1 AND version_key = ?2",
+                        params![
+                            harness,
+                            version_key,
+                            attempts,
+                            now.saturating_add(cooldown * 1000),
+                            failure.key, failure.quota && failure.preflight,
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                    (OUTCOME_NOT_CHECKED, Some(reason), None, None)
+                }
             } else {
-                version.clone()
+                (OUTCOME_PASSED, None, None, None)
+            };
+            let checked_version = if outcome == OUTCOME_NOT_CHECKED {
+                ""
+            } else {
+                &version
             };
             let changed = tx
                 .execute(
                     "UPDATE harness_checks SET outcome = ?2, not_checked_reason = ?3,
-                         checked_version = ?4, checked_at = ?5, check_profile = ?6,
-                         failure_step = ?7, failure_error = ?8,
-                         attempted_version = NULL, attempted_at = 0, updated_at = ?5,
-                         automatic_blocked = CASE ?2 WHEN 'failed' THEN 1 WHEN 'passed' THEN 0
-                                                 ELSE automatic_blocked END
-                     WHERE harness = ?1 AND attempted_version IS NOT NULL
-                       AND attempted_version = ?9",
+                     checked_version = ?4, checked_at = ?5, check_profile = ?6,
+                     failure_step = ?7, failure_error = ?8,
+                     attempted_version = NULL, attempted_at = 0, updated_at = ?5,
+                     automatic_blocked = CASE ?2 WHEN 'failed' THEN 1 WHEN 'passed' THEN 0
+                                             ELSE automatic_blocked END
+                 WHERE harness = ?1 AND attempted_version = ?9",
                     params![
                         harness,
-                        outcome.outcome,
-                        outcome.reason,
+                        outcome,
+                        reason,
                         checked_version,
                         now,
                         profile,
-                        outcome.step,
-                        error,
+                        step,
+                        message,
                         version,
                     ],
                 )
@@ -408,14 +445,12 @@ impl Store {
                     "harness check run was not claimed for this version",
                 ));
             }
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(())
+            commit_transaction(tx, &self.write_faulted)
         })();
         self.fault_on_persistence_error(&result);
         result
     }
 
-    /// Record a passed scenario run for one harness and version.
     pub fn record_harness_check_passed(
         &mut self,
         harness: &str,
@@ -423,69 +458,39 @@ impl Store {
         profile: &str,
         now: i64,
     ) -> Result<()> {
-        self.record_harness_outcome(harness, version, profile, HarnessOutcome::passed(), now)
+        self.record_harness_outcome(harness, version, profile, None, now)
     }
 
-    /// Record a failed scenario run with the failed step and vendor error.
-    pub fn record_harness_check_failed(
+    pub fn record_harness_check_failure(
         &mut self,
         harness: &str,
         version: &str,
         profile: &str,
-        step: &str,
-        error: &str,
+        failure: HarnessCheckFailure<'_>,
         now: i64,
     ) -> Result<()> {
-        self.record_harness_outcome(
-            harness,
-            version,
-            profile,
-            HarnessOutcome::failed(step, error),
-            now,
-        )
+        self.record_harness_outcome(harness, version, profile, Some(failure), now)
     }
 
-    /// Record a quota refusal without consuming the version's single run, so
-    /// the check runs again after the hold ends.
-    pub fn record_harness_check_quota(
-        &mut self,
-        harness: &str,
-        version: &str,
-        profile: &str,
-        now: i64,
-    ) -> Result<()> {
-        self.record_harness_outcome(harness, version, profile, HarnessOutcome::quota(), now)
-    }
-
-    /// Release one live run claim without recording a run, so the version may
-    /// run again on a later tick. Returns true when a matching claim existed.
-    pub fn release_harness_check_claim(
-        &mut self,
-        harness: &str,
-        version: &str,
-        now: i64,
-    ) -> Result<bool> {
-        check_harness(harness)?;
-        let version = bound_version(version)?;
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let released = tx
-                .execute(
-                    "UPDATE harness_checks SET attempted_version = NULL, attempted_at = 0,
-                         updated_at = ?3
-                     WHERE harness = ?1 AND attempted_version = ?2",
-                    params![harness, version, now],
-                )
-                .map_err(sql_error)?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(released == 1)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
+    /// Read a structured failure code committed for the exact native turn.
+    pub fn harness_check_turn_error_code(&self, turn: &core::Turn) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT json_extract(data, '$.native_error.code') FROM events
+             WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.completed'
+               AND json_extract(data, '$.turn_id') = ?3
+             ORDER BY seq DESC LIMIT 1",
+                params![
+                    core::parse_agent_id(&turn.agent)?,
+                    turn.generation,
+                    turn.turn_id
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(sql_error)
     }
 
     /// Read one harness self-check fact.
@@ -517,6 +522,26 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Find a live diagnostic Agent for the exact installed version.
+    pub fn active_harness_check_agent(
+        &self,
+        harness: &str,
+        version: &str,
+    ) -> Result<Option<String>> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT id FROM agents WHERE harness = ?1
+               AND json_extract(profile_snapshot, '$._harness_check.version') = ?2
+               AND state IN ('created','starting','idle','busy','waiting')
+             ORDER BY id DESC LIMIT 1",
+                params![harness, version],
+                |row| Ok(super::format_agent_id(row.get(0)?)),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     /// True after a failed check, until a later run passes.
     pub fn harness_check_blocks_automatic(&self, harness: &str) -> Result<bool> {
         check_harness(harness)?;
@@ -536,17 +561,36 @@ impl Store {
     /// `limit`. The table holds one row per supported harness, so a full read
     /// with a Rust-side due filter stays bounded.
     pub fn due_harness_checks(&self, now: i64, limit: usize) -> Result<Vec<(String, String)>> {
-        Ok(self
-            .list_harness_checks()?
-            .into_iter()
-            .filter(|row| row.check_due(now))
-            .filter_map(|row| {
-                row.installed_version
-                    .clone()
-                    .map(|version| (row.harness.clone(), version))
-            })
-            .take(limit.max(1))
-            .collect())
+        let mut due = Vec::new();
+        for row in self.list_harness_checks()? {
+            if due.len() == limit {
+                break;
+            }
+            if row.check_due(now)
+                && let Some(version) = row.installed_version
+            {
+                let available = self
+                    .connection
+                    .query_row(
+                        "SELECT attempts < ?3 AND retry_at <= ?4 FROM harness_check_attempts
+                     WHERE harness = ?1 AND version_key = ?2",
+                        params![
+                            row.harness,
+                            core::normalize_harness_version(&row.harness, &version),
+                            core::HARNESS_CHECK_MAX_ATTEMPTS,
+                            now
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .optional()
+                    .map_err(sql_error)?
+                    .unwrap_or(true);
+                if available {
+                    due.push((row.harness, version));
+                }
+            }
+        }
+        Ok(due)
     }
 
     /// When the maintenance worker has no active drive, surviving claims

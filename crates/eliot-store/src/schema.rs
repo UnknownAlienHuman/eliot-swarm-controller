@@ -2607,7 +2607,8 @@ impl Store {
                      not_checked_reason TEXT
                          CHECK(not_checked_reason IS NULL
                              OR not_checked_reason IN
-                                 ('new_version', 'quota', 'no_cheap_profile', 'route_unavailable')),
+                                 ('new_version', 'quota', 'no_cheap_profile', 'route_unavailable',
+                                  'transient_failure', 'unconfirmed_failure', 'attempt_limit')),
                      checked_version TEXT NOT NULL DEFAULT '',
                      checked_at INTEGER NOT NULL DEFAULT 0 CHECK(checked_at >= 0),
                      check_profile TEXT,
@@ -2631,6 +2632,14 @@ impl Store {
                      check_profile TEXT,
                      failure_step TEXT,
                      failure_error TEXT,
+                     PRIMARY KEY (harness, version_key)
+                 ) WITHOUT ROWID;
+                 CREATE TABLE harness_check_attempts (
+                     harness TEXT NOT NULL,
+                     version_key TEXT NOT NULL,
+                     attempts INTEGER NOT NULL CHECK (attempts BETWEEN 0 AND 2),
+                     retry_at INTEGER NOT NULL DEFAULT 0,
+                     first_failure TEXT,
                      PRIMARY KEY (harness, version_key)
                  ) WITHOUT ROWID;",
             )

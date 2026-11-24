@@ -1428,11 +1428,13 @@ harness self-check fact.
    When Swarm sees a changed installed version, the daemon runs one short
    scenario for that harness and version on a daemon-owned isolated Agent
    (launch, a turn with a tool call, steer, stop, resume) on the cheapest
-   configured model, inside a hard time limit, at most once per harness and
-   version. The result goes to the Owner inbox (`harness_check` kind): passed,
-   or the failed step with the vendor's error. A quota refusal stays
-   "not checked" and runs again after the hold ends. A failed check removes
-   the harness from automatic routing until a later check passes; explicit
+   configured model, inside a hard time limit. Each harness version has at
+   most two runs, separated by a cooldown when the first is inconclusive.
+   Provider, transport, timeout and Swarm failures stay "not checked".
+   A quota refusal also waits for the provider hold to clear. Only a repeated,
+   attributable refusal for the same step and frozen profile blocks automatic
+   routing and creates an Owner inbox item with the vendor's error. A later
+   pass clears the item and restores routing. Explicit
    Owner launches still work. An installation change preserves that routing
    block while the new version awaits its check. Swarm restores the recorded
    outcome and routing eligibility when a previously checked version returns.
@@ -1445,6 +1447,8 @@ harness self-check fact.
    Muse version discovery reads installation metadata, and its scenario is
    deferred pending #949. A harness without a configured free or known cheap
    model reports "not checked (no cheap profile)" and spends no inference.
+   Checks appear in `swarm doctor` and `swarm status`. Task lists omit the
+   check Agents, which remain readable by id while retained.
 
 Readbacks: `observe.heavy` (windowed rollup, also `swarm heavy`), `harness.doctor`
 (per-harness installed version plus its self-check record, also `swarm doctor`),

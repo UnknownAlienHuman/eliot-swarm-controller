@@ -9,8 +9,8 @@
 //! Agents, worktrees or the Owner's harness sessions.
 //!
 //! A new installed version is always accepted and marked "not checked"; it is
-//! never refused. At most one recorded run exists per harness and version. On
-//! failure, automatic routing stops choosing that harness until a later check
+//! never refused. At most two attempts are reserved per harness and version. On
+//! a confirmed failure, automatic routing stops choosing that harness until a later check
 //! passes; explicit Owner launches bypass routing and still work. The result
 //! goes to the Owner inbox through the `harness_check` projection.
 
@@ -28,6 +28,7 @@ pub(crate) struct HarnessCheckWork {
     harness: String,
     version: String,
     profile: String,
+    profile_digest: [u8; 32],
     launch_command_id: String,
     send_command_id: String,
     deadline: Instant,
@@ -230,6 +231,15 @@ impl Router {
                 "launch",
             ));
         }
+        let profile_digest = eliot_core::canonical_json_sha256(snapshot).map_err(|_| {
+            (
+                Box::new(Error::new(
+                    "internal",
+                    "the check profile could not be hashed",
+                )),
+                "launch",
+            )
+        })?;
         let refusal = self
             .inner
             .store
@@ -269,71 +279,42 @@ impl Router {
             harness: harness.to_owned(),
             version: version.to_owned(),
             profile: profile.to_owned(),
+            profile_digest,
             launch_command_id: admission.command.id,
             send_command_id: send.id.clone(),
             deadline: Instant::now() + Duration::from_secs(eliot_core::HARNESS_CHECK_TIMEOUT_SECS),
         })
     }
 
-    /// A claimed version that could not start: quota refusals release the run
-    /// for after the hold, transient states release the claim for the next
-    /// tick, and every other start failure records its step with the error.
+    /// Launch preparation has no native failure evidence. Retry it inside
+    /// the same version's budget. A preflight hold spent no model attempt.
     async fn defer_harness_check(
         &self,
         harness: &str,
         version: &str,
         profile: &str,
-        step: &'static str,
+        step: &str,
         error: &Error,
     ) {
-        let now = now_ms();
-        if eliot_core::is_quota_refusal(&error.code) {
-            let mut store = self.inner.store.lock().await;
-            if let Err(record_error) =
-                store.record_harness_check_quota(harness, version, profile, now)
-            {
-                crate::logging::record(
-                    &self.secret_policy_snapshot(),
-                    "daemon.harness_check_quota_unrecorded",
-                    &[("harness", harness)],
-                    Some(&record_error),
-                );
-            }
-            return;
-        }
-        // Transient dispatch states release the claim without consuming the
-        // version's run, so the next tick retries the cheap local path.
-        if matches!(
-            error.code.as_str(),
-            "busy" | "unavailable" | "capacity_unavailable"
-        ) {
-            let mut store = self.inner.store.lock().await;
-            if let Err(release_error) = store.release_harness_check_claim(harness, version, now) {
-                crate::logging::record(
-                    &self.secret_policy_snapshot(),
-                    "daemon.harness_check_claim_unreleased",
-                    &[("harness", harness)],
-                    Some(&release_error),
-                );
-            }
-            return;
-        }
-        let mut store = self.inner.store.lock().await;
-        if let Err(record_error) = store.record_harness_check_failed(
+        let result = self.inner.store.lock().await.record_harness_check_failure(
             harness,
             version,
             profile,
-            step,
-            &check_error_text(error),
-            now,
-        ) {
-            crate::logging::record(
-                &self.secret_policy_snapshot(),
-                "daemon.harness_check_launch_unrecorded",
-                &[("harness", harness)],
-                Some(&record_error),
-            );
-        }
+            eliot_store::HarnessCheckFailure {
+                step,
+                message: &check_error_text(error),
+                key: None,
+                quota: eliot_core::is_quota_refusal(&error.code),
+                preflight: true,
+            },
+            now_ms(),
+        );
+        crate::logging::record(
+            &self.secret_policy_snapshot(),
+            "harness.check_preflight_deferred",
+            &[("method", step)],
+            Some(result.as_ref().err().unwrap_or(error)),
+        );
     }
 
     /// Drive one admitted scenario to its recorded outcome, then delete its
@@ -404,26 +385,29 @@ impl Router {
         }
     }
 
-    /// Record one driven failure: quota refusals and a freshly held provider
-    /// release the run for after the hold. Once launch is admitted, other
-    /// failures consume this version's run.
+    /// Block only when a second exact attempt repeats an attributable
+    /// refusal. Transport, timeouts and unclassified errors stay inconclusive.
     async fn record_drive_failure(&self, work: &HarnessCheckWork, step: &str, error: &Error) {
-        let now = now_ms();
         let quota =
             eliot_core::is_quota_refusal(&error.code) || self.check_held_for_drive(work).await;
-        let mut store = self.inner.store.lock().await;
-        let record = if quota {
-            store.record_harness_check_quota(&work.harness, &work.version, &work.profile, now)
-        } else {
-            store.record_harness_check_failed(
-                &work.harness,
-                &work.version,
-                &work.profile,
+        let attributable = error.code == "model_not_found"
+            || (error.origin == Some(eliot_core::FailureOrigin::Harness)
+                && matches!(error.code.as_str(), "unsupported" | "native_protocol"));
+        let key = (!quota && attributable)
+            .then(|| json!([step, error.code, work.profile_digest]).to_string());
+        let record = self.inner.store.lock().await.record_harness_check_failure(
+            &work.harness,
+            &work.version,
+            &work.profile,
+            eliot_store::HarnessCheckFailure {
                 step,
-                &check_error_text(error),
-                now,
-            )
-        };
+                message: &check_error_text(error),
+                key: key.as_deref(),
+                quota,
+                preflight: false,
+            },
+            now_ms(),
+        );
         if let Err(record_error) = record {
             crate::logging::record(
                 &self.secret_policy_snapshot(),
@@ -492,9 +476,9 @@ impl Router {
                 "harness check SEND left no provable turn outcome",
             )
         })?;
-        check_turn_verdict(&turn, "turn_with_tool_call")?;
         let calls = {
             let store = self.inner.store.lock().await;
+            check_turn_verdict(&store, &turn, "turn_with_tool_call")?;
             store
                 .turn_tool_calls(&work.agent_id, turn.generation, &turn.turn_id)
                 .map_err(|error| {
@@ -560,7 +544,7 @@ impl Router {
                 "harness check resume left no provable turn outcome",
             )
         })?;
-        check_turn_verdict(&resumed, "resume")?;
+        check_turn_verdict(&*self.inner.store.lock().await, &resumed, "resume")?;
         Ok(())
     }
 
@@ -683,7 +667,7 @@ impl Router {
                                 CheckEnd::fail("turn_with_tool_call", error.code, *error.message)
                             })?
                     {
-                        check_turn_verdict(&turn, "turn_with_tool_call")?;
+                        check_turn_verdict(&store, &turn, "turn_with_tool_call")?;
                     }
                     return Err(CheckEnd::fail(
                         "steer",
@@ -992,12 +976,15 @@ impl Router {
 }
 
 pub(super) fn check_model_rank(snapshot: &Value) -> Option<(u8, usize)> {
-    let model = snapshot
+    eliot_core::cheapest_model_rank(check_model(snapshot)?)
+}
+
+fn check_model(snapshot: &Value) -> Option<&str> {
+    snapshot
         .get("model")
         .and_then(Value::as_str)
         .filter(|model| !model.trim().is_empty())
-        .or_else(|| snapshot.get("daemon_model").and_then(Value::as_str))?;
-    eliot_core::cheapest_model_rank(model)
+        .or_else(|| snapshot.get("daemon_model").and_then(Value::as_str))
 }
 
 pub(super) fn configure_check_snapshot(snapshot: &mut Value, harness: &str, version: &str) {
@@ -1021,11 +1008,17 @@ fn check_command_failure(command: &Command, step: &'static str) -> CheckEnd {
             .and_then(|outcome| outcome.get(field))
             .and_then(Value::as_str)
     };
-    CheckEnd::fail(
-        step,
+    let mut error = Error::new(
         text("code").or_else(|| text("reason")).unwrap_or("unknown"),
         text("message").unwrap_or("harness check command ended without a proven result"),
-    )
+    );
+    error.origin = outcome
+        .and_then(|outcome| outcome.get("origin"))
+        .and_then(|origin| serde_json::from_value(origin.clone()).ok());
+    CheckEnd::Step {
+        step,
+        error: Box::new(error),
+    }
 }
 
 /// How a driven scenario ends: clean shutdown (record nothing), or a step
@@ -1060,7 +1053,11 @@ fn verb_step(verb: &str) -> &'static str {
 
 /// Accept only a successful turn. Anything else is the step's failure with
 /// the vendor's terminal message when the turn kept one.
-fn check_turn_verdict(turn: &Turn, step: &'static str) -> CheckResult<()> {
+fn check_turn_verdict(
+    store: &eliot_store::Store,
+    turn: &Turn,
+    step: &'static str,
+) -> CheckResult<()> {
     match Router::turn_entry_status(turn) {
         "succeeded" => Ok(()),
         "still_running" => Err(CheckEnd::fail(
@@ -1070,7 +1067,10 @@ fn check_turn_verdict(turn: &Turn, step: &'static str) -> CheckResult<()> {
         )),
         _ => Err(CheckEnd::fail(
             step,
-            "harness_vendor",
+            store
+                .harness_check_turn_error_code(turn)
+                .map_err(|error| CheckEnd::fail(step, error.code, *error.message))?
+                .unwrap_or_else(|| "unconfirmed_turn".to_owned()),
             turn.native_error_message
                 .as_deref()
                 .filter(|message| !message.trim().is_empty())
