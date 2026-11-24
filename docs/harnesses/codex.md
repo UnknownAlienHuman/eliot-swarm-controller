@@ -97,6 +97,28 @@ exercise used `permissions = "read-only"`. The mode also accepts `"default"`; om
 preserves the native default. Model and effort stay pinned, and permissions are configured
 independently of the collaboration mode.
 
+### Windows workspace-write
+
+On Windows, Codex CLI 0.167.1 reports its backend readiness through
+`windowsSandbox/readiness`. With the backend disabled, Codex returns `notConfigured`
+and would select `readOnly` for a `workspace-write` thread request. Incomplete or
+stale elevated setup reports `updateRequired`. The Owner configures the Windows
+backend in Codex and completes administrator-approved setup when the selected
+backend requires it. Swarm leaves that configuration and setup to the Owner.
+
+Before starting or resuming a `workspace-write` thread, the adapter checks native
+readiness on the owned app-server. A native setup refusal prevents thread dispatch
+and input. After confirmed cleanup, Store records the exact start as failed, with
+the native status in the command outcome shown by CLI wait and command readback.
+The adapter verifies the thread's effective sandbox before publishing
+`session.ready`, even when Codex does not expose the readiness method. The requested
+permissions are sent unchanged. `read-only` and `danger-full-access` do not use the
+Windows workspace-write readiness check.
+
+See the [official Windows sandbox documentation](https://developers.openai.com/codex/windows)
+and the [0.167.1 sandbox selection](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/config/src/config_toml.rs)
+and [readiness implementation](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/app-server/src/request_processors/windows_sandbox_processor.rs).
+
 ### Commits in a managed worktree
 
 The native sandbox protects Git metadata, so a linked worktree cannot commit by default.
