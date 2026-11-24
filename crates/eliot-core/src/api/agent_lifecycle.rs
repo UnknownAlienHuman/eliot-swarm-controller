@@ -1,6 +1,6 @@
 //! Owner-only durable Agent tree presentation and record removal.
 use crate::{Error, Result, parse_agent_id};
-fn validate_ulid(id: &str) -> Result<()> {
+pub(super) fn validate_ulid(id: &str) -> Result<()> {
     if id.len() == 26
         && id
             .bytes()

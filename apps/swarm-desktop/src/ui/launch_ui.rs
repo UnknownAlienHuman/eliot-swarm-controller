@@ -556,8 +556,7 @@ impl DesktopApp {
                     && let Some(revision) = response.revision
                     && self.launch.catalog_watch_revision.as_ref() != Some(&revision)
                 {
-                    self.launch.catalog_watch_revision = Some(revision);
-                    self.load_catalog(context);
+                    self.load_catalog_inner(context, true);
                 }
             }
             LaunchMsg::CatalogRetry => {
@@ -1207,6 +1206,10 @@ impl DesktopApp {
 
     /// Read the unified model catalogue (every page) on a worker.
     pub(super) fn load_catalog(&mut self, context: &ComponentContext<Self>) {
+        self.load_catalog_inner(context, false);
+    }
+
+    fn load_catalog_inner(&mut self, context: &ComponentContext<Self>, from_watch: bool) {
         if self.launch.catalog_loading {
             return;
         }
@@ -1220,9 +1223,14 @@ impl DesktopApp {
             self.launch.catalog_watch_revision = None;
         }
         self.launch.catalog_loading = true;
-        let _task = context.spawn_background(move |_| {
+        let _task = context.spawn_background(move |cancel| {
             let result = client::block_on(config_client::models_catalog(&data_dir))
                 .map_err(|error| error.to_string());
+            // A transient page read must leave the revision pending, without
+            // immediately requesting the same revision again in a loop.
+            if from_watch && result.is_err() {
+                let _ = feed::backoff(10_000, &|| cancel.is_cancelled());
+            }
             Message::Launch(LaunchMsg::CatalogLoaded(data_dir, Box::new(result)))
         });
     }

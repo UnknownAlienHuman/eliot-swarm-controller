@@ -1523,31 +1523,31 @@ pub struct ModelsCatalogWatchResponse {
 }
 
 impl ModelsCatalogWatchRequest {
-    pub fn parsed_revision(&self) -> Result<Option<ulid::Ulid>> {
-        self.revision
-            .as_deref()
-            .map(ulid::Ulid::from_string)
-            .transpose()
-            .map_err(|_| Error::new("invalid", "catalogue revision must be a ULID"))
-    }
-
     pub fn validate(&self) -> Result<()> {
-        self.parsed_revision().map(|_| ())
+        validate_catalog_revision(self.revision.as_deref())
     }
 
     pub fn validate_response(&self, reply: &ModelsCatalogWatchResponse) -> Result<()> {
-        if let Some(revision) = &reply.revision {
-            let revision = ulid::Ulid::from_string(revision)
-                .map_err(|_| Error::new("invalid", "catalogue reply revision must be a ULID"))?;
-            if self.parsed_revision()? == Some(revision) {
-                return Err(Error::new(
-                    "invalid",
-                    "catalogue watch returned its current revision",
-                ));
-            }
+        self.validate()?;
+        validate_catalog_revision(reply.revision.as_deref())?;
+        if reply.revision.is_some() && reply.revision == self.revision {
+            return Err(Error::new(
+                "invalid",
+                "catalogue watch returned its current revision",
+            ));
         }
         Ok(())
     }
+}
+
+fn validate_catalog_revision(revision: Option<&str>) -> Result<()> {
+    if let Some(revision) = revision
+        && (!matches!(revision.as_bytes().first(), Some(b'0'..=b'7'))
+            || super::agent_lifecycle::validate_ulid(revision).is_err())
+    {
+        return Err(Error::new("invalid", "catalogue revision must be a ULID"));
+    }
+    Ok(())
 }
 
 /// Maximum `models.catalog` failure message length in bytes.

@@ -49,7 +49,7 @@ impl Router {
         require_owner(principal)?;
         let request: ModelsCatalogWatchRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
-        let revision = request.parsed_revision()?;
+        request.validate()?;
         let mut updates = self.inner.catalog_updates.subscribe();
         let wait = async {
             loop {
@@ -63,11 +63,11 @@ impl Router {
                     .aggregate
                     .as_ref()
                     .filter(|snapshot| snapshot.is_usable())
-                    .map(|snapshot| snapshot.revision);
+                    .map(|snapshot| snapshot.revision.clone());
                 if let Some(current) = current
-                    && Some(current) != revision
+                    && Some(&current) != request.revision.as_ref()
                 {
-                    return Ok(Some(current.to_string()));
+                    return Ok(Some(current));
                 }
                 updates
                     .changed()
@@ -162,18 +162,33 @@ impl Router {
                     "harness does not match the selected profile",
                 ));
             }
-            let candidate = crate::adhoc::resolve_profile_command_until(
-                name,
-                harness,
-                snapshot.get("cmd").and_then(Value::as_str),
-                deadline,
-            )
-            .await?;
+            let cmd = snapshot["cmd"].as_str();
+            let resolve = crate::adhoc::resolve_profile_command_until(name, harness, cmd, deadline);
+            let candidate = if quota {
+                resolve.await?
+            } else {
+                self.catalog_discovery(
+                    harness,
+                    CatalogDiscoverySource::Profile(name.to_owned(), cmd.map(str::to_owned)),
+                    deadline,
+                    resolve,
+                )
+                .await?
+            };
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
             return Ok((Some(snapshot), name.to_owned(), None));
         }
         let (cmd, discovered) = if !quota && crate::adhoc::has_ranked_install_candidates(harness) {
-            match crate::adhoc::ranked_reader_executable(harness, deadline).await {
+            let resolve = crate::adhoc::ranked_reader_executable(harness, deadline);
+            match self
+                .catalog_discovery(
+                    harness,
+                    CatalogDiscoverySource::Installed,
+                    deadline,
+                    resolve,
+                )
+                .await
+            {
                 Ok(candidate) => (Some(candidate.cmd.clone()), Some(candidate)),
                 Err(error)
                     if HarnessCapabilities::of(harness).documented_models.is_some()
@@ -184,10 +199,19 @@ impl Router {
                 Err(error) => return Err(error),
             }
         } else {
-            (
-                crate::adhoc::discover_cmd_until(harness, deadline).await?,
-                None,
-            )
+            let resolve = crate::adhoc::discover_cmd_until(harness, deadline);
+            let cmd = if quota {
+                resolve.await?
+            } else {
+                self.catalog_discovery(
+                    harness,
+                    CatalogDiscoverySource::Installed,
+                    deadline,
+                    resolve,
+                )
+                .await?
+            };
+            (cmd, None)
         };
         let mut snapshot = crate::adhoc::adhoc_snapshot(
             harness,
@@ -211,6 +235,37 @@ impl Router {
             self.inner.stand_codex_home.as_deref(),
         )?;
         Ok((Some(snapshot), "adhoc".to_owned(), discovered))
+    }
+
+    /// Key the cooldown before resolving the executable, including failures
+    /// for which no executable fingerprint can be constructed.
+    async fn catalog_discovery<T>(
+        &self,
+        harness: &str,
+        source: CatalogDiscoverySource,
+        deadline: Instant,
+        discover: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let gate = self
+            .inner
+            .catalog_cache
+            .lock_recover()
+            .discovery_gate((harness.to_owned(), source))?;
+        let mut failure = tokio::time::timeout_at(deadline.into(), gate.lock())
+            .await
+            .map_err(|_| crate::adhoc::discovery_timeout())?;
+        if let Some(failure) = failure
+            .as_ref()
+            .filter(|failure| Instant::now() < failure.until)
+        {
+            return Err(failure.error.clone());
+        }
+        let result = discover.await;
+        *failure = result
+            .as_ref()
+            .err()
+            .map(|error| DiscoveryFailure::next(failure.as_ref(), error.clone()));
+        result
     }
 
     /// The route an existing Agent's `configure` draws from: its frozen
@@ -421,17 +476,35 @@ impl Router {
                 None
             };
             let cmd = profile["cmd"].as_str().unwrap_or(harness);
-            let (cmd, version) = match discovered {
-                Some(candidate) => (candidate.cmd, candidate.version),
-                None => crate::adhoc::reader_executable(cmd, harness, deadline).await?,
+            let verify = |cmd: String, version: Option<String>| {
+                let unversioned = || {
+                    Error::new(
+                        "unavailable",
+                        "model catalogue executable version could not be verified",
+                    )
+                };
+                let version = version.ok_or_else(unversioned)?;
+                let executable =
+                    crate::adhoc::VersionKey::read(&cmd, None).ok_or_else(unversioned)?;
+                Ok((cmd, executable, version))
+            };
+            let (cmd, executable, version) = match discovered {
+                Some(candidate) => verify(candidate.cmd, candidate.version)?,
+                None => {
+                    self.catalog_discovery(
+                        harness,
+                        CatalogDiscoverySource::Reader(cmd.to_owned()),
+                        deadline,
+                        async {
+                            let (cmd, version) =
+                                crate::adhoc::reader_executable(cmd, harness, deadline).await?;
+                            verify(cmd, version)
+                        },
+                    )
+                    .await?
+                }
             };
             profile["cmd"] = Value::String(cmd.clone());
-            let unversioned = || {
-                Error::new(
-                    "unavailable",
-                    "model catalogue executable version could not be verified",
-                )
-            };
             let cache_key = ModelsCacheKey {
                 scope: model_source_identity(
                     label,
@@ -440,8 +513,8 @@ impl Router {
                     &route.environment,
                 )
                 .ok_or_else(unverified)?,
-                executable: crate::adhoc::VersionKey::read(&cmd, None).ok_or_else(unversioned)?,
-                version: version.ok_or_else(unversioned)?,
+                executable,
+                version,
                 auth_revision: self.inner.catalog_cache.lock_recover().auth_revision,
                 workspace: workspace_key,
             };
@@ -1385,7 +1458,7 @@ impl Router {
         let expires = expires.min(completed.saturating_add(ttl as i64));
         Ok(catalog::CachedAggregate {
             key,
-            revision: ulid::Ulid::new(),
+            revision: ulid::Ulid::new().to_string(),
             harnesses,
             models,
             quotas,
@@ -1421,7 +1494,7 @@ impl Router {
             .models
             .iter()
             .filter(|entry| catalog_matches(entry, query));
-        let revision = snapshot.revision.to_string();
+        let revision = snapshot.revision.clone();
         if let Some(cursor) = request.after.as_deref()
             && !cursor.split_once(':').is_some_and(|(prefix, row)| {
                 prefix == revision && matched.any(|entry| entry.cursor() == row)
@@ -1886,12 +1959,22 @@ fn endpoint_authority(url: &str) -> &str {
 pub(crate) struct CatalogCache {
     models: HashMap<ModelsCacheKey, HarnessModelsResponse>,
     model_reads: HashMap<ModelsCacheKey, ModelRead>,
+    discovery: HashMap<(String, CatalogDiscoverySource), DiscoveryGate>,
     quotas: HashMap<ModelSourceIdentity, HarnessQuotaResponse>,
     aggregate: Option<Arc<CachedAggregate>>,
     aggregate_failure: Option<DiscoveryFailure>,
     aggregate_requested_at: Option<Instant>,
     auth_revision: u64,
 }
+
+#[derive(Hash, PartialEq, Eq)]
+enum CatalogDiscoverySource {
+    Installed,
+    Profile(String, Option<String>),
+    Reader(String),
+}
+
+type DiscoveryGate = Arc<tokio::sync::Mutex<Option<DiscoveryFailure>>>;
 
 pub(super) type AggregateUpdate = Option<Result<Arc<CachedAggregate>>>;
 
@@ -1914,7 +1997,7 @@ impl ModelRead {
 /// freshness are evaluated when projecting each requested page.
 pub(super) struct CachedAggregate {
     key: CatalogKey,
-    revision: ulid::Ulid,
+    revision: String,
     harnesses: Vec<HarnessEntry>,
     models: Vec<ModelsCatalogEntry>,
     quotas: HashMap<String, ScopedQuota>,
@@ -2015,8 +2098,34 @@ impl CatalogCache {
         *self = Self {
             auth_revision: self.auth_revision + 1,
             aggregate_requested_at: self.aggregate_requested_at,
+            discovery: std::mem::take(&mut self.discovery),
             ..Self::default()
         };
+    }
+
+    fn discovery_gate(&mut self, key: (String, CatalogDiscoverySource)) -> Result<DiscoveryGate> {
+        if let Some(gate) = self.discovery.get(&key) {
+            return Ok(gate.clone());
+        }
+        if self.discovery.len() >= MAX_CACHED_SCOPES {
+            self.discovery.retain(|_, gate| {
+                Arc::strong_count(gate) > 1
+                    || gate.try_lock().is_ok_and(|failure| {
+                        failure
+                            .as_ref()
+                            .is_some_and(|failure| Instant::now() < failure.until)
+                    })
+            });
+            if self.discovery.len() >= MAX_CACHED_SCOPES {
+                return Err(Error::new(
+                    "busy",
+                    "catalogue executable discovery capacity exhausted",
+                ));
+            }
+        }
+        let gate = Arc::new(tokio::sync::Mutex::new(None));
+        self.discovery.insert(key, gate.clone());
+        Ok(gate)
     }
 
     fn cached_catalog(&self, key: &CatalogKey) -> Option<Arc<CachedAggregate>> {

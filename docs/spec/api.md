@@ -2415,7 +2415,7 @@ publishing a new aggregate and projects current holds for each page. For
 recently requested catalogues it refreshes before expiry. Each page carries
 the settled revision. The open desktop picker watches for a new revision and
 loads it while keeping the current rows visible. Whole-aggregate failures,
-native reader failures and executable probe failures back off from 30 seconds
+native reader failures and executable discovery failures back off from 30 seconds
 up to 15 minutes. A whole-aggregate cooldown also gates settings and inventory
 checks. Background work stops after five
 minutes without demand and discovery admission closes at shutdown.
