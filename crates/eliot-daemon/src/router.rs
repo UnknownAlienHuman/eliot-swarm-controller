@@ -1784,12 +1784,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
 
         if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
@@ -1943,12 +1938,7 @@ impl Router {
             linked_command,
             ..
         } = admission;
-        if command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(command.id.clone());
-        }
+        self.note_unknown_command(&command);
         self.signal_progress();
         self.adjust_command_for_read(&mut command);
         serde_json::to_value(submit_result(&command, linked_command.as_ref()))
@@ -2016,12 +2006,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new {
             self.schedule_command(admission.command.id.clone(), None);
         }
@@ -2054,12 +2039,7 @@ impl Router {
             return Ok(None);
         };
         self.note_unknown(&admission.events);
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         self.signal_progress();
         serde_json::to_value(submit_result(
             &admission.command,
@@ -2296,12 +2276,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new {
             self.schedule_command(admission.command.id.clone(), None);
         }
@@ -2355,12 +2330,7 @@ impl Router {
             }
         };
         let admission = submitted?;
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
@@ -2387,12 +2357,7 @@ impl Router {
             return Ok(None);
         };
         self.note_unknown(&admission.events);
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         self.signal_progress();
         serde_json::to_value(submit_result(
             &admission.command,
@@ -7279,6 +7244,16 @@ impl Router {
     fn publish_locked(&self, events: &[Event]) {
         self.inner.bus.publish(events);
         self.note_unknown(events);
+    }
+
+    /// Remember a durable Unknown observed during admission or readback.
+    fn note_unknown_command(&self, command: &Command) {
+        if command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(command.id.clone());
+        }
     }
 
     pub(crate) fn note_unknown(&self, events: &[Event]) {

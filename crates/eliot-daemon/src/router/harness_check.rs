@@ -972,12 +972,7 @@ impl Router {
             self.publish_locked(&admission.events);
             admission
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
