@@ -1,6 +1,6 @@
 //! Rate-limited native allowance reads shared by the CLI, routing and maintenance.
 
-use super::{Router, catalog, now_ms};
+use super::{Router, now_ms};
 use crate::router::plugin_host::MetadataRoute;
 use eliot_core::api::{HARNESS_READ_TTL_MS, HarnessQuotaResponse, harness::QuotaObservation};
 use eliot_core::{Error, Result};
@@ -10,20 +10,41 @@ use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 
 const READ_INTERVAL: Duration = Duration::from_millis(HARNESS_READ_TTL_MS);
+// Covers the metadata reader slot wait, plugin startup and the native read.
+const READ_BUDGET: Duration = Duration::from_secs(35);
+const MAX_CLOCK_LEAD_MS: i64 = 30_000;
 const MAX_ACCOUNTS: usize = 256;
 
 #[derive(Default)]
-pub(super) struct AllowanceReads(HashMap<String, Arc<Mutex<AccountRead>>>);
+pub(super) struct AllowanceReads(HashMap<String, Arc<AccountRead>>);
+
+#[derive(Default)]
+struct AccountRead {
+    refresh: Arc<Mutex<()>>,
+    cached: std::sync::Mutex<AllowanceSnapshot>,
+}
 
 #[derive(Clone, Default)]
-struct AccountRead {
+struct AllowanceSnapshot {
     next_read: Option<Instant>,
     good: Option<Value>,
-    error: Option<Error>,
+    failure: Option<AllowanceFailure>,
+}
+
+#[derive(Clone)]
+struct AllowanceFailure {
+    at_ms: i64,
+    error: Error,
+    reported_unavailable: bool,
+}
+
+enum AllowanceReading {
+    Ready(Value),
+    Unavailable(Error),
 }
 
 impl AllowanceReads {
-    fn account(&mut self, key: String) -> Result<Arc<Mutex<AccountRead>>> {
+    fn account(&mut self, key: String) -> Result<Arc<AccountRead>> {
         if let Some(entry) = self.0.get(&key) {
             return Ok(entry.clone());
         }
@@ -34,7 +55,7 @@ impl AllowanceReads {
                 .iter()
                 .filter(|(_, entry)| Arc::strong_count(entry) == 1)
                 .filter_map(|(key, entry)| {
-                    let next = entry.try_lock().ok()?.next_read;
+                    let next = entry.cached.lock_recover().next_read;
                     next.is_none_or(|next| next <= now).then_some((key, next))
                 })
                 .min_by_key(|(_, next)| *next)
@@ -86,49 +107,59 @@ impl Router {
         route: MetadataRoute,
         response: &mut HarnessQuotaResponse,
         deadline: Instant,
-    ) -> Result<bool> {
+    ) -> Result<(bool, Option<Error>)> {
         let Some(identity) = route.identity.as_deref() else {
-            catalog::quota_read_error(
-                response,
-                eliot_plugin::quota::environment("native allowance sign-in scope is unverified"),
-            );
-            return Ok(false);
+            return Ok((
+                false,
+                Some(eliot_plugin::quota::environment(
+                    "native allowance sign-in scope is unverified",
+                )),
+            ));
         };
         let scope_harness = response.harness.clone();
         let scope_environment = route.environment.clone();
-        let Some(key) = crate::adhoc::blocking_discovery(deadline.into(), move || {
+        let key = crate::adhoc::blocking_discovery(deadline.into(), move || {
             account_key(&scope_harness, &scope_environment)
         })
-        .await?
-        else {
-            catalog::quota_read_error(
-                response,
-                eliot_plugin::quota::environment("native allowance sign-in scope is unavailable"),
-            );
-            return Ok(false);
+        .await;
+        let key = match key {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return Ok((
+                    false,
+                    Some(eliot_plugin::quota::environment(
+                        "native allowance sign-in scope is unavailable",
+                    )),
+                ));
+            }
+            Err(error) if error.code == "timeout" => return Ok((false, Some(error))),
+            Err(error) => return Err(error),
         };
         let entry = self.inner.allowance_reads.lock_recover().account(key)?;
-        let mut read = tokio::time::timeout_at(deadline, entry.lock_owned())
-            .await
-            .map_err(|_| crate::adhoc::discovery_timeout())?;
-        let read = if read.next_read.is_some_and(|next| next > Instant::now()) {
-            crate::logging::record_debug(
-                &self.secret_policy_snapshot(),
-                "quota.allowance.cached",
-                &[("harness", &response.harness)],
-                &[],
-            );
-            let cached = read.clone();
-            drop(read);
-            cached
-        } else {
-            let router = self.clone();
-            let harness = response.harness.clone();
-            let profile = profile.clone();
-            // Hold the account lock through reader cleanup and cache settlement,
-            // even if the initiating client drops its request.
-            let task =
-                tokio::spawn(async move {
+        if let Ok(refresh) =
+            tokio::time::timeout_at(deadline, entry.refresh.clone().lock_owned()).await
+        {
+            let cached = entry
+                .cached
+                .lock_recover()
+                .next_read
+                .is_some_and(|next| next > Instant::now());
+            if cached {
+                crate::logging::record_debug(
+                    &self.secret_policy_snapshot(),
+                    "quota.allowance.cached",
+                    &[("harness", &response.harness)],
+                    &[],
+                );
+            } else {
+                let router = self.clone();
+                let harness = response.harness.clone();
+                let profile = profile.clone();
+                let account = entry.clone();
+                // The refresh owns its slot through cleanup and cache settlement.
+                // A caller that runs out of time can still read the cache.
+                let task = tokio::spawn(async move {
+                    let _refresh = refresh;
                     crate::logging::record_debug(
                         &router.secret_policy_snapshot(),
                         "quota.allowance.read",
@@ -138,37 +169,55 @@ impl Router {
                     let result = router
                         .inner
                         .plugin_host
-                        .quota(profile, route.environment, deadline)
+                        .quota(profile, route.environment, Instant::now() + READ_BUDGET)
                         .await
                         .and_then(allowance_details);
+                    let mut read = account.cached.lock_recover();
                     read.next_read = Some(Instant::now() + READ_INTERVAL);
                     match result {
-                        Ok(details) => {
+                        Ok(AllowanceReading::Ready(details)) => {
                             if read.good.as_ref().is_none_or(|previous| {
                                 observed_at(&details) >= observed_at(previous)
                             }) {
                                 read.good = Some(details);
                             }
-                            read.error = None;
+                            read.failure = None;
                         }
-                        Err(error) => read.error = Some(error),
+                        Ok(AllowanceReading::Unavailable(error)) => {
+                            read.good = None;
+                            read.failure = Some(AllowanceFailure {
+                                at_ms: now_ms(),
+                                error,
+                                reported_unavailable: true,
+                            });
+                        }
+                        Err(error) => {
+                            read.failure = Some(AllowanceFailure {
+                                at_ms: now_ms(),
+                                error,
+                                reported_unavailable: false,
+                            });
+                        }
                     }
-                    read.clone()
                 });
-            tokio::time::timeout_at(deadline, task)
-                .await
-                .map_err(|_| crate::adhoc::discovery_timeout())?
-                .map_err(|_| Error::new("internal", "native allowance reader stopped"))?
+                if let Ok(result) = tokio::time::timeout_at(deadline, task).await {
+                    result
+                        .map_err(|_| Error::new("internal", "native allowance reader stopped"))?;
+                }
+            }
+        }
+        let AllowanceSnapshot { good, failure, .. } = entry.cached.lock_recover().clone();
+        let stream = match tokio::time::timeout_at(deadline, self.inner.store.lock()).await {
+            Ok(store) => {
+                store.latest_quota_observation(&response.harness, identity, &profile, now_ms())?
+            }
+            Err(_) => None,
         };
-        let AccountRead { good, error, .. } = read;
-        let stream = self.inner.store.lock().await.latest_quota_observation(
-            &response.harness,
-            identity,
-            &profile,
-            now_ms(),
-        )?;
         let mut details = good;
         if let Some(observation) = stream
+            && !failure.as_ref().is_some_and(|failure| {
+                failure.reported_unavailable && failure.at_ms > observation.observed_at_ms
+            })
             && details
                 .as_ref()
                 .is_none_or(|current| Some(observation.observed_at_ms) > observed_at(current))
@@ -185,7 +234,10 @@ impl Router {
         if let Some(details) = details {
             response.fetched_at_ms = observed_at(&details).expect("validated allowance timestamp");
             response.note = Some(
-                match (error.is_some(), details["source"].as_str()) {
+                match (
+                    failure.is_some_and(|failure| failure.at_ms > response.fetched_at_ms),
+                    details["source"].as_str(),
+                ) {
                     (true, _) => "Last subscription allowance; latest read failed",
                     (false, Some("Muse MSP usage/changed")) => {
                         "Muse subscription usage observed during a turn"
@@ -195,10 +247,17 @@ impl Router {
                 .to_owned(),
             );
             response.details = Some(details);
-        } else if let Some(error) = error {
-            catalog::quota_read_error(response, error);
+            return Ok((true, None));
         }
-        Ok(true)
+        let error = failure.map_or_else(
+            || {
+                eliot_plugin::quota::environment(
+                    "Native subscription allowance read is still in progress",
+                )
+            },
+            |failure| failure.error,
+        );
+        Ok((true, Some(error)))
     }
 }
 
@@ -206,22 +265,46 @@ fn observed_at(details: &Value) -> Option<i64> {
     details.get("observedAtMs")?.as_i64()
 }
 
-fn allowance_details(mut raw: Value) -> Result<Value> {
-    let details = raw["details"].take();
+fn allowance_details(mut raw: Value) -> Result<AllowanceReading> {
+    let mut details = raw["details"].take();
     let invalid = || {
         Error::new(
             "source_integrity",
             "native subscription allowance is invalid",
         )
     };
-    let at = observed_at(&details).ok_or_else(invalid)?;
+    match details["state"].as_str() {
+        Some("unavailable") => {
+            let reason = details["reason"].as_str().ok_or_else(invalid)?;
+            let error = match details["code"].as_str() {
+                Some("auth_required") => Error::new("auth_required", reason).with_origin(
+                    eliot_core::FailureOrigin::Environment,
+                    "Muse usage requires native sign-in",
+                ),
+                Some("quota_unavailable") => {
+                    eliot_plugin::quota::provider("Muse reported no subscription allowance")
+                        .with_message(reason)
+                }
+                _ => return Err(invalid()),
+            };
+            return Ok(AllowanceReading::Unavailable(error));
+        }
+        Some("ready") => {}
+        _ => return Err(invalid()),
+    }
+    let now = now_ms();
+    let at = details
+        .get("observedAtMs")
+        .map_or(Ok(now), |at| at.as_i64().ok_or_else(invalid))?;
     let observation: QuotaObservation = serde_json::from_value(json!({
         "observedAtMs": at, "windows": details.get("windows"),
     }))
     .map_err(|_| invalid())?;
     observation.validate()?;
-    if at > now_ms() || details["state"] != "ready" {
+    if at > now.saturating_add(MAX_CLOCK_LEAD_MS) {
         return Err(invalid());
     }
-    Ok(details)
+    // Downstream freshness and hold release require a local, non-future timestamp.
+    details["observedAtMs"] = json!(at.min(now));
+    Ok(AllowanceReading::Ready(details))
 }

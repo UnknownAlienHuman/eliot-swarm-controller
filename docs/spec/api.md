@@ -2488,11 +2488,17 @@ native Console operation may refresh its active connection while resolving it.
 Muse uses [native `usage --json`](../harnesses/muse.md#subscription-allowance).
 The daemon shares one in-flight allowance read per file-backed sign-in and
 waits at least five minutes after each completion, including failures, before
-starting another. The cache retains the last good allowance and its vendor
-timestamp on failure. `harness.quota` compares that reading with MSP
-`quota.observed` for the verified frozen route and returns the newer observation
-in `details.windows`, with `details.tier` when known. `fetched_at_ms` is the
-native `asOfMs` or `observedAtMs`. Stale values remain visible to the Owner and
+starting another. The shared read has its own deadline. A caller whose wait
+expires gets the available cached or retained observation, or unavailable while
+the read continues. The cache retains the last good allowance on a read failure.
+A native unavailable reason supersedes older windows and identifies sign-in
+requirements with `details.code: "auth_required"`. `harness.quota` compares the
+reading with MSP `quota.observed` for the verified frozen route and returns the
+newer observation in `details.windows`, with `details.tier` when known. A failure
+note accompanies windows only if the failure is newer than those windows.
+`fetched_at_ms` uses the native timestamp or the receipt time when `asOfMs` is
+absent. An allowance timestamp up to 30 seconds ahead is clamped to the receipt
+time. Stale values remain visible to the Owner and
 expire for routing, catalogue availability and hold release. No quota query
 starts a turn, performs inference or polls Agents. Run
 `swarm quota --harness H [--profile P]` from the CLI.

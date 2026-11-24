@@ -119,6 +119,9 @@ pub fn status_line(label: &str, reply: &HarnessQuotaResponse) -> String {
         .and_then(Value::as_str)
         == Some("error");
     if failed {
+        if reply.harness == "muse" && !note.is_empty() {
+            return format!("{label}: {note}");
+        }
         let provider = details
             .and_then(|details| details.get("origin"))
             .and_then(Value::as_str)

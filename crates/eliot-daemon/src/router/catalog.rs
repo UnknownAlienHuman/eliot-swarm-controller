@@ -524,35 +524,17 @@ impl Router {
             .await?;
             crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
-        if HarnessCapabilities::of(&harness).reads_retained_quota {
-            let mut response = HarnessQuotaResponse {
-                harness,
-                scope,
-                credential,
-                fetched_at_ms: now_ms(),
-                ttl_ms: catalog::CATALOG_TTL_MS,
-                status: eliot_core::api::HARNESS_QUOTA_SUPPORTED.to_owned(),
-                note: None,
-                details: None,
-                effective_reserve_percent: 0,
-                reserve_readback: None,
-                observed_usage: Vec::new(),
-            };
-            let route_verified = self
-                .read_allowance(profile, route, &mut response, deadline.into())
-                .await?;
-            request.validate_response(&response)?;
-            return Ok(catalog::ScopedQuota {
-                response,
-                route_verified,
-            });
-        }
-        let cache_key = catalog::canonical_cache_identity(
-            &label,
-            &profile,
-            route.identity.as_deref(),
-            &route.environment,
-        );
+        let retained_quota = HarnessCapabilities::of(&harness).reads_retained_quota;
+        let cache_key = if retained_quota {
+            None
+        } else {
+            catalog::canonical_cache_identity(
+                &label,
+                &profile,
+                route.identity.as_deref(),
+                &route.environment,
+            )
+        };
         let route_verified = cache_key.is_some();
         if let Some(hit) = cache_key.as_deref().and_then(|key| {
             self.inner
@@ -566,11 +548,6 @@ impl Router {
                 route_verified,
             });
         }
-        let raw = self
-            .inner
-            .plugin_host
-            .quota(profile, route.environment, deadline.into())
-            .await;
         let mut response = eliot_core::api::HarnessQuotaResponse {
             harness: harness.clone(),
             scope,
@@ -584,8 +561,28 @@ impl Router {
             reserve_readback: None,
             observed_usage: Vec::new(),
         };
+        let (route_verified, raw) = if retained_quota {
+            let (verified, failure) = self
+                .read_allowance(profile, route, &mut response, deadline.into())
+                .await?;
+            (verified, failure.map_or(Ok(None), Err))
+        } else {
+            let raw = self
+                .inner
+                .plugin_host
+                .quota(profile, route.environment, deadline.into())
+                .await;
+            response.fetched_at_ms = now_ms();
+            (route_verified, raw.map(Some))
+        };
+        let allowance_auth_reason = raw
+            .as_ref()
+            .err()
+            .filter(|error| retained_quota && error.code == "auth_required")
+            .map(|error| eliot_core::bound_chars(&error.message, 512));
         match raw {
-            Ok(raw) => {
+            Ok(None) => {}
+            Ok(Some(raw)) => {
                 if raw.get("status").and_then(Value::as_str) == Some("unsupported") {
                     response.status = "unsupported".to_owned();
                     response.note = Some(
@@ -619,10 +616,14 @@ impl Router {
             }
             // A local reader-capacity refusal says nothing about the provider:
             // return it uncached so the next read tries again.
-            Err(error) if error.code == "busy" => return Err(error),
+            Err(error) if !retained_quota && error.code == "busy" => return Err(error),
             Err(error) => {
                 catalog::quota_read_error(&mut response, error);
             }
+        }
+        if let (Some(reason), Some(details)) = (allowance_auth_reason, response.details.as_mut()) {
+            details["code"] = json!("auth_required");
+            response.note = Some(reason);
         }
         request.validate_response(&response)?;
         if let Some(key) = cache_key {
@@ -1675,7 +1676,9 @@ pub(crate) fn project_quota(
             let (windows, complete, provenance) = usage_pair_window_set(details)?;
             let mut projection =
                 windows_projection(observation, &windows, complete, model, now, provenance)?;
-            if provenance != "muse:windows"
+            if !complete {
+                projection.headroom = QuotaHeadroom::default();
+            } else if provenance != "muse:windows"
                 && let Some(weekly) = details.get("usage").unwrap_or(details).get("weekly")
                 && window_mapping(weekly, model) != QuotaMapping::Unmapped
             {
@@ -1741,15 +1744,14 @@ pub(crate) fn projected_quota(
 
 /// Usage-pair readers contribute three shapes over time: retained `windows[]`
 /// observations, live `usage{window,weekly}` reads, and the older top-level
-/// `window`/`weekly` pair. The legacy pair is complete only when both halves
-/// are present; a lone half is not headroom.
+/// `window`/`weekly` pair. Both halves are required to establish headroom.
 fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
     if let Some(windows) = details
         .get("windows")
         .and_then(Value::as_array)
         .filter(|windows| !windows.is_empty())
     {
-        return Some((windows.iter().collect(), true, "muse:windows"));
+        return Some((windows.iter().collect(), windows.len() == 2, "muse:windows"));
     }
     if let Some(usage) = details.get("usage").and_then(Value::as_object) {
         let mut windows = Vec::new();

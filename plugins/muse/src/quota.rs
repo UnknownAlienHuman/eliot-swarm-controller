@@ -42,7 +42,7 @@ pub(crate) async fn read(_: eliot_plugin::protocol::QuotaReadParams) -> eliot_co
 pub(crate) async fn read(
     params: eliot_plugin::protocol::QuotaReadParams,
 ) -> eliot_core::Result<Value> {
-    use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded};
+    use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_with_stderr};
     use std::{path::Path, time::Duration};
     use tokio::time::Instant;
 
@@ -102,7 +102,9 @@ pub(crate) async fn read(
     if let Some(channel) = crate::install::installed_channel() {
         command.env("MUSE_CHANNEL", channel);
     }
-    let bytes = run_bounded(
+    const LOGGED_OUT: &str = "not logged in: run `muse login` first";
+    const FAILED_EXIT: &str = "Muse allowance process returned an error";
+    match run_bounded_with_stderr(
         command,
         8192,
         Instant::now() + Duration::from_secs(12),
@@ -110,75 +112,108 @@ pub(crate) async fn read(
             start: "Muse allowance process could not start",
             deadline: "Muse allowance read timed out",
             unreadable: "Muse allowance output was unreadable",
-            status: "Muse allowance process returned an error",
+            status: FAILED_EXIT,
         },
+        &eliot_core::SecretPolicy::default(),
     )
-    .await?;
-    project(&bytes)
+    .await
+    {
+        Ok(bytes) => project(&bytes),
+        Err(error)
+            if error.message.as_str() == FAILED_EXIT
+                && error.diagnostics.iter().any(|diagnostic| {
+                    diagnostic
+                        .snapshot
+                        .text
+                        .lines()
+                        .any(|line| line.trim().strip_prefix("muse usage: ") == Some(LOGGED_OUT))
+                }) =>
+        {
+            Ok(unavailable(LOGGED_OUT))
+        }
+        Err(mut error) => {
+            error.diagnostics.clear();
+            Err(error)
+        }
+    }
 }
 
 #[cfg(windows)]
 fn project(bytes: &[u8]) -> eliot_core::Result<Value> {
-    use eliot_core::api::harness::{QuotaObservation, QuotaWindow};
-    use serde::Deserialize;
+    use eliot_core::api::harness::QuotaWindow;
     use serde_json::json;
 
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Usage {
-        schema_version: u32,
-        allowance: Option<Allowance>,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Allowance {
-        tier: Option<String>,
-        window: Window,
-        weekly: Window,
-        as_of_ms: i64,
-        source: String,
-    }
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Window {
-        used_percent: f64,
-        resets_at_ms: Option<i64>,
-    }
-    let usage: Usage = serde_json::from_slice(bytes)
+    let usage: Value = serde_json::from_slice(bytes)
         .map_err(|_| quota::provider("Muse returned an invalid allowance response"))?;
-    if usage.schema_version != 1 {
+    if usage["schemaVersion"].as_u64() != Some(1) {
         return Err(quota::provider("Muse returned an unknown allowance schema"));
     }
-    let allowance = usage
-        .allowance
-        .ok_or_else(|| quota::provider("Muse reported no subscription allowance"))?;
-    let windows = [
-        ("5-hour", allowance.window, 300),
-        ("Weekly", allowance.weekly, 10_080),
-    ]
-    .into_iter()
-    .map(|(label, window, mins)| QuotaWindow {
-        label: label.to_owned(),
-        used_percent: window.used_percent,
-        resets_at_ms: window.resets_at_ms,
-        window_duration_mins: Some(mins),
-    })
-    .collect();
-    let observation = QuotaObservation {
-        observed_at_ms: allowance.as_of_ms,
-        windows,
-    };
-    observation.validate()?;
-    let source = if allowance.source == "mint" {
+    let allowance = &usage["allowance"];
+    if let Some(reason) = [&usage["reason"], &allowance["reason"]]
+        .into_iter()
+        .find(|reason| !reason.is_null())
+    {
+        let reason = reason
+            .as_str()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        return Ok(unavailable(
+            reason.unwrap_or("Muse reported no subscription allowance"),
+        ));
+    }
+    let windows: Vec<_> = [("5-hour", "window", 300), ("Weekly", "weekly", 10_080)]
+        .into_iter()
+        .filter_map(|(label, key, mins)| {
+            let window = &allowance[key];
+            let used_percent = window["usedPercent"]
+                .as_f64()
+                .filter(|used| used.is_finite() && *used >= 0.0)?;
+            Some(QuotaWindow {
+                label: label.to_owned(),
+                used_percent,
+                resets_at_ms: window["resetsAtMs"].as_i64().filter(|at| *at >= 0),
+                window_duration_mins: Some(mins),
+            })
+        })
+        .collect();
+    if windows.is_empty() {
+        return Err(quota::provider(
+            "Muse reported no subscription allowance windows",
+        ));
+    }
+    let source = if allowance["source"].as_str() == Some("mint") {
         "mint"
     } else {
         "usage --json"
     };
-    let tier = allowance.tier.filter(|value| {
-        !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+    let mut details = json!({
+        "state":"ready", "origin":"provider", "source":source, "windows":windows,
     });
-    Ok(json!({"details":{
-        "state":"ready", "origin":"provider", "source":source,
-        "observedAtMs":observation.observed_at_ms, "windows":observation.windows, "tier":tier,
-    }}))
+    if let Some(at) = allowance["asOfMs"].as_i64().filter(|at| *at >= 0) {
+        details["observedAtMs"] = json!(at);
+    }
+    if let Some(tier) = allowance["tier"].as_str().filter(|value| {
+        !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+    }) {
+        details["tier"] = json!(tier);
+    }
+    Ok(json!({"details":details}))
+}
+
+#[cfg(windows)]
+fn unavailable(reason: &str) -> Value {
+    let normalized = reason.to_ascii_lowercase().replace(['_', '-'], " ");
+    let code = if normalized.starts_with("not logged in")
+        || normalized.starts_with("logged out")
+        || matches!(
+            normalized.as_str(),
+            "notloggedin" | "loggedout" | "auth required" | "authrequired"
+        ) {
+        "auth_required"
+    } else {
+        "quota_unavailable"
+    };
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reason = eliot_core::bound_chars(&eliot_core::redact_secret_shapes(&reason), 512);
+    serde_json::json!({"details":{"state":"unavailable", "code":code, "reason":reason}})
 }
