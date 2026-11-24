@@ -422,7 +422,7 @@ impl Store {
             for value in &values {
                 validate_project_rule_definition(project.as_ref(), value)?;
             }
-            let high_water = high_water_tx(&tx)?;
+            let high_water = event_high_water(&tx)?;
             let mut events = Vec::new();
             let existing_ids = rule_ids_tx(&tx, principal)?;
             for id in existing_ids {
@@ -541,7 +541,7 @@ impl Store {
             if stored.view != *state {
                 return Err(Error::new("bad_state", "rule cursor view is stale"));
             }
-            if through > high_water_tx(&tx)? {
+            if through > event_high_water(&tx)? {
                 return Err(Error::new(
                     "invalid",
                     "rule cursor cannot advance past the captured event high-water",
@@ -705,7 +705,7 @@ impl Store {
             if stored.view != *state {
                 return Err(Error::new("bad_state", "rule backlog view is stale"));
             }
-            let high_water = high_water_tx(&tx)?;
+            let high_water = event_high_water(&tx)?;
             if through > high_water || through < state.current_cursor {
                 return Err(Error::new("invalid", "rule backlog boundary is invalid"));
             }
@@ -2498,18 +2498,6 @@ fn load_rule_state(
         definition_digest,
         retiring_definition,
     }))
-}
-
-fn high_water_tx(tx: &Transaction<'_>) -> Result<i64> {
-    tx.query_row(
-        "SELECT MAX(
-             COALESCE((SELECT MAX(seq) FROM events), 0),
-             COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
-         )",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
 }
 
 fn has_non_rule_event_in_range(tx: &Transaction<'_>, after: i64, through: i64) -> Result<bool> {

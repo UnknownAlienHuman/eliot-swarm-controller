@@ -231,7 +231,8 @@ impl Store {
                 "rule catch-up is unavailable while a revision is retiring",
             ));
         }
-        if captured_through_seq < request.after_seq || captured_through_seq > high_water_tx(&tx)? {
+        if captured_through_seq < request.after_seq || captured_through_seq > event_high_water(&tx)?
+        {
             return Err(Error::new("invalid", "rule catch-up boundary is invalid"));
         }
         // Catch-up is explicit work over history the current lane already passed.

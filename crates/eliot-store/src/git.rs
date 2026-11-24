@@ -175,14 +175,7 @@ fn check_git_cursor(
 ) -> Result<(u64, i64)> {
     let cursor = git_source_cursor(source)?;
     let boundary = git_sequence(through)?;
-    let high_water: i64 = tx
-        .query_row(
-            "SELECT MAX(COALESCE((SELECT MAX(seq) FROM events), 0),
-                 COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0))",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
+    let high_water = event_high_water(tx)?;
     if through < cursor || boundary > high_water {
         return Err(Error::new(
             "invalid",
