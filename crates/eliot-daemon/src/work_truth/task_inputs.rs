@@ -3,6 +3,7 @@ use eliot_store::{BriefFacts, MAX_HANDOFF_TASK_BYTES, TaskInstruction};
 
 const INSTRUCTIONS: &str = "instructions.json";
 const MAX_INSTRUCTIONS_BYTES: usize = 896 * 1024;
+const MAX_OMISSION_SOURCES: usize = 32;
 
 /// Leave room for the fixed RPC envelope and the bounded H2 facts, even
 /// when those facts need JSON escaping.
@@ -223,6 +224,7 @@ pub(crate) async fn record_task_inputs(
             inputs.corrections.push(correction);
         }
     }
+    compact_omission_sources(&mut inputs);
     if previous == inputs {
         return Ok(inputs);
     }
@@ -241,6 +243,7 @@ pub(crate) async fn record_task_inputs(
         *number += 1;
         let count = inputs.omitted.entry(source).or_default();
         *count = (*count).max(*number);
+        compact_omission_sources(&mut inputs);
         encoded = encode_task_inputs(&inputs)?;
     }
     let blob = write_blob(&git, &root, &encoded, deadline).await?;
@@ -254,4 +257,27 @@ pub(crate) async fn record_task_inputs(
     let tree = write_tree(&git, &root, &files, deadline).await?;
     publish_task(&git, &root, task_ref, &tree, &commit, deadline).await?;
     Ok(inputs)
+}
+
+fn compact_omission_sources(inputs: &mut TaskInputs) {
+    // Agent IDs grow monotonically along a handoff. Keep the largest source
+    // identities to preserve deduplication for the current and recent sources.
+    while inputs.omitted.len() > MAX_OMISSION_SOURCES {
+        let source = inputs
+            .omitted
+            .keys()
+            .min_by_key(|key| {
+                key.split_once('/').and_then(|(agent, generation)| {
+                    Some((
+                        eliot_core::parse_agent_id(agent).ok()?,
+                        generation.parse::<i64>().ok()?,
+                    ))
+                })
+            })
+            .cloned()
+            .expect("omission map exceeds its nonzero bound");
+        if let Some(omitted) = inputs.omitted.remove(&source) {
+            inputs.compacted_omissions = inputs.compacted_omissions.max(omitted);
+        }
+    }
 }

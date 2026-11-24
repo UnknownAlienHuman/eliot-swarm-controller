@@ -1656,6 +1656,9 @@ transaction with fresh command IDs and the retained workspace. It chooses the fi
 eligible profile that is both in the current `handoff_fallback` order and still in the
 frozen list. Each switch removes its selected profile from that list. `swarm why` reports
 the refusal, skipped profiles and, when admitted, the successor and input command.
+The worker freezes the healthy stream boundary before STOP and rechecks it after
+the exact reserved stop drains. Only the daemon's terminal marker after that
+stop's dispatch is allowed as a new stream gap.
 An automated launch's provider successor applies the same quota admission policy.
 
 #### Automatic handoff (#918)

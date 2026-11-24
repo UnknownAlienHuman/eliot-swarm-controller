@@ -1175,8 +1175,12 @@ source Agent and generation, command ID, principal, verb and delivery state.
 The task binding carries these inputs through subsequent switches. The brief
 quotes a bounded selection and reports known omissions, clipped text and
 unverified coverage in its result. The exact retained corrections remain in
-the private Git task record at `instructions.json`. Automatic Goal continuations
-are excluded. The brief also
+the private Git task record at `instructions.json`. At each handoff Swarm
+refreshes delivery states from matching retained Store commands. Accepted,
+queued and cancelled inputs appear as undelivered provenance without their
+bodies. A legacy record can show unavailable delivery evidence separately from
+an explicit unknown outcome and link its retained predecessor brief. Automatic
+Goal continuations are excluded. The brief also
 includes Store facts about A (workspace, branch and base, Git work, Goal status and
 last check exit, open claims, open or unknown commands of the handed-off generation,
 and any last turn whose effects are uncertain), labelled as recorded by Swarm. It
@@ -1343,11 +1347,14 @@ after these checks pass. The worker rechecks the source checkout identity and st
 proof when admitting the ordinary promptless launch and its parent link. H2 validates the complete
 transfer against current A and B.
 
-Before dispatching the source stop, the worker sizes the selected Git task text,
-saved source bodies and their framing against one handoff budget. Saved bodies
-are mandatory for pointer tasks. If the material exceeds the budget, preparation
-refuses before either native effect. A successful brief reports the count of
-saved sources it delivered in full.
+Before dispatching the source stop, Owner and automatic switches update the Git
+task record and freeze the rendered successor input. They size the exact text and
+encoded frame with room for the widest destination identity. Saved bodies are
+mandatory for pointer tasks. A sizing or record preparation failure refuses before
+either native effect. A successful brief reports the count of saved sources it
+delivered in full. H2 consumes the frozen text after it revalidates the task
+binding and custody. The post-stop source checkpoint updates the Store's work
+truth independently of the brief.
 
 Only an Applied launch plus the exact generation/command-bound committed
 `session.ready` stream event and Idle B permits transfer. For adapters omitting the

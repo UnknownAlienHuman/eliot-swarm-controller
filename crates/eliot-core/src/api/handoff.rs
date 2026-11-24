@@ -125,7 +125,7 @@ pub struct HandoffResponse {
     pub goal_revision: Option<i64>,
     pub reparented: Vec<ReparentedAgent>,
     pub brief_truncated: bool,
-    /// Known number of later inputs omitted from the brief. Exact retained
+    /// Lower bound on later inputs omitted from the brief. Exact retained
     /// Owner inputs may still be available in the Git task record.
     #[serde(default)]
     pub brief_omitted_instructions: usize,

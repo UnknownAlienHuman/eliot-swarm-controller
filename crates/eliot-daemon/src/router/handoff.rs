@@ -31,10 +31,10 @@ impl Router {
             .get_agent(&request.from)?
             .filter(|source| source.generation == request.from_generation)
             .ok_or_else(|| Error::new("stale_generation", "handoff source generation moved"))?;
-        let task = self
-            .prepare_handoff_task(&source, Some(&request.task_command))
+        self.checkpoint_handoff_source(&source).await;
+        let git = self
+            .prepare_handoff_facts(&source, Some(&request.task_command))
             .await?;
-        let git = self.finish_handoff_facts(&source, task).await?;
         let change = {
             let mut store = self.inner.store.lock().await;
             if let Some(value) = store.replay_handoff(&principal_name(principal), &request)? {

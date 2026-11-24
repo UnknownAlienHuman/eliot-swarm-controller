@@ -220,6 +220,15 @@ pub struct SwitchWork {
     pub requested_by: Option<String>,
 }
 
+/// Switch input prepared against the source generation and reserved payload.
+pub struct PreparedSwitchBrief {
+    switch_id: String,
+    provider_boundary: Option<i64>,
+    pub(super) binding: Option<(String, String)>,
+    pub(super) brief: handoff::brief::BuiltBrief,
+    pub(super) resume_goal: bool,
+}
+
 struct RetainedSwitch {
     request: SwitchRequest,
     source_stop_command: Option<String>,
@@ -756,12 +765,11 @@ fn continuation_directive(
     reason: HandoffReason,
     kind: Option<core::ProviderRestrictionKind>,
     source: &str,
-    successor: &str,
     uncertain: bool,
 ) -> String {
     let why = match reason {
-        HandoffReason::Request => format!("the work was moved from {source} to {successor}"),
-        HandoffReason::Routing => format!("routing moved the work from {source} to {successor}"),
+        HandoffReason::Request => format!("the work was moved from {source}"),
+        HandoffReason::Routing => format!("routing moved the work from {source}"),
         HandoffReason::ProviderHold => format!(
             "{source} is on a provider {} hold",
             kind.map_or("quota", core::ProviderRestrictionKind::as_str)
@@ -771,7 +779,7 @@ fn continuation_directive(
     let caution = if uncertain {
         "\nThe previous turn stopped partway. Do not repeat any of its steps until Git and the files show that step did not take effect."
     } else {
-        ""
+        "\nBefore repeating a step from an interrupted turn, check its effects in Git, the files and the Store."
     };
     format!(
         "Handoff brief: continue this task from its worktree. Why: {why}.{caution}\nYou now own this branch and its files as they are on disk, including uncommitted changes. The previous session and its context are gone. Git, the files and the Store facts below are the truth. The original task was written for the first session, so a step it limits to a first or earlier turn is already past. Read git status and git diff first, then finish the remaining work and commit at meaningful checkpoints on this branch. If the work is already complete, verify that and report it. Queued input, if any, arrives in separate messages after this one."
@@ -945,7 +953,7 @@ pub(super) fn reserve_provider_switch_tx(
         return Ok(());
     };
     if restriction.kind == core::ProviderRestrictionKind::ModelRemoved
-        || !provider_retry_allowed(tx, agent, task)?
+        || !provider_retry_allowed(tx, agent, task, None, None)?
     {
         return Ok(());
     }
@@ -1030,14 +1038,34 @@ pub(super) fn reserve_provider_switch_tx(
     Ok(())
 }
 
-fn require_provider_retry(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Result<()> {
-    if !provider_retry_allowed(tx, agent, task)? {
+fn require_provider_retry(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    task: &str,
+    stop: Option<&str>,
+    stop_boundary: Option<i64>,
+) -> Result<()> {
+    if let Some(boundary) = stop_boundary
+        && retention::coverage_pruned_through(tx)? > boundary
+    {
+        return Err(Error::new(
+            "history_gap",
+            "provider retry source evidence was pruned after STOP",
+        ));
+    }
+    if !provider_retry_allowed(tx, agent, task, stop, stop_boundary)? {
         return Err(Error::new("bad_state", "provider retry source changed"));
     }
     Ok(())
 }
 
-fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Result<bool> {
+fn provider_retry_allowed(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    task: &str,
+    stop: Option<&str>,
+    stop_boundary: Option<i64>,
+) -> Result<bool> {
     let num = parse_agent_id(&agent.id)?;
     tx.query_row(
         "SELECT EXISTS(
@@ -1056,17 +1084,148 @@ fn provider_retry_allowed(tx: &Transaction<'_>, agent: &Agent, task: &str) -> Re
                       AND json_extract(s.args,'$.provider_failure') IS NOT NULL)))
               AND t.state='completed' AND t.outcome='failure' AND t.tool_calls=0
               AND t.final_text IS NULL
+              AND NOT EXISTS(SELECT 1 FROM turns other_turn WHERE other_turn.agent=?2
+                  AND other_turn.generation=?3 AND other_turn.turn_id<>t.turn_id)
               AND EXISTS(SELECT 1 FROM source_state ss WHERE ss.agent=?2 AND ss.generation=?3
-                AND ss.source='stream' AND ss.state='open' AND ss.health='ok' AND ss.gap_id IS NULL)
+                AND ss.source='stream'
+                AND ss.state=CASE WHEN ?6 IS NULL THEN 'open' ELSE 'closed' END
+                AND ss.health='ok'
+                AND (ss.gap_id IS NULL OR (ss.gap_id=?7 AND EXISTS(
+                    SELECT 1 FROM events ended WHERE ended.seq=ss.gap_seq AND ended.seq>?6
+                      AND ended.agent=?2 AND ended.generation=?3 AND ended.kind='source.gap'
+                      AND ended.source='daemon' AND json_extract(ended.data,'$.gap_id')=?7
+                      AND json_extract(ended.data,'$.reason') IN (
+                          'stop_exit_without_session_terminal',
+                          'plugin_owner_closed_without_session_terminal'
+                      )
+                      AND EXISTS(SELECT 1 FROM events dispatched
+                          WHERE dispatched.agent=?2 AND dispatched.generation=?3
+                            AND dispatched.seq>?6 AND dispatched.seq<ended.seq
+                            AND dispatched.kind='command.dispatched'
+                            AND json_extract(dispatched.data,'$.command_id')=?5
+                      ))))
+                AND (?6 IS NULL OR NOT EXISTS(
+                    SELECT 1 FROM events gap WHERE gap.agent=?2 AND gap.generation=?3
+                      AND gap.seq>?6 AND gap.kind='source.gap' AND gap.seq IS NOT ss.gap_seq
+                      AND json_extract(gap.data,'$.source')='stream')))
               AND NOT EXISTS(SELECT 1 FROM commands other WHERE other.target=?2 AND other.generation=?3
-                AND other.id<>c.id AND other.verb<>'launch')
+                AND other.id<>c.id AND other.id IS NOT ?5 AND other.verb<>'launch')
         )",
-        params![task, num, agent.generation, encode_json(&core::PROVIDER_LAUNCH_OVERRIDE_FIELDS)?],
+        params![task, num, agent.generation, encode_json(&core::PROVIDER_LAUNCH_OVERRIDE_FIELDS)?, stop, stop_boundary,
+            format!("host-root-exit:{}:{}:stream", agent.id, agent.generation)],
         |row| row.get(0),
     ).map_err(sql_error)
 }
 
 impl Store {
+    /// Render and validate the exact successor input before either native effect.
+    pub fn prepare_switch_brief(
+        &self,
+        id: &str,
+        policy: &core::SecretPolicy,
+        facts: &handoff::BriefFacts,
+        now: i64,
+    ) -> Result<PreparedSwitchBrief> {
+        self.ensure_committed_reads()?;
+        let tx = self.connection.unchecked_transaction().map_err(sql_error)?;
+        let parent = switch_parent(&tx, id)?;
+        if parent.state != CommandState::Dispatched {
+            return Err(Error::new("bad_state", "switch is no longer preparing"));
+        }
+        let retained = decode_switch(parent.args)?;
+        let plan = stored_result(&parent.outcome)?;
+        let request = &retained.request;
+        let (source, _) = source_tx(&tx, request, self.hierarchy_limits, policy, true)?;
+        let (task, originals) = handoff::source_inputs(
+            &tx,
+            &source,
+            &request.task_command,
+            &request.commands,
+            None,
+            policy,
+        )?;
+        // The successor ID is allocated later. Reserve its widest legal wire
+        // spelling, as well as the widest generation, before native effects.
+        let handoff = request.handoff(&plan.handoff_command, "a9223372036854775807", i64::MAX);
+        let provider = retained.provider_failure.is_some();
+        let resume_goal = !provider && request.launch.project.is_none();
+        let binding = facts.task_command.clone().zip(facts.task_ref.clone());
+        let brief = if provider && binding.is_none() {
+            let task = handoff::source_task(&tx, &source, &request.task_command, None)?
+                .ok_or_else(|| Error::new("source_integrity", "provider retry input is missing"))?;
+            if policy.contains_value(&task.args) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "retry input contains a known secret",
+                ));
+            }
+            let text = required_string(&task.args, "text")?;
+            handoff::brief::validate_frame(&handoff, &text)?;
+            handoff::brief::BuiltBrief {
+                text,
+                ..Default::default()
+            }
+        } else {
+            let directive = if provider {
+                Some("Handoff brief: the provider refused the prior turn before work began. Continue the saved task in this worktree using the Git and Store facts below.".to_owned())
+            } else if resume_goal {
+                let source_num = parse_agent_id(&source.id)?;
+                let uncertain = handoff::last_turn_uncertain(&tx, source_num, source.generation)?
+                    || has_unknown_gate(&tx, source_num)?;
+                let reason = retained.continuation.map_or(
+                    if request.launch.role.is_some() {
+                        HandoffReason::Routing
+                    } else {
+                        HandoffReason::Request
+                    },
+                    |value| value.reason,
+                );
+                Some(continuation_directive(
+                    reason,
+                    retained.continuation.and_then(|value| value.kind),
+                    &source.profile,
+                    uncertain,
+                ))
+            } else {
+                None
+            };
+            handoff::brief::build(
+                &tx,
+                &handoff,
+                task.as_ref(),
+                policy,
+                handoff::brief::BriefInput {
+                    saved_context: None,
+                    transferred: &originals,
+                    facts: Some(facts),
+                    directive: directive.as_deref(),
+                    now,
+                },
+            )?
+        };
+        let provider_boundary = if provider {
+            require_provider_retry(
+                &tx,
+                &source,
+                &request.task_command,
+                retained.source_stop_command.as_deref(),
+                None,
+            )?;
+            // A planned STOP can add its own terminal gap. Keep a boundary
+            // to distinguish it from any loss of native retry evidence.
+            Some(self.high_water()?)
+        } else {
+            None
+        };
+        Ok(PreparedSwitchBrief {
+            switch_id: id.to_owned(),
+            provider_boundary,
+            binding,
+            brief,
+            resume_goal,
+        })
+    }
+
     pub fn accepted_provider_switches(&self, after: &str) -> Result<Vec<String>> {
         self.ensure_committed_reads()?;
         let mut statement = self
@@ -1377,13 +1536,14 @@ impl Store {
     /// Same transaction as normal launch allocation, capacity/workspace reservation and child link.
     pub fn admit_switch_launch(
         &mut self,
-        id: &str,
+        brief: &PreparedSwitchBrief,
         request: SubmitCommand,
         preparation: Option<WorkspacePreparationInput>,
         checkout: SwitchLaunchCheckout<'_>,
         policy: &core::SecretPolicy,
         now: i64,
     ) -> Result<Admission> {
+        let id = brief.switch_id.as_str();
         let SwitchLaunchCheckout {
             root: target_checkout_root,
             key: target_checkout_key,
@@ -1486,7 +1646,19 @@ impl Store {
                 ));
             }
             if let Some(failure) = provider_failure {
-                require_provider_retry(&tx, &agent, &source.task_command)?;
+                let boundary = brief.provider_boundary.ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "provider retry has no frozen source boundary",
+                    )
+                })?;
+                require_provider_retry(
+                    &tx,
+                    &agent,
+                    &source.task_command,
+                    Some(source_stop),
+                    Some(boundary),
+                )?;
                 failure.require_authority(&agent.profile_snapshot)?;
                 failure.require_authority(&request.args["profile_snapshot"])?;
                 let selected = request.args.get("profile").and_then(Value::as_str);
@@ -1691,7 +1863,7 @@ impl Store {
         &mut self,
         id: &str,
         policy: &core::SecretPolicy,
-        facts: &handoff::BriefFacts,
+        brief: &PreparedSwitchBrief,
         now: i64,
     ) -> Result<Change<SwitchResponse>> {
         self.ensure_writer_healthy()?;
@@ -1708,8 +1880,15 @@ impl Store {
                     events: Vec::new(),
                 });
             }
+            if brief.switch_id != id {
+                return Err(Error::new(
+                    "source_integrity",
+                    "the frozen brief belongs to another switch",
+                ));
+            }
             let RetainedSwitch {
                 request,
+                source_stop_command,
                 source_checkout_key,
                 target_checkout_root,
                 target_checkout_key,
@@ -1749,7 +1928,26 @@ impl Store {
                     let (source, _) =
                         source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
                     if let Some(failure) = provider_failure {
-                        require_provider_retry(&tx, &source, &request.task_command)?;
+                        let stop = source_stop_command.as_deref().ok_or_else(|| {
+                            Error::new(
+                                "source_integrity",
+                                "provider switch has no reserved source stop",
+                            )
+                        })?;
+                        require_switch_source_exit(&tx, id, stop, &request)?;
+                        let boundary = brief.provider_boundary.ok_or_else(|| {
+                            Error::new(
+                                "source_integrity",
+                                "provider retry has no frozen source boundary",
+                            )
+                        })?;
+                        require_provider_retry(
+                            &tx,
+                            &source,
+                            &request.task_command,
+                            Some(stop),
+                            Some(boundary),
+                        )?;
                         failure.require_authority(&source.profile_snapshot)?;
                         failure.require_authority(&destination.profile_snapshot)?;
                     }
@@ -1767,27 +1965,6 @@ impl Store {
                     uncertain =
                         handoff::last_turn_uncertain(&tx, source_num, request.from_generation)?
                             || has_unknown_gate(&tx, source_num)?;
-                    let directive = continuation_directive(
-                        handoff_reason,
-                        continuation.and_then(|value| value.kind),
-                        &source.profile,
-                        &destination.profile,
-                        uncertain,
-                    );
-                    let transfer = if provider_failure.is_some() {
-                        handoff::HandoffInput::ProviderRetry
-                    } else if request.launch.project.is_some() {
-                        // Continuing a chat in a project waits for the Owner.
-                        handoff::HandoffInput::Brief {
-                            facts,
-                            discover: true,
-                        }
-                    } else {
-                        handoff::HandoffInput::Continuation {
-                            directive: &directive,
-                            facts,
-                        }
-                    };
                     let change = handoff::handoff_tx(
                         &tx,
                         "owner",
@@ -1795,7 +1972,7 @@ impl Store {
                         policy,
                         now,
                         self.hierarchy_limits,
-                        transfer,
+                        handoff::HandoffInput::Switch(brief),
                     )?;
                     super::work_truth::inherit_work_task_tx(
                         &tx,

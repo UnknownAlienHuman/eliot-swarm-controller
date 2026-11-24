@@ -1288,6 +1288,8 @@ async fn publish_task(
     old: &str,
     deadline: Instant,
 ) -> Result<()> {
+    // Task refs point to one parentless snapshot. 'old' is exclusively
+    // the compare-and-swap guard, so updates do not retain prior revisions.
     let mut args = IDENTITY.to_vec();
     args.extend([
         "commit-tree",

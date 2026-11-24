@@ -374,14 +374,21 @@ impl Router {
                 return;
             }
         };
-        let task = if provider_failure.is_some() {
-            Ok(eliot_store::BriefFacts::default())
-        } else {
-            self.prepare_handoff_task(&source, Some(&request.task_command))
-                .await
-        };
-        let task = match task {
-            Ok(task) => task,
+        let prepared_input = async {
+            let facts = self
+                .prepare_handoff_facts(&source, Some(&request.task_command))
+                .await?;
+            let brief = self.inner.store.lock().await.prepare_switch_brief(
+                id,
+                &self.secret_policy_snapshot(),
+                &facts,
+                now_ms(),
+            )?;
+            Ok::<_, Error>((facts, brief))
+        }
+        .await;
+        let (facts, brief) = match prepared_input {
+            Ok(input) => input,
             Err(error) => {
                 self.reject_switch_input(id, &error).await;
                 return;
@@ -424,13 +431,7 @@ impl Router {
         }
         // Capture the source only after Store and native custody prove the
         // exact process family is gone, and before any successor launch.
-        let facts = match self.finish_handoff_facts(&source, task).await {
-            Ok(facts) => facts,
-            Err(error) => {
-                self.reject_switch_input(id, &error).await;
-                return;
-            }
-        };
+        self.checkpoint_handoff_source(&source).await;
         let source_clean = match source.workspace.as_deref() {
             None => Some(true),
             Some(workspace) => match crate::git_monitor::GitProbe::new() {
@@ -676,7 +677,7 @@ impl Router {
             let mut store = self.inner.store.lock().await;
             self.check_command_admission_mode("launch")?;
             let admission = store.admit_switch_launch(
-                id,
+                &brief,
                 prepared.request,
                 prepared.workspace,
                 SwitchLaunchCheckout {
@@ -734,16 +735,20 @@ impl Router {
         let policy = self.secret_policy_snapshot();
         let result = {
             let mut store = self.inner.store.lock().await;
-            let result = store.finish_switch(id, &policy, &facts, now_ms());
+            let result = store.finish_switch(id, &policy, &brief, now_ms());
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
                 if let Some(handoff) = &change.value.handoff {
-                    self.queue_handoff_task_card(
-                        &mut store,
-                        handoff,
-                        &change.events,
-                        facts.applied_task_text(),
-                    );
+                    // A provider retry must leave the successor with one
+                    // input. The frozen brief already carries its task.
+                    if provider_failure.is_none() {
+                        self.queue_handoff_task_card(
+                            &mut store,
+                            handoff,
+                            &change.events,
+                            facts.applied_task_text(),
+                        );
+                    }
                     for child in &handoff.children {
                         self.schedule_command(child.clone(), None);
                     }

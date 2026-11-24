@@ -1138,7 +1138,7 @@ impl Store {
                 "SELECT c.id, COUNT(*) OVER () FROM commands c
              WHERE c.target = ?1 AND c.generation = ?2 AND c.principal = 'owner'
                AND c.id <> ?3 AND c.verb IN ('send', 'steer', 'inject')
-               AND c.state NOT IN ('rejected', 'cancelled')
+               AND c.state <> 'rejected'
                AND c.link_kind IS NOT 'handoff' AND c.link_kind IS NOT 'rule_action'
                AND json_type(c.args, '$.text') = 'text'
                AND NOT EXISTS (SELECT 1 FROM commands t WHERE t.id = ?3

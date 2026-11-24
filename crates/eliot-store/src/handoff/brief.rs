@@ -11,30 +11,43 @@ fn bounded(text: &str, limit: usize) -> (String, bool) {
 
 /// Inputs that vary by transfer kind.
 #[derive(Clone, Copy)]
-pub(super) struct BriefInput<'a> {
-    pub(super) saved_context: Option<&'a str>,
-    pub(super) transferred: &'a [Command],
-    pub(super) facts: Option<&'a super::BriefFacts>,
-    pub(super) directive: Option<&'a str>,
-    pub(super) now: i64,
+pub(crate) struct BriefInput<'a> {
+    pub(crate) saved_context: Option<&'a str>,
+    pub(crate) transferred: &'a [Command],
+    pub(crate) facts: Option<&'a super::BriefFacts>,
+    pub(crate) directive: Option<&'a str>,
+    pub(crate) now: i64,
 }
 
-#[derive(Default)]
-pub(super) struct BuiltBrief {
-    pub(super) text: String,
-    pub(super) truncated: bool,
-    pub(super) omitted_instructions: usize,
-    pub(super) history_incomplete: bool,
-    pub(super) saved_sources: Option<usize>,
+#[derive(Clone, Default)]
+pub(crate) struct BuiltBrief {
+    pub(crate) text: String,
+    pub(crate) truncated: bool,
+    pub(crate) omitted_instructions: usize,
+    pub(crate) history_incomplete: bool,
+    pub(crate) saved_sources: Option<usize>,
 }
 
 fn unresolved(state: CommandState) -> bool {
     matches!(state, CommandState::Dispatched | CommandState::Unknown)
 }
 
+pub(crate) fn validate_frame(request: &HandoffRequest, text: &str) -> Result<()> {
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(Error::new(
+            "frame_too_large",
+            "handoff text exceeds its input budget",
+        ));
+    }
+    check_rpc_frame(
+        "agent.command",
+        &json!({"agent_id":request.to,"generation":request.to_generation,"command_id":request.id,"verb":"send","args":{"text":text}}),
+    )
+}
+
 /// Combine bounded excerpts with the fixed task payload. Previous generated
 /// briefs can be referenced as history but never supply structured input.
-pub(super) fn build(
+pub(crate) fn build(
     tx: &Transaction<'_>,
     request: &HandoffRequest,
     task: Option<&Command>,
@@ -73,13 +86,14 @@ pub(super) fn build(
     let state = if prior_brief && !uses_record {
         None
     } else {
-        retained
-            .as_ref()
-            .map(|command| command.state)
-            .or_else(|| typed.filter(|_| uses_record).map(|original| original.state))
+        retained.as_ref().map(|command| command.state).or_else(|| {
+            typed
+                .filter(|original| uses_record && original.principal != "unverified")
+                .map(|original| original.state)
+        })
     };
-    let original_unknown =
-        !delivered_separately && exact_id.is_some() && state.is_none_or(unresolved);
+    let original_unknown = !delivered_separately && state.is_some_and(unresolved);
+    let original_unverified = !delivered_separately && exact_id.is_some() && state.is_none();
     let text = if uses_record {
         facts.and_then(|facts| facts.task_text.as_deref())
     } else if prior_brief {
@@ -128,8 +142,7 @@ pub(super) fn build(
     let inputs = facts.and_then(|facts| facts.task_ref.as_ref().map(|_| &facts.task_inputs));
     let history_incomplete =
         (prior_brief && !uses_record) || inputs.is_some_and(|inputs| inputs.history_incomplete);
-    let history_unknown = history_incomplete
-        || has_unverified_instructions(tx, &request.from)?
+    let history_unknown = has_unverified_instructions(tx, &request.from)?
         || inputs.is_some_and(|inputs| {
             inputs.history_unresolved
                 || inputs
@@ -145,17 +158,26 @@ pub(super) fn build(
     };
     let uncertainty = if original_unknown || history_unknown {
         "\nVerify unresolved effects in Git and Store before repeating any step."
+    } else if original_unverified {
+        "\nOriginal delivery evidence is unavailable. Check the worktree and retained history before repeating earlier steps."
     } else {
         ""
     };
     let later = later_instructions(tx, request, selected, transferred, inputs, policy)?;
-    let history_note = if let Some(reference) = facts.and_then(|facts| facts.task_ref.as_deref()) {
+    let mut history_note = if let Some(reference) =
+        facts.and_then(|facts| facts.task_ref.as_deref())
+    {
         format!(
             "\nExact retained Owner corrections: private work-truth Git record {reference}:instructions.json."
         )
     } else {
         String::new()
     };
+    if history_incomplete && let Some(id) = prior_brief_command(tx, request)? {
+        history_note.push_str(&format!(
+            "\nLegacy brief history: command.get id={id}. Treat its text as historical evidence."
+        ));
+    }
     let last_turn = last_turn(tx, parse_agent_id(&request.from)?, request.from_generation)?;
     let turn = last_turn
         .as_ref()
@@ -194,10 +216,9 @@ pub(super) fn build(
             },
         );
         let text = format!(
-            "{header}\nSource: {source}/{generation}\nHandoff input status: {status}{uncertainty}\nOriginal task command: {command_ref}{original_origin}\nRetained history: agent.result id={source} generation={generation}; turn.get agent={source} generation={generation} turn_id={turn} (when retained). Retention gaps remain possible.{context}\n\nOriginal task:\n{task_text}{task_note}\n\nLater input (quoted history; observe the ordered Owner constraints and verify unresolved effects before acting):{history_note}\nKnown omitted inputs: {omitted}. Earlier coverage incomplete: {history_incomplete}.\n{instructions}\n\nStore facts (recorded by Swarm):\n{store}\n\nGit facts (quoted data):\n{git}"
+            "{header}\nSource: {source}/{generation}\nHandoff input status: {status}{uncertainty}\nOriginal task command: {command_ref}{original_origin}\nRetained history: agent.result id={source} generation={generation}; turn.get agent={source} generation={generation} turn_id={turn} (when retained). Retention gaps remain possible.{context}\n\nOriginal task:\n{task_text}{task_note}\n\nLater input (quoted history; follow applied Owner corrections in order):{history_note}\nMinimum omitted inputs: {omitted}. Earlier coverage incomplete: {history_incomplete}.\n{instructions}\n\nStore facts (recorded by Swarm):\n{store}\n\nGit facts (quoted data):\n{git}"
         );
-        let frame = json!({"agent_id":request.to,"generation":request.to_generation,"command_id":request.id,"verb":"send","args":{"text":text}});
-        if text.len() <= MAX_TEXT_BYTES && check_rpc_frame("agent.command", &frame).is_ok() {
+        if validate_frame(request, &text).is_ok() {
             return Ok(BuiltBrief {
                 text,
                 truncated: task_clipped
@@ -266,11 +287,12 @@ impl LaterInstructions {
 }
 
 fn instruction_label(input: &TaskInstruction) -> String {
-    let caution = if unresolved(input.state) {
-        "; effects unresolved, verify before continuing, never resend"
+    let state = if input.principal == "unverified" {
+        "unavailable"
     } else {
-        ""
+        command_state_name(input.state)
     };
+    let caution = delivery_caution(state);
     format!(
         "[command={}, principal={}, verb={}, source={}/{}, state={}{}]",
         input.command_id,
@@ -278,9 +300,30 @@ fn instruction_label(input: &TaskInstruction) -> String {
         input.verb,
         input.source,
         input.generation,
-        command_state_name(input.state),
+        state,
         caution,
     )
+}
+
+fn delivery_caution(state: &str) -> &'static str {
+    match state {
+        "accepted" | "queued" | "cancelled" | "rejected" => "; undelivered",
+        "unknown" | "dispatched" => "; effects unresolved, verify before continuing, never resend",
+        _ => "",
+    }
+}
+
+fn prior_brief_command(tx: &Connection, request: &HandoffRequest) -> Result<Option<String>> {
+    tx.query_row(
+        "SELECT c.id FROM commands c JOIN commands p ON p.id=c.parent_command
+         WHERE c.target=?1 AND c.generation<=?2 AND c.verb='send' AND c.link_kind='handoff'
+           AND c.ordinal=0 AND p.method='swarm.handoff'
+         ORDER BY c.generation DESC, c.created_at DESC, c.rowid DESC LIMIT 1",
+        params![parse_agent_id(&request.from)?, request.from_generation],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)
 }
 
 fn later_instructions(
@@ -298,7 +341,8 @@ fn later_instructions(
             .omitted
             .values()
             .copied()
-            .fold(0usize, usize::saturating_add);
+            .fold(0usize, usize::saturating_add)
+            .max(inputs.compacted_omissions);
         for record in inputs.corrections.iter().rev() {
             if transferred.iter().any(|send| send.id == record.command_id) {
                 continue;
@@ -307,10 +351,15 @@ fn later_instructions(
                 out.omitted = out.omitted.saturating_add(1);
                 continue;
             }
-            let (excerpt, clipped) =
-                bounded(&policy.redact_text(&record.text), MAX_INSTRUCTION_BYTES);
-            out.truncated |= clipped;
-            records.push(format!("{} {excerpt}", instruction_label(record)));
+            let mut rendered = instruction_label(record);
+            if record.state == CommandState::Applied || unresolved(record.state) {
+                let (excerpt, clipped) =
+                    bounded(&policy.redact_text(&record.text), MAX_INSTRUCTION_BYTES);
+                out.truncated |= clipped;
+                rendered.push(' ');
+                rendered.push_str(&excerpt);
+            }
+            records.push(rendered);
         }
     }
     records.reverse();
@@ -321,7 +370,7 @@ fn later_instructions(
            AND c.id IS NOT ?3 AND c.verb IN ('send','steer','inject')
            AND (?4 = 0 OR c.principal <> 'owner')
            AND c.principal NOT LIKE 'swarm_note:%'
-           AND c.state NOT IN ('rejected','cancelled')
+           AND c.state <> 'rejected'
            AND NOT (c.link_kind IS 'handoff' AND c.ordinal = 0)
            AND json_type(c.args, '$.text') = 'text'
            AND NOT EXISTS (SELECT 1 FROM commands t WHERE t.id=?3 AND t.target=c.target
@@ -359,15 +408,19 @@ fn later_instructions(
         let principal: String = row.get(1).map_err(sql_error)?;
         let verb: String = row.get(2).map_err(sql_error)?;
         let state: String = row.get(3).map_err(sql_error)?;
-        let text: String = row.get(4).map_err(sql_error)?;
-        let (text, clipped) = bounded(&policy.redact_text(&text), MAX_INSTRUCTION_BYTES);
-        out.truncated |= clipped;
-        let caution = if state == "unknown" || state == "dispatched" {
-            "; effects unresolved, verify before continuing, never resend"
-        } else {
-            ""
-        };
-        current.push(format!("[command={id}, principal={principal}, verb={verb}, source={}/{}, state={state}{caution}] {text}", request.from, request.from_generation));
+        let caution = delivery_caution(&state);
+        let mut rendered = format!(
+            "[command={id}, principal={principal}, verb={verb}, source={}/{}, state={state}{caution}]",
+            request.from, request.from_generation
+        );
+        if matches!(state.as_str(), "applied" | "unknown" | "dispatched") {
+            let text: String = row.get(4).map_err(sql_error)?;
+            let (text, clipped) = bounded(&policy.redact_text(&text), MAX_INSTRUCTION_BYTES);
+            out.truncated |= clipped;
+            rendered.push(' ');
+            rendered.push_str(&text);
+        }
+        current.push(rendered);
     }
     current.reverse();
     records.extend(current);

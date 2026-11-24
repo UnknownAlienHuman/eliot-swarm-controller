@@ -703,7 +703,7 @@ impl Router {
     }
 
     /// Freeze the mandatory task material before a switch dispatches STOP.
-    pub(super) async fn prepare_handoff_task(
+    async fn prepare_handoff_task(
         &self,
         source: &Agent,
         task_command: Option<&str>,
@@ -734,12 +734,13 @@ impl Router {
         }
     }
 
-    /// Capture delivery states after any source stop, then checkpoint its files.
-    pub(super) async fn finish_handoff_facts(
+    /// Freeze task, delivery and Git facts before any switch crosses STOP.
+    pub(super) async fn prepare_handoff_facts(
         &self,
         source: &Agent,
-        mut facts: BriefFacts,
+        selected_task: Option<&str>,
     ) -> Result<BriefFacts> {
+        let mut facts = self.prepare_handoff_task(source, selected_task).await?;
         let Some(workspace) = source.workspace.as_deref().filter(|_| records_work(source)) else {
             return Ok(facts);
         };
@@ -759,6 +760,19 @@ impl Router {
                     .get_command(original_id)?
                     .and_then(|row| TaskInstruction::from_command(&row, String::new()));
                 let mut corrections = Vec::new();
+                for saved in &facts.task_inputs.corrections {
+                    if let Some(row) = store.get_command(&saved.command_id)?
+                        && row.target.as_deref() == Some(&saved.source)
+                        && row.generation == Some(saved.generation)
+                        && row.principal == saved.principal
+                        && row.verb == saved.verb
+                        && row.state != saved.state
+                    {
+                        let mut refreshed = saved.clone();
+                        refreshed.state = row.state;
+                        corrections.push(refreshed);
+                    }
+                }
                 let mut omitted = BTreeMap::new();
                 if facts.task_inputs.history_incomplete
                     && let Some(origin) = facts.task_inputs.original.as_ref()
@@ -798,13 +812,8 @@ impl Router {
             )
             .await?;
         }
-        if let Err(error) = self
-            .checkpoint_work(agent, source.generation, "handoff", None)
-            .await
-        {
-            self.log_work_truth_error("daemon.handoff_checkpoint_failed", &error);
-        }
-        // The stored row names the snapshot even when this pass found no change.
+        // The post-STOP checkpoint can advance this retained reference. It
+        // cannot change or invalidate the frozen input.
         let (recorded, base) = {
             let store = self.inner.store.lock().await;
             (
@@ -837,6 +846,16 @@ impl Router {
             }
         };
         Ok(facts)
+    }
+
+    pub(super) async fn checkpoint_handoff_source(&self, source: &Agent) {
+        if records_work(source)
+            && let Err(error) = self
+                .checkpoint_work(&source.id, source.generation, "handoff", None)
+                .await
+        {
+            self.log_work_truth_error("daemon.handoff_checkpoint_failed", &error);
+        }
     }
 
     fn log_work_truth_error(&self, name: &str, error: &Error) {

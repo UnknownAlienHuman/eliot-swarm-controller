@@ -272,8 +272,8 @@ mod source_install;
 mod switch;
 pub use switch::{
     AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING, PROVIDER_SWITCH_QUEUED,
-    PROVIDER_SWITCH_SETTLED, SwitchContinuation, SwitchLaunchCheckout, SwitchLiveCheckout,
-    SwitchReservation, SwitchWork,
+    PROVIDER_SWITCH_SETTLED, PreparedSwitchBrief, SwitchContinuation, SwitchLaunchCheckout,
+    SwitchLiveCheckout, SwitchReservation, SwitchWork,
 };
 mod swarm_usage;
 mod work_truth;

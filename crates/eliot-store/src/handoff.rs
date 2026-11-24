@@ -5,7 +5,7 @@ use eliot_core::api::{
     SendTransfer,
 };
 
-mod brief;
+pub(super) mod brief;
 pub(super) use brief::{last_turn_uncertain, last_unfinished_turn};
 
 /// Committed when a generation's task inputs, claims, Goal and children move.
@@ -69,6 +69,8 @@ pub struct TaskInputs {
     pub corrections: Vec<TaskInstruction>,
     /// Known omissions by source generation, so recapture does not double-count.
     pub omitted: std::collections::BTreeMap<String, usize>,
+    #[serde(default)]
+    pub compacted_omissions: usize,
     pub history_incomplete: bool,
     #[serde(default)]
     pub history_unresolved: bool,
@@ -221,10 +223,7 @@ impl Store {
             policy,
             now,
             self.hierarchy_limits,
-            HandoffInput::Brief {
-                facts,
-                discover: false,
-            },
+            HandoffInput::Brief { facts },
         )?;
         annotate_owner_events(&tx, &mut change.events, owner_process)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -491,7 +490,7 @@ pub(super) fn switch_transfer_commands(
     Ok(transfer_commands)
 }
 
-fn source_task(
+pub(super) fn source_task(
     connection: &Connection,
     from: &Agent,
     task_command: &str,
@@ -690,18 +689,9 @@ pub(super) fn transferable_send(record: &CommandRecord, stopped_source: bool) ->
 #[derive(Clone, Copy)]
 pub(super) enum HandoffInput<'a> {
     /// Context for an existing destination, which waits for its own input.
-    Brief {
-        facts: &'a BriefFacts,
-        /// A switch finds the task itself and accepts an ended source.
-        discover: bool,
-    },
-    /// B continues the task from its branch.
-    Continuation {
-        directive: &'a str,
-        facts: &'a BriefFacts,
-    },
-    /// The switch has already proven an exact provider refusal before work.
-    ProviderRetry,
+    Brief { facts: &'a BriefFacts },
+    /// Exact payload sized before dispatching the source stop.
+    Switch(&'a crate::switch::PreparedSwitchBrief),
     /// The project transfer has proved source custody and performed the team edits.
     ProjectTransfer { saved_context: Option<&'a str> },
 }
@@ -717,10 +707,7 @@ pub(super) fn handoff_tx(
     input: HandoffInput<'_>,
 ) -> Result<HandoffAdmission> {
     let project_transfer = matches!(input, HandoffInput::ProjectTransfer { .. });
-    let from_switch = matches!(
-        input,
-        HandoffInput::Continuation { .. } | HandoffInput::Brief { discover: true, .. }
-    );
+    let from_switch = matches!(input, HandoffInput::Switch(_));
     if (!project_transfer && !from_switch) || !request.task_command.is_empty() {
         request.validate()?;
     }
@@ -812,7 +799,7 @@ pub(super) fn handoff_tx(
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
-    let continuation = matches!(input, HandoffInput::Continuation { .. });
+    let continuation = matches!(input, HandoffInput::Switch(plan) if plan.resume_goal);
     if project_transfer && from.is_terminal() {
         require_settled_input(tx, &from, parse_agent_id(&from.id)?)?;
     } else if from_switch {
@@ -822,9 +809,17 @@ pub(super) fn handoff_tx(
     }
     quiescent(tx, &to, true)?;
     let input_principal = manager_caller.as_ref().map(|_| principal);
-    if let HandoffInput::Brief { facts, .. } | HandoffInput::Continuation { facts, .. } = input
-        && let (Some(command), Some(reference)) = (&facts.task_command, &facts.task_ref)
-    {
+    let binding = match input {
+        HandoffInput::Brief { facts } => {
+            facts.task_command.as_deref().zip(facts.task_ref.as_deref())
+        }
+        HandoffInput::Switch(plan) => plan
+            .binding
+            .as_ref()
+            .map(|(command, reference)| (command.as_str(), reference.as_str())),
+        HandoffInput::ProjectTransfer { .. } => None,
+    };
+    if let Some((command, reference)) = binding {
         let selected = Store::selected_work_task_command(tx, &from.id, from.generation)?;
         let bound = Store::work_task_binding(tx, &from.id, from.generation, command)?;
         if selected.as_deref() != Some(command)
@@ -836,11 +831,7 @@ pub(super) fn handoff_tx(
             ));
         }
     }
-    let task = if matches!(input, HandoffInput::ProviderRetry) {
-        source_task(tx, &from, &request.task_command, input_principal)?
-    } else if from_switch {
-        continuation_task(tx, &from, &request.task_command, input_principal)?
-    } else if project_transfer && request.task_command.is_empty() {
+    let task = if from_switch || (project_transfer && request.task_command.is_empty()) {
         None
     } else {
         source_task(tx, &from, &request.task_command, input_principal)?
@@ -853,10 +844,6 @@ pub(super) fn handoff_tx(
         policy,
         project_transfer || (from_switch && from.is_terminal()),
     )?;
-    let required_task = || {
-        task.as_ref()
-            .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))
-    };
     let built = match input {
         HandoffInput::Brief { facts, .. } => brief::build(
             tx,
@@ -871,19 +858,15 @@ pub(super) fn handoff_tx(
                 now,
             },
         )?,
-        HandoffInput::Continuation { directive, facts } => brief::build(
-            tx,
-            request,
-            task.as_ref(),
-            policy,
-            brief::BriefInput {
-                saved_context: None,
-                transferred: &originals,
-                facts: Some(facts),
-                directive: Some(directive),
-                now,
-            },
-        )?,
+        HandoffInput::Switch(plan) => {
+            if policy.contains_text(&plan.brief.text) {
+                return Err(Error::new(
+                    "secret_in_payload",
+                    "the frozen handoff input contains a known secret",
+                ));
+            }
+            plan.brief.clone()
+        }
         HandoffInput::ProjectTransfer { saved_context } => brief::build(
             tx,
             request,
@@ -897,24 +880,6 @@ pub(super) fn handoff_tx(
                 now,
             },
         )?,
-        HandoffInput::ProviderRetry => {
-            let task = required_task()?;
-            if policy.contains_value(&task.args) {
-                return Err(Error::new(
-                    "secret_in_payload",
-                    "retry input contains a known secret",
-                ));
-            }
-            let text = task
-                .args
-                .get("text")
-                .and_then(Value::as_str)
-                .ok_or_else(|| Error::new("source_integrity", "retry task text missing"))?;
-            brief::BuiltBrief {
-                text: text.to_owned(),
-                ..brief::BuiltBrief::default()
-            }
-        }
     };
     let mut events = Vec::new();
     // Agent authority never widens: an Agent handoff transfers only task
@@ -1067,13 +1032,7 @@ pub(super) fn handoff_tx(
         Some(from.generation),
         json!({"handoff": request.id, "to": to.id, "to_generation": to.generation}),
     )?);
-    if matches!(
-        input,
-        HandoffInput::Brief {
-            discover: false,
-            ..
-        }
-    ) {
+    if matches!(input, HandoffInput::Brief { .. }) {
         super::work_truth::inherit_work_task_tx(tx, &from, &to, &transfers, now)?;
     }
     super::result_page::record_handoff_origin_tx(tx, parse_agent_id(&to.id)?, to.generation)?;
