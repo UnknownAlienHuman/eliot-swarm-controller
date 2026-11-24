@@ -3,6 +3,7 @@
     reason = "Unix process custody requires process-group and signal FFI."
 )]
 
+use super::io_error;
 use super::process_observation::unknown_sample;
 #[cfg(target_os = "linux")]
 use super::process_observation::{
@@ -1238,10 +1239,6 @@ fn check_path_components(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn io_error(action: &str, error: std::io::Error) -> Error {
-    Error::new("platform_io", format!("{action}: {error}"))
 }
 
 /// Ancestor depth bound for heavy attribution: the harness wrapper, driver

@@ -1,3 +1,4 @@
+use super::io_error;
 use eliot_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -1387,10 +1388,6 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
         let _ = path;
         Ok(())
     }
-}
-
-fn io_error(action: &str, error: std::io::Error) -> Error {
-    Error::new("platform_io", format!("{action}: {error}"))
 }
 
 fn unavailable(message: &str) -> Error {

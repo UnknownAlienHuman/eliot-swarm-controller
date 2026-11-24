@@ -6,6 +6,7 @@
 mod data_acl;
 
 use super::data_dir::{DATA_DIR_ACL_UNREPAIRABLE_LOCATION, DATA_DIR_OWNER_LOCATION};
+use super::io_error;
 use super::process_observation::{
     CommandClass, MAX_PROCESS_SAMPLES, exited_sample, same_identity, unknown_sample,
 };
@@ -2838,10 +2839,6 @@ fn validate_security_handle(handle: &SecurityHandle, directory: bool) -> Result<
         ));
     }
     Ok(())
-}
-
-fn io_error(action: &str, error: std::io::Error) -> Error {
-    Error::new("platform_io", format!("{action}: {error}"))
 }
 
 #[link(name = "ntdll")]
