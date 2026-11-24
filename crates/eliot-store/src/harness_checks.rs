@@ -201,7 +201,8 @@ impl Store {
                              outcome = ?3, not_checked_reason = ?4,
                              checked_version = '', checked_at = 0, check_profile = NULL,
                              failure_step = NULL, failure_error = NULL,
-                             attempted_version = NULL, attempted_at = 0, updated_at = ?5
+                             attempted_version = NULL, attempted_at = 0, automatic_blocked = 0,
+                             updated_at = ?5
                          WHERE harness = ?1",
                         params![
                             harness,

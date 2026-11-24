@@ -1435,8 +1435,8 @@ harness self-check fact.
    attributable refusal for the same step and frozen profile blocks automatic
    routing and creates an Owner inbox item with the vendor's error. A later
    pass clears the item and restores routing. Explicit
-   Owner launches still work. An installation change preserves that routing
-   block while the new version awaits its check. Swarm restores the recorded
+   Owner launches still work. A newly installed version starts unblocked and
+   is blocked again only by its own repeated failure. Swarm restores the recorded
    outcome and routing eligibility when a previously checked version returns.
    A daemon interruption releases the claim for a fresh check after cleanup.
    Boot recovery leaves the interrupted check session closed. Cleanup requires
