@@ -1094,7 +1094,12 @@ impl Store {
             result,
             now,
         );
-        self.fault_on_persistence_error(&outcome);
+        // A pre-commit statement failure rolls back the receipt and gaps.
+        // Only uncertain COMMIT/rollback or failure to reopen writes fences
+        // this connection; commit_transaction handles the COMMIT case.
+        if outcome.is_err() && !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+        }
         outcome
     }
 

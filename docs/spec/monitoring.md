@@ -475,7 +475,9 @@ OS Git changes without a matching native principal remain explicitly external or
 unattributed. A dirty checkout, detached or inconsistent HEAD, duplicate or incomplete
 registration, or changed owner or path remains refused, with both branch names in the
 reason when both were observed.
-For accepted drift, `workspace.ready` carries `data.outcome.result.branch` as the
+Recovery of a pending Resume reuses the same checkout and attribution checks
+as dispatch. If the drift was already recorded, the branch and HEAD must still
+match that receipt. For accepted drift, `workspace.ready` carries `data.outcome.result.branch` as the
 observed branch and `data.outcome.result.branch_drift.original_branch` plus
 `data.outcome.result.branch_drift.observed_branch`; the persisted workspace outcome
 retains the same fields. Existing command-authority checks continue to govern who may

@@ -1692,8 +1692,11 @@ The daemon evaluates this every five seconds for root and child Agents outside c
   subject was created. The daemon persists the exact refusal reason and location, then
   selects it immediately through the same owed-work and automatic-handoff path. Boot
   restart Resume and an explicit Owner Resume both reach this selector. A preflight
-  rejection, including workspace or branch-integrity refusal, is not this category and
-  remains an Owner blocker.
+  rejection for a dirty, changed, or unattributed checkout keeps the work with the
+  current Agent. Automatic handoff would cross the same unverified source boundary.
+  The Owner sees the rejected Resume in `swarm command <id>`, with both branch names
+  for branch drift and the other Agent identity when known. Verify or restore the
+  worktree before issuing a new Resume.
 
 Held and lost sessions use `handoff_fallback` in configured order. A lost session
 can reuse its profile if the fallback list names it. For a withheld response on a

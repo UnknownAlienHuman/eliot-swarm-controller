@@ -6896,11 +6896,6 @@ impl Router {
         let (admission, restart_events) = match outcome {
             Ok(admission) => admission,
             Err(error) => {
-                if action == ShutdownMode::Restart && store.is_write_faulted() {
-                    self.inner
-                        .plugin_host
-                        .set_planned_restart_cutoff(&request.id);
-                }
                 if request.backup
                     && !store.is_write_faulted()
                     && let Err(cleanup) = crate::update_backup::discard_update_backup(

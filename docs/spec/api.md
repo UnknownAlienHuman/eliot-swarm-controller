@@ -3170,8 +3170,10 @@ transaction and represents the prior committed Store state.
 After the restart receipt commits, a late `events.put` receives an `unavailable`
 response with a log entry tied to the gap reference. The frame remains
 unacknowledged. A definite failure before seal rolls back both gaps and receipt,
-leaves native intake open, and uses the existing backup cleanup path. A Store
-write fault fences intake while the seal outcome is uncertain. The backup may
+leaves native intake open, and uses the existing backup cleanup path. Only a
+committed seal sets the planned restart cutoff. An uncertain Store commit
+still fences the writer and reports a Store failure without replaying effects.
+The backup may
 be restored only before a replacement can admit writes; after admission, rollback
 uses the current Store and retains its writes rather than restoring the older
 backup over them.

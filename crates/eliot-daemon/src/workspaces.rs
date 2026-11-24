@@ -585,37 +585,13 @@ impl WorkspaceManager {
             }
             match current.phase {
                 WorkspacePhase::Ready => {
-                    let recorded_drift = current
-                        .outcome
-                        .as_ref()
-                        .filter(|outcome| outcome["reuse"].as_bool() == Some(true))
-                        .map(|outcome| &outcome["result"])
-                        .filter(|result| result["branch_drift"].is_object());
-                    let readback = if recorded_drift.is_some() {
-                        self.inspect_resume_git(&git, &current).await
-                    } else {
-                        git.inspect_retained(&current).await
-                    };
-                    if let Some(error) = workspace_creation_error(&readback) {
+                    if let Err(error) = self.verify_ready_start(&git, &current).await {
                         if agent.generation > 0 {
                             return Err(error);
                         }
                         return Err(problem(
                             "unknown",
                             "ready workspace identity is unavailable",
-                        ));
-                    }
-                    if let Some(recorded) = recorded_drift
-                        && let WorkspaceCreationOutcome::Verified { branch, head, .. } = &readback
-                        && (recorded["branch"].as_str() != Some(branch)
-                            || recorded["head"].as_str() != Some(head))
-                    {
-                        return Err(problem(
-                            "source_integrity",
-                            &format!(
-                                "workspace changed after resume verification: original branch '{}' and observed branch '{}'",
-                                current.requested_branch, branch
-                            ),
                         ));
                     }
                     let _gate = slot.gate.clone().lock_owned().await;
@@ -1633,6 +1609,41 @@ impl WorkspaceManager {
         }
     }
 
+    async fn verify_ready_start(
+        &self,
+        git: &WorkspaceGit,
+        preparation: &WorkspacePreparation,
+    ) -> Result<()> {
+        let recorded_drift = preparation
+            .outcome
+            .as_ref()
+            .filter(|outcome| outcome["reuse"].as_bool() == Some(true))
+            .map(|outcome| &outcome["result"])
+            .filter(|result| result["branch_drift"].is_object());
+        let readback = if recorded_drift.is_some() {
+            self.inspect_resume_git(git, preparation).await
+        } else {
+            git.inspect_retained(preparation).await
+        };
+        if let Some(error) = workspace_creation_error(&readback) {
+            return Err(error);
+        }
+        if let Some(recorded) = recorded_drift
+            && let WorkspaceCreationOutcome::Verified { branch, head, .. } = &readback
+            && (recorded["branch"].as_str() != Some(branch)
+                || recorded["head"].as_str() != Some(head))
+        {
+            return Err(problem(
+                "source_integrity",
+                &format!(
+                    "workspace changed after resume verification: original branch '{}' and observed branch '{}'",
+                    preparation.requested_branch, branch
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     async fn pending_start(&self, preparation: &WorkspacePreparation) -> Result<bool> {
         if !matches!(
             preparation.phase,
@@ -1685,7 +1696,7 @@ impl WorkspaceManager {
                         .and_then(Value::as_bool)
                         == Some(true);
                     let outcome = if reuse {
-                        git.inspect_retained(preparation).await
+                        self.inspect_resume_git(&git, preparation).await
                     } else {
                         self.finish_workspace_create(
                             &git,
@@ -1776,10 +1787,7 @@ impl WorkspaceManager {
             .ok_or_else(|| problem("not_found", "workspace disappeared during recovery"))?;
         drop(store);
         if self.pending_start(&current).await?
-            && matches!(
-                git.inspect_retained(&current).await,
-                WorkspaceCreationOutcome::Verified { .. }
-            )
+            && self.verify_ready_start(&git, &current).await.is_ok()
         {
             return Ok(Some(current.start_command_id));
         }
