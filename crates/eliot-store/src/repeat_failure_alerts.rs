@@ -95,7 +95,7 @@ impl Store {
                 tx.query_row(
                     "SELECT COUNT(*) FROM repeat_failure_alerts WHERE cause <> ?1",
                     [OVERFLOW_CAUSE],
-                    |row| row.get::<_, usize>(0),
+                    |row| row.get::<_, i64>(0),
                 )
                 .map_err(sql_error)?
             };
@@ -103,7 +103,7 @@ impl Store {
                 overflow_at.filter(|at| at.saturating_add(OVERFLOW_QUIET_MS) > now);
             let mut events = Vec::new();
             for (update, message) in openings {
-                if occupied >= MAX_REPEAT_FAILURE_ALERTS {
+                if occupied >= MAX_REPEAT_FAILURE_ALERTS as i64 {
                     overflow_at.get_or_insert(now);
                     break;
                 }
