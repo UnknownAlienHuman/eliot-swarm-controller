@@ -1049,7 +1049,10 @@ single-line refusal. Globs match the full command supplied by a native
 permission request and each trimmed segment separated by unquoted, unescaped
 `;`, `|`, `&`, or a newline. On Windows each segment also matches using the
 executable basename without its `.exe` suffix, with the original arguments.
-Quoted executable paths are supported. Matching performs no shell expansion.
+The executable can follow a leading PowerShell `&` and can be quoted. For an
+unquoted drive-rooted, rooted or dot-relative path, the first valid `.exe`
+boundary can include spaces. Matching performs no shell expansion and leaves
+the command bodies of `cmd /c`, `pwsh -c` and `powershell -Command` opaque.
 Up to 64 entries are accepted; patterns are at most 1024 bytes and refusal
 text at most 512 bytes. The daemon freezes the registered project's table into each
 admitted launch after project discovery. It is evaluated only when a supported native

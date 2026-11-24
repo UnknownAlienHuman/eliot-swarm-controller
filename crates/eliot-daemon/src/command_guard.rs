@@ -104,30 +104,67 @@ impl CommandGuardPolicy {
 }
 
 /// Retain arguments verbatim while also matching the Windows executable's
-/// bare name. Quoted paths can contain spaces. No shell expansion is performed.
+/// bare name. A qualified unquoted path can extend to its `.exe` boundary.
 fn windows_executable_form(segment: &str) -> Option<String> {
     if !cfg!(windows) {
         return None;
     }
-    let (executable, rest) =
-        if let Some(quote) = segment.chars().next().filter(|ch| matches!(ch, '\'' | '"')) {
-            let (executable, rest) = segment[1..].split_once(quote)?;
-            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
-                return None;
-            }
-            (executable, rest)
-        } else {
-            segment.split_at(segment.find(char::is_whitespace).unwrap_or(segment.len()))
-        };
+    let invocation = segment.strip_prefix('&').map_or(segment, str::trim_start);
+    let (executable, rest) = if let Some(quote) = invocation
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '\'' | '"'))
+    {
+        let (executable, rest) = invocation[1..].split_once(quote)?;
+        if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        (executable, rest)
+    } else {
+        invocation.split_at(windows_executable_end(invocation))
+    };
     let basename = executable.rsplit(['/', '\\']).next()?;
-    let stem = basename
-        .get(basename.len().saturating_sub(4)..)
-        .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
-        .map_or(basename, |_| &basename[..basename.len() - 4]);
+    let stem = without_exe_suffix(basename).unwrap_or(basename);
     if stem.is_empty() || stem.len() + rest.len() == segment.len() {
         return None;
     }
     Some(format!("{stem}{rest}"))
+}
+
+fn without_exe_suffix(name: &str) -> Option<&str> {
+    let stem_len = name.len().checked_sub(4)?;
+    name.get(stem_len..)?
+        .eq_ignore_ascii_case(".exe")
+        .then(|| &name[..stem_len])
+}
+
+fn windows_executable_end(invocation: &str) -> usize {
+    let first = invocation
+        .find(char::is_whitespace)
+        .unwrap_or(invocation.len());
+    if without_exe_suffix(&invocation[..first]).is_some() {
+        return first;
+    }
+    let drive = matches!(invocation.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
+    if !drive
+        && !invocation.starts_with(['\\', '/'])
+        && ![".\\", "./", "..\\", "../"]
+            .iter()
+            .any(|prefix| invocation.starts_with(prefix))
+    {
+        return first;
+    }
+    invocation
+        .match_indices(char::is_whitespace)
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(invocation.len()))
+        .find(|&end| without_exe_suffix(&invocation[..end]).is_some())
+        .filter(|&end| {
+            let path = &invocation[..end];
+            let body = if drive { &path[2..] } else { path };
+            !body.contains([':', '\'', '"', '<', '>', '|', '?', '*', '`'])
+        })
+        .unwrap_or(first)
 }
 
 /// Match unquoted shell list separators without interpreting or executing
@@ -157,6 +194,9 @@ fn command_segments(command: &str) -> impl Iterator<Item = &str> {
                 }
                 if matches!(ch, '\'' | '"') {
                     quote = Some(ch);
+                    return None;
+                }
+                if cfg!(windows) && ch == '&' && command[start..offset].trim().is_empty() {
                     return None;
                 }
                 if !matches!(ch, ';' | '|' | '&' | '\n' | '\r') {
