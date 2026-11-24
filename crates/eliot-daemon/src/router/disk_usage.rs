@@ -4,10 +4,12 @@ use super::Router;
 use crate::platform::{is_reparse_point, script_file::Directory};
 use eliot_core::api::{AutomaticCleanupView, DiskUsageDirectory, DiskUsageView};
 use eliot_plugin::{FileIdentity, sync::LockExt};
+use futures_util::FutureExt;
 use std::{
     collections::HashMap,
     fs::{self, ReadDir},
     io::ErrorKind,
+    panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -48,8 +50,7 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    async fn scan(root: &Path) -> Self {
-        let started_at = Instant::now();
+    async fn scan(root: &Path, started_at: Instant) -> Self {
         let (artifacts, artifact_time) = scan_bucket(root.join("artifacts")).await;
         let (worktrees, worktree_time) = scan_bucket(root.join("worktrees")).await;
         let (plugins, plugin_time) = scan_bucket(root.join("plugins")).await;
@@ -61,6 +62,19 @@ impl Snapshot {
             artifacts,
             worktrees,
             plugins,
+        }
+    }
+
+    fn failed(started_at: Instant) -> Self {
+        let completed_at = Instant::now();
+        Self {
+            started_at,
+            completed_at,
+            refresh_delay: REFRESH_TTL
+                .max((completed_at - started_at).saturating_mul(REFRESH_REST_MULTIPLIER)),
+            artifacts: failed("unavailable"),
+            worktrees: failed("unavailable"),
+            plugins: failed("unavailable"),
         }
     }
 }
@@ -84,7 +98,11 @@ impl Router {
                 state.refreshing = true;
                 let entry = entry.clone();
                 drop(tokio::spawn(async move {
-                    let snapshot = Snapshot::scan(&root).await;
+                    let started_at = Instant::now();
+                    let snapshot = AssertUnwindSafe(Snapshot::scan(&root, started_at))
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Snapshot::failed(started_at));
                     let mut state = entry.state.lock_recover();
                     state.snapshot = Some(snapshot);
                     state.refreshing = false;
@@ -103,14 +121,17 @@ impl Router {
         } else {
             (snapshot, refreshing)
         };
-        let (artifacts, worktrees, plugins, snapshot_age_ms) = match snapshot {
+        let now = Instant::now();
+        let age_ms = |at: Instant| u64::try_from((now - at).as_millis()).unwrap_or(u64::MAX);
+        let (artifacts, worktrees, plugins, snapshot_age_ms, snapshot_end_age_ms) = match snapshot {
             Some(snapshot) => (
                 snapshot.artifacts,
                 snapshot.worktrees,
                 snapshot.plugins,
-                Some(u64::try_from(snapshot.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+                Some(age_ms(snapshot.started_at)),
+                Some(age_ms(snapshot.completed_at)),
             ),
-            None => (failed("busy"), failed("busy"), failed("busy"), None),
+            None => (failed("busy"), failed("busy"), failed("busy"), None, None),
         };
         let (owner_decision_worktrees, owner_decision_error_code) = match &cleanup.last_sweep {
             Some(sweep) if sweep.error_code.is_none() => (Some(owner_decision_count), None),
@@ -132,6 +153,7 @@ impl Router {
             worktrees,
             plugins,
             snapshot_age_ms,
+            snapshot_end_age_ms,
             refreshing,
             owner_decision_worktrees,
             owner_decision_error_code,

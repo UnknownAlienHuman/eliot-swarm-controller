@@ -187,19 +187,27 @@ pub async fn cleanup_plan_page(
 
 /// A validated daemon status snapshot for the Worktrees cleanup surface.
 pub async fn daemon_status(data_dir: &Path) -> Result<DaemonStatusResponse> {
-    let request = DaemonStatusRequest {
-        disk_usage_freshness: true,
-    };
-    request.validate()?;
-    let response = match eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await
-    {
-        Ok(response) => response,
-        Err(error) if lacks_disk_usage_freshness(&error) => {
-            let legacy_request = DaemonStatusRequest::default();
-            eliot_daemon::client_call_typed(data_dir, "daemon.status", &legacy_request).await?
+    for request in [
+        DaemonStatusRequest {
+            disk_usage_scan_window: true,
+            ..Default::default()
+        },
+        DaemonStatusRequest {
+            disk_usage_freshness: true,
+            ..Default::default()
+        },
+    ] {
+        match eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await {
+            Err(error) if lacks_disk_usage_freshness(&error) => {}
+            result => {
+                let response = result?;
+                request.validate_response(&response)?;
+                return Ok(response);
+            }
         }
-        Err(error) => return Err(error),
-    };
+    }
+    let request = DaemonStatusRequest::default();
+    let response = eliot_daemon::client_call_typed(data_dir, "daemon.status", &request).await?;
     request.validate_response(&response)?;
     Ok(response)
 }

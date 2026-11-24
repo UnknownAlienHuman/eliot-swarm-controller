@@ -219,9 +219,14 @@ pub fn disk_usage_line(usage: &DiskUsageView) -> String {
         (None, Some(code)) => format!("Owner-decision worktrees unavailable ({code})"),
         _ => "Owner-decision worktrees unavailable".to_owned(),
     };
-    let freshness = match usage.snapshot_age_ms {
-        Some(age_ms) => format!("snapshot age {}", age_words(age_ms)),
-        None => "snapshot age unavailable".to_owned(),
+    let freshness = match (usage.snapshot_age_ms, usage.snapshot_end_age_ms) {
+        (Some(start), Some(end)) => format!(
+            "scan window {} ago to {} ago",
+            age_words(start),
+            age_words(end)
+        ),
+        (Some(age_ms), None) => format!("snapshot age {}", age_words(age_ms)),
+        _ => "snapshot age unavailable".to_owned(),
     };
     let refreshing = if usage.refreshing {
         " · refreshing"

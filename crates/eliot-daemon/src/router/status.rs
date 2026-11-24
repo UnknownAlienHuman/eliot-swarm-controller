@@ -57,7 +57,10 @@ impl Router {
             .map_err(|_| Error::new("internal", "autonomy report could not be encoded"))
     }
 
-    pub(super) async fn status(&self, disk_usage_freshness: bool) -> Result<Value> {
+    pub(super) async fn status(
+        &self,
+        request: eliot_core::api::DaemonStatusRequest,
+    ) -> Result<Value> {
         let eliot_store::OwnerProjection {
             items: inbox,
             liveness,
@@ -76,9 +79,12 @@ impl Router {
         let mut disk_usage = self
             .disk_usage_view(&automatic_cleanup, owner_decision_count)
             .await;
-        if !disk_usage_freshness {
+        if !request.disk_usage_freshness && !request.disk_usage_scan_window {
             disk_usage.snapshot_age_ms = None;
             disk_usage.refreshing = false;
+        }
+        if !request.disk_usage_scan_window {
+            disk_usage.snapshot_end_age_ms = None;
         }
         let mode = self.mode_name();
         let (

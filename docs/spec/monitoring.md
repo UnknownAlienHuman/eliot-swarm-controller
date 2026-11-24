@@ -1418,18 +1418,20 @@ is greater. The iterator advances across steps until the bucket is complete.
 A bucket with an unreadable path, a replaced active directory or more than
 128 active directory levels reports an error without a byte total. The total
 estimates logical bytes observed over the scan window and includes unregistered
-directories. Windows pins paths
-while opening directory iterators. Linux opens them relative to directory
+directories. Windows retains the checked directory and its ancestors while
+opening the iterator by path. Linux opens iterators relative to directory
 handles. Other platforms report existing buckets as unavailable because
 they lack a supported handle-relative enumerator.
 
 After completion, a status call can start the next refresh once the greater
 of five minutes and 64 times the previous scan's active time has passed.
 Pending refreshes serve the previous snapshot. Before the first snapshot,
-status waits up to 500 ms and can report `busy`. CLI status and desktop
-Storage request `snapshot_age_ms` and `refreshing` with
-`disk_usage_freshness: true` and show them with the totals. Age runs from the
-start of the published scan. The desktop's ten-second sidebar poll uses
+status waits up to 500 ms and can report `busy`. A scan panic publishes an
+unavailable snapshot and clears the refresh flag. CLI status uses
+`disk_usage_freshness: true` to show the scan start age. Desktop Storage requests
+`disk_usage_scan_window: true` and shows both endpoint ages
+(`snapshot_age_ms` and `snapshot_end_age_ms`) for the published scan window.
+The desktop's ten-second sidebar poll uses
 `daemon.sidebar` for Owner inbox counts and profile command issues.
 Before #729,
 Swarm's managed launch assigned each worktree a flat `worktrees/<ULID>/` path.

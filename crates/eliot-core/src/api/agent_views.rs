@@ -2327,6 +2327,9 @@ pub struct DiskUsageView {
     /// Time since the last published measurement attempt began, if one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_age_ms: Option<u64>,
+    /// Time since the same measurement attempt ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_end_age_ms: Option<u64>,
     /// A measurement is in progress. The displayed buckets may be cached.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refreshing: bool,
@@ -2339,6 +2342,12 @@ impl DiskUsageView {
         self.artifacts.validate()?;
         self.worktrees.validate()?;
         self.plugins.validate()?;
+        if self
+            .snapshot_end_age_ms
+            .is_some_and(|end| self.snapshot_age_ms.is_none_or(|start| end > start))
+        {
+            return Err(invalid_response());
+        }
         match (
             self.owner_decision_worktrees,
             &self.owner_decision_error_code,
