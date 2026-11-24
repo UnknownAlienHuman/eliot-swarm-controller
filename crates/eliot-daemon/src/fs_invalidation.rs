@@ -2,7 +2,7 @@
 //!
 //! Keep one instance per admitted workspace. The monitor owns debounce,
 //! bounded reconciliation, and fallback polling.
-//! Uses notify 8.2.1 (CC0-1.0, Rust 1.85) with default features disabled.
+//! Uses notify 9.0.0 (CC0-1.0, Rust 1.91) with default features disabled.
 
 use eliot_core::{self as core, Error};
 use std::sync::{

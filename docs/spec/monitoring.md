@@ -649,8 +649,9 @@ silently disabling the configured HTTPS/SSH transport itself.
   provide the durable lower bounds; an unchanged observation needs no durable heartbeat.
 
 The monitor skips periodic Git reads for an idle checkout with a complete sample
-under a healthy filesystem watch. A five-minute reconciliation bounds changes
-outside the watch, including external Git configuration and ignore files. A
+under a healthy filesystem watch. The next reconciliation becomes due after
+300 seconds even if notifications are silently lost or a change is outside the
+watch, including external Git configuration and ignore files. A
 new binding, a native file hint or filesystem invalidation schedules a new
 read. Active bindings, incomplete samples, and unavailable or degraded watches
 keep periodic reads at least 2 s apart without submodule recursion. Slow/error
@@ -670,6 +671,8 @@ Notifications coalesce into read hints. Access-only activity is ignored. Backend
 errors, rescan notices, and changes to watched bindings mark the watcher degraded
 and restore polling while registration is retried. Git readback remains
 authoritative for facts and containment. Notifications never count as model progress.
+Windows zero-byte overflow completions and `ERROR_NOTIFY_ENUM_DIR` both
+arrive as rescan notices. Linux inotify queue overflow also requests a rescan.
 
 The Git view exposes `filesystem_invalidation.state`: `healthy` means an active watcher
 without reported degradation; `degraded` means an active watcher reported an error/rescan;

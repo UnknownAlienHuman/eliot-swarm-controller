@@ -22,6 +22,8 @@ reads the private owner token automatically. Agents send id/generation/token; ma
 scripts use scoped run tokens; plugins have instance credentials. Missing/incomplete/
 revoked credentials reject, never become owner. No manual `--owner` step is required.
 Reads are scoped as well as writes.
+Current controlled Agent generation tokens have 52 characters and contain 160
+random bits from two independently generated ULIDs.
 
 Before granting Owner authority on a local connection, the daemon checks the OS-reported
 client process against its own live Agent custody. Windows uses the client PID from

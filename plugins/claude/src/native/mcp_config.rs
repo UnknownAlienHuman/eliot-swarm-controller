@@ -10,6 +10,8 @@ use eliot_plugin::native_cli::{
 };
 use serde_json::json;
 
+pub(crate) const MCP_TOKEN_ENV: &str = "ELIOT_CLAUDE_MCP_TOKEN";
+
 /// One private Claude CLI config file for an owned native session.
 pub(crate) struct ClaudeMcpConfigFile {
     path: PathBuf,
@@ -33,9 +35,8 @@ impl ClaudeMcpConfigFile {
         )
     }
 
-    /// Write the public executable/data-root arguments and the exact scoped
-    /// Agent identity for this private MCP child. The file is generation-local
-    /// and removed with the native session.
+    /// Write public selectors and a reference Claude expands from its own
+    /// environment. The generation credential never enters this file.
     pub(crate) fn create(
         instance_dir: &Path,
         swarm_binary: &Path,
@@ -65,12 +66,17 @@ impl ClaudeMcpConfigFile {
         let data_dir = data_root
             .to_str()
             .ok_or_else(|| Error::new("invalid", "Claude MCP data-root path is not UTF-8"))?;
+        let token_reference = format!("${{{MCP_TOKEN_ENV}}}");
         let environment_json = environment
             .iter()
             .map(|(name, value)| {
                 (
                     name.to_string_lossy().into_owned(),
-                    serde_json::Value::String(value.to_string_lossy().into_owned()),
+                    if name.eq_ignore_ascii_case("ELIOT_AGENT_TOKEN") {
+                        json!(token_reference)
+                    } else {
+                        json!(value.to_string_lossy())
+                    },
                 )
             })
             .collect::<serde_json::Map<_, _>>();
@@ -88,15 +94,10 @@ impl ClaudeMcpConfigFile {
             let generation = find("ELIOT_AGENT_GENERATION").ok_or_else(|| {
                 Error::new("not_allowed", "Claude Agent MCP identity is incomplete")
             })?;
-            let token = find("ELIOT_AGENT_TOKEN")
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    Error::new("not_allowed", "Claude Agent MCP identity is incomplete")
-                })?;
             json!({"type":"http", "url":url, "headers":{
                 "x-eliot-agent-id":agent_id,
                 "x-eliot-agent-generation":generation,
-                "Authorization":format!("Bearer {token}")
+                "Authorization":format!("Bearer {token_reference}")
             }})
         } else {
             json!({"command":command,"args":worker_swarm_mcp_args(data_dir),"env":environment_json})

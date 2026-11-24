@@ -1966,6 +1966,18 @@ async fn launch_session(
             phase: StartPhase::Auth,
             error: Box::new(error),
         })?;
+    let token = eliot_plugin::native_cli::unique_environment_value(
+        &plan.mcp_environment,
+        "ELIOT_AGENT_TOKEN",
+    )
+    .filter(|token| !token.is_empty())
+    .ok_or_else(|| PhaseFailure {
+        phase: StartPhase::McpConfig,
+        error: Box::new(Error::new(
+            "not_allowed",
+            "Claude Agent MCP credential is missing",
+        )),
+    })?;
     let mcp_config = ClaudeMcpConfigFile::create(
         &plan.instance_dir,
         &plan.swarm_binary,
@@ -2065,11 +2077,13 @@ async fn launch_session(
     }
     argv.push(OsString::from("--plugin-dir"));
     argv.push(OsString::from(skill_root));
+    let mut environment = plan.environment.clone();
+    environment.push((crate::native::MCP_TOKEN_ENV.into(), token.to_owned()));
     let launch = NativeLaunch {
         program: plan.program.clone(),
         args: argv,
         cwd: plan.workspace.clone(),
-        environment: plan.environment.clone(),
+        environment,
     };
     let mut native = ClaudeProcess::spawn(launch, SecretPolicy::new(plan.secrets.iter().cloned()))
         .await
