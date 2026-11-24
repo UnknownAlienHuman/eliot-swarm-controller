@@ -5,6 +5,7 @@ use serde_json::Value;
 
 const MAX_EVENTS: usize = 128;
 const MAX_BYTES: usize = 256 * 1024;
+const OVERFLOW_GAP: &str = "Native early-event buffer exceeded its bound";
 
 /// Native JSON-RPC facts held until the adapter can associate them.
 #[derive(Clone, Serialize)]
@@ -21,8 +22,8 @@ pub enum BufferedRpcFrame {
     },
 }
 
-/// Holds early native events in arrival order. Adapters own admission to the
-/// queue, association with a turn and the source transition on overflow.
+/// Holds early native events in arrival order until the adapter can associate
+/// them. An overflow discards the queue and schedules a source gap.
 pub struct EarlyEventBuffer<T> {
     events: VecDeque<(T, usize)>,
     bytes: usize,
@@ -42,24 +43,23 @@ impl<T> EarlyEventBuffer<T> {
         }
     }
 
-    /// An unencodable or over-limit event leaves the retained queue intact.
-    pub fn try_push(&mut self, event: T) -> bool
+    /// Discard the buffered prefix and incoming event when the bound would be
+    /// exceeded. Keep the earliest gap already pending for this source.
+    pub fn push(&mut self, event: T, deferred_gap: &mut Option<impl From<&'static str>>)
     where
         T: Serialize,
     {
-        if self.events.len() >= MAX_EVENTS {
-            return false;
+        if self.events.len() < MAX_EVENTS
+            && let Ok(encoded) = serde_json::to_vec(&event)
+            && encoded.len() <= MAX_BYTES - self.bytes
+        {
+            let size = encoded.len();
+            self.events.push_back((event, size));
+            self.bytes += size;
+        } else {
+            self.clear();
+            deferred_gap.get_or_insert_with(|| OVERFLOW_GAP.into());
         }
-        let Ok(encoded) = serde_json::to_vec(&event) else {
-            return false;
-        };
-        let size = encoded.len();
-        if size > MAX_BYTES - self.bytes {
-            return false;
-        }
-        self.events.push_back((event, size));
-        self.bytes += size;
-        true
     }
 
     pub fn front(&self) -> Option<&T> {

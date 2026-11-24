@@ -563,20 +563,14 @@ impl EventProcessor {
                 if self.take_child_frame(&params, true) {
                     self.reject_child_request(id, &method, &params).await;
                 } else if !self.status.ready || self.status.active_turn_id.is_none() {
-                    self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Request { id, method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_request(id, method, params).await {
-                    self.status.source_unknown = true;
-                    if !self.gap_reported
-                        && !self.writes_blocked
-                        && error.failure_where.as_deref() != Some("plugin.events.put")
-                    {
-                        let _ = self
-                            .record_gap("Codex native request could not be normalized")
-                            .await;
-                    }
-                    if self.status.failure.is_none() {
-                        self.status.failure = Some(*error.message);
-                    }
+                    self.stream_source()
+                        .note_event_failure(&error, "Codex native request could not be normalized")
+                        .await;
                 }
             }
             Some(NativeFrame::Notification { method, params }) => {
@@ -585,23 +579,19 @@ impl EventProcessor {
                     return;
                 }
                 if self.should_buffer(&method, &params) {
-                    self.buffer_frame(BufferedNativeFrame::Notification { method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Notification { method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_notification(&method, params).await {
-                    self.status.source_unknown = true;
-                    if !self.gap_reported
-                        && !self.writes_blocked
-                        && error.failure_where.as_deref() != Some("plugin.events.put")
-                    {
-                        // Method and error code only: no native payload text.
-                        let reason = format!(
-                            "Codex {method} notification could not be normalized ({})",
-                            error.code
-                        );
-                        let _ = self.record_gap(&reason).await;
-                    }
-                    if self.status.failure.is_none() {
-                        self.status.failure = Some(*error.message);
-                    }
+                    // Method and error code only: no native payload text.
+                    let reason = format!(
+                        "Codex {method} notification could not be normalized ({})",
+                        error.code
+                    );
+                    self.stream_source()
+                        .note_event_failure(&error, &reason)
+                        .await;
                 }
             }
             None => {
@@ -707,13 +697,6 @@ impl EventProcessor {
                 | "error"
         ) || (known_notification(method) && turn_activity_notification(method)))
             && (!self.status.ready || self.status.active_turn_id.is_none())
-    }
-
-    fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
-        if !self.buffer.try_push(frame) {
-            self.buffer.clear();
-            self.defer_gap("Codex early-event buffer exceeded its bound");
-        }
     }
 
     async fn ready(

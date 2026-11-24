@@ -754,6 +754,9 @@ async fn run(
                 } else {
                     processor.buffer_record(record);
                 }
+                if frames.is_empty() {
+                    processor.report_pending_fault_gap().await;
+                }
             }
             changed = stream.changed(), if frames_open && stream_open => {
                 if changed.is_err() {
@@ -1127,14 +1130,7 @@ impl EventProcessor {
     }
 
     fn buffer_record(&mut self, record: Value) {
-        if !self.buffer.try_push(record) {
-            // Overflow is settled as a gap by the next commit path instead of
-            // inventing completion; mark the source now.
-            self.status.source_unknown = true;
-            if self.status.failure.is_none() {
-                self.status.failure = Some("Claude early event buffer overflowed".to_owned());
-            }
-        }
+        self.buffer.push(record, &mut self.pending_fault_gap);
     }
 
     async fn flush_buffer(&mut self) -> Result<()> {
@@ -3538,18 +3534,22 @@ impl EventProcessor {
         Ok(())
     }
 
+    async fn report_pending_fault_gap(&mut self) {
+        if !self.gap_reported
+            && !self.writes_blocked
+            && let Some(reason) = self.pending_fault_gap.take()
+        {
+            let _ = self.record_gap(&reason).await;
+        }
+    }
+
     async fn note_frames_drained(&mut self) {
         self.frames_drained = true;
         self.cancel_all_hook_callbacks();
         if self.planned_stop || self.closed {
             // A sticky record-local fault survives planned stop: flush its
             // gap before end-stop settlement instead of erasing it.
-            if let Some(reason) = self.pending_fault_gap.take()
-                && !self.gap_reported
-                && !self.writes_blocked
-            {
-                let _ = self.record_gap(&reason).await;
-            }
+            self.report_pending_fault_gap().await;
             self.finish_pending_end_stop().await;
             return;
         }
@@ -3598,35 +3598,17 @@ impl EventProcessor {
     }
 
     async fn note_stream_state(&mut self, state: StreamState) {
-        match state {
-            StreamState::Open => {}
-            StreamState::Overflow => {
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self
-                        .record_gap("Claude native event queue overflowed")
-                        .await;
-                }
-            }
-            StreamState::Malformed(fault) => {
-                // Active record-local fault: record its gap immediately with
-                // the safe typed label; keep it sticky for the planned-stop
-                // drain in case this immediate record is blocked.
-                let reason = format!(
-                    "Claude stream contained an invalid frame ({})",
-                    fault.describe()
-                );
-                if self.pending_fault_gap.is_none() {
-                    self.pending_fault_gap = Some(reason.clone());
-                }
-                if !self.gap_reported && !self.writes_blocked {
-                    let _ = self.record_gap(&reason).await;
-                }
-            }
-            StreamState::Closed => {
-                // Settlement happens in `note_frames_drained` once the
-                // buffered tail is processed.
-            }
-        }
+        let reason = match state {
+            StreamState::Overflow => "Claude native event queue overflowed".to_owned(),
+            StreamState::Malformed(fault) => format!(
+                "Claude stream contained an invalid frame ({})",
+                fault.describe()
+            ),
+            // The close is settled in `note_frames_drained`.
+            StreamState::Open | StreamState::Closed => return,
+        };
+        self.pending_fault_gap.get_or_insert(reason);
+        self.report_pending_fault_gap().await;
     }
 
     async fn finish_stop(&mut self) -> Result<()> {

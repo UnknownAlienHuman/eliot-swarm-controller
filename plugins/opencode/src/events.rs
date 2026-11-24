@@ -1001,24 +1001,18 @@ impl EventProcessor {
         match frame {
             Some(SseFrame::Event(envelope)) => {
                 if self.should_buffer(&envelope.event_type) {
-                    self.buffer_envelope(envelope);
+                    self.buffer.push(envelope, &mut self.loss_reason);
                 } else {
                     // Processing may open the turn; flush what that unlocks.
                     // `process_envelope` never flushes itself, so this loop
                     // always terminates.
                     if let Err(error) = self.process_envelope(envelope).await {
-                        self.status.source_unknown = true;
-                        if !self.gap_reported
-                            && !self.writes_blocked
-                            && error.failure_where.as_deref() != Some("plugin.events.put")
-                        {
-                            let _ = self
-                                .record_gap("OpenCode native event could not be normalized")
-                                .await;
-                        }
-                        if self.status.failure.is_none() {
-                            self.status.failure = Some(*error.message);
-                        }
+                        self.stream_source()
+                            .note_event_failure(
+                                &error,
+                                "OpenCode native event could not be normalized",
+                            )
+                            .await;
                     } else {
                         let _ = self.flush_buffer().await;
                     }
@@ -1138,13 +1132,6 @@ impl EventProcessor {
             return self.pending.is_some() || self.stashed_started.is_some();
         }
         false
-    }
-
-    fn buffer_envelope(&mut self, envelope: SseEnvelope) {
-        if !self.buffer.try_push(envelope) {
-            self.buffer.clear();
-            self.defer_gap("OpenCode early-event buffer exceeded its bound");
-        }
     }
 
     async fn ready(
@@ -2756,7 +2743,7 @@ impl EventProcessor {
             ));
         }
         let input = input.clone();
-        if let Err(error) = self
+        let commit = self
             .commit_terminal_facts(
                 &input,
                 &terminal,
@@ -2765,14 +2752,13 @@ impl EventProcessor {
                 (status, outcome),
                 readback.as_ref(),
             )
-            .await
-        {
+            .await;
+        if let Err(error) = &commit {
             if error.failure_where.as_deref() != Some("plugin.events.put") {
-                return Err(error);
+                return commit;
             }
             // The host recorded the gap. The native execution already ended,
             // so its local handles can be released while the daemon settles it.
-            self.status.source_unknown = true;
             self.active_model = None;
         }
         // The completed turn clears its Eliot pendings; drop the retained
@@ -2789,7 +2775,7 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
-        Ok(())
+        commit
     }
 
     async fn commit_terminal_facts(

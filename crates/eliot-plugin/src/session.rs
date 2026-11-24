@@ -1169,18 +1169,23 @@ pub struct StreamSource<'a> {
 }
 
 impl StreamSource<'_> {
+    /// Latch the incomplete source. A definite batch rejection already has a
+    /// host-owned gap, so only other errors can require a new adapter gap.
+    pub async fn note_event_failure(&mut self, error: &Error, gap_reason: &str) -> bool {
+        let rejected = error.failure_where.as_deref() == Some("plugin.events.put");
+        *self.source_unknown = true;
+        if !rejected && !*self.gap_reported && !*self.writes_blocked {
+            let _ = self.record_gap(gap_reason).await;
+        }
+        self.failure.get_or_insert_with(|| (*error.message).clone());
+        rejected
+    }
+
     /// Keep the host's evidence for a definitive rejection. Any other buffered
     /// processing failure leaves coverage unresolved at this sequence boundary.
     pub async fn buffered_failure(&mut self, error: Error, gap_reason: &str) -> Error {
-        if error.failure_where.as_deref() == Some("plugin.events.put") {
+        if self.note_event_failure(&error, gap_reason).await {
             return error;
-        }
-        *self.source_unknown = true;
-        if !*self.gap_reported && !*self.writes_blocked {
-            let _ = self.record_gap(gap_reason).await;
-        }
-        if self.failure.is_none() {
-            *self.failure = Some(*error.message);
         }
         Error::new(
             "unknown",

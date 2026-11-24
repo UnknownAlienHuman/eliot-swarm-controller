@@ -1185,7 +1185,10 @@ impl EventProcessor {
         match frame {
             Some(NativeFrame::Request { id, method, params }) => {
                 if !self.status.ready || self.status.active_turn_id.is_none() {
-                    self.buffer_frame(BufferedNativeFrame::Request { id, method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Request { id, method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_request(id, method, params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported
@@ -1214,7 +1217,10 @@ impl EventProcessor {
                     &params,
                 );
                 if !bypass_buffer && self.should_buffer(&method, &params) {
-                    self.buffer_frame(BufferedNativeFrame::Notification { method, params });
+                    self.buffer.push(
+                        BufferedNativeFrame::Notification { method, params },
+                        &mut self.loss_reason,
+                    );
                 } else if let Err(error) = self.process_notification(method, params).await {
                     self.status.source_unknown = true;
                     if !self.gap_reported
@@ -1417,13 +1423,6 @@ impl EventProcessor {
             !matches_start(buffered) && !turn_matches
         });
         (true, turn_id)
-    }
-
-    fn buffer_frame(&mut self, frame: BufferedNativeFrame) {
-        if !self.buffer.try_push(frame) {
-            self.buffer.clear();
-            self.defer_gap("Muse early-event buffer exceeded its bound");
-        }
     }
 
     async fn ready(
