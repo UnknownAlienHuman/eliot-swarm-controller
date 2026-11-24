@@ -35,6 +35,8 @@ pub(super) const CLOSED_COMPLETION_PARENT: &str = r#"
               WHERE c.target = a.id AND c.generation = a.generation
                 AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
                      OR (c.verb = 'stop' AND c.principal = 'owner' AND c.state = 'applied')
+                     OR (c.verb = 'stop' AND c.state = 'cancelled'
+                         AND json_extract(c.outcome, '$.reason') = 'generation_lost')
                      OR (c.verb = 'resume' AND c.created_at >= restart.ts
                          AND c.state IN ('rejected', 'failed')))
           )
