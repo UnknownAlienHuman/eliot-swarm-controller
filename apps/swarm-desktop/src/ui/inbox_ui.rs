@@ -288,6 +288,10 @@ impl DesktopApp {
                             AuthLoginStatus::Cooldown => {
                                 "Sign-in is cooling down. Try again later.".to_owned()
                             }
+                            AuthLoginStatus::Unknown => {
+                                "Sign-in outcome unknown. Complete sign-in with the vendor."
+                                    .to_owned()
+                            }
                         },
                         error: false,
                     },

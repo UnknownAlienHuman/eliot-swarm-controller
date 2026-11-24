@@ -84,14 +84,12 @@ impl Router {
                 .await
                 .map_err(|_| Error::new("internal", "could not observe sign-in consoles"))?
             };
-            self.inner
-                .store
-                .lock()
-                .await
-                .recover_harness_logins(now, |console| {
-                    gone.iter()
-                        .any(|old| old.pid == console.pid && old.start_time == console.start_time)
-                })?;
+            let mut store = self.inner.store.lock().await;
+            let events = store.recover_harness_logins(now, |console| {
+                gone.iter()
+                    .any(|old| old.pid == console.pid && old.start_time == console.start_time)
+            })?;
+            self.publish_locked(&events);
         }
         Ok(())
     }

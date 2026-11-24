@@ -43,6 +43,46 @@ impl Store {
         tx.commit().map_err(sql_error)
     }
 
+    pub(super) fn migrate_auth_login_unknown(&mut self, version: i64) -> Result<()> {
+        let tx = self.connection.transaction().map_err(sql_error)?;
+        tx.execute_batch(
+            "CREATE TABLE harness_auth_next (
+                harness TEXT PRIMARY KEY,
+                revision TEXT NOT NULL,
+                phase TEXT NOT NULL CHECK (phase IN
+                    ('queued', 'claimed', 'open', 'closed', 'failed', 'unsupported', 'unknown')),
+                first_seen INTEGER NOT NULL,
+                attempt TEXT,
+                claim_until INTEGER NOT NULL DEFAULT 0,
+                console_pid INTEGER,
+                console_start INTEGER,
+                recovered INTEGER NOT NULL DEFAULT 0,
+                retry_at INTEGER NOT NULL DEFAULT 0,
+                signed_out INTEGER NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO harness_auth_next SELECT * FROM harness_auth;
+             CREATE TABLE harness_auth_holds_next (
+                harness TEXT NOT NULL REFERENCES harness_auth_next(harness),
+                scope TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY(harness, scope)
+             );
+             INSERT INTO harness_auth_holds_next SELECT * FROM harness_auth_holds;
+             DROP TABLE harness_auth_holds;
+             DROP TABLE harness_auth;
+             ALTER TABLE harness_auth_next RENAME TO harness_auth;
+             ALTER TABLE harness_auth_holds_next RENAME TO harness_auth_holds;",
+        )
+        .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [version],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
+    }
+
     pub fn request_harness_login(
         &mut self,
         harness: &str,
@@ -72,6 +112,7 @@ impl Store {
                 }
                 let status = match previous {
                     Some((_, phase, _, _)) if phase == "open" => AuthLoginStatus::Open,
+                    Some((_, phase, _, false)) if phase == "unknown" => AuthLoginStatus::Unknown,
                     Some((_, phase, _, _)) if matches!(phase.as_str(), "claimed" | "queued") => {
                         AuthLoginStatus::Queued
                     }
@@ -200,24 +241,25 @@ impl Store {
         &mut self,
         now: i64,
         mut console_gone: impl FnMut(AuthConsoleIdentity) -> bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self.connection.transaction().map_err(sql_error)?;
             let expired = {
                 let mut statement = tx
                     .prepare_cached(
-                        "SELECT harness, resolved, console_pid, console_start FROM harness_auth
+                        "SELECT harness, phase, resolved, console_pid, console_start FROM harness_auth
                      WHERE phase='open' OR (phase='claimed' AND claim_until<=?1)",
                     )
                     .map_err(sql_error)?;
                 let rows = statement
                     .query_map([now], |row| {
-                        let pid: Option<u32> = row.get(2)?;
-                        let start_time: Option<i64> = row.get(3)?;
+                        let pid: Option<u32> = row.get(3)?;
+                        let start_time: Option<i64> = row.get(4)?;
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, bool>(1)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, bool>(2)?,
                             pid.zip(start_time)
                                 .map(|(pid, start_time)| AuthConsoleIdentity { pid, start_time }),
                         ))
@@ -226,8 +268,30 @@ impl Store {
                 rows.collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(sql_error)?
             };
-            for (harness, resolved, console) in expired {
+            let mut events = Vec::new();
+            for (harness, phase, resolved, console) in expired {
                 if console.is_some_and(|identity| !console_gone(identity)) {
+                    continue;
+                }
+                if !resolved && phase == "claimed" && console.is_some() {
+                    // A recorded preparation can have resumed before the desktop
+                    // reported Open. Process exit alone cannot settle that effect.
+                    tx.execute(
+                        "UPDATE harness_auth SET phase='unknown', recovered=1, claim_until=0,
+                             retry_at=0 WHERE harness=?1",
+                        [&harness],
+                    )
+                    .map_err(sql_error)?;
+                    events.push(insert_daemon_event(
+                        &tx,
+                        now,
+                        "x.user.notify",
+                        "user",
+                        None,
+                        None,
+                        json!({"title": "Harness sign-in outcome unknown", "message":
+                            format!("The {harness} sign-in process exited before Swarm could confirm it opened. Swarm is waiting for verified vendor sign-in.")}),
+                    )?);
                     continue;
                 }
                 let requeue = !resolved && console.is_none();
@@ -239,7 +303,8 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             }
-            commit_transaction(tx, &self.write_faulted)
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(events)
         })();
         self.fault_on_persistence_error(&result);
         result
@@ -465,12 +530,15 @@ pub(super) fn project_harness_auth(
             "queued" if recovered => "A sign-in claim expired. Swarm queued it again.",
             "queued" => "Swarm is waiting for the interactive desktop to handle sign-in.",
             "claimed" => "Swarm is waiting for the desktop to confirm the sign-in window.",
+            "unknown" => {
+                "The sign-in process exited before Swarm could confirm it opened. Complete sign-in with the vendor to clear this item."
+            }
             "closed" if recovered => "The previous sign-in console process exited.",
             "closed" => "The sign-in window closed. Swarm is checking the vendor sign-in status.",
             "failed" => "The desktop could not open the vendor sign-in window.",
             _ => "This installation has no supported interactive vendor sign-in command.",
         };
-        let choices = (phase != "unsupported")
+        let choices = (!matches!(phase.as_str(), "unsupported" | "unknown"))
             .then(|| OwnerAction {
                 choice: "sign_in".to_owned(),
                 method: "auth.login".to_owned(),
@@ -483,7 +551,9 @@ pub(super) fn project_harness_auth(
             subject: harness,
             revision,
             age_ms: now.saturating_sub(first_seen),
-            reason: if signed_out {
+            reason: if phase == "unknown" {
+                "auth_attempt_unknown"
+            } else if signed_out {
                 "auth_required"
             } else {
                 "auth_requested"
