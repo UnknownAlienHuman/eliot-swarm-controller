@@ -101,14 +101,7 @@ impl Store {
             ));
         }
         let (fleet, coverage) = read_fleet(&tx, limits)?;
-        let event_watermark = tx
-            .query_row(
-                "SELECT MAX(COALESCE((SELECT MAX(seq) FROM events), 0),
-                        COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0))",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)?;
+        let event_watermark = event_high_water(&tx)?;
         let mut response = ProjectOverviewResponse {
             as_of,
             event_watermark,

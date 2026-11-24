@@ -1784,12 +1784,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
 
         if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
@@ -1943,12 +1938,7 @@ impl Router {
             linked_command,
             ..
         } = admission;
-        if command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(command.id.clone());
-        }
+        self.note_unknown_command(&command);
         self.signal_progress();
         self.adjust_command_for_read(&mut command);
         serde_json::to_value(submit_result(&command, linked_command.as_ref()))
@@ -2016,12 +2006,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new {
             self.schedule_command(admission.command.id.clone(), None);
         }
@@ -2054,12 +2039,7 @@ impl Router {
             return Ok(None);
         };
         self.note_unknown(&admission.events);
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         self.signal_progress();
         serde_json::to_value(submit_result(
             &admission.command,
@@ -2082,11 +2062,7 @@ impl Router {
     ) -> Result<PreparedSubmission> {
         if request.verb != "git.integrate"
             || request.selector.is_some()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
+            || request.has_agent_bindings()
         {
             return Err(Error::new(
                 "invalid",
@@ -2300,12 +2276,7 @@ impl Router {
                 return Err(error);
             }
         };
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new {
             self.schedule_command(admission.command.id.clone(), None);
         }
@@ -2359,12 +2330,7 @@ impl Router {
             }
         };
         let admission = submitted?;
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         if admission.is_new && command_needs_worker(&admission.command) {
             self.schedule_admission(&admission);
         }
@@ -2391,12 +2357,7 @@ impl Router {
             return Ok(None);
         };
         self.note_unknown(&admission.events);
-        if admission.command.state == CommandState::Unknown {
-            self.inner
-                .unknown_commands
-                .lock_recover()
-                .insert(admission.command.id.clone());
-        }
+        self.note_unknown_command(&admission.command);
         self.signal_progress();
         serde_json::to_value(submit_result(
             &admission.command,
@@ -2460,13 +2421,7 @@ impl Router {
         principal: &Principal,
         expected_registration: Option<&ProjectRegistrationView>,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "git.fetch"
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "git.fetch" || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "git.fetch must be targetless and have no Agent or request bindings",
@@ -2555,13 +2510,7 @@ impl Router {
         principal: &Principal,
         expected_registration: Option<&ProjectRegistrationView>,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "git.publish"
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "git.publish" || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "git.publish must be a targetless project-check action",
@@ -2769,14 +2718,7 @@ impl Router {
         mut request: SubmitCommand,
         context: FrozenScriptContext,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "run"
-            || !request.id.is_empty()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "run" || !request.id.is_empty() || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "Owner event Run must be targetless and unbound",
@@ -2808,11 +2750,7 @@ impl Router {
     ) -> Result<PreparedSubmission> {
         if request.verb != "run"
             || !request.id.is_empty()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
+            || request.has_agent_bindings()
             || context.timer().is_none()
         {
             return Err(Error::new(
@@ -7306,6 +7244,16 @@ impl Router {
     fn publish_locked(&self, events: &[Event]) {
         self.inner.bus.publish(events);
         self.note_unknown(events);
+    }
+
+    /// Remember a durable Unknown observed during admission or readback.
+    fn note_unknown_command(&self, command: &Command) {
+        if command.state == CommandState::Unknown {
+            self.inner
+                .unknown_commands
+                .lock_recover()
+                .insert(command.id.clone());
+        }
     }
 
     pub(crate) fn note_unknown(&self, events: &[Event]) {

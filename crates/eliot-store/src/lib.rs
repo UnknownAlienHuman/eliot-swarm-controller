@@ -239,7 +239,7 @@ pub use harness_checks::{HarnessCheckFailure, HarnessCheckRow};
 mod hierarchy;
 pub mod inference;
 mod lifecycle;
-pub use lifecycle::UserEventDispatch;
+pub use lifecycle::{PreparedRuleCoordination, RuleCoordinationDispatch, UserEventDispatch};
 mod native_children;
 pub mod overview;
 mod reparent;
@@ -327,6 +327,19 @@ fn validate_remote_command_context(
         }
     }
     Ok(())
+}
+
+/// Event sequence stays monotonic when retained event rows are pruned.
+fn event_high_water(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT MAX(
+             COALESCE((SELECT MAX(seq) FROM events), 0),
+             COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
@@ -2645,16 +2658,7 @@ impl Store {
     }
 
     pub fn high_water(&self) -> Result<i64> {
-        self.connection
-            .query_row(
-                "SELECT MAX(
-                     COALESCE((SELECT MAX(seq) FROM events), 0),
-                     COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
+        event_high_water(&self.connection)
     }
 
     /// On daemon restart, stop proven exited idle generations, fence remaining
