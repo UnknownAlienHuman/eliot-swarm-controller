@@ -314,6 +314,7 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
         next: None,
         fetched_at_ms: reply.fetched_at_ms,
         ttl_ms: reply.ttl_ms,
+        stale: reply.stale,
         failures: Vec::new(),
     }
 }

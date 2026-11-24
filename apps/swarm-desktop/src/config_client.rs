@@ -244,6 +244,7 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
                 whole.models.extend(page.models);
                 // Every page repeats the aggregate's failed harnesses.
                 whole.failures = page.failures;
+                whole.stale |= page.stale;
             }
             None => whole = Some(page),
         }

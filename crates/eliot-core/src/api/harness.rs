@@ -886,6 +886,9 @@ pub struct HarnessModelsResponse {
     pub fetched_at_ms: i64,
     /// Freshness bound in milliseconds for this entry.
     pub ttl_ms: u64,
+    /// The catalogue is being served past its freshness bound.
+    #[serde(default)]
+    pub stale: bool,
     /// Nonsecret credential identity the read ran under (an environment
     /// name, integration name or ambient marker; never a secret value).
     pub credential: String,
@@ -1466,13 +1469,15 @@ pub struct ModelsCatalogResponse {
     /// Cursor after the last model on this page; absent at the end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-    /// Milliseconds since the Unix epoch when the aggregate was completed.
+    /// Milliseconds since the Unix epoch of the oldest included catalogue read.
     pub fetched_at_ms: i64,
     /// Freshness bound in milliseconds for the aggregate.
     pub ttl_ms: u64,
-    /// Installed harnesses whose catalogue read failed while this aggregate
-    /// was built (repeated on every page). Such an aggregate is partial: it
-    /// is not cached, so the next call reads the failed harness again.
+    /// The aggregate is being served past its freshness bound.
+    #[serde(default)]
+    pub stale: bool,
+    /// Installed harnesses whose catalogue read failed during refresh
+    /// (repeated on every page).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<ModelsCatalogFailure>,
 }

@@ -487,14 +487,8 @@ impl DesktopApp {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(reply) => {
                 self.launch.catalog_loading = false;
-                // Stale while revalidating: a failed refresh keeps the last
-                // catalogue it read and says why.
-                match (*reply, self.launch.catalog.as_ref()) {
-                    (Err(error), Some(Ok(_))) => {
-                        self.set_status(format!("Models not refreshed: {error}"));
-                    }
-                    (reply, _) => self.launch.catalog = Some(reply),
-                }
+                // The daemon serves stale rows only for the current source.
+                self.launch.catalog = Some(*reply);
                 self.keep_highlight();
             }
             LaunchMsg::CatalogRetry => {

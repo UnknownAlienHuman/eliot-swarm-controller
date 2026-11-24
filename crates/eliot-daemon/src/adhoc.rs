@@ -937,6 +937,12 @@ pub(crate) struct InstallationFingerprint {
     metadata_version: Option<String>,
 }
 
+impl InstallationFingerprint {
+    pub(crate) fn first_program(&self) -> Option<&str> {
+        self.executables.first().map(|key| key.program.as_str())
+    }
+}
+
 /// Check the current installation without starting a native CLI. A ranked
 /// adapter can change its choice when any of its candidates changes.
 pub(crate) fn installation_fingerprint(
@@ -988,6 +994,17 @@ pub(crate) struct VersionKey {
 }
 
 impl VersionKey {
+    pub(crate) fn for_reader(program: &str, harness: &str) -> Option<Self> {
+        Self::read(&resolve_native_executable(program, harness).ok()?, None)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        let Ok(metadata) = Path::new(&self.program).metadata() else {
+            return false;
+        };
+        self.modified == metadata.modified().ok() && self.size == metadata.len()
+    }
+
     pub(crate) fn read(program: &str, verify: Option<&InstallDiscovery>) -> Option<Self> {
         let metadata = Path::new(program).metadata().ok()?;
         Some(Self {
