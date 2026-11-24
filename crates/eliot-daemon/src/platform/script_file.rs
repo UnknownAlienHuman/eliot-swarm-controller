@@ -414,7 +414,15 @@ impl CleanupTree {
         }
         let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
         let name = path.file_name().ok_or_else(refused)?;
-        let root = native::open_cleanup(parent.handle(), name, true).map_err(|_| refused())?;
+        let root = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+            {
+                Error::new("busy", "artifact root has a conflicting Windows handle")
+            } else {
+                refused()
+            }
+        })?;
         check(&root, true)?;
         let identity = serde_json::to_string(&eliot_plugin::file_identity(&root).map_err(io)?)
             .map_err(|_| refused())?;
@@ -732,6 +740,11 @@ mod native {
             )
         };
         if status < 0 {
+            if status == windows_sys::Win32::Foundation::STATUS_SHARING_VIOLATION {
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32,
+                ));
+            }
             return Err(io::Error::other(format!("NtCreateFile status {status:#x}")));
         }
         Ok(unsafe { File::from_raw_handle(handle) })

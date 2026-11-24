@@ -31,9 +31,20 @@ enum CleanupApplyMode<'a> {
 #[cfg(windows)]
 async fn open_cleanup_tree(path: PathBuf, budget: Duration) -> Result<CleanupTree> {
     let deadline = std::time::Instant::now() + budget;
-    tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline))
-        .await
-        .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?
+    let retry_until = Instant::now() + budget.min(Duration::from_secs(2));
+    loop {
+        let path = path.clone();
+        let result = tokio::task::spawn_blocking(move || CleanupTree::open(&path, deadline))
+            .await
+            .map_err(|_| Error::new("internal", "cleanup scan worker did not settle"))?;
+        if !result.as_ref().is_err_and(|error| error.code == "busy")
+            || Instant::now() >= retry_until
+        {
+            return result;
+        }
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(100)).min(retry_until))
+            .await;
+    }
 }
 
 #[expect(
