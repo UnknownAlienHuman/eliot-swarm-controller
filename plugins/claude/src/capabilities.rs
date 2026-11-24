@@ -1,6 +1,9 @@
 //! Claude native adapter capability declaration.
 
-use eliot_core::api::harness::{NativeAccessBounds, UserInstructionFiles};
+use eliot_core::api::harness::{
+    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+};
+use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::api::{
     ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
 };
@@ -8,6 +11,12 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        adhoc_launch: Some(AdhocLaunchDefaults {
+            permissions: adhoc_permissions,
+            mcp: eliot_core::McpPolicy::Minimal,
+            pass_env: &["CLAUDE_CONFIG_DIR"],
+            installed_profile_mcp: eliot_core::McpPolicy::Minimal,
+        }),
         documentation_section: Some("docs/harnesses/claude-code.md#sources-and-unresolved-facts"),
         configure_effort_refusal: Some(
             "Claude effort applies only at launch and cannot change mid-session (launch_only)",
@@ -35,6 +44,29 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         ..HarnessCapabilities::default()
     }
+}
+
+fn adhoc_permissions(
+    snapshot: &mut serde_json::Map<String, Value>,
+    access: Option<AdhocAccess>,
+) -> eliot_core::Result<()> {
+    snapshot.insert(
+        "permissions".to_owned(),
+        Value::from(CodexPermissions::default().as_str()),
+    );
+    snapshot.insert(
+        "approval_policy".to_owned(),
+        Value::from(CodexApprovalPolicy::default().as_str()),
+    );
+    if let Some(access) = access {
+        let mode = match access {
+            AdhocAccess::Ask => "manual",
+            AdhocAccess::Auto => "auto",
+            AdhocAccess::Full => "bypassPermissions",
+        };
+        snapshot.insert("permission_mode".to_owned(), Value::from(mode));
+    }
+    Ok(())
 }
 
 fn project_instruction_read(

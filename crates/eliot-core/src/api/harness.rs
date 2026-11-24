@@ -66,9 +66,53 @@ pub struct UserInstructionFiles {
     pub paths: &'static [&'static str],
 }
 
+/// Access levels accepted by an Owner's ad-hoc launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdhocAccess {
+    Ask,
+    Auto,
+    Full,
+}
+
+impl AdhocAccess {
+    pub fn parse(access: &str) -> Result<Self> {
+        match access.trim() {
+            "ask" => Ok(Self::Ask),
+            "auto" => Ok(Self::Auto),
+            "full" => Ok(Self::Full),
+            _ => Err(Error::new(
+                "invalid",
+                "ad-hoc access must be ask, auto or full",
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Full => "full",
+        }
+    }
+}
+
+type AdhocPermissions =
+    fn(&mut serde_json::Map<String, serde_json::Value>, Option<AdhocAccess>) -> Result<()>;
+
+/// Defaults the native adapter can enforce for a launch without a saved profile.
+#[derive(Clone, Copy, Debug)]
+pub struct AdhocLaunchDefaults {
+    pub permissions: AdhocPermissions,
+    pub mcp: crate::McpPolicy,
+    pub pass_env: &'static [&'static str],
+    pub installed_profile_mcp: crate::McpPolicy,
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
+    /// How to freeze a launch without a saved profile and seed its installed preset.
+    pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// Translates native permission selectors for cross-harness handoff.
     pub native_access_bounds: Option<NativeAccessReader>,
     /// Workspace-write sessions need extra Git metadata roots to commit.

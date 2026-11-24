@@ -149,6 +149,8 @@ verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
 Adapters declare their project instruction-file behavior and the user instruction
 paths that doctor compares with committed owner rules.
+They also declare ad-hoc access mappings and the MCP and environment defaults
+used by ad-hoc launches and installed profile presets.
 
 ## Host requests
 

@@ -1,12 +1,19 @@
 //! Muse native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::NativeAccessBounds;
+use eliot_core::api::harness::{AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds};
+use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        adhoc_launch: Some(AdhocLaunchDefaults {
+            permissions: adhoc_permissions,
+            mcp: eliot_core::McpPolicy::Inherit,
+            pass_env: &[],
+            installed_profile_mcp: eliot_core::McpPolicy::Inherit,
+        }),
         documentation_section: Some("docs/harnesses/muse.md#usage-attribution"),
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
@@ -40,6 +47,31 @@ pub fn declaration() -> HarnessCapabilities {
         session_input_includes_cache_reads: true,
         ..HarnessCapabilities::default()
     }
+}
+
+fn adhoc_permissions(
+    snapshot: &mut serde_json::Map<String, Value>,
+    access: Option<AdhocAccess>,
+) -> eliot_core::Result<()> {
+    let permissions = match access {
+        Some(AdhocAccess::Full) => CodexPermissions::DangerFullAccess,
+        Some(AdhocAccess::Ask | AdhocAccess::Auto) => CodexPermissions::WorkspaceWrite,
+        None => CodexPermissions::default(),
+    };
+    snapshot.insert("permissions".to_owned(), Value::from(permissions.as_str()));
+    snapshot.insert(
+        "approval_policy".to_owned(),
+        Value::from(CodexApprovalPolicy::default().as_str()),
+    );
+    if let Some(access) = access {
+        let approval = match access {
+            AdhocAccess::Ask => "onRequest",
+            AdhocAccess::Auto => "promptUnmatched",
+            AdhocAccess::Full => "allowAll",
+        };
+        snapshot.insert("approval".to_owned(), Value::from(approval));
+    }
+    Ok(())
 }
 
 fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {

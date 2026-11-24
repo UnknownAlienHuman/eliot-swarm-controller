@@ -13,7 +13,7 @@
 //! default at start and reports the effective value through its existing
 //! readback; no substitution is ever made for an unavailable requested model.
 
-use core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
+use core::api::harness::{AdhocAccess, HarnessCapabilities};
 use eliot_core as core;
 use eliot_plugin::install::{
     InstallDiscovery, InstallStrategy, cli_identity_matches, discovery_for, find_on_path,
@@ -178,127 +178,6 @@ fn validate_adhoc_effort(harness: &str, effort: &str) -> core::Result<String> {
     Ok(trimmed.to_owned())
 }
 
-/// Ad-hoc access levels for Owner launch: `ask` routes every tool or
-/// permission request to the Owner through the existing pending-request
-/// path (`swarm approve`/`deny`); `auto` lets the harness apply its safe
-/// automatic posture; `full` selects the harness's full-access posture,
-/// exactly the current full-access profiles. Documented in
-/// `docs/spec/configuration.md` (access mapping) and per harness in
-/// `docs/harnesses/*.md`.
-pub(crate) const ADHOC_ACCESS_LEVELS: &[&str] = &["ask", "auto", "full"];
-
-pub(crate) fn validate_adhoc_access(access: &str) -> core::Result<String> {
-    let trimmed = access.trim();
-    if ADHOC_ACCESS_LEVELS.contains(&trimmed) {
-        Ok(trimmed.to_owned())
-    } else {
-        Err(core::Error::new(
-            "invalid",
-            "ad-hoc access must be ask, auto or full",
-        ))
-    }
-}
-
-/// Freeze the native permission result for one access level into the ad-hoc
-/// snapshot. The frozen native fields are exactly the profile fields a
-/// stored full-access profile uses, so launch-time effective settings report
-/// the same values. `ask` always routes approvals through the existing
-/// pending-request path; levels a harness cannot express refuse with a typed
-/// `unsupported` instead of silently weakening.
-fn apply_adhoc_access(
-    snapshot: &mut Map<String, Value>,
-    harness: &str,
-    access: &str,
-    profile_name: &str,
-) -> core::Result<()> {
-    snapshot.insert("access".to_owned(), Value::String(access.to_owned()));
-    let invalid = || core::Error::new("invalid", "ad-hoc access must be ask, auto or full");
-    let text = |value: &str| Value::String(value.to_owned());
-    match harness {
-        "codex" => {
-            let (permissions, approval_policy) = match access {
-                "ask" => (
-                    CodexPermissions::WorkspaceWrite,
-                    CodexApprovalPolicy::OnRequest,
-                ),
-                "auto" => (CodexPermissions::WorkspaceWrite, CodexApprovalPolicy::Never),
-                "full" => (
-                    CodexPermissions::DangerFullAccess,
-                    CodexApprovalPolicy::Never,
-                ),
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
-            snapshot.insert("approval_policy".to_owned(), text(approval_policy.as_str()));
-            Ok(())
-        }
-        "claude" => {
-            // The frozen `permission_mode` is the CLI `--permission-mode`
-            // argv the Claude plugin pushes; `manual` routes `can_use_tool`
-            // through the pending-request path, `auto` approves safe edits,
-            // `bypassPermissions` is the full-access posture.
-            let mode = match access {
-                "ask" => "manual",
-                "auto" => "auto",
-                "full" => "bypassPermissions",
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("permission_mode".to_owned(), text(mode));
-            Ok(())
-        }
-        "muse" => {
-            let (approval, permissions) = match access {
-                "ask" => ("onRequest", CodexPermissions::WorkspaceWrite),
-                "auto" => ("promptUnmatched", CodexPermissions::WorkspaceWrite),
-                "full" => ("allowAll", CodexPermissions::DangerFullAccess),
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("approval".to_owned(), text(approval));
-            snapshot.insert("permissions".to_owned(), text(permissions.as_str()));
-            Ok(())
-        }
-        "opencode" => match access {
-            // OpenCode exposes no verified distinct native permission knob
-            // today: ask and auto share the native permission-reply surface
-            // (permission requests stay pending for the Owner). `full` has no
-            // full-access profile mapping, so it refuses instead of silently
-            // widening.
-            "ask" | "auto" => Ok(()),
-            "full" => Err(core::Error::new(
-                "unsupported",
-                "the opencode slice has no full-access permission mapping",
-            )),
-            _ => Err(invalid()),
-        },
-        "antigravity" => {
-            // `false` keeps the ACP `session/request_permission` round-trip
-            // that bridges to `swarm approve`/`deny`; `true` is the
-            // full-access skip flag.
-            let skip = match access {
-                "ask" | "auto" => false,
-                "full" => true,
-                _ => return Err(invalid()),
-            };
-            snapshot.insert("dangerously_skip_permissions".to_owned(), Value::Bool(skip));
-            Ok(())
-        }
-        _ => Err(core::Error::new(
-            "unsupported",
-            format!("unsupported launch harness {harness}"),
-        )),
-    }
-    .map_err(|error| {
-        if error.code == "invalid" {
-            error
-        } else {
-            core::Error::new(
-                error.code.clone(),
-                format!("ad-hoc {profile_name}: {}", error.message),
-            )
-        }
-    })
-}
-
 /// Longest accepted ad-hoc auth selector, in bytes. Mirrors the plugin's
 /// `IntegrationSelector` rule so the frozen value always passes the
 /// profile-side check.
@@ -396,7 +275,7 @@ pub(crate) fn adhoc_snapshot(
 
     let access = access
         .filter(|value| !value.trim().is_empty())
-        .map(validate_adhoc_access)
+        .map(AdhocAccess::parse)
         .transpose()?;
     if catalogue_only && access.is_some() {
         return Err(core::Error::new(
@@ -488,10 +367,6 @@ pub(crate) fn adhoc_snapshot(
                 ));
             }
             snapshot.insert("cmd".to_owned(), Value::String(validated));
-            snapshot.insert(
-                "dangerously_skip_permissions".to_owned(),
-                Value::Bool(false),
-            );
         }
         _ => {
             return Err(core::Error::new(
@@ -506,29 +381,24 @@ pub(crate) fn adhoc_snapshot(
     if let Some(effort) = effort {
         snapshot.insert("effort".to_owned(), Value::String(effort));
     }
-    if matches!(harness.as_str(), "codex" | "claude" | "muse") {
-        snapshot.insert(
-            "permissions".to_owned(),
-            Value::String(CodexPermissions::default().as_str().to_owned()),
-        );
-        snapshot.insert(
-            "approval_policy".to_owned(),
-            Value::String(CodexApprovalPolicy::default().as_str().to_owned()),
-        );
+    let defaults = HarnessCapabilities::of(&harness)
+        .adhoc_launch
+        .ok_or_else(|| {
+            core::Error::new(
+                "unsupported",
+                format!("unsupported launch harness {harness}"),
+            )
+        })?;
+    if let Some(access) = access {
+        snapshot.insert("access".to_owned(), Value::from(access.as_str()));
     }
-    // Access mapping overwrites the safe defaults above with the exact
-    // native permission result for the requested level, freezing both the
-    // level and its native fields. Omitted access keeps the safe defaults.
-    if let Some(access) = access.as_deref() {
-        apply_adhoc_access(&mut snapshot, &harness, access, &profile_name)?;
-    }
-    // Claude can enforce the same isolated MCP policy as a saved profile.
-    let mcp = if harness == "claude" {
-        "minimal"
-    } else {
-        "inherit"
-    };
-    snapshot.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
+    (defaults.permissions)(&mut snapshot, access).map_err(|error| {
+        core::Error::new(
+            error.code.clone(),
+            format!("ad-hoc {profile_name}: {}", error.message),
+        )
+    })?;
+    snapshot.insert("mcp".to_owned(), Value::from(defaults.mcp.as_str()));
     snapshot.insert("mcp_allow".to_owned(), Value::Array(Vec::new()));
     snapshot.insert("child_profiles".to_owned(), Value::Array(Vec::new()));
     let native_subagents = crate::config::native_subagents_default(&harness).ok_or_else(|| {
@@ -541,12 +411,7 @@ pub(crate) fn adhoc_snapshot(
         "native_subagents".to_owned(),
         Value::String(native_subagents.to_owned()),
     );
-    let pass_env = if harness == "claude" {
-        json!(["CLAUDE_CONFIG_DIR"])
-    } else {
-        json!([])
-    };
-    snapshot.insert("pass_env".to_owned(), pass_env);
+    snapshot.insert("pass_env".to_owned(), json!(defaults.pass_env));
     snapshot.insert("scratch".to_owned(), json!(["target/", "node_modules/"]));
     snapshot.insert(
         "capacity_scopes".to_owned(),

@@ -369,16 +369,13 @@ fn installed_default_profiles(deadline: std::time::Instant) -> serde_json::Map<S
         }
         let mut profile = serde_json::Map::new();
         profile.insert("harness".to_owned(), Value::String((*harness).to_owned()));
-        // Explicit worker MCP policy per harness: the new default is
-        // `minimal` wherever the harness implements an isolation mechanism
-        // (Codex, Claude, OpenCode all serve only the Agent-scoped server);
-        // Muse and Antigravity keep an explicit `inherit` opt-in because no
-        // verified isolation mechanism exists for them.
-        let mcp = match *harness {
-            "muse" | "antigravity" => "inherit",
-            _ => "minimal",
+        let Some(defaults) = HarnessCapabilities::of(harness).adhoc_launch else {
+            continue;
         };
-        profile.insert("mcp".to_owned(), Value::String(mcp.to_owned()));
+        profile.insert(
+            "mcp".to_owned(),
+            Value::from(defaults.installed_profile_mcp.as_str()),
+        );
         profiles.insert((*harness).to_owned(), Value::Object(profile));
     }
     profiles

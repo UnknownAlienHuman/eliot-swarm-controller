@@ -8324,7 +8324,7 @@ fn normalize_launch(request: &mut SubmitCommand, principal: &Principal) -> Resul
             }
         }
         if let Some(access) = args.get("access").and_then(Value::as_str) {
-            crate::adhoc::validate_adhoc_access(access)?;
+            eliot_core::api::harness::AdhocAccess::parse(access)?;
         }
     } else {
         for field in ["model", "effort", "auth", "access"] {

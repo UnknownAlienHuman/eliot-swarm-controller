@@ -1,12 +1,26 @@
 //! Opencode native adapter capability declaration.
 
-use eliot_core::api::harness::UserInstructionFiles;
+use eliot_core::api::harness::{AdhocAccess, AdhocLaunchDefaults, UserInstructionFiles};
 use eliot_core::api::{
     ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting, InstructionReadStatus,
 };
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        adhoc_launch: Some(AdhocLaunchDefaults {
+            permissions: |_, access| {
+                if access == Some(AdhocAccess::Full) {
+                    return Err(eliot_core::Error::new(
+                        "unsupported",
+                        "the opencode slice has no full-access permission mapping",
+                    ));
+                }
+                Ok(())
+            },
+            mcp: eliot_core::McpPolicy::Inherit,
+            pass_env: &[],
+            installed_profile_mcp: eliot_core::McpPolicy::Minimal,
+        }),
         documentation_section: Some("docs/harnesses/opencode.md#working-profile"),
         // No frozen permission knob or OS sandbox constrains this range.
         native_access_bounds: Some(|_| Some((1, 3))),

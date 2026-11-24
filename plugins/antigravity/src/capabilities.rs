@@ -1,12 +1,26 @@
 //! Antigravity native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::{NativeAccessBounds, UserInstructionFiles};
+use eliot_core::api::harness::{
+    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+};
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        adhoc_launch: Some(AdhocLaunchDefaults {
+            permissions: |snapshot, access| {
+                snapshot.insert(
+                    "dangerously_skip_permissions".to_owned(),
+                    Value::Bool(access == Some(AdhocAccess::Full)),
+                );
+                Ok(())
+            },
+            mcp: eliot_core::McpPolicy::Inherit,
+            pass_env: &[],
+            installed_profile_mcp: eliot_core::McpPolicy::Inherit,
+        }),
         documentation_section: Some("docs/harnesses/antigravity.md#native-identity-and-transport"),
         native_access_bounds: Some(native_access_bounds),
         effort: true,

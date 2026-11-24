@@ -1,15 +1,24 @@
 //! Codex native adapter capability declaration.
 
 use eliot_core::InjectPoint;
-use eliot_core::api::harness::{NativeAccessBounds, UserInstructionFiles};
+use eliot_core::api::harness::{
+    AdhocAccess, AdhocLaunchDefaults, NativeAccessBounds, UserInstructionFiles,
+};
 use eliot_core::api::native_profile::{
-    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override,
+    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, CodexApprovalPolicy, CodexPermissions,
+    codex_project_doc_override,
 };
 use eliot_core::api::{HarnessCapabilities, InputTokenAccounting, InstructionReadStatus};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        adhoc_launch: Some(AdhocLaunchDefaults {
+            permissions: adhoc_permissions,
+            mcp: eliot_core::McpPolicy::Inherit,
+            pass_env: &[],
+            installed_profile_mcp: eliot_core::McpPolicy::Minimal,
+        }),
         documentation_section: Some("docs/harnesses/codex.md#sources"),
         native_access_bounds: Some(native_access_bounds),
         workspace_write_commit_roots: true,
@@ -41,6 +50,27 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
         ..HarnessCapabilities::default()
     }
+}
+
+fn adhoc_permissions(
+    snapshot: &mut serde_json::Map<String, Value>,
+    access: Option<AdhocAccess>,
+) -> eliot_core::Result<()> {
+    let (permissions, approval) = match access {
+        Some(AdhocAccess::Ask) => (
+            CodexPermissions::WorkspaceWrite,
+            CodexApprovalPolicy::OnRequest,
+        ),
+        Some(AdhocAccess::Auto) => (CodexPermissions::WorkspaceWrite, CodexApprovalPolicy::Never),
+        Some(AdhocAccess::Full) => (
+            CodexPermissions::DangerFullAccess,
+            CodexApprovalPolicy::Never,
+        ),
+        None => (CodexPermissions::default(), CodexApprovalPolicy::default()),
+    };
+    snapshot.insert("permissions".to_owned(), Value::from(permissions.as_str()));
+    snapshot.insert("approval_policy".to_owned(), Value::from(approval.as_str()));
+    Ok(())
 }
 
 fn project_instruction_read(
