@@ -346,6 +346,8 @@ fn check_files(
     let mut unverified_entry_point = false;
     let legacy_argv = version == PREVIOUS_CHECK_IDENTITY_VERSION;
     if let Some((program, args)) = definition.check.split_first() {
+        // Version 3 resolves the original argv[0] as a path relative to the
+        // check directory. The operand loop preserves that lookup on replay.
         if legacy_argv || !program::is_bare_program(program) {
             operands.push(PathBuf::from(program));
         }
@@ -606,12 +608,14 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String], legacy_argv: bool) -
             }
             option
                 if name == "perl"
-                    && option.starts_with('-')
-                    && option[1..].chars().all(|flag| {
-                        matches!(
-                            flag,
-                            'w' | 'W' | 'T' | 't' | 'U' | 'n' | 'p' | 'a' | 'l' | '0'..='9'
-                        )
+                    && option.strip_prefix('-').is_some_and(|flags| {
+                        !flags.is_empty()
+                            && flags.chars().all(|flag| {
+                                matches!(
+                                    flag,
+                                    'w' | 'W' | 'T' | 't' | 'U' | 'n' | 'p' | 'a' | 'l' | '0'..='9'
+                                )
+                            })
                     }) => {}
             "-r" | "-B" | "-R" | "-F" | "-E" | "-a" if name == "php" => return Unverified,
             "-n" if name == "php" => {}

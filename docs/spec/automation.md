@@ -1964,7 +1964,8 @@ The persisted identity snapshot is optional and serde-defaulted, so old baseline
 remain readable without a database migration. A version-3 identity baseline uses
 its recorded candidate selection and parser when replayed. A baseline predating
 identity recording continues to use its retained `check_files`, declared
-`check_inputs`, and Git scope; a fresh `set` or launch captures the latest identity
+`check_inputs`, and Git scope. These baselines require a fresh Goal `set` to
+detect checker symlink retargeting. A fresh `set` or launch captures the latest identity
 baseline. An unrecognized identity version or an entry point that cannot be verified
 produces `scope_unverified`. The legacy `check_files` view
 keeps its existing resolved-target list and DTO shape. An exact retry reads the retained result
