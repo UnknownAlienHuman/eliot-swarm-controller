@@ -24,10 +24,12 @@
 //! (arrows, Enter, Esc), light dismiss and placement. Reactor's `MenuItem`
 //! is text only: before the menu opens, `crate::flyout` gives each native
 //! item its glyph (and the danger items the error color) and the menu its
-//! accessible name. A chosen item reports only its label, so the labels of
-//! one menu are unique by construction (fixed command names; no project or
-//! task name is ever an item) and resolve within the menu that was opened.
-//! More is a submenu. "Attach to project…" opens its own chooser, a WinUI
+//! accessible name. Every item, here and in the conversation header's "…",
+//! is a typed [`Action`] with one fixed label; Reactor reports a chosen
+//! item only by that label, the labels are proven distinct at compile time,
+//! and the label maps back to its action, which runs only if the opened
+//! menu offered it. No project or task name is ever an item (the tags item
+//! only shows the current tags). More is a submenu. "Attach to project…" opens its own chooser, a WinUI
 //! `Flyout` at the row ([`DesktopApp::attach_anchor`]) whose rows are keyed
 //! by the project's id and checkout, never by its name. All modal
 //! confirmations use the common M3 body/footer and native focus host in
@@ -80,32 +82,137 @@ impl Target {
     }
 }
 
-/// One menu item's action.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Action {
-    NewTaskHere,
-    OpenFolder,
-    Rename,
-    ToggleCollapse,
-    RemoveProject,
+/// Declares [`Action`] from one list, so every action has exactly one label,
+/// glyph and danger flag, and [`Action::ALL`] lists every variant.
+macro_rules! actions {
+    ($($(#[$doc:meta])* $variant:ident => ($label:expr, $glyph:expr, $danger:expr),)*) => {
+        /// One menu command of a row menu or the conversation header's "…".
+        ///
+        /// Reactor 0.100.0's `Menu` reports a chosen item only by its label
+        /// (its `on_click` is a `Callback<String>`; each native
+        /// `MenuFlyoutItem.Click` enqueues the item's label, never its key),
+        /// so the label is the only payload a menu can carry. Each action
+        /// owns one fixed label, the labels are proven distinct at compile
+        /// time (the assertion below), menus are built from actions and a
+        /// chosen label maps back through [`Action::from_label`]: no label
+        /// can stand for two actions, in any build.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) enum Action {
+            $($(#[$doc])* $variant,)*
+        }
+
+        impl Action {
+            /// Every action, in declaration order.
+            pub(super) const ALL: &'static [Action] = &[$(Action::$variant,)*];
+
+            /// The text a menu shows for it and Reactor reports back.
+            pub(super) const fn label(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $label,)*
+                }
+            }
+
+            /// Its icon in a row menu.
+            pub(super) const fn glyph(self) -> &'static str {
+                match self {
+                    $(Action::$variant => $glyph,)*
+                }
+            }
+
+            /// Deletes, removes or forces (the error color; a row menu ends
+            /// with it).
+            pub(super) const fn danger(self) -> bool {
+                match self {
+                    $(Action::$variant => $danger,)*
+                }
+            }
+        }
+    };
+}
+
+actions! {
+    NewTaskHere => ("New task here", m3::glyph::NEW_TASK, false),
+    OpenFolder => ("Open folder", m3::glyph::OPEN_FOLDER, false),
+    Rename => ("Rename", m3::glyph::RENAME, false),
+    /// Expand a collapsed project.
+    Expand => ("Expand", m3::glyph::CHEVRON_DOWN, false),
+    /// Collapse a project.
+    Collapse => ("Collapse", m3::glyph::CHEVRON_RIGHT, false),
     /// Archive every finished task of the project or subproject.
-    ArchiveFinished,
+    ArchiveFinished => ("Archive finished tasks…", m3::glyph::ARCHIVE, false),
     /// Delete every stopped task of the project or subproject.
-    DeleteStopped,
-    Stop,
+    DeleteStopped => ("Delete stopped tasks…", m3::glyph::DELETE, true),
+    RemoveProject => ("Remove from Swarm…", m3::glyph::DELETE, true),
     /// "Move under another task…": open the picker.
-    MoveUnder,
-    /// Resume a lost task in its conversation.
-    Resume,
-    Archive(bool),
-    Delete,
-    CopyId,
+    MoveUnder => ("Move under another task…", m3::glyph::MOVE, false),
     /// "Attach to project…": open the project chooser at the row.
-    AttachMenu,
+    AttachMenu => ("Attach to project…", m3::glyph::FOLDER, false),
     /// Return the chat to the no-project bucket.
-    Detach,
-    /// Edit the Agent's tags inline.
-    EditTags,
+    Detach => ("Detach from project", m3::glyph::FOLDER, false),
+    /// Edit the Agent's tags inline (the item shows the current tags).
+    EditTags => ("Tags…", m3::glyph::TAG, false),
+    Archive => ("Archive", m3::glyph::ARCHIVE, false),
+    Unarchive => ("Unarchive", m3::glyph::ARCHIVE, false),
+    /// Resume an ended task in its conversation.
+    Resume => ("Resume", m3::glyph::RESUME, false),
+    Stop => ("Stop", m3::glyph::STOP, false),
+    /// The More submenu (never chosen itself).
+    More => ("More", m3::glyph::MORE, false),
+    Delete => ("Delete…", m3::glyph::DELETE, true),
+    CopyId => ("Copy Agent ID", m3::glyph::COPY, false),
+    /// The conversation header's Agent details.
+    Details => ("Agent details", m3::glyph::INFO, false),
+    /// The conversation header's handoff or switch.
+    Handoff => ("Hand off or switch…", m3::glyph::FORWARD, false),
+    /// Detach Eliot's observer from an observed Agent (header only).
+    DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
+    /// The conversation header's Force stop (it asks first).
+    ForceStop => ("Force stop…", m3::glyph::STOP, true),
+}
+
+/// Whether `a` and `b` hold the same text, in a constant context.
+const fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < a.len() {
+        if a[at] != b[at] {
+            return false;
+        }
+        at += 1;
+    }
+    true
+}
+
+// Compile time: no two actions share a label, so a reported label names
+// exactly one action.
+const _: () = {
+    let all = Action::ALL;
+    let mut first = 0;
+    while first < all.len() {
+        let mut second = first + 1;
+        while second < all.len() {
+            assert!(
+                !same_text(all[first].label(), all[second].label()),
+                "two menu actions share a label"
+            );
+            second += 1;
+        }
+        first += 1;
+    }
+};
+
+impl Action {
+    /// The action whose label Reactor reported, by an exhaustive search of
+    /// [`Action::ALL`].
+    pub(super) fn from_label(label: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|action| action.label() == label)
+    }
 }
 
 /// One item of a row menu: a command, or a submenu of commands.
@@ -113,139 +220,95 @@ pub(super) enum Action {
 pub(super) enum Entry {
     Item {
         action: Action,
-        label: String,
-        glyph: &'static str,
-        /// Deletes or removes (the menu ends with it; the error color).
-        destructive: bool,
+        /// What the item shows in place of its label (Tags lists the
+        /// current tags); display only: the native item's text is replaced
+        /// as the menu opens, and a choice still reports the label.
+        display: Option<String>,
     },
     Submenu {
-        label: String,
-        glyph: &'static str,
+        action: Action,
         items: Vec<Entry>,
     },
 }
 
 impl Entry {
-    fn item(action: Action, label: impl Into<String>, glyph: &'static str) -> Self {
+    pub(super) fn item(action: Action) -> Self {
         Self::Item {
             action,
-            label: label.into(),
-            glyph,
-            destructive: false,
+            display: None,
         }
     }
 
-    fn destructive(action: Action, label: impl Into<String>, glyph: &'static str) -> Self {
-        Self::Item {
-            action,
-            label: label.into(),
-            glyph,
-            destructive: true,
-        }
-    }
-
-    fn label(&self) -> &str {
+    fn action(&self) -> Action {
         match self {
-            Self::Item { label, .. } | Self::Submenu { label, .. } => label,
+            Self::Item { action, .. } | Self::Submenu { action, .. } => *action,
         }
     }
 
     /// Whether it deletes or removes.
     pub(super) fn is_destructive(&self) -> bool {
-        matches!(
-            self,
-            Self::Item {
-                destructive: true,
-                ..
-            }
-        )
+        matches!(self, Self::Item { action, .. } if action.danger())
     }
 
     /// Whether it is the More submenu (the conversation header has its
     /// own).
     pub(super) fn is_more(&self) -> bool {
-        matches!(self, Self::Submenu { label, .. } if label == MORE)
+        matches!(
+            self,
+            Self::Submenu {
+                action: Action::More,
+                ..
+            }
+        )
     }
 }
-
-/// The More submenu's label.
-const MORE: &str = "More";
 
 /// The automation id prefix of a sidebar row's "…" button, followed by the
 /// row's key (`agent:<id>`, `project:<key>`); its menu opens under it.
 pub(super) const MORE_ID_PREFIX: &str = "eliot-more:";
 
-/// Reactor's menu items for `entries`, each keyed by its label (unique in
-/// one menu, see [`debug_assert_unique`]).
+/// Reactor's menu items for `entries`, each keyed and labelled by its
+/// action's label.
 pub(super) fn menu_items(entries: &[Entry]) -> Vec<MenuItem> {
     entries
         .iter()
-        .map(|entry| match entry {
-            Entry::Item { label, .. } => MenuItem::item(label.clone(), label.clone()),
-            Entry::Submenu { label, items, .. } => {
-                MenuItem::submenu(label.clone(), label.clone(), menu_items(items))
+        .map(|entry| {
+            let label = entry.action().label();
+            match entry {
+                Entry::Item { .. } => MenuItem::item(label, label),
+                Entry::Submenu { items, .. } => MenuItem::submenu(label, label, menu_items(items)),
             }
         })
         .collect()
 }
 
-/// The action of the command labelled `label` in the menu `entries`, at
-/// any depth: Reactor reports a chosen item by its label alone, and one
-/// menu never repeats a label.
-pub(super) fn entry_action(entries: &[Entry], label: &str) -> Option<Action> {
-    entries.iter().find_map(|entry| match entry {
-        Entry::Item {
-            action,
-            label: name,
-            ..
-        } => (name == label).then(|| action.clone()),
-        Entry::Submenu { items, .. } => entry_action(items, label),
+/// Whether the menu `entries` offers `action`, at any depth: a choice runs
+/// only in the menu that offered it.
+pub(super) fn offers(entries: &[Entry], action: Action) -> bool {
+    entries.iter().any(|entry| match entry {
+        Entry::Item { action: item, .. } => *item == action,
+        Entry::Submenu { items, .. } => offers(items, action),
     })
 }
 
-/// How each command of `entries` looks natively: its glyph and danger tint,
-/// by label (`crate::flyout::MenuDress`).
+/// How each command of `entries` looks natively: its glyph, danger tint and
+/// display text, by label (`crate::flyout::MenuDress`).
 fn entry_looks(entries: &[Entry], looks: &mut Vec<crate::flyout::MenuLook>) {
     for entry in entries {
-        let (glyph, danger) = match entry {
-            Entry::Item {
-                glyph, destructive, ..
-            } => (*glyph, *destructive),
-            Entry::Submenu { glyph, items, .. } => {
+        let action = entry.action();
+        let display = match entry {
+            Entry::Item { display, .. } => display.clone(),
+            Entry::Submenu { items, .. } => {
                 entry_looks(items, looks);
-                (*glyph, false)
+                None
             }
         };
         looks.push(crate::flyout::MenuLook {
-            label: entry.label().to_owned(),
-            glyph,
-            danger,
+            label: action.label(),
+            display,
+            glyph: action.glyph(),
+            danger: action.danger(),
         });
-    }
-}
-
-/// Debug builds check that one menu's labels, at every depth, are unique:
-/// a chosen item is told apart only by its label.
-pub(super) fn debug_assert_unique(items: &[MenuItem]) {
-    if cfg!(debug_assertions) {
-        fn labels<'a>(items: &'a [MenuItem], into: &mut Vec<&'a str>) {
-            for item in items {
-                match item {
-                    MenuItem::Item { label, .. } => into.push(label),
-                    MenuItem::Submenu { label, items, .. } => {
-                        into.push(label);
-                        labels(items, into);
-                    }
-                    MenuItem::Separator { .. } => {}
-                }
-            }
-        }
-        let mut seen = Vec::new();
-        labels(items, &mut seen);
-        let mut sorted = seen.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        debug_assert_eq!(sorted.len(), seen.len(), "menu labels repeat: {seen:?}");
     }
 }
 
@@ -261,8 +324,9 @@ pub(super) enum MenuMsg {
     /// Show the menu or attach chooser asked for with this epoch once its
     /// render committed (tries left).
     Show(u64, u8),
-    /// A menu item was chosen: its label.
-    Picked(String),
+    /// A menu item was chosen (mapped from the label Reactor reports by
+    /// [`Action::from_label`]).
+    Picked(Action),
     /// A row of the attach chooser was chosen: the project's id and
     /// checkout.
     AttachPicked(String, String),
@@ -466,12 +530,13 @@ impl DesktopApp {
                     Err(error) => crate::startup::note(&format!("row menu not shown: {error}")),
                 }
             }
-            MenuMsg::Picked(label) => {
+            MenuMsg::Picked(action) => {
                 let Some(open) = &self.menu.open else {
                     return;
                 };
                 self.menu.picked = true;
-                if let Some(action) = entry_action(&open.entries, &label) {
+                // Only an action the opened menu offered runs.
+                if offers(&open.entries, action) {
                     let target = open.target.clone();
                     self.menu_action(target, action, context);
                 }
@@ -816,7 +881,7 @@ impl DesktopApp {
         action: Action,
         context: &ComponentContext<Self>,
     ) {
-        match (action.clone(), &target) {
+        match (action, &target) {
             (Action::NewTaskHere, Target::Project { checkout, .. }) => {
                 self.shell_update(ShellMsg::ProjectPicked(checkout.clone()), context);
             }
@@ -829,7 +894,7 @@ impl DesktopApp {
                     self.open_folder(folder);
                 }
             }
-            (Action::ToggleCollapse, Target::Project { key, .. }) => {
+            (Action::Expand | Action::Collapse, Target::Project { key, .. }) => {
                 self.shell_update(ShellMsg::ProjectToggled(key.clone()), context);
             }
             (Action::Rename, _) => {
@@ -892,8 +957,8 @@ impl DesktopApp {
             (Action::Stop, Target::Agent(agent)) => {
                 self.stop_agent(&agent.id, agent.generation, context);
             }
-            (Action::Archive(archived), Target::Agent(agent)) => {
-                self.submit_archive(agent.clone(), archived, false, context);
+            (Action::Archive | Action::Unarchive, Target::Agent(agent)) => {
+                self.submit_archive(agent.clone(), action == Action::Archive, false, context);
             }
             (Action::MoveUnder, Target::Agent(agent)) => {
                 self.move_update(super::move_ui::MoveMsg::Open(agent.clone()), context);
@@ -1061,10 +1126,10 @@ impl DesktopApp {
     }
 
     /// The menu's entries for a target, in order: the destructive one last.
-    /// Every label is a fixed command name (the tags line starts with
-    /// "Tags"), so one menu never repeats a label.
+    /// Every item is an [`Action`] with its fixed label (unique at compile
+    /// time); the tags item only shows the current tags.
     pub(super) fn menu_entries(&self, target: &Target) -> Vec<Entry> {
-        let entries = match target {
+        match target {
             Target::Project {
                 collapsed,
                 checkouts,
@@ -1073,50 +1138,30 @@ impl DesktopApp {
             } => {
                 let mut entries = Vec::new();
                 if self.can_launch_here(checkout) {
-                    entries.push(Entry::item(
-                        Action::NewTaskHere,
-                        "New task here",
-                        m3::glyph::NEW_TASK,
-                    ));
+                    entries.push(Entry::item(Action::NewTaskHere));
                 }
                 entries.extend([
-                    Entry::item(Action::OpenFolder, "Open folder", m3::glyph::OPEN_FOLDER),
-                    Entry::item(Action::Rename, "Rename", m3::glyph::RENAME),
-                    if *collapsed {
-                        Entry::item(Action::ToggleCollapse, "Expand", m3::glyph::CHEVRON_DOWN)
+                    Entry::item(Action::OpenFolder),
+                    Entry::item(Action::Rename),
+                    Entry::item(if *collapsed {
+                        Action::Expand
                     } else {
-                        Entry::item(Action::ToggleCollapse, "Collapse", m3::glyph::CHEVRON_RIGHT)
-                    },
-                    Entry::item(
-                        Action::ArchiveFinished,
-                        "Archive finished tasks…",
-                        m3::glyph::ARCHIVE,
-                    ),
-                    Entry::destructive(
-                        Action::DeleteStopped,
-                        "Delete stopped tasks…",
-                        m3::glyph::DELETE,
-                    ),
+                        Action::Collapse
+                    }),
+                    Entry::item(Action::ArchiveFinished),
+                    Entry::item(Action::DeleteStopped),
                 ]);
                 // Only a registered checkout can be forgotten.
                 if !self.registrations_in(checkouts).is_empty() {
-                    entries.push(Entry::destructive(
-                        Action::RemoveProject,
-                        "Remove from Swarm…",
-                        m3::glyph::DELETE,
-                    ));
+                    entries.push(Entry::item(Action::RemoveProject));
                 }
                 entries
             }
             Target::Tags(_) => Vec::new(),
             Target::Agent(agent) => {
-                let mut entries = vec![Entry::item(Action::Rename, "Rename", m3::glyph::RENAME)];
+                let mut entries = vec![Entry::item(Action::Rename)];
                 if !agent.native_child {
-                    entries.push(Entry::item(
-                        Action::MoveUnder,
-                        "Move under another task…",
-                        m3::glyph::MOVE,
-                    ));
+                    entries.push(Entry::item(Action::MoveUnder));
                 }
                 // Placement and tags (`chat.attach`/`chat.detach`/`chat.tag`):
                 // attach and detach place chats; tags group any task. The
@@ -1125,36 +1170,24 @@ impl DesktopApp {
                     && !agent.pending
                     && self.nav.organization.registered().next().is_some()
                 {
-                    entries.push(Entry::item(
-                        Action::AttachMenu,
-                        "Attach to project…",
-                        m3::glyph::FOLDER,
-                    ));
+                    entries.push(Entry::item(Action::AttachMenu));
                 }
                 if agent.chat && agent.organization.is_some() {
-                    entries.push(Entry::item(
-                        Action::Detach,
-                        "Detach from project",
-                        m3::glyph::FOLDER,
-                    ));
+                    entries.push(Entry::item(Action::Detach));
                 }
                 if !agent.native_child && !agent.pending {
-                    entries.push(Entry::item(
-                        Action::EditTags,
-                        if agent.tags.is_empty() {
-                            "Tags…".to_owned()
-                        } else {
-                            format!("Tags: {}…", agent.tags.join(", "))
-                        },
-                        m3::glyph::TAG,
-                    ));
+                    entries.push(Entry::Item {
+                        action: Action::EditTags,
+                        display: (!agent.tags.is_empty())
+                            .then(|| format!("Tags: {}…", agent.tags.join(", "))),
+                    });
                 }
                 if !agent.native_child {
-                    entries.push(if agent.archived {
-                        Entry::item(Action::Archive(false), "Unarchive", m3::glyph::ARCHIVE)
+                    entries.push(Entry::item(if agent.archived {
+                        Action::Unarchive
                     } else {
-                        Entry::item(Action::Archive(true), "Archive", m3::glyph::ARCHIVE)
-                    });
+                        Action::Archive
+                    }));
                 }
                 // A lost task cannot be deleted (the Store keeps it):
                 // resume it, or archive it to hide it.
@@ -1165,31 +1198,22 @@ impl DesktopApp {
                         | eliot_core::AgentState::Failed
                 ) && !agent.native_child
                 {
-                    entries.push(Entry::item(Action::Resume, "Resume", m3::glyph::RESUME));
+                    entries.push(Entry::item(Action::Resume));
                 }
                 if agent.live() && !agent.native_child {
-                    entries.push(Entry::item(Action::Stop, "Stop", m3::glyph::STOP));
+                    entries.push(Entry::item(Action::Stop));
                 }
                 entries.push(Entry::Submenu {
-                    label: MORE.to_owned(),
-                    glyph: m3::glyph::MORE,
+                    action: Action::More,
                     items: self.developer_entries(target),
                 });
                 // The destructive action ends the menu.
                 if !agent.native_child && agent.deletable() {
-                    entries.push(Entry::destructive(
-                        Action::Delete,
-                        "Delete…",
-                        m3::glyph::DELETE,
-                    ));
+                    entries.push(Entry::item(Action::Delete));
                 }
                 entries
             }
-        };
-        if cfg!(debug_assertions) {
-            debug_assert_unique(&menu_items(&entries));
         }
-        entries
     }
 
     /// The developer commands of a task (its menu's More): Copy Agent ID
@@ -1198,26 +1222,18 @@ impl DesktopApp {
         let Target::Agent(agent) = target else {
             return Vec::new();
         };
-        let mut entries = vec![Entry::item(
-            Action::CopyId,
-            "Copy Agent ID",
-            m3::glyph::COPY,
-        )];
+        let mut entries = vec![Entry::item(Action::CopyId)];
         // No-project chats have only a private daemon workspace. Other
         // tasks need a real workspace or an absolute legacy project path.
         if agent_folder(agent).is_some() {
-            entries.push(Entry::item(
-                Action::OpenFolder,
-                "Open folder",
-                m3::glyph::OPEN_FOLDER,
-            ));
+            entries.push(Entry::item(Action::OpenFolder));
         }
         entries
     }
 
     pub(super) fn task_dialog(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         if let Some((target, action)) = &self.menu.confirm {
-            return self.confirm_dialog(target, action.clone(), context, palette);
+            return self.confirm_dialog(target, *action, context, palette);
         }
         if let Some(dialog) = &self.menu.moving {
             return self.move_dialog(dialog, context, palette);
@@ -1259,7 +1275,11 @@ impl DesktopApp {
             .vertical_alignment(VerticalAlignment::Top)
             .menu(Menu::new(
                 items,
-                context.callback(|label: String| Message::Menu(MenuMsg::Picked(label))),
+                context.callback(|label: String| {
+                    Action::from_label(&label).map_or(Message::Menu(MenuMsg::Ignored), |action| {
+                        Message::Menu(MenuMsg::Picked(action))
+                    })
+                }),
             ))
     }
 
@@ -1267,9 +1287,9 @@ impl DesktopApp {
     /// row where the chooser opens. While the chooser is open it carries it
     /// as its `Flyout` (`crate::flyout` opens it at the button), one row
     /// per registered project keyed by the project's id and checkout; the
-    /// name is only shown. Enabled only then (a flyout opened at a disabled
-    /// target would disable its content); it is out of the tab order
-    /// otherwise.
+    /// name is only shown ([`AttachRows`]). Enabled only then (a flyout
+    /// opened at a disabled target would disable its content); it is out of
+    /// the tab order otherwise.
     pub(super) fn attach_anchor(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let button = Button::new()
             .automation_id(crate::flyout::ATTACH_ANCHOR)
@@ -1282,47 +1302,15 @@ impl DesktopApp {
         let Some(chooser) = &self.menu.attach else {
             return button.is_enabled(false).into();
         };
-        let title = self.agent_label(&chooser.agent);
-        let rows: Vec<KeyedView> = chooser
-            .choices
-            .iter()
-            .map(|choice| {
-                let path = nav::display_path(&choice.checkout);
-                let current =
-                    chooser.agent.organization.as_deref() == Some(choice.project.as_str());
-                KeyedView::new(
-                    format!("{}\u{1f}{}", choice.project, choice.checkout),
-                    m3::row(palette, false)
-                        .automation_name(format!("{}, {path}", choice.name))
-                        .on_click(context.message(Message::Menu(MenuMsg::AttachPicked(
-                            choice.project.clone(),
-                            choice.checkout.clone(),
-                        ))))
-                        .content(m3::row_content(
-                            Some(m3::glyph::FOLDER),
-                            &choice.name,
-                            &path,
-                            if current {
-                                m3::icon(m3::glyph::CHECK)
-                            } else {
-                                View::empty()
-                            },
-                        )),
-                )
-            })
-            .collect();
-        let content = StackPanel::new()
-            .width(tokens::layout::MENU_WIDTH)
-            .spacing(tokens::spacing::XS)
-            .automation_name(format!("Attach {title} to a project"))
-            .children((
-                m3::secondary("Attach to project")
-                    .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
-                ScrollViewer::new()
-                    .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
-                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                    .content(StackPanel::new().keyed_children(rows)),
-            ));
+        // A component: its rows render again only when the projects, the
+        // chat's placement or the palette change, not on every window render.
+        let content = View::component::<AttachRows>(AttachRowsInput {
+            palette,
+            title: self.agent_label(&chooser.agent),
+            current: chooser.agent.organization.clone(),
+            choices: chooser.choices.clone(),
+            send: context.forward(),
+        });
         button
             .margin(Thickness::new(chooser.x, chooser.y, 0.0, 0.0))
             .flyout_with(
@@ -1440,6 +1428,87 @@ impl DesktopApp {
         self.prefs
             .display_name(&format!("agent:{}", agent.id))
             .map_or_else(|| agent.title.clone(), str::to_owned)
+    }
+}
+
+/// What the attach chooser shows: its rows render again only when this
+/// changes.
+#[derive(Clone, PartialEq)]
+pub(super) struct AttachRowsInput {
+    palette: Palette,
+    /// The chat's name.
+    title: String,
+    /// The project the chat is placed in now.
+    current: Option<String>,
+    choices: Vec<AttachChoice>,
+    send: Callback<Message>,
+}
+
+/// The attach chooser's content: a caption and one row per registered
+/// project, keyed and chosen by the project's id and checkout.
+pub(super) struct AttachRows {
+    send: Callback<Message>,
+}
+
+impl Component for AttachRows {
+    type Input = AttachRowsInput;
+    type Message = Message;
+
+    fn create(input: &AttachRowsInput, _context: &ComponentContext<Self>) -> Self {
+        Self {
+            send: input.send.clone(),
+        }
+    }
+
+    fn input_changed(&mut self, input: &AttachRowsInput, _context: &ComponentContext<Self>) {
+        self.send = input.send.clone();
+    }
+
+    fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
+        let _ = self.send.call(message);
+    }
+
+    fn view(&self, input: &AttachRowsInput, context: &mut ViewContext<Self>) -> View {
+        let palette = input.palette;
+        let rows: Vec<KeyedView> = input
+            .choices
+            .iter()
+            .map(|choice| {
+                let path = nav::display_path(&choice.checkout);
+                let current = input.current.as_deref() == Some(choice.project.as_str());
+                KeyedView::new(
+                    format!("{}\u{1f}{}", choice.project, choice.checkout),
+                    m3::row(palette, false)
+                        .automation_name(format!("{}, {path}", choice.name))
+                        .on_click(context.message(Message::Menu(MenuMsg::AttachPicked(
+                            choice.project.clone(),
+                            choice.checkout.clone(),
+                        ))))
+                        .content(m3::row_content(
+                            Some(m3::glyph::FOLDER),
+                            &choice.name,
+                            &path,
+                            if current {
+                                m3::icon(m3::glyph::CHECK)
+                            } else {
+                                View::empty()
+                            },
+                        )),
+                )
+            })
+            .collect();
+        StackPanel::new()
+            .width(tokens::layout::MENU_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .automation_name(format!("Attach {} to a project", input.title))
+            .children((
+                m3::secondary("Attach to project")
+                    .margin(Thickness::xy(tokens::spacing::INSET, tokens::spacing::XS)),
+                ScrollViewer::new()
+                    .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(StackPanel::new().keyed_children(rows)),
+            ))
     }
 }
 

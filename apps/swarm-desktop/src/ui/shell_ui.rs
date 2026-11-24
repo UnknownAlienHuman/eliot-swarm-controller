@@ -1005,8 +1005,16 @@ impl DesktopApp {
                     // A flyout closed: the open popover or row menu follows
                     // whether or not a dialog is up.
                     Shortcut::FlyoutClosed(epoch) => {
+                        crate::flyout::release();
                         self.launch_update(LaunchMsg::Closed(epoch), context);
                         self.menu_update(MenuMsg::Closed(epoch), context);
+                    }
+                    // Before the dialog arm: the notice shows either way.
+                    Shortcut::Panicked => {
+                        self.alert(
+                            "Something went wrong inside the window and was stopped there. \
+                             Details are in desktop.log; restart Eliot Swarm if it misbehaves.",
+                        );
                     }
                     Shortcut::Popover(key) if self.dialog_kind() != 0 => {
                         self.dialog_key(key, context)

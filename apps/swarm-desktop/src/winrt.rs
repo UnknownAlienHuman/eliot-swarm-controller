@@ -104,22 +104,23 @@ pub(crate) fn delegate<I: Interface<Vtable = DelegateVtbl>>(
 }
 
 /// The `Invoke` slot of [`delegate`]'s vtables. A panic in the callback
-/// (a flyout's `Closed`, a focus or pointer event) stops at this ABI
-/// boundary: unwinding out of an `extern "system"` function aborts the
-/// process, so it is caught and noted in `desktop.log` instead.
+/// stops at this ABI boundary (unwinding out of an `extern "system"`
+/// function aborts the process): it is noted, and the window says so once
+/// (`crate::startup::caught_panic`).
+///
+/// The callback is a plain `fn` and its arguments are raw pointers, so the
+/// closure is unwind safe as it stands, with no `AssertUnwindSafe`. What
+/// the callbacks touch stays consistent after a panic too: the flyout's
+/// `Closed` only reads its registry and enqueues a message; the focus and
+/// pointer events replace one thread-local value whole (a `RefCell`
+/// releases its borrow as it unwinds), count a press or set one native
+/// property.
 unsafe extern "system" fn invoke<I: Interface>(this: Raw, sender: Raw, args: Raw) -> HRESULT {
     // SAFETY: `this` is the box `delegate` allocated for `I`.
     let this = unsafe { &*(this as *const DelegateBox<I, Callback>) };
     let callback = this.invoke;
-    if let Err(panic) =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(sender, args)))
-    {
-        let what = panic
-            .downcast_ref::<&str>()
-            .map(|text| (*text).to_owned())
-            .or_else(|| panic.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "unknown panic".to_owned());
-        crate::startup::note(&format!("a WinUI event handler panicked: {what}"));
+    if let Err(panic) = std::panic::catch_unwind(|| callback(sender, args)) {
+        crate::startup::caught_panic("a WinUI event handler", &*panic);
     }
     HRESULT(0)
 }

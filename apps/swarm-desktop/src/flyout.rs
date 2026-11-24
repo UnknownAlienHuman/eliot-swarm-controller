@@ -13,11 +13,15 @@
 //! - [`hide`] calls `FlyoutBase.Hide`.
 //! - `FlyoutBase.Closed` (light dismiss, Esc, a chosen item, [`hide`])
 //!   reaches the window as `Shortcut::FlyoutClosed` with the epoch the
-//!   flyout was shown with, through the keyboard hook's channel.
+//!   flyout was shown with, through the keyboard hook's channel. The
+//!   handler only enqueues; the window then drops the registrations of
+//!   flyouts that are no longer open ([`release`]), as do [`hide`] and
+//!   every show.
 //! - [`MenuDress`] gives a menu what Reactor's text-only `MenuItem` cannot:
 //!   an accessible name on the `MenuFlyout` (its presenter reads it) and,
 //!   per item, a `FontIcon` with the item's glyph (the implicit `FontIcon`
-//!   style gives it the symbol font) and the danger tint.
+//!   style gives it the symbol font), the danger tint and, where the item
+//!   shows more than its label (the current tags), its display text.
 //!
 //! The button is found by its automation id under the window's content
 //! root (`crate::motion::find`). Reactor replaces a `MenuFlyout` when its
@@ -150,7 +154,9 @@ struct MenuFlyoutItemVtbl {
     base: InspectableSlots,
     /// 6 `get_Text`.
     text: TextGetter,
-    _7_11: [usize; 5],
+    /// 7 `put_Text(String)`.
+    put_text: Setter,
+    _8_11: [usize; 4],
     /// 12 `get_Icon`.
     icon: Getter,
     /// 13 `put_Icon(IconElement)`.
@@ -158,6 +164,7 @@ struct MenuFlyoutItemVtbl {
 }
 const _: () = {
     assert!(offset_of!(MenuFlyoutItemVtbl, text) == 6 * SLOT);
+    assert!(offset_of!(MenuFlyoutItemVtbl, put_text) == 7 * SLOT);
     assert!(offset_of!(MenuFlyoutItemVtbl, icon) == 12 * SLOT);
     assert!(offset_of!(MenuFlyoutItemVtbl, put_icon) == 13 * SLOT);
 };
@@ -393,12 +400,22 @@ pub fn show(anchor: &str, epoch: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// One menu item's look: the item whose text is `label` shows `glyph`, in
-/// the danger color when `danger`.
+/// One menu item's look: the item labelled `label` shows `glyph`, in the
+/// danger color when `danger`, and `display` in place of its label when
+/// given (display only: its click still reports `label`).
 pub struct MenuLook {
-    pub label: String,
+    pub label: &'static str,
+    pub display: Option<String>,
     pub glyph: &'static str,
     pub danger: bool,
+}
+
+impl MenuLook {
+    /// Whether a native item showing `text` is this one (before or after
+    /// its display text replaced the label).
+    fn shows(&self, text: &str) -> bool {
+        self.label == text || self.display.as_deref() == Some(text)
+    }
 }
 
 /// What [`show_menu_at`] gives a menu before it opens.
@@ -452,6 +469,7 @@ pub fn hide(anchor: &str) {
         // does nothing.
         let _ = unsafe { (flyout.vtable().hide)(flyout.as_raw()) };
     }
+    drop_closed(None);
 }
 
 /// Whether `flyout` is open (false when it cannot say).
@@ -517,10 +535,14 @@ fn dress_items(
         // SAFETY: as above.
         let item = unsafe { IInspectable::from_raw(out) };
         if let Ok(item) = item.cast::<IMenuFlyoutItem>() {
-            // SAFETY: slots 6, 12 and 13 of IMenuFlyoutItem are get_Text,
-            // get_Icon and put_Icon.
+            // SAFETY: slots 6, 7, 12 and 13 of IMenuFlyoutItem are
+            // get_Text, put_Text, get_Icon and put_Icon.
             let text = unsafe { text_of(item.as_raw(), item.vtable().text) }?;
-            if let Some(look) = dress.items.iter().find(|look| look.label == text) {
+            if let Some(look) = dress.items.iter().find(|look| look.shows(&text)) {
+                if let Some(display) = look.display.as_deref().filter(|shown| *shown != text) {
+                    let display = HSTRING::from(display);
+                    unsafe { (item.vtable().put_text)(item.as_raw(), abi(&display)) }.ok()?;
+                }
                 let danger = danger.filter(|_| look.danger);
                 if unsafe { get(&item, item.vtable().icon) }.is_err() {
                     let icon = font_icon(look.glyph, danger)?;
@@ -537,7 +559,7 @@ fn dress_items(
             // SAFETY: slots 6, 7, 9 and 10 of IMenuFlyoutSubItem are
             // get_Items, get_Text, get_Icon and put_Icon.
             let text = unsafe { text_of(sub.as_raw(), sub.vtable().text) }?;
-            if let Some(look) = dress.items.iter().find(|look| look.label == text)
+            if let Some(look) = dress.items.iter().find(|look| look.shows(&text))
                 && unsafe { get(&sub, sub.vtable().icon) }.is_err()
             {
                 let icon = font_icon(look.glyph, None)?;
@@ -638,20 +660,7 @@ fn abi(text: &HSTRING) -> Raw {
 /// returned OK but never opened would otherwise keep its `Closed` handler
 /// for good.
 fn watch(flyout: IFlyoutBase, epoch: u64) {
-    let stale: Vec<Watch> = WATCHED.with(|watched| {
-        let mut watched = watched.borrow_mut();
-        let (keep, stale) = std::mem::take(&mut *watched)
-            .into_iter()
-            .partition(|watch| watch.flyout == flyout || is_open(&watch.flyout));
-        *watched = keep;
-        stale
-    });
-    for watch in stale {
-        // SAFETY: slot 33 of IFlyoutBase is remove_Closed with the token
-        // add_Closed returned.
-        let _ =
-            unsafe { (watch.flyout.vtable().remove_closed)(watch.flyout.as_raw(), watch.token) };
-    }
+    drop_closed(Some(&flyout));
     let known = WATCHED.with(|watched| {
         let mut watched = watched.borrow_mut();
         watched
@@ -680,20 +689,47 @@ fn watch(flyout: IFlyoutBase, epoch: u64) {
     }
 }
 
-/// A watched flyout closed: drop its registration and tell the window.
+/// Drop the `Closed` registrations of flyouts that are no longer open: one
+/// that closed, one Reactor replaced on its button, or one whose `ShowAt`
+/// returned OK but never opened. `keep` is the flyout being shown now.
+fn drop_closed(keep: Option<&IFlyoutBase>) {
+    let stale: Vec<Watch> = WATCHED.with(|watched| {
+        let mut watched = watched.borrow_mut();
+        let (open, stale) = std::mem::take(&mut *watched)
+            .into_iter()
+            .partition(|watch| Some(&watch.flyout) == keep || is_open(&watch.flyout));
+        *watched = open;
+        stale
+    });
+    for watch in stale {
+        // SAFETY: slot 33 of IFlyoutBase is remove_Closed with the token
+        // add_Closed returned.
+        let _ =
+            unsafe { (watch.flyout.vtable().remove_closed)(watch.flyout.as_raw(), watch.token) };
+    }
+}
+
+/// The window handled a flyout's `Closed`: registrations of flyouts that
+/// are no longer open go now, outside WinUI's event.
+pub fn release() {
+    drop_closed(None);
+}
+
+/// A watched flyout closed: tell the window, with the epoch it was shown
+/// with. The handler only reads the registry and enqueues; the window
+/// drops the registration ([`release`]).
 fn on_closed(sender: Raw, _args: Raw) {
     let Some(flyout) = borrowed::<IFlyoutBase>(sender) else {
         return;
     };
-    let Some(watch) = WATCHED.with(|watched| {
-        let mut watched = watched.borrow_mut();
-        let at = watched.iter().position(|watch| watch.flyout == flyout)?;
-        Some(watched.swap_remove(at))
-    }) else {
-        return;
-    };
-    // SAFETY: slot 33 of IFlyoutBase is remove_Closed with the token
-    // add_Closed returned; WinUI allows it inside the event.
-    let _ = unsafe { (watch.flyout.vtable().remove_closed)(watch.flyout.as_raw(), watch.token) };
-    crate::shortcuts::flyout_closed(watch.epoch);
+    let epoch = WATCHED.with(|watched| {
+        watched
+            .borrow()
+            .iter()
+            .find(|watch| watch.flyout == flyout)
+            .map(|watch| watch.epoch)
+    });
+    if let Some(epoch) = epoch {
+        crate::shortcuts::flyout_closed(epoch);
+    }
 }

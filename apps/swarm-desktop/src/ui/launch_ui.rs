@@ -193,8 +193,8 @@ pub(super) struct Submission {
 const SHOW_TRIES: u8 = 10;
 const SHOW_RETRY_MS: u64 = 16;
 /// A press outside a popover that lands on its own chip closes it (light
-/// dismiss) and then clicks the chip: a toggle of that chip this soon after
-/// is that same press and must not open it again.
+/// dismiss) and then clicks the chip: a toggle of that chip carrying the
+/// same press (no press since, within this long) must not open it again.
 const DISMISS_PRESS_MS: u128 = 300;
 
 /// The new-task draft and its context.
@@ -205,8 +205,9 @@ pub(super) struct LaunchState {
     /// Renders composed when the popover was asked for: its flyout opens
     /// after the render that attaches it to its chip.
     pub(super) show_after: u64,
-    /// The chip whose popover a light dismiss closed last, and when.
-    pub(super) dismissed: Option<(u8, std::time::Instant)>,
+    /// The chip whose popover a pointer press just closed (light dismiss),
+    /// that press's number (`crate::motion::last_press`) and when.
+    pub(super) dismissed: Option<(u8, u64, std::time::Instant)>,
     /// Files attached in the composer, for the composer they were attached
     /// in (`NEW_TASK` or the open Agent's id).
     pub(super) attachments: Option<(String, Vec<String>)>,
@@ -587,12 +588,19 @@ impl DesktopApp {
             LaunchMsg::Toggle(pop) => {
                 if self.launch.open == Some(pop) {
                     self.close_popover();
-                } else if self.launch.dismissed.take().is_some_and(|(chip, at)| {
-                    self.launch.open.is_none()
-                        && chip == chip_of(pop)
-                        && at.elapsed().as_millis() < DISMISS_PRESS_MS
-                }) {
-                    // The press that light-dismissed this chip's popover.
+                } else if self
+                    .launch
+                    .dismissed
+                    .take()
+                    .is_some_and(|(chip, press, at)| {
+                        self.launch.open.is_none()
+                            && chip == chip_of(pop)
+                            && press == crate::motion::presses()
+                            && at.elapsed().as_millis() < DISMISS_PRESS_MS
+                    })
+                {
+                    // The very press that light-dismissed this chip's
+                    // popover (no press since); a later click opens it.
                 } else {
                     self.open_popover(pop, context);
                 }
@@ -630,7 +638,12 @@ impl DesktopApp {
                 else {
                     return;
                 };
-                self.launch.dismissed = Some((chip_of(open), std::time::Instant::now()));
+                // A press that just came closed it: remember which one. A
+                // close with no press behind it (a switch to another
+                // window, Esc in WinUI) swallows nothing.
+                let (press, age) = crate::motion::last_press();
+                self.launch.dismissed = (u128::from(age) < DISMISS_PRESS_MS)
+                    .then(|| (chip_of(open), press, std::time::Instant::now()));
                 let preset = self.launch.preset.is_some();
                 self.close_popover();
                 // WinUI puts focus back where it was as the flyout closes:

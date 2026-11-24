@@ -38,6 +38,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::mem::offset_of;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_core::imp::ConstBuffer;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface};
@@ -592,9 +593,34 @@ fn automation_id(statics: &IAutomationPropertiesStatics, of: &IInspectable) -> O
     Some(out)
 }
 
-/// A press anywhere in the window: grow the pressed button's ripple from
-/// the press point.
+/// Pointer presses the window's content has seen (handled ones too), and
+/// when the last one came (ms since the Unix epoch).
+static PRESSES: AtomicU64 = AtomicU64::new(0);
+static PRESSED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of the last pointer press in the window's content: a click
+/// that follows a press carries that press's number.
+pub fn presses() -> u64 {
+    PRESSES.load(Ordering::SeqCst)
+}
+
+/// The last pointer press's number and how long ago it came (ms).
+pub fn last_press() -> (u64, u64) {
+    let age = now_ms().saturating_sub(PRESSED_MS.load(Ordering::SeqCst));
+    (presses(), age)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// A press anywhere in the window: count it, and grow the pressed button's
+/// ripple from the press point.
 fn on_pointer_pressed(_sender: Raw, args: Raw) {
+    PRESSES.fetch_add(1, Ordering::SeqCst);
+    PRESSED_MS.store(now_ms(), Ordering::SeqCst);
     let _ = (|| -> Option<()> {
         let pointer: IPointerRoutedEventArgs = borrowed(args)?;
         let routed: IRoutedEventArgs = pointer.cast().ok()?;

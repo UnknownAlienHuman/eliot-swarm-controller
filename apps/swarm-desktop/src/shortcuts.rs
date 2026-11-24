@@ -94,6 +94,9 @@ pub enum Shortcut {
     Foreground,
     /// A flyout `crate::flyout` showed closed (the epoch it was shown with).
     FlyoutClosed(u64),
+    /// A panic was stopped at a native boundary for the first time this
+    /// session (`crate::startup::caught_panic`): the window says so.
+    Panicked,
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a
@@ -168,6 +171,11 @@ pub fn set_popover(popover: Popover) {
 /// A flyout `crate::flyout` showed with `epoch` closed.
 pub fn flyout_closed(epoch: u64) {
     send(Shortcut::FlyoutClosed(epoch));
+}
+
+/// Tell the window that a panic was stopped at a native boundary.
+pub fn panicked() {
+    send(Shortcut::Panicked);
 }
 
 /// The Enter presses counted so far. The hook counts a press as the key
@@ -352,8 +360,29 @@ fn send(found: Shortcut) {
 
 /// `KeyboardProc`: `wparam` is the virtual key; `lparam` bit 29 is Alt
 /// held, bit 30 the previous key state (auto-repeat) and bit 31 the
-/// transition (0 when pressed).
+/// transition (0 when pressed). A panic stops here (unwinding out of an
+/// `extern "system"` function aborts) and the key passes on.
 unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match std::panic::catch_unwind(|| keyboard_takes(code, wparam, lparam)) {
+        // Taken: neither the press nor the release reaches a control.
+        Ok(true) => 1,
+        Ok(false) => next_hook(code, wparam, lparam),
+        Err(panic) => {
+            crate::startup::caught_panic("the keyboard hook", &*panic);
+            next_hook(code, wparam, lparam)
+        }
+    }
+}
+
+/// Pass a hook message on unchanged (the hook handle is ignored).
+fn next_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // SAFETY: passes the message on unchanged.
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+}
+
+/// The keyboard hook's work: whether it takes the key. It reads and
+/// writes this module's atomics and enqueues shortcuts, nothing else.
+fn keyboard_takes(code: i32, wparam: WPARAM, lparam: LPARAM) -> bool {
     if code == HC_ACTION as i32 {
         let flags = lparam as u32;
         // SAFETY: GetKeyState reads this thread's keyboard state.
@@ -369,7 +398,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             }
             // Taken, press and release: F10 would otherwise enter the
             // window's menu mode on its release.
-            return 1;
+            return true;
         }
         let popover = POPOVER.load(Ordering::SeqCst);
         let taken = popover_key(popover, key, ctrl, shift, alt)
@@ -385,8 +414,7 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             // system-menu mode, which takes the next keys and clicks
             // (observed live). No control acts on Alt+arrow.
             if !matches!(found, Shortcut::Back | Shortcut::Forward) {
-                // Taken: neither the press nor the release reaches a control.
-                return 1;
+                return true;
             }
         }
         if pressed && !matches!(key, VK_CONTROL | VK_SHIFT) {
@@ -408,14 +436,21 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             }
         }
     }
-    // SAFETY: passes the message on unchanged (the hook handle is ignored).
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
+    false
 }
 
 /// `LowLevelMouseProc`: `wparam` is the mouse message, `lparam` points at
 /// its `MSLLHOOKSTRUCT`. Steps only while this process's window is in
-/// front and under the pointer; never takes the event.
+/// front and under the pointer; never takes the event. A panic stops here.
 unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Err(panic) = std::panic::catch_unwind(|| side_button(code, wparam, lparam)) {
+        crate::startup::caught_panic("the mouse button hook", &*panic);
+    }
+    next_hook(code, wparam, lparam)
+}
+
+/// The mouse hook's work: enqueue Back or Forward, nothing else.
+fn side_button(code: i32, wparam: WPARAM, lparam: LPARAM) {
     if code == HC_ACTION as i32 && lparam != 0 {
         // SAFETY: for HC_ACTION the system passes a valid MSLLHOOKSTRUCT.
         let event = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
@@ -435,13 +470,20 @@ unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM
             }
         }
     }
-    // SAFETY: passes the event on unchanged.
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 /// `GetMsgProc`: `lparam` points at the retrieved `MSG`; `wparam` is
-/// `PM_REMOVE` when it leaves the queue (counted once, not per peek).
+/// `PM_REMOVE` when it leaves the queue (counted once, not per peek). A
+/// panic stops here.
 unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if let Err(panic) = std::panic::catch_unwind(|| message_seen(code, wparam, lparam)) {
+        crate::startup::caught_panic("the message hook", &*panic);
+    }
+    next_hook(code, wparam, lparam)
+}
+
+/// The message hook's work: note a pointer press in this module's atomics.
+fn message_seen(code: i32, wparam: WPARAM, lparam: LPARAM) {
     if code == HC_ACTION as i32 && wparam == PM_REMOVE as WPARAM && lparam != 0 {
         // SAFETY: for HC_ACTION the system passes a valid MSG pointer.
         let message = unsafe { (*(lparam as *const MSG)).message };
@@ -452,6 +494,4 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             note_input(Input::Pointer);
         }
     }
-    // SAFETY: passes the message on unchanged.
-    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }

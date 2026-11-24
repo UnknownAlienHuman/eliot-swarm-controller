@@ -1018,9 +1018,10 @@ of the explicitly selected release scope.
     `MenuFlyout` on a hidden window button; a native module (`flyout.rs`)
     opens them at the chip or at a point, hides them, reports closed and
     gives menu items their glyphs, the danger tint and the menu its
-    accessible name. Menu labels are unique per menu; Attach to project is
-    its own chooser flyout keyed by project id and checkout. The in-window
-    menus and popovers are removed.
+    accessible name. Menu items are typed actions whose labels are proven
+    distinct at compile time; Attach to project is its own chooser flyout
+    keyed by project id and checkout. The in-window menus and popovers are
+    removed.
   - [ ] **Styles, shapes, motion, shadows, wave.** Carrier control types with
     implicit styles and styles set by key; spring-sampled template key frames;
     composition-host shadows; the wave as a re-templated `ProgressBar`.

@@ -1,10 +1,13 @@
 use super::*;
+use menu_ui::Action;
 
 impl DesktopApp {
-    /// One "…" menu entry, bound to the Agent and generation it was built for.
+    /// One "…" menu entry (or Stop Agent), bound to the Agent and
+    /// generation it was built for: the row menu's action when the row menu
+    /// offers it, else the header's own.
     pub(super) fn agent_menu(
         &mut self,
-        label: &str,
+        action: Action,
         binding: MenuBinding,
         context: &ComponentContext<Self>,
     ) {
@@ -12,15 +15,15 @@ impl DesktopApp {
         if let Some(mut agent) = self.find_agent(&binding.agent).cloned() {
             agent.generation = binding.generation;
             let target = menu_ui::Target::Agent(agent);
-            if let Some(action) = menu_ui::entry_action(&self.menu_entries(&target), label) {
+            if menu_ui::offers(&self.menu_entries(&target), action) {
                 self.menu_action(target, action, context);
                 return;
             }
         }
 
-        match label {
-            MENU_DETAILS => self.show_details(&binding.agent, context),
-            MENU_MOVE => {
+        match action {
+            Action::Details => self.show_details(&binding.agent, context),
+            Action::MoveUnder => {
                 // Bound to the generation the header shows.
                 let agent = self.find_agent(&binding.agent).cloned().or_else(|| {
                     self.chat
@@ -57,14 +60,14 @@ impl DesktopApp {
                     self.move_update(super::move_ui::MoveMsg::Open(agent), context);
                 }
             }
-            MENU_HANDOFF => self.handoff_update(
+            Action::Handoff => self.handoff_update(
                 handoff_ui::HandoffMsg::Open {
                     agent: binding.agent,
                     generation: binding.generation,
                 },
                 context,
             ),
-            MENU_RESUME => {
+            Action::Resume => {
                 let key = format!("resume:{}:{}", bound.agent, bound.generation);
                 self.submit_control(context, "Resume", key, move |data_dir, mutation_id| {
                     client::block_on(client::submit_resume(
@@ -77,7 +80,7 @@ impl DesktopApp {
                     .map(|reply| submit_note(&reply))
                 });
             }
-            MENU_DETACH => {
+            Action::DetachObserver => {
                 let key = format!("detach:{}:{}", bound.agent, bound.generation);
                 self.submit_control(context, "Detach", key, move |data_dir, mutation_id| {
                     client::block_on(client::submit_detach(
@@ -89,8 +92,8 @@ impl DesktopApp {
                     .map(|reply| submit_note(&reply))
                 });
             }
-            MENU_STOP => self.stop_agent(&bound.agent, bound.generation, context),
-            MENU_FORCE => {
+            Action::Stop => self.stop_agent(&bound.agent, bound.generation, context),
+            Action::ForceStop => {
                 let title = self.agent_title(&binding.agent);
                 self.chat.confirm_force = Some((bound, title));
             }
@@ -156,25 +159,28 @@ impl DesktopApp {
                 .into_iter()
                 .filter(|entry| !entry.is_more())
                 .partition(|entry| !entry.is_destructive());
-            let mut items = menu_ui::menu_items(&regular);
-            let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
+            // Every item is an action, so its label maps back to it
+            // (`Action::from_label`).
+            let mut more = vec![menu_ui::Entry::item(Action::Details)];
             if !self.submitting() {
-                more.push(MenuItem::item("handoff", MENU_HANDOFF));
+                more.push(menu_ui::Entry::item(Action::Handoff));
                 if detail.observe_only {
-                    more.push(MenuItem::item("detach", MENU_DETACH));
+                    more.push(menu_ui::Entry::item(Action::DetachObserver));
                 }
                 if controllable && !ended {
-                    more.push(MenuItem::item("force", MENU_FORCE));
+                    more.push(menu_ui::Entry::item(Action::ForceStop));
                 }
             }
             if let Some(target) = &task {
-                more.extend(menu_ui::menu_items(&self.developer_entries(target)));
+                more.extend(self.developer_entries(target));
             }
-            items.push(MenuItem::submenu("more", "More", more));
-            items.extend(menu_ui::menu_items(&destructive));
-            // A chosen item comes back as its label only.
-            menu_ui::debug_assert_unique(&items);
-            items
+            let mut entries = regular;
+            entries.push(menu_ui::Entry::Submenu {
+                action: Action::More,
+                items: more,
+            });
+            entries.extend(destructive);
+            menu_ui::menu_items(&entries)
         });
         // The status pill: the state in words, then what runs it, and the
         // live feed's note when it is not following.
@@ -369,7 +375,13 @@ impl Component for Header {
                     // across renders: Reactor 0.100.0 re-sends a menu
                     // whose callback changed, replacing the native
                     // MenuFlyout and dropping a click on the open one.
-                    context.callback(|label: String| Message::Chat(ChatMsg::AgentMenu(label))),
+                    // Reactor reports the chosen item's label only.
+                    context.callback(|label: String| {
+                        Action::from_label(&label)
+                            .map_or(Message::Menu(menu_ui::MenuMsg::Ignored), |action| {
+                                Message::Chat(ChatMsg::AgentMenu(action))
+                            })
+                    }),
                 )),
             None => m3::icon_button(palette)
                 .is_enabled(false)
@@ -387,9 +399,7 @@ impl Component for Header {
                 m3::destructive(palette)
                     .is_enabled(state == StopButton::Ready)
                     .automation_name(label)
-                    .on_click(
-                        context.message(Message::Chat(ChatMsg::AgentMenu(MENU_STOP.to_owned()))),
-                    )
+                    .on_click(context.message(Message::Chat(ChatMsg::AgentMenu(Action::Stop))))
                     .content(m3::label(label))
             }
             None => View::empty(),
