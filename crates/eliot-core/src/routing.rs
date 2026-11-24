@@ -39,6 +39,10 @@ pub enum RouteSkipReason {
     QuotaUnknown,
     CapacityFull,
     Unauthorized,
+    /// The candidate's frozen authority is not provably equal or narrower.
+    WiderAuthority,
+    /// A sandboxed candidate could not commit on this worktree's branch.
+    CannotCommit,
     InvalidProfile,
     HarnessCheckFailed,
 }
@@ -57,6 +61,8 @@ impl RouteSkipReason {
             Self::QuotaUnknown => "quota unknown and profile requires a reading",
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
+            Self::WiderAuthority => "authority wider than the source",
+            Self::CannotCommit => "its sandbox cannot commit on this branch",
             Self::InvalidProfile => "profile does not resolve",
             Self::HarnessCheckFailed => "harness self-check failed and awaits a later pass",
         }
@@ -165,6 +171,122 @@ pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
     );
     crate::canonical_json_sha256(&authority)
         .map_err(|_| Error::new("internal", "provider switch authority could not be encoded"))
+}
+
+/// Native access as a closed range on one ladder: 0 read-only, 1 every action
+/// asks, 2 automatic approval, 3 full access. A range states what the frozen
+/// fields can prove: a value that native settings can still change spans every
+/// level it could resolve to. `None` is a value this check does not recognize.
+fn native_access_range(snapshot: &Value) -> Option<crate::api::harness::NativeAccessBounds> {
+    let harness = snapshot.get("harness")?.as_str()?;
+    let read = crate::api::HarnessCapabilities::for_harness(harness)?.native_access_bounds?;
+    read(snapshot)
+}
+
+fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<String>> {
+    match snapshot.get(key) {
+        None | Some(Value::Null) => Some(std::collections::BTreeSet::new()),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| value.as_str().map(str::to_owned))
+            .collect(),
+        Some(_) => None,
+    }
+}
+
+/// Why `candidate` may not take over work from `source` automatically or at a
+/// manager's request; `None` when its authority is provably equal or narrower.
+/// Credentials, model and executable belong to the candidate profile the Owner
+/// named in policy. Everything that decides what the session may do is compared.
+pub fn handoff_authority_refusal(source: &Value, candidate: &Value) -> Option<&'static str> {
+    const ACCESS_FIELDS: [&str; 7] = [
+        "harness",
+        "permissions",
+        "approval_policy",
+        "approval",
+        "permission_mode",
+        "dangerously_skip_permissions",
+        "mode",
+    ];
+    const EXACT_FIELDS: [&str; 7] = [
+        "sandbox",
+        "workspace_mode",
+        "inherit_env",
+        "secret_env_names",
+        "literal_env",
+        "collaboration_mode",
+        "setup",
+    ];
+    let identical_access = ACCESS_FIELDS
+        .iter()
+        .all(|key| source.get(key) == candidate.get(key));
+    if !identical_access {
+        let (Some((source_floor, _)), Some((_, candidate_ceiling))) =
+            (native_access_range(source), native_access_range(candidate))
+        else {
+            return Some("native access is not comparable");
+        };
+        if candidate_ceiling > source_floor {
+            return Some("native access is wider");
+        }
+    }
+    if EXACT_FIELDS
+        .iter()
+        .any(|key| source.get(key) != candidate.get(key))
+    {
+        return Some("sandbox, environment or setup differs");
+    }
+    let control = |snapshot: &Value| match snapshot.get("control") {
+        None => Some(crate::AgentControl::Slf),
+        Some(value) => crate::AgentControl::parse(value.as_str()?).ok(),
+    };
+    match (control(source), control(candidate)) {
+        (Some(source), Some(candidate)) if candidate <= source => {}
+        _ => return Some("Swarm control is wider"),
+    }
+    // An unset value is read as the narrower setting on the source and the
+    // wider setting on the candidate.
+    if candidate.get("native_subagents").and_then(Value::as_str) != Some("deny")
+        && source.get("native_subagents").and_then(Value::as_str) != Some("allow")
+    {
+        return Some("native subagents are wider");
+    }
+    if candidate.get("mcp").and_then(Value::as_str) != Some("minimal")
+        && source.get("mcp").and_then(Value::as_str) != Some("inherit")
+    {
+        return Some("MCP inheritance is wider");
+    }
+    if source.get("mcp").and_then(Value::as_str) != Some("inherit")
+        && !subset(source, candidate, "mcp_allow")
+    {
+        return Some("MCP allow list is wider");
+    }
+    if !subset(source, candidate, "child_profiles") {
+        return Some("child profiles are wider");
+    }
+    if !subset(source, candidate, "pass_env") {
+        return Some("passed environment is wider");
+    }
+    if !subset(source, candidate, "scratch") {
+        return Some("worktree cleanup paths are wider");
+    }
+    let identity = |snapshot: &Value| {
+        snapshot
+            .get("pass_agent_identity_to_shell")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+    };
+    if identity(candidate) && !identity(source) {
+        return Some("shell receives the Agent identity");
+    }
+    None
+}
+
+fn subset(source: &Value, candidate: &Value, key: &str) -> bool {
+    match (names(source, key), names(candidate, key)) {
+        (Some(source), Some(candidate)) => candidate.is_subset(&source),
+        _ => false,
+    }
 }
 
 const MAX_NAME_BYTES: usize = 128;

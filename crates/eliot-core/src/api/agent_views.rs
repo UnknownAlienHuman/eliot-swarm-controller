@@ -952,6 +952,9 @@ pub struct AgentGetResponse {
         deserialize_with = "optional_object"
     )]
     pub last_control_failure: Option<AgentControlFailure>,
+    /// Where this generation's work is recorded in Git, and its latest handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_truth: Option<AgentWorkTruthView>,
 }
 
 /// A retained Owner stop or interrupt failure visible to this caller.
@@ -1030,6 +1033,93 @@ impl AgentControlFailure {
         }
         Ok(())
     }
+}
+
+/// The outcome of one daemon checkpoint of a worktree.
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitCheckpointState {
+    /// Uncommitted files were captured under a private ref.
+    Snapshot,
+    /// Everything is committed on the branch.
+    Clean,
+    /// Nothing changed since the previous checkpoint.
+    Unchanged,
+    /// The worktree could not be captured.
+    Failed,
+}
+
+/// A changed file a checkpoint deliberately did not copy into Git.
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitCheckpointWithheld {
+    pub path: String,
+    pub bytes: u64,
+    /// `file_too_large`, `checkpoint_total_limit`, `generation_budget`,
+    /// `too_many_files`, `known_secret`, `nested_repository`, `not_a_file`
+    /// or `unreadable`.
+    pub reason: String,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitCheckpointView {
+    pub state: GitCheckpointState,
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub paths_truncated: bool,
+    /// Changed files that exist only in the worktree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<GitCheckpointWithheld>,
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub withheld_truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub at: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentHandoffView {
+    /// `queued`, `waiting`, `refused` or the switch command's final state.
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<super::HandoffReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<crate::ProviderRestrictionKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continued_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub uncertain: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    pub at: i64,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorkTruthView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<GitCheckpointView>,
+    /// The final checkpoint waits for proof that the session's process tree exited.
+    #[serde(default, skip_serializing_if = "crate::is_false")]
+    pub awaiting_exit: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<AgentHandoffView>,
 }
 
 /// Pending automatic background-process wake surfaced in `agent.get` (`swarm show`).

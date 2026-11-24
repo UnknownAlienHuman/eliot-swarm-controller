@@ -20,6 +20,8 @@ pub(crate) const RETENTION_TICK_TIME_BUDGET: Duration = Duration::from_secs(30);
 
 /// Known provider resets and due probes are serviced within one second.
 pub(crate) const PROVIDER_HOLD_INTERVAL: Duration = Duration::from_secs(1);
+/// A held or lost session waits at most this long for its successor.
+const AUTOMATIC_HANDOFF_INTERVAL: Duration = Duration::from_secs(5);
 
 fn maintenance_join_error(task: &str, error: &tokio::task::JoinError) -> Error {
     let (code, reason) = if error.is_cancelled() {
@@ -190,8 +192,19 @@ async fn run_provider_maintenance(
     let mut provider_ticker = tokio::time::interval(PROVIDER_HOLD_INTERVAL);
     provider_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut provider_probe_tasks = tokio::task::JoinSet::new();
+    let mut handoff_ticker = tokio::time::interval(AUTOMATIC_HANDOFF_INTERVAL);
+    handoff_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            _ = handoff_ticker.tick() => {
+                if let Err(error) = router.finish_session_checkpoints().await {
+                    logging::record(&policy, "daemon.session_checkpoints_failed", &[], Some(&error));
+                }
+                if let Err(error) = router.run_automatic_handoffs().await {
+                    logging::record(&policy, "daemon.automatic_handoffs_failed", &[], Some(&error));
+                }
+                continue;
+            }
             _ = provider_ticker.tick() => {
                 router.flush_command_storms(false);
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
@@ -279,6 +292,7 @@ async fn run_retention(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut config = initial;
+    let mut checkpoint_cursor = None;
     let mut interval_seconds = config.retention.maintenance_interval_seconds();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -332,6 +346,21 @@ async fn run_retention(
         )
         .await
         .ok();
+        if let Err(error) = crate::work_truth_repo::maintain(
+            &store,
+            &data_root,
+            checkpoint_cutoff(&config.retention, now_ms()),
+            &mut checkpoint_cursor,
+        )
+        .await
+        {
+            logging::record(
+                &policy,
+                "daemon.checkpoint_retention_failed",
+                &[],
+                Some(&error),
+            );
+        }
         if unbounded_store_over_threshold(
             &config.retention,
             &data_root,
@@ -384,7 +413,7 @@ pub(crate) async fn run_now(
 ) -> Result<RetentionReport> {
     let config = config::load_daemon_config(data_root)?;
     let mut epochs = 0;
-    run_epochs(
+    let report = run_epochs(
         store,
         data_root,
         &config.retention,
@@ -395,7 +424,21 @@ pub(crate) async fn run_now(
             epochs > 1
         },
     )
-    .await
+    .await?;
+    crate::work_truth_repo::maintain(
+        store,
+        data_root,
+        checkpoint_cutoff(&config.retention, now),
+        &mut None,
+    )
+    .await?;
+    Ok(report)
+}
+
+fn checkpoint_cutoff(retention: &config::RetentionConfig, now: i64) -> Option<i64> {
+    retention
+        .events_retention_seconds()
+        .map(|seconds| now.saturating_sub(seconds.saturating_mul(1_000)))
 }
 
 /// Run bounded retention epochs until an epoch drains or a budget runs out:

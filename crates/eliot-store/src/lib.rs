@@ -39,7 +39,7 @@ pub use goals::{
     GoalContinuation, GoalRoundClaim, GoalRoundCommit, GoalRoundCommitResult, GoalRoundDecision,
     GoalRoundKey, GoalRoundProbe,
 };
-pub use handoff::HandoffAdmission;
+pub use handoff::{AGENT_HANDED_OFF, BriefFacts, HandoffAdmission};
 pub use projects::ProjectRegistrationInput;
 pub use resolution::{ConfigureReadback, TurnInactiveProof, WorkspaceLaunchCleanup};
 pub use retention::{RetentionReport, RetentionSpaceStatus, StoreCompactionReport};
@@ -145,7 +145,8 @@ const RECOVER_ACCEPTED_COMMAND_FILTER: &str =
        OR (link_kind = 'handoff' AND state IN ('accepted','queued'))
        OR (verb = 'worktree.remove' AND state = 'queued')
        OR (link_kind = 'switch' AND ordinal = 0 AND verb = 'launch' AND state = 'accepted'
-           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command AND p.method = 'swarm.switch')
+           AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command
+                       AND p.method = 'swarm.switch' AND p.state = 'dispatched')
            AND NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.agent = commands.target AND w.start_command_id = commands.id))
        OR (link_kind = 'switch' AND ordinal = 2 AND verb = 'stop' AND state = 'accepted'
            AND EXISTS (SELECT 1 FROM commands p WHERE p.id = commands.parent_command
@@ -247,8 +248,17 @@ pub use source_batches::CompletionWorktreeCapture;
 mod source_handoff;
 mod source_install;
 mod switch;
-pub use switch::{PROVIDER_SWITCH_QUEUED, PROVIDER_SWITCH_SETTLED, SwitchWork};
+pub use switch::{
+    AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING, PROVIDER_SWITCH_QUEUED,
+    PROVIDER_SWITCH_SETTLED, SwitchContinuation, SwitchLaunchCheckout, SwitchLiveCheckout,
+    SwitchReservation, SwitchWork,
+};
 mod swarm_usage;
+mod work_truth;
+pub use work_truth::{
+    CheckpointRestoreAdmission, CheckpointRetentionGeneration, GIT_CHECKPOINT, GitCheckpointBasis,
+    GitCheckpointInput, GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
+};
 mod turn_recovery;
 pub(crate) mod usage;
 mod wakes;
@@ -4631,16 +4641,22 @@ fn repo_git_write_blocked_tx(
     command_id: &str,
     common_dir: &str,
 ) -> Result<bool> {
-    let current_rowid: i64 = tx
-        .query_row(
+    let current_rowid: i64 = if command_id.is_empty() {
+        // An event-driven writer starts behind already-admitted Git commands.
+        i64::MAX
+    } else {
+        tx.query_row(
             "SELECT rowid FROM commands WHERE id = ?1",
             [command_id],
             |row| row.get(0),
         )
-        .map_err(sql_error)?;
+        .map_err(sql_error)?
+    };
     let git_action_pending = tx
         .query_row(
             "SELECT EXISTS(
+                 SELECT 1 FROM git_checkpoint_intents WHERE common_dir = ?2
+             ) OR EXISTS(
                  SELECT 1 FROM git_integration_custody
                  WHERE common_dir = ?2 AND cleaned = 0 AND command_id <> ?1
              ) OR EXISTS(

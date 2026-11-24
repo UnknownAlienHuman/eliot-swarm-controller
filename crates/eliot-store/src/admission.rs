@@ -887,6 +887,7 @@ fn admit_launch_tx(
     preparation: &Option<WorkspacePreparationInput>,
     now: i64,
     limits: core::api::HierarchyLimits,
+    linked_switch_launch: bool,
     events: &mut Vec<Event>,
 ) -> Result<Option<String>> {
     if request.target.is_some() {
@@ -1046,6 +1047,9 @@ fn admit_launch_tx(
         ));
     }
     workspace::require_managed_path_ready(tx, &workspace)?;
+    if !linked_switch_launch {
+        switch::require_checkout_owner_tx(tx, Some(&workspace), None)?;
+    }
     if request.args.get("prompt").is_some() {
         return Err(Error::new(
             "invalid",
@@ -1585,6 +1589,9 @@ fn admit_resume_tx(
             "archived Agents cannot be resumed; unarchive the Agent first",
         ));
     }
+    handoff::require_not_handed_off(tx, agent_num)?;
+    switch::require_no_active_checkout_switch(tx, agent_num)?;
+    switch::require_checkout_owner_tx(tx, agent.workspace.as_deref(), Some(agent_num))?;
     cleanup::require_no_cleanup_attempt(tx, &agent)?;
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;
@@ -2251,6 +2258,41 @@ pub(super) fn submit_tx(
         limits,
         policy,
         false,
+        false,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "The switch launch carries the same explicit admission inputs as ordinary launch."
+)]
+pub(super) fn submit_switch_launch_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: SubmitCommand,
+    preparation: Option<WorkspacePreparationInput>,
+    now: i64,
+    derived_rule: bool,
+    limits: core::api::HierarchyLimits,
+    policy: Option<&capacity::PolicyLoader>,
+) -> Result<Admission> {
+    if request.verb != "launch" {
+        return Err(Error::new(
+            "bad_state",
+            "switch launch admission requires a launch command",
+        ));
+    }
+    submit_tx_mode(
+        tx,
+        principal,
+        request,
+        preparation,
+        now,
+        derived_rule,
+        limits,
+        policy,
+        false,
+        true,
     )
 }
 
@@ -2262,7 +2304,9 @@ pub(super) fn submit_restart_resume_tx(
     policy: Option<&capacity::PolicyLoader>,
 ) -> Result<Admission> {
     let command_id = request.id.clone();
-    let admission = submit_tx_mode(tx, "owner", request, None, now, false, limits, policy, true)?;
+    let admission = submit_tx_mode(
+        tx, "owner", request, None, now, false, limits, policy, true, false,
+    )?;
     if admission.is_new {
         super::result_page::record_restart_resume_intent_tx(tx, &command_id)?;
     }
@@ -2283,7 +2327,14 @@ fn submit_tx_mode(
     limits: core::api::HierarchyLimits,
     policy: Option<&capacity::PolicyLoader>,
     restart_resume: bool,
+    linked_switch_launch: bool,
 ) -> Result<Admission> {
+    if linked_switch_launch && request.verb != "launch" {
+        return Err(Error::new(
+            "bad_state",
+            "switch launch admission requires a launch command",
+        ));
+    }
     if request.trusted_review_labels.is_some() && !derived_rule {
         return Err(Error::new(
             "invalid",
@@ -2293,6 +2344,14 @@ fn submit_tx_mode(
     let (payload_digest, replay) = submit_head_tx(tx, principal, &request, now, derived_rule)?;
     if let Some(admission) = replay {
         return Ok(admission);
+    }
+    if matches!(
+        request.verb.as_str(),
+        "send" | "steer" | "inject" | "resume"
+    ) && let Some(target) = request.target.as_deref()
+        && let Ok(target) = parse_agent_id(target)
+    {
+        handoff::require_not_handed_off(tx, target)?;
     }
     if restart_resume {
         let target = request
@@ -2433,6 +2492,7 @@ fn submit_tx_mode(
             &preparation,
             now,
             limits,
+            linked_switch_launch,
             &mut events,
         )?,
         "send" | "stop" => {

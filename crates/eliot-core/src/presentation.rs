@@ -17,6 +17,7 @@ pub fn reason_words(code: &str) -> String {
         "dispatched" => "Sent to the Agent",
         "bad_state" => "The Agent is not ready for this action",
         "stale_generation" => "The task restarted since then; refresh and try again",
+        "handed_off" => "This work moved to another Agent",
         "unsupported" => "This action is not supported",
         "unknown" => "The result couldn't be confirmed",
         "unavailable" => "This action is unavailable",

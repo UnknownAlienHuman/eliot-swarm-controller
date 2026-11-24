@@ -482,13 +482,14 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `agent.list/get/result` | scoped, paginated Agent state and exact results; `agent.get` includes metadata-only owner-rules revision/digest/delivery evidence |
 | `agent.processes/stats` | scoped process records and ephemeral OS samples |
 | `agent.git/edits` | current Git snapshot with complete work line counts when available, and paginated native-attributed edits |
+| `checkpoint.restore` | Owner-only restoration of a retained checkpoint's separate staged and worktree layers into a clean worktree at its captured HEAD and repository |
 | `agent.patch_digest` | review digest of the Agent's patch against its worktree base (else HEAD): changed files and packages, new dependencies, public-interface lines, checker/lint configuration changes, suppressions and paths outside active claim globs, each list bounded; an attention filter, not a quality score |
 | `workspace.list` | owner-only page of the managed worktrees Swarm created |
 | `command.submit/get` | implemented immutable admission and command readback |
 | `turn.get` | implemented running/completed/unknown turn read |
 | `swarm.wait` | bounded wait over a frozen child command/turn set with all/any, timeout and honest per-entry outcomes |
 | `swarm.digest` | durable digest over a frozen child set delivering one coalesced parent mailbox result with the standard mail wake |
-| `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes; failed handoff brief may be Owner-applied |
+| `command.resolve`, `turn.resolve` | constrained Owner resolution of unknown outcomes, interrupted switch checkout release, and asserted application of a failed handoff brief |
 | `swarm.switch` | Owner launch-plus-handoff to a new Agent, using normal launch and the H2 transfer |
 | `swarm.handoff`, `command.cancel` | atomic task transfer to an existing Agent; Owner or issuing-manager withdrawal of undispatched SEND |
 | `command.children` | implemented scoped, paged child readback for a retained expansion |
@@ -556,7 +557,10 @@ The request and readback use [ProjectTransferRequest and ProjectTransferResult](
 A managed manager launch always runs in a project worktree. Without an explicit
 `adopt_worktree` the daemon prepares a fresh opaque worktree on a unique
 branch from the frozen base OID and runs the existing preparation and setup chain
-before native dispatch. Workers inherit that worktree through the parent link by default.
+before native dispatch. Generated branches use `<project>/<agent>/work`; an explicit
+`--worktree BRANCH` keeps the caller's branch name. Managed worktrees reserve each
+`<project>/<agent>` ref parent to one worktree. Workers inherit that worktree through the
+parent link by default.
 `adopt_worktree` names an existing checkout of the same repository explicitly;
 adoption verifies Git identity and live workspace overlap, and freezes the profile
 without running its setup. Cleanup and worktree removal keep bound or borrowed
@@ -730,7 +734,7 @@ event and context response.
 
 Errors include
 `not_found`, `unsupported`, `not_allowed`, `bad_state`, `stale_generation`, `invalid`,
-`busy`, `unavailable`, `auth_required`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
+`busy`, `handed_off`, `unavailable`, `auth_required`, `capacity_unavailable`, `provider_held`, `history_gap`, `source_integrity`,
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
 
 `auth_required` on a failed Claude start means the native CLI reported it
@@ -760,7 +764,9 @@ age in milliseconds, one-line reason, optional recommended action and offered
 choices. An action names the existing method and JSON arguments that implement
 the choice. The projection includes harness requests, unknown command/turn
 outcomes, owner-required holds, unarchived lost/failed Agents, blocked Goals,
-launch items waiting for the owner, and #871 stuck objects. For a stuck Goal
+launch items waiting for the owner, #871 stuck objects, handoffs after a turn with
+uncertain effects (`handoff`) and [work not recorded in Git](monitoring.md#work-recorded-in-git)
+(`work_not_in_git`). For a stuck Goal
 (`active_goal_without_round_or_timer`, #871, #904), the item offers a ready
 `goal.round` action (`round`) as the recommended choice alongside `goal.get`
 (`inspect`) when the Agent is cleanly idle with an unconsumed key or due cadence
@@ -775,6 +781,13 @@ A stale item returns `stale_item`. A snooze lasts until
 the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
+
+For a missing worktree with a retained checkpoint, the inbox instructions include
+`git worktree prune`, `git worktree add`, and the exact
+`swarm --data-dir <daemon-data> checkpoint restore --agent A --generation N
+--checkpoint-ref REF --workspace PATH` command. Restore refuses a dirty or active
+target, a changed HEAD, a different Git common directory, and any unsafe or withheld
+checkpoint path.
 
 Each stuck command has its own `command:<id>` subject, revision, snooze and
 decision receipt. It offers `command.get` (`inspect`). The available corrections
@@ -2149,12 +2162,13 @@ during drain; it never launches another B or repeats work. See
 [Coordination](coordination.md#agent-switch-implemented) for crash/boundary semantics.
 
 ```text
-swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --profile PROFILE
-swarm [--id ULID] switch A --generation N --task-command TASK_SEND [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --profile PROFILE
+swarm [--id ULID] switch A --generation N [--task-command COMMAND] [SEND_ID...] --harness HARNESS [--model MODEL] [--effort EFFORT] [--auth INTEGRATION] [--cmd PATH]
 ```
 
-Both forms accept optional `--workspace`, `--worktree` and `--base`. An initially
-busy A refuses before B is allocated. If readiness/transfer fails after B is
+Both forms accept optional `--workspace`, `--worktree` and `--base`. Without
+`--task-command`, or when that command is no longer retained, Swarm finds the task in
+the Store and the Git task record. An initially busy A refuses before B is allocated. If readiness/transfer fails after B is
 created, B remains visible and A's transfer is rolled back. A definitely launched
 but untransferred B is finished with ordinary `swarm.handoff` using B's exact
 identity and a new handoff mutation ID; no finish mutation exists. Stopping either
@@ -2997,7 +3011,8 @@ started for that directory.
 **Private stand (#837).** `stand up` creates a fresh private daemon directory
 and a scratch Git repository inside it. Repeat `--profile NAME` to import
 profiles from the current settings or from `--settings FILE`. The private
-profiles-only TOML file form `--profile FILE` remains available. It accepts
+ profile TOML file form `--profile FILE` remains available. It contains a
+ `[profiles]` table and can include `[routing]`. The stand accepts
 an optional alternate Swarm binary and
 `--ttl DURATION` (default `DEFAULT_STAND_TTL_MS` = 24 hours, max `MAX_ARTIFACT_TTL_MS` = 30 days in [`api/cleanup.rs`](../../crates/eliot-core/src/api/cleanup.rs)). It prints the new
 data directory as the only line of stdout after the daemon is ready. `--json`
@@ -3139,6 +3154,7 @@ swarm settings read
 swarm settings save FILE [--dry-run]
 swarm settings claude-cmd PROFILE (--cmd PATH|--latest)
 swarm worktree remove AGENT [--generation N]
+swarm checkpoint restore --agent A --generation N --checkpoint-ref REF --workspace PATH
 swarm ls | show A | watch [A|SELECTOR] [--after SEQ] | top
 swarm usage [A] [--generation N] [--project P] [--root A]
 swarm heavy [A] [--generation N] [--window-secs N]

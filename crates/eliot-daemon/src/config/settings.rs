@@ -261,7 +261,7 @@ fn project_source_sections(source: &str, sections: &[&str]) -> String {
 fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
         let mut value = match name {
-            "routing" => serde_json::json!({"default": []}),
+            "routing" => serde_json::json!({"default": [], "auto_handoff": true}),
             "desktop" => desktop_default(),
             _ => empty_object(),
         };
@@ -274,6 +274,15 @@ fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
         .map_err(|_| core::Error::new("internal", "settings section could not be encoded"))?;
     if name == "projects" {
         super::projects::canonicalize_project_settings(&mut value, false)?;
+    }
+    if name == "routing" {
+        value
+            .as_object_mut()
+            .ok_or_else(|| {
+                core::Error::new("source_integrity", "routing settings are not an object")
+            })?
+            .entry("auto_handoff")
+            .or_insert(JsonValue::Bool(true));
     }
     if name == "daemon" {
         add_attention_settings_defaults(&mut value, super::default_attention_suspicion_secs());
@@ -987,16 +996,36 @@ pub(crate) fn owner_rules_snapshot(data_root: &Path) -> core::Result<Option<(Str
     }
 }
 
-pub(crate) fn validate_owner_rules_text(text: &str, policy: &SecretPolicy) -> core::Result<()> {
-    static CREDENTIAL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(concat!(
-                r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
-                r"|\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{16,}",
-                r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
-                r#"|(?i:\b(?:authorization["']?\s*:\s*["']?bearer\s+|(?:[A-Z0-9]+_)*(?:api_key|access_key|token|password|secret)["']?\s*[:=]\s*["']?)[A-Za-z0-9_./+=-]{16,})"#,
-            ))
-            .expect("owner rules credential pattern is valid")
+static CREDENTIAL_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(concat!(
+        r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
+        r"|\b(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-)[A-Za-z0-9_-]{16,}",
+        r"|\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        r#"|(?i:\b(?:authorization["']?\s*:\s*["']?bearer\s+|(?:[A-Z0-9]+_)*(?:api_key|access_key|token|password|secret)["']?\s*[:=]\s*["']?)[A-Za-z0-9_./+=-]{16,})"#,
+    ))
+    .expect("credential pattern is valid")
+});
+
+/// Replace text shaped like a credential, for records no literal policy knows.
+pub(crate) fn contains_credential_shape(text: &str) -> bool {
+    CREDENTIAL_PATTERN.is_match(text)
+}
+
+pub(crate) fn redact_credential_shapes(text: &str) -> String {
+    static PRIVATE_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?s)-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----.*?(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----|\z)",
+        )
+        .expect("private key pattern is valid")
     });
+    let marker = regex::NoExpand(eliot_core::api::REDACTION_MARKER);
+    let text = PRIVATE_KEY.replace_all(text, marker);
+    CREDENTIAL_PATTERN
+        .replace_all(&text, regex::NoExpand(eliot_core::api::REDACTION_MARKER))
+        .into_owned()
+}
+
+pub(crate) fn validate_owner_rules_text(text: &str, policy: &SecretPolicy) -> core::Result<()> {
     if policy.contains_text(text)
         || policy.redact_text(text) != text
         || text.contains(eliot_core::api::REDACTION_MARKER)

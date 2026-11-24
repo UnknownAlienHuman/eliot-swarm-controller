@@ -6,6 +6,25 @@ use eliot_core::api::{
 };
 
 mod brief;
+pub(super) use brief::{last_turn_uncertain, last_unfinished_turn};
+
+/// Committed when a generation's task inputs, claims, Goal and children move.
+pub const AGENT_HANDED_OFF: &str = "agent.handed_off";
+
+/// What the Router read from Git and the file system for one brief.
+#[derive(Clone, Debug, Default)]
+pub struct BriefFacts {
+    pub git: Option<String>,
+    /// Exact original SEND bound to the task record read for this brief.
+    pub task_command: Option<String>,
+    /// Where the task's own saved files can be read, shown with the task.
+    pub task_note: Option<String>,
+    /// The task text from the Git record, used when the Store retains none.
+    pub task_text: Option<String>,
+}
+
+/// Bound on following a chain of same-worktree handoffs.
+const MAX_SUCCESSOR_CHAIN: usize = 64;
 const METHOD: &str = "swarm.handoff";
 
 #[derive(Debug)]
@@ -83,16 +102,42 @@ impl Store {
         Ok(Some(value))
     }
 
+    /// The caller's authority over this source, before any worktree read
+    /// or record that the transfer would need.
+    pub fn check_handoff_caller(&self, principal: &str, request: &HandoffRequest) -> Result<()> {
+        self.ensure_committed_reads()?;
+        let from = load_agent_by_num(&self.connection, parse_agent_id(&request.from)?)?
+            .ok_or_else(|| Error::new("not_found", "source Agent missing"))?;
+        if from.generation != request.from_generation {
+            return Err(Error::new("stale_generation", "handoff generation moved"));
+        }
+        let input_principal = if principal == "owner" {
+            None
+        } else {
+            let caller = hierarchy::parse_caller(&self.connection, principal)?;
+            hierarchy::caller_may_command(&self.connection, &caller, &from)?;
+            Some(principal)
+        };
+        source_task(
+            &self.connection,
+            &from,
+            &request.task_command,
+            input_principal,
+        )
+        .map(|_| ())
+    }
+
     pub fn handoff(
         &mut self,
         principal: &str,
         request: &HandoffRequest,
         policy: &core::SecretPolicy,
         owner_process: Option<&OwnerProcess>,
+        facts: &BriefFacts,
         now: i64,
     ) -> Result<HandoffAdmission> {
         self.ensure_writer_healthy()?;
-        let result = self.handoff_inner(principal, request, policy, owner_process, now);
+        let result = self.handoff_inner(principal, request, policy, owner_process, facts, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -103,6 +148,7 @@ impl Store {
         request: &HandoffRequest,
         policy: &core::SecretPolicy,
         owner_process: Option<&OwnerProcess>,
+        facts: &BriefFacts,
         now: i64,
     ) -> Result<HandoffAdmission> {
         let tx = self
@@ -116,7 +162,10 @@ impl Store {
             policy,
             now,
             self.hierarchy_limits,
-            HandoffInput::Brief,
+            HandoffInput::Brief {
+                facts,
+                discover: false,
+            },
         )?;
         annotate_owner_events(&tx, &mut change.events, owner_process)?;
         commit_transaction(tx, &self.write_faulted)?;
@@ -299,10 +348,88 @@ pub(super) fn source_inputs(
     commands: &[String],
     principal: Option<&str>,
     policy: &core::SecretPolicy,
-) -> Result<(Command, Vec<Command>)> {
-    let task = source_task(connection, from, task_command, principal)?;
-    let originals = source_sends(connection, from, commands, principal, policy, false)?;
+) -> Result<(Option<Command>, Vec<Command>)> {
+    let task = continuation_task(connection, from, task_command, principal)?;
+    let transfer_commands =
+        switch_transfer_commands(connection, from, commands, from.is_terminal())?;
+    let originals = source_sends(
+        connection,
+        from,
+        &transfer_commands,
+        principal,
+        policy,
+        from.is_terminal(),
+    )?;
     Ok((task, originals))
+}
+
+/// Preserve the caller's explicit order, then append every other SEND this
+/// source can safely transfer in Store order.
+pub(super) fn switch_transfer_commands(
+    connection: &Connection,
+    from: &Agent,
+    commands: &[String],
+    stopped_source: bool,
+) -> Result<Vec<String>> {
+    const SCAN_LIMIT: usize = 256;
+    if commands.len() > core::api::MAX_HANDOFF_SENDS {
+        return Err(Error::new(
+            "fanout_limit",
+            "switch has more transferable SENDs than one handoff can carry; settle some before switching",
+        ));
+    }
+    for id in commands {
+        if is_brief_tx(connection, id)? {
+            return Err(Error::new(
+                "bad_state",
+                format!("handoff brief {id} is context, not a transferable task SEND"),
+            ));
+        }
+    }
+    let mut transfer_commands = commands.to_vec();
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM commands INDEXED BY commands_target
+             WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+               AND state IN ('accepted','queued','cancelled','rejected')
+             ORDER BY created_at, rowid LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                parse_agent_id(&from.id)?,
+                from.generation,
+                (SCAN_LIMIT + 1) as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error)?;
+    for (index, row) in rows.enumerate() {
+        if index == SCAN_LIMIT {
+            return Err(Error::new(
+                "fanout_limit",
+                "switch SEND inventory exceeds its safe scan bound; settle older SENDs before switching",
+            ));
+        }
+        let id = row.map_err(sql_error)?;
+        if is_brief_tx(connection, &id)? {
+            continue;
+        }
+        let record = load_command_record(connection, &id)?
+            .ok_or_else(|| Error::new("source_integrity", "switch SEND disappeared"))?;
+        if transferable_send(&record, stopped_source) && !transfer_commands.contains(&id) {
+            if transfer_commands.len() == core::api::MAX_HANDOFF_SENDS {
+                return Err(Error::new(
+                    "fanout_limit",
+                    "switch has more transferable SENDs than one handoff can carry; settle some before switching",
+                ));
+            }
+            transfer_commands.push(id);
+        }
+    }
+    Ok(transfer_commands)
 }
 
 fn source_task(
@@ -310,16 +437,27 @@ fn source_task(
     from: &Agent,
     task_command: &str,
     principal: Option<&str>,
-) -> Result<Command> {
-    let task = load_command(connection, task_command)?.ok_or_else(|| {
-        Error::new(
+) -> Result<Option<Command>> {
+    let binding =
+        crate::Store::work_task_binding(connection, &from.id, from.generation, task_command)?;
+    let Some(task) = load_command(connection, task_command)? else {
+        if let Some((_, issuer)) = binding {
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
+        }
+        return Err(Error::new(
             "not_found",
             format!("original task SEND {task_command} is not retained"),
-        )
-    })?;
+        ));
+    };
     if task.verb != "send"
-        || task.target.as_deref() != Some(&from.id)
-        || task.generation != Some(from.generation)
+        || (task.target.as_deref() != Some(&from.id) || task.generation != Some(from.generation))
+            && binding.is_none()
     {
         return Err(Error::new(
             "invalid",
@@ -335,7 +473,70 @@ fn source_task(
             "handoff transfers only SENDs issued by the caller",
         ));
     }
-    Ok(task)
+    Ok(Some(task))
+}
+
+/// Resolve the selected original SEND, including a pruned command with a Git record.
+fn continuation_task(
+    connection: &Connection,
+    from: &Agent,
+    task_command: &str,
+    principal: Option<&str>,
+) -> Result<Option<Command>> {
+    let selected = if task_command.is_empty() {
+        crate::Store::selected_work_task_command(connection, &from.id, from.generation)?
+    } else {
+        Some(task_command.to_owned())
+    };
+    if let Some(id) = selected.filter(|id| !id.is_empty()) {
+        if let Some((_, issuer)) =
+            crate::Store::work_task_binding(connection, &from.id, from.generation, &id)?
+        {
+            if principal.is_some_and(|principal| issuer.as_deref() != Some(principal)) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(None);
+        }
+        if let Some(task) = load_command(connection, &id)? {
+            if task.target.as_deref() != Some(&from.id)
+                || !matches!(task.verb.as_str(), "send" | "launch")
+                || task.args.get("text").and_then(Value::as_str).is_none()
+            {
+                return Err(Error::new(
+                    "invalid",
+                    format!("task {id} is not an instruction to {}", from.id),
+                ));
+            }
+            if principal.is_some_and(|principal| task.principal != principal) {
+                return Err(Error::new(
+                    "not_allowed",
+                    "handoff transfers only SENDs issued by the caller",
+                ));
+            }
+            return Ok(Some(task));
+        }
+    }
+    let id: Option<String> = connection
+        .query_row(
+            "SELECT id FROM commands INDEXED BY commands_target
+             WHERE target = ?1 AND verb IN ('send', 'launch')
+               AND principal NOT LIKE 'swarm_note:%'
+               AND (?2 IS NULL OR principal = ?2)
+               AND json_type(args, '$.text') = 'text'
+             ORDER BY (link_kind IS 'handoff' AND ordinal = 0), state = 'rejected',
+                      created_at, rowid
+             LIMIT 1",
+            params![parse_agent_id(&from.id)?, principal],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    id.map(|id| load_command(connection, &id))
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn source_sends(
@@ -344,7 +545,7 @@ fn source_sends(
     commands: &[String],
     principal: Option<&str>,
     policy: &core::SecretPolicy,
-    project_transfer: bool,
+    stopped_source: bool,
 ) -> Result<Vec<Command>> {
     let mut originals = Vec::new();
     for id in commands {
@@ -352,35 +553,11 @@ fn source_sends(
             Error::new("not_found", format!("selected SEND {id} is not retained"))
         })?;
         let c = &record.command;
-        let transferable = if project_transfer {
-            c.outcome.as_ref().is_some_and(|outcome| {
-                outcome.get("successor").is_none()
-                    && match c.state {
-                        CommandState::Cancelled => outcome["reason"] == "generation_stopped",
-                        CommandState::Rejected => {
-                            outcome["reason"] == "transfer_in_progress"
-                                && outcome["where"] == "router.dispatch.preflight"
-                        }
-                        _ => false,
-                    }
-            })
-        } else {
-            matches!(c.state, CommandState::Accepted | CommandState::Queued)
-        };
-        if c.verb != "send"
-            || c.target.as_deref() != Some(&from.id)
+        if c.target.as_deref() != Some(&from.id)
             || c.generation != Some(from.generation)
-            || !transferable
-            || c.turn_id.is_some()
-            || record.expected_turn_id.is_some()
-            || c.request_id.is_some()
-            || c.probe
-            || c.selector.is_some()
-            || c.args
-                .as_object()
-                .is_none_or(|args| args.len() != 1 || !args.contains_key("text"))
+            || !transferable_send(&record, stopped_source)
         {
-            let required = if project_transfer {
+            let required = if stopped_source {
                 "a plain SEND stopped or fenced before dispatch"
             } else {
                 "an undispatched plain SEND"
@@ -410,15 +587,64 @@ fn source_sends(
     Ok(originals)
 }
 
+/// A plain SEND that never reached the native session. From a stopped or lost
+/// source this also covers input the generation's end cancelled without effect.
+pub(super) fn transferable_send(record: &CommandRecord, stopped_source: bool) -> bool {
+    let c = &record.command;
+    let pending = matches!(c.state, CommandState::Accepted | CommandState::Queued);
+    // A provider hold refused this input at dispatch, before any native effect.
+    let held = c.state == CommandState::Rejected
+        && c.outcome.as_ref().is_some_and(|outcome| {
+            outcome.get("successor").is_none()
+                && outcome["reason"] == "provider_held"
+                && outcome["where"] == "router.dispatch.preflight"
+        });
+    let undelivered = pending
+        || held
+        || (stopped_source
+            && c.outcome.as_ref().is_some_and(|outcome| {
+                outcome.get("successor").is_none()
+                    && match c.state {
+                        CommandState::Cancelled => {
+                            outcome["reason"] == "generation_stopped"
+                                || outcome["reason"] == "generation_lost"
+                        }
+                        CommandState::Rejected => {
+                            outcome["reason"] == "transfer_in_progress"
+                                && outcome["where"] == "router.dispatch.preflight"
+                        }
+                        _ => false,
+                    }
+            }));
+    c.verb == "send"
+        && undelivered
+        && c.turn_id.is_none()
+        && record.expected_turn_id.is_none()
+        && c.request_id.is_none()
+        && !c.probe
+        && c.selector.is_none()
+        && c.args
+            .as_object()
+            .is_some_and(|args| args.len() == 1 && args.contains_key("text"))
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum HandoffInput<'a> {
-    Brief,
+    /// Context for an existing destination, which waits for its own input.
+    Brief {
+        facts: &'a BriefFacts,
+        /// A switch finds the task itself and accepts an ended source.
+        discover: bool,
+    },
+    /// B continues the task from its branch.
+    Continuation {
+        directive: &'a str,
+        facts: &'a BriefFacts,
+    },
     /// The switch has already proven an exact provider refusal before work.
     ProviderRetry,
     /// The project transfer has proved source custody and performed the team edits.
-    ProjectTransfer {
-        saved_context: Option<&'a str>,
-    },
+    ProjectTransfer { saved_context: Option<&'a str> },
 }
 
 /// Shared transfer transaction. Caller commits, or rolls back the entire transfer.
@@ -432,7 +658,11 @@ pub(super) fn handoff_tx(
     input: HandoffInput<'_>,
 ) -> Result<HandoffAdmission> {
     let project_transfer = matches!(input, HandoffInput::ProjectTransfer { .. });
-    if !project_transfer || !request.task_command.is_empty() {
+    let from_switch = matches!(
+        input,
+        HandoffInput::Continuation { .. } | HandoffInput::Brief { discover: true, .. }
+    );
+    if (!project_transfer && !from_switch) || !request.task_command.is_empty() {
         request.validate()?;
     }
     // Owner hands off anywhere with claims, Goal and children. A manager may
@@ -523,22 +753,24 @@ pub(super) fn handoff_tx(
     }
     project_transfer::require_no_intent(tx, &from.project)?;
     project_transfer::require_no_intent(tx, &to.project)?;
+    let continuation = matches!(input, HandoffInput::Continuation { .. });
     if project_transfer && from.is_terminal() {
         require_settled_input(tx, &from, parse_agent_id(&from.id)?)?;
+    } else if from_switch {
+        transfer_source_ready(tx, &from)?;
     } else {
         quiescent(tx, &from, false)?;
     }
     quiescent(tx, &to, true)?;
     let input_principal = manager_caller.as_ref().map(|_| principal);
-    let task = if project_transfer && request.task_command.is_empty() {
+    let task = if matches!(input, HandoffInput::ProviderRetry) {
+        source_task(tx, &from, &request.task_command, input_principal)?
+    } else if from_switch {
+        continuation_task(tx, &from, &request.task_command, input_principal)?
+    } else if project_transfer && request.task_command.is_empty() {
         None
     } else {
-        Some(source_task(
-            tx,
-            &from,
-            &request.task_command,
-            input_principal,
-        )?)
+        source_task(tx, &from, &request.task_command, input_principal)?
     };
     let originals = source_sends(
         tx,
@@ -546,17 +778,52 @@ pub(super) fn handoff_tx(
         &request.commands,
         input_principal,
         policy,
-        project_transfer,
+        project_transfer || (from_switch && from.is_terminal()),
     )?;
     let required_task = || {
         task.as_ref()
             .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))
     };
     let (brief_text, brief_truncated) = match input {
-        HandoffInput::Brief => brief::build(tx, request, Some(required_task()?), policy, None)?,
-        HandoffInput::ProjectTransfer { saved_context } => {
-            brief::build(tx, request, task.as_ref(), policy, saved_context)?
-        }
+        HandoffInput::Brief { facts, .. } => brief::build(
+            tx,
+            request,
+            task.as_ref(),
+            policy,
+            brief::BriefInput {
+                saved_context: None,
+                transferred: &originals,
+                facts: Some(facts),
+                directive: None,
+                now,
+            },
+        )?,
+        HandoffInput::Continuation { directive, facts } => brief::build(
+            tx,
+            request,
+            task.as_ref(),
+            policy,
+            brief::BriefInput {
+                saved_context: None,
+                transferred: &originals,
+                facts: Some(facts),
+                directive: Some(directive),
+                now,
+            },
+        )?,
+        HandoffInput::ProjectTransfer { saved_context } => brief::build(
+            tx,
+            request,
+            task.as_ref(),
+            policy,
+            brief::BriefInput {
+                saved_context,
+                transferred: &originals,
+                facts: None,
+                directive: None,
+                now,
+            },
+        )?,
         HandoffInput::ProviderRetry => {
             let task = required_task()?;
             if policy.contains_value(&task.args) {
@@ -583,7 +850,8 @@ pub(super) fn handoff_tx(
         } else {
             let (claims, claim_conflicts, conflicts_truncated) =
                 attribution::transfer_claims_tx(tx, &from, &to, policy, now, &mut events)?;
-            let goal_revision = goals::transfer_goal_tx(tx, &from, &to, policy, now, &mut events)?;
+            let goal_revision =
+                goals::transfer_goal_tx(tx, &from, &to, policy, continuation, now, &mut events)?;
             let moved = reparent::reparent_tx(
                 tx,
                 &ReparentRequest {
@@ -709,6 +977,17 @@ pub(super) fn handoff_tx(
         )
         .map_err(sql_error)?;
     }
+    // The durable fact that this generation's work has moved. Automatic
+    // handoff reads it so the same work is never moved twice.
+    events.push(insert_daemon_event(
+        tx,
+        now,
+        AGENT_HANDED_OFF,
+        "handoff",
+        Some(parse_agent_id(&from.id)?),
+        Some(from.generation),
+        json!({"handoff": request.id, "to": to.id, "to_generation": to.generation}),
+    )?);
     super::result_page::record_handoff_origin_tx(tx, parse_agent_id(&to.id)?, to.generation)?;
     refresh_parent_tx(tx, &brief_command, now)?;
     let parent = load_command(tx, &request.id)?
@@ -723,20 +1002,127 @@ pub(super) fn handoff_tx(
     })
 }
 
-pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) -> Result<()> {
+/// A continuation source is idle, or an ended session whose processes have
+/// fully drained. Unknown outcomes of an ended generation cannot still land:
+/// they stay recorded, are named in the brief and are never replayed.
+pub(super) fn transfer_source_ready(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
     observer::require_controlled(agent)?;
-    let num = parse_agent_id(&agent.id)?;
-    if agent.state != AgentState::Idle || agent.active_turn.is_some() || !agent.pending.is_empty() {
+    if !agent.is_terminal() {
+        return live_source_ready(tx, agent);
+    }
+    if let Some(blocker) = session_exit_blocker(tx, agent)? {
         return Err(Error::new(
             "busy",
             format!(
-                "handoff requires idle Agent {} generation {} with no active turn or pending request; its state is {}",
-                agent.id,
-                agent.generation,
-                agent_state_name(agent.state),
+                "Agent {} may still be writing to its worktree: {blocker}",
+                agent.id
             ),
         ));
     }
+    Ok(())
+}
+
+/// Only the running generation can still act on an uncertain command or
+/// turn, so only that blocks a live source, and stopping it clears the block.
+fn live_source_ready(tx: &Transaction<'_>, agent: &Agent) -> Result<()> {
+    require_idle(agent, false)?;
+    let num = parse_agent_id(&agent.id)?;
+    let open: Option<String> = tx
+        .query_row(
+            "SELECT verb || ' ' || id || ' (' || state || ')' FROM commands
+             WHERE target = ?1 AND generation = ?2 AND state IN ('dispatched', 'unknown')
+             UNION ALL
+             SELECT 'turn ' || turn_id || ' (' || state || ')' FROM turns
+             WHERE agent = ?1 AND generation = ?2 AND state IN ('running', 'unknown')
+             LIMIT 1",
+            params![num, agent.generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    if let Some(open) = open {
+        return Err(Error::new(
+            "busy",
+            format!(
+                "the running session of Agent {} may still apply {open}. Run `swarm stop {}`, then retry; the brief will name it",
+                agent.id, agent.id
+            ),
+        ));
+    }
+    require_no_pending_request(tx, agent, num)
+}
+
+/// The Agent now holding this Agent's worktree, following each
+/// same-worktree handoff to the end of the chain.
+pub(crate) fn current_successor(connection: &Connection, agent: i64) -> Result<Option<String>> {
+    let mut statement = connection
+        .prepare_cached("SELECT successor FROM agent_successors WHERE agent = ?1")
+        .map_err(sql_error)?;
+    let (mut current, mut cursor) = (None, agent);
+    for _ in 0..MAX_SUCCESSOR_CHAIN {
+        let Some(next) = statement
+            .query_row([cursor], |row| row.get::<_, i64>(0))
+            .optional()
+            .map_err(sql_error)?
+        else {
+            break;
+        };
+        current = Some(next);
+        cursor = next;
+    }
+    Ok(current.map(format_agent_id))
+}
+
+/// New input to a handed-off Agent would write to a worktree its successor
+/// now owns, so it is refused with the Agent to use instead.
+pub(crate) fn require_not_handed_off(connection: &Connection, agent: i64) -> Result<()> {
+    match current_successor(connection, agent)? {
+        Some(successor) => Err(Error::new(
+            "handed_off",
+            format!(
+                "Agent {} handed its work to {successor}; send to {successor} instead",
+                format_agent_id(agent)
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// What still prevents treating an ended generation's process tree as gone.
+/// A lost state alone proves nothing: orphaned harness children can keep
+/// writing until custody records the whole family's exit.
+pub(super) fn session_exit_blocker(tx: &Connection, agent: &Agent) -> Result<Option<String>> {
+    let num = parse_agent_id(&agent.id)?;
+    if let Some(blocker) = agent_lifecycle::custody_blocker_tx(tx, num, false, None)? {
+        return Ok(Some(blocker));
+    }
+    let proof = capacity::owned_exit_proof_tx(tx, num, agent.generation)?;
+    if proof.is_complete() {
+        return Ok(None);
+    }
+    // A generation refused before any process started has nothing to drain.
+    let started: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM processes WHERE owner = ?1)",
+            [format!("agent:{}#{}", agent.id, agent.generation)],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !started {
+        return Ok(None);
+    }
+    Ok(Some(
+        proof
+            .missing_reason()
+            .unwrap_or("process exit is unproven")
+            .to_owned(),
+    ))
+}
+
+pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) -> Result<()> {
+    observer::require_controlled(agent)?;
+    let num = parse_agent_id(&agent.id)?;
+    require_idle(agent, destination)?;
     require_settled_input(tx, agent, num)?;
     let open: Option<String> = tx
         .query_row(
@@ -754,6 +1140,30 @@ pub(super) fn quiescent(tx: &Transaction<'_>, agent: &Agent, destination: bool) 
             format!("Agent {} has unresolved command {command}", agent.id),
         ));
     }
+    require_no_pending_request(tx, agent, num)
+}
+
+fn require_idle(agent: &Agent, destination: bool) -> Result<()> {
+    if agent.state == AgentState::Idle && agent.active_turn.is_none() && agent.pending.is_empty() {
+        return Ok(());
+    }
+    let remedy = if destination {
+        String::new()
+    } else {
+        format!(". Run `swarm interrupt {}`, then retry", agent.id)
+    };
+    Err(Error::new(
+        "busy",
+        format!(
+            "handoff requires idle Agent {} generation {} with no active turn or pending request; its state is {}{remedy}",
+            agent.id,
+            agent.generation,
+            agent_state_name(agent.state),
+        ),
+    ))
+}
+
+fn require_no_pending_request(tx: &Transaction<'_>, agent: &Agent, num: i64) -> Result<()> {
     let pending: bool = tx
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pending_requests WHERE agent=?1 AND state='pending')",

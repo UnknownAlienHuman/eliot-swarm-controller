@@ -75,8 +75,21 @@ impl Router {
         } else {
             None
         };
+        let data_dir = eliot_core::display_path(&self.inner.data_root.to_string_lossy());
+        let mut visible: Vec<_> = page.into_iter().map(|(_, item)| item).collect();
+        for item in &mut visible {
+            if let Some(instructions) = item.instructions.as_mut() {
+                *instructions = instructions.replace(
+                    "\nswarm checkpoint restore",
+                    &format!(
+                        "\nswarm --data-dir {} checkpoint restore",
+                        powershell_quote(&data_dir)
+                    ),
+                );
+            }
+        }
         serde_json::to_value(OwnerInboxResponse {
-            items: page.into_iter().map(|(_, item)| item).collect(),
+            items: visible,
             next,
         })
         .map_err(|_| Error::new("internal", "owner inbox could not be encoded"))
@@ -305,4 +318,8 @@ impl Router {
         self.mail_send_finish(&request, change).await?;
         Ok(())
     }
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }

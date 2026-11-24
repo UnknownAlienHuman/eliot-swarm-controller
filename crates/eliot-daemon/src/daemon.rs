@@ -547,6 +547,7 @@ async fn initialize_runtime(
     };
     router.note_events(&recovered);
     router.reconcile_git_integrations(None).await?;
+    router.recover_git_checkpoints().await?;
     logging::record(&policy, "daemon.recovered", &[], None);
     let capacity = restart_capacity::Reconcile {
         store: Arc::clone(&store),
@@ -556,6 +557,12 @@ async fn initialize_runtime(
         on_restart: daemon_config.on_restart,
     };
     let report = restart_capacity::reconcile_first_pass(&capacity).await?;
+    let switch_events = store
+        .lock()
+        .await
+        .reconcile_switch_checkout_fences(now_ms())?;
+    bus.publish(&switch_events);
+    router.note_events(&switch_events);
     logging::record(&policy, "daemon.capacity_reconciled", &[], None);
     logging::record_debug(
         &policy,
@@ -760,6 +767,19 @@ async fn spawn_workers(
             let router = context_router.clone();
             async move {
                 let result = crate::router::run_context_notes(router, shutdown.clone()).await;
+                crate::daemon::workers::from_result(result, &shutdown)
+            }
+        },
+    ));
+    let work_truth_router = router.clone();
+    workers.spawn(crate::daemon::workers::supervise(
+        "work_truth",
+        worker_reporter.clone(),
+        worker_stop.subscribe(),
+        move |shutdown: watch::Receiver<bool>| {
+            let router = work_truth_router.clone();
+            async move {
+                let result = crate::router::run_work_truth(router, shutdown.clone()).await;
                 crate::daemon::workers::from_result(result, &shutdown)
             }
         },

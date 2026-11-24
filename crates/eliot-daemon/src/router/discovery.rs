@@ -46,6 +46,15 @@ const METHODS: &[Method] = &[
         "Read the Owner decision queue and offered actions.",
         {}
     ),
+    method!(
+        "checkpoint.restore",
+        CheckpointRestoreRequest,
+        CheckpointRestoreResponse,
+        true,
+        true,
+        "Restore both staged and worktree checkpoint layers into a clean worktree at the captured HEAD.",
+        {"id":EXAMPLE_ID,"agent":"a1","generation":1,"checkpoint_ref":"refs/eliot/checkpoints/a1/g1/0000000000000001-01ARZ3NDEKTSV4RRFFQ69G5FAV","workspace":"C:/work"}
+    ),
     method!("owner.decide", OwnerDecideRequest, OwnerDecideResponse, true, true, "Execute a revision-bound choice or snooze the item until its subject changes.", {"id":EXAMPLE_ID,"item":{"kind":"agent","subject":"a1","revision":"example"},"choice":"snooze"}),
     method!("owner.decide.bulk", OwnerBulkDecideRequest, OwnerBulkDecideResponse, true, true, "Apply recommended actions for explicit revision-bound Owner inbox refs.", {"id":EXAMPLE_ID,"items":[{"kind":"agent","subject":"a1","revision":"example"}]}),
     method!("launch.enqueue", LaunchQueueRequest, LaunchIntentView, false, true, "Enqueue an interactive launch intent for fair admission.", {"id":EXAMPLE_ID,"args":{"profile":"worker","workspace":"C:/work"}}),
@@ -231,7 +240,7 @@ const METHODS: &[Method] = &[
     method!("swarm.wait", SwarmWaitRequest, SwarmWaitResponse, false, false, "Wait up to 30 s for frozen child commands/turns (all/any); completed turns return final_text.", {"commands":[EXAMPLE_ID],"turns":[],"mode":"all","wait_ms":30000}),
     method!("swarm.digest", SwarmDigestRequest, SwarmDigestResponse, false, true, "Register a durable completion digest with the standard mail wake.", {"id":EXAMPLE_ID,"to":"a1","mode":"all","commands":[EXAMPLE_ID],"turns":[]}),
     method!("swarm.reparent", ReparentRequest, ReparentResponse, true, true, "Move one Agent subtree or all children to a controlled manager; Owner only.", {"id":EXAMPLE_ID,"agent":"a2","expected_generation":1,"parent":"a3","parent_generation":1}),
-    method!("swarm.switch", SwitchRequest, SwitchResponse, true, true, "Launch a new session with atomic handoff; launch.project continues a chat in a project.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
+    method!("swarm.switch", SwitchRequest, SwitchResponse, false, true, "Move a task to a new session in its worktree; Owner anywhere, manager for a worker in scope; launch.project continues a chat in a project.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"task_command":"retained-task","commands":[],"launch":{"harness":"antigravity","model":"gemini-4-hydrogen-low"}}),
     method!("swarm.handoff", HandoffRequest, HandoffResponse, false, true, "Transfer caller-issued inputs only; Owner with children, manager in scope never moves them.", {"id":EXAMPLE_ID,"from":"a1","from_generation":1,"to":"a2","to_generation":1,"task_command":"retained-task","commands":[]}),
     method!("command.cancel", CommandCancelRequest, CommandCancelResponse, false, true, "Withdraw one undispatched SEND; Owner for handoff, issuer-manager in scope incl. selector child.", {"id":EXAMPLE_ID,"command_id":"retained-handoff/send-0"}),
     method!("project.transfer", ProjectTransferRequest, ProjectTransferResult, true, true, "Drain, transfer or cancel a registered project manager assignment. Owner only.", {"id":EXAMPLE_ID,"project":"project-1","expected_revision":1,"action":{"kind":"begin"}}),
@@ -603,6 +612,7 @@ impl Router {
             "mail.send" => &["swarm msg send"],
             "mail.inbox" => &["swarm msg inbox", "swarm inbox (Agent)"],
             "owner.inbox" => &["swarm inbox"],
+            "checkpoint.restore" => &["swarm checkpoint restore"],
             "owner.decide.bulk" => &["swarm inbox apply"],
             "mail.read" => &["swarm msg show"],
             "mail.ack" => &["swarm msg ack"],
@@ -1000,6 +1010,9 @@ fn method_limits(name: &str) -> &'static str {
         "owner.inbox" => {
             "Owner only. Page at most 100 current items. Continue with next, when present."
         }
+        "checkpoint.restore" => {
+            "Owner only. Restore only the exact retained Agent-generation checkpoint into a clean worktree at the checkpoint's original HEAD and Git common directory. Refuses an active Agent workspace, dirty target, secret path/content, changed HEAD or repository mismatch."
+        }
         "owner.decide" => {
             "Owner only. Use the displayed kind, subject and revision with an offered choice, recommended, or snooze. Arguments fill only the chosen action's input fields."
         }
@@ -1013,7 +1026,7 @@ fn method_limits(name: &str) -> &'static str {
             "Owner only. Ready grouped projection with event-watermark readback; no client-side Git discovery."
         }
         "swarm.switch" => {
-            "Owner only. Exact source generation; at most 64 selected plain SENDs. Reserve child IDs before launch preparation. Choose profile or ad-hoc harness/model/effort/auth/cmd. No launch prompt. launch.project continues a chat in a registered project: B runs in the target standard worktree while retaining A's authorization scope, and B's organization link records continued_from. Exact session readiness precedes atomic H2 handoff. Failure retains created B; stop separately. Same-ID replay never launches again. Finish an untransferred ready B with ordinary swarm.handoff."
+            "Owner anywhere, or a manager for a worker in its controlled scope, choosing a profile or role in the worker's worktree with authority equal or narrower. Exact source generation; at most 64 selected plain SENDs. Reserve child IDs before launch preparation. Choose profile, role or ad-hoc harness/model/effort/auth/cmd. No launch prompt. launch.project continues a chat in a registered project: B runs in the target standard worktree while retaining A's authorization scope, and B's organization link records continued_from. Exact session readiness precedes atomic H2 handoff. Failure retains created B; stop separately. Same-ID replay never launches again. Finish an untransferred ready B with ordinary swarm.handoff."
         }
         "swarm.handoff" => {
             "Owner anywhere, or a manager between two workers (never itself) in its own controlled scope for caller-issued inputs only. Distinct existing Agents in the same project; exact generations and retained task SEND required. At most 64 selected plain accepted/queued SENDs and configured selector bound. A quiescent, B cleanly idle. Owner transfers all live claims, a quiescent Goal (paused), and all children atomically; Agent handoffs never move children, claims or Goals. Brief first; failed/unknown brief holds successors queued until resolution or cancellation. No native resend on retry."

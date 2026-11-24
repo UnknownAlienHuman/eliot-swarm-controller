@@ -528,6 +528,7 @@ impl DesktopApp {
                       model: Option<String>,
                       effort: Option<String>| SwitchLaunch {
             profile,
+            role: None,
             harness,
             model,
             effort,

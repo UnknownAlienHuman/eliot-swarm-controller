@@ -133,6 +133,22 @@ pub fn lines(
             }));
             values
         }),
+        line("Work in Git", &read.work_in_git, |counts| {
+            vec![
+                format!(
+                    "{} of {} turns left all work in Git · {} with a checkpoint · {} not recorded",
+                    n(counts.turns_in_git),
+                    n(counts.turns),
+                    n(counts.snapshots),
+                    n(counts.not_in_git)
+                ),
+                format!(
+                    "{} handoffs · {} automatic",
+                    n(counts.handoffs),
+                    n(counts.automatic_handoffs)
+                ),
+            ]
+        }),
         line("Owner backlog", &read.owner_waiting, |counts| {
             let mut values = vec![
                 format!("{} waiting for you", n(counts.total)),

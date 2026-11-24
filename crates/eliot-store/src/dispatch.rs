@@ -39,6 +39,21 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     if !is_attachment_verb(command.command.verb.as_str()) {
         observer::require_controlled(&agent)?;
     }
+    if matches!(command.command.verb.as_str(), "send" | "steer" | "resume") {
+        handoff::require_not_handed_off(tx, agent_num)?;
+    }
+    if command.command.verb == "resume" {
+        switch::require_no_active_checkout_switch(tx, agent_num)?;
+        switch::require_checkout_owner_tx(tx, agent.workspace.as_deref(), Some(agent_num))?;
+    }
+    if command.command.verb == "launch" {
+        switch::require_checkout_launch_tx(
+            tx,
+            &command.command.id,
+            agent_num,
+            agent.workspace.as_deref(),
+        )?;
+    }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;
     }
@@ -316,6 +331,7 @@ fn dispatch_resume_tx(
             "resume target changed before its new generation was committed",
         ));
     }
+    Store::inherit_handoff_lineage_tx(tx, agent_num, old_generation, next_generation)?;
     let reason = if restart_resume {
         eliot_core::api::GenerationReason::RestartResume
     } else if command.command.principal == "owner" {
@@ -360,6 +376,12 @@ fn dispatch_resume_tx(
         ));
     }
     project_assignment::advance_resume(tx, agent, agent_num, next_generation, id)?;
+    super::work_truth::inherit_work_task_generation_tx(
+        tx,
+        (agent_num, old_generation),
+        (agent_num, next_generation),
+        now,
+    )?;
     super::goals::advance_resume_tx(
         tx,
         agent_num,
@@ -868,6 +890,7 @@ fn dispatch_inject_tx(
             "active_turn inject unexpectedly has a native request id",
         ));
     }
+    handoff::require_not_handed_off(tx, parse_agent_id(&agent.id)?)?;
     provider_holds::require_dispatch_tx(tx, agent, &command.command)?;
     if args
         .expires_at_ms

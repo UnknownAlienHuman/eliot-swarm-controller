@@ -1024,6 +1024,28 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
     delete_db!(tx.execute("UPDATE provider_holds SET probe_command=NULL, state='held', updated_at=?1 WHERE probe_command IN (SELECT id FROM deleted_commands)",[now]));
     // Active cleanup attempts already block. Deleting the Agent supersedes
     // plan items that never acquired an attempt fence.
+    // A deleted holder passes the worktree on to its own successor, so an
+    // earlier source in the chain never regains a worktree someone else holds.
+    for _ in 0..64 {
+        let moved = delete_db!(tx.execute(
+            "UPDATE agent_successors SET successor =
+                 (SELECT next.successor FROM agent_successors next
+                  WHERE next.agent = agent_successors.successor)
+             WHERE successor IN (SELECT id FROM deleted_agents)
+               AND agent NOT IN (SELECT id FROM deleted_agents)
+               AND EXISTS (SELECT 1 FROM agent_successors next
+                           WHERE next.agent = agent_successors.successor)",
+            []
+        ));
+        if moved == 0 {
+            break;
+        }
+    }
+    delete_db!(tx.execute(
+        "DELETE FROM agent_successors WHERE agent IN (SELECT id FROM deleted_agents)
+             OR successor IN (SELECT id FROM deleted_agents)",
+        []
+    ));
     for (table, column) in [
         ("agent_config", "agent"),
         ("agent_edits", "agent"),
@@ -1044,6 +1066,9 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("completion_digests", "parent"),
         ("artifacts", "agent"),
         ("chat_organization", "agent"),
+        ("git_checkpoints", "agent"),
+        ("git_checkpoint_restore_points", "agent"),
+        ("git_work_tasks", "agent"),
     ] {
         delete_db!(tx.execute(
             &format!("DELETE FROM {table} WHERE {column} IN (SELECT id FROM deleted_agents)"),

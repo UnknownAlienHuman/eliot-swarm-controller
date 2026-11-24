@@ -79,14 +79,55 @@ struct AvailableRoute {
     quota: CandidateQuota,
 }
 
+/// Who may succeed a source whose successor no Owner chose by hand.
+pub(super) struct HandoffRoute {
+    pub(super) reason: eliot_core::api::HandoffReason,
+    pub(super) kind: Option<eliot_core::ProviderRestrictionKind>,
+    /// A role a manager asked for, in place of the source's own.
+    pub(super) role: Option<String>,
+    /// A manager's child profiles.
+    pub(super) allowed: Option<Vec<String>>,
+}
+
+pub(super) fn handoff_waiting_message(error: &Error) -> Option<String> {
+    if let Some(decision) = error.routing.as_deref() {
+        let skipped = decision
+            .skipped
+            .iter()
+            .map(|skip| format!("{} ({})", skip.profile, skip.reason.user_message()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Some(format!(
+            "No eligible successor in routing.handoff_fallback. {skipped}"
+        ));
+    }
+    (error.code == "handoff_unavailable").then(|| (*error.message).clone())
+}
+
+fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<String>> {
+    let reason = if !routing.auto_handoff() {
+        "Automatic handoff is disabled"
+    } else if routing.handoff_fallback.is_empty() {
+        "routing.handoff_fallback is empty"
+    } else {
+        return Ok(routing.handoff_fallback);
+    };
+    Err(Error::new("handoff_unavailable", reason))
+}
+
 #[derive(Default)]
 struct RoutePreflight {
     arbitrated: bool,
     automatic: bool,
     provider_switch: bool,
+    prefer_candidate_order: bool,
     offer_due_probe: bool,
     provider_authority: Option<[u8; 32]>,
     provider_source: Option<Value>,
+    handoff_source: Option<Value>,
+    handoff_allowed: Option<Vec<String>>,
+    /// Source profile when a sandboxed successor could not commit here.
+    handoff_no_commit: Option<String>,
     held_accounts: HashMap<String, Value>,
     capacity_refusal: Option<Error>,
     provider_refusal: Option<Error>,
@@ -202,11 +243,12 @@ impl Router {
             skipped: Vec::new(),
             quota_status: RouteQuotaStatus::Unknown,
             provider_failover: (provider_reactions
+                && routing.auto_handoff()
                 && routing.provider_failover()
                 && matches!(principal, Principal::Owner)
                 && !mode.arbitrated
                 && request.args.get("chat") != Some(&Value::Bool(true)))
-            .then(Vec::new),
+            .then(|| routing.handoff_fallback.clone()),
             owner_automation: mode.owner_automation,
         };
         // A held account is never replaced with another account of the same
@@ -334,13 +376,14 @@ impl Router {
         let mut decision = source.profile_choice.clone().ok_or_else(|| {
             Error::new("source_integrity", "provider switch has no retained route")
         })?;
-        let candidates = decision.provider_failover.take().ok_or_else(|| {
+        let frozen = decision.provider_failover.take().ok_or_else(|| {
             Error::new(
                 "source_integrity",
                 "provider switch has no remaining policy",
             )
         })?;
         decision.profile = None;
+        decision.source = "settings.routing.handoff_fallback".to_owned();
         decision.reason = format!("{} refused the task ({})", source.profile, kind.as_str());
         decision.skipped.push(RouteSkip {
             profile: source.profile.clone(),
@@ -348,10 +391,16 @@ impl Router {
             quota_status: decision.quota_status,
         });
         decision.quota_status = RouteQuotaStatus::Unknown;
-        decision.provider_failover = Some(Vec::new());
+        let routing = crate::config::load_routing_config(&self.inner.data_root)?;
+        let candidates: Vec<_> = automatic_fallback(routing)?
+            .into_iter()
+            .filter(|name| frozen.contains(name))
+            .collect();
+        decision.provider_failover = Some(candidates.clone());
         decision.owner_automation |= owner_automation;
         let mut preflight = RoutePreflight {
             provider_switch: true,
+            prefer_candidate_order: true,
             provider_authority: Some(authority),
             provider_source: Some(source.profile_snapshot.clone()),
             ..RoutePreflight::default()
@@ -376,6 +425,121 @@ impl Router {
         Ok((name, switch_account_identity(&snapshot)))
     }
 
+    /// The daemon follows the Owner's continuation list. A manager's explicit
+    /// role request uses that role and remains bounded by child authority.
+    fn handoff_candidates(&self, source: &Agent, route: &HandoffRoute) -> Result<Vec<String>> {
+        use eliot_core::api::HandoffReason;
+        let routing = crate::config::load_routing_config(&self.inner.data_root)?;
+        let mut list = if let Some(role) = route.role.as_deref() {
+            routing.candidates(role).unwrap_or_default().to_vec()
+        } else {
+            automatic_fallback(routing)?
+        };
+        let keep_source =
+            route.reason == HandoffReason::SessionLost && source.state == AgentState::Lost;
+        let tried: Vec<&str> = source
+            .profile_choice
+            .iter()
+            .flat_map(|choice| &choice.skipped)
+            .filter(|skip| skip.reason == RouteSkipReason::ProviderFailure)
+            .map(|skip| skip.profile.as_str())
+            .collect();
+        let mut seen = HashSet::new();
+        list.retain(|name| {
+            seen.insert(name.clone())
+                && (keep_source || name != &source.profile)
+                && !tried.contains(&name.as_str())
+        });
+        Ok(list)
+    }
+
+    pub(super) async fn route_handoff(
+        &self,
+        request: &mut SubmitCommand,
+        source: &Agent,
+        route: &HandoffRoute,
+    ) -> Result<(String, Value)> {
+        use eliot_core::api::HandoffReason;
+        let candidates = self.handoff_candidates(source, route)?;
+        let role = route
+            .role
+            .clone()
+            .unwrap_or_else(|| "handoff_fallback".to_owned());
+        let mut skipped: Vec<RouteSkip> = source
+            .profile_choice
+            .iter()
+            .flat_map(|choice| &choice.skipped)
+            .filter(|skip| skip.reason == RouteSkipReason::ProviderFailure)
+            .cloned()
+            .collect();
+        if route.reason != HandoffReason::SessionLost || source.state != AgentState::Lost {
+            skipped.push(RouteSkip {
+                profile: source.profile.clone(),
+                reason: RouteSkipReason::ProviderFailure,
+                quota_status: RouteQuotaStatus::Unknown,
+            });
+        }
+        let reason = match route.reason {
+            HandoffReason::ProviderHold => format!(
+                "{} is on a provider {} hold",
+                source.profile,
+                route.kind.map_or("quota", |kind| kind.as_str())
+            ),
+            HandoffReason::SessionLost => format!("the {} session ended", source.profile),
+            HandoffReason::Routing | HandoffReason::Request => {
+                format!("the work moved from {}", source.profile)
+            }
+        };
+        let decision = RoutingDecision {
+            source: format!("settings.routing.{role}"),
+            role,
+            profile: None,
+            reason,
+            skipped,
+            quota_status: RouteQuotaStatus::Unknown,
+            provider_failover: None,
+            owner_automation: true,
+        };
+        let can_commit = match source.workspace.as_deref() {
+            Some(workspace) => self
+                .inner
+                .store
+                .lock()
+                .await
+                .worktree_branch_base(workspace)?
+                .is_some(),
+            None => false,
+        };
+        let mut preflight = RoutePreflight {
+            provider_switch: true,
+            prefer_candidate_order: route.role.is_none(),
+            handoff_source: Some(source.profile_snapshot.clone()),
+            handoff_allowed: route.allowed.clone(),
+            handoff_no_commit: (!can_commit).then(|| source.profile.clone()),
+            ..RoutePreflight::default()
+        };
+        // Never sidestep a held account through another account of the same
+        // harness. Another harness is a separate, policy-named provider.
+        if route.reason == HandoffReason::ProviderHold {
+            preflight.held_accounts.insert(
+                source.harness.clone(),
+                switch_account_identity(&source.profile_snapshot),
+            );
+        }
+        self.prepare_quota_policies(&mut preflight, &candidates, None);
+        let (name, _, snapshot) = self
+            .choose_route(
+                &Principal::Owner,
+                request,
+                candidates,
+                None,
+                decision,
+                preflight,
+            )
+            .await?;
+        Ok((name, switch_account_identity(&snapshot)))
+    }
+
     async fn choose_route(
         &self,
         principal: &Principal,
@@ -385,11 +549,10 @@ impl Router {
         mut decision: RoutingDecision,
         mut preflight: RoutePreflight,
     ) -> Result<(String, String, Value)> {
-        let rank_by_quota = !preflight.quota_policies.is_empty();
+        let rank_by_quota =
+            !preflight.prefer_candidate_order && !preflight.quota_policies.is_empty();
         preflight.discovery_deadline =
             Some(std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
-        let mut failover_candidates =
-            (rank_by_quota && decision.provider_failover.is_some()).then(Vec::new);
         let mut selected: Option<AvailableRoute> = None;
         let mut candidates = candidates.into_iter();
         for name in candidates.by_ref() {
@@ -406,9 +569,6 @@ impl Router {
                 .await?;
             match evaluated {
                 Ok(candidate) => {
-                    if let Some(tail) = &mut failover_candidates {
-                        tail.push(candidate.name.clone());
-                    }
                     if selected.as_ref().is_none_or(|prior| {
                         candidate.quota.weekly_used().is_some_and(|used| {
                             prior.quota.weekly_used().is_none_or(|first| used < first)
@@ -446,14 +606,8 @@ impl Router {
             } else {
                 "first available candidate".into()
             };
-            if decision.provider_failover.is_some() {
-                decision.provider_failover = Some(match failover_candidates {
-                    Some(candidates) => candidates
-                        .into_iter()
-                        .filter(|route| route != &name)
-                        .collect(),
-                    None => candidates.collect(),
-                });
+            if let Some(fallback) = &mut decision.provider_failover {
+                fallback.retain(|route| route != &name);
             }
             decision.quota_status = quota.status;
             request.args["profile_choice"] = serde_json::to_value(decision)
@@ -578,6 +732,26 @@ impl Router {
         }
         if let Some(authority) = preflight.provider_authority
             && eliot_core::provider_switch_authority(&snapshot)? != authority
+        {
+            return Ok(Err(RouteSkipReason::Unauthorized));
+        }
+        if let Some(source) = &preflight.handoff_source
+            && eliot_core::handoff_authority_refusal(source, &snapshot).is_some()
+        {
+            return Ok(Err(RouteSkipReason::WiderAuthority));
+        }
+        if preflight
+            .handoff_no_commit
+            .as_deref()
+            .is_some_and(|source| source != name)
+            && crate::work_truth::needs_commit_roots(&harness, &snapshot)
+        {
+            return Ok(Err(RouteSkipReason::CannotCommit));
+        }
+        if preflight
+            .handoff_allowed
+            .as_ref()
+            .is_some_and(|allowed| !allowed.iter().any(|profile| profile == name))
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }

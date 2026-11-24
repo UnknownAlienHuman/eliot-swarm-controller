@@ -1278,6 +1278,7 @@ impl CodexPlugin {
             selected.effort.clone(),
             plan.native_subagents.as_deref(),
             params.pass_agent_identity_to_shell.unwrap_or(true),
+            &params.commit_roots,
         );
         let (thread_method, params_value) = if let Some(subject) = &plan.resume_subject {
             let params = NativeThreadResumeParams {
@@ -1507,7 +1508,12 @@ impl CodexPlugin {
             && readback.model == selected_model
             && readback.model_provider == plan.route.provider()
             && paths_equal(Path::new(&readback.cwd), &plan.workspace)
-            && sandbox_matches(&readback.sandbox, &plan.permissions, &plan.workspace)
+            && sandbox_matches(
+                &readback.sandbox,
+                &plan.permissions,
+                &plan.workspace,
+                &params.commit_roots,
+            )
             && readback_approval_matches(&readback.approval_policy, &plan.approval_policy)
             // Enforce the exact effective effort only if one was requested;
             // an omitted effort accepts and reports the native readback.
@@ -3142,7 +3148,12 @@ fn thread_state(thread: &Value) -> &'static str {
     }
 }
 
-fn sandbox_matches(sandbox: &Value, requested: &str, workspace: &Path) -> bool {
+fn sandbox_matches(
+    sandbox: &Value,
+    requested: &str,
+    workspace: &Path,
+    commit_roots: &[String],
+) -> bool {
     let sandbox_type = sandbox.get("type").and_then(Value::as_str);
     let no_network = match sandbox.get("networkAccess") {
         None => true,
@@ -3155,14 +3166,28 @@ fn sandbox_matches(sandbox: &Value, requested: &str, workspace: &Path) -> bool {
             if sandbox_type != Some("workspaceWrite") || !no_network {
                 return false;
             }
+            let is_commit_root = |root: &Path| {
+                commit_roots
+                    .iter()
+                    .any(|allowed| paths_equal(root, Path::new(allowed)))
+            };
             match sandbox.get("writableRoots") {
-                None => true,
-                Some(Value::Array(roots)) if roots.is_empty() => true,
+                None => commit_roots.is_empty(),
                 Some(Value::Array(roots)) => {
-                    roots.len() == 1
-                        && roots[0]
-                            .as_str()
-                            .is_some_and(|root| paths_equal(Path::new(root), workspace))
+                    let paths: Option<Vec<&Path>> = roots
+                        .iter()
+                        .map(|root| root.as_str().map(Path::new))
+                        .collect();
+                    paths.is_some_and(|paths| {
+                        paths
+                            .iter()
+                            .all(|root| paths_equal(root, workspace) || is_commit_root(root))
+                            && commit_roots.iter().all(|allowed| {
+                                paths
+                                    .iter()
+                                    .any(|root| paths_equal(root, Path::new(allowed)))
+                            })
+                    })
                 }
                 Some(_) => false,
             }

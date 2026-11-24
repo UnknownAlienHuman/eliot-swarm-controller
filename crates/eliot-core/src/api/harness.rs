@@ -51,9 +51,18 @@ pub enum NativeArchiveBinding {
     Workspace,
 }
 
+/// Inclusive native access bounds from a frozen profile. Levels are read-only
+/// (0), requires approval (1), automatic approval (2) and full access (3).
+pub type NativeAccessBounds = (u8, u8);
+type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
+    /// Translates native permission selectors for cross-harness handoff.
+    pub native_access_bounds: Option<NativeAccessReader>,
+    /// Workspace-write sessions need extra Git metadata roots to commit.
+    pub workspace_write_commit_roots: bool,
     /// Accepts the `compact` verb and emits a compact hint on session growth.
     pub compact: bool,
     /// `harness.models` accepts a `workspace` launch-preview argument.

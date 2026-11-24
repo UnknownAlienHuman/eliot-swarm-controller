@@ -9,6 +9,9 @@ use serde_json::Value;
 #[serde(deny_unknown_fields)]
 pub struct SwitchLaunch {
     pub profile: Option<String>,
+    /// Let routing choose B from this role's candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub harness: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -30,7 +33,10 @@ pub struct SwitchLaunch {
 
 impl SwitchLaunch {
     pub fn validate(&self) -> Result<()> {
-        if self.profile.is_some() == self.harness.is_some()
+        let selectors = usize::from(self.profile.is_some())
+            + usize::from(self.role.is_some())
+            + usize::from(self.harness.is_some());
+        if selectors != 1
             || (self.harness.is_none()
                 && [
                     &self.model,
@@ -44,6 +50,7 @@ impl SwitchLaunch {
             || (self.base.is_some() && self.worktree.is_none())
             || [
                 &self.profile,
+                &self.role,
                 &self.harness,
                 &self.model,
                 &self.effort,
@@ -60,7 +67,7 @@ impl SwitchLaunch {
         {
             return Err(Error::new(
                 "invalid",
-                "switch requires a profile or ad-hoc harness and valid launch selectors",
+                "switch requires one of profile, role or ad-hoc harness and valid launch selectors",
             ));
         }
         if let Some(access) = self.access.as_deref()
@@ -97,6 +104,32 @@ impl SwitchLaunch {
     }
 }
 
+/// Why work moved to a new session. Every reason uses the same switch
+/// transaction and the same brief built from Git and Store facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffReason {
+    /// The Owner or a manager asked for this exact successor.
+    Request,
+    /// The Owner or a manager asked routing to choose the successor.
+    Routing,
+    /// The source's provider scope is on a quota or rate-limit hold.
+    ProviderHold,
+    /// The source session was lost or failed.
+    SessionLost,
+}
+
+impl HandoffReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Routing => "routing",
+            Self::ProviderHold => "provider_hold",
+            Self::SessionLost => "session_lost",
+        }
+    }
+}
+
 /// Router-set launch arg naming the target registration revision the switch
 /// worker verified before preparation. The Store admission transaction
 /// rechecks it, so a revocation between preparation and admission refuses
@@ -113,6 +146,9 @@ pub struct SwitchRequest {
     pub id: String,
     pub from: String,
     pub from_generation: i64,
+    /// Command stating the task, from any generation of A. Empty, or no longer
+    /// retained, lets Swarm find the task in the Store and the Git task record.
+    #[serde(default)]
     pub task_command: String,
     #[schemars(length(max = super::MAX_HANDOFF_SENDS), extend("uniqueItems" = true))]
     pub commands: Vec<String>,
@@ -160,8 +196,22 @@ impl SwitchRequest {
             let created = value.created.as_ref().ok_or_else(|| {
                 Error::new("source_integrity", "switch handoff has no destination")
             })?;
-            self.handoff(&value.handoff_command, &created.agent, created.generation)
-                .validate_response(handoff)?;
+            let mut expected =
+                self.handoff(&value.handoff_command, &created.agent, created.generation);
+            expected.commands = handoff
+                .transfers
+                .iter()
+                .map(|transfer| transfer.original.clone())
+                .collect();
+            if !expected.commands.starts_with(&self.commands)
+                || super::handoff::validate_send_selection(&expected.commands).is_err()
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "switch reply changed its explicit SEND selection",
+                ));
+            }
+            expected.validate_response(handoff)?;
         }
         if value.disposal_command.is_some() != value.disposal_state.is_some()
             || value.disposal_command.as_ref().is_some_and(|id| {

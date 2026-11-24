@@ -1,10 +1,13 @@
 //! Muse native adapter capability declaration.
 
 use eliot_core::InjectPoint;
+use eliot_core::api::harness::NativeAccessBounds;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
         defer_harness_check: true, // #949
         resume_config: true,
@@ -25,5 +28,18 @@ pub fn declaration() -> HarnessCapabilities {
         version_prefixes: &["muse-code", "muse"],
         session_input_includes_cache_reads: true,
         ..HarnessCapabilities::default()
+    }
+}
+
+fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {
+    match (
+        snapshot["permissions"].as_str()?,
+        snapshot["approval"].as_str(),
+    ) {
+        ("danger-full-access", _) => Some((3, 3)),
+        ("workspace-write", Some("onRequest" | "denyUnmatched")) => Some((1, 1)),
+        ("workspace-write", Some("promptUnmatched" | "allowAll")) => Some((2, 2)),
+        ("workspace-write", None) => Some((1, 2)),
+        _ => None,
     }
 }

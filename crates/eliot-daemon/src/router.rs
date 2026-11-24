@@ -3,6 +3,7 @@ mod attribution;
 mod auth;
 mod background_wake;
 mod catalog;
+mod checkpoint_restore;
 mod child_run;
 mod cleanup;
 mod command;
@@ -48,6 +49,7 @@ mod switch;
 mod task_card;
 mod tool_incident;
 mod wake;
+mod work_truth;
 
 #[path = "plugin_host/mod.rs"]
 pub(in crate::router) mod plugin_host;
@@ -66,6 +68,7 @@ pub(crate) use goals::{real_goal_check, run_goal_driver};
 pub(crate) use project_checks::run_project_checks;
 pub(crate) use tool_incident::run_tool_failure_attention;
 pub(crate) use wake::run_agent_wakes;
+pub(crate) use work_truth::run_work_truth;
 
 use self::plugin_host::{AgentCredentials, PluginHost, PluginHostOptions, UnknownCommands};
 use crate::{
@@ -181,6 +184,8 @@ struct RouterInner {
     mail: crate::config::MailConfig,
     attention: crate::config::AttentionConfig,
     background_wake_max_wait_ms: i64,
+    /// Automatic handoff covers only sessions lost since this daemon started.
+    started_at_ms: i64,
     owner_token: String,
     secrets: SecretSet,
     agent_credentials: AgentCredentials,
@@ -457,6 +462,7 @@ impl Router {
                 mail,
                 attention,
                 background_wake_max_wait_ms,
+                started_at_ms: now_ms(),
                 owner_token,
                 secrets,
                 agent_credentials,
@@ -773,6 +779,7 @@ impl Router {
             "usage.summary" => self.usage_summary(&params, &principal).await,
             "observe.heavy" => self.observe_heavy(&params, &principal).await,
             "agent.git" => self.agent_git(&params, &principal).await,
+            "checkpoint.restore" => self.checkpoint_restore(&params, &principal).await,
             "agent.patch_digest" => self.agent_patch_digest(&params, &principal).await,
             "agent.edits" => self.agent_edits(&params, &principal).await,
             "turn.get" => self.turn_get(&params, &principal).await,
@@ -1079,7 +1086,9 @@ impl Router {
                 let Some(command) = store.get_command(&id)? else {
                     continue;
                 };
-                if command.state != CommandState::Accepted || !is_start_verb(command.verb.as_str())
+                if command.state != CommandState::Accepted
+                    || !is_start_verb(command.verb.as_str())
+                    || !store.recoverable_workspace_start(&id)?
                 {
                     continue;
                 }
@@ -5314,6 +5323,12 @@ impl Router {
             });
             (config, pending_background_wake)
         };
+        let work_truth = {
+            let store = self.inner.store.lock().await;
+            store
+                .agent_work_truth(&agent.id, agent.generation)
+                .unwrap_or(None)
+        };
         let mut response = AgentGetResponse {
             agent,
             observation,
@@ -5329,6 +5344,7 @@ impl Router {
             owner_rules_delivery,
             pending_background_wake,
             last_control_failure,
+            work_truth,
         };
         display_agent_get_response(&mut response);
         serde_json::to_value(response)
@@ -8135,7 +8151,8 @@ async fn project_logical_name(
 
 /// Naming parts for a standard worktree directory: the project's logical
 /// name (display name, else origin, else main checkout folder) and the
-/// prompt text the Store slugs into `<project>/<agent>-<task-slug>`.
+/// prompt text the Store slugs into the worktree path leaf
+/// `<agent>-<task-slug>`.
 /// A daemon-set `auto_worktree` hint (manager launches) wins when present.
 async fn generated_naming(
     data_root: &std::path::Path,

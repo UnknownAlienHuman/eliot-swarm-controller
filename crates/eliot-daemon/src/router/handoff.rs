@@ -11,11 +11,21 @@ impl Router {
     ) -> Result<Value> {
         // Authority lives in the Store: Owner anywhere with claims/Goal/children,
         // or a manager for two workers (never itself) in its own controlled scope
-        // for caller-issued task inputs only, never moving children. Reparent and
-        // switch stay Owner-only.
+        // for caller-issued task inputs only, never moving children.
         let request: HandoffRequest = eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let policy = self.secret_policy_snapshot();
+        {
+            let store = self.inner.store.lock().await;
+            if let Some(value) = store.replay_handoff(&principal_name(principal), &request)? {
+                return serde_json::to_value(value)
+                    .map_err(|_| Error::new("internal", "cannot encode handoff replay"));
+            }
+            store.check_handoff_caller(&principal_name(principal), &request)?;
+        }
+        let git = self
+            .handoff_git_facts(&request.from, Some(&request.task_command))
+            .await;
         let change = {
             let mut store = self.inner.store.lock().await;
             if let Some(value) = store.replay_handoff(&principal_name(principal), &request)? {
@@ -36,6 +46,7 @@ impl Router {
                 &request,
                 &policy,
                 owner_process,
+                &git,
                 now_ms(),
             )?;
             self.publish_locked(&change.events);

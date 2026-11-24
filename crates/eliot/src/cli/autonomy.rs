@@ -157,6 +157,16 @@ fn print_report(report: &AutonomyResponse) {
             counts.observed_calls
         );
     });
+    row("Work in Git", &report.work_in_git, |counts| {
+        println!(
+            "  {} of {} finished turns left all work in Git ({} with a checkpoint, {} not recorded)",
+            counts.turns_in_git, counts.turns, counts.snapshots, counts.not_in_git
+        );
+        println!(
+            "  {} handoffs to a successor, {} of them automatic",
+            counts.handoffs, counts.automatic_handoffs
+        );
+    });
     row(
         "Executors calling Swarm",
         &report.executor_swarm,

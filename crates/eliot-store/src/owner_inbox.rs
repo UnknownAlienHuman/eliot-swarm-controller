@@ -9,6 +9,8 @@ use eliot_core::liveness::{self, AgentWaitEvidence, LivenessObject, Mover};
 use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
 
+pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
+
 pub(crate) fn project(
     connection: &Connection,
     now: i64,
@@ -26,6 +28,9 @@ pub(crate) fn project(
     project_launch_intents(connection, now, &mut items, &mut liveness, &[])?;
     project_assignment_waits(connection, now, &mut items, &mut liveness, &[])?;
     project_timers(connection, now, &mut items, &mut liveness, &[])?;
+    project_handoffs(connection, now, &mut items, &mut liveness, &[])?;
+    project_switch_fences(connection, now, &mut items, &mut liveness, &[])?;
+    project_work_not_in_git(connection, now, &mut items, &mut liveness, &[])?;
 
     items.sort_by(|left, right| {
         left.kind
@@ -58,10 +63,13 @@ pub(crate) fn project_item(
         OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
         OwnerInboxKind::Agent => (project_agents, subject),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
+        OwnerInboxKind::Handoff => (project_handoffs, subject),
+        OwnerInboxKind::WorkNotInGit => (project_work_not_in_git, subject),
         OwnerInboxKind::LaunchQueue | OwnerInboxKind::Stuck => match subject.split_once(':') {
             Some(("command", id)) if kind == OwnerInboxKind::Stuck => {
                 (project_unknown_commands, id)
             }
+            Some(("switch", id)) if kind == OwnerInboxKind::Stuck => (project_switch_fences, id),
             Some(("hold", scope)) if kind == OwnerInboxKind::Stuck => (project_holds, scope),
             Some(("goal", goal)) if kind == OwnerInboxKind::Stuck => (project_goals, goal),
             Some(("timer", timer)) if kind == OwnerInboxKind::Stuck => (project_timers, timer),
@@ -108,6 +116,19 @@ pub(crate) fn project_item(
                 &mut stats,
                 &[&agent, &generation, &native_id],
             )?;
+        }
+        "work_not_in_git" => {
+            let mut parts = key.splitn(3, ':');
+            let (Some(agent), Some(generation)) = (parts.next(), parts.next()) else {
+                return Ok(None);
+            };
+            let (Ok(agent), Some(Ok(generation))) = (
+                eliot_core::parse_agent_id(agent),
+                generation.strip_prefix('g').map(str::parse::<i64>),
+            ) else {
+                return Ok(None);
+            };
+            projector(db, now, &mut items, &mut stats, &[&agent, &generation])?;
         }
         "blocked_goal" | "goal" => {
             let Some((agent, mode)) = key.split_once(':') else {
@@ -510,6 +531,289 @@ fn project_unknown_turns(
     Ok(())
 }
 
+/// A successor is working after a turn that may have left partial effects.
+fn project_switch_fences(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT c.id, c.updated_at FROM commands c
+         WHERE c.method = 'swarm.switch'
+           AND c.state IN ('unknown','failed','rejected','cancelled')
+           AND EXISTS(SELECT 1 FROM switch_checkout_owners f WHERE f.switch_command = c.id)",
+        "c.id = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (id, updated) = row.map_err(sql_error)?;
+        stats.stuck += 1;
+        *stats
+            .reasons
+            .entry(SWITCH_FENCE_NEEDS_OWNER.to_owned())
+            .or_insert(0) += 1;
+        let choices = vec![
+            action("inspect", "command.get", json!({"id":id})),
+            action(
+                "release_checkout",
+                "command.resolve",
+                json!({"command_id":id,"as":"failed","reason":null}),
+            ),
+        ];
+        items.push(item(
+            OwnerInboxKind::Stuck,
+            format!("switch:{id}"),
+            format!("fence:{updated}"),
+            now,
+            updated,
+            SWITCH_FENCE_NEEDS_OWNER,
+            None,
+            choices,
+        ));
+    }
+    Ok(())
+}
+
+fn project_handoffs(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    _stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT e.seq, e.ts, CAST(json_extract(e.data,'$.switch_command') AS TEXT),
+                CAST(json_extract(e.data,'$.continued_to') AS TEXT)
+         FROM events e INDEXED BY events_kind
+         WHERE e.kind = 'handoff.settled' AND json_extract(e.data,'$.uncertain') = 1
+           AND json_extract(e.data,'$.state') = 'applied'",
+        "CAST(json_extract(e.data,'$.switch_command') AS TEXT) = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (seq, since, switch, successor) = row.map_err(sql_error)?;
+        items.push(item(
+            OwnerInboxKind::Handoff,
+            switch,
+            format!("event:{seq}"),
+            now,
+            since,
+            "handoff_after_uncertain_turn",
+            None,
+            vec![action("inspect", "agent.get", json!({"id": successor}))],
+        ));
+    }
+    let mut stmt = projection_query(
+        db,
+        "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message')
+         FROM events e INDEXED BY events_kind
+         JOIN agents a ON a.id = e.agent AND a.generation = e.generation
+         WHERE e.kind = 'handoff.waiting' AND a.archived = 0
+           AND NOT EXISTS(SELECT 1 FROM agent_successors s WHERE s.agent = a.id)
+           AND ((json_extract(e.data,'$.reason') = 'session_lost' AND a.state IN ('lost','failed'))
+                OR (json_extract(e.data,'$.reason') = 'provider_hold' AND a.state = 'idle'
+                    AND EXISTS(SELECT 1 FROM provider_holds h
+                        WHERE h.kind IN ('quota','rate_limit')
+                          AND h.scope = CASE WHEN json_type(a.profile_snapshot,'$.account') = 'text'
+                              THEN 'account:' || json_extract(a.profile_snapshot,'$.account') || '.' || a.harness
+                              ELSE 'profile:' || a.profile END)))
+           AND NOT EXISTS(SELECT 1 FROM events newer INDEXED BY events_agent
+               WHERE newer.agent = a.id AND newer.generation = a.generation AND newer.seq > e.seq
+                 AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))",
+        "'waiting:a' || a.id || ':g' || a.generation = ?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (seq, since, agent, generation, message) = row.map_err(sql_error)?;
+        items.push(item(
+            OwnerInboxKind::Handoff,
+            format!("waiting:a{agent}:g{generation}"),
+            format!("event:{seq}"),
+            now,
+            since,
+            &message,
+            None,
+            vec![action(
+                "inspect",
+                "agent.get",
+                json!({"id":format!("a{agent}")}),
+            )],
+        ));
+    }
+    Ok(())
+}
+
+/// Work that a lost session or a removed directory could still cost.
+fn project_work_not_in_git(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    _stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT c.agent, c.generation, c.state, c.updated_at
+         FROM git_checkpoints c JOIN agents a ON a.id = c.agent AND a.generation = c.generation
+         WHERE a.archived = 0
+           AND (c.state = 'failed'
+                OR (c.state = 'snapshot' AND a.state IN ('stopped','lost','failed')))
+           AND NOT EXISTS(SELECT 1 FROM events x INDEXED BY events_kind
+               WHERE x.kind = 'agent.handed_off' AND x.agent = c.agent
+                 AND x.generation = c.generation)",
+        "c.agent = ?1 AND c.generation = ?2",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (agent, generation, state, since) = row.map_err(sql_error)?;
+        let reason = if state == "failed" {
+            "checkpoint_failed"
+        } else {
+            "ended_with_uncommitted_work"
+        };
+        items.push(item(
+            OwnerInboxKind::WorkNotInGit,
+            format!("a{agent}:g{generation}:checkpoint"),
+            format!("{state}:{since}"),
+            now,
+            since,
+            reason,
+            None,
+            vec![action(
+                "inspect",
+                "agent.get",
+                json!({"id": format!("a{agent}")}),
+            )],
+        ));
+    }
+    drop(stmt);
+    let mut stmt = projection_query(
+        db,
+        "SELECT w.agent, w.target_generation, w.updated_at, w.repo_path, w.worktree_path,
+                w.requested_branch, c.checkpoint_ref
+         FROM workspaces w JOIN agents a ON a.id = w.agent
+         LEFT JOIN git_checkpoints c
+             ON c.agent = w.agent AND c.generation = w.target_generation
+         WHERE w.phase = 'removed' AND a.archived = 0
+           AND json_extract(w.outcome,'$.result.directory_absent_before_remove') = 1
+           AND (c.state = 'snapshot'
+                OR json_extract(w.outcome,'$.last_available_git_observation.dirty') = 1)",
+        "w.agent = ?1 AND w.target_generation = ?2",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (agent, generation, since, repo, worktree, branch, checkpoint) =
+            row.map_err(sql_error)?;
+        let mut missing = item(
+            OwnerInboxKind::WorkNotInGit,
+            format!("a{agent}:g{generation}:worktree"),
+            format!("removed:{since}"),
+            now,
+            since,
+            "worktree_missing_with_uncommitted_work",
+            None,
+            vec![action(
+                "inspect",
+                "agent.get",
+                json!({"id": format!("a{agent}")}),
+            )],
+        );
+        missing.instructions = Some(restore_commands(
+            &eliot_core::display_path(&repo),
+            &eliot_core::display_path(&worktree),
+            &branch,
+            &format!("a{agent}"),
+            generation,
+            checkpoint.as_deref(),
+        ));
+        items.push(missing);
+    }
+    Ok(())
+}
+
+/// The commands that bring a missing worktree and its saved files back.
+fn restore_commands(
+    repo: &str,
+    worktree: &str,
+    branch: &str,
+    agent: &str,
+    generation: i64,
+    checkpoint: Option<&str>,
+) -> String {
+    let mut commands = format!(
+        "git -C {} worktree prune\ngit -C {} worktree add {} {}",
+        powershell_quote(repo),
+        powershell_quote(repo),
+        powershell_quote(worktree),
+        powershell_quote(branch),
+    );
+    if let Some(checkpoint) = checkpoint {
+        commands.push_str(&format!(
+            "\nswarm checkpoint restore --agent {agent} --generation {generation} --checkpoint-ref {} --workspace {}",
+            powershell_quote(checkpoint),
+            powershell_quote(worktree),
+        ));
+    }
+    commands
+}
+
+fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 fn project_holds(
     db: &Connection,
     now: i64,
@@ -836,7 +1140,8 @@ fn project_agents(
             state,
             eliot_core::AgentState::Lost | eliot_core::AgentState::Failed
         ) {
-            if archived {
+            // A handoff closes this item: the work continues on the successor.
+            if archived || crate::handoff::current_successor(db, id)?.is_some() {
                 continue;
             }
             let resume_safe = native_scope
@@ -1423,5 +1728,6 @@ fn item(
         reason: reason.to_owned(),
         recommended,
         choices,
+        instructions: None,
     }
 }

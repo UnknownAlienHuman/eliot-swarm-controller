@@ -14,10 +14,10 @@ use super::{
     cleanup_actor, cleanup_startup, complete_plugin_command, custody_label, deadline,
     fence_command_routing, fence_runtime_generation, initialize_agent, is_failed_start_result,
     mark_lost_state, mark_lost_state_with_exit, prepare_queued_stop_call, record_plugin_error,
-    redact_native_error, resolve_resume_config, resolve_send_config, retire_failed_start,
-    settle_drained_source_exit, settle_owned_source_exit, shutdown_and_wait_child, snapshot_future,
-    start_deadline, validate_applied, validate_start_result, wait_child, wait_for_stop_exit_proof,
-    wait_stop_child,
+    redact_native_error, resolve_commit_roots, resolve_resume_config, resolve_send_config,
+    retire_failed_start, settle_drained_source_exit, settle_owned_source_exit,
+    shutdown_and_wait_child, snapshot_future, start_deadline, validate_applied,
+    validate_start_result, wait_child, wait_for_stop_exit_proof, wait_stop_child,
 };
 use crate::monitor::Monitoring;
 use crate::platform::OwnedChild;
@@ -365,6 +365,7 @@ async fn run_agent_startup(
         Some((model, effort, revision)) => (model, effort, Some(revision)),
         None => (None, None, None),
     };
+    let commit_roots = resolve_commit_roots(actor).await;
     let start_params = AgentStartParams {
         agent_id: actor.agent.id.clone(),
         generation: actor.agent.generation,
@@ -390,6 +391,7 @@ async fn run_agent_startup(
         model_override,
         effort_override,
         config_revision,
+        commit_roots,
     };
     let native_started = Instant::now();
     let start = match serde_json::to_value(start_params) {

@@ -1,7 +1,13 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = HARNESS_CHECK_SCHEMA_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHECKPOINT_RESTORE_POINTS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
+const WORK_TRUTH_VERSION: i64 = 113;
+const WORK_TRUTH_INTENT_VERSION: i64 = 114;
+const SWITCH_CHECKOUT_VERSION: i64 = 115;
+const HANDOFF_BUDGET_VERSION: i64 = 116;
+const WORK_TASK_BINDINGS_VERSION: i64 = 117;
+const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -29,7 +35,8 @@ impl Store {
             ));
         }
         self.migrate_through_42(current)?;
-        self.migrate_after_42(current)
+        self.migrate_after_42(current)?;
+        self.migrate_work_truth(current)
     }
 
     // Keep the debug-build migration frames small enough for Windows.
@@ -2650,6 +2657,115 @@ impl Store {
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_work_truth(&mut self, current: i64) -> Result<()> {
+        if current < WORK_TRUTH_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE TABLE work_truth_cursor (id INTEGER PRIMARY KEY CHECK(id=1), seq INTEGER NOT NULL);
+                 INSERT INTO work_truth_cursor VALUES(1, COALESCE((SELECT seq FROM sqlite_sequence WHERE name='events'), 0));
+                 CREATE TABLE git_checkpoints (
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     state TEXT NOT NULL CHECK(state IN ('none','snapshot','clean','failed')),
+                     trigger TEXT,
+                     turn_id TEXT,
+                     head TEXT,
+                     checkpoint_ref TEXT,
+                     oid TEXT,
+                     fingerprint TEXT,
+                     paths TEXT NOT NULL DEFAULT '[]',
+                     paths_truncated INTEGER NOT NULL DEFAULT 0,
+                     withheld TEXT NOT NULL DEFAULT '[]',
+                     withheld_truncated INTEGER NOT NULL DEFAULT 0,
+                     captured_bytes INTEGER NOT NULL DEFAULT 0,
+                     session_end_pending INTEGER NOT NULL DEFAULT 0,
+                     error TEXT,
+                     task_ref TEXT,
+                     journaled_through INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL,
+                     PRIMARY KEY(agent, generation)
+                 );
+                 CREATE INDEX git_checkpoints_session_end ON git_checkpoints(agent, generation)
+                     WHERE session_end_pending = 1;
+                 CREATE INDEX work_truth_events_window ON events(kind, ts, seq)
+                     WHERE kind = 'git.checkpoint' OR kind = 'handoff.settled';
+                 CREATE TABLE agent_successors (
+                     agent INTEGER PRIMARY KEY,
+                     generation INTEGER NOT NULL,
+                     successor INTEGER NOT NULL
+                 );
+                 CREATE INDEX agent_successors_successor ON agent_successors(successor);",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [WORK_TRUTH_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < WORK_TRUTH_INTENT_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE git_checkpoints ADD COLUMN task_command TEXT;
+                 CREATE TABLE git_checkpoint_intents (
+                     common_dir TEXT PRIMARY KEY,
+                     agent INTEGER NOT NULL,
+                     generation INTEGER NOT NULL,
+                     workspace TEXT NOT NULL,
+                     input TEXT NOT NULL,
+                     UNIQUE(agent, generation)
+                 );",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [WORK_TRUTH_INTENT_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        for (version, sql) in [
+            (
+                SWITCH_CHECKOUT_VERSION,
+                include_str!("../migrations/switch_checkout_owners.sql"),
+            ),
+            (
+                HANDOFF_BUDGET_VERSION,
+                include_str!("../migrations/automatic_handoff_budget.sql"),
+            ),
+            (
+                WORK_TASK_BINDINGS_VERSION,
+                include_str!("../migrations/git_work_tasks.sql"),
+            ),
+            (
+                CHECKPOINT_RESTORE_POINTS_VERSION,
+                include_str!("../migrations/git_checkpoint_restore_points.sql"),
+            ),
+        ] {
+            if current < version {
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(sql_error)?;
+                tx.execute_batch(sql).map_err(sql_error)?;
+                tx.execute(
+                    "INSERT INTO schema_migrations(version) VALUES (?1)",
+                    [version],
+                )
+                .map_err(sql_error)?;
+                tx.commit().map_err(sql_error)?;
+            }
         }
         Ok(())
     }

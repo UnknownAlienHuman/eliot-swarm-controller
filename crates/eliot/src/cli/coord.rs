@@ -797,6 +797,12 @@ fn print_owner_inbox(response: &OwnerInboxResponse, json_output: bool) -> Result
             };
             println!("{}@{} · {age}", item.cursor(), item.revision);
             println!("  {}", item.reason);
+            if let Some(instructions) = &item.instructions {
+                println!("  Run:");
+                for line in instructions.lines() {
+                    println!("    {line}");
+                }
+            }
             if let Some(action) = &item.recommended {
                 println!("  Recommended: {} {}", action.method, action.args);
             } else if item.kind == OwnerInboxKind::Stuck {

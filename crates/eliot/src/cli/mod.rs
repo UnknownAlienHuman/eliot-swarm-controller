@@ -5,6 +5,7 @@ mod agents;
 pub(crate) mod args;
 mod autonomy;
 mod autostart;
+mod checkpoint;
 mod cleanup;
 mod coord;
 mod daemon;
@@ -176,6 +177,7 @@ pub(crate) async fn dispatch(
         CliCommand::Doctor => reads::run_doctor(data_dir, json_output, doctor_acl_report).await,
         CliCommand::Heavy(args) => reads::run_heavy(args, data_dir, json_output).await,
         CliCommand::Git(args) => git::run(args.command, &data_dir, json_output, id).await,
+        CliCommand::Checkpoint(args) => checkpoint::run(args, data_dir, json_output, id).await,
         CliCommand::GitStatus(args) => reads::run_git_status(args, data_dir, json_output).await,
         CliCommand::PatchDigest(args) => reads::run_patch_digest(args, data_dir, json_output).await,
         CliCommand::Edits(args) => reads::run_edits(args, data_dir, json_output).await,

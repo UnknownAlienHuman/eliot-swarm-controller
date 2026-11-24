@@ -1,5 +1,8 @@
 use super::*;
 
+const ORIGINAL_UNKNOWN_MARKER: &str = "original_unknown";
+const HISTORY_UNKNOWN_MARKER: &str = "history_unknown";
+
 fn bounded(text: &str, limit: usize) -> (String, bool) {
     if text.len() <= limit {
         return (text.to_owned(), false);
@@ -17,46 +20,213 @@ fn bounded(text: &str, limit: usize) -> (String, bool) {
     )
 }
 
+/// Inputs that vary by transfer kind.
+#[derive(Clone, Copy)]
+pub(super) struct BriefInput<'a> {
+    pub(super) saved_context: Option<&'a str>,
+    /// SENDs admitted separately after this brief.
+    pub(super) transferred: &'a [Command],
+    /// Facts the Router read from the worktree for this transfer.
+    pub(super) facts: Option<&'a super::BriefFacts>,
+    /// Replaces the context-only first line for a continuing successor.
+    pub(super) directive: Option<&'a str>,
+    pub(super) now: i64,
+}
+
 /// Read/filter context in the transfer transaction, never raw native history.
 pub(super) fn build(
     tx: &Transaction<'_>,
     request: &HandoffRequest,
     task: Option<&Command>,
     policy: &core::SecretPolicy,
-    saved_context: Option<&str>,
+    input: BriefInput<'_>,
 ) -> Result<(String, bool)> {
-    let task_text = task
-        .map(|task| required_string(&task.args, "text"))
+    let BriefInput {
+        saved_context,
+        transferred,
+        facts: read_facts,
+        directive,
+        now,
+    } = input;
+    // A predecessor's brief only quotes the task; the Git record is the task.
+    let record = read_facts.and_then(|facts| facts.task_text.as_deref());
+    let task_command = read_facts.and_then(|facts| facts.task_command.as_deref());
+    let task_command_record = task_command
+        .map(|id| load_command(tx, id))
         .transpose()?
-        .map(|text| policy.redact_text(&text));
-    let saved_context = saved_context.map(|text| policy.redact_text(text));
-    let latest: Option<(String,Option<String>)> = tx.query_row(
-        "SELECT turn_id,final_text FROM turns WHERE agent=?1 AND generation=?2
-         AND state NOT IN ('running') ORDER BY COALESCE(completed_at,started_at,0) DESC,rowid DESC LIMIT 1",
-        params![parse_agent_id(&request.from)?,request.from_generation],|row|Ok((row.get(0)?,row.get(1)?)))
-        .optional().map_err(sql_error)?;
-    let (turn, output) = match latest {
-        Some((id, Some(text))) => (id, policy.redact_text(&text)),
-        Some((id, None)) => (
-            id,
-            "[Final output unavailable in retained turn; no success inferred]".into(),
-        ),
-        None => (
-            "none-retained".into(),
-            "[No retained final output; absent or pruned history is not complete history]".into(),
-        ),
+        .flatten();
+    let task_command_unknown = task_command.is_some()
+        && task_command_record.as_ref().is_none_or(|command| {
+            matches!(
+                command.state,
+                CommandState::Unknown | CommandState::Dispatched
+            )
+        });
+    let task_transferred =
+        task.is_some_and(|task| transferred.iter().any(|send| send.id == task.id));
+    let task_is_brief = task
+        .map(|task| is_brief_tx(tx, &task.id))
+        .transpose()?
+        .unwrap_or(false);
+    let prior_status = task
+        .filter(|_| task_is_brief)
+        .and_then(|task| task.args.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|text| {
+            text.lines()
+                .take(5)
+                .find_map(|line| line.strip_prefix("Handoff input status: "))
+        })
+        .unwrap_or_default();
+    let prior_original_unknown = prior_status.contains(ORIGINAL_UNKNOWN_MARKER);
+    let prior_history_unknown = prior_status.contains(HISTORY_UNKNOWN_MARKER);
+    let task_row_unverified = task
+        .is_some_and(|task| matches!(task.state, CommandState::Unknown | CommandState::Dispatched));
+    let original_task_unverified =
+        task_row_unverified || task_command_unknown || prior_original_unknown;
+    let task_unverified = original_task_unverified || prior_history_unknown;
+    let unverified = has_unverified_instructions(tx, request)?;
+    let task_command_transferred =
+        task_command.is_some_and(|id| transferred.iter().any(|send| send.id == id));
+    let task_command_mismatches =
+        task_command.is_some_and(|id| task.is_some_and(|task| !task_is_brief && task.id != id));
+    let use_record = record.is_some() && (task.is_none() || task_is_brief);
+    let use_record = use_record
+        && !task_transferred
+        && !task_unverified
+        && !task_command_transferred
+        && !task_command_unknown
+        && !task_command_mismatches;
+    let task_text = if original_task_unverified || prior_history_unknown {
+        None
+    } else if use_record {
+        record.map(|text| policy.redact_text(text))
+    } else if task_transferred || task_unverified || task_command_transferred || task_is_brief {
+        None
+    } else {
+        task.map(|task| required_string(&task.args, "text"))
+            .transpose()?
+            .map(|text| policy.redact_text(&text))
     };
-    let instructions = if task.is_some() {
-        later_instructions(tx, request, policy)?
+    let no_task = if task_transferred || task_command_transferred {
+        "(the original instruction is delivered once as a separate successor SEND)"
+    } else if task_is_brief && record.is_none() {
+        "(the retained predecessor brief is history; use the branch, files and quoted later history)"
+    } else if prior_history_unknown && !original_task_unverified {
+        "(a prior handoff contains unresolved inputs; the original task and history are quoted below; verify effects before acting)"
+    } else if original_task_unverified {
+        "(a prior handoff marked the original instruction unknown; quoted history below, verify effects before acting)"
+    } else if task_unverified || task_command_unknown {
+        "(input history includes unresolved effects; it is quoted below and must not be resent)"
+    } else if read_facts.is_some() {
+        "(the task text is not retained; use the task record in the Git facts below)"
+    } else {
+        "(none selected)"
+    };
+    let saved_context = saved_context.map(|text| policy.redact_text(text));
+    // The brief is built from Git and Store facts. A vendor transcript or a
+    // model's own report is never part of it; the turn is only a reference.
+    let last_turn = last_turn(tx, parse_agent_id(&request.from)?, request.from_generation)?;
+    let turn = last_turn
+        .as_ref()
+        .map_or("none-retained", |turn| turn.id.as_str());
+    let git = read_facts
+        .and_then(|facts| facts.git.as_deref())
+        .map_or_else(
+            || "[Git facts were not read for this brief; use the Store facts above]".to_owned(),
+            |text| policy.redact_text(text),
+        );
+    let task_note = if task_transferred
+        || task_unverified
+        || task_command_transferred
+        || task_command_unknown
+        || task_command_mismatches
+        || task_is_brief && !use_record
+    {
+        String::new()
+    } else {
+        read_facts
+            .and_then(|facts| facts.task_note.as_deref())
+            .map_or_else(String::new, |note| {
+                format!("\n{}", policy.redact_text(note))
+            })
+    };
+    let header = directive.unwrap_or(
+        "Handoff brief: context only. Await the separate successor SENDs before executing queued work.",
+    );
+    let mut instructions = if task.is_some() || read_facts.is_some() {
+        later_instructions(
+            tx,
+            request,
+            task.map(|task| task.id.as_str()),
+            task_row_unverified,
+            transferred,
+            policy,
+        )?
     } else {
         "(no original task selected)".to_owned()
     };
-    let facts = store_facts(tx, request)?;
+    if (prior_history_unknown || prior_original_unknown || (task_is_brief && record.is_none()))
+        && let Some(history) = task.filter(|_| task_is_brief).and_then(|task| {
+            prior_handoff_input_history(
+                task,
+                prior_original_unknown || prior_history_unknown,
+                policy,
+            )
+        })
+    {
+        instructions.push_str(
+            "\n\nPrior handoff input history (quoted only; verify effects and never resend):\n",
+        );
+        instructions.push_str(&history);
+    }
+    if task_command_unknown {
+        let unknown_text = task_command_record
+            .as_ref()
+            .and_then(|command| command.args.get("text").and_then(Value::as_str))
+            .map(|text| {
+                let id = task_command.unwrap_or_default();
+                let state = task_command_record
+                    .as_ref()
+                    .map_or("not retained", |command| command_state_name(command.state));
+                format!(
+                    "[command={id}, state={state}; effects unresolved, verify before continuing, never resend] {}",
+                    core::fence_untrusted_text(&policy.redact_text(text))
+                )
+            })
+            .or_else(|| {
+                record.map(|text| {
+                    format!(
+                        "[command={}, state=not retained; effects unresolved, verify before continuing, never resend] {}",
+                        task_command.unwrap_or_default(),
+                        core::fence_untrusted_text(&policy.redact_text(text))
+                    )
+                })
+            });
+        if let Some(unknown_text) = unknown_text {
+            instructions.push_str("\n\nUnresolved original input (quoted history only):\n");
+            instructions.push_str(&unknown_text);
+        }
+    }
+    let mut status = Vec::new();
+    if original_task_unverified {
+        status.push(ORIGINAL_UNKNOWN_MARKER);
+    }
+    if prior_history_unknown || task_command_unknown || unverified {
+        status.push(HISTORY_UNKNOWN_MARKER);
+    }
+    let input_status = if status.is_empty() {
+        "none".to_owned()
+    } else {
+        status.join(", ")
+    };
+    let facts = store_facts(tx, request, last_turn.as_ref(), now)?;
     let mut budget = MAX_TEXT_BYTES / 2 - 4096;
     loop {
-        let (task_text, t1) = bounded(task_text.as_deref().unwrap_or("(none selected)"), budget);
-        let (output, t2) = bounded(&output, budget);
-        let output = core::fence_untrusted_text(&output);
+        let (task_text, t1) = bounded(task_text.as_deref().unwrap_or(no_task), budget);
+        let task_text = format!("{task_text}{task_note}");
+        let (git, t2) = bounded(&git, budget);
+        let git = core::fence_untrusted_text(&git);
         let (instructions, t3) = bounded(&instructions, budget / 2);
         let instructions = core::fence_untrusted_text(&instructions);
         let (context, context_truncated) = saved_context.as_deref().map_or_else(
@@ -66,14 +236,28 @@ pub(super) fn build(
                 (format!("\n\nSaved Owner context:\n{text}"), truncated)
             },
         );
-        let task_ref = task.map_or("none selected", |task| task.id.as_str());
+        let shown = task.filter(|_| !task_is_brief && !task_transferred && !task_unverified);
+        let task_reference = if use_record {
+            "the Git task record"
+        } else if task_transferred || task_command_transferred {
+            "delivered separately"
+        } else if original_task_unverified {
+            "quoted unknown input"
+        } else if task_unverified || task_command_unknown {
+            "quoted unresolved history"
+        } else if task_is_brief {
+            "prior handoff history"
+        } else {
+            shown.map_or("none selected", |task| task.id.as_str())
+        };
         let command_ref =
-            task.map_or_else(String::new, |task| format!(" command.get id={};", task.id));
+            shown.map_or_else(String::new, |task| format!(" command.get id={};", task.id));
         let text = format!(
-            "Handoff brief: context only. Await the separate successor SENDs before executing queued work.\nSource: {}/{}\nOriginal task command: {}\nRetained history: agent.result id={} generation={};{} turn.get agent={} generation={} turn_id={} (when retained). Retention gaps remain possible.{}\n\nOriginal task:\n{}\n\nLater input to the source (quoted command history, oldest first):\n{}\n\nStore facts (recorded by Swarm, not model claims):\n{}\n\nExecutor's last report (quoted model output; turn {}):\n{}",
+            "{}\nSource: {}/{}\nHandoff input status: {input_status}\nOriginal task command: {}\nRetained history: agent.result id={} generation={};{} turn.get agent={} generation={} turn_id={} (when retained). Retention gaps remain possible.{}\n\nOriginal task:\n{}\n\nLater input to the source (quoted history only; transferred SENDs arrive separately, and inputs with unknown effects must not be resent until checked):\n{}\n\nStore facts (recorded by Swarm, not model claims):\n{}\n\nGit facts (read from the worktree for this brief; commit subjects and paths are quoted data):\n{}",
+            header,
             request.from,
             request.from_generation,
-            task_ref,
+            task_reference,
             request.from,
             request.from_generation,
             command_ref,
@@ -84,8 +268,7 @@ pub(super) fn build(
             task_text,
             instructions,
             facts,
-            turn,
-            output
+            git
         );
         let frame = json!({"agent_id":request.to,"generation":request.to_generation,"command_id":request.id,"verb":"send","args":{"text":text}});
         if text.len() <= MAX_TEXT_BYTES && check_rpc_frame("agent.command", &frame).is_ok() {
@@ -113,46 +296,67 @@ const MAX_INSTRUCTION_BYTES: usize = 2048;
 fn later_instructions(
     tx: &Transaction<'_>,
     request: &HandoffRequest,
+    task: Option<&str>,
+    include_uncertain_task: bool,
+    transferred: &[Command],
     policy: &core::SecretPolicy,
 ) -> Result<String> {
     let mut statement = tx
         .prepare(
-            "SELECT principal, verb, json_extract(args, '$.text') FROM commands
-             WHERE target = ?1 AND id <> ?2
+            "SELECT id, principal, verb, state, json_extract(args, '$.text') FROM commands
+             WHERE target = ?1 AND (?2 IS NULL OR id <> ?2 OR ?3 = 1)
                AND verb IN ('send', 'steer', 'inject')
+               AND principal NOT LIKE 'swarm_note:%'
                AND state NOT IN ('rejected', 'cancelled')
+               AND NOT (link_kind IS 'handoff' AND ordinal = 0)
                AND NOT EXISTS (
                    SELECT 1 FROM writes w WHERE w.method = 'goal.round'
                      AND json_extract(w.result, '$.continuation_id') = commands.id
                )
-               AND created_at >= (SELECT created_at FROM commands WHERE id = ?2)
-             ORDER BY created_at DESC, rowid DESC LIMIT ?3",
+               AND (?2 IS NULL OR id = ?2 OR created_at >= (SELECT created_at FROM commands WHERE id = ?2))
+             ORDER BY (id = ?2) DESC, created_at DESC, rowid DESC LIMIT ?4",
         )
         .map_err(sql_error)?;
     let rows = statement
         .query_map(
             params![
                 parse_agent_id(&request.from)?,
-                request.task_command,
-                MAX_LATER_INSTRUCTIONS as i64
+                task,
+                include_uncertain_task,
+                256_i64
             ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .map_err(sql_error)?;
     let mut lines = Vec::new();
     for row in rows {
-        let (principal, verb, text) = row.map_err(sql_error)?;
+        let (id, principal, verb, state, text) = row.map_err(sql_error)?;
+        if transferred.iter().any(|send| send.id == id) {
+            continue;
+        }
         let Some(text) = text.filter(|text| !text.trim().is_empty()) else {
             continue;
         };
         let (text, _) = bounded(&policy.redact_text(&text), MAX_INSTRUCTION_BYTES);
-        lines.push(format!("[{principal}, {verb}] {text}"));
+        let outcome_note = if state == "unknown" || state == "dispatched" {
+            "; effects unresolved, quote only, verify before continuing, never resend"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "[command={id}, {principal}, {verb}, state={state}{outcome_note}] {text}"
+        ));
+        if lines.len() == MAX_LATER_INSTRUCTIONS {
+            break;
+        }
     }
     if lines.is_empty() {
         return Ok("(none)".to_owned());
@@ -166,9 +370,119 @@ fn later_instructions(
         .join("\n"))
 }
 
+fn prior_handoff_input_history(
+    task: &Command,
+    include_original: bool,
+    policy: &core::SecretPolicy,
+) -> Option<String> {
+    let text = task.args.get("text")?.as_str()?;
+    let original_start = text.find("\n\nOriginal task:\n")? + "\n\nOriginal task:\n".len();
+    let later_start = text.find("\n\nLater input to the source (")?;
+    let store_start = text.find("\n\nStore facts (recorded by Swarm")?;
+    let mut history = String::new();
+    if include_original {
+        history.push_str("Original task section:\n");
+        history.push_str(text.get(original_start..later_start)?);
+        history.push('\n');
+    }
+    history.push_str("Prior later-input section:\n");
+    history.push_str(text.get(later_start..store_start)?);
+    Some(policy.redact_text(&history))
+}
+
+fn has_unverified_instructions(tx: &Connection, request: &HandoffRequest) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM commands WHERE target = ?1
+           AND verb IN ('send', 'steer', 'inject') AND state IN ('unknown', 'dispatched')
+           AND principal NOT LIKE 'swarm_note:%')",
+        [parse_agent_id(&request.from)?],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+struct LastTurn {
+    id: String,
+    state: String,
+    outcome: Option<String>,
+    tool_calls: i64,
+}
+
+impl LastTurn {
+    /// The turn did not finish cleanly after starting real work, so some of
+    /// its effects may exist and must not be repeated blindly.
+    fn uncertain(&self) -> bool {
+        self.state == "unknown"
+            || self.outcome.as_deref() == Some("unknown")
+            || (self.tool_calls > 0
+                && matches!(self.outcome.as_deref(), Some("failure" | "interrupted")))
+    }
+}
+
+fn last_turn(tx: &Connection, agent: i64, generation: i64) -> Result<Option<LastTurn>> {
+    tx.query_row(
+        "SELECT turn_id, state, outcome, tool_calls FROM turns WHERE agent=?1 AND generation=?2
+         ORDER BY COALESCE(completed_at,started_at,0) DESC, rowid DESC LIMIT 1",
+        params![agent, generation],
+        |row| {
+            Ok(LastTurn {
+                id: row.get(0)?,
+                state: row.get(1)?,
+                outcome: row.get(2)?,
+                tool_calls: row.get(3)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
+/// Whether the source's last turn may have left partial effects.
+pub(crate) fn last_turn_uncertain(tx: &Connection, agent: i64, generation: i64) -> Result<bool> {
+    Ok(last_turn(tx, agent, generation)?.is_some_and(|turn| turn.uncertain()))
+}
+
+/// The source's last turn when it did not finish successfully.
+pub(crate) fn last_unfinished_turn(
+    tx: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<Option<String>> {
+    Ok(last_turn(tx, agent, generation)?
+        .filter(|turn| turn.state != "completed" || turn.outcome.as_deref() != Some("success"))
+        .map(|turn| turn.id))
+}
+
+fn open_claims_line(tx: &Connection, agent: i64, generation: i64, now: i64) -> Result<String> {
+    let mut statement = tx
+        .prepare(
+            "SELECT glob FROM claims WHERE agent = ?1 AND generation = ?2 AND expires_at > ?3
+             ORDER BY glob LIMIT 12",
+        )
+        .map_err(sql_error)?;
+    let claims = statement
+        .query_map(params![agent, generation, now], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    Ok(if claims.is_empty() {
+        "- Open claims: none".to_owned()
+    } else {
+        format!("- Open claims: {}", claims.join(", "))
+    })
+}
+
 /// Machine facts about the source: its workspace and Git work, its Goal,
-/// and the commands still open or unknown for the handed-off generation.
-fn store_facts(tx: &Transaction<'_>, request: &HandoffRequest) -> Result<String> {
+/// open claims, the commands still open or unknown for the handed-off
+/// generation, and any turn whose effects are uncertain.
+fn store_facts(
+    tx: &Transaction<'_>,
+    request: &HandoffRequest,
+    last_turn: Option<&LastTurn>,
+    now: i64,
+) -> Result<String> {
     let agent_num = parse_agent_id(&request.from)?;
     let workspace: Option<String> = tx
         .query_row(
@@ -211,8 +525,9 @@ fn store_facts(tx: &Transaction<'_>, request: &HandoffRequest) -> Result<String>
     let mut statement = tx
         .prepare(
             "SELECT verb, id, state FROM commands
-             WHERE target = ?1 AND generation = ?2
-               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+             WHERE target = ?1 AND principal NOT LIKE 'swarm_note:%'
+               AND (state = 'unknown'
+                    OR (generation = ?2 AND state IN ('accepted', 'queued', 'dispatched')))
              ORDER BY created_at, rowid LIMIT 10",
         )
         .map_err(sql_error)?;
@@ -233,5 +548,63 @@ fn store_facts(tx: &Transaction<'_>, request: &HandoffRequest) -> Result<String>
     } else {
         format!("- Open or unknown commands: {}", open.join("; "))
     };
-    Ok(format!("{workspace_line}\n{goal_line}\n{open_line}"))
+    // A successor shares its predecessor's worktree row, so look up by path.
+    let branch: Option<(String, String)> = match &workspace {
+        Some(path) => tx
+            .query_row(
+                "SELECT requested_branch, base_oid FROM workspaces WHERE worktree_path = ?1",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sql_error)?,
+        None => None,
+    };
+    let branch_line = branch.map_or_else(
+        || "- Branch: not a managed worktree; see the Git facts".to_owned(),
+        |(branch, base)| format!("- Branch: {branch} (base {base})"),
+    );
+    let claims_line = open_claims_line(tx, agent_num, request.from_generation, now)?;
+    let turn_line = match last_turn {
+        Some(turn) if turn.uncertain() => format!(
+            "\n- UNCERTAIN: turn {} ended as {}{} after {} tool calls. Some of its effects may exist. Swarm did not repeat it. Check Git and the retained history before redoing any step.",
+            turn.id,
+            turn.state,
+            turn.outcome
+                .as_deref()
+                .map(|outcome| format!("/{outcome}"))
+                .unwrap_or_default(),
+            turn.tool_calls,
+        ),
+        _ => String::new(),
+    };
+    let mut earlier = tx
+        .prepare(
+            "SELECT generation, turn_id FROM turns
+             WHERE agent = ?1 AND generation <> ?2 AND state = 'unknown'
+             ORDER BY generation, turn_id LIMIT 4",
+        )
+        .map_err(sql_error)?;
+    let earlier_turns = earlier
+        .query_map(params![agent_num, request.from_generation], |row| {
+            Ok(format!(
+                "generation {} turn {}",
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?
+            ))
+        })
+        .map_err(sql_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    let earlier_line = if earlier_turns.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- UNCERTAIN earlier turns: {}. Check Git before redoing their steps.",
+            earlier_turns.join("; ")
+        )
+    };
+    Ok(format!(
+        "{workspace_line}\n{branch_line}\n{goal_line}\n{claims_line}\n{open_line}{turn_line}{earlier_line}"
+    ))
 }

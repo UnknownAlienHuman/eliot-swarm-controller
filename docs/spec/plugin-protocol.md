@@ -227,6 +227,29 @@ When OpenCode cannot prove consumption of a steered native input, it translates
 the cancel and readback into a removal fact. The shared settlement returns
 `unknown` and latches the session unless that fact proves removal.
 
+`commit_roots` lists the Git directories the daemon computed for a sandboxed Agent on a
+managed worktree. The adapter maps them to native writable roots and verifies them in the
+readback. Roots include the worktree's admin directory and the repository's common
+`objects` directory. Generated `<project>/<aN>/work` branches use their own ref and reflog
+parents by default. Store admission prevents another
+managed worktree from sharing it, and successors inherit the roots from the retained
+branch even with a different Agent ID.
+
+Explicit and legacy names receive their actual ref and reflog parents. One-component
+branches receive `refs/heads` and `logs/refs/heads`. These recursive roots permit
+writes to every loose branch ref and reflog below
+the granted parent, including siblings. The daemon still verifies the selected branch
+against the worktree's symbolic `HEAD` and Git's ref inventory, rejects case-only aliases
+and parent/child ref conflicts, and checks that each granted directory tree contains only
+regular files and plain directories. Reparse points and special entries block the
+grant. `packed-refs`, tags, refs outside
+`refs/heads`, repository config and hooks remain outside these roots.
+
+The writable object root covers the repository's entire common `objects` tree, so the
+sandbox can create, replace, remove or corrupt object data used by any ref, including
+loose objects and pack data. Object writes are not isolated per Agent; a broker would
+need to mediate Git object writes and is outside this increment.
+
 `eliot_core::AgentStartParams` is the shared start-parameter definition used by Store
 preflight, host dispatch and plugin decoding; Plugin reexports it. Missing optional
 fields decode as `None`, and serialization retains their nullable wire fields. Store's

@@ -152,6 +152,8 @@ pub(crate) enum CliCommand {
     Usage(UsageArgs),
     /// Run local Git operations through the daemon.
     Git(GitArgs),
+    /// Restore a retained private work-truth checkpoint.
+    Checkpoint(CheckpointArgs),
     /// Read the current Git snapshot for an Agent's workspace.
     GitStatus(GitStatusArgs),
     /// Digest an Agent's patch for review: files, packages, new
@@ -486,7 +488,7 @@ pub(crate) struct LaunchArgs {
     pub(crate) chat: bool,
     /// Prepare a managed worktree on a new branch. A value names the branch
     /// explicitly; a bare `--worktree` generates the standard
-    /// `<project>/<agent>-<task-slug>` branch (use `--` before the prompt so
+    /// `<project>/<agent>/work` branch (use `--` before the prompt so
     /// the prompt is not consumed as the value).
     #[arg(long, value_name = "BRANCH", num_args(0..=1), default_missing_value = "")]
     pub(crate) worktree: Option<String>,
@@ -765,6 +767,27 @@ pub(crate) struct GitArgs {
     pub(crate) command: GitCommand,
 }
 
+#[derive(Args)]
+pub(crate) struct CheckpointArgs {
+    #[command(subcommand)]
+    pub(crate) command: CheckpointCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum CheckpointCommand {
+    /// Restore staged and unstaged layers into a clean worktree at the captured HEAD.
+    Restore {
+        #[arg(long, value_name = "AGENT")]
+        agent: String,
+        #[arg(long, value_name = "GENERATION", value_parser = clap::value_parser!(i64).range(0..))]
+        generation: i64,
+        #[arg(long = "checkpoint-ref", value_name = "REF")]
+        checkpoint_ref: String,
+        #[arg(long, value_name = "PATH")]
+        workspace: String,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum GitCommand {
     /// Merge local branches in a private checkout and run the project check.
@@ -949,12 +972,16 @@ pub(crate) struct SwitchArgs {
     pub(crate) from: String,
     #[arg(long, value_parser=clap::value_parser!(i64).range(1..))]
     pub(crate) generation: i64,
+    /// Command stating the task. Omitted, Swarm finds it in the Store and Git.
     #[arg(long)]
-    pub(crate) task_command: String,
+    pub(crate) task_command: Option<String>,
     /// Ordered undispatched plain SENDs, at most 64.
     pub(crate) commands: Vec<String>,
-    #[arg(long, conflicts_with = "harness")]
+    #[arg(long, conflicts_with_all = ["harness", "role"])]
     pub(crate) profile: Option<String>,
+    /// Let routing choose B from this role's candidates.
+    #[arg(long, conflicts_with = "harness")]
+    pub(crate) role: Option<String>,
     #[arg(long)]
     pub(crate) harness: Option<String>,
     #[arg(long, requires = "harness")]

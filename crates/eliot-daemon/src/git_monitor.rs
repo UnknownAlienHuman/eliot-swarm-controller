@@ -1174,6 +1174,47 @@ impl GitProbe {
         self.run(root, args, &overrides, &[], deadline).await
     }
 
+    /// Collect the daemon-owned bare repository under its exclusive write lane.
+    pub(crate) async fn gc_private_repository(&self, root: &Path, deadline: Instant) -> Result<()> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        let command = self.build_command(
+            root,
+            &["gc", "--quiet", "--no-detach", "--prune=now"],
+            &overrides,
+            None,
+        )?;
+        let (code, _) = Self::capture_git_with_helpers(command, &[], deadline, true, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        if code != 0 {
+            return Err(unavailable("private Git garbage collection failed"));
+        }
+        Ok(())
+    }
+
+    /// Read exactly the already-sized blob, under the caller's checkpoint
+    /// limit rather than the status command's smaller output limit.
+    pub(crate) async fn workspace_blob(
+        &self,
+        root: &Path,
+        oid: &str,
+        bytes: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        if !eliot_core::api::is_git_oid(oid) {
+            return Err(unavailable("Git blob identity is invalid"));
+        }
+        let overrides = self.safe_overrides(root, deadline).await?;
+        let command = self.build_command(root, &["cat-file", "blob", oid], &overrides, None)?;
+        let (code, content) =
+            Self::capture_git(command, &[], deadline, |stdout| bounded_read(stdout, bytes)).await?;
+        if code != 0 || content.len() != bytes {
+            return Err(unavailable("Git blob readback differs from its bound size"));
+        }
+        Ok(content)
+    }
+
     /// Read a complete NUL-delimited path listing under the shared listing
     /// bounds. Each path is validated before it is retained for cleanup.
     pub(crate) async fn workspace_path_listing(
@@ -1195,6 +1236,45 @@ impl GitProbe {
             return Err(unavailable("Git path listing failed"));
         }
         Ok(paths)
+    }
+
+    /// Run one local plumbing command that reads `input` on stdin.
+    pub(crate) async fn workspace_input_command(
+        &self,
+        root: &Path,
+        args: &[&str],
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let overrides = self.safe_overrides(root, deadline).await?;
+        self.run(root, args, &overrides, input, deadline).await
+    }
+
+    /// The sanitized configuration for a batch of plumbing commands.
+    pub(crate) async fn batch_overrides(
+        &self,
+        root: &Path,
+        deadline: Instant,
+    ) -> Result<Vec<(String, String)>> {
+        self.safe_overrides(root, deadline).await
+    }
+
+    /// One plumbing command of a batch, optionally bound to a private index.
+    pub(crate) async fn workspace_input_with(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        index_file: Option<&Path>,
+        input: &[u8],
+        deadline: Instant,
+    ) -> Result<Captured> {
+        let command = self.build_command_with_index(root, args, overrides, None, index_file)?;
+        let (code, stdout) = Self::capture_git(command, input, deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await?;
+        Ok(Captured { code, stdout })
     }
 
     /// Read using one explicitly scoped index file, without inheriting any
@@ -1545,16 +1625,34 @@ impl GitProbe {
         deadline: Instant,
         read_stdout: impl FnOnce(ChildStdout) -> F,
     ) -> Result<(i32, T)> {
+        Self::capture_git_with_helpers(command, input, deadline, false, read_stdout).await
+    }
+
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This capture path takes ownership of the prepared Git child command."
+    )]
+    async fn capture_git_with_helpers<T, F: Future<Output = Result<T>>>(
+        command: Command,
+        input: &[u8],
+        deadline: Instant,
+        allow_helpers: bool,
+        read_stdout: impl FnOnce(ChildStdout) -> F,
+    ) -> Result<(i32, T)> {
         if Instant::now() >= deadline {
             return Err(unavailable("Git observation deadline elapsed"));
         }
-        let mut child = OwnedChild::spawn_leaf(command).map_err(|error| {
-            if error.code == "unavailable" {
-                Error::new("git_leaf_fence_unavailable", *error.message)
-            } else {
-                error
-            }
-        })?;
+        let mut child = if allow_helpers {
+            OwnedChild::spawn(command)?
+        } else {
+            OwnedChild::spawn_leaf(command).map_err(|error| {
+                if error.code == "unavailable" {
+                    Error::new("git_leaf_fence_unavailable", *error.message)
+                } else {
+                    error
+                }
+            })?
+        };
         let stdout = child
             .take_stdout()
             .ok_or_else(|| unavailable("Git stdout is unavailable"))?;
@@ -2085,14 +2183,14 @@ fn dirty_worktree_digest(
 
 /// Content of one Git path under `root`, read without following a link or
 /// non-directory among its parents.
-enum PathContent {
+pub(crate) enum PathContent {
     Missing,
     Link(PathBuf),
     File(Vec<u8>),
     Other,
 }
 
-fn read_path_content(
+pub(crate) fn read_path_content(
     root: &Path,
     path: &str,
     max_file_bytes: u64,
