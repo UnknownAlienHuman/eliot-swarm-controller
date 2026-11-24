@@ -4848,7 +4848,6 @@ fn opencode_manifest() -> PluginManifest {
     PluginManifest::per_agent(
         "opencode",
         env!("CARGO_PKG_VERSION"),
-        "2.2.7",
         &[
             "launch",
             "resume",

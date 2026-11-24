@@ -289,9 +289,11 @@ sections, and [OpenCodex](harnesses/opencodex.md) only for the proxy task.
       reconciliation. Commit ownership/cursor boundaries before publication; keep
       private history private and never replay an uncertain external effect.
 - [x] **L3.3d Observe what matters.** `activity.heavy` episodes with basename-only
-      categories, `session.growth` warnings, and `harness.drift`
-      against pinned verified contracts surface in `swarm top` (`OBS`), `swarm stats`,
+      categories, `session.growth` warnings, and harness version facts
+      surface in `swarm top` (`OBS`), `swarm stats`,
       `swarm heavy`, `swarm doctor` and the desktop Details Observe section.
+      The `harness.drift`-against-pinned-contracts event is superseded by the
+      #932 per-harness self-check fact (installed version plus last pass).
 - [x] **L3.3e Monitoring reactions (#835, #833).** On OpenCode 2.2.7, a stalled
       turn queued one question, received one interrupt and produced one Owner
       notice. A killed idle Agent resumed its retained session once. Three

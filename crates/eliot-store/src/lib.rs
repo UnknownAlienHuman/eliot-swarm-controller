@@ -216,6 +216,8 @@ mod fleet;
 mod git;
 mod goals;
 mod handoff;
+mod harness_checks;
+pub use harness_checks::{HarnessCheckFailure, HarnessCheckRow};
 mod hierarchy;
 pub mod inference;
 mod lifecycle;
@@ -2113,10 +2115,14 @@ impl Store {
         }))
     }
 
-    /// Count all Agents without truncating at a page limit.
+    /// Count task Agents without truncating at a page limit.
     pub fn agent_count(&self) -> Result<i64> {
         self.connection
-            .query_row("SELECT COUNT(*) FROM agents", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE json_type(profile_snapshot, '$._harness_check') IS NULL",
+                [],
+                |row| row.get(0),
+            )
             .map_err(sql_error)
     }
 

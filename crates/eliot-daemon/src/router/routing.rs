@@ -11,6 +11,7 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) owner_automation: bool,
     pub(super) provider_source: Option<&'a Value>,
     pub(super) preview: bool,
+    pub(super) harness_check_candidate: Option<&'a eliot_core::api::HarnessCandidate>,
 }
 
 impl LaunchRouting<'_> {
@@ -270,6 +271,18 @@ impl Router {
         if !mode.automatic(principal) {
             return Ok(());
         }
+        if self
+            .inner
+            .store
+            .lock()
+            .await
+            .harness_check_blocks_automatic(harness)?
+        {
+            return Err(Error::new(
+                "harness_check_failed",
+                RouteSkipReason::HarnessCheckFailed.user_message(),
+            ));
+        }
         let policy = self.launch_quota_policy(profile, Some(snapshot));
         if !policy.enabled() {
             return Ok(());
@@ -524,6 +537,18 @@ impl Router {
             }
         };
         let harness = required_text(&snapshot, "harness")?.to_owned();
+        // A failed self-check removes the harness from automatic routing until
+        // a later check passes (#932 item 3). Explicit Owner launches bypass
+        // routing, so they still work.
+        if self
+            .inner
+            .store
+            .lock()
+            .await
+            .harness_check_blocks_automatic(&harness)?
+        {
+            return Ok(Err(RouteSkipReason::HarnessCheckFailed));
+        }
         if let Some(parent) = parent
             && hierarchy::inherit_child_launch_bounds(&mut snapshot, parent).is_err()
         {

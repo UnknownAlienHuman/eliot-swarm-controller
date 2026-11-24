@@ -20,6 +20,7 @@ pub(crate) fn project(
     project_unknown_commands(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
     project_holds(connection, now, &mut items, &mut liveness, &[])?;
+    project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
     project_agents(connection, now, &mut items, &mut liveness, &[])?;
     project_goals(connection, now, &mut items, &mut liveness, &[])?;
     project_launch_intents(connection, now, &mut items, &mut liveness, &[])?;
@@ -54,6 +55,7 @@ pub(crate) fn project_item(
         OwnerInboxKind::UnknownCommand => (project_unknown_commands, subject),
         OwnerInboxKind::UnknownTurn => (project_unknown_turns, subject),
         OwnerInboxKind::Hold => (project_holds, subject),
+        OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
         OwnerInboxKind::Agent => (project_agents, subject),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
         OwnerInboxKind::LaunchQueue | OwnerInboxKind::Stuck => match subject.split_once(':') {
@@ -177,7 +179,7 @@ fn project_requests(
                   AND e.generation=r.generation AND e.kind IN ('request.opened','request.resolved','request.closed')
                   AND json_extract(e.data,'$.request_id')=r.request_id),0)
          FROM pending_requests r JOIN agents a ON a.id=r.agent AND a.generation=r.generation
-         WHERE r.state='pending'", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
+         WHERE r.state='pending' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "r.agent=?1 AND r.generation=?2 AND r.request_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -290,7 +292,9 @@ fn project_unknown_commands(
                 EXISTS(SELECT 1 FROM commands parent
                   WHERE parent.id=c.parent_command AND c.link_kind='handoff'
                     AND parent.method='swarm.handoff')
-         FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')", "c.id=?1", bindings)?;
+         FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
+           AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
+                 AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -465,7 +469,7 @@ fn project_unknown_turns(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
                   AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id),0)
-         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown'", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
+         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -641,6 +645,69 @@ fn project_holds(
     Ok(())
 }
 
+/// One confirmed failure per blocked harness. A pending newer check keeps
+/// the last confirmed failure visible until a pass restores routing.
+fn project_harness_checks(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT h.harness,
+                COALESCE(f.checked_version, h.checked_version),
+                COALESCE(f.checked_at, h.checked_at),
+                COALESCE(f.check_profile, h.check_profile, ''),
+                COALESCE(f.failure_step, h.failure_step),
+                COALESCE(f.failure_error, h.failure_error)
+         FROM harness_checks h
+         LEFT JOIN harness_check_history f
+           ON h.outcome <> 'failed' AND f.harness=h.harness AND f.version_key=(
+               SELECT old.version_key FROM harness_check_history old
+               WHERE old.harness=h.harness AND old.outcome='failed'
+               ORDER BY old.checked_at DESC, old.version_key LIMIT 1
+           )
+         WHERE h.automatic_blocked=1 AND (h.outcome='failed' OR f.version_key IS NOT NULL)",
+        "('harness:' || h.harness)=?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (harness, checked, checked_at, profile, step, error) = row.map_err(sql_error)?;
+        tally(
+            stats,
+            &Mover::Asked {
+                reason: "harness_check_failed",
+                item: OwnerInboxKind::HarnessCheck,
+            },
+        );
+        items.push(item(
+            OwnerInboxKind::HarnessCheck,
+            format!("harness:{harness}"),
+            format!("checked:{checked}:profile:{profile}:step:{step}"),
+            now,
+            checked_at,
+            &format!("harness {harness} {checked} self-check failed at {step}: {error}"),
+            None,
+            Vec::new(),
+        ));
+    }
+    Ok(())
+}
+
 fn project_agents(
     db: &Connection,
     now: i64,
@@ -692,6 +759,7 @@ fn project_agents(
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
+            AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
             AND a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {

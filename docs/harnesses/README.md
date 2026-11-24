@@ -29,23 +29,20 @@ Future APIs/tables from the complete specification are not first-adapter prerequ
 The first plugin needs one per-Agent stream; source handoff, discovery, children and
 shared pools enter only with their actual callers.
 
-## Verified versions and `swarm doctor`
+## Checked versions and `swarm doctor`
 
-`crates/eliot-core/src/observe.rs` records the integration-time diagnostic baseline
-per harness. The table is not a vendor executable pin or a launch gate. `swarm doctor`
-compares the live installed version and contract marker against it and reports drift
-without blocking launch:
+One durable fact per harness records the installed version and when that
+version last passed Swarm's own scenario
+(`crates/eliot-store/src/harness_checks.rs`, #932). The fact is not a vendor
+executable pin or a launch gate: a new installed version is always accepted
+and marked "not checked", never refused. `swarm doctor` shows the installed
+version with its self-check record (passed with version and time, failed with
+step and vendor error, or not checked with reason). After a vendor update the
+daemon runs the short scenario itself and reports to the Owner inbox; a failed
+check removes the harness from automatic routing until a later check passes,
+while explicit Owner launches still work.
 
-| Harness | Verified version | Contract marker |
-| --- | --- | --- |
-| codex | 0.167.1 | app-server schema v2 |
-| claude | 2.1.325 | stream-json records |
-| muse | 1.4.0-R4161.1 | MSP v1 host |
-| opencode | 2.2.7 | native schema |
-| antigravity | 1.5.9 | ACP v1 `7ec5185c.json`, AGY 1.5.2 |
-
-A drifted install still launches; the mismatch is annotated on `swarm doctor`, the
-`harness.drift` event and the launch flag. Every profile with an explicitly pinned
+Every profile with an explicitly pinned
 executable path that has disappeared is reported with the configured path, an
 installed replacement when available, and instructions to omit `cmd`. `cmd` may be
 omitted from any of the five harness profiles; the profile and ad-hoc launch use the

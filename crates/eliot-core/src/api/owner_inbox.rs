@@ -17,10 +17,11 @@ pub enum OwnerInboxKind {
     BlockedGoal,
     LaunchQueue,
     Stuck,
+    HarnessCheck,
 }
 
 impl OwnerInboxKind {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::HarnessRequest,
         Self::UnknownCommand,
         Self::UnknownTurn,
@@ -29,6 +30,7 @@ impl OwnerInboxKind {
         Self::BlockedGoal,
         Self::LaunchQueue,
         Self::Stuck,
+        Self::HarnessCheck,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -41,6 +43,7 @@ impl OwnerInboxKind {
             Self::BlockedGoal => "blocked_goal",
             Self::LaunchQueue => "launch_queue",
             Self::Stuck => "stuck",
+            Self::HarnessCheck => "harness_check",
         }
     }
 }

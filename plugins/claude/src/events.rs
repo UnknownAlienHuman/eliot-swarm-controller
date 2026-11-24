@@ -1791,9 +1791,11 @@ impl EventProcessor {
             };
         }
         let has_tool_uses = main_thread && assistant_tool_use_count(record) > 0;
+        let text = assistant_text(record);
         if main_thread {
             let native_error_kind = record.get("error").and_then(Value::as_str);
-            self.native_failure = native_error_kind.and_then(claude_api_failure);
+            self.native_failure =
+                native_error_kind.and_then(|kind| claude_api_failure(kind, &text));
             self.native_provider_restriction =
                 native_error_kind.and_then(claude_provider_restriction);
             if has_tool_uses {
@@ -1803,7 +1805,6 @@ impl EventProcessor {
             self.observe_tool_uses(record).await?;
         }
         let observed_model = model.filter(|_| model_output);
-        let text = assistant_text(record);
         if is_blank_native_text(&text) {
             if let Some(model) = observed_model {
                 self.message_seq = self.message_seq.saturating_add(1);
@@ -3388,6 +3389,11 @@ impl EventProcessor {
             {
                 data["native_error"] =
                     json!({"code":"quota_exhausted", "message":"provider billing/quota refusal"});
+            } else if let Some(error) = &error {
+                attach_native_error(&mut data, Some(error.message.as_str()), &secrets);
+                if let Some(native_error) = data["native_error"].as_object_mut() {
+                    native_error.insert("code".to_owned(), json!(error.code));
+                }
             }
             let failure_origin = error
                 .as_ref()
@@ -3856,7 +3862,7 @@ fn claude_provider_restriction(kind: &str) -> Option<eliot_core::ProviderRestric
     })
 }
 
-fn claude_api_failure(kind: &str) -> Option<Error> {
+fn claude_api_failure(kind: &str, text: &str) -> Option<Error> {
     use eliot_core::FailureOrigin;
     if kind == "billing_error" {
         return Some(Error::provider(
@@ -3890,7 +3896,16 @@ fn claude_api_failure(kind: &str) -> Option<Error> {
             FailureOrigin::Harness,
             "native refusal without structured upstream evidence",
         ),
+        "api_error" => (
+            FailureOrigin::Unknown,
+            "assistant.error reported an unclassified API error",
+        ),
         _ => return None,
     };
-    Some(Error::new("native_failure", "native API failure").with_origin(origin, evidence))
+    let message = if is_blank_native_text(text) {
+        kind.to_owned()
+    } else {
+        format!("{kind}: {}", text.trim())
+    };
+    Some(Error::new(kind, message).with_origin(origin, evidence))
 }

@@ -669,7 +669,8 @@ fn agent_list_select_recent(
     } else {
         AGENT_RECORD_COLUMNS.to_owned()
     };
-    let mut predicates = Vec::new();
+    let mut predicates =
+        vec!["json_type(agents.profile_snapshot, '$._harness_check') IS NULL".to_owned()];
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     if let Some(parent) = &filter.parent {
         predicates.push("agents.parent = ?".to_owned());
@@ -826,7 +827,8 @@ fn agent_list_select(
     } else {
         AGENT_RECORD_COLUMNS.to_owned()
     };
-    let mut predicates = Vec::new();
+    let mut predicates =
+        vec!["json_type(agents.profile_snapshot, '$._harness_check') IS NULL".to_owned()];
     let mut params: Vec<rusqlite::types::Value> = Vec::new();
     // Prefer the selective structural/scope index (parent/root/project/scope)
     // when present; state/harness composites only lead when no structural

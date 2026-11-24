@@ -18,10 +18,12 @@ static INSTALL_DECLARATIONS: OnceLock<HashMap<&'static str, InstallDiscovery>> =
 /// `FirstExisting` takes the first enumerated candidate that exists;
 /// `NewestVerified` probes candidates with `--version` and takes the newest
 /// parseable result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum InstallStrategy {
     ByName,
     FirstExisting,
+    /// Resolve the first payload, then read its version from install metadata.
+    MetadataVersion(fn(&Path) -> Option<String>),
     NewestVerified,
 }
 

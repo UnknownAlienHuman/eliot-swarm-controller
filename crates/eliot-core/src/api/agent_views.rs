@@ -2378,6 +2378,8 @@ pub struct DaemonHealthSummary {
 pub struct DaemonStatusResponse {
     #[serde(default)]
     pub owner_inbox: std::collections::BTreeMap<super::OwnerInboxKind, usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub harness_checks: Vec<super::HarnessCheckStatus>,
     #[serde(default)]
     pub liveness: super::SwarmLiveness,
     #[serde(default, skip_serializing_if = "Option::is_none")]

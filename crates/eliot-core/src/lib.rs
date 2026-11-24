@@ -20,6 +20,7 @@ mod canonical;
 mod command;
 mod context;
 mod diagnostics;
+mod harness_check;
 mod ids;
 pub mod local_provider;
 mod mcp_policy;
@@ -60,6 +61,16 @@ pub use diagnostics::{
     MAX_STDERR_BYTES, MAX_STDERR_DIAGNOSTIC_BYTES, StderrDiagnostic, StderrSnapshot, StderrSource,
     bound_stderr_diagnostics,
 };
+pub use harness_check::{
+    CHECK_STEPS, HARNESS_CHECK_BATCH_LIMIT, HARNESS_CHECK_INVENTORY_SECS, HARNESS_CHECK_LAUNCH_ARG,
+    HARNESS_CHECK_MAX_ATTEMPTS, HARNESS_CHECK_QUOTA_RETRY_SECS, HARNESS_CHECK_RESUME_TEXT,
+    HARNESS_CHECK_RETRY_SECS, HARNESS_CHECK_STEER_TEXT, HARNESS_CHECK_TICK_SECS,
+    HARNESS_CHECK_TIMEOUT_SECS, HARNESS_CHECK_TOOL_PROMPT, MAX_HARNESS_CHECK_ERROR_BYTES,
+    MAX_HARNESS_CHECK_VERSION_BYTES, NOT_CHECKED_ATTEMPT_LIMIT, NOT_CHECKED_NEW_VERSION,
+    NOT_CHECKED_NO_CHEAP_PROFILE, NOT_CHECKED_QUOTA, NOT_CHECKED_ROUTE_UNAVAILABLE,
+    NOT_CHECKED_TRANSIENT, NOT_CHECKED_UNCONFIRMED, OUTCOME_FAILED, OUTCOME_NOT_CHECKED,
+    OUTCOME_PASSED, cheapest_model_rank, is_quota_refusal, is_terminal_outcome,
+};
 pub use ids::parse_agent_id;
 pub use mcp_policy::{
     MAX_MCP_ALLOW_ENTRIES, MAX_MCP_SERVER_NAME_LEN, MCP_POLICY_INHERIT, MCP_POLICY_MINIMAL,
@@ -85,13 +96,12 @@ pub use observe::{
     ACTIVITY_HEAVY_KIND, ATTENTION_STEP_KIND, AttentionStep, BUILD_WORKER_PROGRAMS,
     CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE, CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS,
     DEFAULT_HEAVY_RSS_BYTES, DEFAULT_HEAVY_WALL_SECS, DEFAULT_SESSION_FILE_BYTES,
-    DEFAULT_SESSION_GROWTH_RATIO, HARNESS_DRIFT_KIND, HarnessDrift, HeavyEpisode, HeavyThresholds,
-    OBSERVE_LEVEL_DEBUG, OBSERVE_LEVEL_STANDARD, OBSERVED_ROLLOUT_FAMILIES, SESSION_GROWTH_KIND,
-    SHELL_WRAPPER_PROGRAMS, SessionGrowth, SessionGrowthBasis, SessionGrowthThresholds,
-    VERIFIED_HARNESSES, VerifiedHarness, check_harness_drift, classify_heavy_command,
-    compact_hint_for_harness, evaluate_session_growth, merge_heavy_episodes,
-    normalize_harness_version, resolve_heavy_category, split_unix_cmdline,
-    split_windows_command_line, unwrap_shell_command, verified_harness,
+    DEFAULT_SESSION_GROWTH_RATIO, HeavyEpisode, HeavyThresholds, OBSERVE_LEVEL_DEBUG,
+    OBSERVE_LEVEL_STANDARD, OBSERVED_ROLLOUT_FAMILIES, SESSION_GROWTH_KIND, SHELL_WRAPPER_PROGRAMS,
+    SessionGrowth, SessionGrowthBasis, SessionGrowthThresholds, classify_heavy_command,
+    compact_hint_for_harness, evaluate_session_growth, harness_doc_section, merge_heavy_episodes,
+    normalize_harness_version, resolve_heavy_category, same_harness_version, split_unix_cmdline,
+    split_windows_command_line, unwrap_shell_command,
 };
 pub use presentation::{
     count_words, fence_untrusted_prefix, fence_untrusted_text, origin_words, reason_message,
@@ -578,6 +588,29 @@ impl Agent {
             && self.parent.is_none()
             && self.profile_snapshot.get(PROVIDER_PROBE_LAUNCH_ARG)
                 == Some(&serde_json::Value::Bool(true))
+    }
+
+    /// A daemon-owned harness self-check Agent (#932 item 3): a root chat
+    /// with no project, carrying the check's harness and installed version
+    /// in its frozen snapshot. Like a provider probe it owns no production
+    /// work and is deleted when its check ends.
+    pub fn is_harness_check(&self) -> bool {
+        self.chat
+            && !self.observe_only
+            && self.project.is_empty()
+            && self.parent.is_none()
+            && self
+                .profile_snapshot
+                .get(HARNESS_CHECK_LAUNCH_ARG)
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|marker| {
+                    marker.get("harness").and_then(serde_json::Value::as_str)
+                        == Some(self.harness.as_str())
+                        && marker
+                            .get("version")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|version| !version.trim().is_empty())
+                })
     }
 
     pub fn new(

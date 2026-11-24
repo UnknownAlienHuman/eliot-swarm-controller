@@ -20,7 +20,7 @@ pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "muse",
         exe_stems: &["muse"],
-        strategy: InstallStrategy::FirstExisting,
+        strategy: InstallStrategy::MetadataVersion(payload_version),
         cli_identity: None,
         capability_probe: None,
         allow_script_wrapper: false,
@@ -33,6 +33,15 @@ pub fn discovery() -> InstallDiscovery {
         ide_unsupported: None,
         timeout_newer: None,
     }
+}
+
+fn payload_version(path: &Path) -> Option<String> {
+    // Windows discovery has already tied this payload to the launcher
+    // manifest. Unix has no supported passive version source.
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("muse-bin-")
+        .map(str::to_owned)
 }
 
 pub(crate) fn candidate_paths() -> core::Result<Vec<PathBuf>> {

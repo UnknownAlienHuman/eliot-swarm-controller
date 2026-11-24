@@ -16,6 +16,7 @@ pub(crate) mod discovery;
 mod goal_scope;
 mod goals;
 mod handoff;
+mod harness_check;
 mod hierarchy;
 mod inference;
 mod insertion_facts;
@@ -91,9 +92,9 @@ use eliot_core::{
         DaemonShutdownResponse, DaemonStatusRequest, DiscoverPage, DoctorHarnessEntry,
         EmitDefinitionArgs, EventsBoundsRequest, EventsFilter, EventsReadRequest,
         EventsReadResponse, EventsSubscribeRequest, EventsSubscribeResponse, FrozenGitPublish,
-        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessDoctorRequest,
-        HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView, HeavySummaryView,
-        MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
+        GitFetchDefinitionArgs, GitPublishTrigger, GitView, HarnessCheckOutcome,
+        HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,
+        HeavySummaryView, MAX_OBSERVATION_PAGE_BYTES, MAX_SWARM_WAIT_MS, MAX_SWARM_WAIT_TARGETS,
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
         NotifyDefinitionArgs, ObservationPage, ObservationQuery, ObservationView,
@@ -4090,12 +4091,23 @@ impl Router {
                 ));
             }
         } else {
-            let candidate = crate::adhoc::resolve_profile_command(
-                &profile_name,
-                &harness,
-                snapshot.get("cmd").and_then(Value::as_str),
-            )
-            .await?;
+            let candidate = if let Some(candidate) = routing.harness_check_candidate {
+                let version = candidate
+                    .version
+                    .as_deref()
+                    .ok_or_else(|| Error::new("unavailable", "installed version is unavailable"))?;
+                if harness_check::check_model_rank(&snapshot).is_none() {
+                    return Err(Error::new(
+                        "unavailable",
+                        "the check profile has no cheap model",
+                    ));
+                }
+                harness_check::configure_check_snapshot(&mut snapshot, &harness, version);
+                candidate.clone()
+            } else {
+                let selector = snapshot.get("cmd").and_then(Value::as_str);
+                crate::adhoc::resolve_profile_command(&profile_name, &harness, selector).await?
+            };
             crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
         }
         // Reused parent snapshots already carry their frozen default; only
@@ -4893,23 +4905,23 @@ impl Router {
             .map_err(|_| Error::new("internal", "heavy work could not be encoded"))
     }
 
-    /// Read-only harness installation, version and contract report per
-    /// harness: installed probe facts, the verified-against record, drift
-    /// yes or no with the doc section to re-verify, and the last
-    /// `harness_contract_mismatch` seen (absent while k68 is unmerged).
-    /// Owner only, like `harness.list`; starts no model turn and performs
-    /// no inference. Manifest versions stay unset: manifests report at
-    /// actor init and the daemon retains no central copy.
+    /// Read-only harness installation and self-check report per harness: the
+    /// installed probe facts plus the single durable self-check fact (the
+    /// installed version and when that version last passed, #932 item 3),
+    /// with the doc section and the last `harness_contract_mismatch` seen.
+    /// Recording a changed installed version marks it "not checked"; a new
+    /// version is never refused. Owner only, like `harness.list`; starts no
+    /// model turn and performs no inference.
     async fn harness_doctor(&self, params: &Value, principal: &Principal) -> Result<Value> {
         require_owner(principal)?;
         let request: HarnessDoctorRequest =
             eliot_core::api::discovery::decode_params(params.clone())?;
         request.validate()?;
         let mut probes = Vec::new();
-        for verified in eliot_core::VERIFIED_HARNESSES {
+        for harness in eliot_core::api::harness::SUPPORTED_HARNESSES {
             probes.push((
-                verified.harness,
-                crate::adhoc::harness_installation_async(verified.harness).await,
+                *harness,
+                crate::adhoc::harness_installation_async(harness).await,
             ));
         }
         let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
@@ -4917,7 +4929,6 @@ impl Router {
         let store = self.inner.store.lock().await;
         let mut harnesses = Vec::new();
         for (harness, entry) in &probes {
-            let verified = eliot_core::verified_harness(harness).expect("table covers probes");
             let installed = entry
                 .get("installed")
                 .and_then(Value::as_bool)
@@ -4926,7 +4937,23 @@ impl Router {
                 .get("version")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            let drift = eliot_core::check_harness_drift(harness, version.as_deref(), None);
+            let row = store.get_harness_check(harness)?.filter(|row| {
+                version
+                    .as_deref()
+                    .zip(row.installed_version.as_deref())
+                    .is_some_and(|(actual, recorded)| {
+                        eliot_core::same_harness_version(harness, actual, recorded)
+                    })
+            });
+            let checked = row.as_ref().filter(|row| row.version_checked());
+            let check_outcome = row
+                .as_ref()
+                .map_or(HarnessCheckOutcome::NotChecked, |row| row.checked_outcome());
+            let check_agent = version
+                .as_deref()
+                .map(|version| store.active_harness_check_agent(harness, version))
+                .transpose()?
+                .flatten();
             let contract_mismatch = store
                 .latest_event_data("harness_contract_mismatch")?
                 .and_then(|data| doctor_mismatch_text(&data));
@@ -4934,12 +4961,25 @@ impl Router {
                 harness: (*harness).to_owned(),
                 installed,
                 version,
-                manifest_version: None,
-                verified_version: verified.verified_version.to_owned(),
-                verified_marker: verified.verified_marker.to_owned(),
-                drift: drift.is_some(),
-                drift_message: drift.map(|drift| drift.message),
-                doc_section: verified.doc_section.to_owned(),
+                check_outcome,
+                checked_version: checked.and_then(|row| row.checked_version.clone()),
+                checked_at: checked.map(|row| row.checked_at),
+                check_profile: checked
+                    .and_then(|row| row.check_profile.clone())
+                    .filter(|profile| !profile.is_empty()),
+                check_agent,
+                not_checked_reason: if checked.is_none() && installed {
+                    Some(
+                        row.as_ref()
+                            .and_then(|row| row.not_checked_reason.clone())
+                            .unwrap_or_else(|| eliot_core::NOT_CHECKED_NEW_VERSION.to_owned()),
+                    )
+                } else {
+                    None
+                },
+                failure_step: checked.and_then(|row| row.failure_step.clone()),
+                failure_error: checked.and_then(|row| row.failure_error.clone()),
+                doc_section: eliot_core::harness_doc_section(harness).to_owned(),
                 contract_mismatch,
             });
         }

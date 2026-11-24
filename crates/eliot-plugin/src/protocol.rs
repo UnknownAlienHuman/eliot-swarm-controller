@@ -164,7 +164,6 @@ pub struct PluginManifest {
     pub name: String,
     pub version: String,
     pub protocol: String,
-    pub harness_version: String,
     pub available: bool,
     pub mode: String,
     pub verbs: Vec<String>,
@@ -187,11 +186,10 @@ pub struct ManifestFeatures {
 impl PluginManifest {
     /// The manifest of a per-Agent native adapter: protocol `eliot-plugin/1`,
     /// available, no child verbs. Each adapter passes its own name, package
-    /// version, pinned harness version, verbs, features, sources and proxy.
+    /// version, verbs, features, sources and proxy.
     pub fn per_agent(
         name: &str,
         version: &str,
-        harness_version: &str,
         verbs: &[&str],
         features: ManifestFeatures,
         sources: BTreeMap<String, BTreeMap<String, String>>,
@@ -201,7 +199,6 @@ impl PluginManifest {
             name: name.to_owned(),
             version: version.to_owned(),
             protocol: "eliot-plugin/1".to_owned(),
-            harness_version: harness_version.to_owned(),
             available: true,
             mode: "per_agent".to_owned(),
             verbs: verbs.iter().map(|verb| (*verb).to_owned()).collect(),

@@ -2325,7 +2325,6 @@ fn claude_manifest() -> PluginManifest {
     PluginManifest::per_agent(
         "claude",
         env!("CARGO_PKG_VERSION"),
-        "2.1.278",
         &[
             "launch",
             "resume",

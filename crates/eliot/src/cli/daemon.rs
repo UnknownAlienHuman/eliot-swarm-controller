@@ -417,6 +417,14 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
             "healthy"
         }
     );
+    for check in &response.harness_checks {
+        println!(
+            "{} {} self-check: {}",
+            check.harness,
+            check.version,
+            check.outcome.as_str().replace('_', " "),
+        );
+    }
     for worker in &response.automation_tasks {
         if worker.restart_count > 0 || worker.failure_code.is_some() {
             let cause = worker
