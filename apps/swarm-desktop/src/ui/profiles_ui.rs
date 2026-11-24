@@ -388,26 +388,25 @@ impl DesktopApp {
     }
 
     /// The selected preset's Model control: a field styled like the form's
-    /// dropdowns (width, outline, chevron) naming its model, and, while
-    /// open, the composer's catalogue picker filtered to its harness as a
-    /// popover over the rows below it (with a layer a click on closes it).
+    /// dropdowns (width, outline, chevron) naming its model; while open, it
+    /// carries the composer's catalogue picker filtered to its harness as
+    /// its flyout, under the field.
     fn preset_model_control(
         &self,
         name: &str,
         context: &mut ViewContext<Self>,
         palette: Palette,
-    ) -> Option<(View, Option<View>)> {
+    ) -> Option<View> {
         let harness = self.preset_harness(name)?;
         let model = match profiles::field(&self.editor.draft, name, "model") {
             profiles::Field::Simple(model) => Some(model),
             profiles::Field::Absent => None,
             profiles::Field::Complex => {
-                return Some((
+                return Some(
                     m3::secondary("Complex value: edit it as TOML")
                         .vertical_alignment(VerticalAlignment::Center)
                         .into(),
-                    None,
-                ));
+                );
             }
         };
         // The model's name, not its id; "Default" leaves the choice to the
@@ -416,15 +415,19 @@ impl DesktopApp {
             || "Default".to_owned(),
             |model| self.model_name(&harness, model),
         );
-        let open = self.launch.open == Some(launch_ui::Pop::Model)
-            && self
-                .launch
-                .preset_target()
-                .is_some_and(|(preset, _)| preset == name);
+        let open = self
+            .launch
+            .open
+            .filter(|pop| matches!(pop, launch_ui::Pop::Model | launch_ui::Pop::Manage))
+            .filter(|_| {
+                self.launch
+                    .preset_target()
+                    .is_some_and(|(preset, _)| preset == name)
+            });
         let field = m3::field_button(palette)
             .automation_name(format!(
                 "Profile Model: {label} ({})",
-                if open {
+                if open.is_some() {
                     "list open"
                 } else {
                     "choose from the list"
@@ -434,39 +437,15 @@ impl DesktopApp {
             .on_click(context.message(Message::Launch(LaunchMsg::PresetPicker(
                 name.to_owned(),
                 harness,
-            ))))
-            .content(m3::field_button_content(&label));
-        // Anchored to the field: just under it, at its left edge (the form
-        // row's label column and gap). Where the field's column is
-        // narrower than the list, the list ends at the card's right edge
-        // instead, so it is never cut off. The layer behind it closes it.
-        let field_left = tokens::layout::FIELD_INDENT;
-        let left = match self.settings_column_width() {
-            Some(column) => {
-                let inner = column - 2.0 * tokens::spacing::MD;
-                if inner - field_left < tokens::layout::PICKER_WIDTH {
-                    (inner - tokens::layout::PICKER_WIDTH).max(0.0)
-                } else {
-                    field_left
-                }
-            }
-            None => field_left,
-        };
-        let popover = open.then(|| {
-            Grid::new().children((
-                Border::new()
-                    .background(Brush::Solid(Color::transparent()))
-                    .on_pointer_pressed(
-                        context.callback(|_: PointerEventInfo| Message::Launch(LaunchMsg::Close)),
-                    ),
-                Border::new()
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .vertical_alignment(VerticalAlignment::Top)
-                    .margin(Thickness::new(left, tokens::height::FORM_ROW, 0.0, 0.0))
-                    .content(self.model_popover(context, palette)),
-            ))
-        });
-        Some((field, popover))
+            ))));
+        Some(self.anchored_popover(
+            field,
+            m3::field_button_content(&label),
+            open,
+            FlyoutPlacement::BottomEdgeAlignedLeft,
+            context,
+            palette,
+        ))
     }
 
     pub(super) fn profiles_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -480,10 +459,9 @@ impl DesktopApp {
             .as_deref()
             .map(|name| self.preset_fields(name))
             .unwrap_or_default();
-        let (model, model_popover) = selected
+        let model = selected
             .as_deref()
-            .and_then(|name| self.preset_model_control(name, context, palette))
-            .map_or((None, None), |(field, popover)| (Some(field), popover));
+            .and_then(|name| self.preset_model_control(name, context, palette));
         let count = fields.len();
         let harness = selected
             .as_deref()
@@ -523,7 +501,6 @@ impl DesktopApp {
             source_open: self.editor.source_open,
             fields,
             model,
-            model_popover,
             harness: harness.as_deref().map(crate::picker::harness_label),
             subagents,
             field_error: field_error.map(|error| (error.key.as_str(), error.words.as_str())),

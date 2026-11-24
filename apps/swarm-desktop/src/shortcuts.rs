@@ -1,16 +1,13 @@
 //! The window's keyboard: the chords Ctrl+N (new task), Ctrl+K (search
 //! tasks), Ctrl+M (model picker) and Ctrl+, (Settings); the keys of an open
-//! popover (↑/↓/←/→, Enter, Esc, Ctrl+F); how the last input arrived,
+//! popover flyout (↑/↓/←/→, Enter, Esc, Ctrl+F), which move its highlight
+//! while its search field keeps the keyboard; how the last input arrived,
 //! which tells a search suggestion reached with the arrows from one chosen
 //! with Enter or a click; and whether the last key was Enter without Shift,
 //! which turns the line break it typed into the composer into Send
 //! (Reactor 0.100.0 has no key events on `TextBox`; Shift+Enter keeps the
-//! line break); and a press on the composer's message field while a
-//! popover is open, which closes it (WinUI's `TextBox` handles its own
-//! pointer presses and Reactor 0.100.0 has no focus events, so only the
-//! field's `PointerEntered`/`PointerExited` reach the window: they tell
-//! this hook where the pointer is, and the press itself goes on to the
-//! field).
+//! line break). The same channel carries `crate::flyout`'s closed flyouts
+//! to the window.
 //!
 //! Reactor 0.100.0 has no key events, and its `KeyAccelerator` keys are R,
 //! Enter and the number pad only; WinUI's own `KeyboardAccelerator` needs
@@ -85,9 +82,6 @@ pub enum Shortcut {
     /// Enter outside a popover, passed on to the focused control; carries
     /// the input epoch at the press (see [`last_input`]).
     Enter(u64),
-    /// A pointer press on the composer's message field while a popover is
-    /// open; the press itself goes on to the field.
-    ComposerPressed,
     /// Keyboard focus moved (`crate::motion::resolve_focused_row` says
     /// whether a sidebar row holds it).
     FocusMoved,
@@ -97,16 +91,19 @@ pub enum Shortcut {
     /// The window became the foreground window while keyboard focus was
     /// held (`crate::window_place::held_focus_ready`).
     Foreground,
+    /// A flyout `crate::flyout` showed closed (the epoch it was shown with).
+    FlyoutClosed(u64),
 }
 
 /// Which popover is open: none, the model picker (all popover keys), a
-/// menu (no ←/→ or Ctrl+F), or a panel of focusable controls (Manage
-/// models), whose Tab stays native so it reaches the panel's switches.
+/// list (no ←/→ or Ctrl+F: access, project, usage), a panel of focusable
+/// controls (Manage models), whose Tab stays native so it reaches the
+/// panel's switches, or a dialog (Esc only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Popover {
     None = 0,
     Picker = 1,
-    Menu = 2,
+    List = 2,
     Panel = 3,
     Dialog = 4,
 }
@@ -126,10 +123,6 @@ pub enum Input {
 
 static CHORDS: OnceLock<Mutex<Sender<Shortcut>>> = OnceLock::new();
 static POPOVER: AtomicU8 = AtomicU8::new(Popover::None as u8);
-/// The pointer is over the composer's message field (its `PointerEntered`
-/// since the last `PointerExited`). Cleared whenever a popover opens or
-/// closes, so a field rebuilt under a still pointer never reads as hovered.
-static COMPOSER_OVER: AtomicU8 = AtomicU8::new(0);
 /// A sidebar row holds keyboard focus (Shift+F10 and the context-menu key
 /// open its menu; elsewhere they go on to the focused control).
 static ROW_FOCUSED: AtomicU8 = AtomicU8::new(0);
@@ -167,19 +160,11 @@ pub fn take_plain_enter() -> bool {
 /// Tell the hook which popover is open (its keys are taken while it is).
 pub fn set_popover(popover: Popover) {
     POPOVER.store(popover as u8, Ordering::SeqCst);
-    COMPOSER_OVER.store(0, Ordering::SeqCst);
 }
 
-/// Tell the hook whether the pointer is over the composer's message field
-/// (the field's `PointerEntered` / `PointerExited`).
-pub fn set_composer_over(over: bool) {
-    COMPOSER_OVER.store(u8::from(over), Ordering::SeqCst);
-}
-
-/// Whether a pointer press is one on the composer's field while a popover
-/// is open.
-fn composer_press(popover: u8, over: u8) -> bool {
-    popover != Popover::None as u8 && over == 1
+/// A flyout `crate::flyout` showed with `epoch` closed.
+pub fn flyout_closed(epoch: u64) {
+    send(Shortcut::FlyoutClosed(epoch));
 }
 
 /// How the last input arrived, how long ago (ms) and the input epoch.
@@ -454,12 +439,6 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
             WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_NCLBUTTONDOWN | WM_POINTERDOWN
         ) {
             note_input(Input::Pointer);
-            if composer_press(
-                POPOVER.load(Ordering::SeqCst),
-                COMPOSER_OVER.load(Ordering::SeqCst),
-            ) {
-                send(Shortcut::ComposerPressed);
-            }
         }
     }
     // SAFETY: passes the message on unchanged.

@@ -11,7 +11,7 @@
 //!   `Themes/generic.xaml`) from the window's scheme: the accent ramp, list
 //!   selection, the text box as an M3 outlined text field, the combo box as
 //!   an M3 exposed dropdown menu, radio buttons and check boxes in M3
-//!   selection-control roles, menus and combo-box popups on
+//!   selection-control roles, menus, flyouts and combo-box popups on
 //!   surface-container, the dialog on
 //!   surface-container-high, the tooltip on inverse-surface and the focus
 //!   ring in secondary. WinUI resolves a ThemeResource through the
@@ -29,8 +29,9 @@
 //!   one `ControlCornerRadius` for every control): one button style per
 //!   shape under the keys Reactor's `ButtonStyle` looks up (see
 //!   [`styles_xaml`]), text fields, combo boxes and check boxes, menu items
-//!   as control-height rows, dialogs and menus with the container corner,
-//!   and menus without the acrylic backdrop, on the solid M3 container. A
+//!   as control-height rows, dialogs, menus and popover flyouts with the
+//!   container corner, menus and flyouts without the acrylic backdrop, on
+//!   the solid M3 container, and a flyout with the menu's 4-DIP inset. A
 //!   Reactor `Thickness` or `CornerRadius` resource override reaches WinUI as
 //!   zero (observed live), so shapes cannot be per button.
 //!
@@ -795,6 +796,10 @@ fn overlays(s: &Roles) -> Vec<(&'static str, Value)> {
         ("AutoSuggestBoxSuggestionsListBackground", opaque(s.menu)),
         ("AutoSuggestBoxSuggestionsListBorderBrush", edge(s)),
         ("MenuFlyoutPresenterBorderBrush", edge(s)),
+        // A popover is a `Flyout`: the menu role and edge, without acrylic.
+        ("FlyoutPresenterBackground", opaque(s.menu)),
+        ("FlyoutBorderThemeBrush", edge(s)),
+        ("FlyoutBorderThemeThickness", uniform(layout::HAIRLINE)),
         ("MenuFlyoutSeparatorBackground", opaque(s.outline)),
         (
             "MenuFlyoutItemBackgroundPointerOver",
@@ -950,6 +955,12 @@ pub fn styles_xaml() -> String {
     // Menu items are control-height rows: WinUI pads them from a
     // StaticResource (11,9,11,10), so only a style sets their height.
     let (min, inset, row) = (height::CONTROL, spacing::INSET, spacing::ROW);
+    // A popover flyout insets its content by the menu's 4 DIPs (WinUI pads
+    // it from a StaticResource, 16,15,16,17) and is as wide as its widest
+    // content, the model picker, with that inset and its edge (WinUI caps
+    // it at 456).
+    let flyout_inset = spacing::XS;
+    let flyout_width = layout::PICKER_WIDTH + 2.0 * (spacing::XS + layout::HAIRLINE);
     let font = format!(
         "<Setter Property=\"FontFamily\" Value=\"{}\"/>\
          <Setter Property=\"FontSize\" Value=\"{}\"/>",
@@ -1087,6 +1098,12 @@ pub fn styles_xaml() -> String {
          <Style TargetType=\"MenuFlyoutPresenter\">\
            <Setter Property=\"SystemBackdrop\" Value=\"{{x:Null}}\"/>\
            <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
+         </Style>\
+         <Style TargetType=\"FlyoutPresenter\">\
+           <Setter Property=\"CornerRadius\" Value=\"{container}\"/>\
+           <Setter Property=\"Padding\" Value=\"{flyout_inset}\"/>\
+           <Setter Property=\"MinWidth\" Value=\"0\"/>\
+           <Setter Property=\"MaxWidth\" Value=\"{flyout_width}\"/>\
          </Style>\
          <Style TargetType=\"HyperlinkButton\">\
            <Setter Property=\"Width\" Value=\"{min}\"/>\

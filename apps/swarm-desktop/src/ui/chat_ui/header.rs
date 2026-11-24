@@ -12,12 +12,7 @@ impl DesktopApp {
         if let Some(mut agent) = self.find_agent(&binding.agent).cloned() {
             agent.generation = binding.generation;
             let target = menu_ui::Target::Agent(agent);
-            if let Some((action, _, _, _)) = self
-                .menu_entries(&target)
-                .into_iter()
-                .chain(self.developer_entries(&target))
-                .find(|(_, name, _, _)| name == label)
-            {
+            if let Some(action) = menu_ui::entry_action(&self.menu_entries(&target), label) {
                 self.menu_action(target, action, context);
                 return;
             }
@@ -159,12 +154,9 @@ impl DesktopApp {
                 .map(|target| self.menu_entries(target))
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|(action, _, _, _)| *action != menu_ui::Action::More)
-                .partition(|(_, _, _, destructive)| !destructive);
-            let item = |(_, label, _, _): (menu_ui::Action, String, &str, bool)| {
-                MenuItem::item(label.clone(), label)
-            };
-            let mut items: Vec<MenuItem> = regular.into_iter().map(item).collect();
+                .filter(|entry| !entry.is_more())
+                .partition(|entry| !entry.is_destructive());
+            let mut items = menu_ui::menu_items(&regular);
             let mut more = vec![MenuItem::item("details", MENU_DETAILS)];
             if !self.submitting() {
                 more.push(MenuItem::item("handoff", MENU_HANDOFF));
@@ -179,11 +171,11 @@ impl DesktopApp {
                 more.extend(
                     self.developer_entries(target)
                         .into_iter()
-                        .map(|(_, label, _, _)| MenuItem::item(label.clone(), label)),
+                        .map(|(_, label)| MenuItem::item(label.clone(), label)),
                 );
             }
             items.push(MenuItem::submenu("more", "More", more));
-            items.extend(destructive.into_iter().map(item));
+            items.extend(menu_ui::menu_items(&destructive));
             items
         });
         // The status pill: the state in words, then what runs it, and the

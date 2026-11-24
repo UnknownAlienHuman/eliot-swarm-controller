@@ -125,7 +125,6 @@ impl DesktopApp {
             },
             (None, _) => Primary::Start,
         };
-        let popover = self.launch.open.is_some();
         View::component::<Composer>(ComposerInput {
             palette,
             drafts: views::Shared(Rc::clone(&self.chat.drafts)),
@@ -133,8 +132,6 @@ impl DesktopApp {
             primed: self.fields_primed,
             placeholder,
             field: self.chat.composer_ref.clone(),
-            popover,
-            dismiss: popover && self.launch.preset.is_none(),
             retry,
             project: if home {
                 self.composer_project_row(context, palette)
@@ -155,7 +152,7 @@ impl DesktopApp {
     }
 
     /// The open Agent's model-and-effort chip: the next turn's values; it
-    /// opens the effort popover.
+    /// opens the effort popover, and the model picker from there.
     fn model_chip(
         &self,
         detail: &UiDetail,
@@ -178,13 +175,19 @@ impl DesktopApp {
             effort.map_or_else(|| "default effort".to_owned(), effort_name)
         );
         let open = self.launch.open == Some(Pop::Effort);
-        m3::chip(palette)
-            .automation_name(format!(
-                "Model and effort: {name} ({})",
-                if open { "open" } else { "change" }
-            ))
-            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort))))
-            .content(m3::chip_content(None, &label, true, label_width))
+        self.popover_chip(
+            m3::chip(palette)
+                .automation_name(format!(
+                    "Model and effort: {name} ({})",
+                    if open { "open" } else { "change" }
+                ))
+                .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort)))),
+            m3::chip_content(None, &label, true, label_width),
+            &[Pop::Effort, Pop::Model, Pop::Manage],
+            FlyoutPlacement::TopEdgeAlignedLeft,
+            context,
+            palette,
+        )
     }
 
     /// The open Agent and its detail when the popovers act on it (not a
@@ -361,32 +364,22 @@ impl DesktopApp {
         } else {
             m3::secondary("←→ effort   Enter apply   Esc close").into()
         };
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .min_width(tokens::layout::EFFORT_MENU_MIN_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-            m3::popover(palette)
-                .automation_name("Model and effort")
-                .content(
-                    StackPanel::new()
-                        .spacing(tokens::spacing::SM)
-                        .margin(Thickness::uniform(tokens::spacing::SM))
-                        .children((
-                            header,
-                            steps,
-                            if note.is_empty() {
-                                View::empty()
-                            } else {
-                                m3::secondary(note).text_wrapping(TextWrapping::Wrap).into()
-                            },
-                            hints,
-                            change_model,
-                        )),
-                ),
-        )
+        StackPanel::new()
+            .min_width(tokens::layout::EFFORT_MENU_MIN_WIDTH)
+            .spacing(tokens::spacing::SM)
+            .margin(Thickness::uniform(tokens::spacing::SM))
+            .automation_name("Model and effort")
+            .children((
+                header,
+                steps,
+                if note.is_empty() {
+                    View::empty()
+                } else {
+                    m3::secondary(note).text_wrapping(TextWrapping::Wrap).into()
+                },
+                hints,
+                change_model,
+            ))
     }
 
     /// Codex's usage popover over the composer: where the usage comes from,
@@ -440,41 +433,35 @@ impl DesktopApp {
                 )
             })
             .collect();
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .width(tokens::layout::USAGE_MENU_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Right),
-            m3::popover(palette).automation_name("Usage").content(
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    StackPanel::new()
-                        .margin(Thickness::new(
-                            tokens::spacing::SM,
-                            tokens::spacing::SM,
-                            tokens::spacing::SM,
-                            0.0,
-                        ))
-                        .children((
-                            m3::secondary(source).text_wrapping(TextWrapping::Wrap),
-                            StackPanel::new().keyed_children(rows),
-                        )),
-                    m3::divider(palette),
-                    m3::row(palette, false)
-                        .automation_name("Manage usage")
-                        .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                            settings_ui::Page::Usage,
-                        ))))
-                        .content(m3::row_content(
-                            None,
-                            "Manage usage",
-                            "",
-                            m3::icon(m3::glyph::CHEVRON_RIGHT),
-                        )),
-                )),
-            ),
-        )
+        StackPanel::new()
+            .width(tokens::layout::USAGE_MENU_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .automation_name("Usage")
+            .children((
+                StackPanel::new()
+                    .margin(Thickness::new(
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        tokens::spacing::SM,
+                        0.0,
+                    ))
+                    .children((
+                        m3::secondary(source).text_wrapping(TextWrapping::Wrap),
+                        StackPanel::new().keyed_children(rows),
+                    )),
+                m3::divider(palette),
+                m3::row(palette, false)
+                    .automation_name("Manage usage")
+                    .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                        settings_ui::Page::Usage,
+                    ))))
+                    .content(m3::row_content(
+                        None,
+                        "Manage usage",
+                        "",
+                        m3::icon(m3::glyph::CHEVRON_RIGHT),
+                    )),
+            ))
     }
 
     /// The harness the composer talks to: the open Agent's, else the new
@@ -516,7 +503,8 @@ impl DesktopApp {
 
     /// Codex's usage indicator beside Send: the tightest quota window of
     /// the composer's harness as a small ring and the share left; it opens
-    /// the usage popover over the composer. The attention color only for a
+    /// the usage popover as its flyout (without its tooltip meanwhile: a
+    /// flyout's chip takes none). The attention color only for a
     /// real reading under the threshold on the account the task runs on; a
     /// neutral outline ring when that is not known or another provider's
     /// limits apply. Nothing when the harness reports no quota.
@@ -574,22 +562,39 @@ impl DesktopApp {
                 .vertical_alignment(VerticalAlignment::Center)
                 .into()
         };
-        // Keyed by whether the reading applies: the ring's colors come from
-        // the button's resources, read when its template is applied.
+        let button = Button::new()
+            .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
+            .style(ButtonStyle::Subtle)
+            .width(tokens::height::CONTROL)
+            .height(tokens::height::CONTROL)
+            .automation_name(format!(
+                "Usage: {label}, {note} ({})",
+                if open { "open" } else { "show limits" }
+            ))
+            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Usage))));
+        let open = open && self.launch.preset.is_none();
+        let button = if open {
+            self.anchored_popover(
+                button,
+                ring,
+                Some(Pop::Usage),
+                FlyoutPlacement::TopEdgeAlignedRight,
+                context,
+                palette,
+            )
+        } else {
+            button.content(ring).tooltip(note)
+        };
+        // Keyed by whether the reading applies (the ring's colors come from
+        // the button's resources, read when its template is applied) and
+        // by whether its flyout is open (a tooltip and a flyout do not
+        // share a button).
         Grid::new().keyed_children(vec![KeyedView::new(
-            format!("usage:{applies}:{}", remaining < crate::theme::QUOTA_LOW),
-            Button::new()
-                .resource_overrides(palette.usage_ring(if applies { remaining } else { 100.0 }))
-                .style(ButtonStyle::Subtle)
-                .width(tokens::height::CONTROL)
-                .height(tokens::height::CONTROL)
-                .automation_name(format!(
-                    "Usage: {label}, {note} ({})",
-                    if open { "open" } else { "show limits" }
-                ))
-                .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Usage))))
-                .content(ring)
-                .tooltip(note),
+            format!(
+                "usage:{applies}:{}:{open}",
+                remaining < crate::theme::QUOTA_LOW
+            ),
+            button,
         )])
     }
 }
@@ -676,11 +681,6 @@ pub(in crate::ui) struct ComposerInput {
     primed: bool,
     placeholder: &'static str,
     field: ElementRef<TextBox>,
-    /// A popover is open: typing closes it, in the window.
-    popover: bool,
-    /// The clear layer over the field that takes a press and closes the
-    /// popover (not for a preset's picker in Settings).
-    dismiss: bool,
     /// An unresolved submission: an edit abandons it, in the window.
     retry: bool,
     /// Home's project and worktree chips above the field.
@@ -705,8 +705,7 @@ pub(in crate::ui) struct ComposerInput {
 /// chip. Usage and the one trailing button (Send, Stop, Steer or Resume)
 /// sit at the right. A keystroke is stored here and redraws this card
 /// only; an edit that also concerns the window (Enter's line break, an
-/// open popover, an unresolved submission) and every control go to the
-/// window.
+/// unresolved submission) and every control go to the window.
 pub(in crate::ui) struct Composer {
     input: ComposerInput,
 }
@@ -724,7 +723,7 @@ impl Composer {
         if text == previous {
             return true;
         }
-        if input.popover || input.retry || enter_send_text(previous, text).is_some() {
+        if input.retry || enter_send_text(previous, text).is_some() {
             return false;
         }
         // Every edit spends an earlier plain Enter, as in the window.
@@ -785,35 +784,14 @@ impl Component for Composer {
             );
         // WinUI's text box insets its text: the margin starts the text at
         // the card's 16-DIP inset, where the chips start.
-        let mut field_cells = vec![KeyedView::new(
-            "field",
-            Border::new()
-                .margin(Thickness::new(
-                    -tokens::spacing::FIELD_LEADING_INSET,
-                    0.0,
-                    0.0,
-                    0.0,
-                ))
-                .content(field),
-        )];
-        // A click into the field closes an open popover. WinUI's text box
-        // keeps its presses and its mouse input never reaches the window's
-        // hooks (observed live), so while a popover is open a clear layer
-        // over the field takes the press, closes it and focuses the field.
-        if input.dismiss {
-            field_cells.push(KeyedView::new(
-                "dismiss",
-                Border::new()
-                    .background(Brush::Solid(Color::transparent()))
-                    .on_pointer_pressed(context.callback(|_: PointerEventInfo| {
-                        Message::Launch(LaunchMsg::ComposerPointer {
-                            over: true,
-                            pressed: true,
-                        })
-                    })),
-            ));
-        }
-        let field = Grid::new().keyed_children(field_cells);
+        let field = Border::new()
+            .margin(Thickness::new(
+                -tokens::spacing::FIELD_LEADING_INSET,
+                0.0,
+                0.0,
+                0.0,
+            ))
+            .content(field);
         // The design: + (attach files), then the chips, 6 DIPs apart.
         let chips = StackPanel::new()
             .orientation(Orientation::Horizontal)

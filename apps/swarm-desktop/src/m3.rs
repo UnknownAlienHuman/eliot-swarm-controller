@@ -390,11 +390,6 @@ pub fn row(palette: Palette, selected: bool) -> Button {
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
 
-/// A menu row with the attention role carried by its content and state layer.
-pub fn destructive_row(palette: Palette, selected: bool) -> Button {
-    row(palette, selected).resource_overrides(palette.destructive_row(selected))
-}
-
 /// A row under its parent (same height as every row).
 pub fn sub_row(palette: Palette, selected: bool) -> Button {
     row(palette, selected)
@@ -1121,18 +1116,6 @@ pub fn link_content(label: &str) -> View {
             text(label.to_owned(), style::BUTTON).vertical_alignment(VerticalAlignment::Center),
             small_icon(glyph::EXTERNAL),
         ))
-}
-
-/// A popover or in-window menu: the menu role (`surface-container`), the
-/// container corner, the dark themes' overlay border, a 4-DIP inset (lift
-/// it with [`lifted`] at level 2).
-pub fn popover(palette: Palette) -> Border {
-    Border::new()
-        .background(palette.menu())
-        .border_brush(palette.overlay_border())
-        .border_thickness(Thickness::uniform(layout::HAIRLINE))
-        .corner_radius(radius::CONTAINER)
-        .padding(Thickness::uniform(spacing::XS))
 }
 
 /// A small outlined badge ("default").

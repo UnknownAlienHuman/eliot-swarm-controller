@@ -539,11 +539,6 @@ pub mod winui {
             self.role(|r| r.composer, ThemeBrush::SolidBackground)
         }
 
-        /// Menus and popovers.
-        pub fn menu(self) -> Brush {
-            self.role(|r| r.menu, ThemeBrush::SolidBackground)
-        }
-
         /// The selection: a selected row, segment or pane tab, a status
         /// pill, a popover row under the keyboard.
         pub fn selected(self) -> Brush {
@@ -800,19 +795,6 @@ pub mod winui {
             self.with(|r| {
                 Family::new(Some(r.primary_container), r.on_primary_container).overrides(r)
             })
-        }
-
-        /// A menu's or popover's 1-DIP edge: `overlay-border` (dark themes
-        /// only; transparent in light ones).
-        pub fn overlay_border(self) -> Brush {
-            match self.roles {
-                Some(r) => {
-                    let v = r.scheme.overlay_border;
-                    let c = super::rgb(v);
-                    Brush::Solid(Color::argb((v >> 24) as u8, c.r, c.g, c.b))
-                }
-                None => Brush::Theme(ThemeBrush::CardStroke),
-            }
         }
 
         /// Settings usage status for a reported percentage remaining.

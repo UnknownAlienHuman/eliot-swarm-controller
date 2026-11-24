@@ -1,8 +1,10 @@
 //! Hand-declared WinRT interfaces for the few WinUI calls Reactor 0.100.0
-//! does not expose (`app_resources`, `motion`). Reactor's own bindings are
-//! crate-private, so each caller declares only the vtable slots it calls,
-//! with ids and slot numbers read from the Windows App SDK metadata
-//! (`Microsoft.UI.Xaml.winmd` 2.3.0, `Microsoft.UI.winmd` 2.1.3).
+//! does not expose (`app_resources`, `motion`, `flyout`). Reactor's own
+//! bindings are crate-private, so each caller declares only the vtable
+//! slots it calls, with ids and slot numbers read from the Windows App SDK
+//! metadata (`Microsoft.UI.Xaml.winmd` 2.3.0, `Microsoft.UI.winmd` 2.1.3).
+//! The event handlers those callers add are windows-core delegate boxes
+//! around a plain function ([`delegate`]).
 #![allow(
     unsafe_code,
     reason = "WinRT UI integration requires COM and native interface calls."
@@ -10,7 +12,8 @@
 
 use std::ffi::c_void;
 
-use windows_core::{HRESULT, IInspectable, Interface};
+use windows_core::imp::DelegateBox;
+use windows_core::{HRESULT, IInspectable, IUnknown, Interface};
 
 /// A WinRT interface pointer with a hand-declared vtable.
 macro_rules! winrt_interface {
@@ -57,4 +60,53 @@ pub(crate) unsafe fn get<T: Interface>(
     }
     // SAFETY: the getter returned one owned reference.
     Ok(unsafe { IInspectable::from_raw(out) })
+}
+
+/// Borrow an ABI argument as `T`.
+pub(crate) fn borrowed<T: Interface>(raw: Raw) -> Option<T> {
+    // SAFETY: `raw` is a live interface pointer the caller lends for the
+    // call; `cast` takes a new reference of its own.
+    unsafe { IUnknown::from_raw_borrowed(&raw) }?.cast().ok()
+}
+
+/// A delegate: IUnknown, then `Invoke(sender, args)`.
+#[repr(C)]
+pub(crate) struct DelegateVtbl {
+    base: windows_core::IUnknown_Vtbl,
+    invoke: unsafe extern "system" fn(Raw, Raw, Raw) -> HRESULT,
+}
+
+/// What a delegate calls with its sender and arguments.
+pub(crate) type Callback = fn(Raw, Raw);
+
+/// A delegate calling `callback`: windows-core's delegate box with this
+/// module's `Invoke` thunk.
+pub(crate) fn delegate<I: Interface<Vtable = DelegateVtbl>>(
+    vtable: &'static DelegateVtbl,
+    callback: Callback,
+) -> I {
+    let boxed = Box::new(DelegateBox::<I, Callback>::new(vtable, callback));
+    // SAFETY: a `DelegateBox` starts with its vtable pointer and carries
+    // one reference; `I` is a transparent interface pointer.
+    unsafe { I::from_raw(Box::into_raw(boxed).cast()) }
+}
+
+/// The `Invoke` slot of [`delegate`]'s vtables.
+unsafe extern "system" fn invoke<I: Interface>(this: Raw, sender: Raw, args: Raw) -> HRESULT {
+    // SAFETY: `this` is the box `delegate` allocated for `I`.
+    let this = unsafe { &*(this as *const DelegateBox<I, Callback>) };
+    (this.invoke)(sender, args);
+    HRESULT(0)
+}
+
+/// The vtable of a delegate of interface `I` (kept in a `static`).
+pub(crate) const fn delegate_vtable<I: Interface>() -> DelegateVtbl {
+    DelegateVtbl {
+        base: windows_core::IUnknown_Vtbl {
+            QueryInterface: DelegateBox::<I, Callback>::QueryInterface,
+            AddRef: DelegateBox::<I, Callback>::AddRef,
+            Release: DelegateBox::<I, Callback>::Release,
+        },
+        invoke: invoke::<I>,
+    }
 }

@@ -1,8 +1,12 @@
 //! The new-task composer's chips and the popovers they open: the project
 //! list, the model picker and the access menu (see [`super::launch_ui`]
 //! for their state and keys). The open Agent's effort and usage popovers
-//! are drawn by the conversation's composer; every popover overlays the
-//! conversation right above the composer.
+//! are built by the conversation's composer. Every popover is a real
+//! WinUI `Flyout` on its chip ([`DesktopApp::popover_chip`]): its presenter
+//! gives the menu surface, edge, corner, inset and elevation
+//! (`app_resources`), so the content here is the rows alone. A flyout's
+//! content takes no tooltip (Reactor 0.100.0 refuses a tooltip under a
+//! flyout).
 
 use eliot_core::api::native_profile::CodexPermissions;
 use std::collections::HashMap;
@@ -20,9 +24,6 @@ const PICKER_HINTS: &str = "↑↓ move   ←→ effort   Enter choose   Ctrl+F 
 const DEFAULT_EFFORT: &str = "Default effort";
 /// Models a Manage models group lists before it asks for a search.
 const MANAGE_GROUP_ROWS: usize = 150;
-/// The conversation rows a popover overlays: the transcript, pending
-/// requests and the notice row, down to the composer.
-pub(super) const POPOVER_ROWS: i32 = 4;
 
 impl DesktopApp {
     /// A new task composer's first row, inside its card (Codex's): the
@@ -46,18 +47,24 @@ impl DesktopApp {
         } else {
             m3::glyph::FOLDER
         };
-        let chip = m3::chip(palette)
-            .automation_name(format!(
-                "Project: {label} ({})",
-                if open { "list open" } else { "choose" }
-            ))
-            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project))))
-            .content(m3::chip_content(
+        let chip = self.popover_chip(
+            m3::chip(palette)
+                .automation_name(format!(
+                    "Project: {label} ({})",
+                    if open { "list open" } else { "choose" }
+                ))
+                .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project)))),
+            m3::chip_content(
                 Some(glyph),
                 &label,
                 true,
                 tokens::layout::PROJECT_CHIP_WIDTH,
-            ));
+            ),
+            &[Pop::Project],
+            FlyoutPlacement::TopEdgeAlignedLeft,
+            context,
+            palette,
+        );
         let folder: View = if !self.launch.chat
             && (self.launch.custom_workspace || self.nav.projects.is_empty())
         {
@@ -132,13 +139,19 @@ impl DesktopApp {
             Choice::Auto => m3::glyph::AUTO,
             _ => m3::glyph::MODEL,
         };
-        let model = m3::chip(palette)
-            .automation_name(format!(
-                "Model: {} (Ctrl+M)",
-                self.launch.choice.chip_name(auto_profile)
-            ))
-            .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model))))
-            .content(m3::chip_content(Some(glyph), &label, true, label_width));
+        let model = self.popover_chip(
+            m3::chip(palette)
+                .automation_name(format!(
+                    "Model: {} (Ctrl+M)",
+                    self.launch.choice.chip_name(auto_profile)
+                ))
+                .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model)))),
+            m3::chip_content(Some(glyph), &label, true, label_width),
+            &[Pop::Model, Pop::Manage],
+            FlyoutPlacement::TopEdgeAlignedLeft,
+            context,
+            palette,
+        );
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();
@@ -146,21 +159,27 @@ impl DesktopApp {
                 // Keyed by level: a chip's colors apply when it is created.
                 Grid::new().keyed_children(vec![KeyedView::new(
                     format!("access:{}", access.wire()),
-                    if full {
-                        m3::attention_chip(palette)
-                    } else {
-                        m3::chip(palette)
-                    }
-                    .automation_name(format!("Access: {}", access.label()))
-                    .on_click(
-                        context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
-                    )
-                    .content(m3::chip_content(
-                        Some(access_glyph(access)),
-                        access.label(),
-                        false,
-                        tokens::layout::PROJECT_CHIP_WIDTH,
-                    )),
+                    self.popover_chip(
+                        if full {
+                            m3::attention_chip(palette)
+                        } else {
+                            m3::chip(palette)
+                        }
+                        .automation_name(format!("Access: {}", access.label()))
+                        .on_click(
+                            context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Access))),
+                        ),
+                        m3::chip_content(
+                            Some(access_glyph(access)),
+                            access.label(),
+                            false,
+                            tokens::layout::PROJECT_CHIP_WIDTH,
+                        ),
+                        &[Pop::Access],
+                        FlyoutPlacement::TopEdgeAlignedLeft,
+                        context,
+                        palette,
+                    ),
                 )])
             }
             // A preset (or Auto's pick) carries its own permissions: an
@@ -194,23 +213,42 @@ impl DesktopApp {
             .children((access, model))
     }
 
-    /// The open popover in the reading column right above the composer
-    /// (empty when none is open). It overlays the conversation (the rows
-    /// above the composer), so the transcript never moves when it opens;
-    /// the usage popover sits at the right, under its ring.
-    pub(super) fn popover_view(
+    /// `chip`, which opens `pops`: while one of them is open (and not for a
+    /// preset, whose Model field carries its own), the chip carries it as
+    /// its WinUI `Flyout`, at `placement` from the chip, with the anchor id
+    /// the window opens it by (`crate::flyout`). The content is one native
+    /// element (a flyout takes exactly one), switched in place between the
+    /// popovers of one chip.
+    pub(super) fn popover_chip(
         &self,
-        column: Option<f64>,
+        chip: Button,
+        label: View,
+        pops: &[Pop],
+        placement: FlyoutPlacement,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let Some(pop) = self.launch.open else {
-            return View::empty();
+        let open = self
+            .launch
+            .open
+            .filter(|pop| pops.contains(pop) && self.launch.preset.is_none());
+        self.anchored_popover(chip, label, open, placement, context, palette)
+    }
+
+    /// `chip` with its `label` content, carrying the flyout of `open`, if
+    /// any (see [`Self::popover_chip`]).
+    pub(super) fn anchored_popover(
+        &self,
+        chip: Button,
+        label: View,
+        open: Option<Pop>,
+        placement: FlyoutPlacement,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let Some(pop) = open else {
+            return chip.content(label);
         };
-        if self.launch.preset_target().is_some() {
-            // A preset's picker opens in its Settings form.
-            return View::empty();
-        }
         let content = match pop {
             Pop::Model => self.model_popover(context, palette),
             Pop::Manage => self.manage_popover(context, palette),
@@ -219,23 +257,9 @@ impl DesktopApp {
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };
-        // The design's entrance: a 250 ms fade (Reactor's opacity
-        // transition) while the popover rises 4 DIPs into place
-        // (`crate::motion::popover_entered`, which finds it by its
-        // automation id).
-        let entering = self.launch.entering;
-        let entrance = std::time::Duration::from_millis(tokens::motion::POPOVER_MS);
-        Border::new()
-            .grid_row(1)
-            .grid_row_span(POPOVER_ROWS)
-            .vertical_alignment(VerticalAlignment::Bottom)
-            .width(column)
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .automation_id(crate::motion::POPOVER_ID)
-            .opacity(if entering { 0.0 } else { 1.0 })
-            .opacity_transition(Some(entrance))
-            .content(content)
+        chip.automation_id(crate::flyout::POPOVER_ANCHOR)
+            .content(label)
+            .flyout_with(Flyout::rich(Border::new().content(content)).placement(placement))
     }
 
     pub(super) fn model_popover(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
@@ -372,8 +396,7 @@ impl DesktopApp {
             .height(tokens::height::CONTROL)
             .automation_name("Manage models")
             .on_click(context.message(Message::Launch(LaunchMsg::ManageOpened)))
-            .content(m3::icon(m3::glyph::SLIDERS))
-            .tooltip("Manage models");
+            .content(m3::icon(m3::glyph::SLIDERS));
         let search = Grid::new()
             .columns([GridLength::STAR, GridLength::Auto])
             .column_spacing(tokens::spacing::XS)
@@ -383,27 +406,20 @@ impl DesktopApp {
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Models")
             .content(StackPanel::new().keyed_children(items));
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .width(tokens::layout::PICKER_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-            m3::popover(palette).content(StackPanel::new().spacing(tokens::spacing::XS).children(
-                (
-                    search,
-                    list,
-                    m3::divider(palette),
-                    m3::secondary(PICKER_HINTS).margin(Thickness::new(
-                        tokens::spacing::SM,
-                        0.0,
-                        tokens::spacing::SM,
-                        tokens::spacing::XS,
-                    )),
-                ),
-            )),
-        )
+        StackPanel::new()
+            .width(tokens::layout::PICKER_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .children((
+                search,
+                list,
+                m3::divider(palette),
+                m3::secondary(PICKER_HINTS).margin(Thickness::new(
+                    tokens::spacing::SM,
+                    0.0,
+                    tokens::spacing::SM,
+                    tokens::spacing::XS,
+                )),
+            ))
     }
 
     /// One choosable row (OpenCode's): the check, the full model name and an
@@ -475,38 +491,36 @@ impl DesktopApp {
         .collect();
         // The name takes the width it needs (the picker is sized for the
         // widest catalogue name); only the note gives way.
-        let button = button
-            .content(
-                Grid::new()
-                    .columns([
-                        GridLength::Pixel(tokens::layout::CHECK_COLUMN),
-                        GridLength::Auto,
-                        GridLength::STAR,
-                        GridLength::Auto,
-                    ])
-                    .column_spacing(tokens::spacing::SM)
-                    .children((
-                        Border::new()
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .content(check),
-                        TextBlock::new()
-                            .grid_column(1)
-                            .text(title.to_owned())
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        m3::secondary(note.to_owned())
-                            .grid_column(2)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        StackPanel::new()
-                            .grid_column(3)
-                            .orientation(Orientation::Horizontal)
-                            .spacing(tokens::spacing::XS)
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .keyed_children(labels),
-                    )),
-            )
-            .tooltip(title.to_owned());
+        let button = button.content(
+            Grid::new()
+                .columns([
+                    GridLength::Pixel(tokens::layout::CHECK_COLUMN),
+                    GridLength::Auto,
+                    GridLength::STAR,
+                    GridLength::Auto,
+                ])
+                .column_spacing(tokens::spacing::SM)
+                .children((
+                    Border::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(check),
+                    TextBlock::new()
+                        .grid_column(1)
+                        .text(title.to_owned())
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                    m3::secondary(note.to_owned())
+                        .grid_column(2)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                    StackPanel::new()
+                        .grid_column(3)
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::XS)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .keyed_children(labels),
+                )),
+        );
         let segment = highlighted && enabled && !item.efforts.is_empty();
         let effort: View = if segment {
             let segments: Vec<KeyedView> =
@@ -691,15 +705,9 @@ impl DesktopApp {
                     .content(row),
             ));
         }
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .width(tokens::layout::MENU_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-            m3::popover(palette).content(StackPanel::new().keyed_children(rows)),
-        )
+        StackPanel::new()
+            .width(tokens::layout::MENU_WIDTH)
+            .keyed_children(rows)
     }
 
     /// The project list: a search field, the registered projects (name and
@@ -762,23 +770,16 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::ProjectQuery(text))),
             );
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .width(tokens::layout::MENU_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-            m3::popover(palette).content(
-                StackPanel::new().spacing(tokens::spacing::XS).children((
-                    search,
-                    ScrollViewer::new()
-                        .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
-                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                        .content(StackPanel::new().keyed_children(rows)),
-                )),
-            ),
-        )
+        StackPanel::new()
+            .width(tokens::layout::MENU_WIDTH)
+            .spacing(tokens::spacing::XS)
+            .children((
+                search,
+                ScrollViewer::new()
+                    .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .content(StackPanel::new().keyed_children(rows)),
+            ))
     }
 }
 
@@ -919,25 +920,18 @@ impl DesktopApp {
             .on_text_changed(
                 context.callback(|text| Message::Launch(LaunchMsg::ManageQuery(text))),
             );
-        m3::lifted(
-            palette,
-            crate::theme::elevation::Level::Two,
-            tokens::radius::CONTAINER,
-            Grid::new()
-                .width(tokens::layout::PICKER_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Left),
-            m3::popover(palette).content(
-                StackPanel::new().spacing(tokens::spacing::SM).children((
-                    header,
-                    search,
-                    ScrollViewer::new()
-                        .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
-                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                        .automation_name("Model groups")
-                        .content(StackPanel::new().keyed_children(rows)),
-                )),
-            ),
-        )
+        StackPanel::new()
+            .width(tokens::layout::PICKER_WIDTH)
+            .spacing(tokens::spacing::SM)
+            .children((
+                header,
+                search,
+                ScrollViewer::new()
+                    .max_height(tokens::layout::POPOVER_LIST_HEIGHT)
+                    .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                    .automation_name("Model groups")
+                    .content(StackPanel::new().keyed_children(rows)),
+            ))
     }
 }
 

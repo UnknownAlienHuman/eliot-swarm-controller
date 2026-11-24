@@ -1,6 +1,6 @@
-//! The design's press-point ripple and popover rise (`System.dc.html`:
-//! "Ripple from the press point", "250 ms for popover entrance (fade +
-//! 4-DIP rise)"): two pieces of motion that need WinUI calls Reactor
+//! The design's press-point ripple ("Ripple from the press point",
+//! `System.dc.html`), focus within a sidebar row, and the window's content
+//! root that `crate::flyout` finds its anchors under: WinUI calls Reactor
 //! 0.100.0 does not expose.
 //!
 //! - **Ripple.** The button template (`app_resources::templates`) grows its
@@ -16,13 +16,12 @@
 //!   (automation id [`ROW_ID_PREFIX`], [`resolve_focused_row`]) so the row
 //!   shows its "⋯" to the keyboard as to the pointer; Shift+F10 or the
 //!   context-menu key opens its menu at the row ([`focused_row_anchor`]).
-//! - **Popover rise.** Reactor fades the popover in through its opacity
-//!   transition; [`popover_entered`] lowers the popover (automation id
-//!   [`POPOVER_ID`]) by the design's 4 DIPs and lets
-//!   `UIElement.TranslationTransition` bring it up over the same 250 ms.
+//! - **Elements by automation id.** [`find`] walks the content root
+//!   breadth-first for an automation id; [`element_bottom_left`] places a
+//!   menu under an element.
 //!
 //! Every call fails quietly: without the root the ripple grows from the
-//! centre and the popover only fades. All of it runs on the UI thread.
+//! centre and nothing is found. All of it runs on the UI thread.
 //!
 //! Interface ids and vtable slots are those of `Microsoft.UI.Xaml.winmd`
 //! (WinUI 2.3.0) and `Microsoft.UI.winmd` (Windows App SDK 2.1.3), read
@@ -38,15 +37,15 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::mem::offset_of;
 
-use windows_core::imp::{ConstBuffer, DelegateBox};
+use windows_core::imp::ConstBuffer;
 use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
 use windows_reference::IReference;
 
-use crate::ui::tokens::{layout, motion};
-use crate::winrt::{Getter, InspectableSlots, Raw, get, winrt_interface};
-
-/// The automation id of the composer's popover (`ui::picker_ui`).
-pub const POPOVER_ID: &str = "eliot-popover";
+use crate::ui::tokens::layout;
+use crate::winrt::{
+    DelegateVtbl, Getter, InspectableSlots, Raw, borrowed, delegate, delegate_vtable, get,
+    winrt_interface,
+};
 
 /// The automation id prefix of a sidebar row's container, followed by the
 /// row's key (`agent:<id>`, `project:<key>`; `ui::sidebar_ui`).
@@ -59,7 +58,7 @@ const BUTTON_CLASS: &str = "Microsoft.UI.Xaml.Controls.Button";
 const MAX_ANCESTORS: usize = 24;
 /// How deep under the Button its ripple is looked for.
 const MAX_TEMPLATE_DEPTH: usize = 8;
-/// The most elements one popover search visits.
+/// The most elements one search by automation id visits.
 const MAX_SEARCH: usize = 6000;
 
 /// `Windows.Foundation.Point`.
@@ -68,15 +67,6 @@ const MAX_SEARCH: usize = 6000;
 struct Point {
     x: f32,
     y: f32,
-}
-
-/// `System.Numerics.Vector3`.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct Vector3 {
-    x: f32,
-    y: f32,
-    z: f32,
 }
 
 const SLOT: usize = size_of::<usize>();
@@ -101,13 +91,7 @@ struct UIElementVtbl {
     _6_19: [usize; 14],
     /// 20 `put_RenderTransformOrigin`.
     put_render_transform_origin: unsafe extern "system" fn(Raw, Point) -> HRESULT,
-    _21_89: [usize; 69],
-    /// 90 `put_Translation`.
-    put_translation: unsafe extern "system" fn(Raw, Vector3) -> HRESULT,
-    _91: usize,
-    /// 92 `put_TranslationTransition`.
-    put_translation_transition: unsafe extern "system" fn(Raw, Raw) -> HRESULT,
-    _93_108: [usize; 16],
+    _21_108: [usize; 88],
     /// 109 `get_XamlRoot`.
     xaml_root: Getter,
     _110_214: [usize; 105],
@@ -119,8 +103,6 @@ struct UIElementVtbl {
 }
 const _: () = {
     assert!(offset_of!(UIElementVtbl, put_render_transform_origin) == 20 * SLOT);
-    assert!(offset_of!(UIElementVtbl, put_translation) == 90 * SLOT);
-    assert!(offset_of!(UIElementVtbl, put_translation_transition) == 92 * SLOT);
     assert!(offset_of!(UIElementVtbl, xaml_root) == 109 * SLOT);
     assert!(offset_of!(UIElementVtbl, add_handler) == 215 * SLOT);
     assert!(offset_of!(UIElementVtbl, transform_to_visual) == 217 * SLOT);
@@ -215,33 +197,11 @@ struct AutomationPropertiesStaticsVtbl {
 }
 const _: () = assert!(offset_of!(AutomationPropertiesStaticsVtbl, automation_id) == 13 * SLOT);
 
-#[repr(C)]
-struct Vector3TransitionFactoryVtbl {
-    base: InspectableSlots,
-    /// 6 `CreateInstance(Object outer, out Object inner)`.
-    create_instance: unsafe extern "system" fn(Raw, Raw, *mut Raw, *mut Raw) -> HRESULT,
-}
-
-#[repr(C)]
-struct Vector3TransitionVtbl {
-    base: InspectableSlots,
-    _6: usize,
-    /// 7 `put_Duration(TimeSpan)`.
-    put_duration: unsafe extern "system" fn(Raw, i64) -> HRESULT,
-}
-
 /// `DependencyObject` parameters take this interface's pointer (the ABI
 /// passes a class by its default interface); no slot is called on it.
 #[repr(C)]
 struct DependencyObjectVtbl {
     base: InspectableSlots,
-}
-
-/// A delegate: IUnknown, then `Invoke(sender, args)`.
-#[repr(C)]
-struct DelegateVtbl {
-    base: windows_core::IUnknown_Vtbl,
-    invoke: unsafe extern "system" fn(Raw, Raw, Raw) -> HRESULT,
 }
 
 winrt_interface!(
@@ -309,16 +269,6 @@ winrt_interface!(
     GeneralTransformVtbl,
     GUID::from_u128(0x04eedeeb_31e5_54c0_ae3f_8bd06645d339)
 );
-winrt_interface!(
-    IVector3TransitionFactory,
-    Vector3TransitionFactoryVtbl,
-    GUID::from_u128(0xa3a084fc_b965_534b_900f_78e288129232)
-);
-winrt_interface!(
-    IVector3Transition,
-    Vector3TransitionVtbl,
-    GUID::from_u128(0x0c408bb9_f9a2_55d7_8aed_143d36d603f2)
-);
 // `EventHandler<FocusManagerGotFocusEventArgs>`: a parameterized id.
 winrt_interface!(
     GotFocusHandler,
@@ -357,40 +307,6 @@ runtime_class!(
     AutomationProperties,
     "Microsoft.UI.Xaml.Automation.AutomationProperties"
 );
-runtime_class!(Vector3Transition, "Microsoft.UI.Xaml.Vector3Transition");
-
-type Callback = fn(Raw, Raw);
-
-/// A delegate calling `callback`: windows-core's delegate box with this
-/// module's `Invoke` thunk.
-fn delegate<I: Interface<Vtable = DelegateVtbl>>(
-    vtable: &'static DelegateVtbl,
-    callback: Callback,
-) -> I {
-    let boxed = Box::new(DelegateBox::<I, Callback>::new(vtable, callback));
-    // SAFETY: a `DelegateBox` starts with its vtable pointer and carries
-    // one reference; `I` is a transparent interface pointer.
-    unsafe { I::from_raw(Box::into_raw(boxed).cast()) }
-}
-
-/// The `Invoke` slot of [`delegate`]'s vtables.
-unsafe extern "system" fn invoke<I: Interface>(this: Raw, sender: Raw, args: Raw) -> HRESULT {
-    // SAFETY: `this` is the box `delegate` allocated for `I`.
-    let this = unsafe { &*(this as *const DelegateBox<I, Callback>) };
-    (this.invoke)(sender, args);
-    HRESULT(0)
-}
-
-const fn delegate_vtable<I: Interface>() -> DelegateVtbl {
-    DelegateVtbl {
-        base: windows_core::IUnknown_Vtbl {
-            QueryInterface: DelegateBox::<I, Callback>::QueryInterface,
-            AddRef: DelegateBox::<I, Callback>::AddRef,
-            Release: DelegateBox::<I, Callback>::Release,
-        },
-        invoke: invoke::<I>,
-    }
-}
 
 static GOT_FOCUS_VTABLE: DelegateVtbl = delegate_vtable::<GotFocusHandler>();
 static POINTER_VTABLE: DelegateVtbl = delegate_vtable::<PointerEventHandler>();
@@ -426,13 +342,6 @@ pub fn install() -> Result<(), String> {
         Ok(())
     };
     run().map_err(|error| format!("motion: {error} ({:#010X})", error.code().0))
-}
-
-/// Borrow an ABI argument as `T`.
-fn borrowed<T: Interface>(raw: Raw) -> Option<T> {
-    // SAFETY: `raw` is a live interface pointer the caller lends for the
-    // call; `cast` takes a new reference of its own.
-    unsafe { IUnknown::from_raw_borrowed(&raw) }?.cast().ok()
 }
 
 fn on_got_focus(_sender: Raw, args: Raw) {
@@ -508,7 +417,48 @@ pub fn resolve_focused_row() -> Option<String> {
 /// menu opens (window DIPs), for Shift+F10 and the context-menu key.
 pub fn focused_row_anchor() -> Option<(String, f64, f64)> {
     let (key, row) = STATE.with(|state| state.borrow().focused_row.clone())?;
-    let frame: IFrameworkElement = row.cast().ok()?;
+    let (x, y) = bottom_left(&row)?;
+    Some((key, x, y))
+}
+
+/// The window's content root (`XamlRoot.Content`), once an element took
+/// focus.
+pub fn root() -> Option<IInspectable> {
+    STATE.with(|state| state.borrow().root.clone())?.cast().ok()
+}
+
+/// The element with automation id `id`, breadth-first from the content
+/// root. Nothing is kept once it is found.
+pub fn find(id: &str) -> Option<IInspectable> {
+    let tree = tree()?;
+    let statics =
+        windows_core::factory::<AutomationProperties, IAutomationPropertiesStatics>().ok()?;
+    let mut queue = VecDeque::from([root()?]);
+    let mut visited = 0;
+    while let Some(node) = queue.pop_front() {
+        visited += 1;
+        if visited > MAX_SEARCH {
+            return None;
+        }
+        for child in children(&tree, &node) {
+            if automation_id(&statics, &child).is_some_and(|found| found == id) {
+                return Some(child);
+            }
+            queue.push_back(child);
+        }
+    }
+    None
+}
+
+/// The point under the start of the element with automation id `id`, in
+/// the content root's DIPs (where its menu opens).
+pub fn element_bottom_left(id: &str) -> Option<(f64, f64)> {
+    bottom_left(&find(id)?.cast().ok()?)
+}
+
+/// The bottom-left corner of `element` in the content root's DIPs.
+fn bottom_left(element: &IUIElement) -> Option<(f64, f64)> {
+    let frame: IFrameworkElement = element.cast().ok()?;
     let mut height = 0.0;
     let mut transform = std::ptr::null_mut();
     let mut point = Point::default();
@@ -520,9 +470,13 @@ pub fn focused_row_anchor() -> Option<(String, f64, f64)> {
         (frame.vtable().actual_height)(frame.as_raw(), &mut height)
             .ok()
             .ok()?;
-        (row.vtable().transform_to_visual)(row.as_raw(), std::ptr::null_mut(), &mut transform)
-            .ok()
-            .ok()?;
+        (element.vtable().transform_to_visual)(
+            element.as_raw(),
+            std::ptr::null_mut(),
+            &mut transform,
+        )
+        .ok()
+        .ok()?;
         if transform.is_null() {
             return None;
         }
@@ -538,7 +492,7 @@ pub fn focused_row_anchor() -> Option<(String, f64, f64)> {
         .ok()
         .ok()?;
     }
-    Some((key, f64::from(point.x), f64::from(point.y)))
+    Some((f64::from(point.x), f64::from(point.y)))
 }
 
 fn add_pointer_handler(root: &IUIElement) -> windows_core::Result<()> {
@@ -640,7 +594,7 @@ fn on_pointer_pressed(_sender: Raw, args: Raw) {
             }
             button = parent(&tree, &button)?;
         }
-        let ripple = find(&tree, &button, MAX_TEMPLATE_DEPTH, &|element| {
+        let ripple = find_under(&tree, &button, MAX_TEMPLATE_DEPTH, &|element| {
             name(element).is_some_and(|name| name == RIPPLE_NAME)
         })?;
         // The ripple overhangs its state layer by `RIPPLE_INSET` on every
@@ -698,7 +652,7 @@ fn on_pointer_pressed(_sender: Raw, args: Raw) {
 
 /// The first element under `from` (depth-first, at most `depth` levels)
 /// that `matches`.
-fn find(
+fn find_under(
     tree: &IVisualTreeHelperStatics,
     from: &IInspectable,
     depth: usize,
@@ -711,90 +665,7 @@ fn find(
         if matches(&child) {
             Some(child)
         } else {
-            find(tree, &child, depth - 1, matches)
+            find_under(tree, &child, depth - 1, matches)
         }
     })
-}
-
-/// The popover's element, breadth-first from the root (it sits a few
-/// levels down). Nothing is kept once it is found.
-fn popover(tree: &IVisualTreeHelperStatics) -> Option<IInspectable> {
-    let statics =
-        windows_core::factory::<AutomationProperties, IAutomationPropertiesStatics>().ok()?;
-    let root: IInspectable = STATE
-        .with(|state| state.borrow().root.clone())?
-        .cast()
-        .ok()?;
-    let mut queue = VecDeque::from([root]);
-    let mut visited = 0;
-    while let Some(node) = queue.pop_front() {
-        visited += 1;
-        if visited > MAX_SEARCH {
-            return None;
-        }
-        for child in children(tree, &node) {
-            if automation_id(&statics, &child).is_some_and(|id| id == POPOVER_ID) {
-                return Some(child);
-            }
-            queue.push_back(child);
-        }
-    }
-    None
-}
-
-/// The popover just started fading in: lower it by the design's rise and
-/// let a translation transition bring it up over the entrance.
-pub fn popover_entered() {
-    let _ = (|| -> Option<()> {
-        let tree = tree()?;
-        let element: IUIElement = popover(&tree)?.cast().ok()?;
-        let factory =
-            windows_core::factory::<Vector3Transition, IVector3TransitionFactory>().ok()?;
-        let (mut inner, mut transition) = (std::ptr::null_mut(), std::ptr::null_mut());
-        // SAFETY: slot 6 of IVector3TransitionFactory is CreateInstance; no
-        // outer object, so `inner` stays null and `transition` is owned.
-        unsafe {
-            (factory.vtable().create_instance)(
-                factory.as_raw(),
-                std::ptr::null_mut(),
-                &mut inner,
-                &mut transition,
-            )
-        }
-        .ok()
-        .ok()?;
-        if transition.is_null() {
-            return None;
-        }
-        // SAFETY: as above.
-        let transition: IVector3Transition =
-            unsafe { IInspectable::from_raw(transition) }.cast().ok()?;
-        // 100-ns ticks.
-        let ticks = i64::try_from(motion::POPOVER_MS).ok()? * 10_000;
-        // SAFETY: slot 7 of IVector3Transition is put_Duration; slots 90 and
-        // 92 of IUIElement are put_Translation and put_TranslationTransition.
-        unsafe {
-            (transition.vtable().put_duration)(transition.as_raw(), ticks)
-                .ok()
-                .ok()?;
-            let raw = element.as_raw();
-            let vtable = element.vtable();
-            (vtable.put_translation_transition)(raw, std::ptr::null_mut())
-                .ok()
-                .ok()?;
-            (vtable.put_translation)(
-                raw,
-                Vector3 {
-                    y: motion::POPOVER_RISE as f32,
-                    ..Vector3::default()
-                },
-            )
-            .ok()
-            .ok()?;
-            (vtable.put_translation_transition)(raw, transition.as_raw())
-                .ok()
-                .ok()?;
-            (vtable.put_translation)(raw, Vector3::default()).ok().ok()
-        }
-    })();
 }

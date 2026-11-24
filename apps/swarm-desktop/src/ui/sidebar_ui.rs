@@ -602,6 +602,11 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         actions.push(KeyedView::new(
             "more",
             m3::icon_button(palette)
+                .automation_id(format!(
+                    "{}project:{}",
+                    super::menu_ui::MORE_ID_PREFIX,
+                    section.key
+                ))
                 .automation_name(format!("Project actions for {name}"))
                 .on_click(
                     context.message(Message::Menu(MenuMsg::Opened(Target::Project {
@@ -756,6 +761,11 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         actions.push(KeyedView::new(
             "more",
             m3::icon_button(palette)
+                .automation_id(format!(
+                    "{}agent:{}",
+                    super::menu_ui::MORE_ID_PREFIX,
+                    agent.id
+                ))
                 .automation_name(format!("Task actions for {title}, Agent {}", agent.id))
                 .on_click(
                     context.message(Message::Menu(MenuMsg::Opened(Target::Agent(agent.clone())))),

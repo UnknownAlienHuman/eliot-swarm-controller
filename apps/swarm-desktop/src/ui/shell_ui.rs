@@ -1002,6 +1002,12 @@ impl DesktopApp {
                             self.focus_held_now(target, FOCUS_TRIES, context);
                         }
                     }
+                    // A flyout closed: the open popover or row menu follows
+                    // whether or not a dialog is up.
+                    Shortcut::FlyoutClosed(epoch) => {
+                        self.launch_update(LaunchMsg::Closed(epoch), context);
+                        self.menu_update(MenuMsg::Closed(epoch), context);
+                    }
                     Shortcut::Popover(key) if self.dialog_kind() != 0 => {
                         self.dialog_key(key, context)
                     }
@@ -1019,24 +1025,7 @@ impl DesktopApp {
                             self.launch_update(LaunchMsg::Toggle(launch_ui::Pop::Model), context);
                         }
                     }
-                    Shortcut::Popover(key) if self.menu.open.is_some() => {
-                        use crate::shortcuts::PopoverKey;
-                        match key {
-                            PopoverKey::Escape | PopoverKey::Tab => self.close_menu(),
-                            // Arrows reach clipped actions from the
-                            // keyboard; Enter chooses the highlighted row.
-                            PopoverKey::Up => self.menu_update(MenuMsg::HighlightMove(-1), context),
-                            PopoverKey::Down => {
-                                self.menu_update(MenuMsg::HighlightMove(1), context)
-                            }
-                            PopoverKey::Enter => {
-                                self.menu_update(MenuMsg::HighlightActivate, context)
-                            }
-                            _ => {}
-                        }
-                    }
                     Shortcut::Popover(key) => self.launch_update(LaunchMsg::Key(key), context),
-                    Shortcut::ComposerPressed => self.composer_pressed(),
                     Shortcut::FocusMoved => {
                         let row = crate::motion::resolve_focused_row();
                         if self.menu.focused != row {
@@ -2194,8 +2183,8 @@ impl DesktopApp {
                 Border::new().grid_column(1).content(main),
                 panel,
             ));
-        // One cell: the window, and over it the right-click menu or the
-        // confirmation dialog.
+        // One cell: the window, the row-menu button that carries the
+        // sidebar's menu flyout, and the confirmation dialog.
         let overlay = if self.handoff.open {
             self.handoff_dialog(context)
         } else if self.settings.cleanup_confirm {
@@ -2207,8 +2196,7 @@ impl DesktopApp {
         } else {
             self.task_dialog(context, palette)
         };
-        let window =
-            Grid::new().children((columns_grid, self.menu_overlay(context, palette), overlay));
+        let window = Grid::new().children((columns_grid, self.menu_anchor(context), overlay));
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before
