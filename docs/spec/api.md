@@ -503,7 +503,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
-| `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
+| `auth.login` | Owner-local request to queue or reopen one native harness sign-in. The typed response reports `queued`, `open`, `cooldown` or `unknown` and contains no credentials. |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An `after` cursor from a replaced listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
 | `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
@@ -763,8 +763,8 @@ of failure or permission to replay the effect.
 `swarm auth login --harness H` is an Owner-local `auth.login` call using
 [`AuthLoginRequest` and `AuthLoginResponse`](../../crates/eliot-core/src/api/auth_login.rs).
 The CLI sends `{harness: H, revision: null}` and prints the returned status, or the
-response DTO with `--json`. `queued`, `open` and `cooldown` describe request state;
-none establishes that a vendor account is signed in. The CLI carries no credential and
+response DTO with `--json`. `queued`, `open`, `cooldown` and `unknown` describe
+request state. Vendor sign-in is established by the status probe. The CLI carries no credential and
 does not run a vendor command.
 
 The Owner inbox projects a `harness_auth` item for a sign-in action. Its `sign_in`
