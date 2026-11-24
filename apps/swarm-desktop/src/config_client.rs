@@ -15,7 +15,9 @@
 use std::path::Path;
 
 use eliot_core::AgentState;
-use eliot_core::api::harness::MAX_CATALOG_LIMIT;
+use eliot_core::api::harness::{
+    MAX_CATALOG_LIMIT, ModelsCatalogWatchRequest, ModelsCatalogWatchResponse,
+};
 use eliot_core::api::{
     AgentListRequest, ArchivedFilter, DaemonStatusRequest, DaemonStatusResponse,
     HarnessQuotaRequest, HarnessQuotaResponse, ManagedWorkspaceView, ModelsCatalogRequest,
@@ -238,6 +240,17 @@ pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     }
 }
 
+pub async fn models_catalog_watch(
+    data_dir: &Path,
+    revision: Option<String>,
+) -> Result<ModelsCatalogWatchResponse> {
+    let params = ModelsCatalogWatchRequest { revision };
+    params.validate()?;
+    let reply = eliot_daemon::client_call_typed(data_dir, "models.catalog.watch", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
 async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut request = ModelsCatalogRequest {
         query: None,
@@ -254,6 +267,12 @@ async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
         next = page.next.clone();
         match whole.as_mut() {
             Some(whole) => {
+                if whole.revision != page.revision {
+                    return Err(Error::new(
+                        "invalid",
+                        "catalogue cursor is no longer in the listing; restart from the first page",
+                    ));
+                }
                 whole.models.extend(page.models);
                 // Every page repeats the aggregate's failed harnesses.
                 whole.failures = page.failures;

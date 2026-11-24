@@ -505,6 +505,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
 | `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An `after` cursor from a replaced listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
+| `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
@@ -2411,8 +2412,12 @@ read on a cold or changed source joins the shared refresh within its discovery
 deadline. The desktop keeps its current list while that read settles.
 The daemon rechecks settings, installations and login revisions before
 publishing a new aggregate and projects current holds for each page. For
-recently requested catalogues it refreshes before expiry. Repeated failures
-back off from 30 seconds up to 15 minutes. Background work stops after five
+recently requested catalogues it refreshes before expiry. Each page carries
+the settled revision. The open desktop picker watches for a new revision and
+loads it while keeping the current rows visible. Whole-aggregate failures,
+native reader failures and executable probe failures back off from 30 seconds
+up to 15 minutes. A whole-aggregate cooldown also gates settings and inventory
+checks. Background work stops after five
 minutes without demand and discovery admission closes at shutdown.
 An expired snapshot for the same key may be served with `stale = true`.
 The aggregate can retain last-good rows for an unavailable source and reports
@@ -2477,9 +2482,14 @@ fallback. The daemon gives each shared read its own budget, subject to the
 native reader's limit, and retains custody through cleanup. Validated
 successful responses populate the cache. Known file-backed login changes,
 the Windows Antigravity keyring revision and resolved Swarm sign-in reports
-invalidate old catalogue results. Explicit workspace previews, legacy or
-unverified sources and live session reads continue to use their exact native
-read. Only verified native sources contribute shared aggregate rows.
+invalidate old catalogue results. A source whose login revision cannot be
+observed has a hard 90-second freshness limit for both direct and aggregate
+reads. Concurrent previews of the same verified source and canonical
+workspace share their in-flight read. After a successful workspace preview,
+the same key returns `busy` for 30 seconds. Workspace-specific results live
+only for the callers waiting on that read. Unverified sources return
+`unavailable` or documented aliases without starting a model reader. Exact
+live session catalogue reads continue to use the owned generation.
 Public `scope` names the profile and route without
 private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`,
 `stale` and a nonsecret `credential` reference. Native model IDs remain verbatim.

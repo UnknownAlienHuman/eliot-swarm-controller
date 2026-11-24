@@ -788,6 +788,7 @@ impl Router {
             "auth.desktop.report" => self.auth_desktop_report(&params).await,
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
+            "models.catalog.watch" => self.models_catalog_watch(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,
             "agent.archive" => {
                 require_owner(&principal)?;

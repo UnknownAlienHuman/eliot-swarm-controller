@@ -1486,6 +1486,9 @@ impl ModelsCatalogEntry {
 /// Response for `models.catalog`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelsCatalogResponse {
+    /// Revision of the daemon's settled aggregate, shared by every page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     /// Every installed harness with its version and status.
     pub harnesses: Vec<HarnessEntry>,
     /// The bounded page of unified models, sorted by harness, id and profile.
@@ -1504,6 +1507,47 @@ pub struct ModelsCatalogResponse {
     /// (repeated on every page).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<ModelsCatalogFailure>,
+}
+
+/// Wait for a settled aggregate newer than the desktop's current revision.
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelsCatalogWatchRequest {
+    pub revision: Option<String>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct ModelsCatalogWatchResponse {
+    /// The new revision, or no change within the bounded wait.
+    pub revision: Option<String>,
+}
+
+impl ModelsCatalogWatchRequest {
+    pub fn parsed_revision(&self) -> Result<Option<ulid::Ulid>> {
+        self.revision
+            .as_deref()
+            .map(ulid::Ulid::from_string)
+            .transpose()
+            .map_err(|_| Error::new("invalid", "catalogue revision must be a ULID"))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.parsed_revision().map(|_| ())
+    }
+
+    pub fn validate_response(&self, reply: &ModelsCatalogWatchResponse) -> Result<()> {
+        if let Some(revision) = &reply.revision {
+            let revision = ulid::Ulid::from_string(revision)
+                .map_err(|_| Error::new("invalid", "catalogue reply revision must be a ULID"))?;
+            if self.parsed_revision()? == Some(revision) {
+                return Err(Error::new(
+                    "invalid",
+                    "catalogue watch returned its current revision",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Maximum `models.catalog` failure message length in bytes.

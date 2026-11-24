@@ -26,6 +26,8 @@ use crate::picker::{self, Choice, Item, Pick, Row};
 use crate::settings::Access;
 use crate::shortcuts::{Popover as HookPopover, PopoverKey};
 use eliot_core::api::ModelsCatalogResponse;
+use eliot_core::api::harness::ModelsCatalogWatchResponse;
+use std::path::PathBuf;
 
 /// A popover above the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +66,8 @@ pub(super) enum LaunchMsg {
     /// `routing.preview` for the default role.
     PreviewLoaded(Box<Fallible<eliot_core::RoutingDecision>>),
     /// `models.catalog`, every page.
-    CatalogLoaded(Box<Fallible<ModelsCatalogResponse>>),
+    CatalogLoaded(PathBuf, Box<Fallible<ModelsCatalogResponse>>),
+    CatalogWatchLoaded(PathBuf, Box<Fallible<ModelsCatalogWatchResponse>>),
     /// A failed harness's Retry: read the catalogue again.
     CatalogRetry,
     /// Open a popover, or close it when it is the one open.
@@ -226,6 +229,9 @@ pub(super) struct LaunchState {
     /// The unified catalogue, once read.
     pub(super) catalog: Option<Fallible<ModelsCatalogResponse>>,
     pub(super) catalog_loading: bool,
+    pub(super) catalog_data_dir: Option<PathBuf>,
+    pub(super) catalog_watch_pending: bool,
+    pub(super) catalog_watch_revision: Option<String>,
     /// A failed refresh stays visible with the last successful catalogue.
     pub(super) catalog_refresh_error: Option<String>,
     /// What routing would pick for a new task now (advisory).
@@ -519,11 +525,16 @@ impl DesktopApp {
     pub(super) fn launch_update(&mut self, msg: LaunchMsg, context: &ComponentContext<Self>) {
         match msg {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
-            LaunchMsg::CatalogLoaded(reply) => {
+            LaunchMsg::CatalogLoaded(data_dir, reply) => {
                 self.launch.catalog_loading = false;
+                if self.data_dir.as_ref().ok() != Some(&data_dir) {
+                    self.ensure_catalog_watch(context);
+                    return;
+                }
                 match *reply {
                     Ok(catalog) => {
                         // The daemon serves stale rows only for the current source.
+                        self.launch.catalog_watch_revision = catalog.revision.clone();
                         self.launch.catalog = Some(Ok(catalog));
                         self.launch.catalog_refresh_error = None;
                     }
@@ -535,6 +546,19 @@ impl DesktopApp {
                     }
                 }
                 self.keep_highlight();
+            }
+            LaunchMsg::CatalogWatchLoaded(data_dir, reply) => {
+                self.launch.catalog_watch_pending = false;
+                if self.data_dir.as_ref().ok() == Some(&data_dir)
+                    && self.unified_catalog_picker_visible()
+                    && !self.launch.catalog_loading
+                    && let Ok(response) = *reply
+                    && let Some(revision) = response.revision
+                    && self.launch.catalog_watch_revision.as_ref() != Some(&revision)
+                {
+                    self.launch.catalog_watch_revision = Some(revision);
+                    self.load_catalog(context);
+                }
             }
             LaunchMsg::CatalogRetry => {
                 // The Agent picker's Retry re-reads live state: opencode
@@ -786,6 +810,7 @@ impl DesktopApp {
                 }
             }
         }
+        self.ensure_catalog_watch(context);
     }
 
     /// The `[desktop]` preferences arrived: a new task starts with the most
@@ -891,6 +916,7 @@ impl DesktopApp {
             }
             Pop::Usage => crate::shortcuts::set_popover(HookPopover::Menu),
         }
+        self.ensure_catalog_watch(context);
     }
 
     /// A press on the composer's message field (the pointer hook's report,
@@ -1187,12 +1213,49 @@ impl DesktopApp {
         let Ok(data_dir) = self.data_dir.clone() else {
             return;
         };
+        if self.launch.catalog_data_dir.as_ref() != Some(&data_dir) {
+            self.launch.catalog_data_dir = Some(data_dir.clone());
+            self.launch.catalog = None;
+            self.launch.catalog_refresh_error = None;
+            self.launch.catalog_watch_revision = None;
+        }
         self.launch.catalog_loading = true;
         let _task = context.spawn_background(move |_| {
-            Message::Launch(LaunchMsg::CatalogLoaded(Box::new(
-                client::block_on(config_client::models_catalog(&data_dir))
-                    .map_err(|error| error.to_string()),
-            )))
+            let result = client::block_on(config_client::models_catalog(&data_dir))
+                .map_err(|error| error.to_string());
+            Message::Launch(LaunchMsg::CatalogLoaded(data_dir, Box::new(result)))
+        });
+    }
+
+    fn unified_catalog_picker_visible(&self) -> bool {
+        matches!(self.launch.open, Some(Pop::Model | Pop::Manage))
+            && (self.main == Main::Conversation && self.selected_agent_id().is_none()
+                || self.main == Main::Settings && self.launch.preset.is_some())
+    }
+
+    fn ensure_catalog_watch(&mut self, context: &ComponentContext<Self>) {
+        if !self.unified_catalog_picker_visible()
+            || self.launch.catalog_loading
+            || self.launch.catalog_watch_pending
+        {
+            return;
+        }
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if self.launch.catalog_data_dir.as_ref() != Some(&data_dir) {
+            self.load_catalog(context);
+            return;
+        }
+        let revision = self.launch.catalog_watch_revision.clone();
+        self.launch.catalog_watch_pending = true;
+        let _task = context.spawn_background(move |cancel| {
+            let result = client::block_on(config_client::models_catalog_watch(&data_dir, revision))
+                .map_err(|error| error.to_string());
+            if result.is_err() {
+                let _ = crate::feed::backoff(10_000, &|| cancel.is_cancelled());
+            }
+            Message::Launch(LaunchMsg::CatalogWatchLoaded(data_dir, Box::new(result)))
         });
     }
 

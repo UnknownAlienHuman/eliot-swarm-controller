@@ -5,7 +5,11 @@
 //! private process environment. Public scope labels contain only route names.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
-use eliot_core::api::harness::{ModelLoginSource, NativeRoute, QuotaEvidence, QuotaWindowFacts};
+use crate::adhoc::{DISCOVERY_RETRY_INTERVAL, DISCOVERY_RETRY_MAX, DiscoveryFailure};
+use eliot_core::api::harness::{
+    ModelLoginSource, ModelsCatalogWatchRequest, ModelsCatalogWatchResponse, NativeRoute,
+    QuotaEvidence, QuotaWindowFacts,
+};
 use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry, HarnessListResponse,
     HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
@@ -37,6 +41,47 @@ struct ModelReadOptions {
 }
 
 impl Router {
+    pub(super) async fn models_catalog_watch(
+        &self,
+        params: &Value,
+        principal: &Principal,
+    ) -> Result<Value> {
+        require_owner(principal)?;
+        let request: ModelsCatalogWatchRequest =
+            eliot_core::api::discovery::decode_params(params.clone())?;
+        let revision = request.parsed_revision()?;
+        let mut updates = self.inner.catalog_updates.subscribe();
+        let wait = async {
+            loop {
+                if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                    return Err(catalog_shutting_down());
+                }
+                let current = self
+                    .inner
+                    .catalog_cache
+                    .lock_recover()
+                    .aggregate
+                    .as_ref()
+                    .filter(|snapshot| snapshot.is_usable())
+                    .map(|snapshot| snapshot.revision);
+                if let Some(current) = current
+                    && Some(current) != revision
+                {
+                    return Ok(Some(current.to_string()));
+                }
+                updates
+                    .changed()
+                    .await
+                    .map_err(|_| Error::new("unknown", "model catalogue refresh worker stopped"))?;
+            }
+        };
+        let revision = tokio::time::timeout(Duration::from_secs(20), wait)
+            .await
+            .unwrap_or(Ok(None))?;
+        serde_json::to_value(ModelsCatalogWatchResponse { revision })
+            .map_err(|_| Error::new("internal", "catalogue revision could not be encoded"))
+    }
+
     /// Read-only harness installation facts: no model turn, no inference.
     pub(super) async fn harness_list(
         &self,
@@ -341,46 +386,83 @@ impl Router {
                 )
             })?;
             let route = crate::router::plugin_host::metadata_route(&profile)?;
-            if let Some(documented) = documented_models
-                && route.identity.is_none()
-            {
-                return Err(Error::new("unavailable", documented.unverified_route));
+            let unverified = || {
+                Error::new(
+                    "unavailable",
+                    documented_models
+                        .map_or("model catalogue source could not be verified", |models| {
+                            models.unverified_route
+                        }),
+                )
+            };
+            if route.identity.is_none() {
+                return Err(unverified());
             }
+            let workspace_key = if let Some(path) = workspace.clone() {
+                Some(
+                    crate::adhoc::blocking_discovery(deadline, move || {
+                        let path = std::path::Path::new(&path);
+                        if !path.is_absolute() || !path.is_dir() {
+                            return Err(Error::new(
+                                "invalid",
+                                "model preview workspace must be an existing absolute directory",
+                            ));
+                        }
+                        path.canonicalize().map_err(|_| {
+                            Error::new(
+                                "unavailable",
+                                "model preview workspace could not be verified",
+                            )
+                        })
+                    })
+                    .await??,
+                )
+            } else {
+                None
+            };
             let cmd = profile["cmd"].as_str().unwrap_or(harness);
             let (cmd, version) = match discovered {
                 Some(candidate) => (candidate.cmd, candidate.version),
                 None => crate::adhoc::reader_executable(cmd, harness, deadline).await?,
             };
             profile["cmd"] = Value::String(cmd.clone());
-            let cache_key = if workspace.is_none() && route.identity.is_some() {
-                let unverified = || {
-                    Error::new(
-                        "unavailable",
-                        "model catalogue executable version or source could not be verified",
-                    )
-                };
-                let scope = model_source_identity(
+            let unversioned = || {
+                Error::new(
+                    "unavailable",
+                    "model catalogue executable version could not be verified",
+                )
+            };
+            let cache_key = ModelsCacheKey {
+                scope: model_source_identity(
                     label,
                     &profile,
                     route.identity.as_deref(),
                     &route.environment,
                 )
-                .ok_or_else(unverified)?;
-                Some(ModelsCacheKey {
-                    scope,
-                    executable: crate::adhoc::VersionKey::read(&cmd, None)
-                        .ok_or_else(unverified)?,
-                    version: version.ok_or_else(unverified)?,
-                    auth_revision: self.inner.catalog_cache.lock_recover().auth_revision,
-                })
-            } else {
-                None
+                .ok_or_else(unverified)?,
+                executable: crate::adhoc::VersionKey::read(&cmd, None).ok_or_else(unversioned)?,
+                version: version.ok_or_else(unversioned)?,
+                auth_revision: self.inner.catalog_cache.lock_recover().auth_revision,
+                workspace: workspace_key,
             };
             let host = self.inner.plugin_host.clone();
+            let router = self.clone();
             let harness = harness.to_owned();
             let scope = scope.clone();
             let credential = credential.clone();
+            let login_tracked = cache_key.scope.login.is_tracked();
             let read = move |read_deadline: Instant| async move {
+                let source = if workspace.is_some() {
+                    "workspace"
+                } else {
+                    "profile"
+                };
+                crate::logging::record(
+                    &router.secret_policy_snapshot(),
+                    "catalog.source_read_started",
+                    &[("harness", &harness), ("source", source)],
+                    None,
+                );
                 let raw = host
                     .models(profile, route.environment, workspace, read_deadline.into())
                     .await?;
@@ -389,22 +471,17 @@ impl Router {
                 } else {
                     "canonical"
                 };
-                let response = catalog::native_models_response(
+                let mut response = catalog::native_models_response(
                     &harness, &cmd, scope, credential, provenance, &raw,
                 )?;
+                if !login_tracked {
+                    response.ttl_ms = UNTRACKED_LOGIN_TTL_MS;
+                }
                 response.validate()?;
                 Ok(response)
             };
-            match cache_key {
-                Some(key) => self.coalesced_models_read(key, deadline, mode, read).await,
-                None if matches!(mode, ModelReadMode::Launch | ModelReadMode::Refresh) => {
-                    Err(Error::new(
-                        "unavailable",
-                        "model catalogue source could not be verified",
-                    ))
-                }
-                None => read(deadline).await,
-            }
+            self.coalesced_models_read(cache_key, deadline, mode, read)
+                .await
         }
         .await;
         match read {
@@ -439,8 +516,10 @@ impl Router {
             let mut cache = self.inner.catalog_cache.lock_recover();
             let now = now_ms();
             let cached = cache.models.get(&key);
+            let tracked = key.scope.login.is_tracked();
             let lead = match mode {
-                ModelReadMode::Refresh => CATALOG_REFRESH_LEAD_MS,
+                ModelReadMode::Refresh if tracked => CATALOG_REFRESH_LEAD_MS,
+                ModelReadMode::Refresh => UNTRACKED_LOGIN_TTL_MS / 3,
                 _ => 0,
             };
             let failure = cache
@@ -455,7 +534,7 @@ impl Router {
                 return Ok(hit.clone());
             }
             let stale = cached
-                .filter(|_| mode == ModelReadMode::Serve)
+                .filter(|_| mode == ModelReadMode::Serve && tracked)
                 .filter(|_| {
                     failure
                         .as_ref()
@@ -471,6 +550,17 @@ impl Router {
             let result = match cache.model_reads.get(&key).and_then(ModelRead::in_flight) {
                 Some(in_flight) => in_flight,
                 None => {
+                    if cache
+                        .model_reads
+                        .get(&key)
+                        .and_then(|read| read.suppress_until)
+                        .is_some_and(|until| Instant::now() < until)
+                    {
+                        return Err(Error::new(
+                            "busy",
+                            "workspace model catalogue was just read; retry after its 30-second read interval",
+                        ));
+                    }
                     if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
                         return Err(catalog_shutting_down());
                     }
@@ -486,6 +576,7 @@ impl Router {
                         ModelRead {
                             running: Some(result.clone()),
                             failure: failure.clone(),
+                            suppress_until: None,
                         },
                     );
                     let router = self.clone();
@@ -510,14 +601,33 @@ impl Router {
                             return;
                         }
                         if let Ok(response) = &result {
-                            cache.insert_models(key.clone(), response.clone());
-                            cache.model_reads.remove(&key);
+                            if key.workspace.is_some() {
+                                // Workspace-local settings are mutable and do not have a
+                                // verified identity. Only current waiters share this result.
+                                cache.model_reads.insert(
+                                    key,
+                                    ModelRead {
+                                        running: None,
+                                        failure: None,
+                                        suppress_until: Some(
+                                            Instant::now() + DISCOVERY_RETRY_INTERVAL,
+                                        ),
+                                    },
+                                );
+                            } else {
+                                cache.insert_models(key.clone(), response.clone());
+                                cache.model_reads.remove(&key);
+                            }
                         } else if let Err(error) = &result {
                             cache.model_reads.insert(
                                 key,
                                 ModelRead {
                                     running: None,
-                                    failure: Some(ModelFailure::next(failure, error.clone())),
+                                    failure: Some(DiscoveryFailure::next(
+                                        failure.as_ref(),
+                                        error.clone(),
+                                    )),
+                                    suppress_until: None,
                                 },
                             );
                         }
@@ -845,14 +955,27 @@ impl Router {
             ));
         }
         let mut updates = self.inner.catalog_updates.subscribe();
-        let key = self.catalog_key(deadline).await?;
         let snapshot = {
             let mut cache = self.inner.catalog_cache.lock_recover();
             cache.aggregate_requested_at = Some(Instant::now());
-            cache.cached_catalog(&key)
+            if let Some(error) = cache.aggregate_retry_error() {
+                return Err(error);
+            }
+            cache.aggregate.clone()
+        };
+        let key = if snapshot.is_some() {
+            self.catalog_key(deadline).await.ok()
+        } else {
+            None
         };
         let snapshot = match snapshot {
-            Some(snapshot) if request.after.is_some() || !snapshot.refresh_due() => snapshot,
+            Some(snapshot)
+                if key.as_ref() == Some(&snapshot.key)
+                    && snapshot.is_usable()
+                    && (request.after.is_some() || !snapshot.refresh_due()) =>
+            {
+                snapshot
+            }
             _ => {
                 self.inner.catalog_refresh.notify_one();
                 tokio::time::timeout_at(deadline.into(), updates.changed())
@@ -862,7 +985,9 @@ impl Router {
                 let snapshot = updates.borrow_and_update().clone().ok_or_else(|| {
                     Error::new("unknown", "model catalogue refresh produced no outcome")
                 })??;
-                if snapshot.key != key && snapshot.key != self.catalog_key(deadline).await? {
+                if key.as_ref() != Some(&snapshot.key)
+                    && snapshot.key != self.catalog_key(deadline).await?
+                {
                     return Err(catalog_source_changed());
                 }
                 snapshot
@@ -889,19 +1014,35 @@ impl Router {
                     .send_replace(Some(Err(catalog_shutting_down())));
                 continue;
             }
-            if !self
-                .inner
-                .catalog_cache
-                .lock_recover()
-                .aggregate_requested_at
-                .is_some_and(|at| at.elapsed() < CATALOG_INTEREST)
-            {
-                continue;
-            }
+            let auth_revision = {
+                let cache = self.inner.catalog_cache.lock_recover();
+                if cache.aggregate_retry_error().is_some()
+                    || !cache
+                        .aggregate_requested_at
+                        .is_some_and(|at| at.elapsed() < CATALOG_INTEREST)
+                {
+                    continue;
+                }
+                cache.auth_revision
+            };
             let result = tokio::select! {
                 _ = shutdown.changed() => break,
                 result = self.refresh_catalogue() => result,
             };
+            if let Err(error) = &result {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "catalog.aggregate_refresh_failed",
+                    &[],
+                    Some(error),
+                );
+            }
+            let mut cache = self.inner.catalog_cache.lock_recover();
+            if cache.auth_revision == auth_revision {
+                cache.aggregate_failure = result.as_ref().err().map(|error| {
+                    DiscoveryFailure::next(cache.aggregate_failure.as_ref(), error.clone())
+                });
+            }
             self.inner.catalog_updates.send_replace(Some(result));
         }
         self.inner
@@ -918,6 +1059,7 @@ impl Router {
                 return Err(catalog_shutting_down());
             }
             if let Some(snapshot) = self.cached_catalog(&key)
+                && snapshot.is_usable()
                 && !snapshot.refresh_due()
             {
                 return Ok(snapshot);
@@ -1023,6 +1165,7 @@ impl Router {
         let mut quotas = HashMap::new();
         let mut oldest = now_ms();
         let mut expires = i64::MAX;
+        let mut hard_expires_at = None;
         for entry in &harnesses {
             let harness = entry.harness.as_str();
             if tokio::time::Instant::now() >= discovery_deadline {
@@ -1085,7 +1228,7 @@ impl Router {
                 }
             };
             if let Some(response) = ad_hoc_response {
-                apply_source_age(&response, &mut oldest, &mut expires);
+                apply_source_age(&response, &mut oldest, &mut expires, &mut hard_expires_at);
                 if response.credential != "auth:available"
                     && let Ok(Ok(quota)) = tokio::time::timeout_at(
                         discovery_deadline,
@@ -1162,7 +1305,12 @@ impl Router {
                             break;
                         }
                     };
-                    apply_source_age(&scoped_response, &mut oldest, &mut expires);
+                    apply_source_age(
+                        &scoped_response,
+                        &mut oldest,
+                        &mut expires,
+                        &mut hard_expires_at,
+                    );
                     let configured = self
                         .resolve_profile_cached(&name)
                         .ok()
@@ -1231,8 +1379,8 @@ impl Router {
                             .iter()
                             .map(|failure| (&failure.harness, &failure.code)))
             })
-            .map_or(CATALOG_RETRY_INTERVAL, |entry| {
-                (entry.retry_delay * 2).min(CATALOG_RETRY_MAX)
+            .map_or(DISCOVERY_RETRY_INTERVAL, |entry| {
+                (entry.retry_delay * 2).min(DISCOVERY_RETRY_MAX)
             });
         let expires = expires.min(completed.saturating_add(ttl as i64));
         Ok(catalog::CachedAggregate {
@@ -1246,6 +1394,7 @@ impl Router {
             ttl_ms: expires.saturating_sub(oldest).max(1) as u64,
             completed_at: Instant::now(),
             retry_delay,
+            hard_expires_at,
         })
     }
 
@@ -1259,6 +1408,12 @@ impl Router {
     ) -> Result<ModelsCatalogResponse> {
         use eliot_core::api::catalog_matches;
 
+        if !snapshot.is_usable() {
+            return Err(Error::new(
+                "unavailable",
+                "model catalogue login freshness expired during refresh",
+            ));
+        }
         let query = request.query.as_deref().unwrap_or("");
         let stale = !quota_fresh(snapshot.fetched_at_ms, snapshot.ttl_ms, now_ms());
         let limit = request.effective_limit();
@@ -1311,6 +1466,7 @@ impl Router {
             }
         }
         let response = ModelsCatalogResponse {
+            revision: Some(revision),
             harnesses: snapshot.harnesses.clone(),
             models,
             next,
@@ -1327,16 +1483,15 @@ impl Router {
 /// Maximum cached scopes per read kind.
 const MAX_CACHED_SCOPES: usize = 32;
 const CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
-const CATALOG_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-const CATALOG_RETRY_MAX: Duration = Duration::from_secs(15 * 60);
 const CATALOG_INTEREST: Duration = Duration::from_secs(5 * 60);
 // Allow a complete discovery pass and one scheduler tick before expiry.
 const CATALOG_REFRESH_LEAD_MS: u64 = 105_000;
 
 /// Serve cached catalogue/quota entries for this long after the native read.
 pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
+const UNTRACKED_LOGIN_TTL_MS: u64 = 90_000;
 
-const PARTIAL_AGGREGATE_TTL_MS: u64 = CATALOG_RETRY_INTERVAL.as_millis() as u64;
+const PARTIAL_AGGREGATE_TTL_MS: u64 = DISCOVERY_RETRY_INTERVAL.as_millis() as u64;
 
 fn catalog_shutting_down() -> Error {
     Error::new(
@@ -1361,7 +1516,7 @@ fn stale_after_failure(error: &Error) -> bool {
 
 fn stale_models(
     mut response: HarnessModelsResponse,
-    failure: Option<&ModelFailure>,
+    failure: Option<&DiscoveryFailure>,
 ) -> HarnessModelsResponse {
     response.stale = true;
     response.refresh_failure =
@@ -1369,13 +1524,21 @@ fn stale_models(
     response
 }
 
-fn apply_source_age(response: &HarnessModelsResponse, oldest: &mut i64, expires: &mut i64) {
+fn apply_source_age(
+    response: &HarnessModelsResponse,
+    oldest: &mut i64,
+    expires: &mut i64,
+    hard_expires_at: &mut Option<i64>,
+) {
     *oldest = (*oldest).min(response.fetched_at_ms);
-    *expires = (*expires).min(
-        response
-            .fetched_at_ms
-            .saturating_add(response.ttl_ms as i64),
-    );
+    let source_expires = response
+        .fetched_at_ms
+        .saturating_add(response.ttl_ms as i64);
+    *expires = (*expires).min(source_expires);
+    if response.ttl_ms == UNTRACKED_LOGIN_TTL_MS {
+        *hard_expires_at =
+            Some(hard_expires_at.map_or(source_expires, |previous| previous.min(source_expires)));
+    }
 }
 
 fn catalog_source_scope(label: &str, mut snapshot: Value) -> Option<ModelSourceIdentity> {
@@ -1418,6 +1581,18 @@ enum NativeLoginRevision {
 }
 
 impl NativeLoginRevision {
+    fn is_tracked(&self) -> bool {
+        match self {
+            // The first declared file is the sign-in store. Later entries
+            // can also affect the catalogue, but do not establish login.
+            Self::Files(files) => files
+                .first()
+                .is_some_and(|(_, revision)| revision.is_some()),
+            Self::Keyring { modified, .. } => modified.is_some(),
+            Self::Untracked => false,
+        }
+    }
+
     fn read(harness: &str, environment: &Value) -> Self {
         use std::path::PathBuf;
         let env_path = |name: &str| {
@@ -1713,6 +1888,7 @@ pub(crate) struct CatalogCache {
     model_reads: HashMap<ModelsCacheKey, ModelRead>,
     quotas: HashMap<ModelSourceIdentity, HarnessQuotaResponse>,
     aggregate: Option<Arc<CachedAggregate>>,
+    aggregate_failure: Option<DiscoveryFailure>,
     aggregate_requested_at: Option<Instant>,
     auth_revision: u64,
 }
@@ -1721,7 +1897,8 @@ pub(super) type AggregateUpdate = Option<Result<Arc<CachedAggregate>>>;
 
 struct ModelRead {
     running: Option<watch::Receiver<Option<Result<HarnessModelsResponse>>>>,
-    failure: Option<ModelFailure>,
+    failure: Option<DiscoveryFailure>,
+    suppress_until: Option<Instant>,
 }
 
 impl ModelRead {
@@ -1730,25 +1907,6 @@ impl ModelRead {
             .as_ref()
             .filter(|read| read.has_changed().is_ok())
             .cloned()
-    }
-}
-
-#[derive(Clone)]
-struct ModelFailure {
-    until: Instant,
-    exponent: u8,
-    error: Error,
-}
-
-impl ModelFailure {
-    fn next(previous: Option<Self>, error: Error) -> Self {
-        let exponent = previous.map_or(0, |failure| failure.exponent.saturating_add(1).min(5));
-        Self {
-            until: Instant::now()
-                + (CATALOG_RETRY_INTERVAL * (1 << exponent)).min(CATALOG_RETRY_MAX),
-            exponent,
-            error,
-        }
     }
 }
 
@@ -1765,15 +1923,22 @@ pub(super) struct CachedAggregate {
     ttl_ms: u64,
     completed_at: Instant,
     retry_delay: Duration,
+    hard_expires_at: Option<i64>,
 }
 
 impl CachedAggregate {
+    fn is_usable(&self) -> bool {
+        self.hard_expires_at
+            .is_none_or(|expires| now_ms() < expires)
+    }
+
     fn refresh_due(&self) -> bool {
         let now = now_ms();
         if self.failures.is_empty() {
             !quota_fresh(
                 self.fetched_at_ms,
-                self.ttl_ms.saturating_sub(CATALOG_REFRESH_LEAD_MS),
+                self.ttl_ms
+                    .saturating_sub((self.ttl_ms / 3).min(CATALOG_REFRESH_LEAD_MS)),
                 now,
             )
         } else {
@@ -1787,6 +1952,21 @@ impl CachedAggregate {
         harness: &str,
         profile: Option<&str>,
     ) -> bool {
+        let scope = match profile {
+            Some(name) => self
+                .key
+                .previews
+                .iter()
+                .find(|preview| preview.name == name)
+                .and_then(|preview| preview.scope.as_ref()),
+            None => SUPPORTED_HARNESSES
+                .iter()
+                .position(|name| *name == harness)
+                .and_then(|index| self.key.adhoc[index].as_ref()),
+        };
+        if !scope.is_some_and(|scope| scope.login.is_tracked()) {
+            return false;
+        }
         let count = models.len();
         models.extend(
             self.models
@@ -1820,9 +2000,17 @@ struct ModelsCacheKey {
     executable: crate::adhoc::VersionKey,
     version: String,
     auth_revision: u64,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl CatalogCache {
+    fn aggregate_retry_error(&self) -> Option<Error> {
+        self.aggregate_failure
+            .as_ref()
+            .filter(|failure| Instant::now() < failure.until)
+            .map(|failure| failure.error.clone())
+    }
+
     pub(super) fn invalidate_auth(&mut self) {
         *self = Self {
             auth_revision: self.auth_revision + 1,
@@ -1845,7 +2033,16 @@ impl CatalogCache {
         let evict = self
             .model_reads
             .iter()
-            .filter(|(_, read)| read.in_flight().is_none())
+            .filter(|(_, read)| {
+                read.in_flight().is_none()
+                    && read
+                        .suppress_until
+                        .is_none_or(|until| Instant::now() >= until)
+                    && read
+                        .failure
+                        .as_ref()
+                        .is_none_or(|failure| Instant::now() >= failure.until)
+            })
             .min_by_key(|(_, read)| read.failure.as_ref().map(|failure| failure.until))
             .map(|(key, _)| key.clone());
         evict.is_some_and(|key| self.model_reads.remove(&key).is_some())
