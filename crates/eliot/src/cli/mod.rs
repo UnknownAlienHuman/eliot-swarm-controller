@@ -3,6 +3,7 @@
 //! module only routes a parsed command to the owning family runner.
 mod agents;
 pub(crate) mod args;
+mod auth;
 mod autonomy;
 mod autostart;
 mod checkpoint;
@@ -22,7 +23,7 @@ mod store;
 pub(crate) mod support;
 mod update;
 
-use self::args::{CliCommand, DaemonAction, LsArgs, PageArgs, StandAction};
+use self::args::{AuthCommand, CliCommand, DaemonAction, LsArgs, PageArgs, StandAction};
 use self::support::Failure;
 pub(crate) use reads::report_doctor_acl;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,9 @@ pub(crate) async fn dispatch(
         CliCommand::Cleanup(args) => cleanup::run_cleanup(args, data_dir, json_output, id).await,
         CliCommand::Artifact(args) => cleanup::run_artifact(args, data_dir, json_output, id).await,
         CliCommand::Settings(args) => settings::run(args, data_dir, json_output).await,
+        CliCommand::Auth(args) => match args.command {
+            AuthCommand::Login { harness } => auth::login(harness, data_dir, json_output).await,
+        },
         CliCommand::Daemon(args) if args.interrupt_on_deadline => {
             let Some(DaemonAction::Update {
                 release,

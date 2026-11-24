@@ -503,6 +503,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
+| `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical DTOs](../../crates/eliot-core/src/api/harness.rs) define requests, entries, failures and quota vocabulary. Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible. A partial listing supports continuation and the next first page retries failed reads. An `after` cursor missing from the current listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles caching, discovery and page availability. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
@@ -753,6 +754,43 @@ service-management APIs remain `unsupported` in this increment.
 enum; plugin-specific codes may be preserved. Unfamiliar post-I/O error codes classify
 as `Unknown` under [Core policy](../../crates/eliot-core/src/command.rs), never proof
 of failure or permission to replay the effect.
+
+## Owner harness sign-in
+
+`swarm auth login --harness H` is an Owner-local `auth.login` call using
+[`AuthLoginRequest` and `AuthLoginResponse`](../../crates/eliot-core/src/api/auth_login.rs).
+The CLI sends `{harness: H, revision: null}` and prints the returned status, or the
+response DTO with `--json`. `queued`, `open` and `cooldown` describe request state;
+none establishes that a vendor account is signed in. The CLI carries no credential and
+does not run a vendor command.
+
+The Owner inbox projects a `harness_auth` item for a sign-in action. Its `sign_in`
+choice names `auth.login` and is revision-bound to the displayed harness request.
+`owner.decide.bulk` excludes `sign_in`; an interactive credential action is never
+submitted as a generic batch recommendation. Without an interactive desktop session,
+the daemon keeps the work queued. The desktop claims the exact harness and revision,
+runs the vendor's native interactive flow in the Owner's desktop session, and reports
+the result through the bounded desktop sign-in DTOs. The CLI request itself never
+opens a headless vendor process or asserts that the desktop action completed.
+
+The daemon retains one durable automatic claim per harness outage until a positive
+read-only probe closes it. An explicit request for open work reports `open`; a request
+inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
+eligible only after five minutes have passed since the last claim and the prior launch
+is known closed or failed. An active or uncertain attempt stays fenced. The exact claim
+and attempt are durable (Store schema 122). If no desktop is present, work remains
+queued. After restart, the interactive desktop reconciles the retained attempt with a
+read-only status probe and reports against the exact peer, harness, revision and attempt.
+The daemon never repeats a vendor login because an RPC reply, desktop connection or
+daemon process was lost. Existing harness-auth holds remain bound to their
+harness/revision until a positive readback settles them.
+
+The desktop bridge keeps vendor credentials in the Owner's native configuration or
+OS credential store. Login argv, environment, stdin, Store rows, events, and diagnostics
+contain no token, password, OAuth code, or credential-file content. Vendor status
+commands are read-only and run in that same interactive desktop context; successful
+sign-in is reported only from their positive result. Each harness's supported command
+and explicit unsupported boundary is owned by the [plugin protocol](plugin-protocol.md#owner-sign-in).
 
 ## Agent and daemon read views
 
@@ -3194,6 +3232,7 @@ swarm stand down <PATH>
 swarm stand list
 swarm stand prune
 swarm status
+swarm auth login --harness H [--json]
 swarm autonomy [--since TIME] [--json]
 swarm store compact
 swarm maintenance compact
