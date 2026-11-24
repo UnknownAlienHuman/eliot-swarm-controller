@@ -1727,15 +1727,19 @@ async fn confirm_worktree_absence_after_grace(
     parent: &Directory,
     deadline: Instant,
 ) -> Result<()> {
+    wait_for_absence_grace(deadline).await?;
+    confirm_worktree_absence(path, parent)
+}
+
+pub(crate) async fn wait_for_absence_grace(deadline: Instant) -> Result<()> {
     timeout_at(deadline, sleep_until(Instant::now() + ABSENCE_GRACE))
         .await
         .map_err(|_| {
             problem(
                 "unavailable",
-                "worktree absence observation deadline elapsed",
+                "directory absence observation deadline elapsed",
             )
-        })?;
-    confirm_worktree_absence(path, parent)
+        })
 }
 
 pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>> {
@@ -1761,7 +1765,7 @@ pub(crate) fn observe_worktree_absence(path: &Path) -> Result<Option<Directory>>
     Ok(absent(path)?.then_some(guard))
 }
 
-fn confirm_worktree_absence(path: &Path, previous: &Directory) -> Result<()> {
+pub(crate) fn confirm_worktree_absence(path: &Path, previous: &Directory) -> Result<()> {
     let Some(current) = observe_worktree_absence(path)? else {
         return Err(problem(
             "worktree_present",

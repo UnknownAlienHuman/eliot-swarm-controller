@@ -276,6 +276,7 @@ pub(super) enum SettingsMsg {
         MutationResult<(
             eliot_core::api::CleanupApplyResponse,
             Option<eliot_core::api::DiskUsageView>,
+            Option<String>,
         )>,
     ),
     PageSelected(Page),
@@ -989,14 +990,13 @@ impl DesktopApp {
                         artifacts: Some(selected),
                     };
                     Message::Settings(SettingsMsg::CleanupApplied(client::block_on(async {
-                        let reply =
-                            eliot_daemon::client_call_typed(&data, "cleanup.apply", &request)
-                                .await?;
+                        let (reply, terminal_note) =
+                            client::cleanup_apply_and_wait(&data, &request).await?;
                         let disk_usage = client::daemon_status(&data)
                             .await
                             .ok()
                             .and_then(|status| status.disk_usage);
-                        Ok::<_, eliot_core::Error>((reply, disk_usage))
+                        Ok::<_, eliot_core::Error>((reply, disk_usage, terminal_note))
                     })))
                 });
             }
@@ -1005,8 +1005,9 @@ impl DesktopApp {
                 let uncertain = result.as_ref().err().is_some_and(crate::state::uncertain);
                 let key = s.cleanup_key.take();
                 match result {
-                    Ok((reply, disk_usage)) => {
+                    Ok((reply, disk_usage, terminal_note)) => {
                         s.cleanup_disk_usage = disk_usage;
+                        s.cleanup_error = terminal_note;
                         if let Some(plan) = s.cleanup_plan.take() {
                             s.cleanup_result = Some((plan, reply));
                         }

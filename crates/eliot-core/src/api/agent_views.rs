@@ -2056,6 +2056,9 @@ pub enum StatusBlocker {
     DiscoveryReaders {
         count: usize,
     },
+    CleanupActive {
+        id: String,
+    },
     AgentLive {
         agent: String,
         generation: i64,
@@ -2414,6 +2417,8 @@ pub struct DaemonStatusResponse {
     pub automatic_cleanup: Option<AutomaticCleanupView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_usage: Option<DiskUsageView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_capacity: Option<super::ArtifactCapacityView>,
     pub unknown_commands_count: usize,
     pub unknown_commands: Vec<String>,
     pub unknown_commands_truncated: bool,

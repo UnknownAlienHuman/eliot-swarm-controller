@@ -1537,6 +1537,14 @@ fn admit_worktree_remove_tx(
             "worktree removal is pending or missing-directory reconciliation was attempted recently",
         ));
     }
+    if let Some(command_id) = workspace::workspace_removal_fence_tx(tx, agent_num, &workspace)? {
+        return Err(Error::new(
+            "prior_cleanup_attempt",
+            format!(
+                "worktree removal {command_id} is already pending or unresolved for this workspace scope"
+            ),
+        ));
+    }
     workspace::require_workspace_removable(tx, &agent, &workspace, now, refused_launch.is_some())?;
     let mut args = json!({"target_generation": workspace.target_generation});
     if let Some(tip) = expected_tip {

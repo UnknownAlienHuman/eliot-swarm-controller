@@ -435,6 +435,12 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
             "healthy"
         }
     );
+    if let Some(capacity) = &response.artifact_capacity {
+        println!(
+            "Artifacts: {} of {} active registration slots · {} ownership roots · {} tombstones",
+            capacity.active, capacity.limit, capacity.ownership_roots, capacity.tombstones,
+        );
+    }
     for check in &response.harness_checks {
         println!(
             "{} {} self-check: {}",
@@ -520,6 +526,7 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
                 StatusBlocker::DiscoveryReaders { count } => {
                     println!("  {count} discovery reader(s)")
                 }
+                StatusBlocker::CleanupActive { id } => println!("  active cleanup {id}"),
                 StatusBlocker::AgentLive {
                     agent,
                     generation,

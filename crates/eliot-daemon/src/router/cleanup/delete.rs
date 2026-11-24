@@ -33,7 +33,7 @@ impl Router {
         } else {
             store
                 .retain_cleanup_plan("owner", &plan, now_ms())
-                .and_then(|()| store.begin_cleanup_apply("owner", &apply, now_ms()))
+                .and_then(|()| store.begin_cleanup_apply("owner", &apply, now_ms(), false))
                 .map(|(_, response, _)| Some(response))
         };
         drop(store);
@@ -45,7 +45,13 @@ impl Router {
             let result = async {
                 if let Some(mut response) = started? {
                     router
-                        .apply_cleanup_artifacts("owner", &apply, &plan, &mut response, true, false)
+                        .apply_cleanup_artifacts(
+                            "owner",
+                            &apply,
+                            &plan,
+                            &mut response,
+                            CleanupApplyMode::AgentTree,
+                        )
                         .await?;
                     require_agent_delete_cleanup(&plan, &response)?;
                 }
@@ -105,7 +111,9 @@ impl Router {
             }
             #[cfg(windows)]
             if let Some(artifact) = self.agent_delete_probe_chat(agent).await? {
-                let (bytes, absent) = self.cleanup_preflight(&artifact).await?;
+                let (bytes, absent) = self
+                    .cleanup_preflight(&artifact, CLEANUP_PLAN_MAX_PREFLIGHT)
+                    .await?;
                 items.push(CleanupCandidate {
                     artifact,
                     bytes: Some(bytes),

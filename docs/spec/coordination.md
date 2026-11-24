@@ -29,6 +29,15 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
+The 4,096 active-artifact limit applies to new Agent registrations and counts
+registered and uncertain rows. Bound ownership roots and settled tombstones
+consume zero registration slots. Daemon-owned custody records for a launch or
+its managed workspace and native session commit even when the registration limit
+is reached. Daemon status shows the counts and the Owner inbox warns at 80 percent.
+Bounded maintenance prunes expired previews and settled plans and reclaims
+unreferenced tombstones. It preserves uncertain attempts, native-session fences
+and the inventory sequence high-water row.
+
 `cleanup.plan {scope?:self_tree|project|all,project?,older_than?,continuation?}` changes
 no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
@@ -82,9 +91,12 @@ plan/apply and `stand down` retain their independent root, registry, marker,
 owner-binding and #885 two-pass cleanup checks.
 
 Plans anchor the managed workspace identity and branch tip. Apply rechecks the
-same identity and exact local tip before mutation. A proven missing directory for
-a retained artifact can surface as `safe(already_absent)`. Apply verifies it is
-still absent and settles zero bytes. For a worktree, apply uses the existing
+same identity and exact local tip before mutation. A missing directory for
+a retained artifact can surface as `safe(already_absent)`. Apply confirms
+absence twice across the 15-second grace interval before settling
+`removed(already_absent)` with zero bytes, including when the directory was
+present in the plan.
+For a worktree, apply uses the existing
 missing-worktree reconciliation and preserves the local branch. A reappearing
 directory requires a fresh plan. Changed local identity,
 checked-out branches, filesystem guards and Git readiness still keep/refuse the
@@ -101,9 +113,15 @@ has passed. Expired registered private stands
 clean shutdown (`daemon.stopped`), and clean `#885` preflight on external-repo
 worktrees/branches before surfacing `safe(expired_stand)`.
 
-`cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates, rechecks
-authority, generation, expiry, Git cleanliness, opened identities and busy/link refusal,
-then records each outcome as `removed`, `skipped` with reason, or `unknown`. For an
+`cleanup.apply {id,plan_id,artifacts?}` consumes only the plan's safe candidates and
+returns a durable `running` receipt with its mutation id. The daemon owns the job after
+admission and rechecks authority, generation, expiry, Git cleanliness, opened identities
+and busy/link refusal before effects. `cleanup.status {id}` and exact apply retries read
+the caller's retained receipt. Items waiting for a live worker show `pending`. Settled
+items are `removed`, `skipped` with reason, `failed` for known operational failures, or
+`unknown` for uncertain effects. A completed job has visited its full selection. Drain
+waits for the cleanup worker, and an interrupted worker leaves durable attempt fences.
+For an
 expired stand candidate, apply performs `#885` two-pass external worktree and detached
 branch cleanup under `WorktreeWriteGuard` + `OwnedChild`, keeps the stand if any
 external item is kept/unknown, and deletes the offline stand root and external registry
@@ -116,13 +134,19 @@ Deleting an Agent tree supersedes all of its items in unapplied plans at the
 deletion commit. Apply keeps the original selection binding and records those
 items as `skipped(superseded)`, without reserving an attempt or touching their
 artifacts. Other items proceed under the same plan and checks.
-The Store commits an unknown attempt before effects and settles results before
-acknowledgement. Exact same-ID replay returns the retained response. Another ID
+The Store commits attempt reservations before effects and retains each outcome as it
+settles. Exact same-ID replay returns the current receipt. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted
-artifact. Uncertain attempts fence resume at admission and dispatch. Windows
+artifact. An accepted or uncertain worktree removal fences its exact workspace
+through the retained command and workspace marker. New cleanup pages and stale
+plans keep it with `prior_cleanup_attempt` until exact readback or Owner
+reconciliation settles the removal. The original receipt remains readable.
+Uncertain attempts fence
+resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
-reparse points and deletes by handle disposition. Any file whose link count is
+reparse points and deletes by handle disposition. A scan is bounded to 262,144
+entries and by its deadline. Any file whose link count is
 not exactly one keeps the entire tree with `hard_link`, including Cargo targets
 with shared binaries. Guarded scans at both plan and apply refuse repository
 roots (including bare repositories), every `.git` entry, and native/user config
@@ -174,13 +198,34 @@ If a selected session is kept or uncertain, pending worktrees in that task
 tree settle as `skipped(native_session_kept)`. This also applies to a
 `cleanup.apply` selection that includes both effects.
 
+`cleanup.apply_all {id,scope?,project?,older_than?}` is an explicit Owner action that
+traverses the inventory on the daemon, with `all` as the default scope. It applies
+safe local candidates using the same attempt reservations and live rechecks. It handles
+ordinary artifacts and native sessions before their worktrees or chat directories,
+including across pages. Project registrations use current revision and
+path checks for each batch. One explicit cleanup apply runs at a time. Read progress
+with `cleanup.status {id}` or repeat the original call with the same id and filters.
+The tally includes pages, page errors by reason, inventory issue count, applied,
+skipped by reason, failed, unknown, pending, and confirmed bytes reclaimed.
+A rejected page admission records failures for its safe candidates and advances
+to the next page. A per-item refusal or settlement error preserves the durable
+outcomes and reservations for that page while independent items continue.
+If the inventory cursor cannot advance, the job records that failure and still
+considers independent project registrations. Losing the Store writer stops new
+effects. A daemon restart leaves
+interrupted jobs readable and never replays an uncertain effect. Active bulk receipts
+are pinned, and write-history retention for them starts at settlement or interruption.
+A pruned bulk receipt follows the normal mutation retry window and its original
+ID is refused as `id_expired`.
+
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as
 `--after <token>` and MCP passes the string as `params.continuation`.
 The daemon also accepts legacy JSON continuations. A progress page can contain
 zero candidates with a continuation while the daemon scans the retained inventory.
-The backfill cursor advances only across completed probe batches. A failed probe
-rejects the page. A time slice that ends mid-batch can return progress through
+The backfill cursor advances across completed probes, including reported per-Agent
+failures. A failure to enumerate the Agent batch rejects the page. A time slice
+that ends mid-batch can return progress through
 the last completed batch, with the unfinished batch retried on continuation.
 The desktop advances through those pages and offers Next page for more candidates.
 
@@ -201,9 +246,13 @@ candidate. CLI callers pass one `--artifact <id>` per safe registration selected
 `cleanup apply <plan-id>`. The desktop's Project
 registrations group starts unchecked.
 
-The current limits are 64 candidates, 4,096 retained artifacts and 1,024 retained
+The current limits are 64 candidates per page and 1,024 retained
 plans. On Windows, the [`CleanupTree` artifact-directory scan](../../crates/eliot-daemon/src/platform/script_file.rs#L391)
-is bounded to 10,000 filesystem entries, depth 64 and five seconds per scan.
+is bounded to 262,144 filesystem entries and depth 64. Interactive plans use
+their remaining page budget for a scan. Bulk planning and apply allow up to
+120 seconds per scan under daemon custody. A Windows root sharing conflict
+gets a bounded retry before any disposition. A persistent conflict keeps the
+artifact with reason `busy`.
 Managed-worktree removal uses a separate [write-fence inventory](../../crates/eliot-daemon/src/platform/worktree_guard.rs#L34),
 bounded to 20,000 entries and depth 64 with a ten-second deadline for each
 prepare and activation pass. Exceeding an applicable bound refuses its operation

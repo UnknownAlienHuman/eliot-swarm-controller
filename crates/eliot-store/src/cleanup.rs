@@ -13,9 +13,12 @@ const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 /// are settled or filtered out.
 const CLEANUP_INVENTORY_SCAN: usize = 256;
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
+const ACTIVE_ARTIFACT_LIMIT: i64 = 4_096;
+const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
+    pub inventory_issues: Vec<CleanupInventoryIssue>,
     pub truncated: bool,
     pub snapshot_seq: i64,
     pub next_rank: u8,
@@ -33,6 +36,42 @@ pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<
 }
 
 impl Store {
+    pub fn artifact_capacity(&self) -> Result<ArtifactCapacityView> {
+        self.ensure_committed_reads()?;
+        artifact_capacity(&self.connection)
+    }
+
+    pub(super) fn prune_cleanup_metadata(&mut self, now: i64) -> Result<(i64, i64)> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1);
+        let plans = prune_settled_cleanup_plans_tx(&tx, cutoff)?
+            + prune_stale_cleanup_plans_tx(&tx, cutoff)?;
+        // The maximum sequence anchors later insertion and inventory cursors,
+        // and native-session tombstones fence resuming the archived subject.
+        let artifacts = tx
+            .execute(
+                "WITH refs AS MATERIALIZED (
+                 SELECT DISTINCT json_extract(i.value, '$.artifact.id') AS id
+                 FROM cleanup_plans p, json_each(p.body, '$.items') i
+             )
+             DELETE FROM artifacts WHERE id IN (
+                 SELECT a.id FROM artifacts a
+                 WHERE a.seq < (SELECT MAX(seq) FROM artifacts)
+                   AND json_extract(a.body, '$.state') = 'removed'
+                   AND json_extract(a.body, '$.kind') <> 'native_session'
+                   AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.id = a.id)
+                 ORDER BY a.seq LIMIT ?1
+             )",
+                [ARTIFACT_TOMBSTONE_BATCH],
+            )
+            .map_err(sql_error)? as i64;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok((plans, artifacts))
+    }
+
     pub fn record_automatic_cleanup(&mut self, data: Value, now: i64) -> Result<Event> {
         self.ensure_writer_healthy()?;
         let tx = self
@@ -267,12 +306,8 @@ impl Store {
             }
             return commit_transaction(tx, &self.write_faulted);
         }
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
-            .map_err(sql_error)?;
-        if count >= 4096 {
-            return Err(Error::new("unavailable", "artifact ledger is full"));
-        }
+        // Daemon-owned rows record custody for an already-admitted generation.
+        // The optional Agent registration quota must not block a launch.
         let seq: i64 = tx
             .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM artifacts", [], |r| {
                 r.get(0)
@@ -423,6 +458,7 @@ impl Store {
         page: &PlanContinuation,
         limit: usize,
         include_ownership_roots: bool,
+        bulk: bool,
     ) -> Result<CleanupInventoryPage> {
         request.validate()?;
         if limit > MAX_CLEANUP_ITEMS {
@@ -452,17 +488,27 @@ impl Store {
                 })
                 .map_err(sql_error)?,
         };
+        let rank_of = |kind: ArtifactKind, purpose: &str| {
+            match (bulk, kind, purpose) {
+                (true, ArtifactKind::NativeSession, _) => 0,
+                // Other directory preflights still need the Agent's chat
+                // workspace for their Git ownership checks.
+                (true, ArtifactKind::Other, "Swarm chat directory") => 1,
+                _ => kind.cleanup_rank(),
+            }
+        };
         let (mut rank, mut after_seq) = match page.inventory_rank {
             Some(rank) => (rank, page.inventory_seq_after),
             None => match page.artifact_after.as_deref() {
                 None => (0, None),
                 Some(id) => {
-                    let (kind, seq): (String, i64) = self
+                    let (kind, purpose, seq): (String, String, i64) = self
                         .connection
                         .query_row(
-                            "SELECT json_extract(body, '$.kind'), seq FROM artifacts WHERE id = ?1",
+                            "SELECT json_extract(body, '$.kind'), json_extract(body, '$.purpose'), seq
+                             FROM artifacts WHERE id = ?1",
                             [id],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .map_err(|error| match error {
                             rusqlite::Error::QueryReturnedNoRows => {
@@ -477,7 +523,7 @@ impl Store {
                     if seq > snapshot {
                         return Err(Error::new("invalid", "cleanup continuation is stale"));
                     }
-                    (kind.cleanup_rank(), Some(seq))
+                    (rank_of(kind, &purpose), Some(seq))
                 }
             },
         };
@@ -487,6 +533,7 @@ impl Store {
         if rank == 3 {
             return Ok(CleanupInventoryPage {
                 artifacts: Vec::new(),
+                inventory_issues: Vec::new(),
                 truncated: false,
                 snapshot_seq: snapshot,
                 next_rank: rank,
@@ -496,35 +543,62 @@ impl Store {
 
         let mut scanned = 0_usize;
         let mut eligible = Vec::with_capacity(limit);
+        let mut inventory_issues = Vec::new();
         let mut truncated = false;
         'scan: while rank < 3 && scanned < CLEANUP_INVENTORY_SCAN {
             let remaining = CLEANUP_INVENTORY_SCAN - scanned;
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT body, seq FROM artifacts
+                    "SELECT body, seq, agent, generation FROM artifacts
                      WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC LIMIT ?3",
                 )
                 .map_err(sql_error)?;
             let rows = statement
                 .query_map(
                     params![after_seq.unwrap_or(0), snapshot, (remaining + 1) as i64],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
                 )
                 .map_err(sql_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sql_error)?;
             let fetched = rows.len();
-            for (body, seq) in rows.into_iter().take(remaining) {
+            for (body, seq, agent, generation) in rows.into_iter().take(remaining) {
                 let previous_seq = after_seq;
                 after_seq = Some(seq);
                 scanned += 1;
-                let artifact: ArtifactView = serde_json::from_str(&body)
-                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+                let artifact: ArtifactView = match serde_json::from_str(&body) {
+                    Ok(artifact) => artifact,
+                    Err(_) if bulk => {
+                        if rank == 0 {
+                            inventory_issues.push(CleanupInventoryIssue {
+                                agent: format!("a{agent}"),
+                                generation,
+                                path: None,
+                                reason: "source_integrity".to_owned(),
+                                detail: "invalid artifact ledger row".to_owned(),
+                            });
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "invalid artifact ledger row",
+                        ));
+                    }
+                };
                 let owned_root = include_ownership_roots
                     && matches!(caller, Sender::Owner)
                     && artifact.state == "ownership_root";
-                if artifact.kind.cleanup_rank() != rank
+                if rank_of(artifact.kind, &artifact.purpose) != rank
                     || (artifact.state != "registered" && !owned_root)
                 {
                     continue;
@@ -573,6 +647,7 @@ impl Store {
         }
         Ok(CleanupInventoryPage {
             artifacts: eligible,
+            inventory_issues,
             truncated,
             snapshot_seq: snapshot,
             next_rank: rank,
@@ -699,6 +774,64 @@ impl Store {
         Ok(None)
     }
 
+    pub fn cleanup_job_receipt(&self, principal: &str, id: &str) -> Result<(String, Value)> {
+        self.ensure_committed_reads()?;
+        let Some((author, method, _, result)) = write_binding(&self.connection, id)? else {
+            return Err(Error::new("not_found", "cleanup receipt absent"));
+        };
+        if !matches!(method.as_str(), "cleanup.apply" | "cleanup.apply_all") {
+            return Err(Error::new("not_found", "cleanup receipt absent"));
+        }
+        if author != principal {
+            return Err(Error::new(
+                "not_allowed",
+                "cleanup receipt belongs to another principal",
+            ));
+        }
+        Ok((method, decode_json(&result)?))
+    }
+
+    pub fn update_cleanup_job(
+        &mut self,
+        principal: &str,
+        id: &str,
+        method: &str,
+        result: &impl serde::Serialize,
+        finished_at: Option<i64>,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let mut result = serde_json::to_value(result)
+            .map_err(|_| Error::new("internal", "cleanup receipt cannot encode"))?;
+        if let Some(finished_at) = finished_at {
+            result["finished_at"] = Value::from(finished_at);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        update_cleanup_result(&tx, principal, id, method, &result)?;
+        commit_transaction(tx, &self.write_faulted)
+    }
+
+    /// An interrupted bulk traversal keeps its last tallies and page receipt.
+    /// Daemon startup has exclusive Store custody and never resumes effects.
+    pub fn interrupt_bulk_cleanup_jobs(&mut self, now: i64) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute(
+            "UPDATE writes
+             SET result=json_set(result, '$.state', 'interrupted',
+                          '$.reason', 'cleanup_worker_lost', '$.finished_at', ?1)
+             WHERE method='cleanup.apply_all' AND json_extract(result, '$.state')='running'",
+            [now],
+        )
+        .map_err(sql_error)?;
+        commit_transaction(tx, &self.write_faulted)
+    }
+
     /// Called after the Router pins and validates the existing local directory.
     pub fn register_artifact(
         &mut self,
@@ -796,13 +929,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
-            .map_err(sql_error)?;
-        if count >= 4096 {
+        if active_artifact_count(&tx)? >= ACTIVE_ARTIFACT_LIMIT {
             return Err(Error::new(
                 "unavailable",
-                "artifact ledger is full (4096 entries)",
+                "active artifact registration limit reached; see Owner artifact capacity status",
             ));
         }
         {
@@ -932,6 +1062,7 @@ impl Store {
         principal: &str,
         request: &CleanupApplyRequest,
         now: i64,
+        job: bool,
     ) -> Result<(CleanupPlan, CleanupApplyResponse, bool)> {
         self.ensure_writer_healthy()?;
         request.validate()?;
@@ -1007,6 +1138,8 @@ impl Store {
         let attempted =
             |item: &CleanupCandidate| item.verdict == "safe" && request.selects(&item.artifact.id);
         let mut response = CleanupApplyResponse {
+            id: job.then(|| request.id.clone()),
+            state: job.then_some(CleanupJobState::Running),
             plan_id: plan.plan_id.clone(),
             bytes_reclaimed: 0,
             items: plan
@@ -1017,6 +1150,8 @@ impl Store {
                     detail: None,
                     outcome: if attempted(item) {
                         "unknown"
+                    } else if item.verdict == "failed" {
+                        "failed"
                     } else {
                         "skipped"
                     }
@@ -1097,6 +1232,15 @@ impl Store {
             }
             // Fence every attempted artifact across new plans and daemon restarts.
             if attempted(item) {
+                if item.artifact.kind == ArtifactKind::Worktree
+                    && let Some(preparation) = workspace::load_workspace(&tx, agent)?
+                    && cleanup_path(&preparation.worktree_path) == cleanup_path(&item.artifact.path)
+                    && workspace::workspace_removal_fence_tx(&tx, agent, &preparation)?.is_some()
+                {
+                    response.items[index].outcome = "skipped".to_owned();
+                    response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
+                    continue;
+                }
                 let body: Option<String> = tx
                     .query_row(
                         "SELECT body FROM artifacts WHERE id=?1 AND agent=?2",
@@ -1247,8 +1391,8 @@ impl Store {
             let mut updated = artifact.clone();
             updated.state = match outcome.outcome.as_str() {
                 "removed" => "removed",
-                "skipped" if artifact.state == "ownership_root" => "ownership_root",
-                "skipped" => "registered",
+                "skipped" | "failed" if artifact.state == "ownership_root" => "ownership_root",
+                "skipped" | "failed" => "registered",
                 _ => "unknown",
             }
             .to_owned();
@@ -1352,6 +1496,30 @@ fn known_native_session_artifact(
     .transpose()
 }
 
+pub(super) fn artifact_capacity(connection: &Connection) -> Result<ArtifactCapacityView> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE state IN ('registered','unknown')),
+                    COUNT(*) FILTER (WHERE state = 'ownership_root'),
+                    COUNT(*) FILTER (WHERE state = 'removed')
+             FROM (SELECT json_extract(body, '$.state') AS state FROM artifacts)",
+            [],
+            |row| {
+                Ok(ArtifactCapacityView {
+                    active: row.get(0)?,
+                    limit: ACTIVE_ARTIFACT_LIMIT,
+                    ownership_roots: row.get(1)?,
+                    tombstones: row.get(2)?,
+                })
+            },
+        )
+        .map_err(sql_error)
+}
+
+fn active_artifact_count(connection: &Connection) -> Result<i64> {
+    Ok(artifact_capacity(connection)?.active)
+}
+
 /// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
 /// fully settled consumed plans (their receipt is retained and no item
 /// outcome is `unknown`, so the exact-apply replay and the unknown-attempt
@@ -1364,21 +1532,7 @@ fn known_native_session_artifact(
 /// `unknown` attempt, a receipt-less consumed plan with an uncertain outcome,
 /// or a fresh preview. Returns the reclaimed count.
 fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<i64> {
-    let settled = tx
-        .execute(
-            "DELETE FROM cleanup_plans WHERE id IN (
-                 SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
-                 WHERE p.apply_id IS NOT NULL
-                   AND w.method = 'cleanup.apply'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM json_each(w.result, '$.items') r
-                       WHERE json_extract(r.value, '$.outcome') = 'unknown'
-                   )
-                 ORDER BY p.id LIMIT ?1
-             )",
-            [CLEANUP_PLAN_RECLAIM_BATCH],
-        )
-        .map_err(sql_error)? as i64;
+    let settled = prune_settled_cleanup_plans_tx(tx, i64::MAX)?;
     // A consumed plan whose receipt was pruned before retention pinned
     // consumed receipts can never replay (exact replay needs the receipt) and
     // can never settle further through this row. Reclaim it when its own
@@ -1406,18 +1560,42 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
     // within the retry window is abandoned, and its delayed apply reads
     // `not_found` so the manager re-previews through this same path.
     let stale_cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS);
-    let stale = tx
-        .execute(
-            "DELETE FROM cleanup_plans WHERE id IN (
+    let stale = prune_stale_cleanup_plans_tx(tx, stale_cutoff)?;
+    Ok(settled + stranded + stale)
+}
+
+fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
+    tx.execute(
+        "DELETE FROM cleanup_plans WHERE id IN (
+             SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
+             WHERE w.method = 'cleanup.apply'
+               AND json_extract(p.body, '$.created_at') <= ?1
+               AND json_extract(w.result, '$.state') IS NOT 'running'
+               AND json_type(w.result, '$.items') = 'array'
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(w.result, '$.items') r
+                   WHERE json_extract(r.value, '$.outcome') = 'unknown'
+               )
+             ORDER BY p.id LIMIT ?2
+         )",
+        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+    )
+    .map(|rows| rows as i64)
+    .map_err(sql_error)
+}
+
+fn prune_stale_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
+    tx.execute(
+        "DELETE FROM cleanup_plans WHERE id IN (
                  SELECT p.id FROM cleanup_plans p
                  WHERE p.apply_id IS NULL
                    AND json_extract(p.body, '$.created_at') <= ?1
                  ORDER BY p.id LIMIT ?2
              )",
-            params![stale_cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
-        )
-        .map_err(sql_error)? as i64;
-    Ok(settled + stranded + stale)
+        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+    )
+    .map(|rows| rows as i64)
+    .map_err(sql_error)
 }
 
 /// Consumed plans whose receipt is gone and whose outcome is still uncertain
@@ -1446,10 +1624,20 @@ fn update_cleanup_receipt(
     request: &CleanupApplyRequest,
     response: &CleanupApplyResponse,
 ) -> Result<()> {
+    update_cleanup_result(tx, principal, &request.id, "cleanup.apply", response)
+}
+
+fn update_cleanup_result(
+    tx: &Transaction<'_>,
+    principal: &str,
+    id: &str,
+    method: &str,
+    response: &impl serde::Serialize,
+) -> Result<()> {
     let changed = tx
         .execute(
-            "UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method='cleanup.apply'",
-            params![encode_json(response)?, request.id, principal],
+            "UPDATE writes SET result=?1 WHERE id=?2 AND principal=?3 AND method=?4",
+            params![encode_json(response)?, id, principal, method],
         )
         .map_err(sql_error)?;
     if changed != 1 {

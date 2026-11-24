@@ -3297,6 +3297,8 @@ swarm store compact
 swarm maintenance compact
 swarm cleanup plan [--after TOKEN]
 swarm cleanup apply <PLAN_ID> [--artifact ID]... [--delete-remote]
+swarm cleanup apply-all [--scope all|project] [--project PROJECT] [--older-than TIMESTAMP]
+swarm cleanup status <ID>
 swarm artifact register <PATH> --kind build|data_dir|temp|other --purpose TEXT [--ttl DURATION]
 swarm launch [--profile P | --role R | --harness H] --workspace PATH [--worktree BRANCH [--base REF]] [--parent AGENT] [--source PATH]... [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]
 swarm launch [--workspace PATH | --chat] [--parent AGENT] [--no-policy REASON] [--goal-json JSON_OBJECT] [PROMPT] [--queue] [--wait] [--timeout-seconds N]

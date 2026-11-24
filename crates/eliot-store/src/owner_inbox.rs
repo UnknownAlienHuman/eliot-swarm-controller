@@ -11,6 +11,36 @@ use serde_json::{Value, json};
 
 pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
 pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
+const ARTIFACT_LEDGER_SUBJECT: &str = "artifact-ledger";
+
+fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<OwnerInboxItem>> {
+    let capacity = super::cleanup::artifact_capacity(connection)?;
+    if !capacity.approaching_limit() {
+        return Ok(None);
+    }
+    let at_limit = capacity.active >= capacity.limit;
+    let reason = if at_limit {
+        "artifact_registration_limit"
+    } else {
+        "artifact_capacity_near_limit"
+    };
+    Ok(Some(OwnerInboxItem {
+        kind: OwnerInboxKind::ArtifactCapacity,
+        subject: ARTIFACT_LEDGER_SUBJECT.to_owned(),
+        revision: reason.to_owned(),
+        age_ms: 0,
+        reason: reason.to_owned(),
+        detail: Some(format!(
+            "{} of {} active artifact registration slots are in use. Managed launches can still record custody.",
+            capacity.active, capacity.limit,
+        )),
+        recommended: None,
+        choices: Vec::new(),
+        instructions: Some(
+            "Review safe candidates with swarm cleanup plan --scope all.".to_owned(),
+        ),
+    }))
+}
 
 pub(crate) fn project(
     connection: &Connection,
@@ -34,6 +64,7 @@ pub(crate) fn project(
     project_switch_fences(connection, now, &mut items, &mut liveness, &[])?;
     project_work_not_in_git(connection, now, &mut items, &mut liveness, &[])?;
     items.extend(project_repeated_failures(connection, now, None)?);
+    items.extend(artifact_capacity_item(connection)?);
 
     items.sort_by(|left, right| {
         left.kind
@@ -64,6 +95,13 @@ pub(crate) fn project_item(
         &[&dyn ToSql],
     ) -> eliot_core::Result<()>;
     let (projector, key): (Projector, &str) = match kind {
+        OwnerInboxKind::ArtifactCapacity => {
+            return if subject == ARTIFACT_LEDGER_SUBJECT {
+                artifact_capacity_item(db)
+            } else {
+                Ok(None)
+            };
+        }
         OwnerInboxKind::HarnessRequest => (project_requests, subject),
         OwnerInboxKind::UnknownCommand => (project_unknown_commands, subject),
         OwnerInboxKind::UnknownTurn => (project_unknown_turns, subject),

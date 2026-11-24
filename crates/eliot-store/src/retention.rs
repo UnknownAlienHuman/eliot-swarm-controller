@@ -75,6 +75,8 @@ pub struct RetentionReport {
     pub writes_deleted: i64,
     pub mail_deleted: i64,
     pub digests_deleted: i64,
+    pub artifact_tombstones_deleted: i64,
+    pub cleanup_plans_deleted: i64,
     pub processes_deleted: i64,
     pub processes_examined: i64,
     pub process_scan_more: bool,
@@ -93,6 +95,8 @@ impl RetentionReport {
             + self.writes_deleted
             + self.mail_deleted
             + self.digests_deleted
+            + self.artifact_tombstones_deleted
+            + self.cleanup_plans_deleted
             + self.processes_deleted
     }
 
@@ -109,6 +113,8 @@ impl RetentionReport {
         self.writes_deleted += batch.writes_deleted;
         self.mail_deleted += batch.mail_deleted;
         self.digests_deleted += batch.digests_deleted;
+        self.artifact_tombstones_deleted += batch.artifact_tombstones_deleted;
+        self.cleanup_plans_deleted += batch.cleanup_plans_deleted;
         self.processes_deleted += batch.processes_deleted;
         self.processes_examined += batch.processes_examined;
         self.process_scan_more = batch.process_scan_more;
@@ -274,6 +280,8 @@ impl Store {
             Some(seconds) => self.prune_events(seconds_cutoff(seconds))?,
             None => (0, coverage_pruned_through(&self.connection)?),
         };
+        let (cleanup_plans_deleted, artifact_tombstones_deleted) =
+            self.prune_cleanup_metadata(now)?;
         let (commands_deleted, writes_deleted) = match commands_cutoff {
             Some(cutoff) => self.prune_commands_and_writes(cutoff)?,
             None => (0, 0),
@@ -302,6 +310,8 @@ impl Store {
             writes_deleted,
             mail_deleted,
             digests_deleted,
+            artifact_tombstones_deleted,
+            cleanup_plans_deleted,
             processes_deleted,
             processes_examined,
             process_scan_more,
@@ -1022,6 +1032,10 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
                         AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
                AND NOT (method = 'cleanup.apply' AND EXISTS(
                    SELECT 1 FROM cleanup_plans p WHERE p.apply_id=writes.id
+               ))
+               AND NOT (method = 'cleanup.apply_all' AND (
+                   json_extract(result, '$.state') IS 'running'
+                   OR COALESCE(json_extract(result, '$.finished_at'), created_at) > ?1
                ))
              ORDER BY created_at, id LIMIT ?2
          )",

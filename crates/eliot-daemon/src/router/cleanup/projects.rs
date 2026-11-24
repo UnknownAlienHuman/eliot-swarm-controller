@@ -88,6 +88,7 @@ impl Router {
             return Ok(());
         };
 
+        let mut updated = response.clone();
         let policy = self.secret_policy_snapshot();
         let revision = &first.artifact.identity;
         let result = (|| {
@@ -112,11 +113,11 @@ impl Router {
                     .map(project_path)
                     .transpose()?;
                 if &artifact.identity != revision || current_path != Some(artifact.path.as_str()) {
-                    project_outcome(&mut response.items[index], Err("identity_changed"));
+                    project_outcome(&mut updated.items[index], Err("identity_changed"));
                     continue;
                 }
                 if let Err(error) = check_stale_project(store, &artifact.project, &artifact.path) {
-                    project_outcome(&mut response.items[index], Err(&error.code));
+                    project_outcome(&mut updated.items[index], Err(&error.code));
                     continue;
                 }
                 selected.push(artifact.project.clone());
@@ -136,7 +137,7 @@ impl Router {
         })();
 
         for (index, _) in attempted {
-            let outcome = &mut response.items[index];
+            let outcome = &mut updated.items[index];
             if outcome.outcome == "unknown" {
                 project_outcome(
                     outcome,
@@ -147,7 +148,9 @@ impl Router {
                 );
             }
         }
-        store.settle_project_cleanup(request, response)
+        store.settle_project_cleanup(request, &updated)?;
+        *response = updated;
+        Ok(())
     }
 }
 

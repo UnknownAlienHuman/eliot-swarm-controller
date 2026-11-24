@@ -95,6 +95,144 @@ pub(super) fn load_workspace_by_path(
         .map_err(sql_error)
 }
 
+/// Resolve a durable, workspace-scoped worktree removal fence. The retained
+/// command row catches accepted/queued removals before dispatch has written a
+/// workspace marker; the marker preserves exact readback for dispatched and
+/// legacy rows.
+pub(super) fn workspace_removal_fence_tx(
+    connection: &Connection,
+    agent_num: i64,
+    workspace: &WorkspacePreparation,
+) -> Result<Option<String>> {
+    if parse_agent_id(&workspace.agent)? != agent_num {
+        return Err(Error::new(
+            "source_integrity",
+            "workspace removal fence belongs to another Agent",
+        ));
+    }
+
+    let marker = workspace
+        .outcome
+        .as_ref()
+        .filter(|outcome| outcome["stage"] == "removal");
+    let marker_command_id = marker
+        .and_then(|outcome| outcome["command_id"].as_str())
+        .map(str::to_owned);
+    if marker.is_some() && marker_command_id.is_none() {
+        return Err(Error::new(
+            "source_integrity",
+            "workspace removal marker has no exact command ID",
+        ));
+    }
+
+    if let Some(command_id) = marker_command_id.as_deref()
+        && let Some(command) = load_command_record(connection, command_id)?
+    {
+        if command.target != Some(agent_num)
+            || command.command.verb != "worktree.remove"
+            || command
+                .command
+                .args
+                .get("target_generation")
+                .is_some_and(|generation| generation.as_i64() != Some(workspace.target_generation))
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "workspace removal marker does not match its exact command scope",
+            ));
+        }
+        match command.state {
+            CommandState::Accepted
+            | CommandState::Queued
+            | CommandState::Dispatched
+            | CommandState::Unknown => return Ok(Some(command_id.to_owned())),
+            CommandState::Applied if workspace.phase == WorkspacePhase::Removed => {
+                return Ok(Some(command_id.to_owned()));
+            }
+            CommandState::Applied => {
+                return Err(Error::new(
+                    "source_integrity",
+                    "applied worktree removal does not match the retained workspace phase",
+                ));
+            }
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled
+                if matches!(
+                    workspace.phase,
+                    WorkspacePhase::Removing | WorkspacePhase::Unknown | WorkspacePhase::Removed
+                ) =>
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "settled worktree removal does not match the retained workspace phase",
+                ));
+            }
+            CommandState::Rejected | CommandState::Failed | CommandState::Cancelled => {}
+        }
+    } else if let Some(command_id) = marker_command_id
+        && !(matches!(
+            workspace.phase,
+            WorkspacePhase::Ready | WorkspacePhase::Failed
+        ) && marker.is_some_and(|marker| marker["result"]["state"] == "failed"))
+    {
+        // A retained marker can prove a refusal after command pruning.
+        // Missing or uncertain settlement stays fenced.
+        return Ok(Some(command_id));
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id, generation, args FROM commands
+             WHERE target = ?1 AND verb = 'worktree.remove'
+               AND state IN ('accepted', 'queued', 'dispatched', 'unknown')
+             ORDER BY created_at, id",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map([agent_num], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for retained in rows {
+        let (command_id, generation, args) = retained.map_err(sql_error)?;
+        let args: Value = serde_json::from_str(&args).map_err(|_| {
+            Error::new(
+                "source_integrity",
+                "retained worktree removal arguments are invalid",
+            )
+        })?;
+        match args.get("target_generation") {
+            Some(value) => {
+                let target_generation = value.as_i64().ok_or_else(|| {
+                    Error::new(
+                        "source_integrity",
+                        "retained worktree removal has an invalid target generation",
+                    )
+                })?;
+                if target_generation == workspace.target_generation {
+                    return Ok(Some(command_id));
+                }
+            }
+            None if generation == Some(workspace.target_generation) => {
+                // Older commands without a target_generation argument are
+                // scoped by their retained command generation.
+                return Ok(Some(command_id));
+            }
+            None => {
+                return Err(Error::new(
+                    "unknown",
+                    format!("legacy worktree removal {command_id} has no exact workspace scope"),
+                ));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 /// Rebind the operational receipt and Git artifacts to the successor's exact
 /// generation. Preserve the first preparation identity and all Git/setup facts.
 pub(super) fn transfer_workspace_custody(
@@ -1539,6 +1677,12 @@ impl Store {
             .ok_or_else(|| Error::new("not_found", "managed workspace was not found"))?;
         let owner = load_agent_by_num(&self.connection, id)?
             .ok_or_else(|| Error::new("not_found", "workspace owner was not found"))?;
+        if let Some(command_id) = workspace_removal_fence_tx(&self.connection, id, &preparation)? {
+            return Err(Error::new(
+                "prior_cleanup_attempt",
+                format!("worktree removal {command_id} already owns this workspace scope"),
+            ));
+        }
         require_workspace_removable(&self.connection, &owner, &preparation, now, false)?;
         Ok(preparation)
     }

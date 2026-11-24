@@ -98,7 +98,9 @@ const METHODS: &[Method] = &[
     method!("chat.detach", ChatDetachRequest, ChatOrganizationMutationResponse, true, true, "Return chats to the no-project bucket; execution scope is untouched.", {"id":EXAMPLE_ID,"agents":["a1"]}),
     method!("chat.tag", ChatTagRequest, ChatOrganizationMutationResponse, true, true, "Replace tag groups of Agents or chats with revision readback.", {"id":EXAMPLE_ID,"agents":["a1"],"tags":["inbox"]}),
     method!("cleanup.plan", CleanupPlanRequest, CleanupPlan, false, false, "Plan bounded cleanup: Agents own subtree; Owner project or all. No deletion.", {"scope":"self_tree"}),
-    method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Consume one plan, rechecking safe entries; replay returns retained outcomes.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),
+    method!("cleanup.apply", CleanupApplyRequest, CleanupApplyResponse, false, true, "Accept a cleanup plan for guarded daemon execution; inspect progress with cleanup.status.", {"id":EXAMPLE_ID,"plan_id":EXAMPLE_ID}),
+    method!("cleanup.apply_all", CleanupApplyAllRequest, CleanupJobStatus, true, true, "Owner only: accept guarded cleanup across all pages of a project or fleet.", {"id":EXAMPLE_ID,"scope":"all"}),
+    method!("cleanup.status", CleanupStatusRequest, CleanupJobStatus, false, false, "Read the retained progress and tally of a cleanup apply by mutation id.", {"id":EXAMPLE_ID}),
     method!(
         "client.identity",
         InferenceIdentityRequest,

@@ -471,14 +471,25 @@ pub(crate) struct CleanupTree {
 }
 
 #[cfg(windows)]
+const MAX_CLEANUP_TREE_ENTRIES: usize = 262_144;
+
+#[cfg(windows)]
 impl CleanupTree {
-    pub(crate) fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path, deadline: std::time::Instant) -> Result<Self> {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             cleanup_name(name)?;
         }
         let parent = Directory::open(path.parent().ok_or_else(refused)?)?;
         let name = path.file_name().ok_or_else(refused)?;
-        let root = native::open_cleanup(parent.handle(), name, true).map_err(|_| refused())?;
+        let root = native::open_cleanup(parent.handle(), name, true).map_err(|error| {
+            if error.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+            {
+                Error::new("busy", "artifact root has a conflicting Windows handle")
+            } else {
+                refused()
+            }
+        })?;
         check(&root, true)?;
         let identity = serde_json::to_string(&eliot_plugin::file_identity(&root).map_err(io)?)
             .map_err(|_| refused())?;
@@ -489,7 +500,6 @@ impl CleanupTree {
             bytes: 0,
             contains_daemon_lock: false,
         };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         tree.visit(root, 0, deadline)?;
         Ok(tree)
     }
@@ -498,7 +508,7 @@ impl CleanupTree {
         if depth >= 64 {
             return Err(Error::new("unavailable", "cleanup depth bound"));
         }
-        let children = native::children(&directory).map_err(io)?;
+        let children = native::children(&directory, deadline).map_err(io)?;
         if ["HEAD", "objects", "refs"].iter().all(|expected| {
             children
                 .iter()
@@ -510,7 +520,9 @@ impl CleanupTree {
             ));
         }
         for (name, is_dir) in children {
-            if self.entries.len() >= 10_000 || std::time::Instant::now() >= deadline {
+            if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES
+                || std::time::Instant::now() >= deadline
+            {
                 return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
             }
             let text = name.to_str().ok_or_else(refused)?;
@@ -522,24 +534,23 @@ impl CleanupTree {
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
             if is_dir {
                 check(&child, true)?;
-            } else {
-                check_cleanup_file(&child)?;
-            }
-            if is_dir {
                 self.visit(child, depth + 1, deadline)?;
             } else {
-                let len = child.metadata().map_err(io)?.len();
+                let len = check_cleanup_file(&child)?;
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
                 self.entries.push(child);
             }
+        }
+        if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES {
+            return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
         }
         self.entries.push(directory);
         Ok(())
     }
 
     /// Every error after the first attempted disposition is unknown. No retry.
-    pub(crate) fn remove(mut self) -> Result<u64> {
-        for file in self.entries.drain(..) {
+    pub(crate) fn remove(mut self, cancelled: impl Fn() -> bool) -> Result<u64> {
+        for (index, file) in self.entries.drain(..).enumerate() {
             let unknown = |_| {
                 Error::new(
                     "unknown",
@@ -553,6 +564,16 @@ impl CleanupTree {
                     "unknown",
                     "link count changed after preflight; no replay",
                 ));
+            }
+            if cancelled() {
+                return Err(if index == 0 {
+                    Error::new(
+                        "interrupted",
+                        "forced shutdown interrupted cleanup before deletion",
+                    )
+                } else {
+                    Error::new("unknown", "forced shutdown interrupted a partial cleanup")
+                });
             }
             native::delete_handle(&file)
                 .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;
@@ -620,7 +641,7 @@ pub(crate) fn protected_cleanup_name(name: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn check_cleanup_file(file: &File) -> Result<()> {
+fn check_cleanup_file(file: &File) -> Result<u64> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
@@ -631,7 +652,7 @@ fn check_cleanup_file(file: &File) -> Result<()> {
             "cleanup refuses files with multiple links",
         ));
     }
-    Ok(())
+    Ok(metadata.len())
 }
 
 /// At most the editor limit plus one byte, always from the verified handle.
@@ -786,6 +807,11 @@ mod native {
             )
         };
         if status < 0 {
+            if status == windows_sys::Win32::Foundation::STATUS_SHARING_VIOLATION {
+                return Err(io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32,
+                ));
+            }
             return Err(io::Error::other(format!("NtCreateFile status {status:#x}")));
         }
         Ok(unsafe { File::from_raw_handle(handle) })
@@ -905,10 +931,18 @@ mod native {
         }
         Ok(())
     }
-    pub(super) fn children(file: &File) -> io::Result<Vec<(std::ffi::OsString, bool)>> {
+    pub(super) fn children(
+        file: &File,
+        deadline: std::time::Instant,
+    ) -> io::Result<Vec<(std::ffi::OsString, bool)>> {
         let mut result = Vec::new();
         let mut restart = true;
         loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::other(
+                    "cleanup directory enumeration exceeded its deadline",
+                ));
+            }
             let mut buffer = vec![0u64; 8192];
             let class = if restart {
                 FileIdBothDirectoryRestartInfo
@@ -955,7 +989,7 @@ mod native {
                 });
                 if name != "." && name != ".." {
                     if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                        || result.len() >= 10_000
+                        || result.len() >= super::MAX_CLEANUP_TREE_ENTRIES
                     {
                         return Err(io::Error::other("linked or oversized cleanup tree"));
                     }
