@@ -789,6 +789,16 @@ impl CodexPlugin {
             cwd: PathBuf::from(&initialized.instance_dir),
             environment: variables,
         };
+        let launch = if profile.get("stand_native_store") == Some(&Value::Bool(true)) {
+            let root = environment["CODEX_SQLITE_HOME"]
+                .as_str()
+                .map(Path::new)
+                .filter(|root| root.is_absolute())
+                .ok_or_else(|| Error::new("profile_error", "stand Codex SQLite root is missing"))?;
+            crate::discovery::pinned_launch(&launch, root)?
+        } else {
+            launch
+        };
         Ok((launch, secrets, metadata_secrets))
     }
 

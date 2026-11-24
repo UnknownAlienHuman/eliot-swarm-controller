@@ -58,6 +58,30 @@ codex app-server generate-json-schema --out <temporary-schema-directory>
 Use typed messages for the implemented methods. Do not import the Codex harness/model
 loop or make its unstable types part of `eliot-core`.
 
+## Project trust on private stands
+
+In installed Codex 0.167.1 (`rust-v0.167.1`, revision `0a94398fa60c`),
+`thread/start` attempts to save `[projects.'<path>']` with `trust_level = "trusted"`
+when the request supplies a `cwd`, the project has no explicit trust level, and
+the effective config has a project. An explicit `untrusted` level also suppresses
+the automatic write. The write targets the resolved Git trust
+root or the effective `cwd`, using `CODEX_HOME/config.toml`. Effective disabled
+(`danger-full-access`) and external sandboxes qualify. A managed sandbox qualifies
+when it can write `cwd`, as with effective `workspace-write`. Effective read-only
+does not qualify. Approval policy is independent, so `never` with a writable
+`cwd` still permits the write. [Trust decision and reload](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/request_processors/thread_processor.rs#L1455-L1530) · [Config write](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/core/src/config/edit.rs#L743-L786)
+
+An explicit trust entry can be supplied without persistence using a process
+`-c` override for the `projects` table or a `projects` map in `thread/start.config`.
+The request entries join the CLI overrides before project trust is resolved.
+Put the path inside the table or map as a single key. The CLI override builder
+splits dotted override keys. [Request overlay](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/app-server/src/config_manager.rs#L695-L719) · [Trust-layer precedence](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/config/src/loader/mod.rs#L343-L386) · [Override keys](https://github.com/openai/codex/blob/0a94398fa60c4fac0e7659e4213a0a36e613dd46/codex-rs/config/src/overrides.rs#L9-L25)
+
+[Private stands](../spec/api.md#cli) give every daemon-launched app-server its
+stand-owned home. Swarm pins the SQLite root there before metadata as well as
+Agent startup. Codex can persist trust and session artifacts within the stand's
+cleanup boundary using the requested permissions and approval policy.
+
 ## First useful path
 
 Use an existing authenticated `CODEX_HOME` and a disposable existing workspace.

@@ -240,28 +240,128 @@ fn claude_route_selectors_resolved(
         })
 }
 
-/// Called only for a newly resolved launch/attach profile, after retained-ID miss.
-pub(crate) fn capture_native_store_inputs(
-    profile: &mut Value,
-    selector_lookup: impl FnMut(&str) -> Option<OsString>,
-) -> core::Result<()> {
-    capture_native_store_inputs_inner(profile, selector_lookup, |name| std::env::var_os(name))
+pub(crate) fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(data_root.join(crate::stand_cleanup::STAND_MARKER)) {
+        Ok(_) => Ok(Some(data_root.join("codex-home"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(core::Error::new(
+            "platform_io",
+            format!("inspect stand marker: {error}"),
+        )),
+    }
 }
 
-fn capture_native_store_inputs_inner(
-    profile: &mut Value,
-    mut selector_lookup: impl FnMut(&str) -> Option<OsString>,
-    mut credential_lookup: impl FnMut(&str) -> Option<OsString>,
+fn require_stand_codex_proxy(profile: &Value) -> core::Result<()> {
+    if !profile["route_binding"].is_object() {
+        return Err(core::Error::new(
+            "stand_codex_login_unsupported",
+            "Codex ChatGPT/OAuth login is unavailable in a private stand; select a named Codex profile with an adopted Responses proxy",
+        ));
+    }
+    Ok(())
+}
+
+/// Compare the actual environment and any retained native store before the plugin
+/// can start Codex. A retained binding can repin the home after environment setup.
+pub(crate) fn verify_stand_codex_route(
+    stand_home: Option<&Path>,
+    harness: &str,
+    profile: &Value,
+    environment: Option<&JsonMap<String, Value>>,
 ) -> core::Result<()> {
+    if !core::api::HarnessCapabilities::of(harness).requires_frozen_store_inputs {
+        return Ok(());
+    }
+    let Some(home) = stand_home else {
+        return Ok(());
+    };
+    require_stand_codex_proxy(profile)?;
+    let home = canonical_stand_codex_home(home)?;
+    match std::fs::symlink_metadata(home.join("config.toml")) {
+        Ok(metadata) if metadata.is_file() && !crate::platform::is_reparse_point(&metadata) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(core::Error::new(
+                "not_allowed",
+                "stand Codex config.toml must be a regular file without links",
+            ));
+        }
+        Err(error) => {
+            return Err(core::Error::new(
+                "platform_io",
+                format!("inspect stand Codex config: {error}"),
+            ));
+        }
+    }
+    let matches_home = |value: &Value| {
+        value.as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path.is_absolute()
+                && path
+                    .canonicalize()
+                    .is_ok_and(|path| crate::operator::data_dirs_match(&path, &home))
+        })
+    };
+    if profile["stand_native_store"] == true
+        && CODEX_STORE_SELECTORS.iter().all(|&name| {
+            environment
+                .and_then(|env| env.get(name))
+                .is_some_and(matches_home)
+        })
+        && profile
+            .get("native_store_binding")
+            .is_none_or(|binding| matches_home(&binding["home"]) && matches_home(&binding["root"]))
+    {
+        return Ok(());
+    }
+    Err(core::Error::new(
+        "profile_error",
+        "Codex on a private stand requires its stand-owned home and SQLite root; launch a fresh Agent if the retained store is outside the stand",
+    ))
+}
+
+/// Called only for a newly resolved launch, attach or metadata profile.
+pub(crate) fn capture_native_store_inputs(
+    profile: &mut Value,
+    stand_home: Option<&Path>,
+) -> core::Result<()> {
+    let home = if let Some(home) = stand_home.filter(|_| {
+        core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .requires_frozen_store_inputs
+    }) {
+        require_stand_codex_proxy(profile)?;
+        if let Err(error) = std::fs::create_dir(home)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(core::Error::new(
+                "platform_io",
+                format!("create stand Codex home: {error}"),
+            ));
+        }
+        let names = profile["pass_env"].as_array_mut().ok_or_else(|| {
+            core::Error::new("invalid", "resolved profile pass_env must be an array")
+        })?;
+        for &selector in CODEX_STORE_SELECTORS {
+            if admitted_selector(names, selector).is_none() {
+                names.push(Value::from(selector));
+            }
+        }
+        Some(canonical_stand_codex_home(home)?)
+    } else {
+        None
+    };
+
     let names = profile
         .get("pass_env")
         .and_then(Value::as_array)
         .ok_or_else(|| core::Error::new("invalid", "resolved profile pass_env must be an array"))?;
     let mut values = serde_json::Map::new();
     for &selector in CODEX_STORE_SELECTORS {
-        let selected = admitted_selector(names, selector);
+        let selected = home
+            .as_ref()
+            .map(|path| core::display_path(&path.to_string_lossy()).into())
+            .or_else(|| admitted_selector(names, selector).and_then(std::env::var_os));
         let value = selected
-            .and_then(&mut selector_lookup)
             .map(|value| {
                 value.into_string().map(Value::String).map_err(|_| {
                     core::Error::new("invalid", "native store selector is not valid Unicode")
@@ -283,7 +383,7 @@ fn capture_native_store_inputs_inner(
                 && !claude_model_selector(profile, name)
         })
         .chain(profile["api_key_env"].as_str())
-        .filter_map(&mut credential_lookup)
+        .filter_map(std::env::var_os)
         .filter_map(|value| value.into_string().ok())
         .collect::<Vec<_>>();
     // Keep resolved credentials only in this temporary policy; snapshot data
@@ -291,6 +391,9 @@ fn capture_native_store_inputs_inner(
     let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
     let mut snapshot = profile.clone();
     snapshot["pass_env_values"] = captured;
+    if home.is_some() {
+        snapshot["stand_native_store"] = Value::Bool(true);
+    }
     if snapshot.get("harness").and_then(Value::as_str).is_some() {
         let identity = native_route_identity(&snapshot, |name| {
             if let Some(selector) = native_store_selector(name)
@@ -300,7 +403,7 @@ fn capture_native_store_inputs_inner(
                     .as_str()
                     .map(str::to_owned));
             }
-            selector_lookup(name)
+            std::env::var_os(name)
                 .map(|value| {
                     value.into_string().map_err(|_| {
                         core::Error::new("invalid", "native route selector is not valid Unicode")
@@ -320,6 +423,13 @@ fn capture_native_store_inputs_inner(
     // The augmented snapshot is bounded by the existing Store admission/frame
     // checks. This capture proves inputs, never an effective native root/scope.
     Ok(())
+}
+
+fn canonical_stand_codex_home(path: &Path) -> core::Result<PathBuf> {
+    crate::stand_cleanup::check_directory_chain(path)?;
+    path.canonicalize().map_err(|error| {
+        core::Error::new("platform_io", format!("resolve stand Codex home: {error}"))
+    })
 }
 
 /// Freeze an Agent's exact build output directory when the profile admits it

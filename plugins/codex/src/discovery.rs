@@ -1069,9 +1069,10 @@ pub(crate) fn pinned_launch_for_binding(
             name != "CODEX_HOME"
         }
     });
-    pinned
-        .environment
-        .push((OsString::from("CODEX_HOME"), OsString::from(&binding.home)));
+    pinned.environment.push((
+        OsString::from("CODEX_HOME"),
+        OsString::from(eliot_core::display_path(&binding.home)),
+    ));
     Ok(pinned)
 }
 
@@ -1552,11 +1553,12 @@ async fn read_store_config(
     Ok((store, config))
 }
 
-fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
+pub(crate) fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
     let root = root.to_str().ok_or_else(unverified_store)?;
     // serde_json emits escapes valid in a TOML basic string; argv goes directly
     // to Codex, never through a shell. Pin before process-scoped store creation.
-    let quoted = serde_json::to_string(root).map_err(|_| unverified_store())?;
+    let quoted =
+        serde_json::to_string(&eliot_core::display_path(root)).map_err(|_| unverified_store())?;
     let mut args = vec![
         OsString::from("-c"),
         OsString::from(format!("sqlite_home={quoted}")),

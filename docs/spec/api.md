@@ -3126,6 +3126,23 @@ consistent SQLite snapshot into an offline stand and prints its directory.
 `status` and `ls` read the copied Store without a daemon. Launches, mutation,
 and daemon startup are rejected against this directory.
 
+The stand daemon fixes its Codex home at startup and creates `<stand>/codex-home`
+on first use. Stand Codex profiles use it for `CODEX_HOME` and
+`CODEX_SQLITE_HOME`, including native metadata readers. Stand custody overrides
+explicitly admitted home selectors so profiles can be imported without retaining
+access to the owner's native store. Windows process arguments and environment use
+ordinary paths, while store checks compare canonical paths. A linked home or config,
+or a retained binding to a different native store, refuses before starting a
+workspace setup command or app-server. Agents frozen without a stand home
+require a fresh launch. Stand setup copies no Codex configuration or credential
+files. Direct ChatGPT/OAuth profiles fail at admission with
+`stand_codex_login_unsupported`. An adopted Responses proxy, such as
+[OpenCodex](../harnesses/opencodex.md), can authenticate through its own
+credentials or an explicitly admitted client-key environment variable.
+The stand removes the private Codex files with its root after daemon exit.
+Ordinary daemons continue using their configured Codex home and authentication.
+See [Codex project trust](../harnesses/codex.md#project-trust-on-private-stands).
+
 When run inside a managed Agent session with inherited credentials, omitting
 `--root` and `SWARM_STANDS_ROOT` places the stand under `ELIOT_ARTIFACT_ROOT`,
 and `stand up` automatically registers the stand with the issuing parent daemon

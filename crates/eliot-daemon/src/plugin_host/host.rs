@@ -184,13 +184,19 @@ type StoreHandle = Arc<AsyncMutex<eliot_store::Store>>;
 pub(crate) struct PluginHostOptions {
     data_root: PathBuf,
     owner_token: String,
+    stand_codex_home: Option<PathBuf>,
 }
 
 impl PluginHostOptions {
-    pub(crate) fn new(data_root: PathBuf, owner_token: String) -> Self {
+    pub(crate) fn new(
+        data_root: PathBuf,
+        owner_token: String,
+        stand_codex_home: Option<PathBuf>,
+    ) -> Self {
         Self {
             data_root,
             owner_token,
+            stand_codex_home,
         }
     }
 }
@@ -347,6 +353,7 @@ impl PendingCommand {
 struct HostState {
     acl_notices: Arc<crate::acl_notice::AclNotices>,
     data_root: PathBuf,
+    stand_codex_home: Option<PathBuf>,
     owner_token: String,
     store: StoreHandle,
     bus: Bus,
@@ -475,11 +482,13 @@ impl PluginHost {
         let PluginHostOptions {
             data_root,
             owner_token,
+            stand_codex_home,
         } = options;
         Self {
             state: Arc::new(HostState {
                 acl_notices,
                 data_root,
+                stand_codex_home,
                 owner_token,
                 store,
                 bus,
@@ -691,8 +700,12 @@ impl PluginHost {
                 )
             })
             .transpose()?;
-        let (mut target_environment, mcp_environment) =
-            build_target_environment(&self.state.data_root, &agent, &agent_token)?;
+        let (mut target_environment, mcp_environment) = build_target_environment(
+            &self.state.data_root,
+            self.state.stand_codex_home.as_deref(),
+            &agent,
+            &agent_token,
+        )?;
         // A harness self-check Agent runs real tool turns, so unlike a
         // provider probe it keeps the ordinary MCP identity environment.
         let mcp_environment = if agent.is_automatic_provider_probe()
@@ -3727,6 +3740,7 @@ fn data_root_only_mcp_environment(environment: &Value) -> Result<Value> {
 
 fn build_target_environment(
     data_root: &Path,
+    stand_codex_home: Option<&Path>,
     agent: &Agent,
     agent_token: &str,
 ) -> Result<(Value, Value)> {
@@ -3851,6 +3865,12 @@ fn build_target_environment(
         .into_string()
         .map_err(|_| Error::new("invalid", "managed target PATH is not valid Unicode"))?;
     insert_environment(&mut environment, "PATH", path_value);
+    crate::config::verify_stand_codex_route(
+        stand_codex_home,
+        &agent.harness,
+        &agent.profile_snapshot,
+        Some(&environment),
+    )?;
     Ok((Value::Object(environment), Value::Object(mcp_environment)))
 }
 

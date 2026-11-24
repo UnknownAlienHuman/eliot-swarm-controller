@@ -277,11 +277,17 @@ impl WorkspaceManager {
         Ok(input)
     }
 
-    pub(crate) async fn prepare(&self, command_id: &str) -> Result<()> {
+    pub(crate) async fn prepare(
+        &self,
+        command_id: &str,
+        stand_codex_home: Option<&Path>,
+    ) -> Result<()> {
         let Some((_, preparation)) = self.start(command_id).await? else {
             return Ok(());
         };
-        let result = self.prepare_workspace(command_id, &preparation).await;
+        let result = self
+            .prepare_workspace(command_id, &preparation, stand_codex_home)
+            .await;
         self.retire_slots(&preparation.agent).await;
         result
     }
@@ -489,6 +495,7 @@ impl WorkspaceManager {
         &self,
         command_id: &str,
         preparation: &WorkspacePreparation,
+        stand_codex_home: Option<&Path>,
     ) -> Result<()> {
         let slot = self.register_slot(preparation).await?;
         let _operation = slot.operation.lock().await;
@@ -674,6 +681,7 @@ impl WorkspaceManager {
                         &agent.profile_snapshot,
                         &current.agent,
                         current.target_generation,
+                        stand_codex_home,
                     )
                     .and_then(|environment| {
                         setup::verify_command(
