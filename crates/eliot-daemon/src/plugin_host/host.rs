@@ -22,7 +22,9 @@ use eliot_core::{
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
-    AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
+    AgentCommandParams, PluginManifest, StderrCapture, StderrView,
+    protocol::{AgentModelCatalogue, AgentModelsParams, CatalogueProvenance, ModelCatalogue},
+    spawn_plugin_stderr,
     sync::LockExt,
 };
 use eliot_store::{AgentLossEvidence, OwnedExitProof};
@@ -1559,7 +1561,11 @@ impl PluginHost {
             })
     }
 
-    pub(crate) async fn agent_models(&self, agent_id: &str, generation: i64) -> Result<Value> {
+    pub(crate) async fn agent_models(
+        &self,
+        agent_id: &str,
+        generation: i64,
+    ) -> Result<ModelCatalogue> {
         let key = AgentKey {
             id: agent_id.to_owned(),
             generation,
@@ -1580,7 +1586,7 @@ impl PluginHost {
             }
             (entry.client.clone(), Arc::clone(&entry.source_credentials))
         };
-        let params = serde_json::to_value(eliot_plugin::protocol::AgentModelsParams {
+        let params = serde_json::to_value(AgentModelsParams {
             agent_id: key.id.clone(),
             generation,
         })
@@ -3347,45 +3353,39 @@ fn complete_plugin_command(
 /// A read-only live session catalogue: the `model.list` response shape
 /// with `session` provenance. No state is claimed; the shape alone proves
 /// the read.
-fn validate_models_catalog_result(value: Value, key: &AgentKey) -> Result<Value> {
-    if value.get("provenance").and_then(Value::as_str) != Some("session")
-        || value.get("agent_id").and_then(Value::as_str) != Some(key.id.as_str())
-        || value.get("generation").and_then(Value::as_i64) != Some(key.generation)
+fn validate_models_catalog_result(value: Value, key: &AgentKey) -> Result<ModelCatalogue> {
+    use eliot_core::api::harness::MAX_HARNESS_MODEL_ID_BYTES;
+    let reply: AgentModelCatalogue = serde_json::from_value(value)
+        .map_err(|_| Error::new("source_integrity", "plugin session catalogue is malformed"))?;
+    let catalogue = reply.catalogue;
+    if catalogue.provenance != CatalogueProvenance::Session
+        || reply.agent_id != key.id
+        || reply.generation != key.generation
     {
         return Err(Error::new(
             "source_integrity",
             "plugin session catalogue did not bind to the requested live Agent generation",
         ));
     }
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("source_integrity", "plugin session catalogue is malformed"))?;
-    if models.len() > 1024 {
-        return Err(Error::new(
-            "source_integrity",
-            "plugin session catalogue exceeds 1024 entries",
-        ));
-    }
-    for model in models {
-        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-        if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+    catalogue.validate_count("plugin session")?;
+    for model in &catalogue.models {
+        if model.id.trim().is_empty()
+            || model.id.len() > MAX_HARNESS_MODEL_ID_BYTES
+            || model.id.chars().any(char::is_control)
+        {
             return Err(Error::new(
                 "source_integrity",
                 "plugin session catalogue entry is malformed",
             ));
         }
     }
-    if value
-        .get("default")
-        .is_some_and(|default| !default.is_null())
-    {
+    if catalogue.default.is_some() {
         return Err(Error::new(
             "source_integrity",
             "plugin session catalogue names an unexpected default",
         ));
     }
-    Ok(value)
+    Ok(catalogue)
 }
 
 fn validate_send_result(value: Value) -> Result<Value> {

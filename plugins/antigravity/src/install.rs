@@ -7,6 +7,7 @@ use eliot_plugin::install::{
     InstallDiscovery, InstallProbe, InstallStrategy, find_on_path, is_script_wrapper, local_roots,
 };
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 /// Required CLI file stem: only `agy` implements the native ACP/model CLI.
 pub const CLI_STEM: &str = "agy";
@@ -27,7 +28,7 @@ pub fn discovery() -> InstallDiscovery {
         cli_identity: Some(CLI_STEM),
         capability_probe: Some(InstallProbe {
             args: &["acp", "--help"],
-            executable_marker: "google-antigravity/antigravity-cli",
+            verify_executable: has_cli_module,
             refusal: "executable did not establish Antigravity CLI ACP capability",
         }),
         allow_script_wrapper: false,
@@ -40,6 +41,42 @@ pub fn discovery() -> InstallDiscovery {
         ide_unsupported: Some(ide_unsupported_error),
         timeout_newer: None,
     }
+}
+
+/// The CLI has no passive capability receipt. Its Go module distinguishes
+/// the native payload from an IDE copied to a file named `agy` before execution.
+fn has_cli_module(program: &Path, deadline: Instant) -> bool {
+    use std::io::Read;
+    const MODULE: &[u8] = b"google-antigravity/antigravity-cli";
+    let Ok(mut file) = std::fs::File::open(program) else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() <= 512 * 1024 * 1024)
+    {
+        return false;
+    }
+    let mut bytes = vec![0; 64 * 1024];
+    let mut carry = 0;
+    while Instant::now() < deadline {
+        let Ok(read) = file.read(&mut bytes[carry..]) else {
+            return false;
+        };
+        if read == 0 {
+            return false;
+        }
+        let end = carry + read;
+        if bytes[..end]
+            .windows(MODULE.len())
+            .any(|window| window == MODULE)
+        {
+            return true;
+        }
+        carry = (MODULE.len() - 1).min(end);
+        bytes.copy_within(end - carry..end, 0);
+    }
+    false
 }
 
 pub(crate) fn candidate_paths() -> core::Result<Vec<PathBuf>> {

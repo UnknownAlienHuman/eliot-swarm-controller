@@ -278,6 +278,57 @@ pub enum ModelListPart {
     Variants,
 }
 
+/// Normalized catalogue rows from either metadata reader. Vendor formats
+/// are decoded in the adapter before this private protocol boundary.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ModelCatalogue {
+    pub models: Vec<eliot_core::api::HarnessModelEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub provenance: CatalogueProvenance,
+}
+
+impl ModelCatalogue {
+    pub fn validate_count(&self, operation: &str) -> eliot_core::Result<()> {
+        let max = eliot_core::api::harness::MAX_HARNESS_MODELS;
+        if self.models.len() > max {
+            return Err(Error::new(
+                "source_integrity",
+                format!("{operation} catalogue exceeds {max} entries"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CatalogueProvenance {
+    #[default]
+    Canonical,
+    Preview,
+    Session,
+}
+
+impl CatalogueProvenance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::Preview => "preview",
+            Self::Session => "session",
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgentModelCatalogue {
+    pub agent_id: String,
+    pub generation: i64,
+    #[serde(flatten)]
+    pub catalogue: ModelCatalogue,
+}
+
 /// One launch's verified native-store selection and optional plugin-owned
 /// startup metadata from the same read. The daemon freezes both at dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]

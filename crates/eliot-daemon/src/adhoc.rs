@@ -840,42 +840,6 @@ fn native_cmd_unavailable() -> core::Error {
     )
 }
 
-/// The installed CLI carries its upstream module name. Screen the file
-/// before execution so an IDE copied to a capability-named file is refused.
-fn has_cli_module(program: &str, module: &str, deadline: Instant) -> bool {
-    use std::io::Read;
-    let module = module.as_bytes();
-    let Ok(mut file) = std::fs::File::open(program) else {
-        return false;
-    };
-    if !file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() <= 512 * 1024 * 1024)
-    {
-        return false;
-    }
-    let mut bytes = vec![0; 64 * 1024];
-    let mut carry = 0;
-    while Instant::now() < deadline {
-        let Ok(read) = file.read(&mut bytes[carry..]) else {
-            return false;
-        };
-        if read == 0 {
-            return false;
-        }
-        let end = carry + read;
-        if bytes[..end]
-            .windows(module.len())
-            .any(|window| window == module)
-        {
-            return true;
-        }
-        carry = (module.len() - 1).min(end);
-        bytes.copy_within(end - carry..end, 0);
-    }
-    false
-}
-
 pub(crate) async fn reader_executable(
     cmd: &str,
     harness: &str,
@@ -883,21 +847,26 @@ pub(crate) async fn reader_executable(
 ) -> core::Result<(String, Option<String>)> {
     let cmd = cmd.to_owned();
     let harness = harness.to_owned();
-    let verify = discovery_for(&harness).ok();
-    blocking_discovery(deadline, move || {
-        let cmd = resolve_native_executable(&cmd, &harness)?;
-        let version = match verify.map(|decl| decl.strategy) {
-            Some(InstallStrategy::MetadataVersion(read)) => read(Path::new(&cmd)),
-            _ => probe_optional_native_version(&cmd, verify.as_ref(), deadline)?,
-        };
-        if let Some(probe) = verify.and_then(|decl| decl.capability_probe)
-            && version.is_none()
-        {
-            return Err(core::Error::new("unsupported", probe.refusal));
-        }
-        Ok((cmd, version))
-    })
-    .await?
+    blocking_discovery(deadline, move || verify_reader(&cmd, &harness, deadline)).await?
+}
+
+fn verify_reader(
+    cmd: &str,
+    harness: &str,
+    deadline: Instant,
+) -> core::Result<(String, Option<String>)> {
+    let decl = discovery_for(harness)?;
+    let cmd = resolve_native_executable(cmd, harness)?;
+    let version = match decl.strategy {
+        InstallStrategy::MetadataVersion(read) => read(Path::new(&cmd)),
+        _ => probe_optional_native_version(&cmd, Some(&decl), deadline)?,
+    };
+    if let Some(probe) = decl.capability_probe
+        && version.is_none()
+    {
+        return Err(core::Error::new("unsupported", probe.refusal));
+    }
+    Ok((cmd, version))
 }
 
 /// Resolve the newest verified reader and reuse its observed version.
@@ -941,17 +910,8 @@ fn installation_error(harness: &str, error: core::Error) -> Value {
 pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     let read = || -> core::Result<Value> {
         let discovered = discover_cmd_for_harness(harness, deadline)?;
-        let verify = discovery_for(harness).ok();
-        let cmd = resolve_native_executable(discovered.as_deref().unwrap_or(harness), harness)?;
-        let version = match verify.map(|decl| decl.strategy) {
-            Some(InstallStrategy::MetadataVersion(read)) => read(Path::new(&cmd)),
-            _ => probe_optional_native_version(&cmd, verify.as_ref(), deadline)?,
-        };
-        if let Some(probe) = verify.and_then(|decl| decl.capability_probe)
-            && version.is_none()
-        {
-            return Err(core::Error::new("unsupported", probe.refusal));
-        }
+        let (cmd, version) =
+            verify_reader(discovered.as_deref().unwrap_or(harness), harness, deadline)?;
         Ok(json!({"harness": harness, "installed": true, "cmd": cmd, "version": version}))
     };
     read().unwrap_or_else(|error| installation_error(harness, error))
@@ -1187,9 +1147,9 @@ fn probe_version_uncached(
 ) -> VersionResult {
     let capability = verify.and_then(|decl| decl.capability_probe);
     if let Some(probe) = capability {
-        let has_module = has_cli_module(program, probe.executable_marker, deadline);
+        let verified = (probe.verify_executable)(Path::new(program), deadline);
         discovery_remaining(deadline)?;
-        if !has_module {
+        if !verified {
             return Ok(None);
         }
         let help = native_capture(
@@ -1198,9 +1158,8 @@ fn probe_version_uncached(
             deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
         )?;
         discovery_remaining(deadline)?;
-        // The binary module identity and successful subcommand invocation
-        // establish the CLI surface. Help prose and option spelling are not
-        // version gates; launch still supplies its explicit configured argv.
+        // The adapter's passive identity check precedes the bounded
+        // subcommand. Help prose and option spelling do not gate it.
         if !help.is_some_and(|capture| capture.status.success()) {
             return Ok(None);
         }

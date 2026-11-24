@@ -2465,7 +2465,7 @@ lookup and election are atomic for the resolved
 binary. Followers share its result within their deadline. On Unix the
 resolved payload must have an ELF or Mach-O header before a probe, including
 for explicit paths. Inventory, model discovery, quota and launch resolve one
-`agy` executable. They screen it for the vendor CLI module before running
+`agy` executable. The Antigravity adapter screens it for the vendor CLI module before running
 bounded `acp --help` and version checks. An IDE executable is refused.
 `harness.models` (`HarnessModelsRequest`/`HarnessModelsResponse`) returns the
 harness's own read-only catalogue (Codex native `model/list`, Muse native
@@ -2500,6 +2500,8 @@ owned generation's live session catalogue on every call and reports any read
 failure. An unscoped OpenCode read uses native configuration and auth in place.
 A named OpenCode profile reads an isolated preview of its launch inventory.
 Both may take an existing absolute `workspace` to apply that directory's configuration.
+The daemon resolves the workspace once and uses the canonical directory for both
+the cache key and the native read.
 The Agent's harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are
@@ -2527,6 +2529,9 @@ workspace share their in-flight read. Later requests for that source and
 workspace reuse the result for up to 30 seconds. Unverified sources return
 `unavailable` or documented aliases without starting a model reader. Exact
 live session catalogue reads continue to use the owned generation.
+Both readers return the same bounded typed model rows. The live reply also
+binds the exact Agent and generation. OpenCode's optional metadata supplements
+only the IDs returned by its primary catalogue.
 Public `scope` names the profile and route without
 private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`,
 `stale` and a nonsecret `credential` reference. Native model IDs remain verbatim.

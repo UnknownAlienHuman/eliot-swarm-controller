@@ -9,7 +9,8 @@ use eliot_core::{
     api::{DiscoverPage, HarnessCapabilities, harness::NativeArchiveBinding, is_supported_harness},
 };
 use eliot_plugin::protocol::{
-    ModelListParams, ModelListPart, NativeArchiveParams, ProfileStoreParams, ProfileStoreResult,
+    ModelCatalogue, ModelListParams, ModelListPart, NativeArchiveParams, ProfileStoreParams,
+    ProfileStoreResult,
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
@@ -249,7 +250,7 @@ impl PluginHost {
         environment: Value,
         workspace: Option<String>,
         deadline: Instant,
-    ) -> Result<Value> {
+    ) -> Result<ModelCatalogue> {
         if !profile
             .get("harness")
             .and_then(Value::as_str)
@@ -260,22 +261,6 @@ impl PluginHost {
                 "harness.models needs a codex, claude, muse, opencode or antigravity profile",
             ));
         }
-        let workspace = if let Some(workspace) = workspace {
-            let workspace = crate::adhoc::blocking_discovery(deadline.into(), move || {
-                let path = std::path::Path::new(&workspace);
-                if !path.is_absolute() || !path.is_dir() {
-                    return Err(Error::new(
-                        "invalid",
-                        "model preview workspace must be an existing absolute directory",
-                    ));
-                }
-                Ok(workspace)
-            })
-            .await??;
-            Some(workspace)
-        } else {
-            None
-        };
         let options = profile["harness"]
             .as_str()
             .map(HarnessCapabilities::of)
@@ -609,7 +594,7 @@ impl PluginHost {
         mut request: ModelListParams,
         stop: watch::Receiver<Option<Instant>>,
         until: Instant,
-    ) -> MetadataRead<Value> {
+    ) -> MetadataRead<ModelCatalogue> {
         // OpenCode's two CLI operations must never share a reader lifetime:
         // closing the first Job proves its standalone server is gone before
         // starting the metadata command. Retain one admission slot throughout.
@@ -650,7 +635,7 @@ impl PluginHost {
         request: ModelListParams,
         mut stop: watch::Receiver<Option<Instant>>,
         until: Instant,
-    ) -> MetadataRead<Value> {
+    ) -> MetadataRead<ModelCatalogue> {
         if stop.borrow().is_some() {
             return MetadataRead {
                 result: Err(Error::new(
@@ -709,22 +694,16 @@ impl PluginHost {
                 .map_err(|_| Error::new("internal", "model.list params encoding failed"))?;
             let value = reader.client.call("model.list", request, until).await?;
             reject_reserved_metadata(&value, &metadata_secrets, "model.list")?;
-            let mut value: Value = value;
-            if value.get("models").and_then(Value::as_array).is_none() {
+            let catalogue: ModelCatalogue = serde_json::from_value(value)
+                .map_err(|_| Error::new("source_integrity", "model.list catalogue is malformed"))?;
+            catalogue.validate_count("model.list")?;
+            if catalogue.provenance == eliot_plugin::protocol::CatalogueProvenance::Session {
                 return Err(Error::new(
                     "source_integrity",
-                    "model.list catalogue is malformed",
+                    "model.list returned a live session catalogue",
                 ));
             }
-            if let Some(models) = value.get_mut("models").and_then(Value::as_array_mut)
-                && models.len() > 1024
-            {
-                return Err(Error::new(
-                    "source_integrity",
-                    "model.list catalogue exceeds 1024 entries",
-                ));
-            }
-            Ok(value)
+            Ok(catalogue)
         };
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>
@@ -1069,23 +1048,20 @@ impl PluginHost {
     }
 }
 
-fn overlay_model_metadata(catalogue: &mut Value, metadata: &Value) {
-    let (Some(models), Some(metadata)) = (
-        catalogue.get_mut("models").and_then(Value::as_array_mut),
-        metadata.get("models").and_then(Value::as_array),
-    ) else {
-        return;
-    };
-    for model in models {
-        let Some(entry) = metadata
-            .iter()
-            .find(|entry| entry.get("id") == model.get("id"))
-        else {
-            continue;
-        };
-        for field in ["efforts", "display_name"] {
-            if let Some(value) = entry.get(field).filter(|value| !value.is_null()) {
-                model[field] = value.clone();
+fn overlay_model_metadata(catalogue: &mut ModelCatalogue, metadata: &ModelCatalogue) {
+    let by_id: HashMap<_, _> = metadata
+        .models
+        .iter()
+        .rev()
+        .map(|row| (row.id.as_str(), row))
+        .collect();
+    for model in &mut catalogue.models {
+        if let Some(row) = by_id.get(model.id.as_str()) {
+            if row.efforts.is_some() {
+                model.efforts.clone_from(&row.efforts);
+            }
+            if row.display_name.is_some() {
+                model.display_name.clone_from(&row.display_name);
             }
         }
     }

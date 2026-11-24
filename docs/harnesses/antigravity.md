@@ -26,7 +26,7 @@ flags; it accepts no hook-config location or registration flag, and the
 top-level `--settings` flag is a print-mode session option, not an `acp`
 option. The install directory ships no bundled docs or settings schema, so
 hook discovery truly requires a directory root. Inventory, model and quota reads,
-and launch check one resolved CLI. The daemon verifies the vendor CLI module in
+and launch check one resolved CLI. The adapter verifies the vendor CLI module in
 the executable before running bounded `agy acp --help` and `agy --version`.
 The bounded `agy acp --help` command must exit successfully; its help prose
 and option spelling do not gate discovery. Launch continues to pass explicit
