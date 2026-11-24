@@ -446,11 +446,18 @@ impl Store {
     }
 
     pub fn cleanup_authorized(&self, principal: &str, artifact: &ArtifactView) -> Result<bool> {
+        Self::cleanup_authorized_at(&self.connection, principal, artifact)
+    }
+
+    fn cleanup_authorized_at(
+        connection: &Connection,
+        principal: &str,
+        artifact: &ArtifactView,
+    ) -> Result<bool> {
         match parse_sender(principal, "cleanup")? {
             Sender::Owner => Ok(true),
             Sender::Agent { id, generation, .. } => {
-                let manager = self
-                    .get_agent(&id)?
+                let manager = load_agent_by_num(connection, parse_agent_id(&id)?)?
                     .ok_or_else(|| Error::new("not_found", "cleanup manager absent"))?;
                 if manager.generation != generation || cleanup_terminal(manager.state) {
                     return Err(Error::new(
@@ -459,14 +466,14 @@ impl Store {
                     ));
                 }
                 project_assignment::authorize_coordination(
-                    &self.connection,
+                    connection,
                     principal,
                     Some(parse_agent_id(&artifact.agent)?),
                 )?;
                 if !artifact.tree.contains(&format!("{id}:{generation}")) {
                     return Ok(false);
                 }
-                let mut current = self.get_agent(&artifact.agent)?;
+                let mut current = load_agent_by_num(connection, parse_agent_id(&artifact.agent)?)?;
                 for _ in 0..64 {
                     let Some(row) = current else {
                         return Ok(false);
@@ -477,7 +484,7 @@ impl Store {
                     current = row
                         .parent
                         .as_deref()
-                        .map(|p| self.get_agent(p))
+                        .map(|p| load_agent_by_num(connection, parse_agent_id(p)?))
                         .transpose()?
                         .flatten();
                 }
@@ -833,6 +840,52 @@ impl Store {
         Ok((method, decode_json(&result)?))
     }
 
+    /// Use the authority of one reserved cleanup item without changing its
+    /// caller identity or enabling direct Agent worktree commands.
+    pub fn submit_manager_worktree_cleanup(
+        &mut self,
+        principal: &str,
+        apply_id: &str,
+        artifact_id: &str,
+        request: &SubmitCommand,
+        now: i64,
+    ) -> Result<Admission> {
+        self.ensure_writer_healthy()?;
+        let artifact =
+            reserved_manager_worktree(&self.connection, principal, apply_id, artifact_id)?;
+        let tip = artifact
+            .git
+            .as_ref()
+            .and_then(|git| git.planned_tip.as_deref());
+        if request.verb != "worktree.remove"
+            || request.id != cleanup_worktree_command_id(apply_id, artifact_id)?
+            || request.target.as_deref() != Some(artifact.agent.as_str())
+            || request.expected_generation != Some(artifact.generation)
+            || tip.is_none()
+            || request.args != json!({"expected_tip": tip})
+            || !self.cleanup_agent_quiescent(&artifact)?
+        {
+            return Err(manager_cleanup_refused());
+        }
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let admission = admission::submit_manager_worktree_cleanup_tx(
+                &tx,
+                principal,
+                request,
+                (apply_id, artifact_id),
+                now,
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(admission)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn update_cleanup_job(
         &mut self,
         principal: &str,
@@ -1143,7 +1196,7 @@ impl Store {
                     continue;
                 };
                 if command.verb != "worktree.remove"
-                    || (command.principal != "owner" && command.principal != principal)
+                    || command.principal != principal
                     || command.target.as_deref() != Some(artifact.agent.as_str())
                     || command.generation != Some(artifact.generation)
                     || command.state != CommandState::Applied
@@ -1762,6 +1815,84 @@ fn cleanup_terminal(state: AgentState) -> bool {
 
 /// Fence resume at admission and dispatch while cleanup is unknown, or after
 /// the current native session has been removed but before its Agent is deleted.
+fn manager_cleanup_refused() -> Error {
+    Error::new(
+        "not_allowed",
+        "worktree removal has no matching manager cleanup reservation",
+    )
+}
+
+fn reserved_manager_worktree(
+    connection: &Connection,
+    principal: &str,
+    apply_id: &str,
+    artifact_id: &str,
+) -> Result<ArtifactView> {
+    let row: Option<(String, String)> = connection
+        .query_row(
+            "SELECT w.result, p.body
+             FROM writes w JOIN cleanup_plans p ON p.id = json_extract(w.result, '$.plan_id')
+             WHERE w.id = ?1 AND w.principal = ?2 AND w.method = 'cleanup.apply'
+               AND p.apply_id = w.id AND p.principal = w.principal",
+            params![apply_id, principal],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let (receipt, plan) = row.ok_or_else(manager_cleanup_refused)?;
+    let receipt: CleanupApplyResponse = serde_json::from_str(&receipt)
+        .map_err(|_| Error::new("source_integrity", "invalid cleanup receipt"))?;
+    let plan: CleanupPlan = serde_json::from_str(&plan)
+        .map_err(|_| Error::new("source_integrity", "invalid cleanup plan row"))?;
+    let reserved = receipt.items.iter().any(|item| {
+        item.artifact_id == artifact_id
+            && item.outcome == "unknown"
+            && item.reason.as_deref() == Some("attempt_reserved")
+    });
+    let candidate = plan.items.into_iter().find(|item| {
+        item.artifact.id == artifact_id
+            && item.artifact.kind == ArtifactKind::Worktree
+            && item.verdict == "safe"
+    });
+    let artifact = candidate.ok_or_else(manager_cleanup_refused)?.artifact;
+    if !principal.starts_with("agent:")
+        || receipt.state != Some(CleanupJobState::Running)
+        || !reserved
+        || !Store::cleanup_authorized_at(connection, principal, &artifact)?
+    {
+        return Err(manager_cleanup_refused());
+    }
+    Ok(artifact)
+}
+
+pub(super) fn require_manager_cleanup_dispatch(
+    connection: &Connection,
+    command: &Command,
+    binding: &Value,
+) -> Result<()> {
+    let apply_id = binding["apply_id"]
+        .as_str()
+        .ok_or_else(manager_cleanup_refused)?;
+    let artifact_id = binding["artifact_id"]
+        .as_str()
+        .ok_or_else(manager_cleanup_refused)?;
+    let artifact =
+        reserved_manager_worktree(connection, &command.principal, apply_id, artifact_id)?;
+    let tip = artifact
+        .git
+        .as_ref()
+        .and_then(|git| git.planned_tip.as_deref());
+    if command.id != cleanup_worktree_command_id(apply_id, artifact_id)?
+        || command.target.as_deref() != Some(artifact.agent.as_str())
+        || command.generation != Some(artifact.generation)
+        || tip.is_none()
+        || command.args["expected_tip"].as_str() != tip
+    {
+        return Err(manager_cleanup_refused());
+    }
+    Ok(())
+}
+
 pub(super) fn require_no_cleanup_attempt(connection: &Connection, agent: &Agent) -> Result<()> {
     let pending: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM artifacts WHERE agent=?1 AND generation=?2 AND (json_extract(body,'$.state')='unknown' OR (json_extract(body,'$.kind')='native_session' AND json_extract(body,'$.state')='removed')))",params![parse_agent_id(&agent.id)?,agent.generation],|r|r.get(0)).map_err(sql_error)?;
     if pending {

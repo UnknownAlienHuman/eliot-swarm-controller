@@ -31,7 +31,11 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     projects::validate_project_command_dispatch_tx(tx, command)?;
     if command.command.principal.starts_with("agent:") {
         let caller = hierarchy::parse_caller(tx, &command.command.principal)?;
-        if command.command.verb != "launch" {
+        if command.command.verb == "worktree.remove"
+            && let Some(binding) = command.command.args.get("manager_cleanup")
+        {
+            cleanup::require_manager_cleanup_dispatch(tx, &command.command, binding)?;
+        } else if command.command.verb != "launch" {
             hierarchy::caller_may_command(tx, &caller, &agent)?;
         }
     }

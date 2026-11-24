@@ -1466,6 +1466,7 @@ fn admit_worktree_remove_tx(
     payload_digest: &[u8],
     now: i64,
     events: &mut Vec<Event>,
+    manager_cleanup: Option<(&str, &str)>,
 ) -> Result<()> {
     let target = request
         .target
@@ -1560,6 +1561,9 @@ fn admit_worktree_remove_tx(
     }
     if let Some(mode) = cleanup_mode {
         args["cleanup_mode"] = mode.clone();
+    }
+    if let Some((apply_id, artifact_id)) = manager_cleanup {
+        args["manager_cleanup"] = json!({"apply_id": apply_id, "artifact_id": artifact_id});
     }
     events.push(admit_command(
         tx,
@@ -2524,7 +2528,15 @@ fn submit_tx_mode(
             None
         }
         "worktree.remove" => {
-            admit_worktree_remove_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
+            admit_worktree_remove_tx(
+                tx,
+                principal,
+                &request,
+                &payload_digest,
+                now,
+                &mut events,
+                None,
+            )?;
             None
         }
         "resume" => admit_resume_tx(tx, principal, &request, &payload_digest, now, &mut events)
@@ -2594,6 +2606,41 @@ fn submit_tx_mode(
     Ok(Admission {
         command,
         linked_command,
+        events,
+        is_new: true,
+    })
+}
+
+/// Admit the derived removal once Store has verified the manager's exact
+/// cleanup job and selected artifact. Public command admission still checks
+/// ordinary Agent command scope.
+pub(super) fn submit_manager_worktree_cleanup_tx(
+    tx: &Transaction<'_>,
+    principal: &str,
+    request: &SubmitCommand,
+    binding: (&str, &str),
+    now: i64,
+) -> Result<Admission> {
+    let (digest, replay) = submit_head_tx(tx, principal, request, now, false)?;
+    if let Some(admission) = replay {
+        return Ok(admission);
+    }
+    submit_target_guards_tx(tx, request, &None)?;
+    let mut events = Vec::new();
+    admit_worktree_remove_tx(
+        tx,
+        principal,
+        request,
+        &digest,
+        now,
+        &mut events,
+        Some(binding),
+    )?;
+    let command = load_command(tx, &request.id)?
+        .ok_or_else(|| Error::new("internal", "new cleanup command was not visible"))?;
+    Ok(Admission {
+        command,
+        linked_command: None,
         events,
         is_new: true,
     })

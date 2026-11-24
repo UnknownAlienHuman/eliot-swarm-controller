@@ -1222,6 +1222,14 @@ impl WorkspaceManager {
                 Ok(Err(error)) => return removal_preflight_error(&error, "cleanliness"),
                 Err(_) => return removal_unknown("workspace_scratch_deadline"),
             };
+            if command.principal.starts_with("agent:")
+                && !preflight.files.is_empty()
+                && let Err(error) = git
+                    .require_automatic_removal_merge(preparation, &preflight.tip, deadline)
+                    .await
+            {
+                return removal_preflight_error(&error, "merge_proof");
+            }
             if let Err(outcome) = self
                 .remove_scratch_files(
                     command,
@@ -1278,7 +1286,8 @@ impl WorkspaceManager {
         if Instant::now() >= deadline {
             return removal_unknown("workspace_remove_deadline");
         }
-        if command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic")
+        if (command.args.get("cleanup_mode").and_then(Value::as_str) == Some("automatic")
+            || command.principal.starts_with("agent:"))
             && let Err(error) = git
                 .require_automatic_removal_merge(preparation, expected_tip, deadline)
                 .await

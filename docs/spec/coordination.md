@@ -63,10 +63,12 @@ it between kept and safe without moving the revision), or an unresolvable
 cursor rejects the continued page as stale. Automatic retirement filters the exact Agent,
 generation and kind before the same cap.
 Agents are restricted to their frozen and current subtree; Owner selects project
-or all. A manager's admitted cleanup job retains the manager principal. After
-rechecking that authority and the selected artifact, the daemon issues the
-derived worktree removal through the same guarded command as local Owner removal.
-Direct `worktree.remove` remains Owner-only. Terminal means Stopped or Failed with no open native source, pending
+or all. An admitted manager job delegates removal of its exact selected
+worktree to the guarded removal command. Both the job and derived command retain
+the manager principal. Recovery settles the job only from a command with that
+same principal and exact derived binding. Planning and execution require the
+manager's branch tip to be merged. Direct `worktree.remove` remains Owner-only.
+Terminal means Stopped or Failed with no open native source, pending
 command or retained non-exited owned process. Lost remains conservative.
 Clean managed worktrees require exact reciprocal Git/common-directory identity.
 Tracked changes and untracked or ignored paths outside frozen scratch paths keep the
@@ -76,7 +78,7 @@ terminal Swarm-created Agent is `safe` with reason `native_archive_pending`.
 Attached or observed sessions and every other harness stay
 `keep(no_native_archive)`.
 Owner-initiated worktree cleanup and direct `worktree.remove` accept clean
-checkouts on unmerged branches. Age-based cleanup requires the merge proof below.
+checkouts on unmerged branches. Manager and age-based cleanup require merge proof.
 After the existing terminal-owner, borrower, assignment, age, reciprocal Git
 identity, cleanliness and filesystem-guard checks pass, Swarm removes only the
 checkout and its private worktree administration directory. The local branch

@@ -1076,14 +1076,24 @@ of the explicitly selected release scope.
 - [x] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
       Implemented generation/tree artifact custody, bounded plan/apply, handle
       deletion, branch verification, native archive, retirement opt-in, CLI and
-      Advanced Settings. On a private Windows stand on 2026-11-24, a self-scoped
-      Claude Haiku 5.5 manager removed a stopped child's managed worktree through
-      its Agent-authored cleanup job. Direct Agent worktree removal was refused.
-      An explicit Owner branch cleanup archived the exact retained tip.
-      The private main build also kept a dirty worktree, removed a child-registered
-      temp directory, and verified removal of an OpenCode native session.
-      Frozen Codex archive scope and malformed acknowledgements have source
-      coverage. This run did not inject a native archive fault.
+      Advanced Settings. On a private Windows stand on 2026-11-24, binary
+      SHA-256 `a309e41c19fd9684cb3d16c23b0e94316224a338340159cfa943c3b27ddbe445`
+      ran a self-scoped Claude Code manager configured for `claude-haiku-5-5`
+      without submitting a turn. Principal `agent:a1:1` kept its stopped child's
+      worktree when it became dirty or unmerged after planning. A fresh plan
+      removed the clean, merged worktree and kept its branch tip. All three
+      derived commands retained the manager principal. Direct Agent removal
+      and cross-principal replay were refused. The owned Agents and daemon
+      exited, and the stand was removed. Workspace formatting, locked release
+      all-target builds and warnings-denied release Clippy passed for
+      `eliot-store`, `eliot-daemon`, and `eliot`.
+      Earlier binary SHA-256
+      `765e0b96741d300cfbb97d12dd04bd503c817aac1151c93a1db2b64cccce6ab5`
+      served `claude-haiku-5-5` to manager `agent:a1:1`, which removed a
+      child-registered temp directory. Owner cleanup archived the exact branch
+      tip and verified removal of an OpenCode native session without a model
+      turn. The owned stand was removed. Frozen Codex archive scope and malformed
+      acknowledgements have source coverage without a native fault-injection run.
 
       - [x] **Agent-launched managed child worktrees (2026-11-22).** A private
         Claude manager launched Claude and OpenCode children in parallel, refused
