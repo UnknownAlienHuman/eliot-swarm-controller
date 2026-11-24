@@ -520,11 +520,13 @@ impl Store {
                     if response.deliveries.len() != definition.to.len() {
                         return Err(Error::new("internal", "mail effect did not fan out"));
                     }
-                    (
-                        json!({"deliveries": response.deliveries}),
-                        events,
-                        definition.to,
-                    )
+                    let outcome = json!({"deliveries": response.deliveries});
+                    let recipients = response
+                        .deliveries
+                        .into_iter()
+                        .map(|delivery| delivery.recipient)
+                        .collect();
+                    (outcome, events, recipients)
                 }
                 RuleCoordinationEffect::Variable(definition, scope) => {
                     let encoded_value = encode_json(&definition.value)?;
