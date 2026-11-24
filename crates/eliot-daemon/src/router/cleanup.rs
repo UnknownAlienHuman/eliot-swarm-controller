@@ -28,6 +28,27 @@ enum CleanupApplyMode<'a> {
     Bulk(&'a HashSet<String>),
 }
 
+enum CleanupRemoval {
+    Removed(u64),
+    AlreadyAbsent,
+}
+
+impl CleanupRemoval {
+    fn outcome(self, artifact_id: &str) -> CleanupItemOutcome {
+        let (bytes_reclaimed, reason) = match self {
+            Self::Removed(bytes) => (bytes, None),
+            Self::AlreadyAbsent => (0, Some("already_absent".to_owned())),
+        };
+        CleanupItemOutcome {
+            artifact_id: artifact_id.to_owned(),
+            outcome: "removed".to_owned(),
+            reason,
+            detail: None,
+            bytes_reclaimed,
+        }
+    }
+}
+
 #[cfg(windows)]
 async fn open_cleanup_tree(path: PathBuf, budget: Duration) -> Result<CleanupTree> {
     let deadline = std::time::Instant::now() + budget;
@@ -1296,7 +1317,7 @@ impl Router {
         principal: &Principal,
     ) -> Result<Value> {
         encoded(
-            self.cleanup_plan_page(params, principal, None, false, false)
+            self.cleanup_plan_page(params, principal, None, false, None)
                 .await?,
         )
     }
@@ -1312,7 +1333,7 @@ impl Router {
             &Principal::Owner,
             Some(retention_ms),
             retain_for_apply,
-            false,
+            None,
         )
         .await
     }
@@ -1323,8 +1344,9 @@ impl Router {
         principal: &Principal,
         auto_cleanup_after_ms: Option<i64>,
         retain_automatic_plan: bool,
-        bulk: bool,
+        bulk_tally: Option<&mut CleanupTally>,
     ) -> Result<CleanupPlan> {
+        let bulk = bulk_tally.is_some();
         let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
         let mut request: CleanupPlanRequest = coordination::decode_coordination_request(
@@ -1378,14 +1400,24 @@ impl Router {
         if !auto_cleanup && page.snapshot_seq.is_none() {
             // Backfill within one slice, then freeze the inventory on the
             // first candidate page. Large or slow fleets resume the backfill.
-            page.backfill_after = self
+            page.backfill_after = match self
                 .backfill_cleanup_inventory(
                     &name,
                     &request,
                     page.backfill_after,
                     &mut plan.inventory_issues,
                 )
-                .await?;
+                .await
+            {
+                Ok(after) => after,
+                Err(error) => match bulk_tally {
+                    Some(tally) => {
+                        jobs::record_page_error(tally, &error);
+                        None
+                    }
+                    None => return Err(error),
+                },
+            };
             if page.backfill_after.is_some() {
                 page.request_binding = Some(binding);
                 plan.truncated = true;
@@ -1470,6 +1502,7 @@ impl Router {
         let artifact_limit = MAX_CLEANUP_ITEMS - shown_safe.len();
         let eliot_store::CleanupInventoryPage {
             artifacts,
+            inventory_issues,
             truncated: artifacts_truncated,
             snapshot_seq,
             next_rank,
@@ -1482,6 +1515,7 @@ impl Router {
             auto_cleanup,
             bulk,
         )?;
+        plan.inventory_issues.extend(inventory_issues);
         let artifacts_total = artifacts.len();
         let mut middle = Vec::new();
         for artifact in artifacts {
@@ -1561,6 +1595,9 @@ impl Router {
                     !auto_cleanup && matches!(principal, Principal::Owner),
                 )
                 .await;
+                if bulk && cleanup_operation_failed(&candidate.reason) {
+                    candidate.verdict = "failed".to_owned();
+                }
                 if candidate.verdict == "safe"
                     && let Some(reason) = retention_reason
                 {
@@ -1569,8 +1606,11 @@ impl Router {
                     candidate.bytes = self.cleanup_worktree_bytes(&candidate.artifact).await;
                 }
             } else if candidate.artifact.kind == ArtifactKind::Branch {
-                let Some(git) = candidate.artifact.git.as_ref() else {
+                let Some(git) = candidate.artifact.git.clone() else {
                     candidate.reason = "source_integrity".to_owned();
+                    if bulk {
+                        candidate.verdict = "failed".to_owned();
+                    }
                     middle.push(candidate);
                     continue;
                 };
@@ -1579,21 +1619,14 @@ impl Router {
                 {
                     break;
                 }
-                if !self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .cleanup_agent_quiescent(&candidate.artifact)?
-                {
-                    candidate.reason = "agent_not_quiescent".to_owned();
+                if !self.cleanup_plan_agent_gate(&mut candidate, bulk).await? {
                     middle.push(candidate);
                     continue;
                 }
                 match self
                     .cleanup_branch_tip(
                         &candidate.artifact,
-                        git,
+                        &git,
                         Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT,
                     )
                     .await
@@ -1604,38 +1637,15 @@ impl Router {
                         candidate.reason = "local_branch_retirement".to_owned();
                         candidate.bytes = Some(0);
                     }
-                    Err(error) => candidate.reason = error.code,
+                    Err(error) => cleanup_plan_refusal(&mut candidate, bulk, error),
                 }
             } else if candidate.artifact.kind == ArtifactKind::NativeSession {
-                let swarm_created = self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .get_agent(&candidate.artifact.agent)?
-                    .is_some_and(|agent| swarm_created_session_agent(&agent));
-                if !swarm_created || !native_archive_supported(&candidate.artifact.purpose) {
-                    candidate.reason = "no_native_archive".to_owned();
-                } else if !self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .cleanup_agent_quiescent(&candidate.artifact)?
-                {
-                    candidate.reason = "agent_not_quiescent".to_owned();
-                } else {
+                if self.cleanup_plan_agent_gate(&mut candidate, bulk).await? {
                     candidate.verdict = "safe".to_owned();
                     candidate.reason = "native_archive_pending".to_owned();
                     candidate.bytes = None;
                 }
-            } else if self
-                .inner
-                .store
-                .lock()
-                .await
-                .cleanup_agent_quiescent(&candidate.artifact)?
-            {
+            } else if self.cleanup_plan_agent_gate(&mut candidate, bulk).await? {
                 if call_deadline.saturating_duration_since(tokio::time::Instant::now())
                     < CLEANUP_PLAN_MAX_PREFLIGHT
                 {
@@ -1664,7 +1674,7 @@ impl Router {
                         .to_owned();
                         candidate.bytes = Some(bytes);
                     }
-                    Err(error) => candidate.reason = error.code,
+                    Err(error) => cleanup_plan_refusal(&mut candidate, bulk, error),
                 }
             }
             middle.push(candidate);
@@ -1712,10 +1722,10 @@ impl Router {
                 .encode()?,
             );
         }
-        let retain_plan = if auto_cleanup {
+        let retain_plan = if bulk {
+            false
+        } else if auto_cleanup {
             retain_automatic_plan && plan.items.iter().any(|item| item.verdict == "safe")
-        } else if bulk {
-            plan.items.iter().any(|item| item.verdict == "safe")
         } else {
             !plan.items.is_empty() || !plan.truncated
         };
@@ -1727,6 +1737,34 @@ impl Router {
                 .retain_cleanup_plan(&name, &plan, now_ms())?;
         }
         Ok(plan)
+    }
+
+    async fn cleanup_plan_agent_gate(
+        &self,
+        candidate: &mut CleanupCandidate,
+        bulk: bool,
+    ) -> Result<bool> {
+        let store = self.inner.store.lock().await;
+        let eligible = (|| {
+            if candidate.artifact.kind == ArtifactKind::NativeSession
+                && (!store
+                    .get_agent(&candidate.artifact.agent)?
+                    .is_some_and(|agent| swarm_created_session_agent(&agent))
+                    || !native_archive_supported(&candidate.artifact.purpose))
+            {
+                candidate.reason = "no_native_archive".to_owned();
+                return Ok(false);
+            }
+            store.cleanup_agent_quiescent(&candidate.artifact)
+        })();
+        match eligible {
+            Err(error) if bulk && !store.is_write_faulted() => {
+                candidate.verdict = "failed".to_owned();
+                candidate.reason = error.code;
+                Ok(false)
+            }
+            result => result,
+        }
     }
 
     async fn backfill_cleanup_inventory(
@@ -2331,6 +2369,7 @@ impl Router {
         response: &mut CleanupApplyResponse,
         mode: CleanupApplyMode<'_>,
     ) -> Result<()> {
+        let mut page_error = None;
         // A native reader may need the managed workspace as its directory.
         let (sessions, other): (Vec<_>, Vec<_>) = plan
             .items
@@ -2365,7 +2404,9 @@ impl Router {
                     .zip(&response.items)
                     .any(|(session, outcome)| {
                         session.artifact.kind == ArtifactKind::NativeSession
-                            && session.verdict == "safe"
+                            && (session.verdict == "safe"
+                                || (matches!(mode, CleanupApplyMode::Bulk(_))
+                                    && session.verdict == "failed"))
                             && request.selects(&session.artifact.id)
                             && outcome.outcome != "removed"
                             && (matches!(mode, CleanupApplyMode::AgentTree)
@@ -2406,13 +2447,7 @@ impl Router {
                 );
             }
             let outcome = match removal {
-                Ok(bytes) => CleanupItemOutcome {
-                    artifact_id: item.artifact.id.clone(),
-                    outcome: "removed".to_owned(),
-                    reason: (item.reason == "already_absent").then(|| item.reason.clone()),
-                    detail: None,
-                    bytes_reclaimed: bytes,
-                },
+                Ok(removal) => removal.outcome(&item.artifact.id),
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     detail: (item.artifact.kind == ArtifactKind::Branch).then(|| {
@@ -2425,10 +2460,7 @@ impl Router {
                         // local branch is already gone: the item is partial,
                         // never a clean skip, and never replayed.
                         "unknown"
-                    } else if matches!(
-                        error.code.as_str(),
-                        "internal" | "platform_io" | "store_io" | "source_integrity"
-                    ) {
+                    } else if cleanup_operation_failed(&error.code) {
                         "failed"
                     } else {
                         "skipped"
@@ -2439,16 +2471,20 @@ impl Router {
                 },
             };
             response.bytes_reclaimed += outcome.bytes_reclaimed;
-            response.items[index] = outcome.clone();
-            self.inner.store.lock().await.settle_cleanup_item(
-                name,
-                request,
-                response,
-                &item.artifact,
-                &outcome,
-            )?;
+            let previous = std::mem::replace(&mut response.items[index], outcome.clone());
+            let mut store = self.inner.store.lock().await;
+            let settled =
+                store.settle_cleanup_item(name, request, response, &item.artifact, &outcome);
+            if let Err(error) = settled {
+                response.items[index] = previous;
+                response.bytes_reclaimed -= outcome.bytes_reclaimed;
+                if !matches!(mode, CleanupApplyMode::Bulk(_)) || store.is_write_faulted() {
+                    return Err(error);
+                }
+                page_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        page_error.map_or(Ok(()), Err)
     }
 
     async fn cleanup_remove(
@@ -2457,7 +2493,7 @@ impl Router {
         item: &CleanupCandidate,
         request: &CleanupApplyRequest,
         automatic: bool,
-    ) -> Result<u64> {
+    ) -> Result<CleanupRemoval> {
         let artifact = &item.artifact;
         if artifact.kind == ArtifactKind::Branch {
             let git = artifact
@@ -2506,7 +2542,7 @@ impl Router {
                 .await
                 .map_err(|error| Error::new("remote_delete_failed", (*error.message).clone()))?;
             }
-            return Ok(0);
+            return Ok(CleanupRemoval::Removed(0));
         }
         if artifact.kind == ArtifactKind::NativeSession {
             // Local native stores are never deleted as files. Codex threads
@@ -2566,12 +2602,19 @@ impl Router {
                         error
                     }
                 })
-                .map(|()| 0);
+                .map(|()| CleanupRemoval::Removed(0));
         }
         if artifact.kind == ArtifactKind::Worktree {
             return self
                 .cleanup_remove_worktree(principal, item, &request.id, automatic)
-                .await;
+                .await
+                .map(|bytes| {
+                    if item.reason == "already_absent" {
+                        CleanupRemoval::AlreadyAbsent
+                    } else {
+                        CleanupRemoval::Removed(bytes)
+                    }
+                });
         }
         if let Some(expires_at) = artifact.expires_at
             && now_ms() < expires_at
@@ -2619,7 +2662,7 @@ impl Router {
                     error
                 }
             })?;
-            return Ok(0);
+            return Ok(CleanupRemoval::AlreadyAbsent);
         }
         if item.reason == "already_absent" {
             return Err(Error::new(
@@ -2657,7 +2700,8 @@ impl Router {
                 &path,
                 &artifact.identity,
             )
-            .await;
+            .await
+            .map(CleanupRemoval::Removed);
         }
         #[cfg(windows)]
         {
@@ -2706,6 +2750,7 @@ impl Router {
             delete
                 .await
                 .map_err(|_| Error::new("unknown", "cleanup deletion worker did not settle"))?
+                .map(CleanupRemoval::Removed)
         }
         #[cfg(not(windows))]
         {
@@ -3711,13 +3756,7 @@ impl Router {
                 continue;
             }
             let outcome = match self.cleanup_remove("owner", item, &apply, false).await {
-                Ok(bytes) => CleanupItemOutcome {
-                    artifact_id: item.artifact.id.clone(),
-                    outcome: "removed".to_owned(),
-                    reason: None,
-                    detail: None,
-                    bytes_reclaimed: bytes,
-                },
+                Ok(removal) => removal.outcome(&item.artifact.id),
                 Err(error) => CleanupItemOutcome {
                     artifact_id: item.artifact.id.clone(),
                     detail: None,
@@ -3742,6 +3781,20 @@ impl Router {
             );
         }
     }
+}
+
+fn cleanup_operation_failed(code: &str) -> bool {
+    matches!(
+        code,
+        "internal" | "platform_io" | "store_io" | "source_integrity"
+    )
+}
+
+fn cleanup_plan_refusal(candidate: &mut CleanupCandidate, bulk: bool, error: Error) {
+    if bulk && cleanup_operation_failed(&error.code) {
+        candidate.verdict = "failed".to_owned();
+    }
+    candidate.reason = error.code;
 }
 
 /// Whether the `daemon.json` beside a present `daemon.lock` names a process

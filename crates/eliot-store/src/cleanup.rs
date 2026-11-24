@@ -18,6 +18,7 @@ const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
+    pub inventory_issues: Vec<CleanupInventoryIssue>,
     pub truncated: bool,
     pub snapshot_seq: i64,
     pub next_rank: u8,
@@ -532,6 +533,7 @@ impl Store {
         if rank == 3 {
             return Ok(CleanupInventoryPage {
                 artifacts: Vec::new(),
+                inventory_issues: Vec::new(),
                 truncated: false,
                 snapshot_seq: snapshot,
                 next_rank: rank,
@@ -541,31 +543,58 @@ impl Store {
 
         let mut scanned = 0_usize;
         let mut eligible = Vec::with_capacity(limit);
+        let mut inventory_issues = Vec::new();
         let mut truncated = false;
         'scan: while rank < 3 && scanned < CLEANUP_INVENTORY_SCAN {
             let remaining = CLEANUP_INVENTORY_SCAN - scanned;
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT body, seq FROM artifacts
+                    "SELECT body, seq, agent, generation FROM artifacts
                      WHERE seq > ?1 AND seq <= ?2 ORDER BY seq ASC LIMIT ?3",
                 )
                 .map_err(sql_error)?;
             let rows = statement
                 .query_map(
                     params![after_seq.unwrap_or(0), snapshot, (remaining + 1) as i64],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    },
                 )
                 .map_err(sql_error)?
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(sql_error)?;
             let fetched = rows.len();
-            for (body, seq) in rows.into_iter().take(remaining) {
+            for (body, seq, agent, generation) in rows.into_iter().take(remaining) {
                 let previous_seq = after_seq;
                 after_seq = Some(seq);
                 scanned += 1;
-                let artifact: ArtifactView = serde_json::from_str(&body)
-                    .map_err(|_| Error::new("source_integrity", "invalid artifact ledger row"))?;
+                let artifact: ArtifactView = match serde_json::from_str(&body) {
+                    Ok(artifact) => artifact,
+                    Err(_) if bulk => {
+                        if rank == 0 {
+                            inventory_issues.push(CleanupInventoryIssue {
+                                agent: format!("a{agent}"),
+                                generation,
+                                path: None,
+                                reason: "source_integrity".to_owned(),
+                                detail: "invalid artifact ledger row".to_owned(),
+                            });
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "invalid artifact ledger row",
+                        ));
+                    }
+                };
                 let owned_root = include_ownership_roots
                     && matches!(caller, Sender::Owner)
                     && artifact.state == "ownership_root";
@@ -618,6 +647,7 @@ impl Store {
         }
         Ok(CleanupInventoryPage {
             artifacts: eligible,
+            inventory_issues,
             truncated,
             snapshot_seq: snapshot,
             next_rank: rank,
@@ -1120,6 +1150,8 @@ impl Store {
                     detail: None,
                     outcome: if attempted(item) {
                         "unknown"
+                    } else if item.verdict == "failed" {
+                        "failed"
                     } else {
                         "skipped"
                     }

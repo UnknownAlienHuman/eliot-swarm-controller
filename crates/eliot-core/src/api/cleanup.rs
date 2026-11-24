@@ -504,6 +504,8 @@ impl CleanupStatusRequest {
 #[derive(schemars::JsonSchema, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CleanupTally {
     pub pages: u64,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub page_errors: std::collections::BTreeMap<String, u64>,
     pub inventory_issues: u64,
     pub applied: u64,
     pub skipped: std::collections::BTreeMap<String, u64>,

@@ -93,7 +93,9 @@ owner-binding and #885 two-pass cleanup checks.
 Plans anchor the managed workspace identity and branch tip. Apply rechecks the
 same identity and exact local tip before mutation. A missing directory for
 a retained artifact can surface as `safe(already_absent)`. Apply confirms
-absence twice across the 15-second grace interval before settling zero bytes.
+absence twice across the 15-second grace interval before settling
+`removed(already_absent)` with zero bytes, including when the directory was
+present in the plan.
 For a worktree, apply uses the existing
 missing-worktree reconciliation and preserves the local branch. A reappearing
 directory requires a fresh plan. Changed local identity,
@@ -135,7 +137,9 @@ artifacts. Other items proceed under the same plan and checks.
 The Store commits attempt reservations before effects and retains each outcome as it
 settles. Exact same-ID replay returns the current receipt. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted
-artifact. Uncertain attempts fence resume at admission and dispatch. Windows
+artifact. An uncertain worktree removal stays fenced for that workspace
+until exact readback or Owner reconciliation settles it. Uncertain attempts fence
+resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
 reparse points and deletes by handle disposition. A scan is bounded to 262,144
@@ -198,11 +202,18 @@ ordinary artifacts and native sessions before their worktrees or chat directorie
 including across pages. Project registrations use current revision and
 path checks for each batch. One explicit cleanup apply runs at a time. Read progress
 with `cleanup.status {id}` or repeat the original call with the same id and filters.
-The tally includes pages, inventory issue count, applied, skipped by reason, failed,
-unknown, pending, and confirmed bytes reclaimed. A traversal failure retains the
-tally for work already examined and reports its reason. A daemon restart leaves
+The tally includes pages, page errors by reason, inventory issue count, applied,
+skipped by reason, failed, unknown, pending, and confirmed bytes reclaimed.
+A rejected page admission records failures for its safe candidates and advances
+to the next page. A per-item refusal or settlement error preserves the durable
+outcomes and reservations for that page while independent items continue.
+If the inventory cursor cannot advance, the job records that failure and still
+considers independent project registrations. Losing the Store writer stops new
+effects. A daemon restart leaves
 interrupted jobs readable and never replays an uncertain effect. Active bulk receipts
 are pinned, and write-history retention for them starts at settlement or interruption.
+A pruned bulk receipt follows the normal mutation retry window and its original
+ID is refused as `id_expired`.
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as

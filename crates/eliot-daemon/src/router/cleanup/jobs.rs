@@ -104,6 +104,8 @@ impl Router {
             reason: None,
         };
         let accepted = encoded(&status)?;
+        // The ordinary Store admission validates the ULID retry window on a
+        // receipt miss, including after write-history retention prunes it.
         store.record_write(&request.id, OWNER, APPLY_ALL, &payload, &accepted, now_ms())?;
         let worker = self.claim_cleanup_worker(&request.id);
         tokio::spawn(async move {
@@ -206,35 +208,73 @@ impl Router {
         status: &mut CleanupJobStatus,
     ) -> Result<()> {
         let mut native_kept = HashSet::new();
-        loop {
+        let inventory = loop {
             self.check_cleanup_worker_shutdown()?;
             let params = encoded(&request)?;
-            let mut page = self
-                .cleanup_plan_page(&params, &Principal::Owner, None, false, true)
-                .await?;
+            let mut page = match self
+                .cleanup_plan_page(
+                    &params,
+                    &Principal::Owner,
+                    None,
+                    false,
+                    Some(&mut status.tally),
+                )
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    record_page_error(&mut status.tally, &error);
+                    self.persist_bulk_status(status).await?;
+                    break Err(error);
+                }
+            };
             status.tally.inventory_issues += page.inventory_issues.len() as u64;
             let after = page.continuation.take();
             self.apply_bulk_page(page, status, &mut native_kept).await?;
-            let Some(after) = after else { break };
+            let Some(after) = after else { break Ok(()) };
             if request.continuation.as_ref() == Some(&after) {
-                return Err(Error::new("internal", "cleanup inventory did not advance"));
+                let error = Error::new("internal", "cleanup inventory did not advance");
+                record_page_error(&mut status.tally, &error);
+                break Err(error);
             }
             request.continuation = Some(after);
-        }
+        };
 
+        let projects = self
+            .apply_bulk_projects(&request, status, &mut native_kept)
+            .await;
+        inventory.and(projects)
+    }
+
+    async fn apply_bulk_projects(
+        &self,
+        request: &CleanupPlanRequest,
+        status: &mut CleanupJobStatus,
+        native_kept: &mut HashSet<String>,
+    ) -> Result<()> {
         // Project removals change the settings revision used by preview
         // continuations. Snapshot project identities once, then recheck each
         // bounded batch against its current settings revision.
-        let (projects, _) = self.plan_project_registrations(&request).await?;
-        let mut initial = projects;
-        for batch in initial.chunks_mut(MAX_CLEANUP_ITEMS) {
+        let (projects, _) = self
+            .plan_project_registrations(request)
+            .await
+            .inspect_err(|error| record_page_error(&mut status.tally, error))?;
+        for batch in projects.chunks(MAX_CLEANUP_ITEMS) {
             self.check_cleanup_worker_shutdown()?;
-            let (current, _) = self.plan_project_registrations(&request).await?;
+            let (current, _) = match self.plan_project_registrations(request).await {
+                Ok(current) => current,
+                Err(error) => {
+                    count_unstarted_page(batch, &mut status.tally, native_kept, &error);
+                    self.persist_bulk_status(status).await?;
+                    continue;
+                }
+            };
             let by_id: HashMap<_, _> = current
                 .into_iter()
                 .map(|item| (item.artifact.project.clone(), item))
                 .collect();
-            for item in batch.iter_mut().filter(|item| item.verdict == "safe") {
+            let mut items = batch.to_vec();
+            for item in items.iter_mut().filter(|item| item.verdict == "safe") {
                 if let Some(current) = by_id.get(&item.artifact.project)
                     && current.artifact.path == item.artifact.path
                 {
@@ -248,19 +288,12 @@ impl Router {
             let plan = CleanupPlan {
                 plan_id: ulid::Ulid::new().to_string(),
                 created_at: now,
-                items: batch.to_vec(),
+                items,
                 inventory_issues: Vec::new(),
                 truncated: false,
                 continuation: None,
             };
-            if plan.items.iter().any(|item| item.verdict == "safe") {
-                self.inner
-                    .store
-                    .lock()
-                    .await
-                    .retain_cleanup_plan(OWNER, &plan, now)?;
-            }
-            self.apply_bulk_page(plan, status, &mut native_kept).await?;
+            self.apply_bulk_page(plan, status, native_kept).await?;
         }
         Ok(())
     }
@@ -280,37 +313,50 @@ impl Router {
             };
             status.current_apply_id = Some(request.id.clone());
             self.persist_bulk_status(status).await?;
-            let (_, mut response, _) = self.inner.store.lock().await.begin_cleanup_apply(
-                OWNER,
-                &request,
-                now_ms(),
-                false,
-            )?;
-            self.run_cleanup_page(
-                OWNER,
-                &request,
-                &plan,
-                &mut response,
-                CleanupApplyMode::Bulk(native_kept),
-            )
-            .await?;
+            let admission = {
+                let mut store = self.inner.store.lock().await;
+                self.check_cleanup_worker_shutdown()?;
+                let now = now_ms();
+                store
+                    .retain_cleanup_plan(OWNER, &plan, now)
+                    .and_then(|()| store.begin_cleanup_apply(OWNER, &request, now, false))
+            };
+            let (_, mut response, _) = match admission {
+                Ok(admission) => admission,
+                Err(error) => {
+                    count_unstarted_page(&plan.items, &mut status.tally, native_kept, &error);
+                    status.current_apply_id = None;
+                    return self.persist_bulk_status(status).await;
+                }
+            };
+            if let Err(error) = self
+                .run_cleanup_page(
+                    OWNER,
+                    &request,
+                    &plan,
+                    &mut response,
+                    CleanupApplyMode::Bulk(native_kept),
+                )
+                .await
+            {
+                if error.code == "interrupted" || self.inner.store.lock().await.is_write_faulted() {
+                    return Err(error);
+                }
+                record_page_error(&mut status.tally, &error);
+            }
             for (item, outcome) in plan.items.iter().zip(&response.items) {
                 if item.artifact.kind == ArtifactKind::NativeSession
-                    && item.verdict == "safe"
+                    && matches!(item.verdict.as_str(), "safe" | "failed")
                     && outcome.outcome != "removed"
                 {
-                    native_kept.insert(
-                        cleanup_tree_root(&item.artifact)
-                            .unwrap_or(&item.artifact.agent)
-                            .to_owned(),
-                    );
+                    keep_native_workspace(native_kept, &item.artifact);
                 }
             }
             status.tally.count(&response, false);
             status.current_apply_id = None;
         } else {
-            for item in plan.items {
-                *status.tally.skipped.entry(item.reason).or_default() += 1;
+            for item in &plan.items {
+                count_unstarted_item(item, &mut status.tally, native_kept);
             }
         }
         status.tally.pages += 1;
@@ -347,6 +393,47 @@ impl Router {
             );
         }
     }
+}
+
+pub(super) fn record_page_error(tally: &mut CleanupTally, error: &Error) {
+    *tally.page_errors.entry(error.code.clone()).or_default() += 1;
+}
+
+fn count_unstarted_page(
+    items: &[CleanupCandidate],
+    tally: &mut CleanupTally,
+    native_kept: &mut HashSet<String>,
+    error: &Error,
+) {
+    record_page_error(tally, error);
+    tally.pages += 1;
+    for item in items {
+        count_unstarted_item(item, tally, native_kept);
+    }
+}
+
+fn count_unstarted_item(
+    item: &CleanupCandidate,
+    tally: &mut CleanupTally,
+    native_kept: &mut HashSet<String>,
+) {
+    match item.verdict.as_str() {
+        "safe" | "failed" => {
+            tally.failed += 1;
+            if item.artifact.kind == ArtifactKind::NativeSession {
+                keep_native_workspace(native_kept, &item.artifact);
+            }
+        }
+        _ => *tally.skipped.entry(item.reason.clone()).or_default() += 1,
+    }
+}
+
+fn keep_native_workspace(native_kept: &mut HashSet<String>, artifact: &ArtifactView) {
+    native_kept.insert(
+        cleanup_tree_root(artifact)
+            .unwrap_or(&artifact.agent)
+            .to_owned(),
+    );
 }
 
 fn settlement_state(result: &Result<()>) -> CleanupJobState {
