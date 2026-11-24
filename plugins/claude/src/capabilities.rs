@@ -5,18 +5,15 @@ use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
     NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
     NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
-    ProjectInstructionRead, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
-use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting,
-    InstructionReadStatus::{Documented, Unknown},
-};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
                 resolve: || auth_command(&["auth", "login"]),
@@ -83,22 +80,8 @@ pub fn declaration() -> HarnessCapabilities {
         manager_preference: Some(1),
         owner_rules_delivery:
             eliot_core::api::OwnerRulesDeliveryMethod::ClaudeAppendSystemPromptFile,
-        project_instruction_read: Some(ProjectInstructionRead {
-            paths: &[
-                ("AGENTS.md", Unknown),
-                ("CLAUDE.md", Documented),
-                ("CLAUDE.local.md", Documented),
-                (".claude/CLAUDE.md", Documented),
-                (".claude/CLAUDE.local.md", Unknown),
-            ],
-            report_version: true,
-            ..ProjectInstructionRead::default()
-        }),
-        user_instruction_files: Some(UserInstructionFiles {
-            root_override_env: Some("CLAUDE_CONFIG_DIR"),
-            home_subdir: ".claude",
-            paths: &["CLAUDE.md"],
-        }),
+        project_instruction_read: crate::instructions::PROJECT_READ,
+        user_instruction_files: crate::instructions::USER_FILES,
         resume_config: true,
         restart_requires_idle: true,
         accepts_send_during_native_turn: true,

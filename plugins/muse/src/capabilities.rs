@@ -3,21 +3,17 @@
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeAuthCapability,
     NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback,
-    NativeRoute, ProfileCapabilities,
+    NativeRoute, ProfileCapabilities, RetainedQuotaReadback,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
-use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus::NotNative,
-    OwnerRulesDeliveryMethod,
-};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
 use eliot_core::{InjectPoint, McpPolicy};
-use eliot_plugin::capabilities::{
-    adhoc_launch, instruction_files, quota_readback, sandbox_permissions,
-};
+use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_catalogue_presentation: Some(
             crate::catalog_presentation::model_catalogue_presentation,
         ),
@@ -51,7 +47,7 @@ pub fn declaration() -> HarnessCapabilities {
             ..quota_readback(
                 crate::quota::project_quota,
                 crate::quota::quota_usage_windows,
-                |_| "Muse subscription allowance",
+                crate::allowance::source_note,
             )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
@@ -67,10 +63,7 @@ pub fn declaration() -> HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
         owner_rules_delivery: OwnerRulesDeliveryMethod::FirstInput,
-        project_instruction_read: Some(instruction_files(&[
-            ("AGENTS.md", NotNative),
-            ("AGENTS.override.md", NotNative),
-        ])),
+        project_instruction_read: crate::instructions::PROJECT_READ,
         defer_harness_check: true, // #949
         resume_config: true,
         resume_previous_turn: true,
@@ -86,7 +79,11 @@ pub fn declaration() -> HarnessCapabilities {
         configure_reports_accepted_model: true,
         provider_response_model_verification: true,
         configure_reports_effort_verification: true,
-        reads_retained_quota: true,
+        retained_quota: Some(RetainedQuotaReadback {
+            account_key: crate::allowance::account_key,
+            source: crate::allowance::STREAM_SOURCE,
+            unavailable: crate::allowance::unavailable,
+        }),
         view_projection_gap_recovery: true,
         native_child_families: &eliot_core::MUSE_NATIVE_CHILD_FAMILIES,
         native_child_history_refusal: Some(

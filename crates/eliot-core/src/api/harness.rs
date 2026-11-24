@@ -16,6 +16,7 @@
 //! and read account windows. The query performs no inference and never polls
 //! per Agent.
 
+use super::instructions::{InstructionInventoryPath, normalize_instruction_inventory};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
@@ -195,6 +196,14 @@ pub struct NativeQuotaReadback {
     pub route_refusal: Option<QuotaRouteRefusal>,
 }
 
+/// Native account scope and diagnostics for a reader with retained turn evidence.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedQuotaReadback {
+    pub account_key: fn(&serde_json::Value) -> Option<String>,
+    pub source: &'static str,
+    pub unavailable: fn(code: &str, reason: &str) -> Option<Error>,
+}
+
 /// A documented model list usable when a verified native read is unavailable.
 #[derive(Clone, Copy, Debug)]
 pub struct DocumentedModelCatalog {
@@ -368,6 +377,8 @@ pub struct HarnessCapabilities {
     pub owner_rules_delivery: super::OwnerRulesDeliveryMethod,
     /// Native project instruction-file behavior for the frozen profile.
     pub project_instruction_read: Option<ProjectInstructionRead>,
+    /// Project instruction candidates contributed to the composed inventory.
+    pub instruction_inventory: &'static [InstructionInventoryPath],
     /// User instruction files that doctor may compare with committed owner rules.
     pub user_instruction_files: Option<UserInstructionFiles>,
     /// MCP identity comes only from data-root values, not the full target
@@ -404,7 +415,7 @@ pub struct HarnessCapabilities {
     /// Native archive support and the binding required by its reader.
     pub native_archive: Option<NativeArchiveBinding>,
     /// Read quota evidence retained from an actual turn.
-    pub reads_retained_quota: bool,
+    pub retained_quota: Option<RetainedQuotaReadback>,
     /// Native shapes accepted for read-only quota projection.
     pub quota_readback: Option<NativeQuotaReadback>,
     /// Passes the Agent identity variables to the native process.
@@ -427,7 +438,11 @@ pub struct HarnessCapabilities {
 }
 
 type Declarations = Box<[(&'static str, HarnessCapabilities)]>;
-static BUILTIN_CAPABILITIES: OnceLock<Declarations> = OnceLock::new();
+struct RegisteredAdapters {
+    declarations: Declarations,
+    instructions: Vec<InstructionInventoryPath>,
+}
+static BUILTIN_CAPABILITIES: OnceLock<RegisteredAdapters> = OnceLock::new();
 
 /// Register the adapter declarations once before starting the executable.
 pub fn register_harness_capabilities(
@@ -459,19 +474,38 @@ pub fn register_harness_capabilities(
             "built-in adapter declaration is missing its documentation section or native-subagent policy",
         ));
     }
-    BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
-        Error::new(
-            "internal",
-            "built-in adapter capabilities already registered",
-        )
-    })
+    let instructions: Vec<_> = declarations
+        .iter()
+        .flat_map(|(_, caps)| caps.instruction_inventory.iter().copied())
+        .collect();
+    let instructions = normalize_instruction_inventory(&instructions)?;
+    BUILTIN_CAPABILITIES
+        .set(RegisteredAdapters {
+            declarations,
+            instructions,
+        })
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "built-in adapter capabilities already registered",
+            )
+        })
 }
 
 impl HarnessCapabilities {
-    fn registered() -> &'static Declarations {
+    fn registration() -> &'static RegisteredAdapters {
         BUILTIN_CAPABILITIES
             .get()
             .expect("built-in adapter capabilities must be registered at the entry point")
+    }
+
+    fn registered() -> &'static Declarations {
+        &Self::registration().declarations
+    }
+
+    /// Project instruction candidates in stable catalogue order.
+    pub fn project_instruction_inventory() -> &'static [InstructionInventoryPath] {
+        &Self::registration().instructions
     }
 
     /// Require registration before the daemon can open its Store.

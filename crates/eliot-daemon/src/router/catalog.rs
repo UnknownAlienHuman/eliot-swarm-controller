@@ -526,8 +526,8 @@ impl Router {
             .await?;
             crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
-        let retained_quota = HarnessCapabilities::of(&harness).reads_retained_quota;
-        let cache_key = if retained_quota {
+        let retained_quota = HarnessCapabilities::of(&harness).retained_quota;
+        let cache_key = if retained_quota.is_some() {
             None
         } else {
             catalog::canonical_cache_identity(
@@ -563,9 +563,9 @@ impl Router {
             reserve_readback: None,
             observed_usage: Vec::new(),
         };
-        let (route_verified, raw) = if retained_quota {
+        let (route_verified, raw) = if let Some(retained) = retained_quota {
             let (verified, failure) = self
-                .read_allowance(profile, route, &mut response, deadline.into())
+                .read_allowance(profile, route, retained, &mut response, deadline.into())
                 .await?;
             (verified, failure.map_or(Ok(None), Err))
         } else {
@@ -580,7 +580,7 @@ impl Router {
         let allowance_auth_reason = raw
             .as_ref()
             .err()
-            .filter(|error| retained_quota && error.code == "auth_required")
+            .filter(|error| retained_quota.is_some() && error.code == "auth_required")
             .map(|error| eliot_core::bound_chars(&error.message, 512));
         match raw {
             Ok(None) => {}
@@ -618,7 +618,7 @@ impl Router {
             }
             // A local reader-capacity refusal says nothing about the provider:
             // return it uncached so the next read tries again.
-            Err(error) if !retained_quota && error.code == "busy" => return Err(error),
+            Err(error) if retained_quota.is_none() && error.code == "busy" => return Err(error),
             Err(error) => {
                 self.note_harness_auth_required(&harness, Some(&error.code))
                     .await;

@@ -4,17 +4,15 @@ use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
     NativeAuthCapability, NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation,
-    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, UserInstructionFiles,
+    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
-use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting,
-    InstructionReadStatus::{Conditional, Documented},
-};
-use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
+use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         model_catalogue_presentation: Some(
             crate::catalog_presentation::model_catalogue_presentation,
         ),
@@ -70,15 +68,8 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         manager_preference: Some(2),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
-        project_instruction_read: Some(instruction_files(&[
-            ("AGENTS.md", Documented),
-            ("CLAUDE.md", Conditional),
-        ])),
-        user_instruction_files: Some(UserInstructionFiles {
-            root_override_env: Some("XDG_CONFIG_HOME"),
-            home_subdir: ".config",
-            paths: &["opencode/AGENTS.md"],
-        }),
+        project_instruction_read: crate::instructions::PROJECT_READ,
+        user_instruction_files: crate::instructions::USER_FILES,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::Workspace),
         resume_config: true,
         manifest_extra_verbs: &["models"],

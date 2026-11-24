@@ -71,6 +71,9 @@ composed. Shared code resolves the declaration from the configured identity, the
 its capabilities to prepare and validate operations. Keep vendor request and response
 translation with the adapter, reusable native lifecycle mechanics in `eliot-plugin`,
 and routing, admission and durable settlement in the daemon and Store.
+Adapter declarations also supply native catalogue presentation, quota evidence and
+project instruction candidates. The daemon owns bounded workspace reads, source
+delivery and the use of those facts for admission and settlement.
 
 ## Memory inference boundary
 

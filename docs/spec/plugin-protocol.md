@@ -181,9 +181,11 @@ capabilities to prepare launches and validate runtime manifests. The shared
 install engine reads the adapter's candidate search, executable identity and
 verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
-Adapters declare their project instruction-file behavior and the user instruction
-paths that doctor compares with committed owner rules. They also declare how the
-daemon routes the shared rules at start or on first input.
+Adapters declare their project instruction candidates and native read behavior,
+and the user instruction paths that doctor compares with committed owner rules.
+The daemon combines the project candidates in their declared order, captures
+bounded file facts in the prepared workspace and settles source delivery. Adapter
+declarations also select the delivery mechanism for owner rules.
 The controller and offline desktop settings editor register the same profile
 capabilities from the built-in adapters before using them. Store entry points
 return an error when registration is missing. Adapter declarations identify
@@ -193,7 +195,8 @@ which project instructions the native loader will select. Swarm's normal project
 source delivery applies, and any installed version is provenance.
 They also declare ad-hoc access mappings and the MCP and environment defaults
 used by ad-hoc launches and installed profile presets.
-Catalogue reader stages and quota readback come from the same declarations.
+Catalogue reader stages, vendor-specific catalogue notes and quota readback
+come from the same declarations.
 The quota adapter projects its reader's details into typed model evidence
 and account window bounds. Adapters use the shared window interpretation in
 `eliot-plugin` for common fields and declare their own model groups. The daemon
