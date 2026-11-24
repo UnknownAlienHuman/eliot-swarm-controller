@@ -1118,7 +1118,7 @@ pub fn styles_xaml() -> String {
          </ResourceDictionary>",
         family = crate::fonts::families().text,
         font_size = text::BODY.size,
-        switch_width = layout::SWITCH_WIDTH,
+        switch_width = layout::WINUI_SWITCH_PILL_WIDTH,
         combo_box = templates::combo_box(),
     )
 }

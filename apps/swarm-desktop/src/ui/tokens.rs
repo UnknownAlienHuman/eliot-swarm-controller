@@ -141,13 +141,16 @@ pub mod icon {
 
 /// The brand book's motion (Material 3 Expressive springs; until they run
 /// as springs, their settle times with the emphasized easing): state
-/// colors on effects-fast, presses on spatial-fast, the ripple on
-/// effects-slow, popovers moving into place on spatial with a 4-DIP rise.
+/// colors and the press feedback on effects-fast (a storyboard over the
+/// 347-ms spatial-fast settle time would read as a slow press; the press
+/// morph moves to the spatial-fast spring with the motion increment), the
+/// ripple on effects-slow, popovers moving into place on spatial with a
+/// 4-DIP rise.
 pub mod motion {
     use super::brand;
 
     pub const STATE_MS: u64 = brand::EFFECTS_FAST_MS;
-    pub const PRESS_MS: u64 = brand::SPATIAL_FAST_MS;
+    pub const PRESS_MS: u64 = brand::EFFECTS_FAST_MS;
     pub const RIPPLE_MS: u64 = brand::EFFECTS_SLOW_MS;
     pub const POPOVER_MS: u64 = brand::SPATIAL_MS;
     /// How far a popover rises into place while it fades in.
@@ -284,11 +287,13 @@ pub mod layout {
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;
     /// The check column of a popover row.
     pub const CHECK_COLUMN: f64 = 16.0;
-    /// A switch's pill: WinUI's ToggleSwitch template keeps a 154-DIP
-    /// content area after it, so a bare switch is sized to WinUI's own
-    /// 40-DIP pill. The brand book's 52 × 32 switch needs its re-templated
-    /// style (D11 styles increment), which then sizes it.
-    pub const SWITCH_WIDTH: f64 = 40.0;
+    /// Layout exception, not a brand value: a bare switch is sized to the
+    /// pill WinUI's own ToggleSwitch template draws (40 DIPs; the template
+    /// keeps a 154-DIP content area after it). The brand book's 52 × 32
+    /// switch (`size-switch-width`, `size-switch-height`) needs the
+    /// re-templated style of the D11 styles increment, which then takes the
+    /// tokens and removes this constant.
+    pub const WINUI_SWITCH_PILL_WIDTH: f64 = 40.0;
     /// A quota ring (Models & Usage).
     pub const RING: f64 = crate::brand::SIZE_RING_SM;
     /// The composer's usage ring.
