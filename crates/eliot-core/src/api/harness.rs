@@ -12,13 +12,16 @@
 //! timestamp and a nonsecret credential identity. `harness.quota`
 //! reports provider-supported account quota readback with timestamp, scope,
 //! an explicit supported/unsupported/unknown status and provider-verbatim
-//! `details` when supported (Codex `account/rateLimits/read` plus
-//! `account/usage/read`; Muse `usage/read`); it performs no inference and
-//! never polls per Agent.
+//! `details` when supported. The adapter declares how to interpret details
+//! and read account windows. The query performs no inference and never polls
+//! per Agent.
 
+use super::instructions::{InstructionInventoryPath, normalize_instruction_inventory};
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+
+pub use super::instructions::{ProjectInstructionRead, UserInstructionFiles};
 
 /// The native harness adapters the controller supports.
 pub const SUPPORTED_HARNESSES: &[&str] = &["codex", "claude", "muse", "opencode", "antigravity"];
@@ -55,22 +58,6 @@ pub enum NativeArchiveBinding {
 /// (0), requires approval (1), automatic approval (2) and full access (3).
 pub type NativeAccessBounds = (u8, u8);
 type NativeAccessReader = fn(&serde_json::Value) -> Option<NativeAccessBounds>;
-/// Evidence available for native project instruction-file reading.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ProjectInstructionRead {
-    pub paths: &'static [(&'static str, super::InstructionReadStatus)],
-    pub report_version: bool,
-    pub byte_limit: Option<fn(&serde_json::Value) -> u64>,
-}
-
-/// Locations of the adapter's documented user instruction files.
-#[derive(Clone, Copy, Debug)]
-pub struct UserInstructionFiles {
-    pub root_override_env: Option<&'static str>,
-    pub home_subdir: &'static str,
-    pub paths: &'static [&'static str],
-}
-
 /// Access levels accepted by an Owner's ad-hoc launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdhocAccess {
@@ -151,26 +138,71 @@ pub enum LaunchDefaultPolicy {
     OmitForServerDefault,
 }
 
-/// Native evidence the daemon can project into shared quota windows.
+/// Vendor quota evidence for an optional exact model selector.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QuotaProjectionFormat {
-    RateLimits,
-    IntegrationWindows,
-    UsagePair,
-    Windows,
+pub enum QuotaMapping {
+    /// A bucket keyed by the exact requested model id.
+    ExactId,
+    /// A documented provider group window applying to this model
+    /// (`account` for unlabeled account-scope windows).
+    Group(&'static str),
+    /// No documented mapping: the window constrains no model.
+    Unmapped,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuotaWindowFacts {
+    pub used_percent: Option<f64>,
+    pub reset_ms: Option<i64>,
+    pub weekly: bool,
+}
+
+/// Provider evidence scoped to the selected route and optional model.
+#[derive(Debug)]
+pub enum QuotaEvidence {
+    Windows {
+        applicable: Vec<(QuotaWindowFacts, QuotaMapping)>,
+        complete: bool,
+    },
+    Tiered(TieredQuotaWindows),
+}
+
+/// Account windows and optional model-specific windows, with native usage signals.
+#[derive(Debug)]
+pub struct TieredQuotaWindows {
+    pub account: [QuotaWindowFacts; 2],
+    pub model: Option<[QuotaWindowFacts; 2]>,
+    pub model_limits_reported: bool,
+    pub spend_control_reached: bool,
+    pub limit_reached: bool,
+    pub remaining_percent: Option<i64>,
+    pub credits_present: bool,
+    pub ordinary_usage_allowed: bool,
+}
+
+pub type QuotaEvidenceReader = fn(&serde_json::Value, Option<&str>) -> Option<QuotaEvidence>;
+pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
 
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
 
 /// Adapter readback shape and route preflight for provider quota.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeQuotaReadback {
-    pub projection: QuotaProjectionFormat,
+    pub evidence: QuotaEvidenceReader,
+    pub usage_windows: QuotaUsageWindows,
     pub method: &'static str,
     pub adhoc_integration: Option<&'static str>,
     pub description: fn(&serde_json::Value) -> &'static str,
     pub unsupported_note: Option<&'static str>,
     pub route_refusal: Option<QuotaRouteRefusal>,
+}
+
+/// Native account scope and diagnostics for a reader with retained turn evidence.
+#[derive(Clone, Copy, Debug)]
+pub struct RetainedQuotaReadback {
+    pub account_key: fn(&serde_json::Value) -> Option<String>,
+    pub source: &'static str,
+    pub unavailable: fn(code: &str, reason: &str) -> Option<Error>,
 }
 
 /// A documented model list usable when a verified native read is unavailable.
@@ -181,6 +213,14 @@ pub struct DocumentedModelCatalog {
     pub unverified_route: &'static str,
     pub empty_native_inventory: &'static str,
 }
+
+/// Public catalogue status and note for an adapter's translated model list.
+pub type ModelCataloguePresentation = fn(
+    cmd: &str,
+    provenance: &str,
+    empty: bool,
+    default: Option<&str>,
+) -> (&'static str, Option<String>);
 
 /// Requirements for a dedicated native catalogue reader.
 #[derive(Clone, Copy, Debug, Default)]
@@ -286,6 +326,7 @@ pub struct HarnessCapabilities {
     pub models_workspace_preview: bool,
     /// Published native aliases used when a verified live catalogue is unavailable.
     pub documented_models: Option<DocumentedModelCatalog>,
+    pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,
@@ -337,6 +378,8 @@ pub struct HarnessCapabilities {
     pub owner_rules_delivery: super::OwnerRulesDeliveryMethod,
     /// Native project instruction-file behavior for the frozen profile.
     pub project_instruction_read: Option<ProjectInstructionRead>,
+    /// Project instruction candidates contributed to the composed inventory.
+    pub instruction_inventory: &'static [InstructionInventoryPath],
     /// User instruction files that doctor may compare with committed owner rules.
     pub user_instruction_files: Option<UserInstructionFiles>,
     /// MCP identity comes only from data-root values, not the full target
@@ -373,7 +416,7 @@ pub struct HarnessCapabilities {
     /// Native archive support and the binding required by its reader.
     pub native_archive: Option<NativeArchiveBinding>,
     /// Read quota evidence retained from an actual turn.
-    pub reads_retained_quota: bool,
+    pub retained_quota: Option<RetainedQuotaReadback>,
     /// Native shapes accepted for read-only quota projection.
     pub quota_readback: Option<NativeQuotaReadback>,
     /// Passes the Agent identity variables to the native process.
@@ -396,7 +439,11 @@ pub struct HarnessCapabilities {
 }
 
 type Declarations = Box<[(&'static str, HarnessCapabilities)]>;
-static BUILTIN_CAPABILITIES: OnceLock<Declarations> = OnceLock::new();
+struct RegisteredAdapters {
+    declarations: Declarations,
+    instructions: Vec<InstructionInventoryPath>,
+}
+static BUILTIN_CAPABILITIES: OnceLock<RegisteredAdapters> = OnceLock::new();
 
 /// Register the adapter declarations once before starting the executable.
 pub fn register_harness_capabilities(
@@ -428,19 +475,38 @@ pub fn register_harness_capabilities(
             "built-in adapter declaration is missing its documentation section or native-subagent policy",
         ));
     }
-    BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
-        Error::new(
-            "internal",
-            "built-in adapter capabilities already registered",
-        )
-    })
+    let instructions: Vec<_> = declarations
+        .iter()
+        .flat_map(|(_, caps)| caps.instruction_inventory.iter().copied())
+        .collect();
+    let instructions = normalize_instruction_inventory(&instructions)?;
+    BUILTIN_CAPABILITIES
+        .set(RegisteredAdapters {
+            declarations,
+            instructions,
+        })
+        .map_err(|_| {
+            Error::new(
+                "internal",
+                "built-in adapter capabilities already registered",
+            )
+        })
 }
 
 impl HarnessCapabilities {
-    fn registered() -> &'static Declarations {
+    fn registration() -> &'static RegisteredAdapters {
         BUILTIN_CAPABILITIES
             .get()
             .expect("built-in adapter capabilities must be registered at the entry point")
+    }
+
+    fn registered() -> &'static Declarations {
+        &Self::registration().declarations
+    }
+
+    /// Project instruction candidates in stable catalogue order.
+    pub fn project_instruction_inventory() -> &'static [InstructionInventoryPath] {
+        &Self::registration().instructions
     }
 
     /// Require registration before the daemon can open its Store.

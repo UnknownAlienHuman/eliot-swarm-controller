@@ -1,4 +1,6 @@
 //! Bounded read-only provider transport. Provider URLs and projection belong to plugins.
+pub mod projection;
+
 use eliot_core::{Error, FailureOrigin, ProviderRestriction, ProviderRestrictionKind, Result};
 use serde_json::{Value, json};
 use std::{
@@ -187,40 +189,32 @@ pub fn result(windows: Vec<Value>, source: &'static str) -> Result<Value> {
     unsafe_code,
     reason = "Windows Credential Manager access requires this narrow FFI call."
 )]
-pub fn antigravity_credential() -> Result<Value> {
+pub fn windows_credential_json(
+    target: &str,
+    [unavailable, oversized, invalid]: [&'static str; 3],
+) -> Result<Value> {
     use windows_sys::Win32::Security::Credentials::{
         CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
     };
-    let target: Vec<u16> = "gemini:antigravity\0".encode_utf16().collect();
+    let target: Vec<u16> = target.encode_utf16().chain([0]).collect();
     let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
-    // Same native Windows Credential Manager entry as AGY's go-keyring store.
     if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
-        return Err(environment(
-            "Antigravity native keyring credential is unavailable",
-        ));
+        return Err(environment(unavailable));
     }
     let result = unsafe {
         let row = &*credential;
         if row.CredentialBlobSize > 256 * 1024 || row.CredentialBlob.is_null() {
-            Err(environment(
-                "Antigravity native keyring credential exceeds its bound",
-            ))
+            Err(environment(oversized))
         } else {
             serde_json::from_slice(std::slice::from_raw_parts(
                 row.CredentialBlob,
                 row.CredentialBlobSize as usize,
             ))
-            .map_err(|_| environment("Antigravity native keyring credential schema is unavailable"))
+            .map_err(|_| environment(invalid))
         }
     };
     unsafe { CredFree(credential.cast()) };
     result
-}
-#[cfg(not(windows))]
-pub fn antigravity_credential() -> Result<Value> {
-    Err(environment(
-        "Antigravity native credential reader is currently Windows-only",
-    ))
 }
 
 pub fn decode(params: &Value) -> Result<crate::protocol::QuotaReadParams> {

@@ -16,6 +16,9 @@ use crate::{
         },
     },
 };
+use eliot_core::api::harness::{
+    QuotaEvidence, QuotaWindowBounds, QuotaWindowFacts, TieredQuotaWindows,
+};
 use eliot_core::{
     Error, NativeStoreBinding, Result, SecretPolicy,
     api::{
@@ -24,6 +27,7 @@ use eliot_core::{
     },
     canonical_json_sha256,
 };
+use eliot_plugin::quota::projection::{usage_bound, window_facts};
 use eliot_plugin::{
     DiscoverParams, MAX_EVENT_BYTES,
     retry::{Retry, RetryOperation, StartupAfterFailure},
@@ -2017,4 +2021,43 @@ fn too_large() -> Error {
         "frame_too_large",
         "Codex discovery metadata exceeds its bound",
     )
+}
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    let rates = details
+        .get("rateLimits")
+        .filter(|rates| rates.is_object())?;
+    let model_limits = details.get("rateLimitsByLimitId");
+    let credits = &rates["credits"];
+    Some(QuotaEvidence::Tiered(TieredQuotaWindows {
+        account: quota_window_pair(rates),
+        model: model
+            .and_then(|model| model_limits?.get(model))
+            .map(quota_window_pair),
+        model_limits_reported: model_limits.is_some_and(|limits| match limits {
+            Value::Null => false,
+            Value::Object(limits) => !limits.is_empty(),
+            _ => true,
+        }),
+        spend_control_reached: rates["spendControlReached"].as_bool() == Some(true),
+        limit_reached: rates
+            .get("rateLimitReachedType")
+            .is_some_and(|value| !value.is_null()),
+        remaining_percent: rates["individualLimit"]["remainingPercent"].as_i64(),
+        credits_present: credits["unlimited"].as_bool() == Some(true)
+            || credits["hasCredits"].as_bool() == Some(true),
+        ordinary_usage_allowed: details["ordinaryUsageAllowed"].as_bool() == Some(true),
+    }))
+}
+
+fn quota_window_pair(rates: &Value) -> [QuotaWindowFacts; 2] {
+    ["primary", "secondary"].map(|key| window_facts(&rates[key]))
+}
+
+pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
+    let rates = &details["rateLimits"];
+    [("primary", "Primary"), ("secondary", "Secondary")]
+        .into_iter()
+        .filter_map(|(key, label)| usage_bound(label, &rates[key], None, now))
+        .collect()
 }

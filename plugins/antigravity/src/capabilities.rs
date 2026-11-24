@@ -2,7 +2,7 @@
 
 use eliot_core::api::harness::{
     AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeAccessBounds, NativeQuotaReadback,
-    NativeRoute, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
+    NativeRoute, ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
@@ -12,6 +12,11 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        project_instruction_read: crate::instructions::PROJECT_READ,
+        model_catalogue_presentation: Some(
+            crate::catalog_presentation::model_catalogue_presentation,
+        ),
         // Installed AGY help exposes neither a standalone sign-in command nor sign-in status.
         native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
@@ -32,7 +37,8 @@ pub fn declaration() -> HarnessCapabilities {
                     .then_some("Antigravity profile selects external auth; native keyring quota would describe another route")
             }),
             ..quota_readback(
-                QuotaProjectionFormat::Windows,
+                crate::quota::quota_evidence,
+                crate::quota::quota_usage_windows,
                 |_| "Antigravity account quota; provider read-only values",
             )
         }),
@@ -48,16 +54,7 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         prepared_mcp_config: true,
         owner_rules_delivery: OwnerRulesDeliveryMethod::FirstInput,
-        user_instruction_files: Some(UserInstructionFiles {
-            root_override_env: None,
-            home_subdir: ".gemini",
-            paths: &[
-                "AGENTS.md",
-                "GEMINI.md",
-                "config/AGENTS.md",
-                "config/GEMINI.md",
-            ],
-        }),
+        user_instruction_files: crate::instructions::USER_FILES,
         reader_executable_discovery: true,
         resume_config: true,
         guard_refusal_point: Some(InjectPoint::TurnSafePoint),

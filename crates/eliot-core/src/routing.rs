@@ -578,7 +578,9 @@ impl ProviderHold {
     pub fn uses_passive_quota_readback(&self) -> bool {
         self.kind == ProviderRestrictionKind::Quota
             && self.source.as_ref().is_some_and(|source| {
-                crate::api::HarnessCapabilities::of(&source.harness).reads_retained_quota
+                crate::api::HarnessCapabilities::of(&source.harness)
+                    .retained_quota
+                    .is_some()
             })
     }
 

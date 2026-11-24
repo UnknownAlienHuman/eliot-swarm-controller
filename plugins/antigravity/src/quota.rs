@@ -1,4 +1,5 @@
 //! OpenCodex 2.84.0 quota/antigravity.ts: pattern only, no copied source.
+use eliot_core::api::harness::{QuotaEvidence, QuotaWindowBounds};
 use eliot_core::{ProviderRestriction, ProviderRestrictionKind, Result};
 use eliot_plugin::quota as q;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
     // External provider routes never reach this reader: the daemon refuses
     // them in `router::catalog::external_quota_route` before spawning any
     // reader, so only the native keyring route is reported here.
-    let credential = q::antigravity_credential()?;
+    let credential = keyring_credential()?;
     let token = credential
         .pointer("/token/access_token")
         .and_then(Value::as_str)
@@ -81,6 +82,25 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
         summary_windows(&body),
         "Antigravity retrieveUserQuotaSummary",
     )
+}
+
+#[cfg(windows)]
+fn keyring_credential() -> Result<Value> {
+    q::windows_credential_json(
+        "gemini:antigravity",
+        [
+            "Antigravity native keyring credential is unavailable",
+            "Antigravity native keyring credential exceeds its bound",
+            "Antigravity native keyring credential schema is unavailable",
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn keyring_credential() -> Result<Value> {
+    Err(q::environment(
+        "Antigravity native credential reader is currently Windows-only",
+    ))
 }
 
 fn summary_windows(body: &Value) -> Vec<Value> {
@@ -152,4 +172,19 @@ fn summary_windows(body: &Value) -> Vec<Value> {
         }
     }
     windows
+}
+
+const QUOTA_PERIODS: &[&str] = &["quota"];
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    const GROUPS: q::projection::WindowGroups = &[
+        ("gemini 4 argon", &["argon"]),
+        ("claude/gpt", &["claude", "gpt"]),
+        ("gemini", &["gemini"]),
+    ];
+    q::projection::window_evidence(details, GROUPS, QUOTA_PERIODS, model)
+}
+
+pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
+    q::projection::account_usage_windows_with_periods(details, now, QUOTA_PERIODS)
 }

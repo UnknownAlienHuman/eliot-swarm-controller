@@ -24,6 +24,7 @@ mod goals;
 mod handoff;
 pub mod harness;
 mod hierarchy;
+pub mod instructions;
 pub mod launch_queue;
 mod maintenance;
 mod monitor_views;
@@ -73,11 +74,10 @@ pub use agent_views::{
     CommandWithoutDispatcherStatus, CrashMarker, DaemonBuildIdentity, DaemonHealthSummary,
     DaemonPanicTestResponse, DaemonStatusResponse, DiagnoseResponse, DiagnoseStep,
     DiskUsageDirectory, DiskUsageView, DrainReport, GitCheckpointState, GitCheckpointView,
-    GitCheckpointWithheld, GitCredentialHelper, INSTRUCTION_FILE_PATHS, InstructionDeliveryView,
-    InstructionFileStatus, InstructionFileView, InstructionReadStatus, InstructionSourceStatus,
-    MAX_DIAGNOSE_ATTENTION_STEPS, MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS,
-    MAX_DIAGNOSE_SUMMARY_CHARS, MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES,
-    NativeDiagnosticCounts, NativeNotice, NativeNoticeKind, OwnedProcessKind, OwnedProcessSummary,
+    GitCheckpointWithheld, GitCredentialHelper, MAX_DIAGNOSE_ATTENTION_STEPS,
+    MAX_DIAGNOSE_MESSAGE_CHARS, MAX_DIAGNOSE_STEPS, MAX_DIAGNOSE_SUMMARY_CHARS,
+    MAX_PATCH_DIGEST_OUTSIDE_CLAIMS, MAX_PATCH_DIGEST_PATH_BYTES, NativeDiagnosticCounts,
+    NativeNotice, NativeNoticeKind, OwnedProcessKind, OwnedProcessSummary,
     OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
     PROCESS_CURSOR_MAX_BYTES, PROJECT_POLICY_OPT_OUT_REASON_MAX_BYTES, PROJECT_POLICY_OPTOUTS_MAX,
     PatchDigestFile, ProcessPageCursor, ProjectCheckoutView, ProjectDiscoverResponse,
@@ -163,6 +163,10 @@ pub use hierarchy::{
     DEFAULT_MAX_CHILDREN_PER_AGENT, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SELECTOR_TARGETS,
     DEFAULT_MAX_TREE_AGENTS, HierarchyLimits, ReparentRequest, ReparentResponse, ReparentedAgent,
     parse_tree_selector, selector_child_id,
+};
+pub use instructions::{
+    InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionInventoryPath,
+    InstructionReadStatus, InstructionSourceStatus,
 };
 pub use maintenance::{
     MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,

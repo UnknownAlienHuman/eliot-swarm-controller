@@ -307,7 +307,8 @@ The launch facts are committed once and retained across held retries; a retry do
 rescan a changed checkout. Legacy Agents keep a null fact column and omit this optional
 readback.
 
-The inventory is limited to these seven paths: AGENTS.md, AGENTS.override.md,
+The built-in adapters declare the paths and their stable inventory and primary
+order. The combined inventory has seven paths: AGENTS.md, AGENTS.override.md,
 CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md, .claude/CLAUDE.local.md, and
 GEMINI.md. It reports each relative path, file status, byte size when available,
 full SHA-256 when read within the bound, native-read status, and source-delivery status.

@@ -1,4 +1,5 @@
 //! OpenCodex 2.84.0 vendor-probes-oauth.ts: pattern only, no copied source.
+use eliot_core::api::harness::QuotaEvidence;
 use eliot_core::{Result, api::CLAUDE_EXTERNAL_ROUTE_MARKERS};
 use eliot_plugin::quota as q;
 use serde_json::Value;
@@ -181,4 +182,14 @@ pub(crate) async fn read(raw: &Value) -> Result<Value> {
         }
     }
     q::result(windows, "Claude CLI OAuth usage")
+}
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    const GROUPS: q::projection::WindowGroups = &[
+        ("opus", &["opus"]),
+        ("sonnet", &["sonnet"]),
+        ("fable", &["fable"]),
+        ("haiku", &["haiku"]),
+    ];
+    q::projection::window_evidence(details, GROUPS, &[], model)
 }

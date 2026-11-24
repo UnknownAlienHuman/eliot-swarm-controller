@@ -24,6 +24,7 @@
 //! ever issued and no secret is logged. Selectors without a verified
 //! read-only path stay `unsupported`.
 use eliot_core::Result;
+use eliot_core::api::harness::{QuotaEvidence, QuotaMapping};
 use eliot_plugin::quota as q;
 use serde_json::{Value, json};
 pub(crate) async fn read(raw: &Value) -> Result<Value> {
@@ -129,4 +130,54 @@ async fn read_console(profile: &Value, environment: &Value) -> Result<Value> {
         details.remove("consoleWindows");
     }
     Ok(reply)
+}
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    let model = model?;
+    let (provider, _) = eliot_plugin::session::split_provider_model(model)?;
+    match (details.get("integration").and_then(Value::as_str), provider) {
+        (Some("opencode-go"), "opencode-go") => {
+            let windows = details.get("windows")?.as_array()?;
+            Some(QuotaEvidence::Windows {
+                applicable: windows
+                    .iter()
+                    .filter_map(|window| {
+                        q::projection::mapped_window(window, &[], &[], Some(model))
+                    })
+                    .collect(),
+                complete: true,
+            })
+        }
+        (Some("opencode"), _) => {
+            let applicable: Vec<_> = details
+                .get("consoleWindows")?
+                .as_array()?
+                .iter()
+                .filter_map(|window| {
+                    if !matches!(window.get("scope")?.as_str()?, "each" | "combined") {
+                        return None;
+                    }
+                    let mapping = match window.get("coverage")?.as_str()? {
+                        "all" if provider == "opencode" => QuotaMapping::Group("console"),
+                        "models"
+                            if window
+                                .get("models")?
+                                .as_array()?
+                                .iter()
+                                .any(|id| id.as_str() == Some(model)) =>
+                        {
+                            QuotaMapping::ExactId
+                        }
+                        _ => return None,
+                    };
+                    Some((q::projection::window_facts(window), mapping))
+                })
+                .collect();
+            Some(QuotaEvidence::Windows {
+                applicable,
+                complete: true,
+            })
+        }
+        _ => None,
+    }
 }

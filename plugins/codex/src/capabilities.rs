@@ -3,20 +3,17 @@
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
     NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
-    ProfileCapabilities, ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
+    ProfileCapabilities,
 };
-use eliot_core::api::native_profile::{
-    CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, NativeSubagentsPolicy, codex_project_doc_override,
-};
-use eliot_core::api::{
-    HarnessCapabilities, InputTokenAccounting, InstructionReadStatus::Documented,
-};
+use eliot_core::api::native_profile::NativeSubagentsPolicy;
+use eliot_core::api::{HarnessCapabilities, InputTokenAccounting};
 use eliot_core::{InjectPoint, McpPolicy};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
                 resolve: || auth_command(&["login"]),
@@ -55,7 +52,8 @@ pub fn declaration() -> HarnessCapabilities {
                 )
             }),
             ..quota_readback(
-                QuotaProjectionFormat::RateLimits,
+                crate::discovery::quota_evidence,
+                crate::discovery::quota_usage_windows,
                 |_| "Codex account/rateLimits/read; provider read-only values",
             )
         }),
@@ -71,24 +69,8 @@ pub fn declaration() -> HarnessCapabilities {
         manager_preference: Some(0),
         provider_probe: true,
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
-        project_instruction_read: Some(ProjectInstructionRead {
-            paths: &[
-                ("AGENTS.md", Documented),
-                ("AGENTS.override.md", Documented),
-            ],
-            byte_limit: Some(|profile| {
-                profile
-                    .as_object()
-                    .and_then(codex_project_doc_override)
-                    .unwrap_or(CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
-            }),
-            ..ProjectInstructionRead::default()
-        }),
-        user_instruction_files: Some(UserInstructionFiles {
-            root_override_env: Some("CODEX_HOME"),
-            home_subdir: ".codex",
-            paths: &["AGENTS.override.md", "AGENTS.md"],
-        }),
+        project_instruction_read: crate::instructions::PROJECT_READ,
+        user_instruction_files: crate::instructions::USER_FILES,
         requires_pass_env: true,
         requires_frozen_store_inputs: true,
         native_discovery: true,

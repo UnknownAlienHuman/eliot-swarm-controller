@@ -2,8 +2,12 @@
 
 use super::sources::{self, SourceReadError};
 use eliot_core::api::{
-    HarnessCapabilities, INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus,
-    InstructionFileView, InstructionReadStatus, InstructionSourceStatus, inference::sha256_hex,
+    HarnessCapabilities,
+    inference::sha256_hex,
+    instructions::{
+        InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionReadStatus,
+        InstructionSourceStatus,
+    },
 };
 use eliot_plugin::MAX_EVENT_BYTES;
 use serde_json::Value;
@@ -40,13 +44,15 @@ pub(super) fn append_owner_rules(
 }
 
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {
+    let inventory = HarnessCapabilities::project_instruction_inventory();
     let root = workspace.and_then(|workspace| std::fs::canonicalize(workspace).ok());
     let source_workspace = workspace.map(ToOwned::to_owned);
     let native_read = HarnessCapabilities::of(harness).project_instruction_read;
     let mut remaining = MAX_CATALOG_BYTES;
-    let files = INSTRUCTION_FILE_PATHS
+    let files = inventory
         .iter()
-        .map(|path| {
+        .map(|candidate| {
+            let path = candidate.path;
             let mut file = match root.as_deref() {
                 Some(root) => catalog_file(root, path, &mut remaining),
                 None => empty_file(path, InstructionFileStatus::WorkspaceUnavailable),
@@ -63,26 +69,19 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
             file
         })
         .collect::<Vec<_>>();
-    let primary = [
-        "AGENTS.md",
-        "AGENTS.override.md",
-        "CLAUDE.md",
-        ".claude/CLAUDE.md",
-        "GEMINI.md",
-        "CLAUDE.local.md",
-        ".claude/CLAUDE.local.md",
-    ]
-    .into_iter()
-    .find(|candidate| {
-        files.iter().any(|file| {
-            file.path == *candidate
-                && !matches!(
-                    file.status,
-                    InstructionFileStatus::Missing | InstructionFileStatus::WorkspaceUnavailable
-                )
+    let primary = inventory
+        .iter()
+        .zip(&files)
+        .min_by_key(|(candidate, file)| {
+            let unavailable = matches!(
+                file.status,
+                InstructionFileStatus::Missing | InstructionFileStatus::WorkspaceUnavailable
+            );
+            (unavailable, candidate.primary_rank)
         })
-    })
-    .unwrap_or("AGENTS.md");
+        .expect("registered project instruction inventory is nonempty")
+        .0
+        .path;
     let source_path = root.as_deref().and_then(|root| {
         let path = sources::resolve_source(root, primary).ok()?;
         Some(path.strip_prefix(root).ok()?.to_string_lossy().into_owned())

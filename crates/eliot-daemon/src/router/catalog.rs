@@ -5,7 +5,7 @@
 //! private process environment. Public scope labels contain only route names.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
-use eliot_core::api::harness::NativeRoute;
+use eliot_core::api::harness::{NativeRoute, QuotaEvidence, QuotaWindowFacts};
 use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry, HarnessListResponse,
     HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
@@ -382,7 +382,7 @@ impl Router {
     /// signals into `details`: Codex keeps its `rateLimits` shape, the other
     /// four use `windows[]` with `usedPercent`/`resetsAtMs`. Routing and the
     /// catalogue consume all five through one normalized projection
-    /// ([`catalog::project_quota`]).
+    /// ([`catalog::projected_quota`]).
     /// A method-not-found or schema mismatch stays `unsupported` or `unknown`
     /// naming the checked method; no numbers are fabricated. A quota failure
     /// never selects another model or account.
@@ -526,8 +526,8 @@ impl Router {
             .await?;
             crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
         }
-        let retained_quota = HarnessCapabilities::of(&harness).reads_retained_quota;
-        let cache_key = if retained_quota {
+        let retained_quota = HarnessCapabilities::of(&harness).retained_quota;
+        let cache_key = if retained_quota.is_some() {
             None
         } else {
             catalog::canonical_cache_identity(
@@ -563,9 +563,9 @@ impl Router {
             reserve_readback: None,
             observed_usage: Vec::new(),
         };
-        let (route_verified, raw) = if retained_quota {
+        let (route_verified, raw) = if let Some(retained) = retained_quota {
             let (verified, failure) = self
-                .read_allowance(profile, route, &mut response, deadline.into())
+                .read_allowance(profile, route, retained, &mut response, deadline.into())
                 .await?;
             (verified, failure.map_or(Ok(None), Err))
         } else {
@@ -580,7 +580,7 @@ impl Router {
         let allowance_auth_reason = raw
             .as_ref()
             .err()
-            .filter(|error| retained_quota && error.code == "auth_required")
+            .filter(|error| retained_quota.is_some() && error.code == "auth_required")
             .map(|error| eliot_core::bound_chars(&error.message, 512));
         match raw {
             Ok(None) => {}
@@ -618,7 +618,7 @@ impl Router {
             }
             // A local reader-capacity refusal says nothing about the provider:
             // return it uncached so the next read tries again.
-            Err(error) if !retained_quota && error.code == "busy" => return Err(error),
+            Err(error) if retained_quota.is_none() && error.code == "busy" => return Err(error),
             Err(error) => {
                 self.note_harness_auth_required(&harness, Some(&error.code))
                     .await;
@@ -888,6 +888,7 @@ impl Router {
                     }
                 }
                 if let Some(entry) = catalog::coalesced_preview_failure(
+                    harness,
                     &preview_failed,
                     preview_incomplete.as_deref(),
                 ) {
@@ -1012,33 +1013,6 @@ pub(crate) const CATALOG_TTL_MS: u64 = HARNESS_READ_TTL_MS;
 /// continuation pages of the listing that built it, for at most this long;
 /// every first page rebuilds it, so the failed harness is read again.
 pub(crate) const PARTIAL_AGGREGATE_TTL_MS: u64 = 30_000;
-/// Provenance note for an OpenCode catalogue read: the picker and the
-/// configure gate must never disagree, so the note always names which
-/// session-true source produced the list.
-fn opencode_catalog_note(provenance: &str) -> &'static str {
-    match provenance {
-        "session" => "Advisory OpenCode catalogue from the live session GET /api/model",
-        "preview" => {
-            "OpenCode launch preview using the profile's provider settings and auth; workspace and live provider state can change availability"
-        }
-        _ => "OpenCode catalogue from the installed CLI using native configuration and auth",
-    }
-}
-
-/// Muse catalogue note: the native `isDefault` marker names a marked row
-/// for display. An omitted `--model` always defers to the server default at
-/// launch (MSP `session/start.modelId`: "server default when omitted"),
-/// whether or not the catalogue marks a row.
-fn muse_catalog_note(default: Option<&str>) -> String {
-    match default {
-        Some(marked) if !marked.trim().is_empty() => format!(
-            "Muse model/list marks a row with the native isDefault marker ({marked}); an omitted --model still defers to the server default at launch"
-        ),
-        _ => "Muse model/list names no default marker; the server default applies at launch"
-            .to_owned(),
-    }
-}
-
 /// Shared preflight for a quota reader whose frozen route is external or
 /// ambiguous. The adapter declaration classifies only the frozen profile
 /// and reader environment and returns a nonsecret refusal reason. The daemon
@@ -1400,38 +1374,15 @@ fn native_models_response(
         .and_then(Value::as_str)
         .filter(|default| !default.trim().is_empty())
         .map(str::to_owned);
-    // These response labels describe the reader's provenance to the caller.
-    let (catalogue, note) = if harness == "muse" && entries.is_empty() {
-        (
-            "empty".to_owned(),
-            Some(format!(
-                "Muse model/list from {cmd} returned an empty catalogue after provider discovery"
-            )),
-        )
-    } else if harness == "muse" {
-        (
-            "native".to_owned(),
-            Some(muse_catalog_note(default.as_deref())),
-        )
-    } else if harness == "opencode" {
-        (
-            "native".to_owned(),
-            Some(opencode_catalog_note(provenance).to_owned()),
-        )
-    } else if harness == "antigravity" {
-        (
-            "native".to_owned(),
-            Some(
-                "Antigravity catalogue from `agy models`; effort-suffixed ids map to thought_level at launch"
-                    .to_owned(),
-            ),
-        )
-    } else {
-        ("native".to_owned(), None)
-    };
+    // Adapters own vendor-specific view notes; the daemon supplies only the
+    // shared default presentation when an adapter declares no callback.
+    let (catalogue, note) = HarnessCapabilities::of(harness)
+        .model_catalogue_presentation
+        .map(|present| present(cmd, provenance, entries.is_empty(), default.as_deref()))
+        .unwrap_or(("native", None));
     Ok(HarnessModelsResponse {
         harness: harness.to_owned(),
-        catalogue,
+        catalogue: catalogue.to_owned(),
         models: entries,
         default,
         note,
@@ -1498,7 +1449,8 @@ pub(crate) fn profile_frozen_selection(snapshot: &Value) -> Option<(String, Opti
 /// affected profiles. Per-profile pushes would exceed the response failure
 /// bound (failures count against harnesses, not profiles) and invalidate the
 /// whole catalogue. Returns `None` when every named preview succeeded.
-pub(crate) fn coalesced_preview_failure(
+fn coalesced_preview_failure(
+    harness: &str,
     failed: &[String],
     incomplete: Option<&str>,
 ) -> Option<ModelsCatalogFailure> {
@@ -1543,7 +1495,7 @@ pub(crate) fn coalesced_preview_failure(
         message.push_str(incomplete);
     }
     Some(ModelsCatalogFailure::from_error(
-        "opencode",
+        harness,
         &Error::new("unavailable", message),
     ))
 }
@@ -1568,60 +1520,7 @@ pub(crate) fn append_failure_message(failure: &mut ModelsCatalogFailure, suffix:
     failure.message = combined[..end].to_owned();
 }
 
-/// Catalogue membership establishes identity, not account availability.
-/// Only complete hold readback plus affirmative, fresh native quota signals
-/// can establish availability. Unsupported and missing signals stay unknown.
-/// Normalized provider quota projection: one typed, scoped observation
-/// per read, consumed identically by routing (skip exhausted routes) and the
-/// catalogue (availability needs affirmative headroom on every recognized
-/// window). Callers consume only these typed fields: they never reparse raw
-/// quota JSON into booleans.
-///
-/// - `provider`: the harness whose native schema was consumed.
-/// - `scope`: the quota scope the observation covers (the response scope).
-/// - `observed_at_ms`: the native observation time.
-/// - `exhausted`: a recognized window is full with a future (or unknown)
-///   reset; for Codex only the primary bucket's explicit limit state settles
-///   exhaustion (`spendControlReached`, a non-null `rateLimitReachedType`, a
-///   depleted `individualLimit`, or a full primary window without credits).
-///   A full secondary window or a metered `rateLimitsByLimitId` bucket never
-///   exhausts a route.
-/// - `available`: every recognized window for this model shows headroom
-///   (used below 100% with a future reset; Codex additionally requires
-///   `ordinaryUsageAllowed` and per-model headroom when the provider scopes
-///   them). Account quota alone never invents per-model entitlement: a
-///   model-scoped window only constrains matching models.
-/// - `mapping`: how the decisive bucket maps to the requested model (an
-///   exact bucket id, a documented provider group, or unmapped).
-/// - `provenance`: which provider shape was consumed (`muse:usage`,
-///   `muse:windows`, `muse:window/weekly`, `codex:rateLimits`, `windows`).
-///
-/// Missing or unsupported signals yield `None`. Windows that exist but map
-/// to no model yield an inert projection (`mapping: Unmapped`, neither
-/// exhausted nor available). Either way callers keep `unknown` and never
-/// skip a route or assert availability from them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QuotaMapping {
-    /// A bucket keyed by the exact requested model id.
-    ExactId,
-    /// A documented provider group window applying to this model
-    /// (`account` for unlabeled account-scope windows).
-    Group(&'static str),
-    /// No documented mapping: the window constrains no model.
-    Unmapped,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct QuotaProjection {
-    pub provider: String,
-    pub scope: String,
-    pub observed_at_ms: i64,
-    pub exhausted: bool,
-    pub available: bool,
-    pub mapping: QuotaMapping,
-    pub provenance: &'static str,
-    pub headroom: QuotaHeadroom,
-}
+pub(crate) use eliot_core::api::harness::QuotaMapping;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct QuotaHeadroom {
@@ -1629,82 +1528,13 @@ pub(crate) struct QuotaHeadroom {
     pub weekly_used: Option<f64>,
 }
 
-impl QuotaHeadroom {
-    fn observe(&mut self, window: &Value, now: i64, weekly: bool) {
-        let Some(used) = window_used_percent(window)
-            .filter(|_| window_reset_ms(window).is_none_or(|reset| reset > now))
-        else {
-            return;
-        };
-        self.max_used = Some(self.max_used.map_or(used, |prior| prior.max(used)));
-        if weekly
-            || window.get("windowDurationMins").and_then(Value::as_u64) == Some(10_080)
-            || window
-                .get("label")
-                .and_then(Value::as_str)
-                .and_then(|label| label.split_ascii_whitespace().last())
-                .is_some_and(|period| period.eq_ignore_ascii_case("weekly"))
-        {
-            self.weekly_used = Some(self.weekly_used.map_or(used, |prior| prior.max(used)));
-        }
-    }
-}
-
-/// Typed quota observation: the provider whose native schema was consumed,
-/// the quota scope it covers, and its native observation time. It travels
-/// from the typed `HarnessQuotaResponse` into the projection untouched, so
-/// neither the projectors nor their callers reparse raw quota JSON for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct QuotaObservation<'a> {
-    pub provider: &'a str,
-    pub scope: &'a str,
+/// Scoped native evidence and the time used to settle a retained quota hold.
+pub(crate) struct QuotaProjection {
     pub observed_at_ms: i64,
-}
-
-/// Normalize the adapter-declared quota `details` into one projection.
-/// A model scopes named windows. Without one only account windows apply.
-/// Returns `None` when no signal maps to this observation's route
-/// (missing or unsupported shapes stay `unknown` at the caller).
-pub(crate) fn project_quota(
-    observation: QuotaObservation<'_>,
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
-    if !details.is_object() {
-        return None;
-    }
-    let readback = HarnessCapabilities::of(observation.provider).quota_readback?;
-    match readback.projection {
-        eliot_core::api::harness::QuotaProjectionFormat::UsagePair => {
-            let (windows, complete, provenance) = usage_pair_window_set(details)?;
-            let mut projection =
-                windows_projection(observation, &windows, complete, model, now, provenance)?;
-            if !complete {
-                projection.headroom = QuotaHeadroom::default();
-            } else if provenance != "muse:windows"
-                && let Some(weekly) = details.get("usage").unwrap_or(details).get("weekly")
-                && window_mapping(weekly, model) != QuotaMapping::Unmapped
-            {
-                projection.headroom.observe(weekly, now, true);
-            }
-            Some(projection)
-        }
-        eliot_core::api::harness::QuotaProjectionFormat::RateLimits => {
-            rate_limits_projection(observation, details, model, now)
-        }
-        eliot_core::api::harness::QuotaProjectionFormat::IntegrationWindows => {
-            integration_windows_projection(observation, details, model, now)
-        }
-        eliot_core::api::harness::QuotaProjectionFormat::Windows => {
-            let windows = details
-                .get("windows")
-                .and_then(Value::as_array)
-                .filter(|windows| !windows.is_empty())?;
-            let windows: Vec<&Value> = windows.iter().collect();
-            windows_projection(observation, &windows, true, model, now, "windows")
-        }
-    }
+    pub exhausted: bool,
+    pub available: bool,
+    pub mapping: QuotaMapping,
+    pub headroom: QuotaHeadroom,
 }
 
 #[derive(Clone, Debug)]
@@ -1713,457 +1543,132 @@ pub(crate) struct ScopedQuota {
     pub(crate) route_verified: bool,
 }
 
-/// One typed entry point for routing and the catalogue: a `supported`
-/// response observed inside its freshness TTL projects, anything else
-/// (missing, stale, unsupported) stays `unknown`. Both consumers share this
-/// function, so a stale observation can neither skip a route nor mark a
-/// model available.
+/// Routing and catalogue availability share a single verified, fresh quota projection.
 pub(crate) fn projected_quota(
     quota: &ScopedQuota,
     model: Option<&str>,
     now: i64,
 ) -> Option<QuotaProjection> {
-    if !quota.route_verified {
-        return None;
-    }
-    let quota = &quota.response;
-    if quota.status != eliot_core::api::HARNESS_QUOTA_SUPPORTED {
-        return None;
-    }
-    if !quota_fresh(quota.fetched_at_ms, quota.ttl_ms, now) {
-        return None;
-    }
-    let details = quota.details.as_ref()?;
-    project_quota(
-        QuotaObservation {
-            provider: quota.harness.as_str(),
-            scope: quota.scope.as_str(),
-            observed_at_ms: quota.fetched_at_ms,
-        },
-        details,
-        model,
-        now,
-    )
-}
-
-/// Usage-pair readers contribute three shapes over time: retained `windows[]`
-/// observations, live `usage{window,weekly}` reads, and the older top-level
-/// `window`/`weekly` pair. Both halves are required to establish headroom.
-fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
-    if let Some(windows) = details
-        .get("windows")
-        .and_then(Value::as_array)
-        .filter(|windows| !windows.is_empty())
+    let response = &quota.response;
+    if !quota.route_verified
+        || response.status != eliot_core::api::HARNESS_QUOTA_SUPPORTED
+        || !quota_fresh(response.fetched_at_ms, response.ttl_ms, now)
     {
-        return Some((windows.iter().collect(), windows.len() == 2, "muse:windows"));
-    }
-    if let Some(usage) = details.get("usage").and_then(Value::as_object) {
-        let mut windows = Vec::new();
-        for key in ["window", "weekly"] {
-            if let Some(window) = usage.get(key).filter(|window| window.is_object()) {
-                windows.push(window);
-            }
-        }
-        if windows.is_empty() {
-            return None;
-        }
-        let complete = windows.len() == 2;
-        return Some((windows, complete, "muse:usage"));
-    }
-    let mut windows = Vec::new();
-    for key in ["window", "weekly"] {
-        if let Some(window) = details.get(key).filter(|window| window.is_object()) {
-            windows.push(window);
-        }
-    }
-    if windows.is_empty() {
         return None;
     }
-    let complete = windows.len() == 2;
-    Some((windows, complete, "muse:window/weekly"))
+    let details = response
+        .details
+        .as_ref()
+        .filter(|details| details.is_object())?;
+    let readback = HarnessCapabilities::of(&response.harness).quota_readback?;
+    let evidence = (readback.evidence)(details, model)?;
+    let (exhausted, available, mapping, headroom) = match evidence {
+        QuotaEvidence::Windows {
+            applicable,
+            complete,
+        } => {
+            let exhausted = applicable
+                .iter()
+                .any(|(window, _)| window_exhausted(window, now));
+            let mapping = applicable
+                .iter()
+                .filter(|(window, _)| window_exhausted(window, now) == exhausted)
+                .map(|(_, mapping)| *mapping)
+                .min_by_key(|mapping| *mapping != QuotaMapping::ExactId)
+                .unwrap_or(QuotaMapping::Unmapped);
+            let available = complete
+                && !applicable.is_empty()
+                && applicable
+                    .iter()
+                    .all(|(window, _)| window_has_headroom(window, now));
+            let headroom = if complete {
+                quota_headroom(applicable.iter().map(|(window, _)| window), now)
+            } else {
+                QuotaHeadroom::default()
+            };
+            (exhausted, available, mapping, headroom)
+        }
+        QuotaEvidence::Tiered(windows) => {
+            // The primary account bucket and explicit native limit signals govern
+            // exhaustion. Secondary and per-model buckets only affect headroom.
+            let exhausted = windows.spend_control_reached
+                || windows.limit_reached
+                || windows
+                    .remaining_percent
+                    .is_some_and(|remaining| remaining <= 0)
+                || !windows.credits_present && window_exhausted(&windows.account[0], now);
+            let available = !exhausted
+                && windows.ordinary_usage_allowed
+                && windows
+                    .account
+                    .iter()
+                    .all(|window| window_has_headroom(window, now))
+                && (!windows.model_limits_reported
+                    || windows.model.as_ref().is_some_and(|pair| {
+                        pair.iter().all(|window| window_has_headroom(window, now))
+                    }));
+            let mapping = if !exhausted && windows.model.is_some() {
+                QuotaMapping::ExactId
+            } else {
+                QuotaMapping::Group("primary")
+            };
+            let headroom = quota_headroom(
+                windows.account.iter().chain(windows.model.iter().flatten()),
+                now,
+            );
+            (exhausted, available, mapping, headroom)
+        }
+    };
+    Some(QuotaProjection {
+        observed_at_ms: response.fetched_at_ms,
+        exhausted,
+        available,
+        mapping,
+        headroom,
+    })
 }
 
-fn window_used_percent(window: &Value) -> Option<f64> {
-    window
-        .get("usedPercent")
-        .and_then(Value::as_f64)
-        .filter(|used| used.is_finite() && *used >= 0.0)
+fn window_exhausted(window: &QuotaWindowFacts, now: i64) -> bool {
+    window.used_percent.is_some_and(|used| used >= 100.0)
+        && window.reset_ms.is_none_or(|reset| reset > now)
 }
 
-fn window_reset_ms(window: &Value) -> Option<i64> {
-    window
-        .get("resetsAtMs")
-        .and_then(Value::as_i64)
-        .filter(|reset| *reset >= 0)
-        .or_else(|| {
-            window
-                .get("resetsAt")
-                .and_then(Value::as_i64)
-                .filter(|reset| *reset >= 0)
-                .and_then(|reset| reset.checked_mul(1000))
-        })
+fn window_has_headroom(window: &QuotaWindowFacts, now: i64) -> bool {
+    window.used_percent.is_some_and(|used| used < 100.0)
+        && window.reset_ms.is_some_and(|reset| reset > now)
 }
 
-/// Only account-wide windows with explicit bounds can be joined to retained
-/// Swarm usage. Model families can have different native windows and billing.
+fn quota_headroom<'a>(
+    windows: impl Iterator<Item = &'a QuotaWindowFacts>,
+    now: i64,
+) -> QuotaHeadroom {
+    let mut headroom = QuotaHeadroom::default();
+    for window in windows {
+        let Some(used) = window
+            .used_percent
+            .filter(|_| window.reset_ms.is_none_or(|reset| reset > now))
+        else {
+            continue;
+        };
+        headroom.max_used = Some(headroom.max_used.map_or(used, |prior| prior.max(used)));
+        if window.weekly {
+            headroom.weekly_used = Some(headroom.weekly_used.map_or(used, |prior| prior.max(used)));
+        }
+    }
+    headroom
+}
+
 fn quota_usage_windows(
     response: &HarnessQuotaResponse,
     now: i64,
 ) -> Vec<eliot_core::api::harness::QuotaWindowBounds> {
-    use eliot_core::api::harness::QuotaWindowBounds;
-
-    let mut bounds = Vec::new();
-    let Some(details) = response.details.as_ref() else {
-        return bounds;
-    };
-    let Some(readback) = HarnessCapabilities::of(&response.harness).quota_readback else {
-        return bounds;
-    };
-    let mut collect = |label: &str, window: &Value, duration: Option<i64>| {
-        let Some((resets, minutes)) =
-            window_reset_ms(window).zip(window["windowDurationMins"].as_i64().or(duration))
-        else {
-            return;
-        };
-        if window_used_percent(window).is_some()
-            && minutes > 0
-            && resets > now
-            && let Some(starts_at_ms) = minutes
-                .checked_mul(60_000)
-                .and_then(|ms| resets.checked_sub(ms))
-            && (0..now).contains(&starts_at_ms)
-        {
-            bounds.push(QuotaWindowBounds {
-                label: label.to_owned(),
-                starts_at_ms: Some(starts_at_ms),
-                through_ms: now,
-            });
-        }
-    };
-    use eliot_core::api::harness::QuotaProjectionFormat;
-    match readback.projection {
-        QuotaProjectionFormat::RateLimits => {
-            let rates = &details["rateLimits"];
-            for (key, label) in [("primary", "Primary"), ("secondary", "Secondary")] {
-                collect(label, &rates[key], None);
-            }
-        }
-        QuotaProjectionFormat::UsagePair if details["windows"].as_array().is_none() => {
-            let usage = details.get("usage").unwrap_or(details);
-            collect("5-hour", &usage["window"], None);
-            collect("Weekly", &usage["weekly"], Some(10_080));
-        }
-        QuotaProjectionFormat::UsagePair
-        | QuotaProjectionFormat::IntegrationWindows
-        | QuotaProjectionFormat::Windows => {
-            if let Some(windows) = details["windows"].as_array() {
-                for window in windows {
-                    if let Some(label) = window["label"].as_str()
-                        && window_family(label).is_none()
-                    {
-                        collect(label, window, None);
-                    }
-                }
-            }
-        }
-    }
-    bounds
-}
-
-/// Full with a future (or unknown) reset: without reset evidence the window
-/// may already have rolled, so callers treat it as exhausted only when the
-/// provider gives no earlier reset.
-fn window_exhausted(window: &Value, now: i64) -> bool {
-    window_used_percent(window).is_some_and(|used| used >= 100.0)
-        && window_reset_ms(window).is_none_or(|reset| reset > now)
-}
-
-/// Affirmative headroom: below 100% with a future reset. The future reset
-/// is required: a full or reset-less window is never availability evidence.
-fn window_headroom(window: &Value, now: i64) -> bool {
-    window_used_percent(window).is_some_and(|used| used < 100.0)
-        && window_reset_ms(window).is_some_and(|reset| reset > now)
-}
-
-/// Documented provider quota groups: the window-label family plus the model-id
-/// tokens that prove membership. Group names come from the readers that emit
-/// the labels (Antigravity `retrieveUserQuotaSummary` display names, Claude
-/// CLI OAuth usage keys); a label whose family is not listed here is
-/// unrecognized and maps to no model. Matching is on whole id tokens, never
-/// substrings: the `Gemini 4 Argon` group requires an `argon` token, so an
-/// exhausted Argon bucket never constrains a Hydrogen model even though both
-/// contain `gemini`.
-const WINDOW_MODEL_GROUPS: &[(&str, &[&str])] = &[
-    ("gemini 4 argon", &["argon"]),
-    ("claude/gpt", &["claude", "gpt"]),
-    ("gemini", &["gemini"]),
-    ("opus", &["opus"]),
-    ("sonnet", &["sonnet"]),
-    ("fable", &["fable"]),
-    ("haiku", &["haiku"]),
-];
-
-/// Provider window-label periods emitted by the readers (`5-hour`, `Weekly`,
-/// `Monthly`, Antigravity `quota`). A label that is exactly a period, or
-/// carries no label at all, is account scope.
-const WINDOW_LABEL_PERIODS: &[&str] = &["weekly", "5-hour", "monthly", "quota"];
-
-fn documented_group(family: &str) -> Option<(&'static str, &'static [&'static str])> {
-    WINDOW_MODEL_GROUPS
-        .iter()
-        .find(|(name, _)| *name == family)
-        .map(|(name, tokens)| (*name, *tokens))
-}
-
-/// The provider group named by a window label, or `None` for account-scope
-/// (bare-period) labels. An unrecognized family yields `Some` of itself so
-/// the caller can report it unmapped.
-fn window_family(label: &str) -> Option<String> {
-    let lower = label.trim().to_ascii_lowercase();
-    if lower.is_empty() {
-        return None;
-    }
-    for period in WINDOW_LABEL_PERIODS {
-        if lower == *period {
-            return None;
-        }
-        if let Some(family) = lower.strip_suffix(period) {
-            let family = family.trim().to_owned();
-            if !family.is_empty() {
-                return Some(family);
-            }
-        }
-    }
-    Some(lower)
-}
-
-fn model_token_present(model: &str, token: &str) -> bool {
-    model
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|part| part.eq_ignore_ascii_case(token))
-}
-
-/// How one window maps to the requested model: an exact label match, a
-/// documented provider group the model belongs to, the unlabeled account
-/// scope, or unmapped (an unrecognized provider label, or a recognized group
-/// the model is not a member of). An unrecognized label applies to no model,
-/// even on an unscoped read.
-fn window_mapping(window: &Value, model: Option<&str>) -> QuotaMapping {
-    let label = window.get("label").and_then(Value::as_str).unwrap_or("");
-    if let Some(model) = model.filter(|model| !model.trim().is_empty())
-        && label.eq_ignore_ascii_case(model.trim())
-    {
-        return QuotaMapping::ExactId;
-    }
-    let family = window_family(label);
-    let Some(family) = family.as_deref() else {
-        return QuotaMapping::Group("account");
-    };
-    let Some((group, tokens)) = documented_group(family) else {
-        return QuotaMapping::Unmapped;
-    };
-    match model {
-        Some(model) if tokens.iter().any(|token| model_token_present(model, token)) => {
-            QuotaMapping::Group(group)
-        }
-        _ => QuotaMapping::Unmapped,
-    }
-}
-
-fn windows_projection(
-    observation: QuotaObservation<'_>,
-    windows: &[&Value],
-    complete: bool,
-    model: Option<&str>,
-    now: i64,
-    provenance: &'static str,
-) -> Option<QuotaProjection> {
-    let applicable: Vec<(&Value, QuotaMapping)> = windows
-        .iter()
-        .map(|&window| (window, window_mapping(window, model)))
-        .filter(|(_, mapping)| *mapping != QuotaMapping::Unmapped)
-        .collect();
-    summarize_windows(observation, &applicable, complete, now, provenance)
-}
-
-fn summarize_windows(
-    observation: QuotaObservation<'_>,
-    applicable: &[(&Value, QuotaMapping)],
-    complete: bool,
-    now: i64,
-    provenance: &'static str,
-) -> Option<QuotaProjection> {
-    if applicable.is_empty() {
-        // Windows exist but none maps to this model (for example an
-        // unrecognized `Model group` label, or an Argon bucket read for a
-        // Hydrogen model): report the inert unmapped projection so callers
-        // stay unknown instead of skipping a route or asserting availability.
-        return Some(QuotaProjection {
-            provider: observation.provider.to_owned(),
-            scope: observation.scope.to_owned(),
-            observed_at_ms: observation.observed_at_ms,
-            exhausted: false,
-            available: false,
-            mapping: QuotaMapping::Unmapped,
-            provenance,
-            headroom: QuotaHeadroom::default(),
-        });
-    }
-    let exhausted = applicable
-        .iter()
-        .any(|(window, _)| window_exhausted(window, now));
-    // The decisive bucket drives the verdict: the first exhausted window
-    // when anything is exhausted (preferring an exact id), else the exact
-    // id when one matched, else the first applicable group window.
-    let mapping = applicable
-        .iter()
-        .filter(|(window, _)| window_exhausted(window, now) == exhausted)
-        .map(|(_, mapping)| *mapping)
-        .find(|mapping| *mapping == QuotaMapping::ExactId)
-        .or_else(|| {
-            applicable
-                .iter()
-                .filter(|(window, _)| window_exhausted(window, now) == exhausted)
-                .map(|(_, mapping)| *mapping)
-                .next()
+    response
+        .details
+        .as_ref()
+        .zip(HarnessCapabilities::of(&response.harness).quota_readback)
+        .map_or_else(Vec::new, |(details, readback)| {
+            (readback.usage_windows)(details, now)
         })
-        .unwrap_or(applicable[0].1);
-    let mut headroom = QuotaHeadroom::default();
-    for (window, _) in applicable {
-        headroom.observe(window, now, false);
-    }
-    Some(QuotaProjection {
-        provider: observation.provider.to_owned(),
-        scope: observation.scope.to_owned(),
-        observed_at_ms: observation.observed_at_ms,
-        exhausted,
-        available: complete
-            && applicable
-                .iter()
-                .all(|(window, _)| window_headroom(window, now)),
-        mapping,
-        provenance,
-        headroom,
-    })
-}
-
-fn integration_windows_projection(
-    observation: QuotaObservation<'_>,
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
-    let model = model?;
-    let (provider, _) = eliot_plugin::session::split_provider_model(model)?;
-    match (details.get("integration").and_then(Value::as_str), provider) {
-        (Some("opencode-go"), "opencode-go") => {
-            let windows: Vec<_> = details.get("windows")?.as_array()?.iter().collect();
-            windows_projection(observation, &windows, true, Some(model), now, "opencode:go")
-        }
-        (Some("opencode"), _) => {
-            let applicable: Vec<_> = details
-                .get("consoleWindows")?
-                .as_array()?
-                .iter()
-                .filter_map(|window| {
-                    if !matches!(window.get("scope")?.as_str()?, "each" | "combined") {
-                        return None;
-                    }
-                    let mapping = match window.get("coverage")?.as_str()? {
-                        "all" if provider == "opencode" => QuotaMapping::Group("console"),
-                        "models"
-                            if window
-                                .get("models")?
-                                .as_array()?
-                                .iter()
-                                .any(|id| id.as_str() == Some(model)) =>
-                        {
-                            QuotaMapping::ExactId
-                        }
-                        _ => return None,
-                    };
-                    Some((window, mapping))
-                })
-                .collect();
-            summarize_windows(observation, &applicable, true, now, "opencode:console")
-        }
-        _ => None,
-    }
-}
-
-fn rate_limits_projection(
-    observation: QuotaObservation<'_>,
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
-    let rates = details
-        .get("rateLimits")
-        .filter(|rates| rates.is_object())?;
-    // Only the primary bucket's explicit limit state settles exhaustion: the
-    // deny signals, or a full primary window without credits. A full secondary
-    // window or a metered `rateLimitsByLimitId` bucket never proves the
-    // request's own quota is spent, so neither skips the route.
-    let mut exhausted = rates.get("spendControlReached").and_then(Value::as_bool) == Some(true)
-        || rates
-            .get("rateLimitReachedType")
-            .is_some_and(|reached| !reached.is_null())
-        || rates
-            .get("individualLimit")
-            .and_then(|limit| limit.get("remainingPercent"))
-            .and_then(Value::as_i64)
-            .is_some_and(|remaining| remaining <= 0);
-    let credits = &rates["credits"];
-    let credit_available = credits["unlimited"].as_bool() == Some(true)
-        || credits["hasCredits"].as_bool() == Some(true);
-    exhausted |= !credit_available && window_exhausted(&rates["primary"], now);
-    let available = !exhausted
-        && details["ordinaryUsageAllowed"].as_bool() == Some(true)
-        && window_headroom(&rates["primary"], now)
-        && window_headroom(&rates["secondary"], now)
-        && match details.get("rateLimitsByLimitId") {
-            None | Some(Value::Null) => true,
-            Some(Value::Object(limits)) if limits.is_empty() => true,
-            Some(Value::Object(limits)) => model.is_some_and(|model| {
-                limits.get(model).is_some_and(|rates| {
-                    window_headroom(&rates["primary"], now)
-                        && window_headroom(&rates["secondary"], now)
-                })
-            }),
-            _ => false,
-        };
-    // Only the primary bucket can establish exhaustion. Per-model buckets
-    // can establish the mapping for affirmative headroom.
-    let mapping = match model {
-        Some(model)
-            if !exhausted
-                && details
-                    .get("rateLimitsByLimitId")
-                    .and_then(|limits| limits.get(model))
-                    .is_some() =>
-        {
-            QuotaMapping::ExactId
-        }
-        _ => QuotaMapping::Group("primary"),
-    };
-    let mut headroom = QuotaHeadroom::default();
-    for bucket in std::iter::once(rates)
-        .chain(model.and_then(|model| details.get("rateLimitsByLimitId")?.get(model)))
-    {
-        for key in ["primary", "secondary"] {
-            headroom.observe(&bucket[key], now, false);
-        }
-    }
-    Some(QuotaProjection {
-        provider: observation.provider.to_owned(),
-        scope: observation.scope.to_owned(),
-        observed_at_ms: observation.observed_at_ms,
-        exhausted,
-        available,
-        mapping,
-        provenance: "codex:rateLimits",
-        headroom,
-    })
 }
 
 /// Catalogue membership establishes identity, not account availability.

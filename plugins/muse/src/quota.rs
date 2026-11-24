@@ -1,5 +1,6 @@
 //! Translation of the vendor's one-shot subscription allowance command.
 
+use eliot_core::api::harness::{QuotaEvidence, QuotaWindowBounds};
 use eliot_plugin::quota;
 use serde_json::Value;
 
@@ -216,4 +217,60 @@ fn unavailable(reason: &str) -> Value {
     let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     let reason = eliot_core::bound_chars(&eliot_core::redact_secret_shapes(&reason), 512);
     serde_json::json!({"details":{"state":"unavailable", "code":code, "reason":reason}})
+}
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    let (windows, paired) = usage_pair_window_set(details)?;
+    let complete = windows.len() == 2;
+    let weekly = paired
+        .then(|| details.get("usage").unwrap_or(details).get("weekly"))
+        .flatten();
+    let applicable = windows
+        .into_iter()
+        .filter_map(|raw| {
+            let (mut window, mapping) = quota::projection::mapped_window(raw, &[], &[], model)?;
+            window.weekly |= weekly.is_some_and(|weekly| core::ptr::eq(raw, weekly));
+            Some((window, mapping))
+        })
+        .collect();
+    Some(QuotaEvidence::Windows {
+        applicable,
+        complete,
+    })
+}
+
+/// Live and legacy usage pairs expose account usage bounds even without a windows array.
+pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
+    if details["windows"].as_array().is_some() {
+        return quota::projection::account_usage_windows(details, now);
+    }
+    let usage = details.get("usage").unwrap_or(details);
+    [
+        ("window", "5-hour", None),
+        ("weekly", "Weekly", Some(10_080)),
+    ]
+    .into_iter()
+    .filter_map(|(key, label, duration)| {
+        quota::projection::usage_bound(label, &usage[key], duration, now)
+    })
+    .collect()
+}
+
+/// Accept live usage pairs, legacy top-level pairs and retained window observations.
+fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool)> {
+    if let Some(windows) = details["windows"]
+        .as_array()
+        .filter(|windows| !windows.is_empty())
+    {
+        return Some((windows.iter().collect(), false));
+    }
+    let usage = details
+        .get("usage")
+        .filter(|value| value.is_object())
+        .unwrap_or(details);
+    let windows: Vec<_> = ["window", "weekly"]
+        .into_iter()
+        .filter_map(|key| usage.get(key).filter(|window| window.is_object()))
+        .collect();
+    (!windows.is_empty()).then_some((windows, true))
 }

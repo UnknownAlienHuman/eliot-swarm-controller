@@ -4,18 +4,18 @@ use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
     NativeAuthCapability, NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation,
-    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
-    UserInstructionFiles,
+    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
-use eliot_core::api::{
-    ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting,
-    InstructionReadStatus::{Conditional, Documented},
-};
-use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, InputTokenAccounting};
+use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        model_catalogue_presentation: Some(
+            crate::catalog_presentation::model_catalogue_presentation,
+        ),
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
                 resolve: || auth_command(&["auth", "login", "--standalone"]),
@@ -40,13 +40,17 @@ pub fn declaration() -> HarnessCapabilities {
         },
         quota_readback: Some(NativeQuotaReadback {
             adhoc_integration: Some("opencode-go"),
-            ..quota_readback(QuotaProjectionFormat::IntegrationWindows, |details| {
-                if details["integration"] == "opencode" {
-                    "OpenCode Console workspace budgets and Go allowance; provider read-only values"
-                } else {
-                    "OpenCode Go account usage; provider read-only values"
-                }
-            })
+            ..quota_readback(
+                crate::quota::quota_evidence,
+                eliot_plugin::quota::projection::account_usage_windows,
+                |details| {
+                    if details["integration"] == "opencode" {
+                        "OpenCode Console workspace budgets and Go allowance; provider read-only values"
+                    } else {
+                        "OpenCode Go account usage; provider read-only values"
+                    }
+                },
+            )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
         adhoc_launch: Some(AdhocLaunchDefaults {
@@ -64,15 +68,8 @@ pub fn declaration() -> HarnessCapabilities {
         effort: true,
         manager_preference: Some(2),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::OpenCodeAgentsFile,
-        project_instruction_read: Some(instruction_files(&[
-            ("AGENTS.md", Documented),
-            ("CLAUDE.md", Conditional),
-        ])),
-        user_instruction_files: Some(UserInstructionFiles {
-            root_override_env: Some("XDG_CONFIG_HOME"),
-            home_subdir: ".config",
-            paths: &["opencode/AGENTS.md"],
-        }),
+        project_instruction_read: crate::instructions::PROJECT_READ,
+        user_instruction_files: crate::instructions::USER_FILES,
         native_archive: Some(eliot_core::api::harness::NativeArchiveBinding::Workspace),
         resume_config: true,
         manifest_extra_verbs: &["models"],

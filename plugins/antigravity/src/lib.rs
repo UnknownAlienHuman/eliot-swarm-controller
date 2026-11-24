@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 pub mod capabilities;
+pub(crate) mod catalog_presentation;
 mod events;
 mod hooks;
 mod host;
 pub mod install;
+mod instructions;
 mod mcp;
 mod native;
 mod profile;
