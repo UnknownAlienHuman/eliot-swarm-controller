@@ -5,6 +5,37 @@
 use crate::{CommandState, Error, Result};
 use serde::{Deserialize, Serialize};
 
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedCustodyResolveRequest {
+    pub id: String,
+    pub agent: String,
+    pub generation: i64,
+    pub reason: String,
+}
+
+impl FailedCustodyResolveRequest {
+    pub fn validate(&self) -> Result<()> {
+        super::launch_queue::validate_id(&self.id)?;
+        crate::parse_agent_id(&self.agent)?;
+        if self.generation <= 0 || self.reason.trim().is_empty() || self.reason.len() > 512 {
+            return Err(Error::new(
+                "invalid",
+                "custody resolution requires a generation and a reason of at most 512 bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+pub struct FailedCustodyResolveResponse {
+    pub id: String,
+    pub agent: String,
+    pub generation: i64,
+    pub basis: String,
+}
+
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandResolution {

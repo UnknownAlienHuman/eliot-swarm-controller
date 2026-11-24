@@ -152,6 +152,15 @@ impl Store {
             id,
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
+        if state == CommandState::Rejected
+            && record.command.method == "swarm.switch"
+            && super::switch::release_rejected_switch_fence_tx(&tx, &record.command, now)?
+        {
+            events.push(insert_daemon_command_event(
+                &tx, now, "switch.checkout_released", None, None, id,
+                json!({"command_id":id,"state":"rejected","reason":"Rejected switch reservation released."}),
+            )?);
+        }
         if state == CommandState::Applied
             && record.command.is_owner_interrupt()
             && outcome
@@ -198,6 +207,16 @@ impl Store {
             now,
             &mut events,
         )?;
+        if start_not_spawned && let (Some(agent), Some(generation)) = (target, generation) {
+            events.extend(super::failed_custody::record_failed_exit(
+                &tx,
+                agent,
+                generation,
+                super::failed_custody::NEVER_SPAWNED,
+                "Start settled with exact daemon proof that no process spawned",
+                now,
+            )?);
+        }
 
         record = load_command_record(&tx, id)?
             .ok_or_else(|| Error::new("internal", "settled command disappeared"))?;
@@ -743,7 +762,9 @@ impl Store {
                 ));
             };
             let proof = capacity::owned_exit_proof_tx(&tx, agent_num, generation)?;
-            if !proof.is_complete() {
+            let failed_basis =
+                super::failed_custody::failed_generation_exit_basis_tx(&tx, agent_num, generation)?;
+            if !proof.is_complete() && failed_basis.is_none() {
                 return Err(Error::new(
                     "unknown",
                     format!(
@@ -765,8 +786,20 @@ impl Store {
             let fields = outcome.as_object_mut().ok_or_else(|| {
                 Error::new("source_integrity", "applied stop outcome is not an object")
             })?;
-            fields.insert("process_custody_exit_proven".into(), json!(true));
-            fields.insert("native_source_drain_proven".into(), json!(true));
+            let verified_job = failed_basis.as_deref() == Some(super::failed_custody::JOB_VERIFIED);
+            let never_spawned =
+                failed_basis.as_deref() == Some(super::failed_custody::NEVER_SPAWNED);
+            if let Some(basis) = failed_basis {
+                fields.insert("stop_basis".into(), json!(basis));
+            }
+            fields.insert(
+                "process_custody_exit_proven".into(),
+                json!(proof.process_custody_exited || verified_job || never_spawned),
+            );
+            fields.insert(
+                "native_source_drain_proven".into(),
+                json!(proof.native_source_drained || never_spawned),
+            );
             fields.insert("native_session_end_observed".into(), json!(native_ended));
             let interrupt_id: Option<String> = tx
                 .query_row(

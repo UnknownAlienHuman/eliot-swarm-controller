@@ -1,9 +1,49 @@
-//! Indexed readback of the latest Owner stop/interrupt failure.
+//! Indexed readback of retained Owner control failures.
 
 use super::*;
 use rusqlite::{OptionalExtension, params};
 
 impl Store {
+    /// Read the latest retained failed Owner Resume across all Agent generations.
+    pub fn latest_owner_resume_failure(&self, agent: &Agent) -> Result<Option<Command>> {
+        let agent_num = parse_agent_id(&agent.id)?;
+        let command_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM commands
+                 WHERE target=?1 AND principal='owner' AND verb='resume'
+                   AND state IN ('rejected','failed')
+                 ORDER BY created_at DESC,rowid DESC LIMIT 1",
+                [agent_num],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        let Some(command_id) = command_id else {
+            return Ok(None);
+        };
+        let command = self.get_command(&command_id)?.ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "latest retained Resume failure disappeared",
+            )
+        })?;
+        if command.target.as_deref() != Some(agent.id.as_str())
+            || command.verb != "resume"
+            || !matches!(
+                command.state,
+                eliot_core::CommandState::Rejected | eliot_core::CommandState::Failed
+            )
+            || command.generation.is_none()
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "latest retained Resume failure has a mismatched binding",
+            ));
+        }
+        Ok(Some(command))
+    }
+
     /// Read the latest failed or unconfirmed requested Owner control result
     /// for this generation, including the Agent's member of a tree stop.
     pub fn latest_owner_control_failure(&self, agent: &Agent) -> Result<Option<Command>> {

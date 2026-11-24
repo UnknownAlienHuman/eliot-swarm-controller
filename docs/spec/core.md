@@ -151,6 +151,18 @@ generation before failing it, closing unstarted sources and releasing its reserv
 in the same transaction. Errors after a child may have been created retain their
 ordinary uncertainty until owned process exit and reader drain are proven. A conflicting
 existing Job is never adopted or terminated by this failed start.
+Failed generations retain the custody closure basis by Agent and generation.
+The daemon can verify the exact local Windows Job and retained process identities.
+Owner method `agent.custody.resolve` records an explicit assertion for the
+current Failed generation after its native publication authority has closed.
+The daemon checks each retained unexited PID against its exact OS start time
+and checks recorded process-family custody where supported. A live identity or
+family, a failed observation, or truncated readback refuses the assertion. Use
+the generation's Stop for custody-proven termination where available. The
+assertion supplies only the remaining unobservable family-exit evidence. Store
+rechecks the observed generation and custody snapshot before retaining the
+assertion and reason. The Stop receipt distinguishes the assertion from a
+daemon-proven family exit.
 If Store rejects the no-spawn proof, ordinary plugin-error settlement records unknown
 and retains capacity; a concurrent authoritative terminal settlement is preserved.
 A successful no-spawn settlement clears that generation's recorded custody name, so it cannot
@@ -205,17 +217,23 @@ Readers accept persisted rows carrying any of these reasons.
 
 With the default [restart policy](configuration.md#agent-restart-policy), the
 daemon reopens an eligible retained idle session after restart through a
-generation-bound `resume` without text, and resumes an eligible retained
-generation that was live through a `resume` carrying a framed Swarm note as
-the new generation's first input. Roots resume before their children.
+generation-bound `resume` without text, including an idle generation whose
+owned exit and reader drain are proven at restart. It resumes an eligible
+retained generation that was live through a `resume` carrying a framed Swarm
+note as the new generation's first input. Roots resume before their children.
 Descendants wait for restart-affected ancestors to resume. A completed Owner
 Stop or a failed or rejected restart Resume ends automatic attempts for that
 generation.
 Eligibility requires exact custody closure and settled commands, requests,
-and Goal rounds for the prior generation. The exact turn interrupted by the
-restart may remain unknown. The new generation keeps the native subject and
-its retained settings. The note names the interrupted turn and asks the Agent
-to inspect its workspace before continuing. That turn and other uncertain
+and Goal rounds for the prior generation. Idle continuation uses retained
+`owned_exit_before_restart` evidence or a restart loss that captured the
+generation idle with no active turn ID. The Store rechecks closure and
+settled work before admitting a promptless Resume.
+Unresolved commands, turns, requests, Goal rounds, Owner Stops, or restart-
+affected ancestors continue to fence admission. The exact turn interrupted by
+the restart may remain unknown. The new generation keeps the native subject
+and its retained settings. The note names the interrupted turn and asks the
+Agent to inspect its workspace before continuing. That turn and other uncertain
 effects keep their `unknown` outcome until normal settlement. A terminal
 `send` refusal identifies the next explicit action for that Agent.
 

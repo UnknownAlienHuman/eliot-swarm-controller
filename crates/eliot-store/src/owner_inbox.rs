@@ -52,6 +52,7 @@ pub(crate) fn project(
     project_requests(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_commands(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_restores(connection, now, &mut items, &mut liveness, &[])?;
+    project_resume_failures(connection, now, &mut items, &[])?;
     project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
     project_holds(connection, now, &mut items, &mut liveness, &[])?;
     project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
@@ -83,6 +84,13 @@ pub(crate) fn project_item(
     subject: &str,
     now: i64,
 ) -> eliot_core::Result<Option<OwnerInboxItem>> {
+    if kind == OwnerInboxKind::Agent
+        && let Some(command_id) = subject.strip_prefix("resume:")
+    {
+        let mut items = Vec::new();
+        project_resume_failures(db, now, &mut items, &[&command_id])?;
+        return Ok(items.pop());
+    }
     if kind == OwnerInboxKind::Stuck
         && let Some(cause) = subject.strip_prefix("repeat:")
     {
@@ -218,6 +226,67 @@ pub(crate) fn project_item(
     Ok(items
         .into_iter()
         .find(|item| item.kind == kind && item.subject == subject))
+}
+
+fn project_resume_failures(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut stmt = projection_query(
+        db,
+        "SELECT c.id,c.updated_at
+         FROM commands c
+         WHERE c.verb='resume' AND c.principal='owner' AND c.state IN ('rejected','failed')",
+        "c.id=?1",
+        bindings,
+    )?;
+    let rows = stmt
+        .query_map(bindings, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (command_id, updated_at) = row.map_err(sql_error)?;
+        let command = super::load_command(db, &command_id)?.ok_or_else(|| {
+            crate::Error::new("source_integrity", "retained Resume failure disappeared")
+        })?;
+        let failure = eliot_core::api::AgentResumeFailure::from_command(&command)?;
+        let agent = command.target.as_deref().ok_or_else(|| {
+            crate::Error::new("source_integrity", "retained Resume failure has no Agent")
+        })?;
+        let mut entry = item(
+            OwnerInboxKind::Agent,
+            format!("resume:{command_id}"),
+            format!(
+                "{}:{}:{}",
+                super::command_state_name(failure.state),
+                failure.reason,
+                failure.detail.as_deref().unwrap_or("")
+            ),
+            now,
+            updated_at,
+            "resume_failed",
+            None,
+            vec![
+                action("inspect_agent", "agent.get", json!({"id":agent})),
+                action("inspect_command", "command.get", json!({"id":command_id})),
+            ],
+        );
+        entry.detail = Some(match failure.detail {
+            Some(detail) => format!(
+                "Resume generation {} failed: {} — {}",
+                failure.generation, failure.reason, detail
+            ),
+            None => format!(
+                "Resume generation {} failed: {}",
+                failure.generation, failure.reason
+            ),
+        });
+        items.push(entry);
+    }
+    Ok(())
 }
 
 fn project_repeated_failures(

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHECKPOINT_RESTORE_CUSTODY_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = FAILED_CUSTODY_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -18,6 +18,7 @@ const ATTENTION_LOOKUPS_VERSION: i64 = 125;
 const MAIL_NOTICE_REVISION_VERSION: i64 = 126;
 const CHECKPOINT_RESTORE_INTENT_VERSION: i64 = 127;
 const CHECKPOINT_RESTORE_CUSTODY_VERSION: i64 = 128;
+const FAILED_CUSTODY_VERSION: i64 = 129;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -86,6 +87,9 @@ impl Store {
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
+        }
+        if current < FAILED_CUSTODY_VERSION {
+            self.migrate_failed_custody(FAILED_CUSTODY_VERSION)?;
         }
         Ok(())
     }

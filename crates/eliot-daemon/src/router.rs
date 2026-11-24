@@ -790,6 +790,7 @@ impl Router {
             "command.children" => self.command_children(&params, &principal).await,
             "command.resolve" => self.command_resolve(&params, &principal).await,
             "command.settle_stopped" => self.command_settle_stopped(&params, &principal).await,
+            "agent.custody.resolve" => self.failed_custody_resolve(&params, &principal).await,
             "agent.get" => self.agent_get(&params, &principal).await,
             "agent.discover" => self.agent_discover(&params, &principal).await,
             "harness.list" => self.harness_list(&params, &principal).await,
@@ -5315,6 +5316,7 @@ impl Router {
             instruction_delivery,
             owner_rules_delivery,
             last_control_failure,
+            last_resume_failure,
         ) = {
             let store = self.inner.store.lock().await;
             hierarchy::authorize_agent_read(&store, principal, id, None)?;
@@ -5327,6 +5329,18 @@ impl Router {
                         Ok(()) => Some(eliot_core::api::AgentControlFailure::from_command(
                             &command,
                         )?),
+                        Err(error) if error.code == "not_allowed" => None,
+                        Err(error) => return Err(error),
+                    }
+                }
+                None => None,
+            };
+            let last_resume_failure = match store.latest_owner_resume_failure(&agent)? {
+                Some(command) => {
+                    match hierarchy::authorize_command_read(&store, principal, &command) {
+                        Ok(()) => {
+                            Some(eliot_core::api::AgentResumeFailure::from_command(&command)?)
+                        }
                         Err(error) if error.code == "not_allowed" => None,
                         Err(error) => return Err(error),
                     }
@@ -5353,6 +5367,7 @@ impl Router {
                 instruction_delivery,
                 owner_rules_delivery,
                 last_control_failure,
+                last_resume_failure,
             )
         };
         let live_presence = if agent.observe_only {
@@ -5443,6 +5458,7 @@ impl Router {
             owner_rules_delivery,
             pending_background_wake,
             last_control_failure,
+            last_resume_failure,
             work_truth,
         };
         display_agent_get_response(&mut response);

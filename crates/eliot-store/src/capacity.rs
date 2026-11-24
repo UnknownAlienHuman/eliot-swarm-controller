@@ -24,6 +24,16 @@ const RESTART_RESUME_EVENT: &str = r#"
 const RESTART_INTERRUPTED_WORK: &str = "restart.kind = 'agent.lost'
     AND (json_type(restart.data, '$.turn_id') IS 'text'
          OR COALESCE(json_extract(restart.data, '$.previous_state') IN ('busy', 'waiting'), 0))";
+// `owned_exit_before_restart` is emitted only after Store proves the prior
+// generation was idle with no active/unknown turn, pending request, or open
+// command. That clean idle session is itself a continuation candidate.
+const RESTART_CLEAN_IDLE_SESSION: &str = "(
+    (restart.kind = 'agent.stopped'
+        AND json_extract(restart.data, '$.reason') = 'owned_exit_before_restart')
+    OR (restart.kind = 'agent.lost'
+        AND json_extract(restart.data, '$.previous_state') = 'idle'
+        AND json_type(restart.data, '$.turn_id') IS NULL)
+)";
 const RESTART_UNDELIVERED_INPUT: &str = "json_extract(restart.data, '$.undelivered_input') IS 1";
 const RESTART_LINKED_LAUNCH_INPUT_VALID: &str = "EXISTS (
     SELECT 1 FROM commands send
@@ -49,7 +59,7 @@ fn restart_resume_eligibility() -> String {
     AND json_extract(a.profile_snapshot, '$._provider_probe') IS NOT 1
     AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
     AND a.state IN ('lost', 'stopped')
-    AND (({interrupted_work}) OR ({undelivered_input}))
+    AND (({interrupted_work}) OR ({clean_idle_session}) OR ({undelivered_input}))
     AND a.capacity_generation IS NULL
     AND a.harness IN (SELECT value FROM json_each(?3))
     AND TRIM(COALESCE(a.native_scope, '')) <> ''
@@ -97,6 +107,7 @@ fn restart_resume_eligibility() -> String {
     )
 "#,
         interrupted_work = RESTART_INTERRUPTED_WORK,
+        clean_idle_session = RESTART_CLEAN_IDLE_SESSION,
         undelivered_input = RESTART_UNDELIVERED_INPUT,
     )
 }
@@ -134,7 +145,8 @@ pub(super) fn restart_ancestor_fences_resume_tx(
              SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
              {RESTART_RESUME_EVENT}
              WHERE a.state IN ('lost', 'stopped') AND a.archived = 0
-                 AND (({RESTART_INTERRUPTED_WORK}) OR ({RESTART_UNDELIVERED_INPUT}))
+                 AND (({RESTART_INTERRUPTED_WORK}) OR ({RESTART_CLEAN_IDLE_SESSION})
+                      OR ({RESTART_UNDELIVERED_INPUT}))
              UNION ALL
              SELECT 1 FROM ancestors p JOIN agents a ON a.id = p.id
              JOIN commands c ON c.target = a.id AND c.generation = a.generation
@@ -535,9 +547,9 @@ impl Store {
         Ok(retained)
     }
 
-    /// Page eligible generations in hierarchy order. The retained loss event
-    /// supplies the interrupted turn's identity and the transaction rechecks
-    /// eligibility before admitting Resume.
+    /// Page eligible generations in hierarchy order. Retained restart events
+    /// supply the interrupted turn or clean-idle evidence, and the transaction
+    /// rechecks eligibility before admitting Resume.
     pub fn restart_resume_candidates(
         &self,
         after: Option<&RestartResumeCandidate>,

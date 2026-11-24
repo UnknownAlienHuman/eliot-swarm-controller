@@ -1446,6 +1446,109 @@ impl PluginHost {
         self.state.running.lock_recover().contains_key(&key)
     }
 
+    pub(crate) async fn resolve_failed_custody(
+        &self,
+        request: &eliot_core::api::FailedCustodyResolveRequest,
+    ) -> Result<eliot_store::Change<eliot_core::api::FailedCustodyResolveResponse>> {
+        let _startup = self.state.startup_gate.lock().await;
+        let snapshot = {
+            let store = self.state.store.lock().await;
+            if let Some(value) = store.replay_failed_custody_resolution(request)? {
+                return Ok(eliot_store::Change {
+                    value,
+                    events: Vec::new(),
+                });
+            }
+            if self.controls_generation(&request.agent, request.generation) {
+                return Err(Error::new(
+                    "busy",
+                    "the daemon still controls this generation; stop it first",
+                ));
+            }
+            store.failed_generation_exit_snapshot(&request.agent, request.generation)?
+        };
+        let snapshot = tokio::task::spawn_blocking(move || {
+            crate::platform::custody::check_failed_exit_assertion(&snapshot)?;
+            Ok::<_, Error>(snapshot)
+        })
+        .await
+        .map_err(|_| Error::new("unavailable", "failed custody observation did not return"))??;
+        self.state
+            .store
+            .lock()
+            .await
+            .resolve_failed_custody(request, &snapshot, now_ms())
+    }
+
+    #[cfg(windows)]
+    pub(crate) async fn prove_failed_generation_exit(&self, agent: &Agent) -> Result<()> {
+        let _startup = self.state.startup_gate.lock().await;
+        if self.controls_generation(&agent.id, agent.generation) {
+            return Err(Error::new(
+                "busy",
+                "the daemon still controls this generation",
+            ));
+        }
+        let snapshot = {
+            let store = self.state.store.lock().await;
+            let snapshot = store.failed_generation_exit_snapshot(&agent.id, agent.generation)?;
+            if snapshot.custody_namespace.as_deref() != Some(store.custody_namespace()?.as_str()) {
+                return Err(Error::new(
+                    "process_custody_foreign",
+                    "no local named Job binding for failed generation",
+                ));
+            }
+            snapshot
+        };
+        let snapshot = tokio::task::spawn_blocking(move || {
+            if snapshot.processes_truncated {
+                return Err(Error::new(
+                    "process_custody_unproven",
+                    "retained process identities exceed the readback bound",
+                ));
+            }
+            let namespace = snapshot.custody_namespace.as_deref().ok_or_else(|| {
+                Error::new(
+                    "process_custody_unproven",
+                    "failed generation has no named Job",
+                )
+            })?;
+            let name = crate::platform::custody::agent_custody_name(
+                namespace,
+                &snapshot.agent,
+                snapshot.generation,
+            );
+            if !crate::platform::windows::named_job_closed(&name)? {
+                crate::platform::windows::terminate_named_generation_job(&name)?;
+            }
+            match crate::platform::restart_custody(&snapshot)? {
+                crate::platform::RestartCustody::Closed {
+                    orphan_possible: false,
+                    ..
+                } => Ok(snapshot),
+                _ => Err(Error::new(
+                    "process_custody_unproven",
+                    "failed generation Job or retained process is still live",
+                )),
+            }
+        })
+        .await
+        .map_err(|_| {
+            Error::new(
+                "unknown",
+                "failed generation Job verification did not return",
+            )
+        })??;
+        let events = self
+            .state
+            .store
+            .lock()
+            .await
+            .commit_failed_generation_job_exit(&snapshot, now_ms())?;
+        self.state.bus.publish(&events);
+        Ok(())
+    }
+
     pub(crate) fn take_late_batch_cause(&self, agent: &str, generation: i64) -> Option<String> {
         self.state
             .late_batch_causes

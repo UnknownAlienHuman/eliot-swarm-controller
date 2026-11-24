@@ -14,6 +14,9 @@ const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 const CLEANUP_INVENTORY_SCAN: usize = 256;
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
 const ACTIVE_ARTIFACT_LIMIT: i64 = 4_096;
+/// Bound daemon-owned custody metadata within one Agent generation. This is
+/// deliberately per generation: user artifact capacity must not stop launches.
+const DAEMON_CUSTODY_LIMIT_PER_GENERATION: i64 = 512;
 const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
 pub struct CleanupInventoryPage {
@@ -291,12 +294,31 @@ impl Store {
             ));
         }
         let agent_num = parse_agent_id(&artifact.agent)?;
+        let existing_id: Option<String> = tx
+            .query_row(
+                "SELECT body FROM artifacts WHERE id=?1",
+                [&artifact.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(body) = existing_id {
+            let existing: ArtifactView = serde_json::from_str(&body)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact custody row"))?;
+            if !same_known_custody(&existing, &artifact) {
+                return Err(Error::new(
+                    "conflict",
+                    "daemon artifact custody ID collides with another binding",
+                ));
+            }
+            return commit_transaction(tx, &self.write_faulted);
+        }
         if artifact.kind == ArtifactKind::NativeSession
             && let Some(previous) = known_native_session_artifact(&tx, agent_num, &artifact.path)?
         {
-            // A resume may carry the same native session into the new
-            // generation. Updating custody must preserve the attempt fence.
+            // Resuming the same native subject retains its old attempt fence.
             if previous.state == "registered" && previous.generation < artifact.generation {
+                require_daemon_custody_room(&tx, agent_num, artifact.generation)?;
                 artifact.id = previous.id;
                 tx.execute(
                     "UPDATE artifacts SET generation=?1,body=?2 WHERE id=?3",
@@ -306,43 +328,63 @@ impl Store {
             }
             return commit_transaction(tx, &self.write_faulted);
         }
-        // Daemon-owned rows record custody for an already-admitted generation.
-        // The optional Agent registration quota must not block a launch.
+        let existing_path: Option<String> = tx
+            .query_row(
+                "SELECT body FROM artifacts WHERE path=?1",
+                [&artifact.path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)?;
+        if let Some(body) = existing_path {
+            let mut existing: ArtifactView = serde_json::from_str(&body)
+                .map_err(|_| Error::new("source_integrity", "invalid artifact custody row"))?;
+            if same_known_custody(&existing, &artifact) {
+                return commit_transaction(tx, &self.write_faulted);
+            }
+            if existing.kind == ArtifactKind::Branch
+                && artifact.kind == ArtifactKind::Branch
+                && existing.agent == artifact.agent
+                && existing.generation == artifact.generation
+                && existing.state == "registered"
+            {
+                // Keep the same branch row and sequence while its exact tip moves.
+                existing.identity = artifact.identity;
+                existing.tree = artifact.tree;
+                existing.git = artifact.git;
+                tx.execute(
+                    "UPDATE artifacts SET body=?1 WHERE id=?2",
+                    params![encode_json(&existing)?, existing.id],
+                )
+                .map_err(sql_error)?;
+                return commit_transaction(tx, &self.write_faulted);
+            }
+            return Err(Error::new(
+                "conflict",
+                "daemon artifact custody path has another binding",
+            ));
+        }
+        require_daemon_custody_room(&tx, agent_num, artifact.generation)?;
         let seq: i64 = tx
             .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM artifacts", [], |r| {
                 r.get(0)
             })
             .map_err(sql_error)?;
-        let changed = tx.execute("INSERT OR IGNORE INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",params![artifact.id,agent_num,artifact.generation,artifact.path,encode_json(&artifact)?,seq]).map_err(sql_error)?;
-        if changed == 0 && artifact.kind == ArtifactKind::Branch {
-            // Branches move as their agent commits: refresh the tracked tip
-            // so the plan snapshot anchors exactly what apply re-verifies.
-            // Identity, tree and git binding follow the live branch; row id,
-            // creation time and tombstone state stay untouched.
-            let body: Option<String> = tx
-                .query_row(
-                    "SELECT body FROM artifacts WHERE path=?1",
-                    params![artifact.path],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(sql_error)?;
-            if let Some(body) = body
-                && let Ok(mut stored) = serde_json::from_str::<ArtifactView>(&body)
-                && stored.kind == ArtifactKind::Branch
-            {
-                stored.identity = artifact.identity.clone();
-                stored.tree.clone_from(&artifact.tree);
-                stored.git.clone_from(&artifact.git);
-                tx.execute(
-                    "UPDATE artifacts SET body=?1 WHERE path=?2",
-                    params![encode_json(&stored)?, artifact.path],
-                )
-                .map_err(sql_error)?;
-            }
-        }
+        tx.execute(
+            "INSERT INTO artifacts(id,agent,generation,path,body,seq) VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                artifact.id,
+                agent_num,
+                artifact.generation,
+                artifact.path,
+                encode_json(&artifact)?,
+                seq
+            ],
+        )
+        .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)
     }
+
     /// Registered branch rows for one agent generation, including the
     /// retained git binding used to re-resolve the live tip after the
     /// worktree is gone.
@@ -1471,6 +1513,33 @@ fn cleanup_root_has_descendants(connection: &Connection, root: &ArtifactView) ->
         }
     }
     Ok(false)
+}
+
+fn same_known_custody(existing: &ArtifactView, artifact: &ArtifactView) -> bool {
+    existing.agent == artifact.agent
+        && existing.generation == artifact.generation
+        && existing.path == artifact.path
+        && existing.kind == artifact.kind
+        && existing.purpose == artifact.purpose
+        && existing.identity == artifact.identity
+}
+
+fn require_daemon_custody_room(connection: &Connection, agent: i64, generation: i64) -> Result<()> {
+    let count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE agent=?1 AND generation=?2
+      AND json_extract(body,'$.state') IN ('registered','unknown','ownership_root')",
+            params![agent, generation],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if count >= DAEMON_CUSTODY_LIMIT_PER_GENERATION {
+        return Err(Error::new(
+            "unavailable",
+            "daemon artifact custody limit reached for this Agent generation",
+        ));
+    }
+    Ok(())
 }
 
 fn known_native_session_artifact(
