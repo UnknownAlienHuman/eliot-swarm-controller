@@ -90,9 +90,11 @@ impl Router {
             }
 
             if let Some(mut artifact) = self.agent_delete_worktree(agent).await? {
-                let tip = self.worktree_cleanup_preflight(&artifact).await?;
+                let tip = self
+                    .worktree_cleanup_preflight(&artifact, false, false)
+                    .await?;
                 if let Some(git) = artifact.git.as_mut() {
-                    git.planned_tip = Some(tip);
+                    git.planned_tip = tip;
                 }
                 items.push(CleanupCandidate {
                     artifact,
@@ -103,12 +105,17 @@ impl Router {
             }
             #[cfg(windows)]
             if let Some(artifact) = self.agent_delete_probe_chat(agent).await? {
-                let bytes = self.cleanup_preflight(&artifact).await?;
+                let (bytes, absent) = self.cleanup_preflight(&artifact).await?;
                 items.push(CleanupCandidate {
                     artifact,
                     bytes: Some(bytes),
                     verdict: "safe".to_owned(),
-                    reason: "terminal_owned_artifact".to_owned(),
+                    reason: if absent {
+                        "already_absent"
+                    } else {
+                        "terminal_owned_artifact"
+                    }
+                    .to_owned(),
                 });
             }
             if items.len() > MAX_CLEANUP_ITEMS {

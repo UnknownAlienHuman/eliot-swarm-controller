@@ -664,6 +664,7 @@ impl Router {
                     std::fs::canonicalize(target_path),
                 ) {
                     (Ok(root), Ok(target)) => target != root && !target.starts_with(&root),
+                    (Err(error), Ok(_)) if error.kind() == std::io::ErrorKind::NotFound => true,
                     _ => false,
                 },
                 None => true,
@@ -2691,7 +2692,22 @@ impl Router {
             request.target = Some(artifact.agent.clone());
             request.expected_generation = Some(artifact.generation);
             request.args = if item.reason == "already_absent" {
-                check_worktree_binding(artifact, &preparation)?;
+                let git = check_worktree_binding(artifact, &preparation)?;
+                match std::fs::symlink_metadata(&git.admin) {
+                    Ok(_) if directory_identity(Path::new(&git.admin))? != git.admin_identity => {
+                        return Err(Error::new(
+                            "identity_changed",
+                            "worktree administration identity changed",
+                        ));
+                    }
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(Error::new(
+                            "platform_io",
+                            format!("inspect worktree administration: {error}"),
+                        ));
+                    }
+                    _ => {}
+                }
                 json!({"observe_missing": true})
             } else {
                 check_worktree_artifact(artifact, &preparation)?;
