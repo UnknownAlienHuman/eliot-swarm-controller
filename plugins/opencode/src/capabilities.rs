@@ -7,6 +7,7 @@ use eliot_core::api::{
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        documentation_section: Some("docs/harnesses/opencode.md#working-profile"),
         // No frozen permission knob or OS sandbox constrains this range.
         native_access_bounds: Some(|_| Some((1, 3))),
         effort: true,

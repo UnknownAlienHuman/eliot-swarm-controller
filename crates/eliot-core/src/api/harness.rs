@@ -173,6 +173,10 @@ pub struct HarnessCapabilities {
     /// Hot-start manager order among harnesses that can deny native subagents;
     /// lower is preferred.
     pub manager_preference: Option<u8>,
+    /// Documentation section describing this adapter's native sources.
+    pub documentation_section: Option<&'static str>,
+    /// Exact configure refusal when reasoning effort cannot change mid-session.
+    pub configure_effort_refusal: Option<&'static str>,
 }
 
 type Declarations = Box<[(&'static str, HarnessCapabilities)]>;
@@ -195,6 +199,16 @@ pub fn register_harness_capabilities(
         return Err(Error::new(
             "internal",
             "built-in adapter declarations do not match supported harnesses",
+        ));
+    }
+    if declarations.iter().any(|(_, capabilities)| {
+        capabilities
+            .documentation_section
+            .is_none_or(|section| section.trim().is_empty())
+    }) {
+        return Err(Error::new(
+            "internal",
+            "built-in adapter declaration is missing its documentation section",
         ));
     }
     BUILTIN_CAPABILITIES.set(declarations).map_err(|_| {
@@ -626,11 +640,10 @@ impl ConfigureSupport {
                 effort_refusal: Some(reason),
             };
         }
+        let capabilities = HarnessCapabilities::for_harness(harness).unwrap_or_default();
         Self {
             model_refusal: None,
-            effort_refusal: (harness == "claude").then(|| {
-                "Claude effort applies only at launch and cannot change mid-session (launch_only)".to_owned()
-            }),
+            effort_refusal: capabilities.configure_effort_refusal.map(str::to_owned),
         }
     }
 }
@@ -1272,9 +1285,8 @@ impl ModelsCatalogResponse {
     }
 }
 
-/// Provider for one catalogue id: OpenCode and Antigravity models carry a
-/// provider prefix or group; Codex is openai, Claude is anthropic, Muse is
-/// meta. Documented in `docs/spec/configuration.md` (access mapping).
+/// Provider display label for a model catalogue ID, also used by the desktop
+/// without loading the adapter registry.
 pub fn catalog_provider(harness: &str, id: &str) -> String {
     if let Some((provider, _)) = id.split_once('/')
         && !provider.trim().is_empty()

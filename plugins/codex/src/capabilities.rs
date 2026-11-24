@@ -10,6 +10,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        documentation_section: Some("docs/harnesses/codex.md#sources"),
         native_access_bounds: Some(native_access_bounds),
         workspace_write_commit_roots: true,
         effort: true,

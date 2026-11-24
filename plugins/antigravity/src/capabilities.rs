@@ -7,6 +7,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        documentation_section: Some("docs/harnesses/antigravity.md#native-identity-and-transport"),
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         prepared_mcp_config: true,

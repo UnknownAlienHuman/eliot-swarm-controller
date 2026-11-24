@@ -7,6 +7,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        documentation_section: Some("docs/harnesses/muse.md#usage-attribution"),
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
         project_instruction_read: Some(|path, _, _| {

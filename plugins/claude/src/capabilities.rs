@@ -8,6 +8,10 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        documentation_section: Some("docs/harnesses/claude-code.md#sources-and-unresolved-facts"),
+        configure_effort_refusal: Some(
+            "Claude effort applies only at launch and cannot change mid-session (launch_only)",
+        ),
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         manager_preference: Some(1),
