@@ -15,12 +15,12 @@ use crate::{
             NativeModelListResult, NativeSession, NativeSessionReadParams, NativeSessionReadResult,
             NativeSessionReasoningEffortChangedNotification, NativeSessionResumeParams,
             NativeSessionResumeResult, NativeSessionSetModelParams, NativeSessionSetModelResult,
-            NativeSessionStartParams, NativeSessionStartResult, NativeTurnCancelParams,
-            NativeTurnCancelResult, NativeTurnCompletedNotification, NativeTurnInputPart,
-            NativeTurnStartParams, NativeTurnStartResult, NativeTurnStartedNotification,
-            NativeTurnSteerParams, NativeTurnSteerResult, NativeTurnTerminal,
-            NativeUnframedViewEvent, NativeViewPageParams, NativeViewPageResult,
-            is_reasoning_effort_tier,
+            NativeSessionStartParams, NativeSessionStartResult, NativeSettingsReadResult,
+            NativeTurnCancelParams, NativeTurnCancelResult, NativeTurnCompletedNotification,
+            NativeTurnInputPart, NativeTurnStartParams, NativeTurnStartResult,
+            NativeTurnStartedNotification, NativeTurnSteerParams, NativeTurnSteerResult,
+            NativeTurnTerminal, NativeUnframedViewEvent, NativeViewPageParams,
+            NativeViewPageResult, is_contributor_model, is_reasoning_effort_tier,
         },
     },
 };
@@ -208,6 +208,8 @@ struct AgentSession {
     selected_effort: Option<String>,
     /// Selector that the first and subsequent provider responses must match.
     expected_model: Option<String>,
+    /// The startup flag is fixed for this owned host's lifetime.
+    contributor_mode_forced: bool,
     secrets: Vec<String>,
     native: NativeProcess,
     native_client: NativeClient,
@@ -517,6 +519,7 @@ impl MusePlugin {
             Path::new(&initialized.instance_dir),
             &policy,
             true,
+            requested_model.is_none(),
         )
         .await
         {
@@ -539,7 +542,7 @@ impl MusePlugin {
         };
         let resume_route = requested_model
             .as_deref()
-            .filter(|model| resume_subject.is_some() && model.ends_with("-contributor"))
+            .filter(|model| resume_subject.is_some() && is_contributor_model(model))
             .map(|model| host.catalogue.selection(model));
         let mut session = match start::bind_owned_session(
             &params,
@@ -553,6 +556,8 @@ impl MusePlugin {
             Ok(session) => session,
             Err(error) => return Ok(self.retain_proven_no_effect_start(&params, error)),
         };
+        session.contributor_mode_forced =
+            requested_model.as_deref().is_some_and(is_contributor_model);
 
         if let Err(error) = register_native_process(
             peer,
@@ -1106,6 +1111,9 @@ impl MusePlugin {
             }));
         }
         let deadline = Instant::now() + RPC_TIMEOUT;
+        if let Err(error) = check_model_mode(session, &requested_model, deadline).await {
+            return Ok(rejected_control(&error.message));
+        }
         // The exact catalogue row supplies effort variants when available.
         let catalog: NativeModelListResult = match session
             .native_client
@@ -1145,6 +1153,7 @@ impl MusePlugin {
                 .find(|model| model.model_id == requested_model),
         );
         if let Some(effort) = requested.effort.as_deref()
+            && !is_contributor_model(selection.id)
             && !selection.allows_effort(|entry| match entry.variants.as_ref() {
                 Some(NativeModelEffortVariants::Known(variants)) => {
                     variants.iter().any(|variant| variant == effort)
@@ -1158,11 +1167,6 @@ impl MusePlugin {
             }));
         }
         let native_selection = catalog.selection(selection.id);
-        if selection.id.ends_with("-contributor") && native_selection.profile_id.is_none() {
-            return Ok(rejected_control(
-                "Muse catalogue did not identify the provider profile for the Contributor selector",
-            ));
-        }
         let model_command = new_command_id();
         let model_response = match session
             .native_client
@@ -1420,6 +1424,11 @@ impl MusePlugin {
             .model_override
             .clone()
             .or_else(|| session.expected_model.clone());
+        if let Some(model) = expected_model.as_deref()
+            && let Err(error) = check_model_mode(session, model, proof_deadline).await
+        {
+            return Ok(rejected_control(&error.message));
+        }
         let effort = params
             .effort_override
             .clone()
@@ -2249,6 +2258,7 @@ impl MusePlugin {
             Path::new(&initialized.instance_dir),
             &policy,
             false,
+            true,
         )
         .await?;
         host.close().await?;
@@ -3062,9 +3072,46 @@ fn muse_serve_args(permissions: &str, model: Option<&str>) -> Vec<OsString> {
     let mut args = vec![OsString::from("serve")];
     if let Some(model) = model {
         args.extend([OsString::from("--model"), OsString::from(model)]);
+        if is_contributor_model(model) {
+            args.extend([OsString::from("--contributor-mode"), OsString::from("on")]);
+        }
     }
     if permissions == "danger-full-access" {
         args.push(OsString::from("--disable-sandbox"));
     }
     args
+}
+
+async fn check_model_mode(session: &AgentSession, model: &str, deadline: Instant) -> Result<()> {
+    let contributor = is_contributor_model(model);
+    if session.contributor_mode_forced {
+        return if contributor {
+            Ok(())
+        } else {
+            Err(Error::new(
+                "unsupported",
+                "Muse Contributor mode is fixed on for this host. Start a new Muse Agent with an ordinary model to use that selector.",
+            ))
+        };
+    }
+    if !contributor {
+        return Ok(());
+    }
+    // A host started without an override can use the Owner's native
+    // Contributor mode. MSP's settings writes would persist native settings.
+    let response = session
+        .native_client
+        .call("settings/read", json!({}), deadline)
+        .await;
+    if response
+        .ok()
+        .and_then(|value| serde_json::from_value::<NativeSettingsReadResult>(value).ok())
+        .is_some_and(|settings| settings.values.contributor_mode_enabled)
+    {
+        return Ok(());
+    }
+    Err(Error::new(
+        "unsupported",
+        "Muse Contributor mode is unconfirmed for this host. Enable it in Muse or start a new Agent with a Contributor profile.",
+    ))
 }

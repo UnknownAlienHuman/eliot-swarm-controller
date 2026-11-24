@@ -873,6 +873,11 @@ valid structured Core restriction kind, but the
 Codex 0.161 classifier does not infer it from an unrecognized native variant, HTTP 404
 or message text.
 
+Muse reports typed quota exhaustion or its provider HTTP 429 error envelope
+as a quota hold. The same controlled terminal fact feeds the existing
+provider handoff policy. The model mismatch hold requires a separate
+successful provider response naming a different model.
+
 A hold is `Held` or `Probing`. It blocks new provider-backed launch/send/steer work in
 that scope, including queued dispatch. Future Goal work that admits provider-backed
 commands uses the same gate. A launch with linked input must reject before either effect;

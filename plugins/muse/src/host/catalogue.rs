@@ -32,9 +32,10 @@ impl CatalogueHost {
         instance_dir: &Path,
         policy: &SecretPolicy,
         observe_models: bool,
+        refresh_empty: bool,
     ) -> Result<Self> {
         let mut host = Self::read(launch, policy, observe_models).await?;
-        if !host.catalogue.models.is_empty() {
+        if !refresh_empty || !host.catalogue.models.is_empty() {
             return Ok(host);
         }
 

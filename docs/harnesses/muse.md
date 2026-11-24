@@ -88,13 +88,21 @@ lost its `tbh` route and the provider answered with the ordinary model.
 Startup lets Muse resolve the profile for the exact `--model`. Resume uses
 `session/resume.modelId` and rebinds an already-selected Contributor model
 to its provider profile for sessions retained from earlier versions.
-The Contributor model can be hidden from the public picker, so its absence
-does not prevent attempting the exact selector on the native catalogue route.
-Contributor mode and disclosure consent use the Owner's native configuration.
-On 2026-11-24, Muse 1.4.25-R9361.1 preserved the `tbh` profile and still
-returned the base model, both with native settings and with the process
-override `--contributor-mode on`. A qualified Contributor route on this
-release remains unproven.
+The Owner confirmed that Muse CLI 1.4.25 saw the High Usage subscription after
+a fresh Meta login. The vendor launcher's
+`exec --model muse-spark-1.3-contributor --contributor-mode on --reasoning-effort low`
+returned `OK`, and Meta confirmed the exact Contributor model ID.
+`--list-models` omitted the working variant. The catalogue supplies metadata
+and cannot establish whether the variant is served. HTTP 429 is quota
+exhaustion and enters the shared provider hold and handoff path.
+
+Swarm starts a Contributor selector with the exact `--model` and
+`--contributor-mode on`. An ordinary selector receives no Contributor flag.
+`session/setModel` preserves the provider route and the host's mode. On a host
+with no override, changing to a Contributor selector requires the Owner's
+native mode to be enabled. Changing a forced-on host to an ordinary selector
+requires a host started for the ordinary selector. Disclosure consent
+continues to use the Owner's native configuration.
 
 On Windows the adapter reads the installed launcher's
 `.muse-update-checked-at` before starting an owned host. When the check
@@ -104,6 +112,9 @@ starts independently of the check's outcome. Omitted `cmd` resolves from
 the vendor manifest again on the next launch. The interval comes from the
 daemon's `MUSE_UPDATE_INTERVAL_SECONDS` environment setting, with a default
 of 3600 seconds. Profile environment entries cannot suppress updates.
+The Windows `muse.cmd` wrapper drops `exec` arguments. Swarm uses it for
+version-only update checks and calls the installed binary directly for
+native sessions.
 
 Model proof comes from the exact session's MSP `log/subscribe` live stream
 (`rawLog`). The adapter checks every successful provider response bound to

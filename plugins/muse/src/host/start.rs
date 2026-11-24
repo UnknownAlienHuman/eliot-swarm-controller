@@ -15,7 +15,7 @@ use crate::{
             NativeSessionSetApprovalModeParams, NativeSessionSetApprovalModeResult,
             NativeSessionSetModelParams, NativeSessionSetModelResult,
             NativeSessionSetReasoningEffortParams, NativeSessionSetReasoningEffortResult,
-            is_approval_mode, is_reasoning_effort_tier,
+            is_approval_mode, is_contributor_model, is_reasoning_effort_tier,
         },
     },
 };
@@ -270,6 +270,7 @@ pub(super) fn bind_owned_session(
         native_scope: String::new(),
         selected_effort: None,
         expected_model: None,
+        contributor_mode_forced: false,
         secrets,
         native,
         native_client,
@@ -385,6 +386,7 @@ impl MusePlugin {
             )
         });
         if let (Some(effort), Some(selection)) = (requested_effort, &selection)
+            && !is_contributor_model(selection.id)
             && !selection.allows_effort(|entry| match entry.variants.as_ref() {
                 Some(NativeModelEffortVariants::Known(variants)) => {
                     variants.iter().any(|variant| variant == effort)

@@ -3267,7 +3267,7 @@ impl EventProcessor {
                 "muse",
                 origin,
                 if origin == eliot_core::FailureOrigin::Provider {
-                    "MSP authRequired or exact API 429 rate_limit_error refusal"
+                    "MSP authRequired, typed quota or exact provider HTTP 429 refusal"
                 } else {
                     "no documented structured upstream error on native terminal"
                 },
