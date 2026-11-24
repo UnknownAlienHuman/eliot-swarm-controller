@@ -28,7 +28,7 @@ const MAX_RESULT_CHARS: usize = 4_000;
 #[derive(Clone, Debug)]
 pub(super) enum InboxMsg {
     /// Owner counts and executable diagnostics from the sidebar's status read.
-    Status(Fallible<client::SidebarStatus>),
+    Status(Fallible<eliot_core::api::DaemonSidebarResponse>),
     /// One `owner.inbox` read (its sequence).
     Loaded(u64, Fallible<OwnerInboxResponse>),
     /// Decide an item: its reference as shown, the choice (`recommended`,

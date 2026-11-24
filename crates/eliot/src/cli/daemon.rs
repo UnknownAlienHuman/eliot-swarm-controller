@@ -195,6 +195,7 @@ pub(crate) async fn run_maintenance(
 pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
     let params = DaemonStatusRequest {
         disk_usage_freshness: true,
+        ..Default::default()
     };
     params.validate().map_err(Failure::for_read)?;
     #[cfg(windows)]

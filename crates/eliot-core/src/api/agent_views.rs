@@ -2324,9 +2324,12 @@ pub struct DiskUsageView {
     pub artifacts: DiskUsageDirectory,
     pub worktrees: DiskUsageDirectory,
     pub plugins: DiskUsageDirectory,
-    /// Age of the last completed measurement attempt, if one exists.
+    /// Time since the last published measurement attempt began, if one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_age_ms: Option<u64>,
+    /// Time since the same measurement attempt ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_end_age_ms: Option<u64>,
     /// A measurement is in progress. The displayed buckets may be cached.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub refreshing: bool,
@@ -2339,6 +2342,12 @@ impl DiskUsageView {
         self.artifacts.validate()?;
         self.worktrees.validate()?;
         self.plugins.validate()?;
+        if self
+            .snapshot_end_age_ms
+            .is_some_and(|end| self.snapshot_age_ms.is_none_or(|start| end > start))
+        {
+            return Err(invalid_response());
+        }
         match (
             self.owner_decision_worktrees,
             &self.owner_decision_error_code,
@@ -2357,6 +2366,13 @@ pub struct DaemonHealthSummary {
     pub active_repeat_windows: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeated_failure_inbox_items: Option<usize>,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonSidebarResponse {
+    pub owner_inbox: BTreeMap<super::OwnerInboxKind, usize>,
+    pub profile_command_issues: Vec<super::ProfileCommandIssue>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

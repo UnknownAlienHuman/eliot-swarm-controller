@@ -219,12 +219,40 @@ pub fn disk_usage_line(usage: &DiskUsageView) -> String {
         (None, Some(code)) => format!("Owner-decision worktrees unavailable ({code})"),
         _ => "Owner-decision worktrees unavailable".to_owned(),
     };
+    let freshness = match (usage.snapshot_age_ms, usage.snapshot_end_age_ms) {
+        (Some(start), Some(end)) => format!(
+            "scan window {} ago to {} ago",
+            age_words(start),
+            age_words(end)
+        ),
+        (Some(age_ms), None) => format!("snapshot age {}", age_words(age_ms)),
+        _ => "snapshot age unavailable".to_owned(),
+    };
+    let refreshing = if usage.refreshing {
+        " · refreshing"
+    } else {
+        ""
+    };
     format!(
-        "Disk use: {} · {} · {} · {decisions}",
+        "Disk use: {} · {} · {} · {decisions} · {freshness}{refreshing}",
         size("artifacts", &usage.artifacts),
         size("worktrees", &usage.worktrees),
         size("plugins", &usage.plugins),
     )
+}
+
+fn age_words(age_ms: u64) -> String {
+    if age_ms < 1_000 {
+        return format!("{age_ms}ms");
+    }
+    let seconds = age_ms / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
 }
 
 /// A plan or apply reason code in words.

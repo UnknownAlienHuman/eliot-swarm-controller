@@ -151,6 +151,15 @@ const METHODS: &[Method] = &[
     ),
     method!("daemon.shutdown", DaemonShutdownRequest, DaemonShutdownResponse, true, true, "Request drain or force shutdown; acknowledgement is not process-exit proof.", {"id":EXAMPLE_ID,"mode":"drain"}),
     method!(
+        "daemon.sidebar",
+        DaemonSidebarRequest,
+        DaemonSidebarResponse,
+        true,
+        false,
+        "Read Owner inbox counts and missing profile commands.",
+        {}
+    ),
+    method!(
         "autonomy.get",
         AutonomyRequest,
         AutonomyResponse,
