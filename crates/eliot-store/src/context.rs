@@ -183,8 +183,13 @@ impl Store {
                   AND done.kind = 'tool.completed' AND done.seq > start.seq AND done.seq < ?3
                   AND json_extract(done.data, '$.turn_id') = ?5
                   AND json_extract(done.data, '$.item_id') = json_extract(start.data, '$.item_id')
-                  AND json_type(done.data, '$.exit_code') = 'integer'
-                  AND json_extract(done.data, '$.exit_code') = 0
+                  AND LOWER(COALESCE(json_extract(done.data, '$.status'), '')) NOT IN
+                      ('error', 'failed', 'failure', 'declined', 'denied', 'cancelled', 'canceled',
+                       'interrupted', 'aborted', 'rejected', 'timed_out')
+                  AND ((json_type(done.data, '$.exit_code') = 'integer'
+                        AND json_extract(done.data, '$.exit_code') = 0)
+                       OR (COALESCE(json_type(done.data, '$.exit_code'), 'null') = 'null'
+                           AND json_extract(done.data, '$.status') = 'completed'))
                 WHERE start.agent = ?1 AND start.generation = ?2 AND start.seq < ?3
                   AND start.seq > ?8 AND start.ts >= ?4
                   AND start.source = 'stream' AND start.native_id IS NOT NULL AND start.kind = 'tool.started'
