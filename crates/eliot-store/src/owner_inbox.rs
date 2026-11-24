@@ -51,6 +51,7 @@ pub(crate) fn project(
 
     project_requests(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_commands(connection, now, &mut items, &mut liveness, &[])?;
+    project_unknown_restores(connection, now, &mut items, &mut liveness, &[])?;
     project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
     project_holds(connection, now, &mut items, &mut liveness, &[])?;
     project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
@@ -103,7 +104,10 @@ pub(crate) fn project_item(
             };
         }
         OwnerInboxKind::HarnessRequest => (project_requests, subject),
-        OwnerInboxKind::UnknownCommand => (project_unknown_commands, subject),
+        OwnerInboxKind::UnknownCommand => match subject.strip_prefix("checkpoint_restore:") {
+            Some(id) => (project_unknown_restores, id),
+            None => (project_unknown_commands, subject),
+        },
         OwnerInboxKind::UnknownTurn => (project_unknown_turns, subject),
         OwnerInboxKind::Hold => (project_holds, subject),
         OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
@@ -558,6 +562,86 @@ fn project_unknown_commands(
             recommended,
             choices,
         ));
+    }
+    Ok(())
+}
+
+fn project_unknown_restores(
+    db: &Connection,
+    now: i64,
+    items: &mut Vec<OwnerInboxItem>,
+    stats: &mut SwarmLiveness,
+    bindings: &[&dyn ToSql],
+) -> eliot_core::Result<()> {
+    let mut statement = projection_query(
+        db,
+        "SELECT r.id,r.workspace,w.created_at,r.applying,r.writer_boot IS NOT NULL,r.custody_error
+         FROM checkpoint_restore_intents r JOIN writes w ON w.id = r.id
+         WHERE w.result <> 'null'",
+        "r.id = ?1",
+        bindings,
+    )?;
+    let rows = statement
+        .query_map(bindings, |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for row in rows {
+        let (id, workspace, created_at, applying, armed, custody_error) = row.map_err(sql_error)?;
+        let reason = if custody_error.is_some() {
+            "checkpoint_restore_writer_custody_check_failed"
+        } else if armed {
+            "checkpoint_restore_writer_exit_unproven"
+        } else {
+            "checkpoint_restore_needs_owner_inspection"
+        };
+        let mut choices = vec![action(
+            "release_after_inspection",
+            "checkpoint.restore.release",
+            json!({"restore_id": id}),
+        )];
+        if armed {
+            #[cfg(windows)]
+            choices.push(action(
+                "stop_writer",
+                "checkpoint.restore.stop",
+                json!({"restore_id": id}),
+            ));
+            choices.push(action(
+                "abandon_reservation",
+                "checkpoint.restore.abandon",
+                json!({"restore_id": id, "confirm": null, "reason": null}),
+            ));
+        }
+        tally(stats, &Mover::Parked { reason });
+        let mut restore = item(
+            OwnerInboxKind::UnknownCommand,
+            format!("checkpoint_restore:{id}"),
+            format!("applying:{applying}:armed:{armed}:custody:{custody_error:?}"),
+            now,
+            created_at,
+            reason,
+            None,
+            choices,
+        );
+        let workspace = eliot_core::display_path(&workspace);
+        restore.detail = Some(match custody_error {
+            Some(code) => format!("{workspace} ({code})"),
+            None => workspace,
+        });
+        restore.instructions = Some(if armed {
+            "Stop the writer if its custody is proven. Abandoning only releases the reservation and can allow overlapping work while the writer is alive."
+        } else {
+            "Inspect the worktree and index before releasing the restore reservation."
+        }.to_owned());
+        items.push(restore);
     }
     Ok(())
 }

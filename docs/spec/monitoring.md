@@ -797,11 +797,27 @@ behavior. The checkpoint filter applies to daemon-owned capture.
 
 An Owner restores a retained checkpoint with `swarm checkpoint restore` after recreating
 the worktree. Restore requires a clean target at the captured HEAD and in the same Git
-common directory, and refuses while an Agent uses the target. It revalidates every path
-and stored blob before writing. It imports the staged blobs into the project object
-store for the index and writes the captured disk bytes directly to the files. The
-checkpoint ref remains in the daemon-owned repository. An interrupted restore without
-a retained result reports an unknown effect on exact retry.
+common directory. The Store checks Agent ownership and owned exit proof on overlapping
+paths in the transaction that binds the Owner receipt and reserves the target.
+Launch and Resume check the reservation at admission and dispatch. The reservation
+also participates in the common directory's Git write ordering. Restores of
+different, non-overlapping worktrees in that repository can run concurrently.
+
+Restore revalidates paths and blobs, imports staged blobs into the project object
+store, writes the captured disk bytes and updates the index. The checkpoint ref
+remains in the daemon-owned repository. The Store marks application before the
+first worktree or index write. After interruption, the daemon retains an unknown
+outcome on the original receipt. The daemon rechecks Git writer custody at
+startup, in bounded liveness batches, and on exact retry. It releases a
+reservation automatically once custody is closed if application never began.
+If application began, the Owner inspects the worktree and index and chooses
+`release_after_inspection` in the inbox. Release requires closed writer custody
+and preserves the unknown outcome. Recovery never repeats the restore.
+If a writer persists, `stop_writer` terminates its exact Windows Job after
+verifying the retained process identity and confirms family exit. If closure
+cannot be verified, the Owner can explicitly confirm `abandon_reservation`
+and record a reason. This releases the reservation even if an external writer
+can still run. Custody probe failures are logged and shown in the inbox.
 
 The final checkpoint of a session waits for the
 [owned exit proof](#process-identity-and-custody): the process family has exited and the

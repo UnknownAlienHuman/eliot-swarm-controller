@@ -83,6 +83,141 @@ pub enum CheckpointRestoreAdmission {
     Replay(Result<CheckpointRestoreResponse>),
 }
 
+pub struct CheckpointRestoreIntent {
+    pub id: String,
+    pub writer_key: String,
+    pub writer_custody_bound: bool,
+    pub writer_boot: Option<String>,
+    pub writer_identity: Option<core::ProcessIdentity>,
+}
+
+pub(super) fn require_no_checkpoint_restore(conn: &Connection, workspace: &str) -> Result<()> {
+    if checkpoint_restore_overlaps(conn, workspace)? {
+        return Err(Error::new(
+            "busy",
+            "workspace is reserved for checkpoint restore",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn checkpoint_restore_overlaps(conn: &Connection, workspace: &str) -> Result<bool> {
+    let mut statement = conn
+        .prepare("SELECT workspace FROM checkpoint_restore_intents")
+        .map_err(sql_error)?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sql_error)?;
+    for path in paths {
+        if workspace::workspace_paths_overlap(workspace, &path.map_err(sql_error)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn require_restore_workspace_idle(tx: &Transaction<'_>, workspace: &str) -> Result<()> {
+    let mut statement = tx
+        .prepare("SELECT id, workspace, state FROM agents WHERE workspace IS NOT NULL")
+        .map_err(sql_error)?;
+    let agents = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    for agent in agents {
+        let (id, path, state) = agent.map_err(sql_error)?;
+        if !workspace::workspace_paths_overlap(workspace, &path) {
+            continue;
+        }
+        if !matches!(state.as_str(), "stopped" | "failed" | "lost") {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "restore workspace overlaps active Agent {}",
+                    format_agent_id(id)
+                ),
+            ));
+        }
+        let agent = load_agent_by_num(tx, id)?
+            .ok_or_else(|| Error::new("source_integrity", "restore workspace Agent is missing"))?;
+        if let Some(blocker) = handoff::session_exit_blocker(tx, &agent)? {
+            return Err(Error::new(
+                "busy",
+                format!(
+                    "restore workspace Agent {} has unproven exit: {blocker}",
+                    agent.id
+                ),
+            ));
+        }
+        if has_pending_resume_tx(tx, id, agent.generation, "")? {
+            return Err(Error::new(
+                "busy",
+                "restore workspace has a pending Agent Resume",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_digest(request: &CheckpointRestoreRequest) -> Result<Vec<u8>> {
+    let args = serde_json::to_value(request)
+        .map_err(|_| Error::new("internal", "cannot encode checkpoint restore"))?;
+    canonical::digest(&args)
+}
+
+fn checkpoint_restore_receipt(
+    conn: &Connection,
+    id: &str,
+    digest: &[u8],
+) -> Result<Option<Result<CheckpointRestoreResponse>>> {
+    let Some((principal, method, saved_digest, saved)) = write_binding(conn, id)? else {
+        return Ok(None);
+    };
+    if principal != "owner" || method != CHECKPOINT_RESTORE || saved_digest != digest {
+        return Err(Error::new(
+            "id_conflict",
+            "checkpoint restore id is already bound",
+        ));
+    }
+    let outcome: Option<Result<CheckpointRestoreResponse>> = serde_json::from_str(&saved)
+        .map_err(|_| Error::new("source_integrity", "checkpoint restore receipt is invalid"))?;
+    Ok(Some(outcome.unwrap_or_else(|| {
+        Err(Error::new(
+            "unknown",
+            "checkpoint restore effect has no retained outcome",
+        ))
+    })))
+}
+
+fn require_restore_intent_update(changed: rusqlite::Result<usize>) -> Result<()> {
+    if changed.map_err(sql_error)? != 1 {
+        return Err(Error::new(
+            "source_integrity",
+            "checkpoint restore intent changed",
+        ));
+    }
+    Ok(())
+}
+
+fn settle_restore_receipt(
+    conn: &Connection,
+    id: &str,
+    outcome: &Result<CheckpointRestoreResponse>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE writes SET result = ?1
+         WHERE id = ?2 AND method = ?3 AND principal = 'owner' AND result = 'null'",
+        params![encode_json(outcome)?, id, CHECKPOINT_RESTORE],
+    )
+    .map_err(sql_error)?;
+    Ok(())
+}
+
 /// What the next checkpoint of a generation starts from.
 #[derive(Clone, Debug, Default)]
 pub struct GitCheckpointBasis {
@@ -267,48 +402,39 @@ fn checkpoint_switch_gate(
 }
 
 impl Store {
+    pub fn retained_checkpoint_restore(
+        &self,
+        request: &CheckpointRestoreRequest,
+    ) -> Result<Option<Result<CheckpointRestoreResponse>>> {
+        self.ensure_committed_reads()?;
+        checkpoint_restore_receipt(&self.connection, &request.id, &restore_digest(request)?)
+    }
+
     pub fn reserve_checkpoint_restore(
         &mut self,
         request: &CheckpointRestoreRequest,
         workspace: &str,
+        common_dir: &str,
         now: i64,
     ) -> Result<CheckpointRestoreAdmission> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            let args = serde_json::to_value(request)
-                .map_err(|_| Error::new("internal", "cannot encode checkpoint restore"))?;
-            let digest = canonical::digest(&args)?;
-            if let Some((principal, method, saved_digest, saved)) =
-                write_binding(&self.connection, &request.id)?
-            {
-                if principal != "owner" || method != CHECKPOINT_RESTORE || saved_digest != digest {
-                    return Err(Error::new(
-                        "id_conflict",
-                        "checkpoint restore id is already bound",
-                    ));
-                }
-                let outcome: Option<Result<CheckpointRestoreResponse>> =
-                    serde_json::from_str(&saved).map_err(|_| {
-                        Error::new("source_integrity", "checkpoint restore receipt is invalid")
-                    })?;
-                return Ok(CheckpointRestoreAdmission::Replay(outcome.unwrap_or_else(
-                    || {
-                        Err(Error::new(
-                            "unknown",
-                            "checkpoint restore effect has no retained outcome",
-                        ))
-                    },
-                )));
+            let digest = restore_digest(request)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if let Some(outcome) = checkpoint_restore_receipt(&tx, &request.id, &digest)? {
+                return Ok(CheckpointRestoreAdmission::Replay(outcome));
             }
-            if command_binding(&self.connection, &request.id)?.is_some() {
+            if command_binding(&tx, &request.id)?.is_some() {
                 return Err(Error::new(
                     "id_conflict",
                     "restore id is already used by a command",
                 ));
             }
             validate_id_age(&request.id, now)?;
-            let oid: String = self
-                .connection
+            let oid: String = tx
                 .query_row(
                     "SELECT oid FROM git_checkpoints
                      WHERE agent = ?1 AND generation = ?2 AND checkpoint_ref = ?3
@@ -330,13 +456,15 @@ impl Store {
                         "checkpoint reference is not retained for restore",
                     )
                 })?;
-            if self.workspace_has_active_agents(workspace)? {
-                return Err(Error::new("busy", "restore workspace has an active Agent"));
+            require_no_checkpoint_restore(&tx, workspace)?;
+            workspace::require_managed_path_ready(&tx, workspace)?;
+            require_restore_workspace_idle(&tx, workspace)?;
+            if repo_git_write_conflicts_tx(&tx, "", common_dir)? {
+                return Err(Error::new(
+                    "busy",
+                    "restore repository has a pending Git write",
+                ));
             }
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
             coordination::retain_write_tx(
                 &tx,
                 &request.id,
@@ -346,6 +474,11 @@ impl Store {
                 &Value::Null,
                 now,
             )?;
+            tx.execute(
+                "INSERT INTO checkpoint_restore_intents(id, workspace, common_dir) VALUES (?1, ?2, ?3)",
+                params![request.id, workspace, common_dir],
+            )
+            .map_err(sql_error)?;
             commit_transaction(tx, &self.write_faulted)?;
             Ok(CheckpointRestoreAdmission::Start { oid })
         })();
@@ -356,26 +489,303 @@ impl Store {
     pub fn settle_checkpoint_restore(
         &mut self,
         id: &str,
-        outcome: &Result<CheckpointRestoreResponse>,
+        outcome: Result<CheckpointRestoreResponse>,
+    ) -> Result<Result<CheckpointRestoreResponse>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let (armed, applying): (bool, bool) = tx
+                .query_row(
+                    "SELECT writer_boot IS NOT NULL, applying
+                     FROM checkpoint_restore_intents WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .ok_or_else(|| {
+                    Error::new("source_integrity", "checkpoint restore intent is missing")
+                })?;
+            let outcome = if armed || applying {
+                outcome.map_err(|error| {
+                    Error::new(
+                        "unknown",
+                        format!(
+                            "checkpoint restore did not settle; inspect the worktree: {}",
+                            error.message
+                        ),
+                    )
+                })
+            } else {
+                outcome
+            };
+            if !armed && (!applying || outcome.is_ok()) {
+                require_restore_intent_update(
+                    tx.execute("DELETE FROM checkpoint_restore_intents WHERE id = ?1", [id]),
+                )?;
+            }
+            settle_restore_receipt(&tx, id, &outcome)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(outcome)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn mark_checkpoint_restore_applying(&mut self, id: &str) -> Result<()> {
+        self.update_restore_writer(
+            "UPDATE checkpoint_restore_intents SET applying = 1
+             WHERE id = ?1 AND applying = 0 AND writer_boot IS NULL",
+            [id],
+        )
+    }
+
+    pub fn arm_checkpoint_restore_writer(&mut self, id: &str, boot: &str) -> Result<()> {
+        self.update_restore_writer(
+            "UPDATE checkpoint_restore_intents SET writer_boot = ?2,
+               writer_namespace = (SELECT namespace FROM custody_binding WHERE singleton = 1)
+             WHERE id = ?1 AND writer_boot IS NULL",
+            params![id, boot],
+        )
+    }
+
+    pub fn record_checkpoint_restore_writer(
+        &mut self,
+        id: &str,
+        identity: &core::ProcessIdentity,
+    ) -> Result<()> {
+        self.update_restore_writer(
+            "UPDATE checkpoint_restore_intents SET writer_identity = ?2
+             WHERE id = ?1 AND writer_boot IS NOT NULL AND writer_identity IS NULL",
+            params![id, encode_json(identity)?],
+        )
+    }
+
+    pub fn close_checkpoint_restore_writer(&mut self, id: &str) -> Result<()> {
+        self.update_restore_writer(
+            "UPDATE checkpoint_restore_intents
+             SET writer_boot = NULL, writer_identity = NULL, writer_namespace = NULL, custody_error = NULL
+             WHERE id = ?1 AND writer_boot IS NOT NULL",
+            [id],
+        )
+    }
+
+    fn update_restore_writer(&mut self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = require_restore_intent_update(self.connection.execute(sql, params));
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn checkpoint_restore_intents(
+        &self,
+        settled_id: Option<&str>,
+    ) -> Result<Vec<CheckpointRestoreIntent>> {
+        self.read_checkpoint_restore_intents(
+            "WHERE ?1 IS NULL OR (r.id = ?1 AND w.result <> 'null')",
+            [settled_id],
+        )
+    }
+
+    pub fn pending_checkpoint_restore_writers(
+        &self,
+        after: &str,
+    ) -> Result<Vec<CheckpointRestoreIntent>> {
+        self.read_checkpoint_restore_intents(
+            "WHERE r.id > ?1 AND r.writer_boot IS NOT NULL AND w.result <> 'null'
+             ORDER BY r.id LIMIT 16",
+            [after],
+        )
+    }
+
+    fn read_checkpoint_restore_intents(
+        &self,
+        filter: &str,
+        bindings: impl rusqlite::Params,
+    ) -> Result<Vec<CheckpointRestoreIntent>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(&format!(
+                "SELECT r.id, r.writer_boot, r.writer_identity, r.writer_namespace,
+                    (SELECT namespace FROM custody_binding WHERE singleton = 1)
+             FROM checkpoint_restore_intents r JOIN writes w ON w.id = r.id {filter}"
+            ))
+            .map_err(sql_error)?;
+        statement
+            .query_map(bindings, |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(sql_error)?
+            .map(|row| {
+                let (id, writer_boot, identity, captured, namespace) = row.map_err(sql_error)?;
+                Ok(CheckpointRestoreIntent {
+                    writer_key: format!("{namespace}-{id}"),
+                    writer_custody_bound: captured.as_deref() == Some(namespace.as_str()),
+                    id,
+                    writer_boot,
+                    writer_identity: identity
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|_| {
+                            Error::new("source_integrity", "restore writer identity is invalid")
+                        })?,
+                })
+            })
+            .collect()
+    }
+
+    /// A stopped Git process proves custody closure. Only a restore that never
+    /// began applying worktree or index changes can release automatically.
+    pub fn recover_checkpoint_restore(
+        &mut self,
+        id: &str,
+        writer_closed: bool,
+        custody_error: Option<&str>,
     ) -> Result<()> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            let changed = self
+            let tx = self
                 .connection
-                .execute(
-                    "UPDATE writes SET result = ?1
-                 WHERE id = ?2 AND method = ?3 AND principal = 'owner' AND result = 'null'",
-                    params![encode_json(outcome)?, id, CHECKPOINT_RESTORE],
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if writer_closed {
+                tx.execute(
+                    "UPDATE checkpoint_restore_intents SET writer_boot = NULL, writer_identity = NULL,
+                        writer_namespace = NULL, custody_error = NULL
+                     WHERE id = ?1 AND applying = 1 AND writer_boot IS NOT NULL",
+                    [id],
+                ).map_err(sql_error)?;
+                tx.execute(
+                    "DELETE FROM checkpoint_restore_intents WHERE id = ?1 AND applying = 0",
+                    [id],
                 )
                 .map_err(sql_error)?;
-            if changed != 1 {
+            } else {
+                tx.execute(
+                    "UPDATE checkpoint_restore_intents SET custody_error = ?2
+                            WHERE id = ?1 AND writer_boot IS NOT NULL AND custody_error IS NOT ?2",
+                    params![id, custody_error],
+                )
+                .map_err(sql_error)?;
+            }
+            settle_restore_receipt(
+                &tx,
+                id,
+                &Err(Error::new(
+                    "unknown",
+                    "checkpoint restore was interrupted; inspect the worktree",
+                )),
+            )?;
+            commit_transaction(tx, &self.write_faulted)
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn release_checkpoint_restore(
+        &mut self,
+        action_id: &str,
+        restore_id: &str,
+        writer_closed: bool,
+        abandon_reason: Option<&str>,
+        now: i64,
+    ) -> Result<Value> {
+        let method = if abandon_reason.is_some() {
+            "checkpoint.restore.abandon"
+        } else {
+            "checkpoint.restore.release"
+        };
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let mut payload = json!({"restore_id": restore_id});
+            if let Some(reason) = abandon_reason {
+                require_nonempty(reason, "restore abandonment reason")?;
+                if reason.len() > 1024 {
+                    return Err(Error::new(
+                        "invalid",
+                        "restore abandonment reason exceeds 1024 bytes",
+                    ));
+                }
+                payload["reason"] = json!(reason);
+            }
+            let digest = canonical::digest(&payload)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            if let Some((principal, saved_method, saved_digest, saved)) =
+                write_binding(&tx, action_id)?
+            {
+                if principal != "owner" || saved_method != method || saved_digest != digest {
+                    return Err(Error::new(
+                        "id_conflict",
+                        "restore release id is already bound",
+                    ));
+                }
+                return decode_json(&saved);
+            }
+            validate_id_age(action_id, now)?;
+            if command_binding(&tx, action_id)?.is_some() || digest_id_bound(&tx, action_id)? {
                 return Err(Error::new(
-                    "source_integrity",
-                    "checkpoint restore intent was lost",
+                    "id_conflict",
+                    "restore release id is already bound",
                 ));
             }
-            Ok(())
+            if !writer_closed && abandon_reason.is_none() {
+                return Err(Error::new(
+                    "busy",
+                    "checkpoint restore writer exit is unproven",
+                ));
+            }
+            let released = tx
+                .execute(
+                    "DELETE FROM checkpoint_restore_intents WHERE id = ?1
+                 AND EXISTS (SELECT 1 FROM writes WHERE id = ?1 AND result <> 'null')",
+                    [restore_id],
+                )
+                .map_err(sql_error)?;
+            if released != 1 {
+                return Err(Error::new(
+                    "stale_item",
+                    "checkpoint restore no longer needs release",
+                ));
+            }
+            let mut response = json!({"restore_id": restore_id, "released": true});
+            if let Some(reason) = abandon_reason {
+                response["abandoned"] = json!(true);
+                response["reason"] = json!(reason);
+            }
+            coordination::retain_write_tx(
+                &tx, action_id, "owner", method, &digest, &response, now,
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(response)
         })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
+    pub fn settle_checkpoint_restore_stop(
+        &mut self,
+        id: &str,
+        outcome: &Result<Value>,
+    ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = require_restore_intent_update(self.connection.execute(
+            "UPDATE writes SET result = ?2
+             WHERE id = ?1 AND method = 'checkpoint.restore.stop' AND principal = 'owner' AND result = 'null'",
+            params![id, encode_json(outcome)?],
+        ));
         self.fault_on_persistence_error(&result);
         result
     }

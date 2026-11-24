@@ -263,8 +263,9 @@ pub use switch::{
 mod swarm_usage;
 mod work_truth;
 pub use work_truth::{
-    CheckpointRestoreAdmission, CheckpointRetentionGeneration, GIT_CHECKPOINT, GitCheckpointBasis,
-    GitCheckpointInput, GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
+    CheckpointRestoreAdmission, CheckpointRestoreIntent, CheckpointRetentionGeneration,
+    GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput, GitCheckpointIntent,
+    GitCheckpointReservation, JournalTurn,
 };
 mod turn_recovery;
 pub(crate) mod usage;
@@ -4646,6 +4647,23 @@ fn command_binding(connection: &Connection, id: &str) -> Result<Option<(String, 
 }
 
 fn repo_git_write_blocked_tx(
+    tx: &Transaction<'_>,
+    command_id: &str,
+    common_dir: &str,
+) -> Result<bool> {
+    let restoring: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoint_restore_intents WHERE common_dir = ?1)",
+            [common_dir],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    Ok(restoring || repo_git_write_conflicts_tx(tx, command_id, common_dir)?)
+}
+
+/// Different checkout restores may import immutable Git objects concurrently.
+/// Other repository writers still serialize with every restore.
+fn repo_git_write_conflicts_tx(
     tx: &Transaction<'_>,
     command_id: &str,
     common_dir: &str,

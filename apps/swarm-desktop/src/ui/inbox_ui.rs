@@ -34,6 +34,8 @@ pub(super) enum InboxMsg {
     /// Decide an item: its reference as shown, the choice (`recommended`,
     /// an offered choice or `snooze`) and the button's words.
     Decide(OwnerInboxItemRef, String, String),
+    /// Edit the reason for abandoning a retained reservation.
+    AbandonReason(OwnerInboxItemRef, String),
     /// Queue the shown harness sign-in directly through `auth.login`.
     AuthLogin(String, String),
     /// The direct sign-in result for one inbox revision.
@@ -74,6 +76,8 @@ pub(super) struct InboxState {
     /// One mutation id per item revision and choice, kept after an
     /// uncertain outcome so choosing it again retries the same decision.
     ids: HashMap<String, String>,
+    /// Reason entered for each exact revision, frozen while its decision ID is retained.
+    abandon_reasons: HashMap<String, String>,
     /// Items (cursors) whose decision is running.
     deciding: HashSet<String>,
     /// Harness and revision pairs whose direct sign-in call is running.
@@ -215,6 +219,19 @@ impl DesktopApp {
                 let Ok(data_dir) = self.data_dir.clone() else {
                     return;
                 };
+                let args = if choice == "abandon_reservation" {
+                    let Some(reason) = self
+                        .inbox
+                        .abandon_reasons
+                        .get(&key)
+                        .filter(|reason| !reason.trim().is_empty() && reason.len() <= 1024)
+                    else {
+                        return;
+                    };
+                    Some(serde_json::json!({ "confirm": true, "reason": reason }))
+                } else {
+                    None
+                };
                 let id = self
                     .inbox
                     .ids
@@ -229,11 +246,18 @@ impl DesktopApp {
                         id,
                         item,
                         choice: choice.clone(),
-                        args: None,
+                        args,
                     };
                     let result = client::block_on(client::owner_decide(&data_dir, &request));
                     Message::Inbox(InboxMsg::Decided(key, at, choice, words, Box::new(result)))
                 });
+            }
+            InboxMsg::AbandonReason(item, reason) => {
+                let at = cursor(&item);
+                let key = format!("{at}@{}:abandon_reservation", item.revision);
+                if !self.inbox.ids.contains_key(&key) {
+                    self.inbox.abandon_reasons.insert(key, reason);
+                }
             }
             InboxMsg::AuthLogin(harness, revision) => {
                 let task = format!("{harness}@{revision}");
@@ -289,6 +313,7 @@ impl DesktopApp {
                 let outcome = match *result {
                     Ok(reply) => {
                         inbox.ids.remove(&key);
+                        inbox.abandon_reasons.remove(&key);
                         let text = if reply.snoozed {
                             "Snoozed until something new happens on it.".to_owned()
                         } else {
@@ -507,6 +532,13 @@ impl DesktopApp {
                 (reference.clone(), choice.to_owned(), words.to_owned());
             context.message(Message::Inbox(InboxMsg::Decide(reference, choice, words)))
         };
+        let abandon_key = format!("{at}@{}:abandon_reservation", item.revision);
+        let abandon_reason = self
+            .inbox
+            .abandon_reasons
+            .get(&abandon_key)
+            .cloned()
+            .unwrap_or_default();
         let mut buttons: Vec<KeyedView> = Vec::new();
         if let Some(recommended) = &item.recommended {
             let words = choice_words(&recommended.choice);
@@ -537,6 +569,9 @@ impl DesktopApp {
                 continue;
             }
             let words = choice_words(&choice.choice);
+            let enabled = !busy
+                && (choice.choice != "abandon_reservation"
+                    || (!abandon_reason.trim().is_empty() && abandon_reason.len() <= 1024));
             // Sign-in is a direct auth.login operation; an answer needs the
             // question's own form, so open its Agent.
             let (label, click) = match (item.kind, choice.choice.as_str(), agent) {
@@ -551,17 +586,39 @@ impl DesktopApp {
                     format!("{words}…"),
                     context.message(Message::Inbox(InboxMsg::OpenAgent(agent.to_owned()))),
                 ),
+                (_, "abandon_reservation", _) => (
+                    "Confirm abandonment".to_owned(),
+                    decide(&choice.choice, &words),
+                ),
                 _ => (words.clone(), decide(&choice.choice, &words)),
             };
             buttons.push(KeyedView::new(
                 format!("choice:{}", choice.choice),
                 m3::outlined(palette)
-                    .is_enabled(!busy)
+                    .is_enabled(enabled)
                     .automation_name(format!("{label}: {subject}"))
                     .on_click(click)
                     .content(m3::label(&label)),
             ));
         }
+        let abandon_input: View = if item
+            .choices
+            .iter()
+            .any(|choice| choice.choice == "abandon_reservation")
+        {
+            m3::field()
+                .text(abandon_reason)
+                .is_enabled(!self.inbox.ids.contains_key(&abandon_key))
+                .placeholder_text("Reason for releasing the reservation")
+                .automation_name(format!("Reason to abandon reservation: {subject}"))
+                .on_text_changed(context.callback({
+                    let reference = reference.clone();
+                    move |text| Message::Inbox(InboxMsg::AbandonReason(reference.clone(), text))
+                }))
+                .into()
+        } else {
+            View::empty()
+        };
         buttons.push(KeyedView::new(
             "snooze",
             m3::text_button(palette)
@@ -618,6 +675,7 @@ impl DesktopApp {
                         )),
                     m3::secondary(reason).text_wrapping(TextWrapping::Wrap),
                     instructions,
+                    abandon_input,
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(tokens::spacing::SM)

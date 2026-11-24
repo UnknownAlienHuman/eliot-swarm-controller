@@ -830,9 +830,20 @@ same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner
 For a missing worktree with a retained checkpoint, the inbox instructions include
 `git worktree prune`, `git worktree add`, and the exact
 `swarm --data-dir <daemon-data> checkpoint restore --agent A --generation N
---checkpoint-ref REF --workspace PATH` command. Restore refuses a dirty or active
-target, a changed HEAD, a different Git common directory, and any unsafe or withheld
-checkpoint path.
+--checkpoint-ref REF --workspace PATH` command. The
+[restore contract](monitoring.md#work-recorded-in-git) defines target validation,
+workspace exclusion and restart reconciliation. An exact retry reads the retained
+receipt.
+
+An uncertain restore with a retained reservation appears in the Owner inbox as
+`unknown_command`, with subject `checkpoint_restore:<restore id>`. After
+inspecting the worktree and index, the Owner can choose
+`release_after_inspection`. Swarm checks the writer's custody again before
+releasing the reservation. The original receipt remains available for exact retry.
+For an armed writer, the inbox can also offer `stop_writer` to stop the
+verified family or `abandon_reservation` with `confirm=true` and a recorded
+`reason` when the Owner accepts the risk of an unproven exit. In the CLI, use
+`swarm inbox decide <item-ref> abandon_reservation --arg confirm=true --arg "reason=<reason>"`.
 
 Each stuck command has its own `command:<id>` subject, revision, snooze and
 decision receipt. It offers `command.get` (`inspect`). The available corrections

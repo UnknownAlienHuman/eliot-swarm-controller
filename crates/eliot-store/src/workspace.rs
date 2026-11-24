@@ -598,6 +598,10 @@ pub(super) fn managed_path_contains(root: &str, candidate: &str) -> bool {
         .all(|component| candidate.next() == Some(component))
 }
 
+pub(super) fn workspace_paths_overlap(first: &str, second: &str) -> bool {
+    managed_path_contains(first, second) || managed_path_contains(second, first)
+}
+
 pub(super) fn require_managed_path_ready(connection: &Connection, path: &str) -> Result<()> {
     // Check every containing root, including a non-ready parent of a nested checkout.
     // Stream only path/status candidates; never load frozen setup payloads here.
@@ -693,6 +697,7 @@ pub(super) fn gate_workspace_start(
 ) -> Result<()> {
     if let Some(path) = &agent.workspace {
         require_managed_path_ready(connection, path)?;
+        work_truth::require_no_checkpoint_restore(connection, path)?;
     }
     if let Some(workspace) = load_workspace(connection, parse_agent_id(&agent.id)?)?
         && (workspace.phase != WorkspacePhase::Ready
@@ -738,6 +743,7 @@ pub(super) fn require_workspace_removable(
     now: i64,
     fresh_refusal: bool,
 ) -> Result<()> {
+    work_truth::require_no_checkpoint_restore(connection, &workspace.worktree_path)?;
     // A worktree bound to a current project assignment is never removed,
     // borrowed or not: release the assignment first.
     if assignment_overlaps_workspace(connection, &workspace.worktree_path)? {
@@ -1710,30 +1716,6 @@ impl Store {
         load_workspace_by_path(&self.connection, path)
     }
 
-    /// Refuse a checkpoint restore while any live Agent owns this path or a
-    /// nested workspace below it.
-    pub fn workspace_has_active_agents(&self, path: &str) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        require_absolute_workspace_path(path)?;
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT workspace FROM agents WHERE workspace IS NOT NULL
-                 AND state IN ('created','starting','idle','busy','waiting','unknown')",
-            )
-            .map_err(sql_error)?;
-        let workspaces = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(sql_error)?;
-        for workspace in workspaces {
-            let workspace = workspace.map_err(sql_error)?;
-            if managed_path_contains(path, &workspace) || managed_path_contains(&workspace, path) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Physical cleanup must wait for every containing workspace's Git source to drain.
     pub fn has_open_git_sources_within(&self, worktree_path: &str) -> Result<bool> {
         require_absolute_workspace_path(worktree_path)?;
@@ -2113,6 +2095,10 @@ impl Store {
             ));
         }
         projects::validate_project_command_dispatch_tx(&tx, &command)?;
+        if work_truth::checkpoint_restore_overlaps(&tx, &workspace.worktree_path)? {
+            commit_transaction(tx, &self.write_faulted)?;
+            return Ok(WorkspaceGitReservation::Deferred);
+        }
         if repo_git_write_blocked_tx(&tx, command_id, &workspace.repo_common_dir)? {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(WorkspaceGitReservation::Deferred);

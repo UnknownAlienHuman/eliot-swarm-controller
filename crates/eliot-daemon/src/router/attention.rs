@@ -469,6 +469,7 @@ pub(crate) async fn run_attention(
     let mut liveness_ticks = interval(Duration::from_secs(180));
     liveness_ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut previous_stuck = eliot_store::StuckStates::new();
+    let mut restore_cursor = String::new();
     let mut liveness_result: Option<oneshot::Receiver<Result<eliot_store::StuckStates>>> = None;
     let suspicion_window = attention_duration(attention_config.no_progress.threshold_secs);
     let state = Arc::new(Mutex::new(AttentionState {
@@ -561,6 +562,15 @@ pub(crate) async fn run_attention(
                 &mut tasks,
             ),
             _ = liveness_ticks.tick(), if liveness_result.is_none() => {
+                match router.recheck_checkpoint_restore_writers(&restore_cursor).await {
+                    Ok(cursor) => restore_cursor = cursor,
+                    Err(error) => crate::logging::record(
+                        &router.secret_policy_snapshot(),
+                        "checkpoint.restore.recheck_failed",
+                        &[],
+                        Some(&error),
+                    ),
+                }
                 let (sender, receiver) = oneshot::channel();
                 let router = router.clone();
                 tasks.spawn(async move {

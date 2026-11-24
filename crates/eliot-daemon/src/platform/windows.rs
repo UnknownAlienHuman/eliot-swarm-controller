@@ -1107,6 +1107,10 @@ impl Job {
         Self::new_with_leaf_limit(true, None)
     }
 
+    pub(crate) fn new_named_leaf(name: &str) -> Result<Self> {
+        Self::new_with_leaf_limit(true, Some(name))
+    }
+
     fn new_with_leaf_limit(leaf: bool, name: Option<&str>) -> Result<Self> {
         let name = name.map(|name| {
             OsStr::new(name)
@@ -1234,6 +1238,17 @@ impl Drop for Job {
 /// nothing to terminate. Returns false only when the name is absent; a live
 /// Job must be observed empty within the bounded wait or the outcome is unknown.
 pub(crate) fn terminate_named_generation_job(name: &str) -> Result<bool> {
+    terminate_named_job(name, None)
+}
+
+pub(crate) fn terminate_named_restore_job(
+    name: &str,
+    expected: &eliot_core::ProcessIdentity,
+) -> Result<bool> {
+    terminate_named_job(name, Some(expected))
+}
+
+fn terminate_named_job(name: &str, expected: Option<&eliot_core::ProcessIdentity>) -> Result<bool> {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
     // JOB_OBJECT_TERMINATE (0x0008) plus the query-only rights from
     // Job::observer; neither is exported by windows-sys 0.61.2.
@@ -1247,6 +1262,28 @@ pub(crate) fn terminate_named_generation_job(name: &str) -> Result<bool> {
         } else {
             Err(io_error("open recorded custody Job Object", error))
         };
+    }
+    if let Some(expected) = expected {
+        let verified = job_members(handle).and_then(|(members, complete)| {
+            if complete && members.is_empty() {
+                return Ok(false);
+            }
+            if complete
+                && members.as_slice() == [expected.pid]
+                && recorded_process_alive(expected.pid, expected.start_time)?
+            {
+                return Ok(true);
+            }
+            Err(Error::new(
+                "custody_unproven",
+                "restore Job does not contain the exact recorded Git writer",
+            ))
+        });
+        if !matches!(verified, Ok(true)) {
+            // SAFETY: this function owns the handle and has not dispatched termination.
+            unsafe { CloseHandle(handle) };
+            return verified;
+        }
     }
     // SAFETY: handle was opened above and is not shared.
     let terminated = unsafe { TerminateJobObject(handle, 1) } != 0;

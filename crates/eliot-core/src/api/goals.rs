@@ -583,6 +583,39 @@ impl GoalCounters {
     }
 }
 
+/// Versioned checker-path identity snapshot stored with a Goal's starting point.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalScopeCheckIdentity {
+    /// Version of the retained checker-path identity contract.
+    pub version: u8,
+    /// Non-flag argv paths and their resolution state at baseline capture.
+    pub files: Vec<GoalScopeCheckFile>,
+    /// The interpreter's entry point could not be identified safely.
+    #[serde(default)]
+    pub unverified_entry_point: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalScopeCheckFile {
+    /// Original argv path, normalized lexically relative to the Git root.
+    pub path: String,
+    /// Whether the path was absent, unresolved, or resolved at baseline capture.
+    pub resolution: GoalScopeCheckResolution,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GoalScopeCheckResolution {
+    Missing,
+    Unresolved {
+        link_target: Option<String>,
+    },
+    Resolved {
+        target: String,
+        link_target: Option<String>,
+    },
+}
+
 /// Starting point Swarm records at `set` for a Goal with `scope` or
 /// `check_inputs`. Paths are relative to the Git root `root`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -595,9 +628,13 @@ pub struct GoalScopeBase {
     /// That content is the starting point, not the Goal's work.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub changed: BTreeMap<String, String>,
-    /// Workspace files named by the check argv; they count as check inputs.
+    /// Resolved workspace targets shown by the legacy Goal view.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_files: Vec<String>,
+    /// Versioned path identity snapshot. Missing means this is a legacy
+    /// baseline that cannot safely prove checker identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_identity: Option<GoalScopeCheckIdentity>,
 }
 
 impl GoalScopeBase {
