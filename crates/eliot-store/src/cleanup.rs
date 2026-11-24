@@ -950,6 +950,7 @@ impl Store {
                     plan_id: request.plan_id.clone(),
                     created_at: 0,
                     items: Vec::new(),
+                    inventory_issues: Vec::new(),
                     truncated: false,
                     continuation: None,
                 },

@@ -122,6 +122,7 @@ impl Router {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
             items,
+            inventory_issues: Vec::new(),
             truncated: false,
             continuation: None,
         })

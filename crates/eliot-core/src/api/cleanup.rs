@@ -335,10 +335,22 @@ pub struct CleanupCandidate {
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CleanupInventoryIssue {
+    pub agent: String,
+    pub generation: i64,
+    pub path: Option<String>,
+    pub reason: String,
+    pub detail: String,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupPlan {
     pub plan_id: String,
     pub created_at: i64,
     pub items: Vec<CleanupCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory_issues: Vec<CleanupInventoryIssue>,
     pub truncated: bool,
     /// Opaque token for the next page, absent when the listing is complete.
     /// Echo it as `continuation` to continue in final candidate order.
