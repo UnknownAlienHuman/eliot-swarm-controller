@@ -222,18 +222,26 @@ impl GitProbe {
 
         let mut edited = BTreeSet::new();
         let mut input = Vec::new();
+        let mut hint_bytes = 0;
         for path in edited_paths {
             if Instant::now() >= deadline {
                 return Err(unavailable("Git observation deadline elapsed"));
             }
-            let path = normalize_hint(root_text, path)?;
+            let path = git_path(&eliot_plugin::edit_path::normalize_from_canonical_root(
+                &root, path,
+            )?)?;
             if edited.insert(path.clone()) {
-                input.extend_from_slice(path.as_bytes());
-                input.push(0);
-                if input.len() > INPUT_BYTES {
+                hint_bytes += path.len() + 1;
+                if hint_bytes > INPUT_BYTES {
                     return Err(unavailable(
                         "edited-path input exceeds the observation bound",
                     ));
+                }
+                // By default Git check-ignore excludes paths in the index.
+                // The final index/status read still checks the same snapshot.
+                if !index.contains_key(&path) {
+                    input.extend_from_slice(path.as_bytes());
+                    input.push(0);
                 }
             }
         }

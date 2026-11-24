@@ -92,6 +92,12 @@ fn plain_path(path: &str) -> String {
 /// following a symlink/reparse point outside (or within) the selected worktree.
 pub fn normalize(workspace: &str, path: &str) -> Result<String> {
     let root = canonical_root(workspace)?;
+    normalize_from_canonical_root(&root, path)
+}
+
+/// Normalize another hint within a root validated for the current observation.
+/// Each target still gets its own link and canonical containment checks.
+pub fn normalize_from_canonical_root(root: &Path, path: &str) -> Result<String> {
     if path.is_empty() || path.contains('\0') {
         return Err(unavailable("file-change hint is empty or malformed"));
     }
@@ -145,7 +151,7 @@ pub fn normalize(workspace: &str, path: &str) -> Result<String> {
         canonical.push(component);
     }
     let relative = canonical
-        .strip_prefix(&root)
+        .strip_prefix(root)
         .map_err(|_| unavailable("file-change hint escapes its worktree"))?;
     let mut parts = Vec::new();
     for component in relative.components() {
