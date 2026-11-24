@@ -1,6 +1,18 @@
 use std::time::Duration;
 
-use tokio::time::{Instant, sleep_until};
+use tokio::time::Instant;
+
+/// Wait for an absolute deadline, or remain pending when no deadline exists.
+///
+/// The returned future is cancellation-safe: dropping it does not change the
+/// deadline, so a caller can recreate it in a `select!` loop without extending
+/// the wait.
+pub async fn wait_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// The adapter supplies native evidence. An unresolved effect alone never
 /// authorizes another attempt.
@@ -106,7 +118,7 @@ impl Retry {
         if deadline.is_some_and(|end| wake >= end) {
             return false;
         }
-        sleep_until(wake).await;
+        wait_until(Some(wake)).await;
         if deadline.is_some_and(|end| Instant::now() >= end) {
             return false;
         }
@@ -121,7 +133,7 @@ impl Retry {
     pub async fn wait_settle(&mut self, deadline: Instant) {
         debug_assert!(matches!(self.operation, RetryOperation::ReadinessSettle));
         let delay = readiness_settle_delay(self.retries);
-        sleep_until((Instant::now() + delay).min(deadline)).await;
+        wait_until(Some((Instant::now() + delay).min(deadline))).await;
         self.retries = self.retries.saturating_add(1);
     }
 }

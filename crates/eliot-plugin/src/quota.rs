@@ -1,5 +1,5 @@
 //! Bounded read-only provider transport. Provider URLs and projection belong to plugins.
-use eliot_core::{Error, FailureOrigin, Result};
+use eliot_core::{Error, FailureOrigin, ProviderRestriction, ProviderRestrictionKind, Result};
 use serde_json::{Value, json};
 use std::{
     io::Read,
@@ -17,6 +17,35 @@ pub fn provider(message: &'static str) -> Error {
     Error::new("quota_unavailable", message)
         .with_origin(FailureOrigin::Provider, "provider quota read failed")
 }
+
+/// Native evidence distinguishes a 429 rate limit from a quota exhaustion.
+#[derive(Clone, Copy)]
+pub enum HttpLimitKind {
+    RateLimit,
+    Quota,
+}
+
+/// Project only a confirmed upstream refusal, with its native 429 semantics.
+pub fn confirmed_http_restriction(
+    status: u16,
+    limit_kind: HttpLimitKind,
+    retry_after: Option<i64>,
+    code: Option<String>,
+) -> Option<ProviderRestriction> {
+    let kind = match (status, limit_kind) {
+        (403, _) => ProviderRestrictionKind::Auth,
+        (429, HttpLimitKind::RateLimit) => ProviderRestrictionKind::RateLimit,
+        (429, HttpLimitKind::Quota) => ProviderRestrictionKind::Quota,
+        _ => return None,
+    };
+    Some(ProviderRestriction {
+        kind,
+        retry_after,
+        code,
+        http_status: Some(status),
+    })
+}
+
 pub fn home() -> Result<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map(PathBuf::from)

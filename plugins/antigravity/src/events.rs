@@ -3066,13 +3066,9 @@ pub(crate) fn spawn(
                     Next::StreamClosed(changed.is_err())
                 }
                 callback = hook_rx.recv(), if hooks_open => Next::Hook(callback),
-                _ = async {
-                    if let Some(deadline) = native_terminal_deadline {
-                        tokio::time::sleep_until(deadline).await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => Next::NativeDeadline,
+                _ = eliot_plugin::retry::wait_until(native_terminal_deadline) => {
+                    Next::NativeDeadline
+                }
             };
             match next {
                 Next::NativeDeadline => {

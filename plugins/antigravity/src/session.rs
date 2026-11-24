@@ -1,6 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -1550,30 +1549,28 @@ pub(crate) fn stage_hook_config(
     };
     bytes.push(b'\n');
     let path = agents_dir.join("hooks.json");
-    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(file) => file,
-        Err(_) => {
-            if remove_agents_dir {
-                let _ = fs::remove_dir(&agents_dir);
-            }
-            let _ = fs::remove_dir(&root);
-            return Err(Error::new(
+    if let Err(error) = eliot_plugin::install::write_new_file(
+        &path,
+        &bytes,
+        eliot_plugin::install::OwnedFileDurability::Flush,
+        || {
+            Error::new(
                 "io_error",
                 "Could not create the owned Antigravity hook config",
-            ));
-        }
-    };
-    if file.write_all(&bytes).and_then(|()| file.flush()).is_err() {
-        drop(file);
-        let _ = fs::remove_file(&path);
+            )
+        },
+        || {
+            Error::new(
+                "io_error",
+                "Could not write the owned Antigravity hook config",
+            )
+        },
+    ) {
         if remove_agents_dir {
             let _ = fs::remove_dir(&agents_dir);
         }
         let _ = fs::remove_dir(&root);
-        return Err(Error::new(
-            "io_error",
-            "Could not write the owned Antigravity hook config",
-        ));
+        return Err(error);
     }
     // The bundled coordination skill rides the same discovery root:
     // `.agents/skills/eliot-swarm/` beside `hooks.json`, both
@@ -1606,27 +1603,23 @@ pub(crate) fn stage_hook_config(
                 )
             })?;
             let target = skill_dir.join(file);
-            let mut handle = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)
-                .map_err(|_| {
+            eliot_plugin::install::write_new_file(
+                &target,
+                text.as_bytes(),
+                eliot_plugin::install::OwnedFileDurability::Flush,
+                || {
                     Error::new(
                         "io_error",
                         "Could not create the owned Antigravity skill file",
                     )
-                })?;
-            if handle
-                .write_all(text.as_bytes())
-                .and_then(|()| handle.flush())
-                .is_err()
-            {
-                let _ = fs::remove_file(&target);
-                return Err(Error::new(
-                    "io_error",
-                    "Could not write the owned Antigravity skill file",
-                ));
-            }
+                },
+                || {
+                    Error::new(
+                        "io_error",
+                        "Could not write the owned Antigravity skill file",
+                    )
+                },
+            )?;
             skill_files.push(target);
         }
         Ok(())

@@ -1,7 +1,6 @@
 use std::{
     ffi::OsString,
-    fs::{self, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -86,22 +85,14 @@ impl ClaudeMcpConfigFile {
         let contents = serde_json::to_vec(&config)
             .map_err(|_| Error::new("internal", "Claude MCP config could not be encoded"))?;
         let path = instance_dir.join("claude-mcp-config.json");
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|_| Error::new("platform_io", "could not create Claude MCP config"))?;
-        let guard = Self { path };
-        let write_result = file.write_all(&contents).and_then(|()| file.sync_all());
-        drop(file);
-        if write_result.is_err() {
-            drop(guard);
-            return Err(Error::new(
-                "platform_io",
-                "could not write Claude MCP config",
-            ));
-        }
-        Ok(guard)
+        eliot_plugin::install::write_new_file(
+            &path,
+            &contents,
+            eliot_plugin::install::OwnedFileDurability::Sync,
+            || Error::new("platform_io", "could not create Claude MCP config"),
+            || Error::new("platform_io", "could not write Claude MCP config"),
+        )?;
+        Ok(Self { path })
     }
 
     pub(crate) fn path(&self) -> &Path {

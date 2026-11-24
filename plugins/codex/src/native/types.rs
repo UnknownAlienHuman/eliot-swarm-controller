@@ -548,11 +548,11 @@ impl NativeTurnError {
         }
     }
 
-    /// Project only installed 0.161 structured restriction codes. Free text,
+    /// Project only structured upstream restriction codes. Free text,
     /// extra details, unrelated statuses and unknown future variants stay inert.
     pub(crate) fn provider_restriction(&self) -> Option<ProviderRestriction> {
         let error_info = self.codex_error_info.as_ref()?;
-        let (kind, code, http_status) = match error_info {
+        match error_info {
             serde_json::Value::String(code) => {
                 let kind = match code.as_str() {
                     "rateLimitExceeded" => ProviderRestrictionKind::RateLimit,
@@ -560,7 +560,12 @@ impl NativeTurnError {
                     "unauthorized" => ProviderRestrictionKind::Auth,
                     _ => return None,
                 };
-                (kind, code.clone(), None)
+                Some(ProviderRestriction {
+                    kind,
+                    retry_after: None,
+                    code: Some(code.clone()),
+                    http_status: None,
+                })
             }
             serde_json::Value::Object(variants) if variants.len() == 1 => {
                 let (variant, details) = variants.iter().next()?;
@@ -573,22 +578,16 @@ impl NativeTurnError {
                 ) {
                     return None;
                 }
-                let http_status = details.as_object()?.get("httpStatusCode")?.as_u64()?;
-                let (kind, http_status) = match http_status {
-                    403 => (ProviderRestrictionKind::Auth, Some(403)),
-                    429 => (ProviderRestrictionKind::RateLimit, Some(429)),
-                    _ => return None,
-                };
-                (kind, variant.clone(), http_status)
+                let status = details.as_object()?.get("httpStatusCode")?.as_u64()?;
+                eliot_plugin::quota::confirmed_http_restriction(
+                    u16::try_from(status).ok()?,
+                    eliot_plugin::quota::HttpLimitKind::RateLimit,
+                    None,
+                    Some(variant.clone()),
+                )
             }
-            _ => return None,
-        };
-        Some(ProviderRestriction {
-            kind,
-            retry_after: None,
-            code: Some(code),
-            http_status,
-        })
+            _ => None,
+        }
     }
 
     /// Only a structured rejection of an upstream request qualifies. A broken

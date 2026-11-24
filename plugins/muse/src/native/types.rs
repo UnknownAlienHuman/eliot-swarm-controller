@@ -652,12 +652,13 @@ impl NativeTurnError {
                         .or_else(|| at.as_u64().map(|_| i64::MAX))
                 })
                 .or_else(|| http_quota.as_ref()?.retry_after);
+            let code = (quota.limit_kind == "tierLimit")
+                .then(|| "tierLimit".to_owned())
+                .or_else(|| http_quota.as_ref()?.code.clone());
             return Some(ProviderRestriction {
                 kind: ProviderRestrictionKind::Quota,
                 retry_after,
-                code: (quota.limit_kind == "tierLimit")
-                    .then(|| "tierLimit".to_owned())
-                    .or_else(|| http_quota.as_ref()?.code.clone()),
+                code,
                 http_status: http_quota.and_then(|restriction| restriction.http_status),
             });
         }
@@ -695,12 +696,12 @@ fn muse_api_quota_restriction(message: &str) -> Option<ProviderRestriction> {
         .split_once("Your usage window resets at ")
         .and_then(|(_, reset)| reset.strip_suffix('.'))
         .and_then(|reset| eliot_plugin::quota::reset(Some(&Value::String(reset.to_owned()))));
-    Some(ProviderRestriction {
-        kind: ProviderRestrictionKind::Quota,
+    eliot_plugin::quota::confirmed_http_restriction(
+        429,
+        eliot_plugin::quota::HttpLimitKind::Quota,
         retry_after,
         code,
-        http_status: Some(429),
-    })
+    )
 }
 
 /// `turn/completed` params: the run's durable terminal record landed.

@@ -4177,12 +4177,7 @@ async fn run(
                 processor.handle_frame(frame).await;
                 processor.report_gap_if_queue_empty(frames.is_empty()).await;
             }
-            _ = async {
-                match terminal_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            } => {
+            _ = eliot_plugin::retry::wait_until(terminal_deadline) => {
                 if let Err(error) = processor.expire_terminal_deadline().await {
                     processor.status.source_unknown = true;
                     processor.status.failure.get_or_insert(*error.message);

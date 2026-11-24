@@ -928,6 +928,12 @@ Contain owned children before tools run; use absolute deadlines. Drain buffered 
 output before declaring loss. Plugin replacement never rebinds an uncertain old call.
 Persisted facts backpressure; ephemeral telemetry may drop with visible lag.
 
+Use the shared [`retry`](../../crates/eliot-plugin/src/retry.rs) module for readiness
+polls and absolute deadline waits. Adapters translate native resume readback into shared
+preflight evidence. They translate exact native provider refusals into the common
+restriction fact so the daemon and Store can apply hold policy. Shared file installation
+owns exclusive creation and partial-write cleanup for staged hook and configuration files.
+
 All adapters follow the shared [native data rule](../../crates/eliot-plugin/src/native_data.rs).
 Skip extra fields. Decode an unfamiliar enum value as `Other` and emit a diagnostic.
 Record an unfamiliar event as a `session.native_unclassified` native fact and keep

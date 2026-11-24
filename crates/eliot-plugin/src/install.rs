@@ -8,8 +8,47 @@
 //! `crates/eliot-daemon/src/adhoc.rs`).
 
 use eliot_core as core;
-use std::path::{Path, PathBuf};
-use std::{collections::HashMap, sync::OnceLock};
+use std::{
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
+
+/// Durability requested by the adapter after writing an owned file.
+#[derive(Clone, Copy)]
+pub enum OwnedFileDurability {
+    Flush,
+    Sync,
+}
+
+/// Create and write one exclusively owned file, removing a partial file if
+/// writing or the requested durability step fails. Adapter-specific errors
+/// and durability remain at the call site.
+pub fn write_new_file(
+    path: &Path,
+    contents: &[u8],
+    durability: OwnedFileDurability,
+    create_error: impl FnOnce() -> core::Error,
+    write_error: impl FnOnce() -> core::Error,
+) -> core::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| create_error())?;
+    let write_result = file.write_all(contents).and_then(|()| match durability {
+        OwnedFileDurability::Flush => file.flush(),
+        OwnedFileDurability::Sync => file.sync_all(),
+    });
+    if write_result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(write_error());
+    }
+    Ok(())
+}
 
 static INSTALL_DECLARATIONS: OnceLock<HashMap<&'static str, InstallDiscovery>> = OnceLock::new();
 
