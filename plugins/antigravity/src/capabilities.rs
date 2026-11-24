@@ -5,7 +5,7 @@ use eliot_core::api::harness::{
     NativeRoute, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
-use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
+use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities, OwnerRulesDeliveryMethod};
 use eliot_core::{InjectPoint, McpPolicy};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 use serde_json::Value;
@@ -47,6 +47,7 @@ pub fn declaration() -> HarnessCapabilities {
         native_access_bounds: Some(native_access_bounds),
         effort: true,
         prepared_mcp_config: true,
+        owner_rules_delivery: OwnerRulesDeliveryMethod::FirstInput,
         user_instruction_files: Some(UserInstructionFiles {
             root_override_env: None,
             home_subdir: ".gemini",

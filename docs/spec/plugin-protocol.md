@@ -182,7 +182,8 @@ install engine reads the adapter's candidate search, executable identity and
 verification requirements before resolving a native executable. The profile
 parser owns the input vocabulary used for offline settings validation.
 Adapters declare their project instruction-file behavior and the user instruction
-paths that doctor compares with committed owner rules.
+paths that doctor compares with committed owner rules. They also declare how the
+daemon routes the shared rules at start or on first input.
 The controller and offline desktop settings editor register the same profile
 capabilities from the built-in adapters before using them. Store entry points
 return an error when registration is missing. Adapter declarations identify

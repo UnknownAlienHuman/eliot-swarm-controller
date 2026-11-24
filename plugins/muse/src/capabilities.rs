@@ -8,6 +8,7 @@ use eliot_core::api::harness::{
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
     ConfigureSessionMode, HarnessCapabilities, InstructionReadStatus::NotNative,
+    OwnerRulesDeliveryMethod,
 };
 use eliot_core::{InjectPoint, McpPolicy};
 use eliot_plugin::capabilities::{
@@ -61,6 +62,7 @@ pub fn declaration() -> HarnessCapabilities {
         documentation_section: Some("docs/harnesses/muse.md#usage-attribution"),
         native_access_bounds: Some(native_access_bounds),
         data_root_only_mcp: true,
+        owner_rules_delivery: OwnerRulesDeliveryMethod::FirstInput,
         project_instruction_read: Some(instruction_files(&[
             ("AGENTS.md", NotNative),
             ("AGENTS.override.md", NotNative),

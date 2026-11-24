@@ -5338,11 +5338,10 @@ fn update_command_state(
         ));
     }
     write_command_state(tx, id, state, outcome, generation, now)?;
-    settle_owner_rules_input_failure_tx(tx, id, state, outcome)?;
     provider_holds::command_terminal_tx(tx, id, previous, state, now)
 }
 
-fn settle_owner_rules_input_failure_tx(
+fn settle_owner_rules_failure_tx(
     tx: &Transaction<'_>,
     command_id: &str,
     state: CommandState,
@@ -5361,18 +5360,35 @@ fn settle_owner_rules_input_failure_tx(
         }
         _ => return Ok(()),
     };
-    let target: Option<Option<i64>> = tx
+    let binding: Option<(Option<i64>, String, Option<i64>)> = tx
         .query_row(
-            "SELECT target FROM commands WHERE id = ?1 AND verb = 'send'",
+            "SELECT target, verb, generation FROM commands
+             WHERE id = ?1 AND verb IN ('launch', 'send')",
             [command_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()
         .map_err(sql_error)?;
-    let Some(agent_num) = target.flatten() else {
+    let Some((Some(agent_num), verb, generation)) = binding else {
         return Ok(());
     };
-    update_owner_rules_input_status(tx, agent_num, command_id, status)
+    if verb == "send" {
+        return update_owner_rules_input_status(tx, agent_num, command_id, status);
+    }
+    // A definite launch failure can close an unbound receipt for this
+    // generation. An uncertain start can still acquire its first input.
+    if status == OwnerRulesDeliveryStatus::NotDelivered {
+        tx.execute(
+            "UPDATE agents SET owner_rules_delivery =
+                json_set(owner_rules_delivery, '$.view.status', json(?1))
+             WHERE id = ?2 AND generation = ?3
+               AND json_extract(owner_rules_delivery, '$.view.status') = 'pending'
+               AND json_extract(owner_rules_delivery, '$.input_command_id') IS NULL",
+            params![encode_json(&status)?, agent_num, generation],
+        )
+        .map_err(sql_error)?;
+    }
+    Ok(())
 }
 
 fn update_owner_rules_input_status(
@@ -5415,13 +5431,20 @@ fn write_command_state(
     generation: Option<i64>,
     now: i64,
 ) -> Result<()> {
-    let outcome = outcome.map(encode_json).transpose()?;
+    let encoded_outcome = outcome.map(encode_json).transpose()?;
     db!(tx.execute(
         "UPDATE commands
          SET state = ?1, outcome = ?2, generation = COALESCE(?3, generation), updated_at = ?4
          WHERE id = ?5",
-        params![command_state_name(state), outcome, generation, now, id],
+        params![
+            command_state_name(state),
+            encoded_outcome,
+            generation,
+            now,
+            id
+        ],
     ));
+    settle_owner_rules_failure_tx(tx, id, state, outcome)?;
     coordination::settle_notice_terminal_tx(tx, id, state, now)?;
     handoff::refresh_parent_tx(tx, id, now)?;
     switch::refresh_disposal_parent_tx(tx, id, state, now)

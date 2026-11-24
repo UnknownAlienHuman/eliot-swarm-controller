@@ -373,12 +373,14 @@ The first-input fallback enforces the existing 64 KiB persisted-text budget.
 
 Codex receives the frozen text through native thread developer instructions.
 Claude uses `--append-system-prompt-file` with an owned instance file. OpenCode v2
-loads the instance's isolated `AGENTS.md`. Muse and Antigravity receive a fenced
-owner rules block in the first input after any quoted project-source data.
+loads the instance's isolated `AGENTS.md`. The Muse and Antigravity adapters declare
+first-input delivery. The daemon appends a fenced owner rules block after any
+quoted project-source data, including when the first input is a later `send`.
 
-A launch records `pending` independently of the linked input. If the required
-receipt cannot be bound, the daemon records `not_delivered` when the launch still
-owns the Agent row and refuses the launch. The first eligible send records
+A launch records `pending` independently of the linked input. A definite launch
+failure, rejection or cancellation settles an unbound receipt for that generation
+as `not_delivered` in the same Store transaction. A successful launch without input
+keeps the receipt pending until the first eligible send. That send records
 `offered` before native dispatch, whether that send is linked or submitted later.
 The committed native association of the exact rules-bearing send records
 `delivered=true`. A rejected input records `not_delivered`. An uncertain delivery
