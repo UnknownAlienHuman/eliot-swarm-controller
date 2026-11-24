@@ -207,7 +207,8 @@ pub async fn cleanup_apply_and_wait(
     let mut wait = matches!(initial_state, CleanupJobState::Running);
     loop {
         if wait {
-            tokio::time::sleep(CLEANUP_STATUS_POLL_INTERVAL).await;
+            tokio::time::sleep_until(tokio::time::Instant::now() + CLEANUP_STATUS_POLL_INTERVAL)
+                .await;
         }
         let status: CleanupJobStatus =
             eliot_daemon::client_call_typed(data_dir, "cleanup.status", &status_request)
