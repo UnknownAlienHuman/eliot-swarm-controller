@@ -570,10 +570,12 @@ fn handoff_step(
         } else {
             ""
         };
-        (
-            "handed_off",
-            format!("Handoff ({why}). Continued on {destination} ({profile}).{uncertain}"),
-        )
+        let message = if let Some(message) = data["message"].as_str() {
+            format!("{message} ({destination}).{uncertain}")
+        } else {
+            format!("Handoff ({why}). Continued on {destination} ({profile}).{uncertain}")
+        };
+        ("handed_off", message)
     } else if event.kind == eliot_store::HANDOFF_WAITING {
         (
             "handoff_waiting",

@@ -197,16 +197,24 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
 /// Direct Codex presets share the provider session route. For adopted routes,
 /// the Responses endpoint identifies the route across renamed presets.
 pub fn same_codex_provider_route(source: &Value, candidate: &Value) -> bool {
-    fn endpoint(snapshot: &Value) -> Option<&str> {
+    fn endpoint(snapshot: &Value) -> Option<Url> {
         snapshot
             .pointer("/route_binding/provider_base_url")
             .and_then(Value::as_str)
-            .map(|url| url.trim_end_matches('/'))
+            .and_then(|url| validate_http_url(url).ok())
     }
 
-    source["harness"] == "codex"
-        && candidate["harness"] == "codex"
-        && endpoint(source) == endpoint(candidate)
+    if source["harness"] != "codex" || candidate["harness"] != "codex" {
+        return false;
+    }
+    match (endpoint(source), endpoint(candidate)) {
+        (Some(source), Some(candidate)) => {
+            source.origin() == candidate.origin()
+                && source.path().trim_end_matches('/') == candidate.path().trim_end_matches('/')
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Why `candidate` may not take over work from `source` automatically or at a
