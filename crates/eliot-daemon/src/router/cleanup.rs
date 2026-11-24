@@ -1291,12 +1291,19 @@ impl Router {
     ) -> Result<Value> {
         let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
-        let request: CleanupPlanRequest = coordination::decode_coordination_request(
+        let mut request: CleanupPlanRequest = coordination::decode_coordination_request(
             params,
             &self.inner.secrets,
             "cleanup.plan",
             CleanupPlanRequest::validate,
         )?;
+        if request.scope == CleanupScope::Default {
+            request.scope = if matches!(principal, Principal::Owner) {
+                CleanupScope::All
+            } else {
+                CleanupScope::SelfTree
+            };
+        }
         let name = principal_name(principal);
         let mut page = request
             .continuation

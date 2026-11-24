@@ -32,10 +32,11 @@ pub(crate) async fn run_cleanup(
                 .transpose()
                 .map_err(Failure::for_read)?;
             let request = CleanupPlanRequest {
-                scope: match scope.as_str() {
-                    "all" => CleanupScope::All,
-                    "project" => CleanupScope::Project,
-                    _ => CleanupScope::SelfTree,
+                scope: match scope.as_deref() {
+                    Some("all") => CleanupScope::All,
+                    Some("project") => CleanupScope::Project,
+                    Some(_) => CleanupScope::SelfTree,
+                    None => CleanupScope::Default,
                 },
                 project,
                 older_than,

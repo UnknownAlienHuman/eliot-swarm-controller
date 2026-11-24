@@ -438,7 +438,9 @@ impl Store {
                 "Agents may clean only their own subtree",
             ));
         }
-        if matches!(caller, Sender::Owner) && request.scope == CleanupScope::SelfTree {
+        if matches!(caller, Sender::Owner)
+            && !matches!(request.scope, CleanupScope::Project | CleanupScope::All)
+        {
             return Err(Error::new("invalid", "Owner must select project or all"));
         }
         let snapshot: i64 = match page.snapshot_seq {

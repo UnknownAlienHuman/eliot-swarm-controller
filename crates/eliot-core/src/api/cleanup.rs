@@ -102,9 +102,13 @@ pub struct CleanupGitBinding {
     pub planned_tip: Option<String>,
 }
 
-#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupScope {
+    #[default]
+    Default,
     SelfTree,
     Project,
     All,
@@ -113,6 +117,7 @@ pub enum CleanupScope {
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupPlanRequest {
+    #[serde(default)]
     pub scope: CleanupScope,
     #[serde(default)]
     pub project: Option<String>,

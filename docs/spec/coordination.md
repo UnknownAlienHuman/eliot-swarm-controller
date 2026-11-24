@@ -29,9 +29,10 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
-`cleanup.plan {scope:self_tree|project|all,project?,older_than?,continuation?}` changes
+`cleanup.plan {scope?:self_tree|project|all,project?,older_than?,continuation?}` changes
 no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
+Omitted scope resolves to `all` for the authenticated Owner and `self_tree` for Agents.
 Backfill reports an unreadable or missing source in the page's `inventory_issues`
 with Agent, generation, path when available, and bounded reason and detail. It
 continues inventory for other entries. These diagnostics grant no cleanup authority.

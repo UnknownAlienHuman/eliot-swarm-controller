@@ -251,8 +251,8 @@ pub(crate) struct CleanupArgs {
 #[derive(Subcommand)]
 pub(crate) enum CleanupCommand {
     Plan {
-        #[arg(long, default_value="self_tree", value_parser=["self_tree","project","all"])]
-        scope: String,
+        #[arg(long, value_parser=["self_tree","project","all"])]
+        scope: Option<String>,
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
