@@ -611,7 +611,8 @@ to install [review-after-turn.toml](../../config/recipes/review-after-turn.toml)
 through the existing rule save API. To replace an existing file, supply its
 `--expected-revision` from `swarm rule read`. Approve launch, initial send and
 inject in the project registration. Use a distinct reviewer profile with native
-read-only permissions. The Owner explicitly installs the recipe because it
+read-only permissions. The installer requires all three setup tokens to resolve
+before it saves the rule. The Owner explicitly installs the recipe because it
 launches a reviewer and delivers its result.
 An assigned project reserves launches for its current team. To review from a separate
 checkout in that case, install an Owner rule, constrain the author's project in the

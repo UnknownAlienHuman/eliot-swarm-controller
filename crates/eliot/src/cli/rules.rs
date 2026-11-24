@@ -447,21 +447,23 @@ pub(crate) async fn run_rule(
                 return Err(Failure::new(2, "review workspace must be an absolute path"));
             }
             let template = include_str!("../../../../config/recipes/review-after-turn.toml");
-            let content = template
-                .lines()
-                .map(|line| {
-                    if line.starts_with("on = ") && line.contains("\"author-profile\"") {
-                        line.replace("\"author-profile\"", &json!(author).to_string())
-                    } else if line == "profile = \"reviewer-profile\"" {
-                        format!("profile = {}", json!(reviewer))
-                    } else if line == "workspace = \"C:/src/app\"" {
-                        format!("workspace = {}", json!(workspace))
-                    } else {
-                        line.to_owned()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut content = template.to_owned();
+            for (token, value) in [
+                ("\"{{REVIEW_AUTHOR}}\"", &author),
+                ("\"{{REVIEW_REVIEWER}}\"", &reviewer),
+                ("\"{{REVIEW_WORKSPACE}}\"", &workspace),
+            ] {
+                if !template.contains(token) || value.contains("{{") {
+                    return Err(Failure::new(
+                        2,
+                        "invalid review recipe placeholder or value",
+                    ));
+                }
+                content = content.replace(token, &json!(value).to_string());
+            }
+            if content.contains("{{") {
+                return Err(Failure::new(2, "unresolved review recipe placeholder"));
+            }
             let request = RuleSaveRequest {
                 project: Some(project),
                 path: "review-after-turn.toml".to_owned(),
