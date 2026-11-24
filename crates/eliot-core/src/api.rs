@@ -13,6 +13,7 @@ mod cleanup;
 pub use checkpoint::*;
 pub use child_run::*;
 pub use cleanup::*;
+pub mod auth_login;
 mod config_views;
 mod coordination;
 mod digests;
