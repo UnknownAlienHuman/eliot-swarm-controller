@@ -1004,6 +1004,10 @@ of the explicitly selected release scope.
       Native first-token time is not exposed by the consumed completed-message
       surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
 
+  - [x] **Muse native allowance.** On a private Windows stand with Muse Code
+    1.4.25, two Owner quota calls returned the same provider windows. The
+    process log recorded one native read and one cache hit. Zero model turns.
+
 ## M1 — Memory one-shot inference (#199)
 
 - [x] **M1.1 Scoped first call.** Closed bounded DTOs, one actual non-agentic native
