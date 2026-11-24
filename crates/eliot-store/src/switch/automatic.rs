@@ -338,7 +338,7 @@ fn current_withheld_turn(
                    AND t.turn_id = json_extract(e.data, '$.turn_id')
                  JOIN commands c ON c.id = json_extract(e.data, '$.task_command')
                  WHERE e.seq = ?3 AND e.kind = 'provider.response_withheld'
-                   AND e.source = 'provider' AND e.agent = ?1 AND e.generation = ?2
+                   AND e.source = 'daemon' AND e.agent = ?1 AND e.generation = ?2
                    AND t.start_command_id = c.id AND t.state = 'completed'
                    AND t.outcome = 'failure' AND t.resolution_source IS NULL
                    AND t.insertion_seq = (
@@ -566,7 +566,7 @@ impl Store {
                  JOIN agents a ON a.id = e.agent AND a.generation = e.generation
                  JOIN turns t ON t.agent = a.id AND t.generation = a.generation
                    AND t.turn_id = json_extract(e.data, '$.turn_id')
-                 WHERE e.kind = 'provider.response_withheld' AND e.source = 'provider'
+                 WHERE e.kind = 'provider.response_withheld' AND e.source = 'daemon'
                    AND a.state IN ('idle','lost','failed') AND a.chat = 0
                    AND a.observe_only = 0 AND a.archived = 0 AND a.project <> ''
                    AND NOT EXISTS(SELECT 1 FROM agent_successors s
