@@ -288,9 +288,10 @@ pub(crate) fn verify_stand_codex_route(
             path.is_absolute() && crate::operator::data_dirs_match(path, &home)
         })
     };
-    if CODEX_STORE_SELECTORS
-        .iter()
-        .all(|&name| matches_home(&environment[name]))
+    if profile["stand_native_store"] == true
+        && CODEX_STORE_SELECTORS
+            .iter()
+            .all(|&name| matches_home(&environment[name]))
         && profile
             .get("native_store_binding")
             .is_none_or(|binding| matches_home(&binding["home"]) && matches_home(&binding["root"]))
@@ -378,6 +379,9 @@ pub(crate) fn capture_native_store_inputs(
     let policy = core::SecretPolicy::new(credentials.iter().map(String::as_str));
     let mut snapshot = profile.clone();
     snapshot["pass_env_values"] = captured;
+    if home.is_some() {
+        snapshot["stand_native_store"] = Value::Bool(true);
+    }
     if snapshot.get("harness").and_then(Value::as_str).is_some() {
         let identity = native_route_identity(&snapshot, |name| {
             if let Some(selector) = native_store_selector(name)

@@ -1552,7 +1552,7 @@ async fn read_store_config(
     Ok((store, config))
 }
 
-fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
+pub(crate) fn pinned_launch(launch: &NativeLaunch, root: &Path) -> Result<NativeLaunch> {
     let root = root.to_str().ok_or_else(unverified_store)?;
     // serde_json emits escapes valid in a TOML basic string; argv goes directly
     // to Codex, never through a shell. Pin before process-scoped store creation.
