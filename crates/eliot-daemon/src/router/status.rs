@@ -19,8 +19,11 @@ use std::{
 };
 use tokio::sync::watch;
 
-const DISK_USAGE_CACHE_TTL: Duration = Duration::from_secs(30);
+const DISK_USAGE_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const DISK_USAGE_SCAN_REST_MULTIPLIER: u32 = 64;
 const DISK_USAGE_SCAN_WAIT: Duration = Duration::from_millis(500);
+const DISK_USAGE_BUCKET_TIME: Duration = Duration::from_secs(3);
+const DISK_USAGE_BUCKET_ENTRIES: usize = 500_000;
 
 static DISK_USAGE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<DiskUsageCacheEntry>>>> =
     OnceLock::new();
@@ -39,6 +42,7 @@ struct DiskUsageCacheState {
 #[derive(Clone)]
 struct DiskUsageSnapshot {
     completed_at: Instant,
+    refresh_delay: Duration,
     artifacts: eliot_core::api::DiskUsageDirectory,
     worktrees: eliot_core::api::DiskUsageDirectory,
     plugins: eliot_core::api::DiskUsageDirectory,
@@ -55,23 +59,28 @@ impl DiskUsageCacheEntry {
 }
 
 impl DiskUsageSnapshot {
-    fn scan(root: &Path) -> Self {
+    fn scan(root: &Path, started_at: Instant) -> Self {
         let artifacts = disk_usage_directory(&root.join("artifacts"));
         let worktrees = disk_usage_directory(&root.join("worktrees"));
         let plugins = disk_usage_directory(&root.join("plugins"));
         Self {
             completed_at: Instant::now(),
+            refresh_delay: disk_usage_refresh_delay(started_at),
             artifacts,
             worktrees,
             plugins,
         }
     }
 
-    fn view(&self) -> eliot_core::api::DiskUsageView {
+    fn view(&self, refreshing: bool) -> eliot_core::api::DiskUsageView {
         eliot_core::api::DiskUsageView {
             artifacts: self.artifacts.clone(),
             worktrees: self.worktrees.clone(),
             plugins: self.plugins.clone(),
+            snapshot_age_ms: Some(
+                u64::try_from(self.completed_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ),
+            refreshing,
             owner_decision_worktrees: None,
             owner_decision_error_code: Some("unavailable".to_owned()),
         }
@@ -100,7 +109,7 @@ impl Router {
             .map_err(|_| Error::new("internal", "autonomy report could not be encoded"))
     }
 
-    pub(super) async fn status(&self) -> Result<Value> {
+    pub(super) async fn status(&self, disk_usage_freshness: bool) -> Result<Value> {
         let eliot_store::OwnerProjection {
             items: inbox,
             liveness,
@@ -121,10 +130,13 @@ impl Router {
         let drain = self.drain_report().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();
-        let disk_usage = Some(
-            self.disk_usage_view(&automatic_cleanup, owner_decision_count)
-                .await,
-        );
+        let mut disk_usage = self
+            .disk_usage_view(&automatic_cleanup, owner_decision_count)
+            .await;
+        if !disk_usage_freshness {
+            disk_usage.snapshot_age_ms = None;
+            disk_usage.refreshing = false;
+        }
         let mode = self.mode_name();
         let (
             agent_count,
@@ -219,7 +231,7 @@ impl Router {
             cloud_mcp: crate::cloud_mcp::service_snapshot(),
             automation_tasks: self.inner.worker_tasks.lock_recover().clone(),
             automatic_cleanup: Some(automatic_cleanup),
-            disk_usage,
+            disk_usage: Some(disk_usage),
             unknown_commands_count,
             unknown_commands,
             unknown_commands_truncated,
@@ -236,11 +248,10 @@ impl Router {
         .map_err(|_| Error::new("internal", "daemon status could not be encoded"))
     }
 
-    /// Complete logical-byte scans run off the async executor and serialize
-    /// so concurrent status clients cannot multiply filesystem work. A
-    /// missing bucket is exactly zero; any incomplete walk reports no partial
-    /// total and carries its error code. The worktree scan starts at the root,
-    /// so it includes both legacy `worktrees/<ULID>` paths and current named
+    /// Bounded logical-byte scans serialize off the async executor. Repeat
+    /// status calls reuse the last snapshot while a refresh is in flight.
+    /// A missing bucket is zero and an incomplete walk carries an error code.
+    /// The worktree scan includes both legacy `worktrees/<ULID>` paths and named
     /// project/Agent worktrees without relying on Store registrations.
     async fn disk_usage_view(
         &self,
@@ -250,52 +261,43 @@ impl Router {
         let root = self.inner.data_root.clone();
         let entry = disk_usage_cache_entry(&root);
         let mut changed = entry.changed.subscribe();
-        let fresh = {
+        let (snapshot, refreshing) = {
             let mut state = entry.state.lock_recover();
-            if let Some(snapshot) = state
-                .snapshot
-                .as_ref()
-                .filter(|snapshot| snapshot.completed_at.elapsed() <= DISK_USAGE_CACHE_TTL)
+            if !state.refreshing
+                && state.snapshot.as_ref().is_none_or(|snapshot| {
+                    snapshot.completed_at.elapsed() >= snapshot.refresh_delay
+                })
             {
-                Some(snapshot.clone())
-            } else {
-                if !state.refreshing {
-                    state.refreshing = true;
-                    let worker_entry = entry.clone();
-                    let worker_root = root.clone();
-                    drop(tokio::task::spawn_blocking(move || {
-                        let snapshot =
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                DiskUsageSnapshot::scan(&worker_root)
-                            }))
-                            .unwrap_or_else(|_| failed_disk_usage_snapshot("unavailable"));
-                        let mut state = worker_entry.state.lock_recover();
-                        state.snapshot = Some(snapshot);
-                        state.refreshing = false;
-                        drop(state);
-                        worker_entry
-                            .changed
-                            .send_modify(|version| *version = version.wrapping_add(1));
-                    }));
-                }
-                None
+                state.refreshing = true;
+                let worker_entry = entry.clone();
+                drop(tokio::task::spawn_blocking(move || {
+                    let started_at = Instant::now();
+                    let snapshot = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        DiskUsageSnapshot::scan(&root, started_at)
+                    }))
+                    .unwrap_or_else(|_| failed_disk_usage_snapshot("unavailable", started_at));
+                    let mut state = worker_entry.state.lock_recover();
+                    state.snapshot = Some(snapshot);
+                    state.refreshing = false;
+                    drop(state);
+                    worker_entry
+                        .changed
+                        .send_modify(|version| *version = version.wrapping_add(1));
+                }));
             }
+            (state.snapshot.clone(), state.refreshing)
         };
-        let snapshot = if fresh.is_some() {
-            fresh
-        } else {
+        let (snapshot, refreshing) = if snapshot.is_none() && refreshing {
             let _ = tokio::time::timeout(DISK_USAGE_SCAN_WAIT, changed.changed()).await;
-            entry
-                .state
-                .lock_recover()
-                .snapshot
-                .clone()
-                .filter(|snapshot| snapshot.completed_at.elapsed() <= DISK_USAGE_CACHE_TTL)
+            let state = entry.state.lock_recover();
+            (state.snapshot.clone(), state.refreshing)
+        } else {
+            (snapshot, refreshing)
         };
         let mut view = snapshot
             .as_ref()
-            .map(DiskUsageSnapshot::view)
-            .unwrap_or_else(|| failed_disk_usage("busy"));
+            .map(|snapshot| snapshot.view(refreshing))
+            .unwrap_or_else(|| failed_disk_usage("busy", refreshing));
         match cleanup.last_sweep.as_ref() {
             Some(sweep) if sweep.error_code.is_none() => {
                 view.owner_decision_worktrees = Some(owner_decision_count);
@@ -799,7 +801,7 @@ fn retention_view_of(
     }
 }
 
-fn failed_disk_usage(code: &str) -> eliot_core::api::DiskUsageView {
+fn failed_disk_usage(code: &str, refreshing: bool) -> eliot_core::api::DiskUsageView {
     let failed = || eliot_core::api::DiskUsageDirectory {
         bytes: None,
         error_code: Some(code.to_owned()),
@@ -808,6 +810,8 @@ fn failed_disk_usage(code: &str) -> eliot_core::api::DiskUsageView {
         artifacts: failed(),
         worktrees: failed(),
         plugins: failed(),
+        snapshot_age_ms: None,
+        refreshing,
         owner_decision_worktrees: None,
         owner_decision_error_code: Some(code.to_owned()),
     }
@@ -821,13 +825,22 @@ fn disk_usage_error_code(code: &str) -> String {
     }
 }
 
-fn failed_disk_usage_snapshot(code: &str) -> DiskUsageSnapshot {
+fn disk_usage_refresh_delay(started_at: Instant) -> Duration {
+    DISK_USAGE_CACHE_TTL.max(
+        started_at
+            .elapsed()
+            .saturating_mul(DISK_USAGE_SCAN_REST_MULTIPLIER),
+    )
+}
+
+fn failed_disk_usage_snapshot(code: &str, started_at: Instant) -> DiskUsageSnapshot {
     let failed = || eliot_core::api::DiskUsageDirectory {
         bytes: None,
         error_code: Some(code.to_owned()),
     };
     DiskUsageSnapshot {
         completed_at: Instant::now(),
+        refresh_delay: disk_usage_refresh_delay(started_at),
         artifacts: failed(),
         worktrees: failed(),
         plugins: failed(),
@@ -844,7 +857,7 @@ fn disk_usage_cache_entry(root: &Path) -> Arc<DiskUsageCacheEntry> {
 }
 
 fn disk_usage_directory(path: &Path) -> eliot_core::api::DiskUsageDirectory {
-    match disk_directory_bytes(path, None, None) {
+    match disk_directory_bytes(path, None, Instant::now() + DISK_USAGE_BUCKET_TIME) {
         Ok(bytes) => eliot_core::api::DiskUsageDirectory {
             bytes: Some(bytes),
             error_code: None,
@@ -859,7 +872,7 @@ fn disk_usage_directory(path: &Path) -> eliot_core::api::DiskUsageDirectory {
 pub(super) fn disk_directory_bytes(
     root: &Path,
     expected_identity: Option<&str>,
-    deadline: Option<Instant>,
+    deadline: Instant,
 ) -> std::result::Result<u64, &'static str> {
     use std::io::ErrorKind;
 
@@ -877,52 +890,42 @@ pub(super) fn disk_directory_bytes(
         return Err("not_directory");
     }
 
-    let root_identity =
-        crate::platform::script_file::directory_identity(root).map_err(|_| "unavailable")?;
-    if expected_identity.is_some_and(|expected| expected != root_identity) {
+    let mut directory =
+        crate::platform::script_file::Directory::open(root).map_err(|_| "unavailable")?;
+    if let Some(expected) = expected_identity
+        && directory.identity().map_err(|_| "unavailable")? != expected
+    {
         return Err("identity_changed");
     }
-    let mut pending = vec![(root.to_path_buf(), root_identity)];
+    let mut pending = vec![directory.entries().map_err(|_| "unavailable")?];
+    let mut remaining = DISK_USAGE_BUCKET_ENTRIES;
     let mut bytes = 0_u64;
-    while let Some((directory, expected_identity)) = pending.pop() {
-        let directory_metadata =
-            std::fs::symlink_metadata(&directory).map_err(|_| "unavailable")?;
-        if directory_metadata.file_type().is_symlink()
-            || crate::platform::is_reparse_point(&directory_metadata)
-        {
-            return Err("unsafe_path");
+    while let Some(entries) = pending.last_mut() {
+        if Instant::now() >= deadline {
+            return Err("busy");
         }
-        if !directory_metadata.is_dir() {
-            return Err("not_directory");
-        }
-        // Reopen without following links and compare the identity recorded
-        // when this directory was queued. On Windows the pinned chain also
-        // prevents replacement while its entries are enumerated.
-        let pinned =
-            crate::platform::script_file::Directory::open(&directory).map_err(|_| "unavailable")?;
-        if pinned.identity().map_err(|_| "unavailable")? != expected_identity {
-            return Err("identity_changed");
-        }
-        let entries = std::fs::read_dir(&directory).map_err(|_| "unavailable")?;
-        for entry in entries {
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Err("busy");
+        let Some(entry) = entries.next().transpose().map_err(|_| "unavailable")? else {
+            pending.pop();
+            if !pending.is_empty() {
+                directory.pop_entry_directory();
             }
-            let path = entry.map_err(|_| "unavailable")?.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| "unavailable")?;
-            if metadata.file_type().is_symlink() || crate::platform::is_reparse_point(&metadata) {
-                bytes = bytes.checked_add(metadata.len()).ok_or("overflow")?;
-            } else if metadata.is_dir() {
-                let identity = crate::platform::script_file::directory_identity(&path)
-                    .map_err(|_| "unavailable")?;
-                pending.push((path, identity));
-            } else {
-                // Count every non-directory entry, including hidden files and
-                // special files, by its own logical length. Link targets are
-                // never traversed.
-                bytes = bytes.checked_add(metadata.len()).ok_or("overflow")?;
-            }
+            continue;
+        };
+        remaining = remaining.checked_sub(1).ok_or("busy")?;
+        // DirEntry metadata does not follow links. Windows supplies its
+        // attributes and logical length directly from enumeration.
+        let metadata = entry.metadata().map_err(|_| "unavailable")?;
+        if metadata.is_dir() && !crate::platform::is_reparse_point(&metadata) {
+            directory
+                .push_entry_directory(&entry)
+                .map_err(|_| "unavailable")?;
+            pending.push(directory.entries().map_err(|_| "unavailable")?);
+        } else {
+            bytes = bytes.checked_add(metadata.len()).ok_or("overflow")?;
         }
+    }
+    if Instant::now() >= deadline {
+        return Err("busy");
     }
     Ok(bytes)
 }

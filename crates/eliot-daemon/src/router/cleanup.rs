@@ -1725,7 +1725,7 @@ impl Router {
         let identity = artifact.identity.clone();
         tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            super::status::disk_directory_bytes(&path, Some(&identity), Some(deadline)).ok()
+            super::status::disk_directory_bytes(&path, Some(&identity), deadline).ok()
         })
         .await
         .ok()

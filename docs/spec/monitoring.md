@@ -1410,7 +1410,16 @@ The
 retention view reports the `eliot.db` main and WAL sizes, the configured
 windows and `pruned_through`, along with the SQLite auto-vacuum mode,
 total pages and reusable pages. The disk usage view reports logical bytes under
-`artifacts/`, `worktrees/` and `plugins/` and skips link targets. Before #729,
+`artifacts/`, `worktrees/` and `plugins/` and skips link and reparse targets.
+Status calls share one asynchronous scan. After completion, the next status
+call can start a refresh once the greater of five minutes and 64 times the
+elapsed scan time has passed. Pending refreshes serve the previous snapshot.
+Clients can request its `snapshot_age_ms` and `refreshing` state with
+`disk_usage_freshness: true`. Until the first snapshot completes, status waits
+up to 500 ms and can report `busy`. Each bucket has a cooperative deadline of
+three seconds and a 500,000-entry budget. A bucket that hits either limit
+reports `busy` with no byte total. An unreadable bucket reports `unavailable`.
+Before #729,
 Swarm's managed launch assigned each worktree a flat `worktrees/<ULID>/` path.
 Those paths share the same size accounting as project-named worktrees. A flat
 path qualifies for age cleanup through its retained Agent and Git registration.

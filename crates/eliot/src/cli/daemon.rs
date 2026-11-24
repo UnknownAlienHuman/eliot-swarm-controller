@@ -193,15 +193,32 @@ pub(crate) async fn run_maintenance(
 }
 
 pub(crate) async fn run_status(data_dir: PathBuf, json_output: bool) -> Result<u8, Failure> {
-    let params = DaemonStatusRequest::default();
+    let params = DaemonStatusRequest {
+        disk_usage_freshness: true,
+    };
     params.validate().map_err(Failure::for_read)?;
     #[cfg(windows)]
     let acl_repair_was_pending = eliot_daemon::DataDir::open_existing(&data_dir)
         .is_err_and(|error| eliot_daemon::startup::repairable_data_dir_acl(&error));
-    let response: DaemonStatusResponse =
-        eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params)
+    let status = eliot_daemon::client_call_typed(&data_dir, "daemon.status", &params).await;
+    let response: DaemonStatusResponse = match status {
+        Err(error)
+            if error.code == "invalid"
+                && error
+                    .details
+                    .as_ref()
+                    .is_some_and(|details| details.field == "params.<unknown-field>") =>
+        {
+            eliot_daemon::client_call_typed(
+                &data_dir,
+                "daemon.status",
+                &DaemonStatusRequest::default(),
+            )
             .await
-            .map_err(Failure::for_read)?;
+        }
+        result => result,
+    }
+    .map_err(Failure::for_read)?;
     params
         .validate_response(&response)
         .map_err(Failure::invalid_response)?;
@@ -575,12 +592,19 @@ fn disk_usage_line(usage: &eliot_core::api::DiskUsageView) -> String {
         (None, Some(code)) => format!("Owner-decision worktrees unavailable ({code})"),
         _ => "Owner-decision worktrees unavailable (invalid status)".to_owned(),
     };
-    format!(
+    let mut line = format!(
         "Disk use: {} · {} · {} · {owner_decision}",
         bucket("artifacts", &usage.artifacts),
         bucket("worktrees", &usage.worktrees),
         bucket("plugins", &usage.plugins),
-    )
+    );
+    if let Some(age) = usage.snapshot_age_ms {
+        line.push_str(&format!(" · measured {}s ago", age / 1_000));
+    }
+    if usage.refreshing {
+        line.push_str(" · refreshing");
+    }
+    line
 }
 
 pub(crate) async fn start_daemon(data_dir: &Path, json_output: bool) -> Result<u8, Failure> {

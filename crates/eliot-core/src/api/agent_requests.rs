@@ -841,7 +841,11 @@ impl AgentEditsRequest {
 
 #[derive(schemars::JsonSchema, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DaemonStatusRequest {}
+pub struct DaemonStatusRequest {
+    /// Include the disk snapshot age and refresh state in the response.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disk_usage_freshness: bool,
+}
 
 /// Debug-only forced daemon panic for crash-capture tests. Compiled out of
 /// release builds together with its router arm.

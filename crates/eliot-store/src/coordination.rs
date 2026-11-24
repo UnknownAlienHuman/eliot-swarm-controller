@@ -841,23 +841,27 @@ impl Store {
         let closed_completion = super::digests::CLOSED_COMPLETION_PARENT;
         let mut statement = self
             .connection
-            .prepare(&format!(
-                "SELECT a.id FROM agents a
-                 LEFT JOIN mail_notices mn ON mn.recipient = a.id
-                 WHERE a.id > ?1
-                   AND a.archived = 0
-                   AND a.observe_only = 0
-                   AND a.generation >= 1
-                   AND ((a.state = 'idle' AND (mn.last_notice_at IS NULL
-                        OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
-                   AND EXISTS (
+            .prepare_cached(&format!(
+                "SELECT due.recipient FROM messages AS due INDEXED BY messages_pending_wake
+                 WHERE due.recipient > ?1 AND due.read_at IS NULL AND due.wake = 1
+                 GROUP BY due.recipient
+                 HAVING EXISTS (
+                     SELECT 1 FROM agents a
+                     LEFT JOIN mail_notices mn ON mn.recipient = a.id
+                     WHERE a.id = due.recipient
+                       AND a.archived = 0
+                       AND a.observe_only = 0
+                       AND a.generation >= 1
+                       AND ((a.state = 'idle' AND (mn.last_notice_at IS NULL
+                            OR (mn.last_notice_at <= ?2 AND ?2 - mn.last_notice_at >= ?3))
+                       AND EXISTS (
                            SELECT 1 FROM messages m
                            WHERE m.recipient = a.id AND m.read_at IS NULL AND m.wake = 1
                              AND m.inline_wake_retries < 2
                              AND (COALESCE(m.thread, '') NOT LIKE 'attention-%'
                                   OR ({ATTENTION_WAKING_THREAD_SQL}))
                        )) OR ({closed_completion}))
-                 ORDER BY a.id LIMIT ?4",
+                 ) ORDER BY due.recipient LIMIT ?4",
             ))
             .map_err(sql_error)?;
         let rows = statement

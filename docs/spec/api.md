@@ -934,6 +934,10 @@ When `config.toml` cannot be read, status stays available with a redacted
 [configuration](configuration.md#daemon-and-automation-settings) for the defaults
 and the older-Store conversion.
 
+`daemon.status` accepts `disk_usage_freshness: true` for the snapshot age and
+refresh state described in [monitoring](monitoring.md). `swarm status` requests
+these fields. An empty request continues to return the disk usage buckets.
+
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
 daemon retention settings and runs one bounded retention epoch (the periodic
 tick's row and time budgets), so it returns inside the client call deadline; a

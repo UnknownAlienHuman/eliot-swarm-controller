@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = AUTH_LOGIN_SCHEMA_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = MAIL_PENDING_WAKE_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -13,6 +13,7 @@ const REPEAT_FAILURE_ALERTS_VERSION: i64 = 120;
 const NATIVE_FOLLOWUP_SCHEMA_VERSION: i64 = 121;
 const MUSE_TURN_MODEL_VERSION: i64 = 122;
 const AUTH_LOGIN_SCHEMA_VERSION: i64 = 123;
+const MAIL_PENDING_WAKE_VERSION: i64 = 124;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -53,7 +54,28 @@ impl Store {
         if current < AUTH_LOGIN_SCHEMA_VERSION {
             self.migrate_auth_login(AUTH_LOGIN_SCHEMA_VERSION)?;
         }
+        if current < MAIL_PENDING_WAKE_VERSION {
+            self.migrate_mail_pending_wake()?;
+        }
         Ok(())
+    }
+
+    fn migrate_mail_pending_wake(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(
+            "CREATE INDEX messages_pending_wake ON messages(recipient)
+             WHERE read_at IS NULL AND wake = 1;",
+        )
+        .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [MAIL_PENDING_WAKE_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     fn migrate_muse_turn_models(&mut self) -> Result<()> {
