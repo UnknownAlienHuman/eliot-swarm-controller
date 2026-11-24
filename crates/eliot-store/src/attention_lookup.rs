@@ -362,11 +362,11 @@ fn successful_attention_turns(
              CROSS JOIN events AS started INDEXED BY attention_turn_endpoints
                ON started.agent = t.agent AND started.generation = t.generation
               AND started.kind = 'turn.started'
-              AND json_extract(started.data, '$.turn_id') = t.turn_id
+              AND CAST(json_extract(started.data, '$.turn_id') AS TEXT) = t.turn_id
              CROSS JOIN events AS completed INDEXED BY attention_turn_endpoints
                ON completed.agent = t.agent AND completed.generation = t.generation
               AND completed.kind = 'turn.completed'
-              AND json_extract(completed.data, '$.turn_id') = t.turn_id
+              AND CAST(json_extract(completed.data, '$.turn_id') AS TEXT) = t.turn_id
              WHERE t.agent = ?4 AND t.completed_at >= ?5
                AND t.state = 'completed' AND t.outcome = 'success'
                AND t.started_at > 0 AND t.completed_at >= t.started_at

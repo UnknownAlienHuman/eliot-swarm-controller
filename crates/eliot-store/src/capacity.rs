@@ -65,7 +65,7 @@ fn restart_resume_eligibility() -> String {
     AND TRIM(COALESCE(a.native_scope, '')) <> ''
     AND TRIM(COALESCE(a.native_ref, '')) <> ''
     AND EXISTS (
-        SELECT 1 FROM events custody_event
+        SELECT 1 FROM events custody_event INDEXED BY events_generation_custody
         WHERE custody_event.agent = a.id
           AND custody_event.generation = a.generation
           AND custody_event.kind = 'capacity.released'
@@ -1425,12 +1425,13 @@ fn has_native_source_drain_tx(
     // same closed-source fact. Degraded restart evidence cannot supply it.
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)
-              OR EXISTS(
-                  SELECT 1 FROM events WHERE agent=?1 AND generation=?2 AND kind='capacity.released'
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM owned_exits WHERE agent = ?1 AND generation = ?2)
+              THEN 1 ELSE EXISTS(
+                  SELECT 1 FROM events INDEXED BY events_generation_custody
+                  WHERE agent=?1 AND generation=?2 AND kind='capacity.released'
                   AND json_extract(data,'$.reason')='restart_custody_closed'
                   AND json_extract(data,'$.orphan_possible')=0
-              )",
+              ) END",
             params![agent, generation],
             |row| row.get(0),
         )
