@@ -229,6 +229,7 @@ pub use native_children::{
     NATIVE_CHILD_ATTENTION_PAGE_SIZE, NativeChildrenAttention, NativeChildrenAttentionPage,
 };
 mod agent_lifecycle;
+mod auth_login;
 mod native_events;
 mod observer;
 mod owner_decisions;
