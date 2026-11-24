@@ -41,6 +41,9 @@ pub enum RouteSkipReason {
     Unauthorized,
     /// The candidate's frozen authority is not provably equal or narrower.
     WiderAuthority,
+    /// This task already received a withheld provider response on this route
+    /// or profile.
+    ProviderWithheld,
     /// A sandboxed candidate could not commit on this worktree's branch.
     CannotCommit,
     InvalidProfile,
@@ -62,6 +65,7 @@ impl RouteSkipReason {
             Self::CapacityFull => "at capacity",
             Self::Unauthorized => "not allowed here",
             Self::WiderAuthority => "authority wider than the source",
+            Self::ProviderWithheld => "provider withheld a response on this route for this task",
             Self::CannotCommit => "its sandbox cannot commit on this branch",
             Self::InvalidProfile => "profile does not resolve",
             Self::HarnessCheckFailed => "harness self-check failed and awaits a later pass",
@@ -228,12 +232,24 @@ pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
                 .map(crate::workspace_path_key);
+            // Without a frozen login home or an account, every such profile
+            // would share one key. That identity is unknown, so it must not
+            // match (or block) unrelated routes. Profile-name refusal covers it.
+            if login_home.is_none() && account.is_none() {
+                return None;
+            }
             serde_json::json!(["codex_chatgpt", account, login_home])
         }
     };
     serde_json::to_vec(&identity)
         .ok()
         .map(|bytes| crate::api::inference::sha256_hex(&bytes))
+}
+
+/// The withheld-route set entry that refuses a profile name for a task. Route
+/// digests never start with `profile:`, so the two forms cannot collide.
+pub fn provider_profile_refusal_marker(profile: &str) -> String {
+    format!("profile:{profile}")
 }
 
 /// Why `candidate` may not take over work from `source` automatically or at a

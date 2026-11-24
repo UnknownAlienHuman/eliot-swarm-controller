@@ -386,6 +386,8 @@ fn require_switch_caller(
 }
 
 /// The exact check for a successor nobody with Owner authority chose by hand.
+/// Runs inside the caller's switch transaction, so the withheld-route
+/// evidence it reads is the same committed state that admits the switch.
 fn require_handoff_bounds(
     tx: &Connection,
     source: &Agent,
@@ -393,15 +395,16 @@ fn require_handoff_bounds(
     workspace: Option<&str>,
     profile: Option<&str>,
     requested_by: Option<&str>,
-    reason: Option<HandoffReason>,
 ) -> Result<()> {
-    if reason == Some(HandoffReason::ProviderResponseWithheld)
-        && let Some(route) = core::provider_response_route_key(successor)
-        && automatic::withheld_provider_routes(tx, source)?.contains(&route)
-    {
+    let withheld = automatic::withheld_provider_routes(tx, source)?;
+    let route_withheld =
+        core::provider_response_route_key(successor).is_some_and(|route| withheld.contains(&route));
+    let profile_withheld = profile
+        .is_some_and(|name| withheld.contains(&eliot_core::provider_profile_refusal_marker(name)));
+    if route_withheld || profile_withheld {
         return Err(Error::new(
             "not_allowed",
-            "successor resolved to a Codex provider route that withheld a response for this task",
+            "successor resolved to a provider route that withheld a response for this task",
         ));
     }
     if let Some(reason) = core::handoff_authority_refusal(&source.profile_snapshot, successor) {
@@ -1648,7 +1651,6 @@ impl Store {
                     request.args.get("workspace").and_then(Value::as_str),
                     request.args.get("profile").and_then(Value::as_str),
                     requested_by.as_deref(),
-                    continuation.map(|value| value.reason),
                 )?;
             }
             if let Some(held_since) = continuation.and_then(|value| value.held_since)
@@ -1973,7 +1975,6 @@ impl Store {
                             destination.workspace.as_deref(),
                             Some(destination.profile.as_str()),
                             requested_by.as_deref(),
-                            Some(handoff_reason),
                         )?;
                     }
                     let source_num = parse_agent_id(&request.from)?;

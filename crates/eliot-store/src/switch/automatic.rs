@@ -46,50 +46,50 @@ fn lineage_for(
         .map_err(sql_error)
 }
 
+/// Routes and profile names that withheld a response for this task. Entries
+/// are `route_key` digests and `profile:<name>` markers. A profile marker
+/// covers routes whose identity is unknown. The newest
+/// `WITHHELD_ROUTE_HISTORY_LIMIT` generations with retained evidence are
+/// consulted, including the source's own generation when it has evidence.
 pub(super) fn withheld_provider_routes(
     connection: &Connection,
     source: &Agent,
 ) -> Result<HashSet<String>> {
-    let mut routes = HashSet::new();
-    routes.extend(core::provider_response_route_key(&source.profile_snapshot));
     let agent = parse_agent_id(&source.id)?;
-    let Some((lineage, _)) = lineage_for(connection, agent, source.generation)? else {
-        return Ok(routes);
-    };
+    let lineage = lineage_for(connection, agent, source.generation)?
+        .map_or(agent, |(lineage_agent, _)| lineage_agent);
+    let mut routes = HashSet::new();
     // One frozen route per generation. Older events can use the original
     // snapshot while that exact generation is still the Agent's current one.
     let mut statement = connection
         .prepare_cached(
             "SELECT MAX(json_extract(e.data, '$.route_key')),
                     CASE WHEN MAX(json_extract(e.data, '$.route_key')) IS NULL
-                         THEN a.profile_snapshot END
-             FROM handoff_task_lineages l
-             JOIN events e ON e.agent=l.agent AND e.generation=l.generation
-             LEFT JOIN agents a ON a.id=l.agent AND a.generation=l.generation
-             WHERE l.lineage_agent=?1 AND e.kind='provider.response_withheld'
-               AND e.source='daemon' AND (l.agent<>?2 OR l.generation<>?3)
-             GROUP BY l.agent, l.generation
-             ORDER BY MAX(e.seq) DESC LIMIT ?4",
+                         THEN a.profile_snapshot END,
+                    a.profile
+             FROM events e
+             LEFT JOIN handoff_task_lineages l
+                    ON l.agent=e.agent AND l.generation=e.generation
+             LEFT JOIN agents a ON a.id=e.agent AND a.generation=e.generation
+             WHERE e.kind='provider.response_withheld' AND e.source='daemon'
+               AND ((l.lineage_agent=?1)
+                    OR (l.agent IS NULL AND e.agent=?1))
+             GROUP BY e.agent, e.generation
+             ORDER BY MAX(e.seq) DESC LIMIT ?2",
         )
         .map_err(sql_error)?;
     let rows = statement
-        .query_map(
-            params![
-                lineage,
-                agent,
-                source.generation,
-                WITHHELD_ROUTE_HISTORY_LIMIT
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
+        .query_map(params![lineage, WITHHELD_ROUTE_HISTORY_LIMIT], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
         .map_err(sql_error)?;
     for row in rows {
-        let (key, legacy_snapshot) = row.map_err(sql_error)?;
+        let (key, legacy_snapshot, profile) = row.map_err(sql_error)?;
+        routes.extend(profile.map(|name| core::provider_profile_refusal_marker(&name)));
         routes.extend(key.or_else(|| {
             let snapshot = serde_json::from_str(&legacy_snapshot?).ok()?;
             core::provider_response_route_key(&snapshot)

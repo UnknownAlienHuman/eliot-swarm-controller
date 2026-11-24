@@ -1694,9 +1694,16 @@ and credential selector. Direct Codex uses the fixed ChatGPT endpoint and
 normalized provider endpoint and the configured client-key environment name
 (or its absence). Preset and proxy aliases share that route when these selectors
 match. Only a digest of these selectors is retained in the refusal event.
-Automatic rerouting skips the current route and the routes from the 32 most recent
-earlier lineage generations with retained refusal events. It also skips the
-presets this task already left and profiles on hold.
+Every automatic hop (held, lost, withheld and manager-requested successors) consults the
+task lineage. It skips each route digest and each profile name that a generation with a
+retained refusal event used, across the 32 most recent such generations, including the
+source's own generation. A route with no known identity (direct Codex with neither a
+frozen `CODEX_HOME` nor an account) is never matched by digest; only its profile name
+blocks it. The store gate applies the same check in the switch transaction. It also
+skips the presets this task already left and profiles on hold. Candidates blocked this
+way report `provider_withheld`; with no eligible candidate, the existing waiting item
+records that reason in the Owner inbox, and the disabled-automation and waiting-retry rules
+above apply unchanged.
 Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
 eligible candidate the Agent keeps its work. The Owner inbox and `swarm why` report

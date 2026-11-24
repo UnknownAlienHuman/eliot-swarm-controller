@@ -563,15 +563,14 @@ impl Router {
                 .is_some(),
             None => false,
         };
-        let withheld_provider_routes = if route.reason == HandoffReason::ProviderResponseWithheld {
-            self.inner
-                .store
-                .lock()
-                .await
-                .withheld_provider_routes(source)?
-        } else {
-            HashSet::new()
-        };
+        // Every automatic hop and manager-requested successor consults the
+        // task lineage's refusals, not only a withheld-response reaction.
+        let withheld_provider_routes = self
+            .inner
+            .store
+            .lock()
+            .await
+            .withheld_provider_routes(source)?;
         let mut preflight = RoutePreflight {
             provider_switch: true,
             prefer_candidate_order: route.role.is_none(),
@@ -802,11 +801,15 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if !preflight.withheld_provider_routes.is_empty()
-            && let Some(key) = eliot_core::provider_response_route_key(&snapshot)
-            && preflight.withheld_provider_routes.contains(&key)
-        {
-            return Ok(Err(RouteSkipReason::ProviderFailure));
+        if !preflight.withheld_provider_routes.is_empty() {
+            let profile_withheld = preflight
+                .withheld_provider_routes
+                .contains(&eliot_core::provider_profile_refusal_marker(name));
+            let route_withheld = eliot_core::provider_response_route_key(&snapshot)
+                .is_some_and(|key| preflight.withheld_provider_routes.contains(&key));
+            if profile_withheld || route_withheld {
+                return Ok(Err(RouteSkipReason::ProviderWithheld));
+            }
         }
         if let Some(source) = &preflight.handoff_source
             && eliot_core::handoff_authority_refusal(source, &snapshot).is_some()
