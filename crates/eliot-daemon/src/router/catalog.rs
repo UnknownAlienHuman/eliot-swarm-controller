@@ -20,6 +20,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
+use tokio::sync::watch;
 
 impl Router {
     /// Read-only harness installation facts: no model turn, no inference.
@@ -315,46 +316,33 @@ impl Router {
             } else {
                 None
             };
-            if let Some(hit) = cache_key.as_ref().and_then(|key| {
-                self.inner
-                    .catalog_cache
-                    .lock_recover()
-                    .get_models(key, now_ms())
-            }) {
-                return Ok((hit, None));
-            }
-            let raw = self
-                .inner
-                .plugin_host
-                .models(profile, route.environment, workspace, deadline.into())
-                .await?;
-            let provenance = if raw["provenance"] == "preview" {
-                "preview"
-            } else {
-                "canonical"
+            let host = self.inner.plugin_host.clone();
+            let harness = harness.to_owned();
+            let scope = scope.clone();
+            let credential = credential.clone();
+            let read = move |read_deadline: Instant| async move {
+                let raw = host
+                    .models(profile, route.environment, workspace, read_deadline.into())
+                    .await?;
+                let provenance = if raw["provenance"] == "preview" {
+                    "preview"
+                } else {
+                    "canonical"
+                };
+                let response = catalog::native_models_response(
+                    &harness, &cmd, scope, credential, provenance, &raw,
+                )?;
+                response.validate()?;
+                Ok(response)
             };
-            let response = catalog::native_models_response(
-                harness,
-                &cmd,
-                scope.clone(),
-                credential.clone(),
-                provenance,
-                &raw,
-            )?;
-            Ok((response, cache_key))
+            match cache_key {
+                Some(key) => self.coalesced_models_read(key, deadline, read).await,
+                None => read(deadline).await,
+            }
         }
         .await;
         match read {
-            Ok((response, cache_key)) => {
-                response.validate()?;
-                if let Some(key) = cache_key {
-                    self.inner
-                        .catalog_cache
-                        .lock_recover()
-                        .insert_models(key, response.clone());
-                }
-                Ok(response)
-            }
+            Ok(response) => Ok(response),
             Err(error) => {
                 self.note_harness_auth_required(harness, Some(&error.code))
                     .await;
@@ -369,6 +357,61 @@ impl Router {
                 }
             }
         }
+    }
+
+    async fn coalesced_models_read<F>(
+        &self,
+        key: ModelsCacheKey,
+        wait_deadline: Instant,
+        read: impl FnOnce(Instant) -> F,
+    ) -> Result<HarnessModelsResponse>
+    where
+        F: Future<Output = Result<HarnessModelsResponse>> + Send + 'static,
+    {
+        let mut result = {
+            let mut cache = self.inner.catalog_cache.lock_recover();
+            if let Some(hit) = cache.get_models(&key, now_ms()) {
+                return Ok(hit);
+            }
+            // A stopped worker has closed its channel. Discard its entry so
+            // a later request can elect a new reader.
+            cache
+                .model_reads
+                .retain(|_, read| read.has_changed().is_ok());
+            if let Some(in_flight) = cache.model_reads.get(&key) {
+                in_flight.clone()
+            } else {
+                let (publish, result) = watch::channel(None);
+                cache.model_reads.insert(key.clone(), result.clone());
+                let router = self.clone();
+                let read = read(Instant::now() + crate::adhoc::DISCOVERY_BUDGET);
+                // Own the read through native cleanup even if any caller drops
+                // its wait. The plugin host still tracks it for daemon shutdown.
+                tokio::spawn(async move {
+                    let result = read.await;
+                    let mut cache = router.inner.catalog_cache.lock_recover();
+                    if let Ok(response) = &result {
+                        cache.insert_models(key.clone(), response.clone());
+                    }
+                    publish.send_replace(Some(result));
+                    cache.model_reads.remove(&key);
+                });
+                result
+            }
+        };
+        let settled =
+            tokio::time::timeout_at(wait_deadline.into(), result.wait_for(Option::is_some))
+                .await
+                .map_err(|_| crate::adhoc::discovery_timeout())?;
+        settled
+            .ok()
+            .and_then(|result| result.as_ref().cloned())
+            .unwrap_or_else(|| {
+                Err(Error::new(
+                    "unknown",
+                    "shared model catalogue reader stopped",
+                ))
+            })
     }
 
     /// Provider-supported account quota readback: timestamp, scope and an
@@ -1228,13 +1271,12 @@ fn endpoint_authority(url: &str) -> &str {
     authority.rsplit('@').next().unwrap_or(authority)
 }
 
-/// Bounded per-scope cache for catalogue and quota readback. One live
-/// native read per scope per TTL; concurrent misses may double-read once
-/// but still share the single cached entry (no per-Agent polling: quota and
-/// catalogue reads are never tied to an Agent).
+/// Bounded per-scope cache for catalogue and quota readback. Concurrent
+/// model cache misses for the same verified source share one native read.
 #[derive(Default)]
 pub(crate) struct CatalogCache {
     models: HashMap<ModelsCacheKey, HarnessModelsResponse>,
+    model_reads: HashMap<ModelsCacheKey, watch::Receiver<Option<Result<HarnessModelsResponse>>>>,
     quotas: HashMap<String, HarnessQuotaResponse>,
     aggregate: Option<Arc<CachedAggregate>>,
 }
