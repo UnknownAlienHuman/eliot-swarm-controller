@@ -804,25 +804,15 @@ fn replay_rule_catch_up_tx(
         .ok_or_else(|| Error::new("internal", "rule catch-up binding has no command row"))?;
     request.validate_response(&parent)?;
     let children = load_catch_up_children(connection, &parent.id)?;
-    let expected = parent
-        .outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("children"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("source_integrity", "catch-up parent has no fixed child set"))?
+    let expected = retained_rule_child_ids(
+        &parent,
+        "catch-up parent has no fixed child set",
+        "catch-up child ID is invalid",
+    )?;
+    if !children
         .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| Error::new("source_integrity", "catch-up child ID is invalid"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if children
-        .iter()
-        .map(|child| child.command.id.clone())
-        .collect::<Vec<_>>()
-        != expected
+        .map(|child| child.command.id.as_str())
+        .eq(expected)
     {
         return Err(Error::new(
             "source_integrity",
@@ -976,26 +966,11 @@ pub(crate) fn gate_rule_action_dispatch_tx(
             "script output children cannot dispatch before the Run child set is committed",
         ));
     }
-    let expected_children = parent
-        .command
-        .outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("children"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "rule-action parent has no fixed child set",
-            )
-        })?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| Error::new("source_integrity", "rule-action child ID is invalid"))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let expected_children = retained_rule_child_ids(
+        &parent.command,
+        "rule-action parent has no fixed child set",
+        "rule-action child ID is invalid",
+    )?;
     let mut statement = tx
         .prepare(
             "SELECT id, principal, ordinal, state, target, generation, expected_generation
@@ -1021,11 +996,11 @@ pub(crate) fn gate_rule_action_dispatch_tx(
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(sql_error)?;
     drop(statement);
-    let child_ids = sibling_rows
+    if !sibling_rows
         .iter()
-        .map(|(id, _, _, _, _, _, _)| id.clone())
-        .collect::<Vec<_>>();
-    if child_ids != expected_children {
+        .map(|(id, _, _, _, _, _, _)| id.as_str())
+        .eq(expected_children)
+    {
         return Err(Error::new(
             "source_integrity",
             "rule-action child rows differ from the parent's fixed child set",

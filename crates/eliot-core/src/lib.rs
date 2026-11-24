@@ -46,7 +46,7 @@ pub use background_wake::{
     NATIVE_WAKE_SCOPE_TOOL_PROCESS, extract_configured_mcp_servers,
     format_background_wake_note_body, is_harness_owned_process, redact_secret_shapes,
 };
-pub use canonical::canonical_json_sha256;
+pub use canonical::{canonical_json_sha256, is_lowercase_hex};
 pub use command::{
     classify_dispatched_error, command_transition_allowed, handoff_brief_resolution_allowed,
     is_attachment_verb, is_coordination_verb, is_deterministic_pre_admission_rejection,

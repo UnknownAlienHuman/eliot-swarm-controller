@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{RuleStateView, TimerStateView};
-use crate::{Error, Result};
+use crate::{Error, Result, is_lowercase_hex};
 
 /// Lowercase hexadecimal SHA-256 of the `config.toml` bytes.
 pub const CONFIG_REVISION_HEX_LEN: usize = 64;
@@ -27,10 +27,7 @@ pub const REDACTION_MARKER: &str = "[REDACTED]";
 
 fn validate_revision(revision: &Option<String>) -> Result<()> {
     if let Some(revision) = revision
-        && (revision.len() != CONFIG_REVISION_HEX_LEN
-            || !revision
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        && !is_lowercase_hex(revision, CONFIG_REVISION_HEX_LEN)
     {
         return Err(Error::new(
             "invalid",

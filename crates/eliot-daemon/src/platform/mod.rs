@@ -2,9 +2,7 @@
 //!
 //! Owner: platform slice. Daemon worker and `plugin_host` consume this API.
 
-#[cfg(not(any(windows, unix)))]
-use eliot_core::Error;
-use eliot_core::Result;
+use eliot_core::{Error, Result};
 use std::path::Path;
 
 pub mod custody;
@@ -25,6 +23,10 @@ pub use data_dir::{DataDir, ForeignDataDirAce};
 pub use ipc::{IpcListener, IpcStream};
 pub(crate) use process_observation::CommandClass;
 pub use process_observation::CustodyObserver;
+
+fn io_error(action: &str, error: std::io::Error) -> Error {
+    Error::new("platform_io", format!("{action}: {error}"))
+}
 
 /// Return free bytes available to the current owner on the filesystem that
 /// contains `path`.

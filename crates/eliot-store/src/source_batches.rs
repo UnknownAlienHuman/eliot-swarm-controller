@@ -13,13 +13,7 @@ pub struct CompletionWorktreeCapture {
 
 impl CompletionWorktreeCapture {
     fn validate(&self) -> Result<()> {
-        if !is_git_oid(&self.base)
-            || self.fingerprint.len() != 64
-            || !self
-                .fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+        if !is_git_oid(&self.base) || !core::is_lowercase_hex(&self.fingerprint, 64) {
             return Err(Error::new(
                 "invalid",
                 "completion worktree capture is invalid",

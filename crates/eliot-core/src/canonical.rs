@@ -5,6 +5,14 @@
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+/// Whether the value is lowercase ASCII hex of exactly the requested length.
+pub fn is_lowercase_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// SHA-256 of compact serde_json output after recursively sorting object keys.
 /// Arrays and scalar representations are unchanged. This is not RFC 8785.
 pub fn canonical_json_sha256(value: &Value) -> Result<[u8; 32], serde_json::Error> {

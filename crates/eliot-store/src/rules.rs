@@ -1888,12 +1888,7 @@ fn validate_event_script_run_admitted_origin_tx(
             "script Run has an unsupported or differently-authorized rule parent",
         ));
     }
-    let firing_children = parent
-        .command
-        .outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("children"))
-        .and_then(Value::as_array)
+    let firing_children = recorded_rule_children(&parent.command)
         .ok_or_else(|| Error::new("source_integrity", "script rule parent has no child set"))?;
     if !firing_children
         .iter()
@@ -2989,6 +2984,31 @@ fn rule_event_originates_from_rule_tx(
     .map_err(sql_error)
 }
 
+fn recorded_rule_children(parent: &Command) -> Option<&[Value]> {
+    parent
+        .outcome
+        .as_ref()?
+        .get("children")?
+        .as_array()
+        .map(Vec::as_slice)
+}
+
+fn retained_rule_child_ids<'a>(
+    parent: &'a Command,
+    missing: &str,
+    invalid: &str,
+) -> Result<Vec<&'a str>> {
+    recorded_rule_children(parent)
+        .ok_or_else(|| Error::new("source_integrity", missing))?
+        .iter()
+        .map(|child| {
+            child
+                .as_str()
+                .ok_or_else(|| Error::new("source_integrity", invalid))
+        })
+        .collect()
+}
+
 fn rule_action_counts(
     tx: &Transaction<'_>,
     principal: &str,
@@ -4053,7 +4073,7 @@ fn load_retained_rule_event_action(
         ));
     }
     let expected_children = match &parent.state {
-        CommandState::Applied => vec![key.child_id.clone()],
+        CommandState::Applied => vec![key.child_id.as_str()],
         CommandState::Rejected => Vec::new(),
         _ => {
             return Err(Error::new(
@@ -4062,30 +4082,12 @@ fn load_retained_rule_event_action(
             ));
         }
     };
-    let recorded_children = parent
-        .outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("children"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            Error::new(
-                "source_integrity",
-                "retained rule parent has no fixed child set",
-            )
-        })?
-        .iter()
-        .map(|child| {
-            child
-                .as_str()
-                .ok_or_else(|| Error::new("source_integrity", "retained rule child ID is invalid"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if recorded_children
-        .iter()
-        .map(|child| (*child).to_owned())
-        .collect::<Vec<_>>()
-        != expected_children
-    {
+    let recorded_children = retained_rule_child_ids(
+        &parent,
+        "retained rule parent has no fixed child set",
+        "retained rule child ID is invalid",
+    )?;
+    if recorded_children != expected_children {
         return Err(Error::new(
             "source_integrity",
             "retained rule parent child set differs from its deterministic action",

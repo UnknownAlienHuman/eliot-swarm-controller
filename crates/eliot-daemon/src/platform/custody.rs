@@ -991,7 +991,7 @@ fn io_error(action: &str, error: std::io::Error) -> Error {
     // Process-start failures are the OS/machine refusing: a missing binary
     // or denied execution is `environment`, never a secret, parameter or
     // prompt. The action names the gate, never a working directory.
-    Error::new("platform_io", format!("{action}: {error}"))
+    super::io_error(action, error)
         .with_where("platform.process.spawn")
         .with_origin(
             FailureOrigin::Environment,

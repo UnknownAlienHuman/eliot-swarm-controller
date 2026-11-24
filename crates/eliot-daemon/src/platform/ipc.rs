@@ -1,4 +1,5 @@
 use super::custody::LocalPeer;
+use super::io_error;
 use crate::platform::data_dir::{DaemonLock, DataDir};
 use eliot_core::{Error, Result};
 #[cfg(unix)]
@@ -279,8 +280,4 @@ async fn prepare_socket_path(path: &std::path::Path) -> Result<()> {
         }
         Err(error) => Err(io_error("probe existing Unix daemon socket", error)),
     }
-}
-
-fn io_error(action: &str, error: std::io::Error) -> Error {
-    Error::new("platform_io", format!("{action}: {error}"))
 }
