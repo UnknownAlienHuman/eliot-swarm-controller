@@ -8,6 +8,8 @@ use eliot_plugin::native_child::ChildLifecycle;
 /// Bound on tracked child threads, unconfirmed threads and in-flight spawns per
 /// generation; overflow is a source gap.
 pub(super) const MAX_CHILD_THREADS: usize = 256;
+const MAX_EARLY_FRAMES_PER_CHILD: usize = 128;
+const MAX_CHILD_BUFFER_BYTES: usize = 256 * 1024;
 pub(super) struct ChildState {
     binding: ChildBinding,
     writes_blocked: bool,
@@ -739,8 +741,8 @@ impl EventProcessor {
             .child_buffers
             .entry(child_thread.to_owned())
             .or_default();
-        if queue.len() >= EARLY_EVENT_LIMIT
-            || self.child_buffer_bytes.saturating_add(size) > EARLY_EVENT_BYTES
+        if queue.len() >= MAX_EARLY_FRAMES_PER_CHILD
+            || self.child_buffer_bytes.saturating_add(size) > MAX_CHILD_BUFFER_BYTES
         {
             let discarded: usize = queue.iter().map(child_frame_size).sum();
             queue.clear();
