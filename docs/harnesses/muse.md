@@ -59,9 +59,8 @@ establishes terminal lifecycle even when the terminal value is `Other`. Its outc
 is `unknown`. An unavailable view still requires command-plane proof. A workflow-child
 status or readback value of `Other` carries no terminal or healthy-view evidence.
 
-The adapter has no exact runtime-version equality gate. Its manifest declares
-the `1.4.0` harness baseline. Owned sessions require a non-empty
-`serverInfo.version` and the `rawLog` capability for model observation.
+The manifest reports the adapter package version. Owned sessions require the
+`rawLog` capability for model observation.
 
 ## Native mapping
 
