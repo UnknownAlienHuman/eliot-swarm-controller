@@ -169,8 +169,8 @@ impl Router {
             status.state = CleanupJobState::Interrupted;
             status.reason = Some("cleanup_worker_lost".to_owned());
         }
-        if let Some(page) = &status.current_apply_id {
-            match store.cleanup_job_receipt(principal, page) {
+        if let Some(page) = status.current_apply_id.take() {
+            match store.cleanup_job_receipt(principal, &page) {
                 Ok((_, value)) => status.tally.count(
                     &decode_receipt(value)?,
                     status.state == CleanupJobState::Running,
@@ -208,10 +208,9 @@ impl Router {
         loop {
             self.check_cleanup_worker_shutdown()?;
             let params = encoded(&request)?;
-            let mut page: CleanupPlan = decode_receipt(
-                self.cleanup_plan_page(&params, &Principal::Owner, None, false, true)
-                    .await?,
-            )?;
+            let mut page = self
+                .cleanup_plan_page(&params, &Principal::Owner, None, false, true)
+                .await?;
             status.tally.inventory_issues += page.inventory_issues.len() as u64;
             let after = page.continuation.take();
             self.apply_bulk_page(page, status, &mut native_kept).await?;

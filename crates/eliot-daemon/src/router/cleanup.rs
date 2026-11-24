@@ -1283,8 +1283,10 @@ impl Router {
         params: &Value,
         principal: &Principal,
     ) -> Result<Value> {
-        self.cleanup_plan_page(params, principal, None, false, false)
-            .await
+        encoded(
+            self.cleanup_plan_page(params, principal, None, false, false)
+                .await?,
+        )
     }
 
     async fn auto_cleanup_plan(
@@ -1292,7 +1294,7 @@ impl Router {
         params: &Value,
         retention_ms: i64,
         retain_for_apply: bool,
-    ) -> Result<Value> {
+    ) -> Result<CleanupPlan> {
         self.cleanup_plan_page(
             params,
             &Principal::Owner,
@@ -1310,7 +1312,7 @@ impl Router {
         auto_cleanup_after_ms: Option<i64>,
         retain_automatic_plan: bool,
         bulk: bool,
-    ) -> Result<Value> {
+    ) -> Result<CleanupPlan> {
         let auto_cleanup = auto_cleanup_after_ms.is_some();
         let call_deadline = Instant::now() + Duration::from_secs(25);
         let mut request: CleanupPlanRequest = coordination::decode_coordination_request(
@@ -1376,7 +1378,7 @@ impl Router {
                 page.request_binding = Some(binding);
                 plan.truncated = true;
                 plan.continuation = Some(page.encode()?);
-                return encoded(plan);
+                return Ok(plan);
             }
         }
         let (safe_projects, kept_projects, regs_revision): (Vec<_>, Vec<_>, Option<String>) =
@@ -1712,7 +1714,7 @@ impl Router {
                 .await
                 .retain_cleanup_plan(&name, &plan, now_ms())?;
         }
-        encoded(plan)
+        Ok(plan)
     }
 
     async fn backfill_cleanup_inventory(
@@ -2026,11 +2028,9 @@ impl Router {
         let retention_ms =
             crate::automation::parse_positive_duration_ms(&config.auto_cleanup_after)?;
         let params = json!({"scope": "all", "continuation": after.clone()});
-        let plan: CleanupPlan = serde_json::from_value(
-            self.auto_cleanup_plan(&params, retention_ms, !plan_only)
-                .await?,
-        )
-        .map_err(|_| Error::new("source_integrity", "automatic cleanup plan readback failed"))?;
+        let plan = self
+            .auto_cleanup_plan(&params, retention_ms, !plan_only)
+            .await?;
         let selected = plan
             .items
             .iter()

@@ -459,16 +459,15 @@ impl CleanupTree {
             let child = native::open_cleanup(&directory, &name, is_dir).map_err(|_| refused())?;
             if is_dir {
                 check(&child, true)?;
-            } else {
-                check_cleanup_file(&child)?;
-            }
-            if is_dir {
                 self.visit(child, depth + 1, deadline)?;
             } else {
-                let len = child.metadata().map_err(io)?.len();
+                let len = cleanup_file_len(&child)?;
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
                 self.entries.push(child);
             }
+        }
+        if self.entries.len() >= MAX_CLEANUP_TREE_ENTRIES {
+            return Err(Error::new("unavailable", "cleanup tree exceeds scan bound"));
         }
         self.entries.push(directory);
         Ok(())
@@ -557,7 +556,7 @@ pub(crate) fn protected_cleanup_name(name: &str) -> bool {
 }
 
 #[cfg(windows)]
-fn check_cleanup_file(file: &File) -> Result<()> {
+fn cleanup_file_len(file: &File) -> Result<u64> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
@@ -568,7 +567,7 @@ fn check_cleanup_file(file: &File) -> Result<()> {
             "cleanup refuses files with multiple links",
         ));
     }
-    Ok(())
+    Ok(metadata.len())
 }
 
 /// At most the editor limit plus one byte, always from the verified handle.
