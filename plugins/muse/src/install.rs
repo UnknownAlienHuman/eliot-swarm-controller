@@ -7,7 +7,11 @@ use eliot_plugin::install::{
     InstallDiscovery, InstallStrategy, find_on_path, is_native_executable, is_script_wrapper,
     launcher_manifest_version,
 };
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 /// Vendor launcher directory the native Muse payload installs under.
 pub const LAUNCHER_DIR: &str = r"C:\Tools\MuseCode";
@@ -19,6 +23,7 @@ pub const LAUNCHER_VERSION_FILES: &[&str] = &["muse-version", ".muse-version"];
 pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "muse",
+        model_hold_revision: Some(model_hold_revision),
         exe_stems: &["muse"],
         strategy: InstallStrategy::MetadataVersion(payload_version),
         cli_identity: None,
@@ -33,6 +38,53 @@ pub fn discovery() -> InstallDiscovery {
         ide_unsupported: None,
         timeout_newer: None,
     }
+}
+
+pub(crate) fn model_hold_revision(
+    environment: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    let lookup = |name: &str| {
+        environment
+            .iter()
+            .find(|(key, _)| {
+                if cfg!(windows) {
+                    key.eq_ignore_ascii_case(name)
+                } else {
+                    key.as_str() == name
+                }
+            })
+            .and_then(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let directory = if let Some(path) = lookup("XDG_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else {
+        Path::new(lookup("HOME").or_else(|| lookup("USERPROFILE"))?).join(".config")
+    };
+    if !directory.is_absolute() {
+        return None;
+    }
+    let path = directory.join("muse").join("settings.json");
+    let settings = match File::open(&path) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(MAX_SETTINGS_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+                return None;
+            }
+            Some(core::api::inference::sha256_hex(&bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return None,
+    };
+    let binary = candidate_paths().ok()?.into_iter().next()?;
+    let metadata = binary.metadata().ok()?;
+    let installed = (binary, metadata.len(), metadata.modified().ok()?);
+    let encoded = serde_json::to_vec(&(installed, path, settings)).ok()?;
+    Some(core::api::inference::sha256_hex(&encoded))
 }
 
 fn payload_version(path: &Path) -> Option<String> {

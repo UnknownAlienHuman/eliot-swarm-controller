@@ -19,6 +19,7 @@ pub const IDE_HINT_SUBPATH: &[&str] = &["Programs", "Antigravity", "Antigravity.
 pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "antigravity",
+        model_hold_revision: None,
         exe_stems: &["agy"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: Some(CLI_STEM),

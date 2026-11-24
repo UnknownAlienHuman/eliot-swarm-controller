@@ -42,6 +42,7 @@ pub(super) struct PreparedStart {
     pub(super) workspace: PathBuf,
     pub(super) launch: NativeLaunch,
     pub(super) secrets: Vec<String>,
+    pub(super) model_hold_revision: Option<String>,
 }
 
 pub(super) fn prepare_profile(
@@ -174,6 +175,11 @@ pub(super) fn prepare_profile(
         profile.get("pass_env"),
         "Muse",
     )?;
+    let model_hold_revision = params
+        .target_environment
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(crate::install::model_hold_revision);
     environment.retain(|(name, _)| !name.eq_ignore_ascii_case("MUSE_NO_AUTO_UPDATE"));
     environment.push((OsString::from("MUSE_NO_AUTO_UPDATE"), OsString::from("1")));
     secrets.push(initialized.credential.clone());
@@ -196,6 +202,7 @@ pub(super) fn prepare_profile(
         workspace,
         launch,
         secrets,
+        model_hold_revision,
     })
 }
 
@@ -236,6 +243,7 @@ pub(super) fn bind_owned_session(
     initialized: &Initialized,
     mut native: NativeProcess,
     secrets: Vec<String>,
+    model_hold_revision: Option<String>,
     skill_pointer: String,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
@@ -252,6 +260,7 @@ pub(super) fn bind_owned_session(
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             secrets: secrets.clone(),
+            model_hold_revision,
         },
     );
     Ok(AgentSession {

@@ -1030,9 +1030,12 @@ carried model/effort and Muse reports the carried effort through the
 exact-turn association, which acknowledges native admission of those values;
 `effort_verified`/`model_verified` mark that admission). Claude refreshes the verified serving model from a main-thread assistant
 record on the bound turn. Muse clears model verification on each turn and
-sets it only on a matching provider response. A mismatch keeps the effective
-model unset and names both IDs in the Owner inbox and
-`diagnose` (`swarm why`). Values no turn
+sets it only on a matching foreground provider response. Missing evidence
+keeps the turn successful if its native outcome succeeds and exposes
+`model_unverified_reason`. A mismatch keeps the effective model unset and
+names both IDs in the profile hold, the Owner inbox and `diagnose`
+(`swarm why`). A later verified response clears stale mismatch metadata.
+Values no turn
 re-proves stay at their admission readback; no value is ever presented as
 verified without that admission.
 
@@ -2025,7 +2028,8 @@ continuation cursor for `swarm provider holds` when the status page is full.
 `ProviderClearHoldRequest`/`ProviderClearHoldResponse`. The corrective evidence is a
 closed enum: `credentials_updated`, `configuration_updated`, or `owner_verified`;
 free text is invalid. Its expected-probe binding is compare-and-swap, including explicit
-null to mean no probe claim; a mismatch or unresolved probe cannot be cleared. See the canonical
+null to mean no probe claim. A stale probe binding or an unresolved probe
+prevents the clear. See the canonical
 [Core API DTOs](../../crates/eliot-core/src/api/provider.rs) rather than duplicating
 their field list.
 
@@ -2035,8 +2039,11 @@ hold scope. Eliot never guesses a vendor account. A held scope gates launch/send
 before native I/O and is rechecked when queued work dispatches. Bounded maintenance removes a
 rate-limit/quota hold at or after its known `retry_after` and publishes the automatic
 lift. Launch with linked input and
-resume with new text are gated as sends. Plain resume, reads, request replies, interrupt
-and stop remain available. At initial admission, `provider_held` rejects before binding
+resume with new text are gated as sends. Reads, request replies, interrupt
+and stop remain available. Plain resume remains available for account and
+ordinary profile holds. A `model:<profile>` mismatch hold also gates plain
+resume and carries both model IDs in `source.model_mismatch`. At initial
+admission, `provider_held` rejects before binding
 and creates no command row; that ID may be submitted again after the hold is resolved.
 An already queued command that becomes held is rejected at dispatch under its existing
 binding, before native I/O.

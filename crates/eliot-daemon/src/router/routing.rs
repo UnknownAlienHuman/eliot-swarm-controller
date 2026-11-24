@@ -117,6 +117,7 @@ fn automatic_fallback(routing: crate::config::RoutingConfig) -> Result<Vec<Strin
 
 #[derive(Default)]
 struct RoutePreflight {
+    preview: bool,
     arbitrated: bool,
     automatic: bool,
     provider_switch: bool,
@@ -254,6 +255,7 @@ impl Router {
         // A held account is never replaced with another account of the same
         // harness. Policy may still select a different native harness.
         let mut preflight = RoutePreflight {
+            preview: mode.preview,
             arbitrated: mode.arbitrated,
             automatic: mode.automatic(principal),
             offer_due_probe: mode.preview
@@ -625,9 +627,12 @@ impl Router {
                 )
             });
         let wait = preflight.capacity_refusal.or_else(|| {
-            (preflight.arbitrated && quota_wait.is_none())
-                .then_some(preflight.provider_refusal)
-                .flatten()
+            ((preflight.arbitrated && quota_wait.is_none())
+                || preflight.provider_refusal.as_ref().is_some_and(|error| {
+                    error.failure_where.as_deref() == Some("provider.model_mismatch")
+                }))
+            .then_some(preflight.provider_refusal)
+            .flatten()
         });
         let routing_error = Error::new(
             quota_wait.map_or("routing_unavailable", quota_wait_code),
@@ -768,6 +773,9 @@ impl Router {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
         if preflight.check_candidate_holds() {
+            if !preflight.preview {
+                self.refresh_model_hold(name, &snapshot).await?;
+            }
             let store = self.inner.store.lock().await;
             let probe_at = preflight.offer_due_probe.then(now_ms);
             if let Some(error) = store.routing_refusal(name, &harness, &snapshot, probe_at)? {

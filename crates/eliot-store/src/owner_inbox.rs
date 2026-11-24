@@ -828,7 +828,8 @@ fn project_holds(
                 COALESCE((SELECT MAX(e.seq) FROM events e WHERE CAST(json_extract(e.data,'$.scope') AS TEXT)=h.scope
                   AND e.kind IN ('provider.hold_updated','provider.hold_probe_started','provider.hold_probe_budget_exhausted',
                     'provider.hold_probe_outcome_unknown','provider.hold_cleared','provider.hold_probe_deferred')),0),
-                EXISTS(SELECT 1 FROM commands c WHERE c.id=h.probe_command AND c.state IN ('accepted','queued','dispatched'))
+                EXISTS(SELECT 1 FROM commands c WHERE c.id=h.probe_command AND c.state IN ('accepted','queued','dispatched')),
+                h.source
          FROM provider_holds h WHERE h.state IN ('held','probing')", "h.scope=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
@@ -845,6 +846,7 @@ fn project_holds(
                 r.get::<_, i64>(9)?,
                 r.get::<_, i64>(10)?,
                 r.get::<_, bool>(11)?,
+                r.get::<_, Option<String>>(12)?,
             ))
         })
         .map_err(sql_error)?;
@@ -862,6 +864,7 @@ fn project_holds(
             updated,
             seq,
             probe_active,
+            source,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "held" => eliot_core::ProviderHoldState::Held,
@@ -873,6 +876,7 @@ fn project_holds(
             "quota" => eliot_core::ProviderRestrictionKind::Quota,
             "auth" => eliot_core::ProviderRestrictionKind::Auth,
             "model_removed" => eliot_core::ProviderRestrictionKind::ModelRemoved,
+            "model_mismatch" => eliot_core::ProviderRestrictionKind::ModelMismatch,
             _ => {
                 return Err(crate::Error::new(
                     "corrupt",
@@ -922,13 +926,18 @@ fn project_holds(
             } else {
                 "provider_probe_budget_exhausted"
             };
+            let mismatch_reason = source
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<eliot_core::ProviderHoldSource>(raw).ok())
+                .and_then(|source| source.model_mismatch)
+                .map(|mismatch| mismatch.reason());
             items.push(item(
                 OwnerInboxKind::Hold,
                 scope,
                 format!("held:{since}:updated:{updated}:event:{seq}"),
                 now,
                 since,
-                reason,
+                mismatch_reason.as_deref().unwrap_or(reason),
                 None,
                 choices,
             ));
@@ -1045,8 +1054,7 @@ fn project_agents(
                   SELECT 1 FROM processes p WHERE p.owner='agent:a'||a.id||'#'||a.generation
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
-                json_extract(aw.condition,'$.seconds'),
-                json_extract(a.effective,'$.model_mismatch')
+                json_extract(aw.condition,'$.seconds')
          FROM agents a
          LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
             AND aw.state='waiting' AND EXISTS(
@@ -1092,7 +1100,6 @@ fn project_agents(
                 r.get::<_, Option<i64>>(20)?,
                 r.get::<_, Option<String>>(21)?,
                 r.get::<_, Option<i64>>(22)?,
-                r.get::<_, Option<String>>(23)?,
             ))
         })
         .map_err(sql_error)?;
@@ -1121,7 +1128,6 @@ fn project_agents(
             wake_created_at,
             wake_kind,
             wake_seconds,
-            model_mismatch,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "created" => eliot_core::AgentState::Created,
@@ -1169,9 +1175,7 @@ fn project_agents(
                     "verb":"resume","target":format!("a{id}"),"expected_generation":generation,"args":{}
                 })))
             };
-            let reason = if let Some(reason) = model_mismatch.as_deref() {
-                reason
-            } else if unknown_start.is_some() {
+            let reason = if unknown_start.is_some() {
                 if state == eliot_core::AgentState::Lost {
                     "lost_agent_resolve_unknown_start_first"
                 } else {
@@ -1205,25 +1209,11 @@ fn project_agents(
                 choice.into_iter().collect(),
             ));
         } else {
-            if let Some(reason) = model_mismatch.as_deref() {
-                let target = format!("a{id}");
-                let inspect = action("inspect", "diagnose", json!({"target":target}));
-                items.push(item(
-                    OwnerInboxKind::Agent,
-                    target,
-                    format!("g{generation}:updated:{since}:event:{event_seq}"),
-                    now,
-                    since,
-                    reason,
-                    None,
-                    vec![inspect],
-                ));
-            }
             let result = liveness::mover(
                 &LivenessObject::Agent {
                     state,
                     since,
-                    owner_item: has_request || model_mismatch.is_some(),
+                    owner_item: has_request,
                     launch_queued: launch_queued
                         || (state == eliot_core::AgentState::Starting && process_running),
                     active_turn: observed_turn && (source_open || process_running),

@@ -3528,6 +3528,9 @@ impl Router {
             self.freeze_project_command_guards(request).await?;
             return retained_preparation(&request.args);
         }
+        let profile = required_text(&request.args, "profile")?;
+        self.refresh_model_hold(profile, &request.args["profile_snapshot"])
+            .await?;
         // A switch that requests neither a workspace nor a branch keeps its
         // source checkout: reuse was selected before preparation, so no
         // worktree is minted even under the automatic policy.

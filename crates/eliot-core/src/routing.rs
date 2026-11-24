@@ -416,6 +416,7 @@ pub enum ProviderRestrictionKind {
     Quota,
     Auth,
     ModelRemoved,
+    ModelMismatch,
 }
 
 impl ProviderRestrictionKind {
@@ -425,6 +426,7 @@ impl ProviderRestrictionKind {
             Self::Quota => "quota",
             Self::Auth => "auth",
             Self::ModelRemoved => "model_removed",
+            Self::ModelMismatch => "model_mismatch",
         }
     }
 }
@@ -471,6 +473,53 @@ pub struct ProviderHoldSource {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_mismatch: Option<ProviderModelMismatch>,
+}
+
+pub const PROVIDER_MODEL_UNNAMED: &str = "provider did not name a model";
+
+#[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelMismatch {
+    pub requested_model: String,
+    pub reported_model: String,
+    /// Digest of the installed build and settings used by the native host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+impl ProviderModelMismatch {
+    pub fn validate(&self) -> Result<()> {
+        let valid_id = |model: &str| {
+            !model.trim().is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+        };
+        if !valid_id(&self.requested_model)
+            || !valid_id(&self.reported_model)
+            || self.requested_model == self.reported_model
+            || self.revision.as_ref().is_some_and(|value| {
+                value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(Error::new(
+                "invalid",
+                "invalid provider model mismatch evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn reason(&self) -> String {
+        format!(
+            "model_mismatch: requested {}, provider reported {}",
+            self.requested_model, self.reported_model
+        )
+    }
+}
+
+/// Separate profile model holds from account/quota holds on the same route.
+pub fn model_hold_scope(profile: &str) -> String {
+    format!("model:{profile}")
 }
 
 #[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -527,6 +576,22 @@ pub const MAX_PROVIDER_RESET_HORIZON_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
 impl ProviderHold {
     pub fn validate(&self) -> Result<()> {
         validate_provider_scope(&self.scope)?;
+        let mismatch = self
+            .source
+            .as_ref()
+            .and_then(|source| source.model_mismatch.as_ref());
+        if (self.kind == ProviderRestrictionKind::ModelMismatch) != mismatch.is_some()
+            || (mismatch.is_some()
+                && (self.retry_after.is_some()
+                    || self.next_probe_at.is_some()
+                    || self.state != ProviderHoldState::Held
+                    || !self.scope.starts_with("model:")))
+        {
+            return Err(Error::new("invalid", "invalid model mismatch hold"));
+        }
+        if let Some(mismatch) = mismatch {
+            mismatch.validate()?;
+        }
         let latest_reset = self
             .updated_at
             .saturating_add(MAX_PROVIDER_RESET_HORIZON_MS);
@@ -600,6 +665,13 @@ pub fn frozen_provider_scope_for(
 }
 
 pub(crate) fn validate_provider_scope(scope: &str) -> Result<()> {
+    if let Some(profile) = scope.strip_prefix("model:") {
+        return if valid_name(profile) {
+            Ok(())
+        } else {
+            Err(invalid_provider_scope())
+        };
+    }
     if let Some(account) = scope.strip_prefix("account:")
         && let Some((name, harness)) = account.split_once('.')
     {

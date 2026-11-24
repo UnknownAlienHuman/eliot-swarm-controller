@@ -46,11 +46,10 @@ use crate::native::{
         NativeItemStartedNotification, NativePatchRef, NativeSessionClosedNotification,
         NativeSessionContextUsageNotification, NativeSessionReadResult,
         NativeSessionStartedNotification, NativeSessionTokenUsageNotification,
-        NativeSessionViewHealthChangedNotification, NativeTurnCancelParams,
-        NativeTurnCompletedNotification, NativeTurnStartedNotification, NativeTurnTerminal,
-        NativeUserInputAnswerResult, NativeUserInputCancelResult,
-        NativeUserInputSettledNotification, NativeViewHealth, NativeWorkflowChild,
-        NativeWorkflowItemNotification, session_usage_from_context_usage,
+        NativeSessionViewHealthChangedNotification, NativeTurnCompletedNotification,
+        NativeTurnStartedNotification, NativeTurnTerminal, NativeUserInputAnswerResult,
+        NativeUserInputCancelResult, NativeUserInputSettledNotification, NativeViewHealth,
+        NativeWorkflowChild, NativeWorkflowItemNotification, session_usage_from_context_usage,
         session_usage_from_token_usage, turn_usage,
     },
 };
@@ -139,6 +138,7 @@ pub(crate) struct EventStatus {
     pub last_turn: Option<TurnFacts>,
     pub provider_model_turn: Option<String>,
     pub model_mismatch: Option<(String, String)>,
+    model_stop_at: Option<Instant>,
     /// Confirmed native endpoint exit observed after the last event drain:
     /// exit code plus bounded stderr tail. Endpoint-scoped, never a turn
     /// verdict: an unknown turn next to a recorded exit names the crash
@@ -274,8 +274,10 @@ pub(crate) struct EventConfig {
     pub agent_id: String,
     pub generation: i64,
     pub secrets: Vec<String>,
+    pub model_hold_revision: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct EventHandle {
     actor: EventActor<Control, EventStatus>,
 }
@@ -505,6 +507,7 @@ struct EventProcessor {
     generation: i64,
     secrets: Vec<String>,
     provider_subscription: Option<u64>,
+    model_hold_revision: Option<String>,
     turn_model: TurnModel,
     status: EventStatus,
     buffer: VecDeque<BufferedFrame>,
@@ -599,6 +602,23 @@ pub(crate) fn spawn(
 }
 
 impl EventHandle {
+    pub async fn wait_for_model_stop(&self) {
+        let mut status = self.actor.watch().clone();
+        loop {
+            let deadline = status.borrow_and_update().model_stop_at;
+            if let Some(deadline) = deadline {
+                match timeout_at(deadline, status.changed()).await {
+                    Err(_) if status.borrow().model_stop_at == Some(deadline) => return,
+                    Err(_) | Ok(Ok(())) => continue,
+                    Ok(Err(_)) => break,
+                }
+            } else if status.changed().await.is_err() {
+                break;
+            }
+        }
+        std::future::pending::<()>().await;
+    }
+
     pub async fn view_readback(
         &self,
         session_id: String,
@@ -788,6 +808,7 @@ impl EventProcessor {
             generation: config.generation,
             secrets: config.secrets,
             provider_subscription: None,
+            model_hold_revision: config.model_hold_revision,
             turn_model: TurnModel::default(),
             status: EventStatus::default(),
             buffer: VecDeque::new(),
@@ -1324,6 +1345,7 @@ impl EventProcessor {
             ..TurnModel::default()
         };
         self.status.provider_model_turn = None;
+        self.status.model_mismatch = None;
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
@@ -2418,7 +2440,13 @@ impl EventProcessor {
                     self.status.session_id.clone(),
                     self.status.active_turn_id.clone(),
                 ) {
-                    self.cancel_unverified_turn(&session, &turn).await;
+                    provider::cancel(
+                        &self.native,
+                        &session,
+                        &turn,
+                        Instant::now() + Duration::from_secs(5),
+                    )
+                    .await;
                 }
                 self.record_gap(reason).await?;
             }
@@ -2720,32 +2748,12 @@ impl EventProcessor {
         messages.complete(&mut source, native_id, text, data).await
     }
 
-    async fn flush_verified_messages(&mut self, turn: &str) -> Result<()> {
+    async fn flush_observed_messages(&mut self, turn: &str) -> Result<()> {
         self.messages.awaiting_bytes = 0;
         for (id, text) in std::mem::take(&mut self.messages.awaiting_model) {
             self.complete_message(turn, &id, &text).await?;
         }
         Ok(())
-    }
-
-    async fn cancel_unverified_turn(&self, session: &str, turn: &str) {
-        let params = NativeTurnCancelParams {
-            command_id: crate::host::new_command_id(),
-            session_id: session.to_owned(),
-            turn_id: Some(turn.to_owned()),
-        };
-        if let Ok(params) = serde_json::to_value(params) {
-            // Acceptance alone is not terminal evidence. The exact native
-            // terminal (or the existing recovery path) settles the turn.
-            let _ = self
-                .native
-                .call(
-                    "turn/cancel",
-                    params,
-                    Instant::now() + Duration::from_secs(5),
-                )
-                .await;
-        }
     }
 
     async fn observe_provider_model(&mut self, params: &Value) -> Result<()> {
@@ -2759,7 +2767,7 @@ impl EventProcessor {
         {
             return Ok(());
         }
-        let (task, actual) = match signal.fact {
+        let actual = match signal.fact {
             provider::Fact::ForegroundTask(task) => {
                 self.turn_model.tasks.insert(task.to_owned());
                 return Ok(());
@@ -2768,48 +2776,75 @@ impl EventProcessor {
                 self.turn_model.tasks.remove(task);
                 return Ok(());
             }
-            provider::Fact::Response { task, model } if self.turn_model.tasks.remove(task) => {
-                (task, model)
+            provider::Fact::Response { task, model } if self.turn_model.tasks.contains(task) => {
+                model
             }
             provider::Fact::Response { .. } => return Ok(()),
         };
+        let native_id = event_id(
+            signal.session_id,
+            signal.turn_id,
+            signal.record_id,
+            "turn.model_observed",
+        )?;
+        // Muse 1.4.25 fills an omitted response model with the requested
+        // selector. An exact echo carries no independent provider evidence.
+        let Some(actual) =
+            actual.filter(|actual| Some(*actual) != self.turn_model.expected.as_deref())
+        else {
+            self.status.provider_model_turn = None;
+            self.commit_event(
+                "turn.model_observed",
+                native_id,
+                json!({
+                    "turn_id": signal.turn_id,
+                    "model_unverified_reason": eliot_core::PROVIDER_MODEL_UNNAMED,
+                }),
+            )
+            .await?;
+            return self.flush_observed_messages(signal.turn_id).await;
+        };
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let model = policy.redact_bounded(actual, 256);
-        let mut data = json!({"turn_id": signal.turn_id, "model": model});
-        let mismatch = self
-            .turn_model
-            .expected
-            .as_deref()
-            .filter(|expected| *expected != actual);
-        if let Some(expected) = mismatch {
-            let expected = policy.redact_bounded(expected, 256);
-            let reason =
-                format!("Muse model mismatch: requested {expected}, provider reported {model}");
-            self.status.failure = Some(reason.clone());
-            self.status.model_mismatch = Some((signal.turn_id.to_owned(), reason.clone()));
+        if let Some(expected) = self.turn_model.expected.as_deref()
+            && provider::canonical_model(expected) != provider::canonical_model(actual)
+        {
+            let mismatch = eliot_core::ProviderModelMismatch {
+                requested_model: policy.redact_bounded(expected, 256),
+                reported_model: model,
+                revision: self.model_hold_revision.clone(),
+            };
+            self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
             self.status.provider_model_turn = None;
             self.messages = TurnMessages::default();
-            data["model_mismatch"] = json!(reason);
-            self.cancel_unverified_turn(signal.session_id, signal.turn_id)
-                .await;
+
+            // The hold and the cancellation are independent. Start the exact
+            // cancel immediately and persist the mismatch even if it fails.
+            let native = self.native.clone();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let (committed, accepted) = tokio::join!(
+                self.commit_event(
+                    "turn.model_observed",
+                    native_id,
+                    json!({
+                        "turn_id": signal.turn_id, "model_mismatch": mismatch,
+                    })
+                ),
+                provider::cancel(&native, signal.session_id, signal.turn_id, deadline),
+            );
+            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
+            return committed;
         }
-        if self.status.provider_model_turn.is_none() {
-            let native_id = event_id(
-                signal.session_id,
-                signal.turn_id,
-                task,
-                "turn.model_observed",
-            )?;
-            self.commit_event("turn.model_observed", native_id, data)
-                .await?;
-            if self.status.model_mismatch.is_none() {
-                self.status.provider_model_turn = Some(signal.turn_id.to_owned());
-            }
-        }
-        if self.status.provider_model_turn.is_some() {
-            self.flush_verified_messages(signal.turn_id).await?;
-        }
-        Ok(())
+        self.commit_event(
+            "turn.model_observed",
+            native_id,
+            json!({
+                "turn_id": signal.turn_id, "model": model,
+            }),
+        )
+        .await?;
+        self.status.provider_model_turn = Some(signal.turn_id.to_owned());
+        self.flush_observed_messages(signal.turn_id).await
     }
 
     /// Fold one `session/tokenUsage` event into the session snapshot: cumulative
@@ -3183,16 +3218,11 @@ impl EventProcessor {
             self.status.provider_model_turn.as_deref() == Some(notification.turn_id.as_str());
         let model_error = if let Some((_, reason)) = self.status.model_mismatch.as_ref() {
             Some(("model_mismatch", reason.clone()))
-        } else if notification.terminal == NativeTurnTerminal::Completed && !model_verified {
-            Some((
-                "model_unverified",
-                "Muse completed without provider model evidence".to_owned(),
-            ))
         } else {
             None
         };
-        if model_error.is_none() && model_verified {
-            self.flush_verified_messages(&notification.turn_id).await?;
+        if model_error.is_none() {
+            self.flush_observed_messages(&notification.turn_id).await?;
         }
         let status_text = if model_error.is_some() {
             "failed"
@@ -3217,6 +3247,12 @@ impl EventProcessor {
             },
             "native_status": native_terminal(&notification.terminal).unwrap_or("other"),
         });
+        if model_error.is_none()
+            && !model_verified
+            && notification.terminal == NativeTurnTerminal::Completed
+        {
+            data["model_unverified_reason"] = json!(eliot_core::PROVIDER_MODEL_UNNAMED);
+        }
         // The semantic hold signal gets first claim on the bounded terminal data.
         if notification.terminal == NativeTurnTerminal::Failed {
             let origin = if provider_restriction.is_some() {
@@ -3290,6 +3326,9 @@ impl EventProcessor {
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
+        if committed {
+            self.status.model_stop_at = None;
+        }
         self.messages = TurnMessages::default();
         self.status.clear_stale_idle_latch();
         // A definite Store rejection leaves degraded coverage and requires a

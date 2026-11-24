@@ -1448,6 +1448,7 @@ impl Store {
         let agent_num = parse_agent_id(agent)?;
         let agent_row = load_agent_by_num(&self.connection, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+        super::provider_holds::require_model_unheld(&self.connection, &agent_row)?;
         if agent_row.observe_only {
             return Err(Error::new(
                 "not_allowed",
@@ -2280,6 +2281,7 @@ impl Store {
         }
         let agent_row = load_agent_by_num(&tx, agent_num)?
             .ok_or_else(|| Error::new("not_found", "goal Agent was not found"))?;
+        super::provider_holds::require_model_unheld(&tx, &agent_row)?;
         if agent_row.observe_only {
             return Err(Error::new(
                 "not_allowed",

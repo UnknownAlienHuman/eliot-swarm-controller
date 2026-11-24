@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "claude",
+        model_hold_revision: None,
         exe_stems: &["claude"],
         strategy: InstallStrategy::NewestVerified,
         cli_identity: None,

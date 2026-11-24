@@ -78,10 +78,14 @@ message. Each adapter defines the evidence for `model_verified`. For Muse,
 each main turn begins unverified. The owned session's raw provider response
 must name the model on that exact turn before it becomes verified. A
 selection acknowledgement, catalogue row, session label or token-usage
-model cannot supply that evidence. On the first observed mismatch the
-adapter cancels the exact turn, withholds its unverified response and
-retains both IDs for the Owner inbox and diagnosis. The native terminal
-or the ordinary loss recovery still determines whether the turn ended.
+model cannot supply that evidence. Muse applies its documented canonical
+comparison to each foreground provider response. Unnamed models leave
+verification false and allow the native turn to settle. The first explicit
+mismatch commits both IDs and a [profile hold](monitoring.md#provider-holds)
+while the adapter cancels the exact turn and suppresses its response.
+Failed or unconfirmed cancellation falls back to stopping the owned host.
+Native terminal evidence or ordinary loss recovery determines whether
+the turn ended.
 
 Maximum encoded frame is 1 MiB including the NDJSON newline. Inline input is at most
 512 KiB; persisted event data/final text 64 KiB; pages at most 1,000 entries and below

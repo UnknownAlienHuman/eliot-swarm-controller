@@ -177,6 +177,7 @@ struct MusePlugin {
 enum HostLoopEvent {
     Request(Option<RpcRequest>),
     NativeExit,
+    ForceModelStop,
 }
 
 struct Initialized {
@@ -249,15 +250,35 @@ pub(crate) async fn run() -> Result<()> {
             carried_stop_deadline = stop_deadline;
             HostLoopEvent::Request(Some(request))
         } else {
+            let events = plugin
+                .session
+                .as_ref()
+                .map(|session| session.events.clone());
             tokio::select! {
                 biased;
                 () = eliot_plugin::native_lifecycle::wait_for_native_exit(
                     plugin.session.as_mut().map(|session| &mut session.native.transport)
                 ) => HostLoopEvent::NativeExit,
+                () = async {
+                    if let Some(events) = events {
+                        events.wait_for_model_stop().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => HostLoopEvent::ForceModelStop,
                 request = requests.recv() => HostLoopEvent::Request(request),
             }
         };
         match event {
+            HostLoopEvent::ForceModelStop => {
+                if let Some(session) = plugin.session.as_mut() {
+                    native_retirement =
+                        terminate_session(session, true, Instant::now() + RPC_TIMEOUT).await;
+                    session.events.close().await;
+                }
+                native_endpoint_retired = true;
+                break;
+            }
             HostLoopEvent::NativeExit => {
                 if let Some(session) = plugin.session.as_mut() {
                     // Confirmed exit only: an unconfirmed wait error records
@@ -471,6 +492,7 @@ impl MusePlugin {
             workspace,
             launch,
             secrets,
+            model_hold_revision,
         } = match start::prepare_profile(&params, initialized) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -516,6 +538,7 @@ impl MusePlugin {
             initialized,
             host.native,
             secrets,
+            model_hold_revision,
             skill_pointer,
             peer,
         ) {
@@ -1283,6 +1306,9 @@ impl MusePlugin {
         if session.events.status().mcp_startup_audit_failed {
             return Ok(rejected_control(MCP_AUDIT_DISABLED_REJECTION));
         }
+        if let Some(reason) = active_model_mismatch(&session.events.status()) {
+            return Ok(rejected_control(reason));
+        }
         // A fresh send has no native effect yet. Serialize this check behind
         // the event actor's queued facts/terminal commit, rather than using
         // its potentially older watch snapshot. A durable terminal recovered
@@ -1306,6 +1332,9 @@ impl MusePlugin {
                 }
             },
         };
+        if let Some(reason) = active_model_mismatch(&event_status) {
+            return Ok(rejected_control(reason));
+        }
         // k167b: a readback-settled terminal keeps the send gate until the
         // owned session proves idle with a fresh `session/read`, even when
         // the actor readback itself succeeded.
@@ -2426,25 +2455,16 @@ async fn read_live_snapshot(
         None
     };
     let event_status = session.events.status();
-    if let Some(facts) = &mut last_turn {
-        if event_status.provider_model_turn.as_deref() != Some(facts.turn_id.as_str()) {
-            facts.final_text = None;
-        }
-        if let Some((_, reason)) = event_status
+    if let Some(facts) = &mut last_turn
+        && let Some((_, reason)) = event_status
             .model_mismatch
             .as_ref()
             .filter(|(turn, _)| turn == &facts.turn_id)
-        {
-            facts.native_error = Some(reason.clone());
-            if facts.terminal {
-                facts.status = Some("failed".to_owned());
-            }
-        } else if facts.terminal
-            && facts.status.as_deref() == Some("completed")
-            && event_status.provider_model_turn.as_deref() != Some(facts.turn_id.as_str())
-        {
+    {
+        facts.final_text = None;
+        facts.native_error = Some(reason.clone());
+        if facts.terminal {
             facts.status = Some("failed".to_owned());
-            facts.native_error = Some("Muse completed without provider model evidence".to_owned());
         }
     }
     let result_known = last_turn
@@ -2484,6 +2504,14 @@ fn view_unknown_snapshot(
     snapshot["native_exit"] = json!(session.events.status().native_exit);
     snapshot["batch_unknown"] = json!(session.events.status().batch_unknown);
     Ok(snapshot)
+}
+
+fn active_model_mismatch(status: &EventStatus) -> Option<&str> {
+    status
+        .model_mismatch
+        .as_ref()
+        .filter(|(turn, _)| status.active_turn_id.as_deref() == Some(turn))
+        .map(|(_, reason)| reason.as_str())
 }
 
 /// Fresh exact idle proof for the send gate (k167b): one raw

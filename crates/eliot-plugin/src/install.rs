@@ -13,6 +13,8 @@ use std::{collections::HashMap, sync::OnceLock};
 
 static INSTALL_DECLARATIONS: OnceLock<HashMap<&'static str, InstallDiscovery>> = OnceLock::new();
 
+pub type ModelHoldRevision = fn(&serde_json::Map<String, serde_json::Value>) -> Option<String>;
+
 /// How shared install code turns a plugin's enumerated candidates into one
 /// executable. `ByName` resolves the stem on PATH with no discovery;
 /// `FirstExisting` takes the first enumerated candidate that exists;
@@ -43,6 +45,8 @@ pub struct InstallProbe {
 pub struct InstallDiscovery {
     /// The plugin's own diagnostic name, used in errors, never for branching.
     pub name: &'static str,
+    /// Process-free fingerprint of the native install and settings for a model hold.
+    pub model_hold_revision: Option<ModelHoldRevision>,
     /// Executable stems to look for (without extension or directory).
     pub exe_stems: &'static [&'static str],
     pub strategy: InstallStrategy,

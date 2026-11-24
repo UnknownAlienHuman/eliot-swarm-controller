@@ -15,6 +15,41 @@ pub(crate) struct ProviderProbeWork {
 }
 
 impl Router {
+    /// Recheck native metadata only on launch preparation. A Store
+    /// compare-and-swap protects a newer mismatch while the files are read.
+    pub(super) async fn refresh_model_hold(&self, profile: &str, snapshot: &Value) -> Result<()> {
+        let Some(harness) = snapshot["harness"].as_str() else {
+            return Ok(());
+        };
+        let Some(revision) = eliot_plugin::install::discovery_for(harness)
+            .ok()
+            .and_then(|adapter| adapter.model_hold_revision)
+        else {
+            return Ok(());
+        };
+        let Some(hold) = self.inner.store.lock().await.model_mismatch_hold(profile)? else {
+            return Ok(());
+        };
+        let environment = super::build_process_environment(snapshot)?;
+        let Some(current) = tokio::task::spawn_blocking(move || revision(&environment))
+            .await
+            .map_err(|_| Error::new("unavailable", "native model hold metadata read failed"))?
+        else {
+            return Ok(());
+        };
+        let events = {
+            let mut store = self.inner.store.lock().await;
+            let events = store.clear_changed_model_hold(&hold, &current, now_ms())?;
+            self.publish_locked(&events);
+            events
+        };
+        if !events.is_empty() {
+            self.signal_progress();
+            self.signal_launch_arbitration();
+        }
+        Ok(())
+    }
+
     pub(crate) async fn notify_provider_attention(&self) -> Result<()> {
         let notices = {
             let mut store = self.inner.store.lock().await;

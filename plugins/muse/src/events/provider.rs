@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 
-use crate::native::NativeClient;
+use crate::native::{
+    NativeClient,
+    types::{NativeTurnCancelParams, NativeTurnCancelResult},
+};
 
 #[derive(Serialize, Deserialize)]
 struct StreamRef<'a> {
@@ -53,13 +56,17 @@ pub(super) async fn subscribe(
 pub(super) enum Fact<'a> {
     ForegroundTask(&'a str),
     TaskEnded(&'a str),
-    Response { task: &'a str, model: &'a str },
+    Response {
+        task: &'a str,
+        model: Option<&'a str>,
+    },
 }
 
 pub(super) struct Signal<'a> {
     pub subscription_id: u64,
     pub session_id: &'a str,
     pub turn_id: &'a str,
+    pub record_id: &'a str,
     pub fact: Fact<'a>,
 }
 
@@ -99,10 +106,10 @@ pub(super) fn signal(params: &Value) -> Option<Signal<'_>> {
             if details.get("phase")?.as_str()? != "stream_succeeded" {
                 return None;
             }
-            let model = details
-                .get("facets")?
-                .as_array()?
-                .iter()
+            let model = details["facets"]
+                .as_array()
+                .into_iter()
+                .flatten()
                 .find_map(|facet| {
                     let detail = facet.get("detail")?;
                     if detail.get("kind")?.as_str()? != "provider"
@@ -114,7 +121,7 @@ pub(super) fn signal(params: &Value) -> Option<Signal<'_>> {
                         .get("model")?
                         .as_str()
                         .filter(|id| !id.trim().is_empty())
-                })?;
+                });
             Fact::Response { task, model }
         }
         _ => return None,
@@ -123,6 +130,51 @@ pub(super) fn signal(params: &Value) -> Option<Signal<'_>> {
         subscription_id,
         session_id: stream.id,
         turn_id,
+        record_id: record.get("id")?.as_str()?,
         fact,
+    })
+}
+
+pub(super) fn canonical_model(id: &str) -> &str {
+    let id = id.strip_prefix("meta.").unwrap_or(id);
+    let mut parts = id.rsplitn(4, '-');
+    if let (Some(day), Some(month), Some(year), Some(model)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+        && year.len() == 4
+        && year.bytes().all(|byte| byte.is_ascii_digit())
+        && month.len() == 2
+        && month.bytes().all(|byte| byte.is_ascii_digit())
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month))
+        && day.len() == 2
+        && day.bytes().all(|byte| byte.is_ascii_digit())
+        && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day))
+    {
+        return model;
+    }
+    id
+}
+
+pub(super) async fn cancel(
+    native: &NativeClient,
+    session: &str,
+    turn: &str,
+    deadline: Instant,
+) -> bool {
+    let command_id = crate::host::new_command_id();
+    let params = NativeTurnCancelParams {
+        command_id: command_id.clone(),
+        session_id: session.to_owned(),
+        turn_id: Some(turn.to_owned()),
+    };
+    let Ok(params) = serde_json::to_value(params) else {
+        return false;
+    };
+    let Ok(reply) = native.call("turn/cancel", params, deadline).await else {
+        return false;
+    };
+    serde_json::from_value::<NativeTurnCancelResult>(reply).is_ok_and(|ack| {
+        ack.command_id == command_id && ack.turn_id == turn && ack.status == "accepted"
     })
 }

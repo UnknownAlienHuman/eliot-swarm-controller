@@ -56,6 +56,8 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     }
     if matches!(command.command.verb.as_str(), "launch" | "send" | "steer") {
         provider_holds::require_dispatch_tx(tx, &agent, &command.command)?;
+    } else if command.command.verb == "resume" {
+        provider_holds::require_model_unheld(tx, &agent)?;
     }
     Ok((agent_num, agent, command_generation))
 }

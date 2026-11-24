@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHECKPOINT_RESTORE_POINTS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = MODEL_MISMATCH_HOLD_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -8,6 +8,7 @@ const SWITCH_CHECKOUT_VERSION: i64 = 115;
 const HANDOFF_BUDGET_VERSION: i64 = 116;
 const WORK_TASK_BINDINGS_VERSION: i64 = 117;
 const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
+const MODEL_MISMATCH_HOLD_VERSION: i64 = 119;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -36,7 +37,8 @@ impl Store {
         }
         self.migrate_through_42(current)?;
         self.migrate_after_42(current)?;
-        self.migrate_work_truth(current)
+        self.migrate_work_truth(current)?;
+        self.migrate_model_mismatch_hold(current)
     }
 
     // Keep the debug-build migration frames small enough for Windows.
@@ -2766,6 +2768,55 @@ impl Store {
                 .map_err(sql_error)?;
                 tx.commit().map_err(sql_error)?;
             }
+        }
+        Ok(())
+    }
+
+    fn migrate_model_mismatch_hold(&mut self, current: i64) -> Result<()> {
+        if current < MODEL_MISMATCH_HOLD_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(&format!(
+                "CREATE TABLE provider_holds_new (
+                     scope TEXT PRIMARY KEY CHECK(length(scope) > 0),
+                     kind TEXT NOT NULL CHECK(kind IN ('rate_limit','quota','auth','model_removed','model_mismatch')),
+                     retry_after INTEGER CHECK(retry_after IS NULL OR retry_after >= 0),
+                     probe_command TEXT REFERENCES commands(id),
+                     state TEXT NOT NULL CHECK(state IN ('held','probing')),
+                     updated_at INTEGER NOT NULL,
+                     next_probe_at INTEGER CHECK(next_probe_at IS NULL OR next_probe_at >= 0),
+                     probe_attempts INTEGER NOT NULL DEFAULT 0 CHECK(probe_attempts >= 0),
+                     probe_profile TEXT CHECK(probe_profile IS NULL OR length(probe_profile) > 0),
+                     held_since INTEGER NOT NULL DEFAULT 0 CHECK(held_since >= 0),
+                     automatic_probes INTEGER NOT NULL DEFAULT 0 CHECK(automatic_probes BETWEEN 0 AND {}),
+                     probe_outcome_unknown INTEGER NOT NULL DEFAULT 0 CHECK(probe_outcome_unknown IN (0,1)),
+                     attention_notified INTEGER NOT NULL DEFAULT 0,
+                     source TEXT,
+                     CHECK((state = 'held' AND probe_command IS NULL)
+                        OR (state = 'probing' AND probe_command IS NOT NULL))
+                 );
+                 INSERT INTO provider_holds_new
+                 SELECT scope,kind,retry_after,probe_command,state,updated_at,next_probe_at,
+                        probe_attempts,probe_profile,held_since,automatic_probes,
+                        probe_outcome_unknown,attention_notified,source
+                 FROM provider_holds;
+                 DROP TABLE provider_holds;
+                 ALTER TABLE provider_holds_new RENAME TO provider_holds;
+                 CREATE INDEX provider_holds_probe_due ON provider_holds(next_probe_at, scope)
+                     WHERE next_probe_at IS NOT NULL;
+                 CREATE INDEX provider_holds_reset_due ON provider_holds(retry_after, scope)
+                     WHERE retry_after IS NOT NULL AND state = 'held'
+                       AND kind IN ('rate_limit','quota');",
+                core::MAX_AUTOMATIC_PROVIDER_PROBES,
+            )).map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [MODEL_MISMATCH_HOLD_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
         }
         Ok(())
     }

@@ -98,13 +98,23 @@ override `--contributor-mode on`. A qualified Contributor route on this
 release remains unproven.
 
 Model proof comes from the exact session's MSP `log/subscribe` live stream
-(`rawLog`). The adapter binds each provider success record to the active
-run and its foreground task. Only the model recorded in the provider's
-response facet can verify the selector. `session/tokenUsage.modelId`
-can still echo the configured selector. On a mismatch the adapter sends
-`turn/cancel` for that exact turn, suppresses its unverified output, and
-blocks further input on the affected session. The Owner inbox and
-`swarm why` show both model IDs.
+(`rawLog`). The adapter checks every successful provider response bound to
+the active run and a linked foreground task. Comparison strips the known
+`meta.` prefix and a trailing ISO date. The Contributor suffix remains part
+of the selector. Only a model named in the response can verify it.
+`session/tokenUsage.modelId` can echo the configured selector. Muse 1.4.25
+also fills an omitted provider model with that selector in the raw
+provider facet. An exact echo, an unnamed model or evidence exclusively
+from unlinked tasks leaves verification false with the reason “provider
+did not name a model.” The native result and its text still settle
+normally.
+
+An explicit mismatch suppresses that turn's response and records a durable
+[profile model hold](../spec/monitoring.md#provider-holds) with both IDs.
+The adapter checks the exact `turn/cancel` acknowledgement and verifies
+the native terminal. A failed or unconfirmed cancellation invokes the
+existing owned-host stop path. The Owner inbox shows one item for the
+profile hold. `swarm why` retains the turn diagnosis.
 
 Before `turn/steer` (including `inject active_turn`), the adapter makes a bounded,
 read-only `session/read` with `excludeItems: true`. It requires a readable

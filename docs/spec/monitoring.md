@@ -880,6 +880,17 @@ resume without new text, readback, request replies, interrupt and stop remain av
 Resume with text is a linked send and remains gated. Steer remains bound to its exact
 active turn and generation.
 
+Muse also records a `model_mismatch` hold from the exact, controlled
+`turn.model_observed` response with both model IDs. Store commits the
+hold with the observation, including when native cancellation is still
+unconfirmed. The scope `model:<profile>` is independent of the account
+or quota hold. It refuses launch, send, steer, resume with or without
+input, restart continuation, Goal rounds and probes for that profile.
+The hold has no timer or probe budget. One Owner inbox item tracks it
+until the Owner clears it or launch preparation verifies a changed
+installed Muse build or native settings file. An unreadable revision
+keeps the hold. The next actual launch uses ordinary admission.
+
 The [Owner quota reserve](configuration.md#owner-quota-reserve-872) is a separate
 daemon admission policy for new automatic launches. It uses fresh passive quota
 readback and the existing routing and launch wait paths. Skipping a candidate on
@@ -944,8 +955,9 @@ Clear uses a same-scope compare-and-swap against the expected probe command, inc
 explicit null; it cannot clear an unresolved probe. The mutation ID binds the clear
 request, so an exact retry returns the retained result and changed evidence conflicts.
 
-`agent.list` and `agent.get` project the hold matching that Agent's frozen account or
-profile as `AgentProviderHold { kind, state, retry_after, updated_at,
+`agent.list` and `agent.get` project a profile model hold first, or the
+hold matching that Agent's frozen account or profile, as
+`AgentProviderHold { kind, state, retry_after, updated_at,
 waiting_for_active_turn, next_probe_at, held_since }`; shared scope and probe-command
 identity remain on the owner-only provider-hold read. They also project
 the latest `turn.notice`, or the latest failed terminal `native_error`, as

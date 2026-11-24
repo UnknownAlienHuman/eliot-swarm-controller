@@ -9,6 +9,7 @@ pub(super) struct AgentStatusLookup {
     pub(super) active_turn: Option<String>,
     pub(super) last_progress_at: Option<i64>,
     pub(super) provider_scope: String,
+    pub(super) model_hold_scope: String,
 }
 
 pub(super) struct AgentStatusProjection {
@@ -33,6 +34,7 @@ impl Store {
             generation: agent.generation,
             active_turn: agent.active_turn.clone(),
             last_progress_at,
+            model_hold_scope: core::model_hold_scope(&agent.profile),
             provider_scope: core::frozen_provider_scope_for(
                 &agent.profile,
                 &agent.harness,
@@ -58,7 +60,12 @@ impl Store {
 
         let scopes: Vec<String> = lookups
             .iter()
-            .map(|lookup| lookup.provider_scope.clone())
+            .flat_map(|lookup| {
+                [
+                    lookup.provider_scope.clone(),
+                    lookup.model_hold_scope.clone(),
+                ]
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -75,7 +82,10 @@ impl Store {
             .iter()
             .zip(notices)
             .map(|(lookup, native_notice)| {
-                let mut provider_hold = holds.get(&lookup.provider_scope).cloned();
+                let mut provider_hold = holds
+                    .get(&lookup.model_hold_scope)
+                    .or_else(|| holds.get(&lookup.provider_scope))
+                    .cloned();
                 if let Some(hold) = &mut provider_hold {
                     hold.waiting_for_active_turn = lookup.active_turn.is_some()
                         && hold.state == core::ProviderHoldState::Probing

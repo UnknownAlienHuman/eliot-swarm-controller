@@ -261,6 +261,7 @@ impl Store {
                 generation: record.generation,
                 active_turn: record.active_turn.clone(),
                 last_progress_at,
+                model_hold_scope: core::model_hold_scope(&record.profile),
                 provider_scope: core::frozen_provider_scope_for(
                     &record.profile,
                     &record.harness,
