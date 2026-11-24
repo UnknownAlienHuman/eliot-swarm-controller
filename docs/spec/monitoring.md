@@ -451,7 +451,10 @@ verify Git and worktree identity again before native dispatch.
 A Ready Resume whose retained marker cannot prove a no-write refusal settles
 unknown on a preparation error, retaining the error and fencing native dispatch.
 
-A lost Git response is settled by exact worktree/path/branch/OID readback. A failed
+A lost Git response is settled by exact worktree/path/branch/OID readback. Creation
+uses one initial repository and worktree registry read for absence classification and
+identity verification. The attached branch and commit must agree with the registration,
+and the verifier rereads the subject after the clean-worktree check. A failed
 checkout can leave its new Git branch after Git has removed the worktree. Cleanup
 requires the creation command's branch reflog marker, the frozen tip and no other
 registration. Rollback checks a newly created worktree with porcelain status and
