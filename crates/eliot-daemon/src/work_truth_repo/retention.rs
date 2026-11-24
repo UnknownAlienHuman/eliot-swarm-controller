@@ -39,7 +39,7 @@ pub(crate) async fn maintain(
     let deadline = Instant::now() + SWEEP_TIME;
     if let Some(cutoff) = cutoff {
         for generation in &generations {
-            sweep_generation(store, &git, &root, generation, cutoff, deadline).await?;
+            sweep_generation(&git, &root, generation, cutoff, deadline).await?;
             *after = Some((generation.agent_id, generation.generation));
         }
     }
@@ -51,7 +51,6 @@ pub(crate) async fn maintain(
 }
 
 async fn sweep_generation(
-    store: &Mutex<Store>,
     git: &GitProbe,
     root: &Path,
     generation: &CheckpointRetentionGeneration,
@@ -65,7 +64,12 @@ async fn sweep_generation(
     let output = git
         .workspace_command(
             root,
-            &["for-each-ref", "--format=%(refname) %(objectname)", &prefix],
+            &[
+                "for-each-ref",
+                "--count=128",
+                "--format=%(refname) %(objectname)",
+                &prefix,
+            ],
             deadline,
         )
         .await?;
@@ -76,15 +80,7 @@ async fn sweep_generation(
         ));
     }
     let current = generation.checkpoint_ref.as_deref();
-    let keep_current = match current {
-        Some(reference) => store
-            .lock()
-            .await
-            .checkpoint_ref_is_latest_for_task(reference)?,
-        None => false,
-    };
     let mut writes = String::new();
-    let mut current_retained = false;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some((reference, oid)) = line.split_once(' ') else {
             return Err(Error::new(
@@ -92,7 +88,6 @@ async fn sweep_generation(
                 "invalid private Git ref inventory",
             ));
         };
-        let is_current = current == Some(reference);
         let old = reference
             .strip_prefix(&prefix)
             .and_then(|label| label.split_once('-'))
@@ -101,11 +96,11 @@ async fn sweep_generation(
                     && ts.parse::<i64>().is_ok_and(|ts| ts <= cutoff)
                     && ulid::Ulid::from_string(id).is_ok()
             });
-        if old && eliot_core::api::is_git_oid(oid) && !(is_current && keep_current) {
+        // A task binding can change between captures. Keep the exact Store
+        // pointer the restore API accepts for each retained generation.
+        if old && eliot_core::api::is_git_oid(oid) && current != Some(reference) {
             writeln!(&mut writes, "delete {reference} {oid}")
                 .map_err(|_| Error::new("internal", "checkpoint deletion could not be encoded"))?;
-        } else if is_current {
-            current_retained = true;
         }
     }
     if !writes.is_empty() {
@@ -123,9 +118,6 @@ async fn sweep_generation(
                 "expired checkpoint refs could not be pruned",
             ));
         }
-    }
-    if let Some(reference) = current.filter(|_| !keep_current && !current_retained) {
-        store.lock().await.clear_pruned_checkpoint_ref(reference)?;
     }
     Ok(())
 }

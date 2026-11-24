@@ -578,63 +578,6 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Keep a checkpoint while it is the newest retained snapshot for its
-    /// durable Git task identity, including successor SEND aliases.
-    pub fn checkpoint_ref_is_latest_for_task(&self, reference: &str) -> Result<bool> {
-        self.ensure_committed_reads()?;
-        self.connection
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM git_checkpoints checkpoint
-                     JOIN git_work_tasks task
-                       ON task.agent = checkpoint.agent
-                      AND task.generation = checkpoint.generation
-                     WHERE checkpoint.checkpoint_ref = ?1
-                       AND checkpoint.state IN ('snapshot','failed')
-                       AND NOT EXISTS (
-                           SELECT 1
-                           FROM git_work_tasks newer_task
-                           JOIN git_checkpoints newer
-                             ON newer.agent = newer_task.agent
-                            AND newer.generation = newer_task.generation
-                           WHERE newer_task.task_ref = task.task_ref
-                             AND newer.state = 'snapshot'
-                             AND newer.checkpoint_ref IS NOT NULL
-                             AND substr(newer.checkpoint_ref, -43) > substr(checkpoint.checkpoint_ref, -43)
-                       )
-                 ) OR EXISTS(
-                     SELECT 1 FROM git_checkpoints checkpoint
-                     WHERE checkpoint.checkpoint_ref = ?1
-                       AND checkpoint.state IN ('snapshot','failed')
-                       AND NOT EXISTS (
-                           SELECT 1 FROM git_work_tasks task
-                           WHERE task.agent = checkpoint.agent
-                             AND task.generation = checkpoint.generation
-                       )
-                 )",
-                [reference],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
-    }
-
-    pub fn clear_pruned_checkpoint_ref(&mut self, reference: &str) -> Result<()> {
-        self.ensure_writer_healthy()?;
-        let result = self
-            .connection
-            .execute(
-                "UPDATE git_checkpoints
-                 SET state = 'none', checkpoint_ref = NULL, oid = NULL, fingerprint = NULL
-                 WHERE checkpoint_ref = ?1",
-                [reference],
-            )
-            .map(|_| ())
-            .map_err(sql_error);
-        self.fault_on_persistence_error(&result);
-        result
-    }
-
     /// Whether this ended generation's whole process tree is proven gone.
     pub fn session_exit_proven(&self, agent: &str, generation: i64) -> Result<bool> {
         self.ensure_committed_reads()?;

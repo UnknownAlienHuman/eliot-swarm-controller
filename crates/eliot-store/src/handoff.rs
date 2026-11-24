@@ -780,15 +780,6 @@ pub(super) fn handoff_tx(
         policy,
         project_transfer || (from_switch && from.is_terminal()),
     )?;
-    if from_switch {
-        let complete = switch_transfer_commands(tx, &from, &request.commands, from.is_terminal())?;
-        if complete != request.commands {
-            return Err(Error::new(
-                "bad_state",
-                "switch gained a transferable SEND after its reservation",
-            ));
-        }
-    }
     let required_task = || {
         task.as_ref()
             .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))

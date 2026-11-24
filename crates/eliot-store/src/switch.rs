@@ -804,7 +804,7 @@ pub(super) fn reserve_rule_switch_tx(
             "switch exceeds command budget",
         ));
     }
-    if let Err(error) = source_tx(tx, request, limits, policy) {
+    if let Err(error) = source_tx(tx, request, limits, policy, false) {
         return if error.code == "busy" {
             Err(Error::new("bad_state", *error.message))
         } else {
@@ -994,7 +994,12 @@ pub(super) fn reserve_provider_switch_tx(
     let digest = canonical::digest(&args)?;
     let change = match reserve_switch_tx(tx, &request, args, &digest, now, None, true) {
         Ok(change) => change,
-        Err(error) if error.code == "switch_budget_unavailable" => {
+        Err(error)
+            if matches!(
+                error.code.as_str(),
+                "switch_budget_unavailable" | "fanout_limit"
+            ) =>
+        {
             events.push(insert_daemon_event(
                 tx,
                 now,
@@ -1005,7 +1010,7 @@ pub(super) fn reserve_provider_switch_tx(
                 json!({
                     "task_command": task,
                     "kind": restriction.kind,
-                    "state": "budget_unavailable",
+                    "state": if error.code == "fanout_limit" { "input_scope_refused" } else { "budget_unavailable" },
                 }),
             )?);
             return Ok(());
@@ -1155,7 +1160,7 @@ impl Store {
                 ));
             }
             require_switch_caller(&tx, principal, request)?;
-            source_tx(&tx, request, self.hierarchy_limits, policy)?;
+            source_tx(&tx, request, self.hierarchy_limits, policy, false)?;
             let mut change = reserve_switch_tx(
                 &tx,
                 request,
@@ -1420,7 +1425,7 @@ impl Store {
                 requested_by,
                 ..
             } = decode_switch(parent.args.clone())?;
-            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy)?;
+            let (agent, target) = source_tx(&tx, &source, self.hierarchy_limits, policy, true)?;
             if agent.workspace != source_checkout {
                 return Err(Error::new(
                     "source_integrity",
@@ -1741,7 +1746,8 @@ impl Store {
                         &destination.id,
                         destination.generation,
                     );
-                    let (source, _) = source_tx(&tx, &request, self.hierarchy_limits, policy)?;
+                    let (source, _) =
+                        source_tx(&tx, &request, self.hierarchy_limits, policy, true)?;
                     if let Some(failure) = provider_failure {
                         require_provider_retry(&tx, &source, &request.task_command)?;
                         failure.require_authority(&source.profile_snapshot)?;
@@ -2436,6 +2442,7 @@ fn source_tx(
     request: &SwitchRequest,
     limits: core::api::HierarchyLimits,
     policy: &core::SecretPolicy,
+    frozen: bool,
 ) -> Result<(Agent, Option<core::api::ProjectRegistrationView>)> {
     if request.commands.len() as i64 > limits.max_selector_targets {
         return Err(Error::new(
@@ -2462,6 +2469,17 @@ fn source_tx(
         return Err(Error::new(
             "fanout_limit",
             "switch selection exceeds configured bound",
+        ));
+    }
+    if frozen
+        && inputs
+            .iter()
+            .map(|command| &command.id)
+            .ne(&request.commands)
+    {
+        return Err(Error::new(
+            "bad_state",
+            "switch gained a transferable SEND after its reservation",
         ));
     }
     goals::require_handoff_source_goal(tx, &source, policy)?;

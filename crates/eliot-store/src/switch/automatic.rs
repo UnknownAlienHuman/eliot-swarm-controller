@@ -646,7 +646,7 @@ impl Store {
                     "more input is queued than one handoff can carry; move it by hand",
                 ))
             } else {
-                source_tx(&tx, &request, self.hierarchy_limits, policy).map(|_| ())
+                source_tx(&tx, &request, self.hierarchy_limits, policy, false).map(|_| ())
             };
             if let Err(error) = checked {
                 if error.code == "busy" {
