@@ -2792,7 +2792,7 @@ impl Store {
                      held_since INTEGER NOT NULL DEFAULT 0 CHECK(held_since >= 0),
                      automatic_probes INTEGER NOT NULL DEFAULT 0 CHECK(automatic_probes BETWEEN 0 AND {}),
                      probe_outcome_unknown INTEGER NOT NULL DEFAULT 0 CHECK(probe_outcome_unknown IN (0,1)),
-                     attention_notified INTEGER NOT NULL DEFAULT 0,
+                     attention_notified INTEGER NOT NULL DEFAULT 0 CHECK(attention_notified IN (0,1)),
                      source TEXT,
                      CHECK((state = 'held' AND probe_command IS NULL)
                         OR (state = 'probing' AND probe_command IS NOT NULL))
@@ -2811,6 +2811,8 @@ impl Store {
                        AND kind IN ('rate_limit','quota');",
                 core::MAX_AUTOMATIC_PROVIDER_PROBES,
             )).map_err(sql_error)?;
+            tx.execute_batch(autonomy::PROVIDER_HOLD_AGE_INDEX)
+                .map_err(sql_error)?;
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [MODEL_MISMATCH_HOLD_VERSION],

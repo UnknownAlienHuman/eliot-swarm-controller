@@ -1,5 +1,7 @@
 mod connection;
 mod host;
+#[cfg(windows)]
+mod launcher_update;
 
 pub(crate) use connection::{PluginClient, PluginConnection};
 pub(crate) use host::{

@@ -42,7 +42,7 @@ pub(super) struct PreparedStart {
     pub(super) workspace: PathBuf,
     pub(super) launch: NativeLaunch,
     pub(super) secrets: Vec<String>,
-    pub(super) model_hold_revision: Option<String>,
+    pub(super) model_hold_settings_path: Option<PathBuf>,
 }
 
 pub(super) fn prepare_profile(
@@ -175,11 +175,11 @@ pub(super) fn prepare_profile(
         profile.get("pass_env"),
         "Muse",
     )?;
-    let model_hold_revision = params
+    let model_hold_settings_path = params
         .target_environment
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(crate::install::model_hold_revision);
+        .and_then(crate::install::model_hold_settings_path);
     secrets.push(initialized.credential.clone());
     // Sandbox posture is fixed at host birth (`muse serve` flags):
     // canonical danger-full-access passes --disable-sandbox, while
@@ -200,7 +200,7 @@ pub(super) fn prepare_profile(
         workspace,
         launch,
         secrets,
-        model_hold_revision,
+        model_hold_settings_path,
     })
 }
 
@@ -241,7 +241,7 @@ pub(super) fn bind_owned_session(
     initialized: &Initialized,
     mut native: NativeProcess,
     secrets: Vec<String>,
-    model_hold_revision: Option<String>,
+    model_hold_settings_path: Option<PathBuf>,
     skill_pointer: String,
     peer: &PeerClient,
 ) -> Result<AgentSession> {
@@ -258,7 +258,7 @@ pub(super) fn bind_owned_session(
             agent_id: params.agent_id.clone(),
             generation: params.generation,
             secrets: secrets.clone(),
-            model_hold_revision,
+            model_hold_settings_path,
         },
     );
     Ok(AgentSession {

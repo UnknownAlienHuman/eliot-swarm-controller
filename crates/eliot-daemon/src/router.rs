@@ -3338,6 +3338,8 @@ impl Router {
             ));
         }
 
+        self.refresh_model_hold_for_submission(&request, principal)
+            .await?;
         Ok(PreparedSubmission { request, workspace })
     }
 

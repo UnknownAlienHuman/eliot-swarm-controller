@@ -20,6 +20,8 @@ pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "antigravity",
         model_hold_revision: None,
+        #[cfg(windows)]
+        launcher_update: None,
         exe_stems: &["agy"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: Some(CLI_STEM),

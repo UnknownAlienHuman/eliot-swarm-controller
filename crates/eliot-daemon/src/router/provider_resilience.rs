@@ -15,8 +15,8 @@ pub(crate) struct ProviderProbeWork {
 }
 
 impl Router {
-    /// Recheck native metadata only on launch preparation. A Store
-    /// compare-and-swap protects a newer mismatch while the files are read.
+    /// Recheck passive native metadata before model-hold gates. Store
+    /// compares the exact row so a concurrent newer mismatch stays held.
     pub(super) async fn refresh_model_hold(&self, profile: &str, snapshot: &Value) -> Result<()> {
         let Some(harness) = snapshot["harness"].as_str() else {
             return Ok(());
@@ -46,6 +46,67 @@ impl Router {
         if !events.is_empty() {
             self.signal_progress();
             self.signal_launch_arbitration();
+        }
+        Ok(())
+    }
+
+    pub(super) async fn refresh_model_hold_for_submission(
+        &self,
+        request: &SubmitCommand,
+        principal: &Principal,
+    ) -> Result<()> {
+        if !matches!(request.verb.as_str(), "send" | "steer" | "resume") {
+            return Ok(());
+        }
+        let agents = {
+            let store = self.inner.store.lock().await;
+            if store.get_command(&request.id)?.is_some() {
+                return Ok(());
+            }
+            if let Some(selector) = request
+                .selector
+                .as_deref()
+                .filter(|_| request.verb == "send")
+            {
+                store.model_hold_selector_targets(&principal_name(principal), selector)?
+            } else if let Some(target) = request.target.as_deref() {
+                store.get_agent(target)?.into_iter().collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for agent in agents {
+            if !agent.observe_only
+                && request
+                    .expected_generation
+                    .is_none_or(|generation| generation == agent.generation)
+            {
+                self.refresh_model_hold(&agent.profile, &agent.profile_snapshot)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn refresh_model_hold_for_dispatch(&self, command: &Command) -> Result<()> {
+        if !matches!(
+            command.verb.as_str(),
+            "launch" | "send" | "steer" | "resume" | "inject"
+        ) {
+            return Ok(());
+        }
+        let Some(target) = command.target.as_deref() else {
+            return Ok(());
+        };
+        let agent = self.inner.store.lock().await.get_agent(target)?;
+        if let Some(agent) = agent.filter(|agent| {
+            !agent.observe_only
+                && command
+                    .generation
+                    .is_none_or(|generation| generation == agent.generation)
+        }) {
+            self.refresh_model_hold(&agent.profile, &agent.profile_snapshot)
+                .await?;
         }
         Ok(())
     }

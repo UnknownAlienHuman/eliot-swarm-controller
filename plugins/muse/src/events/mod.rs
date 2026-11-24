@@ -22,7 +22,7 @@ use eliot_plugin::{
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot, watch},
     time::{Instant, timeout_at},
@@ -274,7 +274,7 @@ pub(crate) struct EventConfig {
     pub agent_id: String,
     pub generation: i64,
     pub secrets: Vec<String>,
-    pub model_hold_revision: Option<String>,
+    pub model_hold_settings_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -507,7 +507,7 @@ struct EventProcessor {
     generation: i64,
     secrets: Vec<String>,
     provider_subscription: Option<u64>,
-    model_hold_revision: Option<String>,
+    model_hold_settings_path: Option<PathBuf>,
     turn_model: TurnModel,
     status: EventStatus,
     buffer: VecDeque<BufferedFrame>,
@@ -808,7 +808,7 @@ impl EventProcessor {
             generation: config.generation,
             secrets: config.secrets,
             provider_subscription: None,
-            model_hold_revision: config.model_hold_revision,
+            model_hold_settings_path: config.model_hold_settings_path,
             turn_model: TurnModel::default(),
             status: EventStatus::default(),
             buffer: VecDeque::new(),
@@ -2812,7 +2812,10 @@ impl EventProcessor {
             let mismatch = eliot_core::ProviderModelMismatch {
                 requested_model: policy.redact_bounded(expected, 256),
                 reported_model: model,
-                revision: self.model_hold_revision.clone(),
+                revision: self
+                    .model_hold_settings_path
+                    .as_deref()
+                    .and_then(crate::install::model_hold_revision_for_path),
             };
             self.status.model_mismatch = Some((signal.turn_id.to_owned(), mismatch.reason()));
             self.status.provider_model_turn = None;

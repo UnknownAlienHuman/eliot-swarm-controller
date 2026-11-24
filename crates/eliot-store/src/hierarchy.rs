@@ -474,7 +474,7 @@ pub(super) fn admission_allows_carried_parent_binding(
 /// Snapshot one tree selector to its member rows, in member order. Unknown
 /// roots never create Agents; scope and overflow reject before any row.
 pub(super) fn snapshot_selector_members(
-    tx: &Transaction<'_>,
+    tx: &Connection,
     principal: &str,
     selector: &str,
     limits: HierarchyLimits,

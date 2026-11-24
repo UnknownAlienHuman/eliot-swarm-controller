@@ -31,8 +31,6 @@ CREATE INDEX autonomy_child_creation ON agents(parent, created_at);
 CREATE INDEX IF NOT EXISTS autonomy_fleet_agent_state_event
     ON events(agent, generation, kind, ts DESC, seq DESC)
     WHERE kind IN ('agent.failed', 'agent.lost');
-CREATE INDEX IF NOT EXISTS autonomy_fleet_provider_hold_age
-    ON provider_holds(held_since, scope) WHERE state IN ('held', 'probing');
 CREATE INDEX IF NOT EXISTS autonomy_fleet_turn_window
     ON turns(COALESCE(completed_at, started_at, 0), agent, generation, turn_id);
 "#;

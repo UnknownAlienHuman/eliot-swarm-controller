@@ -213,8 +213,26 @@ impl Store {
         get(&self.connection, &core::model_hold_scope(profile))
     }
 
-    /// A launch can refresh only the exact mismatch row it read before
-    /// checking the installed runtime and settings.
+    /// Read the authorized, live targets of a SEND selector before admission.
+    /// Admission expands and checks the selector again in its transaction.
+    pub fn model_hold_selector_targets(
+        &self,
+        principal: &str,
+        selector: &str,
+    ) -> Result<Vec<Agent>> {
+        self.ensure_committed_reads()?;
+        let mut agents = super::hierarchy::snapshot_selector_members(
+            &self.connection,
+            principal,
+            selector,
+            self.hierarchy_limits,
+        )?;
+        agents.retain(|agent| !agent.state.is_terminal() && !agent.observe_only);
+        Ok(agents)
+    }
+
+    /// Refresh only the exact mismatch row read before checking the
+    /// installed runtime and settings.
     pub fn clear_changed_model_hold(
         &mut self,
         expected: &ProviderHold,
@@ -223,12 +241,16 @@ impl Store {
     ) -> Result<Vec<core::Event>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            let previous = expected
+            let Some(mismatch) = expected
                 .source
                 .as_ref()
                 .and_then(|source| source.model_mismatch.as_ref())
-                .and_then(|mismatch| mismatch.revision.as_deref());
-            if !previous.is_some_and(|previous| previous != revision) {
+            else {
+                return Ok(Vec::new());
+            };
+            // A hold observed without readable metadata gets one attempt
+            // when a revision becomes available.
+            if mismatch.revision.as_deref() == Some(revision) {
                 return Ok(Vec::new());
             }
             let tx = self

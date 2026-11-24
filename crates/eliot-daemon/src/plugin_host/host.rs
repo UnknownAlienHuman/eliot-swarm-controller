@@ -827,6 +827,8 @@ impl PluginHost {
             remove_empty_instance_dir(&instance_dir);
             return Err(error);
         }
+        #[cfg(windows)]
+        super::launcher_update::schedule(&agent.harness, &agent.id, &command.id);
         let spawn_started = Instant::now();
         // Per-spawn crash nonce, written as the plugin's first stdin line
         // (never argv or environment): only reports carrying it and the owned

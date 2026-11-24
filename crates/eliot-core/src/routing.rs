@@ -484,7 +484,7 @@ pub const PROVIDER_MODEL_UNNAMED: &str = "provider did not name a model";
 pub struct ProviderModelMismatch {
     pub requested_model: String,
     pub reported_model: String,
-    /// Digest of the installed build and settings used by the native host.
+    /// Digest of the installed build and settings at mismatch observation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
 }

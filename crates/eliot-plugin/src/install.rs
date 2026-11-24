@@ -13,6 +13,15 @@ use std::{collections::HashMap, sync::OnceLock};
 
 static INSTALL_DECLARATIONS: OnceLock<HashMap<&'static str, InstallDiscovery>> = OnceLock::new();
 
+/// Vendor-owned version check. The daemon owns its short-lived launcher
+/// process, outside the Agent's process custody.
+#[cfg(windows)]
+pub struct LauncherUpdate {
+    pub program: PathBuf,
+    pub args: &'static [&'static str],
+    pub environment: Vec<(&'static str, String)>,
+}
+
 pub type ModelHoldRevision = fn(&serde_json::Map<String, serde_json::Value>) -> Option<String>;
 
 /// How shared install code turns a plugin's enumerated candidates into one
@@ -47,6 +56,9 @@ pub struct InstallDiscovery {
     pub name: &'static str,
     /// Process-free fingerprint of the native install and settings for a model hold.
     pub model_hold_revision: Option<ModelHoldRevision>,
+    /// Returns an update invocation only when the vendor's check is due.
+    #[cfg(windows)]
+    pub launcher_update: Option<fn() -> Option<LauncherUpdate>>,
     /// Executable stems to look for (without extension or directory).
     pub exe_stems: &'static [&'static str],
     pub strategy: InstallStrategy,

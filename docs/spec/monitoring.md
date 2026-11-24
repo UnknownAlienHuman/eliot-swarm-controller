@@ -892,9 +892,11 @@ unconfirmed. The scope `model:<profile>` is independent of the account
 or quota hold. It refuses launch, send, steer, resume with or without
 input, restart continuation, Goal rounds and probes for that profile.
 The hold has no timer or probe budget. One Owner inbox item tracks it
-until the Owner clears it or launch preparation verifies a changed
-installed Muse build or native settings file. An unreadable revision
-keeps the hold. The next actual launch uses ordinary admission.
+until the Owner clears it or launch, send, steer or resume preparation
+observes a changed installed Muse build or native settings file. A hold
+recorded without a readable revision clears on the first readable revision,
+allowing a single new attempt. An unreadable current revision keeps the hold.
+The next action uses ordinary admission and dispatch gates.
 
 The [Owner quota reserve](configuration.md#owner-quota-reserve-872) is a separate
 daemon admission policy for new automatic launches. It uses fresh passive quota

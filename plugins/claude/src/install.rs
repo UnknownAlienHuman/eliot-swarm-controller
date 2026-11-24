@@ -14,6 +14,8 @@ pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "claude",
         model_hold_revision: None,
+        #[cfg(windows)]
+        launcher_update: None,
         exe_stems: &["claude"],
         strategy: InstallStrategy::NewestVerified,
         cli_identity: None,

@@ -2,6 +2,9 @@
 //! vendor launcher directory, never resolved from PATH (a PATH `muse`
 //! names the launcher wrapper whose PID would orphan the real host).
 
+#[cfg(windows)]
+mod update;
+
 use eliot_core as core;
 use eliot_plugin::install::{
     InstallDiscovery, InstallStrategy, find_on_path, is_native_executable, is_script_wrapper,
@@ -24,6 +27,8 @@ pub fn discovery() -> InstallDiscovery {
     InstallDiscovery {
         name: "muse",
         model_hold_revision: Some(model_hold_revision),
+        #[cfg(windows)]
+        launcher_update: Some(update::due_launcher_update),
         exe_stems: &["muse"],
         strategy: InstallStrategy::MetadataVersion(payload_version),
         cli_identity: None,
@@ -43,7 +48,12 @@ pub fn discovery() -> InstallDiscovery {
 pub(crate) fn model_hold_revision(
     environment: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<String> {
-    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    model_hold_revision_for_path(&model_hold_settings_path(environment)?)
+}
+
+pub(crate) fn model_hold_settings_path(
+    environment: &serde_json::Map<String, serde_json::Value>,
+) -> Option<PathBuf> {
     let lookup = |name: &str| {
         environment
             .iter()
@@ -62,11 +72,14 @@ pub(crate) fn model_hold_revision(
     } else {
         Path::new(lookup("HOME").or_else(|| lookup("USERPROFILE"))?).join(".config")
     };
-    if !directory.is_absolute() {
-        return None;
-    }
-    let path = directory.join("muse").join("settings.json");
-    let settings = match File::open(&path) {
+    directory
+        .is_absolute()
+        .then(|| directory.join("muse").join("settings.json"))
+}
+
+pub(crate) fn model_hold_revision_for_path(path: &Path) -> Option<String> {
+    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    let settings = match File::open(path) {
         Ok(file) => {
             let mut bytes = Vec::new();
             file.take(MAX_SETTINGS_BYTES + 1)
