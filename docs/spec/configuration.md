@@ -1688,10 +1688,15 @@ Held and lost sessions use `handoff_fallback` in configured order. A lost sessio
 can reuse its profile if the fallback list names it. For a withheld response on a
 role-routed Agent, `on_provider_failure = "next"` selects from the remaining presets
 in that role. An explicitly selected preset uses `handoff_fallback` when
-`auto_handoff` is enabled. The source preset and its Codex provider route are
-ineligible for the withheld task, including direct presets and aliases of the same
-adopted Responses endpoint. Profiles this task already left and held profiles are
-skipped.
+`auto_handoff` is enabled. A Codex response route identifies the frozen account
+and credential selector. Direct Codex uses the fixed ChatGPT endpoint and
+`CODEX_HOME` (or the default login home). Adopted Responses routes use the
+normalized provider endpoint and the configured client-key environment name
+(or its absence). Preset and proxy aliases share that route when these selectors
+match. Only a digest of these selectors is retained in the refusal event.
+Automatic rerouting skips the current route and the routes from the 32 most recent
+earlier lineage generations with retained refusal events. It also skips the
+presets this task already left and profiles on hold.
 Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no
 eligible candidate the Agent keeps its work. The Owner inbox and `swarm why` report

@@ -145,7 +145,7 @@ struct RoutePreflight {
     provider_authority: Option<[u8; 32]>,
     provider_source: Option<Value>,
     handoff_source: Option<Value>,
-    skip_source_provider_route: bool,
+    withheld_provider_routes: HashSet<String>,
     handoff_allowed: Option<Vec<String>>,
     /// Source profile when a sandboxed successor could not commit here.
     handoff_no_commit: Option<String>,
@@ -563,11 +563,20 @@ impl Router {
                 .is_some(),
             None => false,
         };
+        let withheld_provider_routes = if route.reason == HandoffReason::ProviderResponseWithheld {
+            self.inner
+                .store
+                .lock()
+                .await
+                .withheld_provider_routes(source)?
+        } else {
+            HashSet::new()
+        };
         let mut preflight = RoutePreflight {
             provider_switch: true,
             prefer_candidate_order: route.role.is_none(),
             handoff_source: Some(source.profile_snapshot.clone()),
-            skip_source_provider_route: route.reason == HandoffReason::ProviderResponseWithheld,
+            withheld_provider_routes,
             handoff_allowed: route.allowed.clone(),
             handoff_no_commit: (!can_commit).then(|| source.profile.clone()),
             ..RoutePreflight::default()
@@ -793,15 +802,16 @@ impl Router {
         {
             return Ok(Err(RouteSkipReason::Unauthorized));
         }
-        if let Some(source) = &preflight.handoff_source {
-            if preflight.skip_source_provider_route
-                && eliot_core::same_provider_response_route(source, &snapshot)
-            {
-                return Ok(Err(RouteSkipReason::ProviderFailure));
-            }
-            if eliot_core::handoff_authority_refusal(source, &snapshot).is_some() {
-                return Ok(Err(RouteSkipReason::WiderAuthority));
-            }
+        if !preflight.withheld_provider_routes.is_empty()
+            && let Some(key) = eliot_core::provider_response_route_key(&snapshot)
+            && preflight.withheld_provider_routes.contains(&key)
+        {
+            return Ok(Err(RouteSkipReason::ProviderFailure));
+        }
+        if let Some(source) = &preflight.handoff_source
+            && eliot_core::handoff_authority_refusal(source, &snapshot).is_some()
+        {
+            return Ok(Err(RouteSkipReason::WiderAuthority));
         }
         if preflight
             .handoff_no_commit

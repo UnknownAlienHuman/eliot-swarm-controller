@@ -17,6 +17,7 @@ const WAITING_RETRY_MS: i64 = 60_000;
 const HELD_SCAN_LIMIT: i64 = 256;
 const LOST_SCAN_LIMIT: i64 = 64;
 const WITHHELD_SCAN_LIMIT: i64 = 64;
+const WITHHELD_ROUTE_HISTORY_LIMIT: i64 = 32;
 const MAX_SWITCHES_PER_TASK: i64 = 3;
 type HandoffBudgetState = (i64, Option<i64>, Option<i64>, Option<String>, Option<i64>);
 
@@ -43,6 +44,58 @@ fn lineage_for(
         )
         .optional()
         .map_err(sql_error)
+}
+
+pub(super) fn withheld_provider_routes(
+    connection: &Connection,
+    source: &Agent,
+) -> Result<HashSet<String>> {
+    let mut routes = HashSet::new();
+    routes.extend(core::provider_response_route_key(&source.profile_snapshot));
+    let agent = parse_agent_id(&source.id)?;
+    let Some((lineage, _)) = lineage_for(connection, agent, source.generation)? else {
+        return Ok(routes);
+    };
+    // One frozen route per generation. Older events can use the original
+    // snapshot while that exact generation is still the Agent's current one.
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT MAX(json_extract(e.data, '$.route_key')),
+                    CASE WHEN MAX(json_extract(e.data, '$.route_key')) IS NULL
+                         THEN a.profile_snapshot END
+             FROM handoff_task_lineages l
+             JOIN events e ON e.agent=l.agent AND e.generation=l.generation
+             LEFT JOIN agents a ON a.id=l.agent AND a.generation=l.generation
+             WHERE l.lineage_agent=?1 AND e.kind='provider.response_withheld'
+               AND e.source='daemon' AND (l.agent<>?2 OR l.generation<>?3)
+             GROUP BY l.agent, l.generation
+             ORDER BY MAX(e.seq) DESC LIMIT ?4",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                lineage,
+                agent,
+                source.generation,
+                WITHHELD_ROUTE_HISTORY_LIMIT
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .map_err(sql_error)?;
+    for row in rows {
+        let (key, legacy_snapshot) = row.map_err(sql_error)?;
+        routes.extend(key.or_else(|| {
+            let snapshot = serde_json::from_str(&legacy_snapshot?).ok()?;
+            core::provider_response_route_key(&snapshot)
+        }));
+    }
+    Ok(routes)
 }
 
 fn switch_budget_available(connection: &Connection, agent: &Agent, now: i64) -> Result<bool> {
@@ -157,6 +210,11 @@ fn insert_lineage_generation_tx(
 }
 
 impl Store {
+    pub fn withheld_provider_routes(&self, source: &Agent) -> Result<HashSet<String>> {
+        self.ensure_committed_reads()?;
+        withheld_provider_routes(&self.connection, source)
+    }
+
     /// Carry one task's continuation lineage across a committed switch.
     pub(crate) fn transfer_handoff_lineage_tx(
         tx: &Transaction<'_>,

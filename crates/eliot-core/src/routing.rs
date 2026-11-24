@@ -194,30 +194,45 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
     }
 }
 
-/// Direct presets of the same harness share its provider session route. For adopted routes,
-/// the Responses endpoint identifies the route across renamed presets.
-pub fn same_provider_response_route(source: &Value, candidate: &Value) -> bool {
-    fn endpoint(snapshot: &Value) -> Option<Url> {
-        snapshot
-            .pointer("/route_binding/provider_base_url")
-            .and_then(Value::as_str)
-            .and_then(|url| validate_http_url(url).ok())
+/// Frozen Codex response route across aliases. Use the account and the selector
+/// that supplies credentials for this route. Never hash or retain a credential.
+pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
+    if snapshot["harness"] != "codex" {
+        return None;
     }
-
-    let Some(harness) = source["harness"].as_str() else {
-        return false;
-    };
-    if candidate["harness"] != harness {
-        return false;
-    }
-    match (endpoint(source), endpoint(candidate)) {
-        (Some(source), Some(candidate)) => {
-            source.origin() == candidate.origin()
-                && source.path().trim_end_matches('/') == candidate.path().trim_end_matches('/')
+    let account = snapshot["account"].as_str();
+    let identity = match snapshot.get("route_binding") {
+        Some(binding) => {
+            let url = validate_http_url(binding["provider_base_url"].as_str()?).ok()?;
+            let key_env = binding["client_key_env_name"].as_str().map(|name| {
+                if cfg!(windows) {
+                    name.to_ascii_uppercase()
+                } else {
+                    name.to_owned()
+                }
+            });
+            serde_json::json!([
+                "codex_responses",
+                account,
+                url.origin().ascii_serialization(),
+                url.path().trim_end_matches('/'),
+                key_env
+            ])
         }
-        (None, None) => true,
-        _ => false,
-    }
+        None => {
+            // The direct endpoint is fixed by the adapter. CODEX_SQLITE_HOME
+            // selects the thread database, while CODEX_HOME selects the login.
+            let login_home = snapshot
+                .pointer("/pass_env_values/CODEX_HOME")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .map(crate::workspace_path_key);
+            serde_json::json!(["codex_chatgpt", account, login_home])
+        }
+    };
+    serde_json::to_vec(&identity)
+        .ok()
+        .map(|bytes| crate::api::inference::sha256_hex(&bytes))
 }
 
 /// Why `candidate` may not take over work from `source` automatically or at a

@@ -396,11 +396,12 @@ fn require_handoff_bounds(
     reason: Option<HandoffReason>,
 ) -> Result<()> {
     if reason == Some(HandoffReason::ProviderResponseWithheld)
-        && core::same_provider_response_route(&source.profile_snapshot, successor)
+        && let Some(route) = core::provider_response_route_key(successor)
+        && automatic::withheld_provider_routes(tx, source)?.contains(&route)
     {
         return Err(Error::new(
             "not_allowed",
-            "successor resolved to the Codex provider route that withheld the response",
+            "successor resolved to a Codex provider route that withheld a response for this task",
         ));
     }
     if let Some(reason) = core::handoff_authority_refusal(&source.profile_snapshot, successor) {
