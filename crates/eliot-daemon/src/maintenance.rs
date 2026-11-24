@@ -206,7 +206,7 @@ async fn run_provider_maintenance(
                 continue;
             }
             _ = provider_ticker.tick() => {
-                router.flush_command_storms(false);
+                router.flush_repeat_failures(false).await;
                 let available = eliot_store::PROVIDER_PROBE_BATCH_LIMIT
                     .saturating_sub(provider_probe_tasks.len());
                 let available = if reactions_enabled { available } else { 0 };
@@ -270,7 +270,7 @@ async fn run_provider_maintenance(
             }
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
-                    router.flush_command_storms(true);
+                    router.flush_repeat_failures(true).await;
                     while let Some(joined) = provider_probe_tasks.join_next().await {
                         if let Ok(Err(error)) = joined {
                             logging::record(&policy, "daemon.provider_probe_cleanup_failed", &[], Some(&error));

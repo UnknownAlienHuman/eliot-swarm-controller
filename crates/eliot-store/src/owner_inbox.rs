@@ -1,49 +1,16 @@
 //! Read-only owner decision and liveness projections over existing Store rows.
 
-use crate::{Store, commit_transaction, insert_daemon_event, sql_error};
+use crate::sql_error;
 use eliot_core::api::{
     GoalMode, GoalStatus, LaunchIntentState, LaunchIntentView, OwnerAction, OwnerInboxItem,
     OwnerInboxKind, SwarmLiveness,
 };
 use eliot_core::liveness::{self, AgentWaitEvidence, LivenessObject, Mover};
-use rusqlite::{CachedStatement, Connection, ToSql, TransactionBehavior};
+use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
-use std::collections::HashSet;
 
 pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
 pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
-const REPEATED_FAILURE_EVENT: &str = "daemon.failure_repeated";
-const MAX_REPEAT_ALERT_EVENTS: i64 = 1024;
-
-impl Store {
-    pub fn commit_repeated_failure(
-        &mut self,
-        cause: &str,
-        message: &str,
-        now: i64,
-    ) -> eliot_core::Result<eliot_core::Event> {
-        self.ensure_writer_healthy()?;
-        let result = (|| {
-            let tx = self
-                .connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(sql_error)?;
-            let event = insert_daemon_event(
-                &tx,
-                now,
-                REPEATED_FAILURE_EVENT,
-                "daemon",
-                None,
-                None,
-                json!({"cause": cause, "message": eliot_core::bound_chars(message, 1024)}),
-            )?;
-            commit_transaction(tx, &self.write_faulted)?;
-            Ok(event)
-        })();
-        self.fault_on_persistence_error(&result);
-        result
-    }
-}
 
 pub(crate) fn project(
     connection: &Connection,
@@ -214,46 +181,36 @@ fn project_repeated_failures(
     now: i64,
     cause: Option<&str>,
 ) -> eliot_core::Result<Vec<OwnerInboxItem>> {
-    let mut stmt = db
-        .prepare_cached(
-            "SELECT seq, ts, json_extract(data, '$.cause'), json_extract(data, '$.message')
-             FROM events WHERE kind = ?1 ORDER BY seq DESC LIMIT ?2",
+    let sql = "SELECT r.cause, r.occurrence, r.opened_at, r.message
+         FROM repeat_failure_alerts r LEFT JOIN agents a ON a.id = r.goal_agent
+         WHERE r.expires_at > ?1 AND (r.goal_agent IS NULL OR
+           (a.generation = r.goal_generation AND a.state NOT IN ('stopped','failed','lost')))";
+    let (mut stmt, bindings): (_, &[&dyn ToSql]) = if let Some(cause) = &cause {
+        (
+            db.prepare_cached(&format!("{sql} AND r.cause = ?2"))
+                .map_err(sql_error)?,
+            &[&now, cause],
         )
-        .map_err(sql_error)?;
+    } else {
+        (db.prepare_cached(sql).map_err(sql_error)?, &[&now])
+    };
     let rows = stmt
-        .query_map((REPEATED_FAILURE_EVENT, MAX_REPEAT_ALERT_EVENTS), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
+        .query_map(bindings, |row| {
+            let mut alert = item(
+                OwnerInboxKind::Stuck,
+                format!("repeat:{}", row.get::<_, String>(0)?),
+                row.get(1)?,
+                now,
+                row.get(2)?,
+                REPEATED_FAILURE_REASON,
+                None,
+                Vec::new(),
+            );
+            alert.detail = Some(row.get(3)?);
+            Ok(alert)
         })
         .map_err(sql_error)?;
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-    for row in rows {
-        let (seq, ts, key, message) = row.map_err(sql_error)?;
-        if cause.is_some_and(|cause| cause != key) || !seen.insert(key.clone()) {
-            continue;
-        }
-        let mut alert = item(
-            OwnerInboxKind::Stuck,
-            format!("repeat:{key}"),
-            seq.to_string(),
-            now,
-            ts,
-            REPEATED_FAILURE_REASON,
-            None,
-            Vec::new(),
-        );
-        alert.detail = Some(message);
-        items.push(alert);
-        if cause.is_some() {
-            break;
-        }
-    }
-    Ok(items)
+    rows.map(|row| row.map_err(sql_error)).collect()
 }
 
 fn projection_query<'a>(

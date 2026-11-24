@@ -342,7 +342,8 @@ impl Router {
                         "Goal Agent changed while its check was resolved",
                     ));
                 }
-                store.goal_set(
+                let previous = store.goal_get(&request.agent, request.mode.as_str())?;
+                let view = store.goal_set(
                     &request.agent,
                     request.mode.as_str(),
                     &request.id,
@@ -350,7 +351,11 @@ impl Router {
                     &request.definition,
                     scope_base,
                     now_ms(),
-                )?
+                )?;
+                if previous.is_some_and(|previous| previous.revision < view.revision) {
+                    self.reset_goal_repeat_failures(&view);
+                }
+                view
             }
         };
         if view.definition.cadence_ms.is_none() {
@@ -480,14 +485,24 @@ impl Router {
             GoalPauseRequest::validate,
         )?;
         require_eliot_mode(request.mode)?;
-        let view = self.inner.store.lock().await.goal_pause(
-            &request.agent,
-            request.mode.as_str(),
-            &request.id,
-            &super::principal_name(principal),
-            request.reason.as_deref(),
-            now_ms(),
-        )?;
+        let view = {
+            let mut store = self.inner.store.lock().await;
+            let view = store.goal_pause(
+                &request.agent,
+                request.mode.as_str(),
+                &request.id,
+                &super::principal_name(principal),
+                request.reason.as_deref(),
+                now_ms(),
+            )?;
+            if store
+                .goal_get(&request.agent, request.mode.as_str())?
+                .is_some_and(|current| current.revision == view.revision)
+            {
+                self.reset_goal_repeat_failures(&view);
+            }
+            view
+        };
         request.validate_response(&view)?;
         serde_json::to_value(view)
             .map_err(|_| Error::new("internal", "goal state could not be encoded"))
@@ -505,13 +520,20 @@ impl Router {
         let view = {
             let mut store = self.inner.store.lock().await;
             super::owner_inbox::check_binding(&store)?;
-            store.goal_clear(
+            let view = store.goal_clear(
                 &request.agent,
                 request.mode.as_str(),
                 &request.id,
                 &super::principal_name(principal),
                 now_ms(),
-            )?
+            )?;
+            if store
+                .goal_get(&request.agent, request.mode.as_str())?
+                .is_some_and(|current| current.revision == view.revision)
+            {
+                self.reset_goal_repeat_failures(&view);
+            }
+            view
         };
         request.validate_response(&view)?;
         serde_json::to_value(view)
@@ -1148,6 +1170,9 @@ impl Router {
             }
             if let Some(admission) = &result.admission {
                 self.publish_locked(&admission.events);
+            }
+            if result.view.status == eliot_core::api::GoalStatus::Completed {
+                self.reset_goal_repeat_failures(&result.view);
             }
             self.publish_locked(&result.events);
             result

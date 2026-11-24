@@ -1304,12 +1304,11 @@ round marker. A blocked check includes its bounded observation and can explain t
 diagnosis of an otherwise idle Agent.
 
 `daemon.status.health` and the `swarm status` health line report
-fleet Goals without progress, active repeat windows, and retained repeated-failure
-causes. Goals without progress include blocked Goals, Goals paused at the completion
-deferral limit, and active Goals confirmed stuck. Snoozing an inbox item leaves
-fleet health counts unchanged. The in-memory window count includes unexpired
-windows that have observed at least one failure or refusal, including windows
-below the alert threshold.
+Goals without progress, active repeat windows, and repeated-failure inbox items.
+Goals without progress include blocked Goals, Goals paused at the completion
+deferral limit, and active Goals confirmed stuck. Both inbox item counts exclude
+snoozed rows. The in-memory window count includes unexpired windows that have
+observed at least one failure or refusal, including windows below the alert threshold.
 
 The standard log records `daemon.command_storm` once when an authenticated
 principal/method pair accumulates at least 32 refused submissions in its ten-second
@@ -1327,21 +1326,23 @@ windows on closure or maintenance shutdown. Authenticated RPC methods other than
 failure code and operation, validation field when available, and normalized redacted
 cause. Those windows count failures and log `daemon.rpc_storm` with the cause.
 
-The same counter records a repeated Goal failure and routes one Owner attention
-notice at the third matching failure in a minute. A failing exit has the same
+The same counter records a repeated Goal failure at the third matching failure
+in a minute. A failing exit has the same
 identity whether the round continues or blocks on its budget. Replaying a retained
 Goal round reuses the original outcome without increasing the count.
 
-Each qualifying window in the shared repeat-failure path routes a daemon attention
-notice and retains a bounded alert event. The Owner inbox projects one item per
-cause from the latest 1024 retained alert events and displays the latest diagnostic.
-The item can be snoozed for its current revision. A new qualifying window for that
-cause updates the same inbox subject. Retention applies to the alert events as it
-does to other daemon events.
+The first qualifying repeat opens one current Owner inbox item per cause and commits
+one daemon attention notification in the same transaction. Matching failures refresh
+the occurrence and later qualifying windows update its diagnostic. A snooze holds for
+the entire occurrence. The Store holds at most 1024 causes and keeps existing causes
+when the limit is reached. A cause resolves after a minute without a matching failure
+or 20 seconds without a matching storm refusal. A Goal alert also resolves when its
+Goal completes, is replaced, paused, or cleared, or its Agent generation ends.
+A recurrence must meet the repeat threshold to open a new item and notification.
 
 When the Router commits a third rejection of the same command verb for the same
-Agent within one minute, it records `daemon.repeated_command_rejected` and one
-daemon attention notice. Further matching rejections in that window add no
+Agent within one minute, it records `daemon.repeated_command_rejected` and uses
+the same Owner inbox path. Further matching rejections in that window add no
 diagnostics. Each command keeps its own durable outcome and event.
 
 Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
