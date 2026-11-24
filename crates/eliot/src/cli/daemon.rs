@@ -417,6 +417,12 @@ fn print_status_summary(response: &DaemonStatusResponse, data_dir: &Path) {
             "healthy"
         }
     );
+    if let Some(capacity) = &response.artifact_capacity {
+        println!(
+            "Artifacts: {} of {} active registration slots · {} ownership roots · {} tombstones",
+            capacity.active, capacity.limit, capacity.ownership_roots, capacity.tombstones,
+        );
+    }
     for check in &response.harness_checks {
         println!(
             "{} {} self-check: {}",

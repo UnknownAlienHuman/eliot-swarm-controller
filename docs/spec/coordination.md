@@ -29,6 +29,15 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
+The 4,096 active-artifact limit applies to new Agent registrations and counts
+registered and uncertain rows. Bound ownership roots and settled tombstones
+consume zero registration slots. Daemon-owned custody records for a launch or
+its managed workspace and native session commit even when the registration limit
+is reached. Daemon status shows the counts and the Owner inbox warns at 80 percent.
+Bounded maintenance prunes expired previews and settled plans and reclaims
+unreferenced tombstones. It preserves uncertain attempts, native-session fences
+and the inventory sequence high-water row.
+
 `cleanup.plan {scope?:self_tree|project|all,project?,older_than?,continuation?}` changes
 no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
@@ -223,7 +232,7 @@ candidate. CLI callers pass one `--artifact <id>` per safe registration selected
 `cleanup apply <plan-id>`. The desktop's Project
 registrations group starts unchecked.
 
-The current limits are 64 candidates, 4,096 retained artifacts and 1,024 retained
+The current limits are 64 candidates per page and 1,024 retained
 plans. On Windows, the [`CleanupTree` artifact-directory scan](../../crates/eliot-daemon/src/platform/script_file.rs#L391)
 is bounded to 262,144 filesystem entries and depth 64. Interactive plans use
 their remaining page budget for a scan. Bulk planning and apply allow up to

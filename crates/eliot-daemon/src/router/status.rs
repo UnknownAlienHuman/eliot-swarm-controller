@@ -133,6 +133,7 @@ impl Router {
             unsettled_total,
             provider_probe_attention,
             harness_checks,
+            artifact_capacity,
         ) = {
             let store = self.inner.store.lock().await;
             let harness_checks = store
@@ -156,6 +157,7 @@ impl Router {
                 store.count_unsettled_commands()?,
                 store.provider_probe_attention(STATUS_BLOCKER_MAX)?,
                 harness_checks,
+                store.artifact_capacity()?,
             )
         };
         let mut unknown_commands = self.unknown_ids();
@@ -194,6 +196,7 @@ impl Router {
             (status.markers.clone(), status.truncated)
         };
         serde_json::to_value(DaemonStatusResponse {
+            artifact_capacity: Some(artifact_capacity),
             owner_inbox,
             harness_checks,
             liveness,

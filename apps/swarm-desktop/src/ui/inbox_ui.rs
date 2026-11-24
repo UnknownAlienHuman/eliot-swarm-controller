@@ -110,6 +110,7 @@ fn kind_title(kind: OwnerInboxKind) -> &'static str {
         OwnerInboxKind::Handoff => "Handoffs to check",
         OwnerInboxKind::WorkNotInGit => "Work not in Git",
         OwnerInboxKind::HarnessAuth => "Harness sign-in",
+        OwnerInboxKind::ArtifactCapacity => "Artifact capacity",
     }
 }
 
@@ -128,6 +129,7 @@ fn kind_count(kind: OwnerInboxKind, count: usize) -> String {
         OwnerInboxKind::Handoff => ("handoff to check", "handoffs to check"),
         OwnerInboxKind::WorkNotInGit => ("item not in Git", "items not in Git"),
         OwnerInboxKind::HarnessAuth => ("sign-in", "sign-ins"),
+        OwnerInboxKind::ArtifactCapacity => ("capacity warning", "capacity warnings"),
     };
     eliot_core::count_words(count as u64, one, many)
 }

@@ -13,6 +13,8 @@ const CLEANUP_PLAN_RECLAIM_BATCH: i64 = 64;
 /// are settled or filtered out.
 const CLEANUP_INVENTORY_SCAN: usize = 256;
 const SWARM_PLUGIN_INSTANCE_PURPOSE: &str = "Swarm plugin instance directory";
+const ACTIVE_ARTIFACT_LIMIT: i64 = 4_096;
+const ARTIFACT_TOMBSTONE_BATCH: i64 = 128;
 
 pub struct CleanupInventoryPage {
     pub artifacts: Vec<ArtifactView>,
@@ -33,6 +35,42 @@ pub fn cleanup_worktree_command_id(apply_id: &str, artifact_id: &str) -> Result<
 }
 
 impl Store {
+    pub fn artifact_capacity(&self) -> Result<ArtifactCapacityView> {
+        self.ensure_committed_reads()?;
+        artifact_capacity(&self.connection)
+    }
+
+    pub(super) fn prune_cleanup_metadata(&mut self, now: i64) -> Result<(i64, i64)> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        let cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS + 1);
+        let plans = prune_settled_cleanup_plans_tx(&tx, cutoff)?
+            + prune_stale_cleanup_plans_tx(&tx, cutoff)?;
+        // The maximum sequence anchors later insertion and inventory cursors,
+        // and native-session tombstones fence resuming the archived subject.
+        let artifacts = tx
+            .execute(
+                "WITH refs AS MATERIALIZED (
+                 SELECT DISTINCT json_extract(i.value, '$.artifact.id') AS id
+                 FROM cleanup_plans p, json_each(p.body, '$.items') i
+             )
+             DELETE FROM artifacts WHERE id IN (
+                 SELECT a.id FROM artifacts a
+                 WHERE a.seq < (SELECT MAX(seq) FROM artifacts)
+                   AND json_extract(a.body, '$.state') = 'removed'
+                   AND json_extract(a.body, '$.kind') <> 'native_session'
+                   AND NOT EXISTS (SELECT 1 FROM refs WHERE refs.id = a.id)
+                 ORDER BY a.seq LIMIT ?1
+             )",
+                [ARTIFACT_TOMBSTONE_BATCH],
+            )
+            .map_err(sql_error)? as i64;
+        commit_transaction(tx, &self.write_faulted)?;
+        Ok((plans, artifacts))
+    }
+
     pub fn record_automatic_cleanup(&mut self, data: Value, now: i64) -> Result<Event> {
         self.ensure_writer_healthy()?;
         let tx = self
@@ -267,12 +305,8 @@ impl Store {
             }
             return commit_transaction(tx, &self.write_faulted);
         }
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
-            .map_err(sql_error)?;
-        if count >= 4096 {
-            return Err(Error::new("unavailable", "artifact ledger is full"));
-        }
+        // Daemon-owned rows record custody for an already-admitted generation.
+        // The optional Agent registration quota must not block a launch.
         let seq: i64 = tx
             .query_row("SELECT COALESCE(MAX(seq), 0) + 1 FROM artifacts", [], |r| {
                 r.get(0)
@@ -865,13 +899,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let count: i64 = tx
-            .query_row("SELECT COUNT(*) FROM artifacts", [], |r| r.get(0))
-            .map_err(sql_error)?;
-        if count >= 4096 {
+        if active_artifact_count(&tx)? >= ACTIVE_ARTIFACT_LIMIT {
             return Err(Error::new(
                 "unavailable",
-                "artifact ledger is full (4096 entries)",
+                "active artifact registration limit reached; see Owner artifact capacity status",
             ));
         }
         {
@@ -1424,6 +1455,30 @@ fn known_native_session_artifact(
     .transpose()
 }
 
+pub(super) fn artifact_capacity(connection: &Connection) -> Result<ArtifactCapacityView> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FILTER (WHERE state IN ('registered','unknown')),
+                    COUNT(*) FILTER (WHERE state = 'ownership_root'),
+                    COUNT(*) FILTER (WHERE state = 'removed')
+             FROM (SELECT json_extract(body, '$.state') AS state FROM artifacts)",
+            [],
+            |row| {
+                Ok(ArtifactCapacityView {
+                    active: row.get(0)?,
+                    limit: ACTIVE_ARTIFACT_LIMIT,
+                    ownership_roots: row.get(1)?,
+                    tombstones: row.get(2)?,
+                })
+            },
+        )
+        .map_err(sql_error)
+}
+
+fn active_artifact_count(connection: &Connection) -> Result<i64> {
+    Ok(artifact_capacity(connection)?.active)
+}
+
 /// Bounded self-heal for a full cleanup-plan ledger, oldest first. Deletes
 /// fully settled consumed plans (their receipt is retained and no item
 /// outcome is `unknown`, so the exact-apply replay and the unknown-attempt
@@ -1436,21 +1491,7 @@ fn known_native_session_artifact(
 /// `unknown` attempt, a receipt-less consumed plan with an uncertain outcome,
 /// or a fresh preview. Returns the reclaimed count.
 fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<i64> {
-    let settled = tx
-        .execute(
-            "DELETE FROM cleanup_plans WHERE id IN (
-                 SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
-                 WHERE p.apply_id IS NOT NULL
-                   AND w.method = 'cleanup.apply'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM json_each(w.result, '$.items') r
-                       WHERE json_extract(r.value, '$.outcome') = 'unknown'
-                   )
-                 ORDER BY p.id LIMIT ?1
-             )",
-            [CLEANUP_PLAN_RECLAIM_BATCH],
-        )
-        .map_err(sql_error)? as i64;
+    let settled = prune_settled_cleanup_plans_tx(tx, i64::MAX)?;
     // A consumed plan whose receipt was pruned before retention pinned
     // consumed receipts can never replay (exact replay needs the receipt) and
     // can never settle further through this row. Reclaim it when its own
@@ -1478,18 +1519,42 @@ fn prune_reclaimable_cleanup_plans_tx(tx: &Transaction<'_>, now: i64) -> Result<
     // within the retry window is abandoned, and its delayed apply reads
     // `not_found` so the manager re-previews through this same path.
     let stale_cutoff = now.saturating_sub(RETRY_WINDOW_MS + RETRY_CLOCK_SKEW_MS);
-    let stale = tx
-        .execute(
-            "DELETE FROM cleanup_plans WHERE id IN (
+    let stale = prune_stale_cleanup_plans_tx(tx, stale_cutoff)?;
+    Ok(settled + stranded + stale)
+}
+
+fn prune_settled_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
+    tx.execute(
+        "DELETE FROM cleanup_plans WHERE id IN (
+             SELECT p.id FROM cleanup_plans p JOIN writes w ON w.id = p.apply_id
+             WHERE w.method = 'cleanup.apply'
+               AND json_extract(p.body, '$.created_at') <= ?1
+               AND json_extract(w.result, '$.state') IS NOT 'running'
+               AND json_type(w.result, '$.items') = 'array'
+               AND NOT EXISTS (
+                   SELECT 1 FROM json_each(w.result, '$.items') r
+                   WHERE json_extract(r.value, '$.outcome') = 'unknown'
+               )
+             ORDER BY p.id LIMIT ?2
+         )",
+        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+    )
+    .map(|rows| rows as i64)
+    .map_err(sql_error)
+}
+
+fn prune_stale_cleanup_plans_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
+    tx.execute(
+        "DELETE FROM cleanup_plans WHERE id IN (
                  SELECT p.id FROM cleanup_plans p
                  WHERE p.apply_id IS NULL
                    AND json_extract(p.body, '$.created_at') <= ?1
                  ORDER BY p.id LIMIT ?2
              )",
-            params![stale_cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
-        )
-        .map_err(sql_error)? as i64;
-    Ok(settled + stranded + stale)
+        params![cutoff, CLEANUP_PLAN_RECLAIM_BATCH],
+    )
+    .map(|rows| rows as i64)
+    .map_err(sql_error)
 }
 
 /// Consumed plans whose receipt is gone and whose outcome is still uncertain

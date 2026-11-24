@@ -28,6 +28,20 @@ impl ArtifactKind {
 }
 
 pub const MAX_CLEANUP_ITEMS: usize = 64;
+
+#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactCapacityView {
+    pub active: i64,
+    pub limit: i64,
+    pub ownership_roots: i64,
+    pub tombstones: i64,
+}
+
+impl ArtifactCapacityView {
+    pub fn approaching_limit(&self) -> bool {
+        self.active >= self.limit - self.limit / 5
+    }
+}
 pub const SWARM_STAND_ARTIFACT_PURPOSE: &str = "Swarm private stand";
 pub const MAX_ARTIFACT_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 pub const DEFAULT_STAND_TTL_MS: i64 = 24 * 60 * 60 * 1000;
