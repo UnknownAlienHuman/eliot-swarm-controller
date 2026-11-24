@@ -51,7 +51,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, OpenJobObjectW,
     QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
 };
@@ -1326,6 +1327,17 @@ fn terminate_named_job(name: &str, expected: Option<&eliot_core::ProcessIdentity
 /// member can still be exiting, so callers also check recorded identities.
 /// An open Job counts only when it has no member.
 pub(crate) fn named_job_closed(name: &str) -> Result<bool> {
+    let Some(handle) = open_named_job_for_query(name)? else {
+        return Ok(true);
+    };
+    let members = job_members(handle);
+    // SAFETY: handle was opened above and is not shared.
+    unsafe { CloseHandle(handle) };
+    let (pids, complete) = members?;
+    Ok(complete && pids.is_empty())
+}
+
+fn open_named_job_for_query(name: &str) -> Result<Option<HANDLE>> {
     let wide: Vec<u16> = OsStr::new(name).encode_wide().chain(Some(0)).collect();
     // JOB_OBJECT_QUERY (0x0004); see Job::observer.
     // SAFETY: `wide` is a NUL-terminated name that outlives the call.
@@ -1333,16 +1345,37 @@ pub(crate) fn named_job_closed(name: &str) -> Result<bool> {
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
         return if error.raw_os_error() == Some(ERROR_FILE_NOT_FOUND as i32) {
-            Ok(true)
+            Ok(None)
         } else {
             Err(io_error("open recorded custody Job Object", error))
         };
     }
-    let members = job_members(handle);
+    Ok(Some(handle))
+}
+
+/// A fixed-size query for late members after the outside-lock PID readback.
+pub(crate) fn named_job_has_active_processes(name: &str) -> Result<bool> {
+    let Some(handle) = open_named_job_for_query(name)? else {
+        return Ok(false);
+    };
+    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+    // SAFETY: the handle is queryable and the buffer matches this information class.
+    let result = unsafe {
+        QueryInformationJobObject(
+            handle,
+            JobObjectBasicAccountingInformation,
+            (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+            size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let error = (result == 0).then(std::io::Error::last_os_error);
     // SAFETY: handle was opened above and is not shared.
     unsafe { CloseHandle(handle) };
-    let (pids, complete) = members?;
-    Ok(complete && pids.is_empty())
+    match error {
+        Some(error) => Err(io_error("query recorded custody Job accounting", error)),
+        None => Ok(accounting.ActiveProcesses != 0),
+    }
 }
 
 /// Whether a numeric process id names a process that has not exited yet.

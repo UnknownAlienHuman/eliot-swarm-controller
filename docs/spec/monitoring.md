@@ -104,7 +104,9 @@ snapshot through settlement. Platform liveness checks run outside the Store lock
 The write transaction compares the observed custody identities with the current
 generation and closed native sources. An Owner assertion retries the observation once
 if those identities changed. Windows checks named Job membership when a Job is
-recorded, along with exact PID and creation time. Linux checks recorded processes
+recorded, along with exact PID and creation time. After the identity comparison,
+the transaction rechecks the Job's active process count with one fixed-size
+query. Exact PID and creation-time checks stay outside the transaction. Linux checks recorded processes
 and the distinct process groups of exited plugins on this boot. Group witnesses
 are read separately from the limit on process identities with unconfirmed exit.
 

@@ -19,6 +19,7 @@ const SESSION_GROWTH_AUTHORITY: &str = "session_growth_authority";
 const OWNER_AUTOMATION: &str = "owner_automation";
 const CONTINUATION: &str = "continuation";
 const REQUESTED_BY: &str = "requested_by";
+const PROVIDER_ROUTE_WITHHELD: &str = "provider_route_withheld";
 
 pub type SwitchLiveCheckout = (String, i64, String, String);
 
@@ -399,11 +400,57 @@ fn require_unwithheld_route(
         .is_some_and(|name| withheld.contains(&eliot_core::provider_profile_refusal_marker(name)));
     if route_withheld || profile_withheld {
         return Err(Error::new(
-            "not_allowed",
+            PROVIDER_ROUTE_WITHHELD,
             "successor resolved to a provider route that withheld a response for this task",
         ));
     }
     Ok(())
+}
+
+fn withheld_switch_waiting_tx(
+    tx: &Transaction<'_>,
+    request: &SwitchRequest,
+    reason: HandoffReason,
+    kind: Option<core::ProviderRestrictionKind>,
+    now: i64,
+) -> Result<Event> {
+    insert_daemon_event(
+        tx,
+        now,
+        HANDOFF_WAITING,
+        "handoff",
+        Some(parse_agent_id(&request.from)?),
+        Some(request.from_generation),
+        json!({
+            "reason": reason,
+            "kind": kind,
+            "switch_command": request.id,
+            "message": "The selected preset withheld a response for this task. Review routing presets to continue.",
+            "withheld_routes_blocked": true,
+        }),
+    )
+}
+
+pub(super) fn rejected_switch_waiting_tx(
+    tx: &Transaction<'_>,
+    command: &Command,
+    outcome: Option<&Value>,
+    now: i64,
+) -> Result<Option<Event>> {
+    if !outcome.is_some_and(|result| result["error"] == PROVIDER_ROUTE_WITHHELD) {
+        return Ok(None);
+    }
+    let retained = decode_switch(command.args.clone())?;
+    let (reason, kind) = retained
+        .continuation
+        .map(|value| (value.reason, value.kind))
+        .or_else(|| {
+            retained
+                .provider_failure
+                .map(|failure| (HandoffReason::ProviderHold, Some(failure.kind)))
+        })
+        .unwrap_or((HandoffReason::Routing, None));
+    withheld_switch_waiting_tx(tx, &retained.request, reason, kind, now).map(Some)
 }
 
 /// The exact authority check for a successor nobody with Owner authority chose by hand.
@@ -2306,6 +2353,14 @@ impl Store {
                     Some(parse_agent_id(&request.from)?),
                     Some(request.from_generation),
                     settled_data,
+                )?);
+            }
+            if error.is_some_and(|error| error.code == PROVIDER_ROUTE_WITHHELD) {
+                let (reason, kind) = provider_failure
+                    .map(|failure| (HandoffReason::ProviderHold, Some(failure.kind)))
+                    .unwrap_or((handoff_reason, continuation.and_then(|value| value.kind)));
+                events.push(withheld_switch_waiting_tx(
+                    &tx, &request, reason, kind, now,
                 )?);
             }
             commit_transaction(tx, &self.write_faulted)?;

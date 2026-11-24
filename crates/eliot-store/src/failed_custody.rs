@@ -68,6 +68,7 @@ impl Store {
         &mut self,
         snapshot: &FailedGenerationExitSnapshot,
         now: i64,
+        #[cfg(windows)] recheck_job: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Vec<Event>> {
         self.ensure_writer_healthy()?;
         let tx = self
@@ -89,6 +90,8 @@ impl Store {
                 "failed generation custody does not belong to this daemon",
             ));
         }
+        #[cfg(windows)]
+        recheck_job(generation)?;
         let events = record_failed_exit(
             &tx,
             parse_agent_id(&generation.agent)?,
@@ -119,6 +122,7 @@ impl Store {
         request: &FailedCustodyResolveRequest,
         observed: &FailedGenerationExitSnapshot,
         now: i64,
+        #[cfg(windows)] recheck_job: impl FnOnce(&RetainedGeneration) -> Result<()>,
     ) -> Result<Change<FailedCustodyResolveResponse>> {
         self.ensure_writer_healthy()?;
         request.validate()?;
@@ -136,6 +140,8 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
         require_current_exit_snapshot(&tx, &request.agent, request.generation, observed)?;
+        #[cfg(windows)]
+        recheck_job(&observed.retained)?;
         let agent = parse_agent_id(&request.agent)?;
         let events = record_failed_exit(
             &tx,

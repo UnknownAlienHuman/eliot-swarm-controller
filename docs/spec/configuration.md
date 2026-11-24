@@ -1696,12 +1696,13 @@ normalized provider endpoint and the configured client-key environment name
 match. Only a digest of these selectors is retained in the refusal event.
 Every automatic hop consults the task lineage. It skips the routes used by the 32 most
 recent generations with a retained refusal from the last hour, including the source's
-own generation. For direct Codex without a frozen `CODEX_HOME`, the route identity is
-unknown and only the exact refusing preset is skipped. The event retains that preset
+own generation. Direct Codex uses the configured account when `CODEX_HOME` is
+absent. With neither selector, only the exact refusing preset is skipped. The event retains that preset
 name for lookups after resume. The Store applies the same check in the switch transaction. It also
 skips the presets this task already left and profiles on hold. Candidates blocked this
-way report `provider_withheld`; with no eligible candidate, the existing waiting item
-records that reason in the Owner inbox, and the disabled-automation and waiting-retry rules
+way report `provider_withheld`. When selection or transactional admission refuses the
+successor because of withheld routes, a waiting item records that reason in the Owner
+inbox. The disabled-automation and waiting-retry rules
 above apply unchanged.
 Each candidate passes installation, hold, capacity, quota reserve and the
 [equal-or-narrower authority check](coordination.md#agent-switch-implemented). With no

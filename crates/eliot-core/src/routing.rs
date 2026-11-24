@@ -231,7 +231,10 @@ pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
                 .pointer("/pass_env_values/CODEX_HOME")
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
-                .map(crate::workspace_path_key)?;
+                .map(crate::workspace_path_key);
+            if account.is_none() && login_home.is_none() {
+                return None;
+            }
             serde_json::json!(["codex_chatgpt", account, login_home])
         }
     };

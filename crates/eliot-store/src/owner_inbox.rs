@@ -868,7 +868,7 @@ fn project_handoffs(
          JOIN agents a ON a.id = e.agent AND a.generation = e.generation
          WHERE e.kind = 'handoff.waiting' AND a.archived = 0
            AND NOT EXISTS(SELECT 1 FROM agent_successors s WHERE s.agent = a.id)
-           AND ((json_extract(e.data,'$.withheld_routes_blocked') = 1 AND a.state IN ('idle','lost','failed'))
+           AND ((json_extract(e.data,'$.withheld_routes_blocked') = 1 AND a.state IN ('idle','lost','failed','stopped'))
                 OR (json_extract(e.data,'$.reason') = 'session_lost' AND a.state IN ('lost','failed'))
                 OR (json_extract(e.data,'$.reason') = 'provider_hold' AND a.state = 'idle'
                     AND EXISTS(SELECT 1 FROM provider_holds h

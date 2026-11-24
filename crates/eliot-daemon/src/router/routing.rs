@@ -94,9 +94,6 @@ pub(super) fn handoff_waiting_message(
     error: &Error,
     reason: HandoffReason,
 ) -> Option<(String, bool)> {
-    if error.code == "provider_route_withheld" {
-        return Some(((*error.message).clone(), true));
-    }
     let blocked = error.routing.as_deref().is_some_and(|decision| {
         decision
             .skipped

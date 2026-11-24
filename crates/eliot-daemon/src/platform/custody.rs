@@ -803,13 +803,31 @@ pub(crate) fn check_failed_exit_assertion(
         false
     };
     if live {
-        return Err(Error::new(
-            "process_custody_live",
-            format!(
-                "an owned process or process family is still live; use swarm stop {} --generation {} for custody-proven termination",
-                generation.agent, generation.generation
-            ),
-        ));
+        return Err(failed_custody_live(generation));
+    }
+    Ok(())
+}
+
+fn failed_custody_live(generation: &eliot_store::RetainedGeneration) -> Error {
+    Error::new(
+        "process_custody_live",
+        format!(
+            "an owned process or process family is still live; use swarm stop {} --generation {} for custody-proven termination",
+            generation.agent, generation.generation
+        ),
+    )
+}
+
+#[cfg(windows)]
+pub(crate) fn recheck_failed_job(generation: &eliot_store::RetainedGeneration) -> Result<()> {
+    if let Some(namespace) = generation.custody_namespace.as_deref()
+        && super::windows::named_job_has_active_processes(&agent_custody_name(
+            namespace,
+            &generation.agent,
+            generation.generation,
+        ))?
+    {
+        return Err(failed_custody_live(generation));
     }
     Ok(())
 }

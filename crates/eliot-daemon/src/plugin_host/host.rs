@@ -1486,12 +1486,13 @@ impl PluginHost {
             .map_err(|_| {
                 Error::new("unavailable", "failed custody observation did not return")
             })??;
-            let result =
-                self.state
-                    .store
-                    .lock()
-                    .await
-                    .resolve_failed_custody(request, &snapshot, now_ms());
+            let result = self.state.store.lock().await.resolve_failed_custody(
+                request,
+                &snapshot,
+                now_ms(),
+                #[cfg(windows)]
+                crate::platform::custody::recheck_failed_job,
+            );
             if retry
                 && result
                     .as_ref()
@@ -1571,7 +1572,11 @@ impl PluginHost {
             .store
             .lock()
             .await
-            .commit_failed_generation_job_exit(&snapshot, now_ms())?;
+            .commit_failed_generation_job_exit(
+                &snapshot,
+                now_ms(),
+                crate::platform::custody::recheck_failed_job,
+            )?;
         self.state.bus.publish(&events);
         Ok(())
     }

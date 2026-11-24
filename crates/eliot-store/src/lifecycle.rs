@@ -152,14 +152,21 @@ impl Store {
             id,
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
-        if state == CommandState::Rejected
-            && record.command.method == "swarm.switch"
-            && super::switch::release_rejected_switch_fence_tx(&tx, &record.command, now)?
-        {
-            events.push(insert_daemon_command_event(
-                &tx, now, "switch.checkout_released", None, None, id,
-                json!({"command_id":id,"state":"rejected","reason":"Rejected switch reservation released."}),
-            )?);
+        if state == CommandState::Rejected && record.command.method == "swarm.switch" {
+            if super::switch::release_rejected_switch_fence_tx(&tx, &record.command, now)? {
+                events.push(insert_daemon_command_event(
+                    &tx, now, "switch.checkout_released", None, None, id,
+                    json!({"command_id":id,"state":"rejected","reason":"Rejected switch reservation released."}),
+                )?);
+            }
+            if let Some(event) = super::switch::rejected_switch_waiting_tx(
+                &tx,
+                &record.command,
+                outcome.as_ref(),
+                now,
+            )? {
+                events.push(event);
+            }
         }
         if state == CommandState::Applied
             && record.command.is_owner_interrupt()
