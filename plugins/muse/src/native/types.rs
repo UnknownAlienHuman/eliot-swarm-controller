@@ -114,6 +114,15 @@ pub struct NativeInitializeResult {
     pub user_agent: String,
 }
 
+/// The two authorization fields of the MSP account read. Display identity
+/// stays on the native side of the adapter.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeAccountState {
+    pub state: String,
+    pub credential_required: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Session lifecycle (SS2.5.1, SS2.5.5, SS3.8, SS3.10, SS3.21)
 // ---------------------------------------------------------------------------

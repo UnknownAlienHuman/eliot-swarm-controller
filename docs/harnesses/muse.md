@@ -117,6 +117,12 @@ from unlinked tasks leaves verification false with the reason “provider
 did not name a model.” The native result and its text still settle
 normally.
 
+Owned startup checks `account/read` before catalogue selection. If the
+endpoint requires credentials and Muse reports `loggedOut`, Swarm fails
+the launch with `auth_required` before creating or resuming a session.
+The read keeps only credential state and requirement. A keyless endpoint
+can launch without sign-in.
+
 An explicit mismatch suppresses that turn's response and records a durable
 [profile model hold](../spec/monitoring.md#provider-holds) with both IDs.
 The adapter checks the exact `turn/cancel` acknowledgement and verifies

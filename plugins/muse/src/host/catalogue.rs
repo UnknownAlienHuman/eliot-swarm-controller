@@ -1,7 +1,9 @@
 use super::{contextual_error, native_initialize_params};
 use crate::native::{
     NativeClient, NativeLaunch, NativeProcess,
-    types::{NativeInitializeResult, NativeModelListParams, NativeModelListResult},
+    types::{
+        NativeAccountState, NativeInitializeResult, NativeModelListParams, NativeModelListResult,
+    },
 };
 use eliot_core::{Error, Result, SecretPolicy};
 use eliot_plugin::native_cli::{BoundedReadLabels, run_bounded_with_stderr};
@@ -122,6 +124,32 @@ async fn read_snapshot(
                 "Muse session host did not accept initialized",
             )
         })?;
+    if observe_models {
+        let account = client
+            .call("account/read", serde_json::json!({}), deadline)
+            .await
+            .map_err(|error| {
+                contextual_error(
+                    error,
+                    "native_readback",
+                    "Muse account state could not be read",
+                )
+            })?;
+        let account: NativeAccountState = serde_json::from_value(account).map_err(|_| {
+            Error::new("native_readback", "Muse account state response was invalid")
+        })?;
+        if account.credential_required && account.state == "loggedOut" {
+            return Err(Error::new(
+                "auth_required",
+                "Muse requires sign-in or an API key for this profile",
+            )
+            .with_where("plugin.muse.start.account")
+            .with_origin(
+                eliot_core::FailureOrigin::Environment,
+                "MSP account/read reported loggedOut for a credential-required endpoint",
+            ));
+        }
+    }
     let params = serde_json::to_value(NativeModelListParams { session_id: None })
         .map_err(|_| Error::new("internal", "Muse model/list params could not be encoded"))?;
     let models = client
