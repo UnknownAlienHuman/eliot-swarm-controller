@@ -2,8 +2,12 @@
 
 use super::sources::{self, SourceReadError};
 use eliot_core::api::{
-    HarnessCapabilities, INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus,
-    InstructionFileView, InstructionReadStatus, InstructionSourceStatus, inference::sha256_hex,
+    HarnessCapabilities,
+    inference::sha256_hex,
+    instructions::{
+        INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus,
+        InstructionFileView, InstructionReadStatus, InstructionSourceStatus,
+    },
 };
 use eliot_plugin::MAX_EVENT_BYTES;
 use serde_json::Value;
