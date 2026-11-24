@@ -846,12 +846,15 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                     "process_custody_exit_proven": proof.process_custody_exited,
                                     "native_source_drain_proven": proof.native_source_drained,
                             })),
-                            Err(error) => Err(match source_error {
-                                Some(source) => error.with_message(format!(
-                                    "{}; {}", error.message, source.message
-                                )),
-                                None => error,
-                            }),
+                            Err(error) => {
+                                let error = if let Some(source) = source_error {
+                                    let message = format!("{}; {}", error.message, source.message);
+                                    error.with_message(message)
+                                } else {
+                                    error
+                                };
+                                Err(error)
+                            }
                         };
                         if result.is_err() {
                             // The actor is exiting and control is fenced even if cleanup
