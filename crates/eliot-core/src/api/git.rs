@@ -1,7 +1,8 @@
-//! Typed request and result payloads for the connected native Git fetch action.
+//! Typed payloads and pure binding checks for native Git actions.
 //!
-//! These DTOs are pure data. Repository registration, transport construction,
-//! process ownership, Store admission, and effect settlement belong to callers.
+//! Binding checks compare snapshots supplied by callers. Callers own repository
+//! registration, transport construction, process ownership, Store admission,
+//! and effect settlement.
 
 use super::agent_views::{ProjectGitHubCliView, ProjectRegistrationView};
 use crate::{Agent, Error, FrozenSetupFile, Result, WorkspacePhase, WorkspacePreparation};
