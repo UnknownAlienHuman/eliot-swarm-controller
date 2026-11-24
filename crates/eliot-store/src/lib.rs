@@ -6617,6 +6617,32 @@ fn validate_resume_ready_subject_tx(
             "session readiness does not match the exact resumed generation",
         ));
     }
+    if command
+        .command
+        .outcome
+        .as_ref()
+        .and_then(|outcome| outcome.get("restart_fresh_native"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        if !result_page::is_restart_resume_intent_tx(tx, &command_id)?
+            || projection.native_scope.is_some()
+            || projection.native_ref.is_some()
+            || ["native_scope", "native_ref"].into_iter().any(|field| {
+                native_event
+                    .data
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty())
+            })
+        {
+            return Err(Error::new(
+                "source_integrity",
+                "fresh restart readiness requires a new native subject",
+            ));
+        }
+        return Ok(());
+    }
     let retained_scope = projection
         .native_scope
         .as_deref()

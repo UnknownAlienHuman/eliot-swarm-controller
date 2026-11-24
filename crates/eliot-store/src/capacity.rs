@@ -30,12 +30,14 @@ const RESTART_LINKED_LAUNCH_INPUT_VALID: &str = "EXISTS (
     JOIN commands launch ON launch.id = send.parent_command
     WHERE send.id = json_extract(restart.data, '$.undelivered_send_id')
       AND send.id = launch.id || '/send'
-      AND launch.verb = 'launch' AND launch.state IN ('applied', 'unknown')
+      AND launch.verb = 'launch' AND launch.state = 'applied'
+      AND launch.target = a.id AND launch.generation = a.generation
       AND send.target = a.id AND send.generation = a.generation
       AND send.verb = 'send' AND send.link_kind = 'send' AND send.ordinal = 0
       AND send.state = 'cancelled'
       AND json_extract(send.outcome, '$.reason') = 'generation_lost'
       AND json_type(send.args, '$.text') = 'text'
+      AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.agent = a.id)
 )";
 
 // Both facts must come from the retained restart event, not a later Store read.
@@ -187,25 +189,31 @@ pub(super) fn restart_resume_candidate_tx(
         .flatten();
     match captured_id_kind.as_deref() {
         None => Ok(true),
-        Some("text") => {
-            let query = format!(
-                "SELECT json_extract(send.args, '$.text')
-                 FROM agents a {RESTART_RESUME_EVENT}
-                 JOIN commands send
-                   ON send.id = json_extract(restart.data, '$.undelivered_send_id')
-                 WHERE a.id = ?1 AND a.generation = ?2
-                   AND ({RESTART_LINKED_LAUNCH_INPUT_VALID})"
-            );
-            let captured_text = connection
-                .query_row(&query, params![agent_num, generation], |row| {
-                    row.get::<_, String>(0)
-                })
-                .optional()
-                .map_err(sql_error)?;
-            Ok(captured_text.is_some_and(|expected| resume_text == Some(expected.as_str())))
-        }
+        Some("text") => Ok(
+            restart_initial_launch_input(connection, agent_num, generation)?
+                .is_some_and(|expected| resume_text == Some(expected.as_str())),
+        ),
         Some(_) => Ok(false),
     }
+}
+
+pub(super) fn restart_initial_launch_input(
+    connection: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<Option<String>> {
+    let query = format!(
+        "SELECT json_extract(send.args, '$.text')
+         FROM agents a {RESTART_RESUME_EVENT}
+         JOIN commands send
+           ON send.id = json_extract(restart.data, '$.undelivered_send_id')
+         WHERE a.id = ?1 AND a.generation = ?2
+           AND ({RESTART_LINKED_LAUNCH_INPUT_VALID})"
+    );
+    connection
+        .query_row(&query, params![agent, generation], |row| row.get(0))
+        .optional()
+        .map_err(sql_error)
 }
 
 /// Shared generation proof for stop settlement and restart resume.

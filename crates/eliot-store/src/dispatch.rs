@@ -235,6 +235,24 @@ fn dispatch_resume_tx(
         .generation
         .checked_add(1)
         .ok_or_else(|| Error::new("bad_state", "Agent generation cannot be incremented"))?;
+    let restart_fresh_native = if restart_resume
+        && let Some(text) = capacity::restart_initial_launch_input(tx, agent_num, old_generation)?
+    {
+        let linked = load_linked_command(tx, id)?;
+        if !linked.is_some_and(|send| {
+            send.generation == Some(next_generation)
+                && matches!(send.state, CommandState::Accepted | CommandState::Queued)
+                && send.args.get("text").and_then(Value::as_str) == Some(text.as_str())
+        }) {
+            return Err(Error::new(
+                "source_integrity",
+                "restart first input no longer matches its exact retained launch SEND",
+            ));
+        }
+        true
+    } else {
+        false
+    };
     workspace::gate_workspace_start(tx, agent, &command.command, next_generation)?;
     capacity::require_reservation_tx(tx, agent_num, next_generation)?;
     for old_id in pending_command_ids(tx, agent_num, agent.generation)? {
@@ -275,6 +293,8 @@ fn dispatch_resume_tx(
         "UPDATE agents
          SET generation = ?1, state = 'starting', active_turn = NULL,
              pending = '[]', token = ?2, updated_at = ?3,
+             native_scope = CASE WHEN ?8 THEN NULL ELSE native_scope END,
+             native_ref = CASE WHEN ?8 THEN NULL ELSE native_ref END,
              custody_namespace = (SELECT namespace FROM custody_binding WHERE singleton = 1)
          WHERE id = ?4 AND generation = ?5
            AND state IN ('stopped', 'failed', 'lost')
@@ -286,7 +306,8 @@ fn dispatch_resume_tx(
             agent_num,
             agent.generation,
             native_scope,
-            native_ref
+            native_ref,
+            restart_fresh_native
         ],
     ));
     if changed != 1 {
@@ -349,11 +370,12 @@ fn dispatch_resume_tx(
         events,
     )?;
     install_initial_source_plan(tx, agent_num, next_generation, now)?;
+    let dispatch_outcome = restart_fresh_native.then(|| json!({"restart_fresh_native": true}));
     update_command_state(
         tx,
         id,
         CommandState::Dispatched,
-        None,
+        dispatch_outcome.as_ref(),
         Some(next_generation),
         now,
     )?;
@@ -369,10 +391,11 @@ fn dispatch_resume_tx(
             json!({
                 "agent_id": agent.id,
                 "command_id": id,
-                "resume_from": {
+                "resume_from": (!restart_fresh_native).then(|| json!({
                     "native_scope": native_scope,
                     "native_ref": native_ref
-                }
+                })),
+                "restart_fresh_native": restart_fresh_native,
             }),
         ),
     )?);

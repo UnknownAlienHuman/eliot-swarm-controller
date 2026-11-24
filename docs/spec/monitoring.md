@@ -1117,8 +1117,10 @@ Before the first turn, if the generation is `Starting` or newly `idle` and its
 exact linked initial SEND `<launch-id>/send` is still accepted or queued,
 `agent.lost` records that command ID as
 `undelivered_send_id` before the SEND is cancelled. The event also sets
-`undelivered_input`. Once custody is closed, Restart Resume carries that exact
-retained text as one fresh linked SEND in the new generation. Store admission
+`undelivered_input`. An applied launch with no recorded turns and proven
+custody exit starts a fresh native session on the same Agent in the new
+generation. Restart Resume carries the exact retained text as one linked SEND
+after that fresh session is ready. Store admission
 rechecks the event's exact command ID, parent link, cancelled state and text in
 the same transaction; the original `<launch-id>/send` stays cancelled. A linked
 SEND that was dispatched remains `unknown` and is not captured or replayed. The
