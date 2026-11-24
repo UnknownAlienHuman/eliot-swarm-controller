@@ -1232,6 +1232,15 @@ impl Store {
             }
             // Fence every attempted artifact across new plans and daemon restarts.
             if attempted(item) {
+                if item.artifact.kind == ArtifactKind::Worktree
+                    && let Some(preparation) = workspace::load_workspace(&tx, agent)?
+                    && cleanup_path(&preparation.worktree_path) == cleanup_path(&item.artifact.path)
+                    && workspace::workspace_removal_fence_tx(&tx, agent, &preparation)?.is_some()
+                {
+                    response.items[index].outcome = "skipped".to_owned();
+                    response.items[index].reason = Some("prior_cleanup_attempt".to_owned());
+                    continue;
+                }
                 let body: Option<String> = tx
                     .query_row(
                         "SELECT body FROM artifacts WHERE id=?1 AND agent=?2",

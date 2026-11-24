@@ -137,8 +137,11 @@ artifacts. Other items proceed under the same plan and checks.
 The Store commits attempt reservations before effects and retains each outcome as it
 settles. Exact same-ID replay returns the current receipt. Another ID
 cannot consume the plan; another pre-existing plan cannot retry an attempted
-artifact. An uncertain worktree removal stays fenced for that workspace
-until exact readback or Owner reconciliation settles it. Uncertain attempts fence
+artifact. An accepted or uncertain worktree removal fences its exact workspace
+through the retained command and workspace marker. New cleanup pages and stale
+plans keep it with `prior_cleanup_attempt` until exact readback or Owner
+reconciliation settles the removal. The original receipt remains readable.
+Uncertain attempts fence
 resume at admission and dispatch. Windows
 pins ancestors, opens the entire bounded tree through relative handles without
 delete sharing for every directory and file until disposition/close, refuses
