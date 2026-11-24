@@ -713,7 +713,7 @@ impl Router {
             Some(match &probe.scope_base {
                 Some(base) => (
                     Some(base),
-                    self.goal_scope_changes(probe.workspace.as_deref(), base)
+                    self.goal_scope_changes(probe.workspace.as_deref(), base, &definition)
                         .await,
                 ),
                 None => (
@@ -905,7 +905,7 @@ impl Router {
         let scope = match scope {
             Some((Some(base), _)) => Some((
                 Some(base),
-                self.goal_scope_changes(probe.workspace.as_deref(), base)
+                self.goal_scope_changes(probe.workspace.as_deref(), base, &definition)
                     .await,
             )),
             other => other,

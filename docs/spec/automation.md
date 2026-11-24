@@ -1938,10 +1938,30 @@ either one, `goal set` records the starting point before the Store write: HEAD a
 content digest of every path that already differs from it (index, worktree and
 untracked files; ignored files excluded; renames as both paths). More than 512 such
 paths are refused rather than recorded incompletely. A changed submodule refuses the
-starting point, or leaves a round's change set unverified, rather than hiding edits. Files named by the check argv
-inside the workspace join the check inputs. An exact retry is answered from the
-retained result before the workspace is read again. Each round, before the check, the
-daemon compares the workspace with that starting point. The Goal's work is the paths
+starting point, or leaves a round's change set unverified, rather than hiding edits.
+The checker executable and identified interpreter scripts inside the workspace
+also join the check inputs. Swarm skips recognized interpreter switches and
+their operands, including Python launcher version switches. It recognizes
+PowerShell positional scripts and `-File`, simple `cmd /c` batch-file
+invocations, and positional scripts for common interpreters. Python `-m`
+resolves ordinary source modules and package entry points in the check directory.
+An ambiguous or unresolved interpreter entry point produces `scope_unverified`
+on a passing check. Checker options after the script, including values such as
+`--out report.json`, are excluded. Declare
+other checker dependencies with `check_inputs`. The baseline keeps each
+candidate's original lexical workspace-relative
+spelling and its resolved canonical target when available; absence and an unresolved
+target are separate baseline states. Each round re-resolves those paths as well as
+reading Git, so changing a link's target or type, or making a previously absent path
+appear, counts as a checker-input change even when Git status omits it. A path-resolution
+error leaves the change set unverified.
+The persisted identity snapshot is optional and serde-defaulted, so old baselines
+remain readable without a database migration. A passing check against a baseline
+without the current identity rules is `scope_unverified` until the Owner records a
+new baseline with `set`. The legacy `check_files` view keeps its existing
+resolved-target list and DTO shape. An exact retry is answered from the retained result
+before the workspace is read again. Each round, before the check, the daemon compares
+the workspace with that starting point. The Goal's work is the paths
 committed since the starting HEAD, the paths changed now, and every pre-existing change
 whose content moved; a pre-existing change left unchanged and uncommitted is not the
 Goal's work. A change outside `scope` blocks the round as `scope_violation` without
