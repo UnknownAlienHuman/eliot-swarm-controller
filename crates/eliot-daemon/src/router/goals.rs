@@ -742,12 +742,18 @@ impl Router {
         // The no-progress fingerprint is read now, while the Agent is idle
         // and before the check can write anything; it is compared with the
         // read taken right after the previous failed check.
-        let fingerprint_before = work_fingerprint(probe.workspace.as_deref()).await;
+        let observation = match (probe.workspace.as_deref(), GitProbe::new()) {
+            (Some(workspace), Ok(git)) => git.work_observation(workspace).await.ok(),
+            _ => None,
+        };
         let work_before = if probe.unsuccessful_turn {
-            task_work_present(&probe).await
+            observation.as_ref().and_then(|work| {
+                Some(work.head.as_deref()? != probe.task_base.as_deref()? || work.dirty)
+            })
         } else {
             None
         };
+        let fingerprint_before = observation.and_then(|work| work.fingerprint.ok());
         let policy = self.secret_policy_snapshot();
         let retry_safe = deadline_source == eliot_core::api::GoalCheckDeadlineSource::History
             && definition.check_timeout_retry_safe
