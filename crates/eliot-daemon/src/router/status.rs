@@ -101,14 +101,23 @@ impl Router {
     }
 
     pub(super) async fn status(&self) -> Result<Value> {
-        let (inbox, liveness, command_without_dispatcher) = self.read_owner_projection().await?;
-        let goals_without_progress = inbox
-            .iter()
-            .filter(|item| {
-                item.kind == OwnerInboxKind::BlockedGoal
-                    || (item.kind == OwnerInboxKind::Stuck && item.subject.starts_with("goal:"))
-            })
-            .count();
+        let path = self.inner.data_root.join("eliot.db");
+        let confirmed = self.confirmed_stuck();
+        let (
+            inbox,
+            liveness,
+            command_without_dispatcher,
+            goals_without_progress,
+            repeated_failure_inbox_items,
+        ) = tokio::task::spawn_blocking(move || {
+            eliot_store::Store::read_owner_projection_with_health(
+                &path,
+                super::now_ms(),
+                &confirmed,
+            )
+        })
+        .await
+        .map_err(|_| Error::new("internal", "owner projection reader failed"))??;
         let mut owner_inbox = OwnerInboxKind::ALL
             .into_iter()
             .map(|kind| (kind, 0))
@@ -201,6 +210,7 @@ impl Router {
             health: Some(DaemonHealthSummary {
                 goals_without_progress,
                 active_repeat_windows: self.active_repeat_windows(),
+                repeated_failure_inbox_items: Some(repeated_failure_inbox_items),
             }),
             command_without_dispatcher: Some(command_without_dispatcher),
             build_identity: Some(crate::build_identity::current().clone()),

@@ -51,6 +51,9 @@ pub(crate) fn is_reportable(item: &OwnerInboxItem, now: i64, confirmed: &StuckSt
     item.kind != OwnerInboxKind::Stuck
         // A persisted interrupted fence already establishes the wait.
         || item.reason == super::owner_inbox::SWITCH_FENCE_NEEDS_OWNER
+        // Repeated failures are already grouped by cause in their projection;
+        // waiting for a second liveness sample would delay the alert.
+        || item.reason == super::owner_inbox::REPEATED_FAILURE_REASON
         || confirmed.get(&item.subject).is_some_and(|state| {
             state.reason == item.reason && state.due_at == StuckState::due_at(item, now)
         })
@@ -119,6 +122,25 @@ impl Store {
         SwarmLiveness,
         CommandWithoutDispatcherStatus,
     )> {
+        let (items, liveness, command_without_dispatcher, _, _) =
+            Self::read_owner_projection_with_health(path, now, confirmed)?;
+        Ok((items, liveness, command_without_dispatcher))
+    }
+
+    /// Return the shared owner projection and fleet counts derived before
+    /// snoozed inbox rows are removed. Existing inbox callers keep the original
+    /// projection tuple through `read_owner_projection`.
+    pub fn read_owner_projection_with_health(
+        path: &Path,
+        now: i64,
+        confirmed: &StuckStates,
+    ) -> Result<(
+        Vec<OwnerInboxItem>,
+        SwarmLiveness,
+        CommandWithoutDispatcherStatus,
+        usize,
+        usize,
+    )> {
         read_inbox_snapshot(path, |connection| {
             let (mut items, mut liveness) = super::owner_inbox::project(connection, now)?;
             items.retain(|item| {
@@ -159,6 +181,23 @@ impl Store {
                 }
                 None => CommandWithoutDispatcherStatus::default(),
             };
+            let goals_without_progress = items
+                .iter()
+                .filter(|item| {
+                    item.kind == OwnerInboxKind::BlockedGoal
+                        || (item.kind == OwnerInboxKind::Stuck && item.subject.starts_with("goal:"))
+                })
+                .count();
+            let repeated_failure_inbox_items = items
+                .iter()
+                .filter(|item| {
+                    item.kind == OwnerInboxKind::Stuck
+                        && item.reason == super::owner_inbox::REPEATED_FAILURE_REASON
+                        && item.subject.starts_with("repeat:")
+                })
+                .map(|item| item.subject.as_str())
+                .collect::<HashSet<_>>()
+                .len();
             let snoozes = inbox_snoozes(connection)?;
             let snoozed = snoozes
                 .iter()
@@ -167,7 +206,13 @@ impl Store {
             items.retain(|item| {
                 !snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
             });
-            Ok((items, liveness, command_without_dispatcher))
+            Ok((
+                items,
+                liveness,
+                command_without_dispatcher,
+                goals_without_progress,
+                repeated_failure_inbox_items,
+            ))
         })
     }
 
@@ -185,7 +230,10 @@ impl Store {
                 .collect();
             let candidates = items
                 .iter()
-                .filter(|item| item.kind == OwnerInboxKind::Stuck)
+                .filter(|item| {
+                    item.kind == OwnerInboxKind::Stuck
+                        && item.reason != super::owner_inbox::REPEATED_FAILURE_REASON
+                })
                 .map(|item| {
                     (
                         item.subject.clone(),

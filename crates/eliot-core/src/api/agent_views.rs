@@ -2462,6 +2462,8 @@ impl DiskUsageView {
 pub struct DaemonHealthSummary {
     pub goals_without_progress: usize,
     pub active_repeat_windows: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_failure_inbox_items: Option<usize>,
 }
 
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
