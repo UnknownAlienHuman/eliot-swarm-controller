@@ -1105,14 +1105,7 @@ impl Router {
                     && event.generation == Some(goal.generation)
                     && event.data["revision"].as_i64() == Some(goal.revision)
                 {
-                    self.note_goal_failure(
-                        principal,
-                        &goal,
-                        "check",
-                        &error.code,
-                        &error.message,
-                        None,
-                    );
+                    self.note_goal_failure(principal, &goal, "check", &error.code, &error.message);
                 }
                 retained.value
             }
@@ -1188,7 +1181,6 @@ impl Router {
                         "check_exit",
                         &exit_code.to_string(),
                         &format!("Check exited with code {exit_code}"),
-                        check.output_digest.as_deref(),
                     );
                 } else if let Some(decision) = &commit.decision {
                     let reason = match decision {
@@ -1202,7 +1194,6 @@ impl Router {
                         "round",
                         reason,
                         commit.observation.as_deref().unwrap_or(reason),
-                        None,
                     );
                 }
             }

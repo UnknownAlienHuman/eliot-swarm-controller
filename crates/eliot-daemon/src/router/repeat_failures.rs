@@ -49,8 +49,7 @@ struct FailureKey {
     owner: FailureOwner,
     failure_class: String,
     code: String,
-    message: String,
-    evidence: Option<String>,
+    rule_message: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, Serialize)]
@@ -87,7 +86,6 @@ struct FailureObservation<'a> {
     class: &'a str,
     code: &'a str,
     message: &'a str,
-    evidence: Option<&'a str>,
     goal: Option<RepeatAlertGoal>,
 }
 
@@ -145,16 +143,17 @@ impl StormDiagnostics {
 pub(super) struct RepeatFailures {
     windows: HashMap<WindowKey, CounterWindow>,
     pending_alerts: HashMap<WindowKey, PendingAlert>,
-    overflow_logged_at: Option<Instant>,
-}
-
-enum RepeatOutcome {
-    Quiet,
-    Threshold,
-    Overflow,
+    overflow_at: Option<i64>,
 }
 
 impl RepeatFailures {
+    fn note_overflow(&mut self, observed_at: i64) {
+        self.overflow_at = Some(
+            self.overflow_at
+                .map_or(observed_at, |at| at.max(observed_at)),
+        );
+    }
+
     fn queue_alert(
         &mut self,
         key: WindowKey,
@@ -165,6 +164,7 @@ impl RepeatFailures {
         if self.pending_alerts.len() >= MAX_TRACKED_WINDOWS
             && !self.pending_alerts.contains_key(&key)
         {
+            self.note_overflow(observed_at);
             return;
         }
         let quiet_ms = key.quiet_ms();
@@ -191,24 +191,6 @@ impl RepeatFailures {
         }
     }
 
-    fn record(&mut self, key: WindowKey) -> RepeatOutcome {
-        let now = Instant::now();
-        match self
-            .increment(key, now, 1, 0)
-            .map(|(window, _)| window.count)
-        {
-            Some(count) if count == u64::from(REPEAT_THRESHOLD) => RepeatOutcome::Threshold,
-            None if self
-                .overflow_logged_at
-                .is_none_or(|logged| now.duration_since(logged) >= REPEAT_WINDOW) =>
-            {
-                self.overflow_logged_at = Some(now);
-                RepeatOutcome::Overflow
-            }
-            _ => RepeatOutcome::Quiet,
-        }
-    }
-
     fn increment(
         &mut self,
         key: WindowKey,
@@ -221,6 +203,9 @@ impl RepeatFailures {
             self.windows
                 .retain(|key, window| matches!(key, WindowKey::Storm(_)) || now < window.ends);
             if self.windows.len() >= MAX_TRACKED_WINDOWS {
+                if refused > 0 || !matches!(key, WindowKey::Storm(_)) {
+                    self.note_overflow(super::now_ms());
+                }
                 return None;
             }
         }
@@ -272,9 +257,8 @@ impl Router {
             .count()
     }
 
-    /// Record a failed Goal check in the shared repeat counter. A matching
-    /// failure is bound to this Goal, Agent generation, failure class, code,
-    /// normalized diagnostic text and any exact check-output digest.
+    /// Match failures by Goal definition (including the check), Agent
+    /// generation, failure class, and code.
     pub(super) fn note_goal_failure(
         &self,
         principal: &str,
@@ -282,7 +266,6 @@ impl Router {
         failure_class: &str,
         code: &str,
         message: &str,
-        evidence: Option<&str>,
     ) {
         // A Goal's revision advances after each round; its definition is
         // stable across those rounds and separates replacement definitions.
@@ -304,7 +287,6 @@ impl Router {
                 class: failure_class,
                 code,
                 message,
-                evidence,
                 goal: Some(RepeatAlertGoal {
                     agent,
                     generation: goal.generation,
@@ -450,8 +432,11 @@ impl Router {
         let closed = {
             let mut counter = self.inner.repeat_failures.lock_recover();
             let key = WindowKey::Storm(source);
-            let Some((window, closed)) =
-                counter.increment(key.clone(), Instant::now(), count, refused)
+            let observed_at = super::now_ms();
+            if refused > 0 {
+                counter.queue_alert(key.clone(), observed_at, None, None);
+            }
+            let Some((window, closed)) = counter.increment(key, Instant::now(), count, refused)
             else {
                 return;
             };
@@ -462,9 +447,7 @@ impl Router {
                 window.storm.observe_rule(rule_id);
             }
             if refused > 0 {
-                let observed_at = super::now_ms();
                 window.last_refusal_at = observed_at;
-                counter.queue_alert(key, observed_at, None, None);
             }
             closed
         };
@@ -491,19 +474,21 @@ impl Router {
         for (source, window) in closed {
             self.log_command_storm(source, window);
         }
-        if self
-            .inner
-            .repeat_failures
-            .lock_recover()
-            .pending_alerts
-            .is_empty()
-        {
+        let pending_exists = {
+            let counter = self.inner.repeat_failures.lock_recover();
+            !counter.pending_alerts.is_empty() || counter.overflow_at.is_some()
+        };
+        if !pending_exists {
             return;
         }
         let mut store = self.inner.store.lock().await;
-        let (pending, now) = {
+        let (pending, overflow_at, now) = {
             let mut counter = self.inner.repeat_failures.lock_recover();
-            (std::mem::take(&mut counter.pending_alerts), super::now_ms())
+            (
+                std::mem::take(&mut counter.pending_alerts),
+                counter.overflow_at.take(),
+                super::now_ms(),
+            )
         };
         let policy = self.secret_policy_snapshot();
         let updates: Vec<_> = pending
@@ -521,8 +506,21 @@ impl Router {
                 })
             })
             .collect();
-        match store.update_repeat_alerts(&updates, now) {
-            Ok(events) => self.publish_locked(&events),
+        match store.update_repeat_alerts(&updates, overflow_at, now) {
+            Ok(batch) => {
+                self.publish_locked(&batch.events);
+                if batch.opened_overflow {
+                    crate::logging::record(
+                        &policy,
+                        "daemon.repeat_failure_overflow",
+                        &[("producer", "daemon.repeat_failures")],
+                        Some(&Error::new(
+                            "capacity",
+                            eliot_store::REPEAT_ALERT_OVERFLOW_MESSAGE,
+                        )),
+                    );
+                }
+            }
             Err(error) => crate::logging::record(
                 &policy,
                 "daemon.repeat_alert_commit_failed",
@@ -598,7 +596,6 @@ impl Router {
                         class: "rule",
                         code,
                         message,
-                        evidence: None,
                         goal: None,
                     },
                 );
@@ -638,7 +635,6 @@ impl Router {
                 class: "rule",
                 code: cause,
                 message: &message,
-                evidence: None,
                 goal: None,
             },
         );
@@ -658,27 +654,19 @@ impl Router {
             owner: owner.clone(),
             failure_class: failure_class.clone(),
             code: code.clone(),
-            message: normalized_message(&message),
-            evidence: failure.evidence.map(str::to_owned),
+            rule_message: failure.goal.is_none().then(|| normalized_message(&message)),
         });
-        let (outcome, observed_at) = {
+        let (reached_threshold, observed_at) = {
             let mut counter = self.inner.repeat_failures.lock_recover();
             let observed_at = super::now_ms();
-            let outcome = counter.record(key.clone());
+            let reached_threshold = counter
+                .increment(key.clone(), Instant::now(), 1, 0)
+                .is_some_and(|(window, _)| window.count == u64::from(REPEAT_THRESHOLD));
             counter.queue_alert(key.clone(), observed_at, failure.goal, None);
-            (outcome, observed_at)
+            (reached_threshold, observed_at)
         };
-        match outcome {
-            RepeatOutcome::Quiet => return,
-            RepeatOutcome::Overflow => {
-                let event = match owner {
-                    FailureOwner::Rule { .. } => "daemon.rule_failure_counter_overflow",
-                    FailureOwner::Goal { .. } => "daemon.goal_failure_counter_overflow",
-                };
-                crate::logging::record(&policy, event, &[], None);
-                return;
-            }
-            RepeatOutcome::Threshold => {}
+        if !reached_threshold {
+            return;
         }
         let count = REPEAT_THRESHOLD;
         let text = match owner {
