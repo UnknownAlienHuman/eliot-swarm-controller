@@ -270,6 +270,7 @@ pub(super) fn combo_box() -> String {
     const HIGHLIGHT_OUTSET: f64 = 4.0;
     include_str!("combo_box.xaml")
         .replace("@CHEVRON@", &icon::CHEVRON.to_string())
+        .replace("@SYMBOLS_FAMILY@", &crate::fonts::families().symbols)
         .replace(
             "@CHEVRON_GLYPH@",
             &crate::brand::glyph::CHEVRON_DOWN

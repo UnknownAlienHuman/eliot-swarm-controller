@@ -1172,10 +1172,14 @@ fn native(work: impl FnOnce(&OwnEntries) -> windows_core::Result<()>) -> Result<
 }
 
 /// The icon font for a scheme: Eliot Symbols at grade -25 on dark themes,
-/// grade 0 otherwise (and under High Contrast). WinUI's `FontIcon` does
-/// not read `SymbolThemeFontFamily` from the application's own entries
-/// (observed live), so an implicit `FontIcon` style sets the family; the
-/// key still serves the templates that name it (the combo box chevron).
+/// grade 0 otherwise (and under High Contrast), through an implicit
+/// `FontIcon` style (WinUI's `FontIcon` does not read
+/// `SymbolThemeFontFamily` from the application's own entries, observed
+/// live). `SymbolThemeFontFamily` itself stays Segoe Fluent Icons: WinUI's
+/// own templates draw Segoe glyphs through it (a submenu's chevron, a text
+/// field's clear button), which Eliot Symbols lacks and which no family
+/// fallback recovered (observed live). The combo box template names Eliot
+/// Symbols itself.
 fn symbols_xaml(scheme: Option<&Roles>) -> String {
     let fonts = crate::fonts::families();
     let family = match scheme {
@@ -1184,7 +1188,6 @@ fn symbols_xaml(scheme: Option<&Roles>) -> String {
     };
     format!(
         "{XAML_ROOT}\
-         <FontFamily x:Key=\"SymbolThemeFontFamily\">{family}</FontFamily>\
          <Style TargetType=\"FontIcon\"><Setter Property=\"FontFamily\" Value=\"{family}\"/></Style>\
          </ResourceDictionary>"
     )

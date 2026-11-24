@@ -40,12 +40,9 @@ const LICENCES: [(&str, &[u8]); 3] = [
     ),
 ];
 
-/// The Windows fonts behind the shipped faces: text, code, and the glyphs
-/// WinUI's own templates draw (a text box's clear button, a submenu
-/// chevron), which Eliot Symbols does not carry.
+/// The Windows fonts behind the shipped text faces.
 const TEXT_FALLBACK: &str = "Segoe UI Variable Text, Segoe UI";
 const MONO_FALLBACK: &str = "Cascadia Mono, Consolas";
-const SYMBOLS_FALLBACK: &str = "Segoe Fluent Icons";
 
 /// XAML `FontFamily` values, already escaped for an attribute.
 pub struct Families {
@@ -69,10 +66,10 @@ pub fn families() -> &'static Families {
     static FAMILIES: OnceLock<Families> = OnceLock::new();
     FAMILIES.get_or_init(|| match write_fonts() {
         Ok(names) => Families {
-            text: family(&names[0], "Roboto", TEXT_FALLBACK),
-            mono: family(&names[1], "Roboto Mono", MONO_FALLBACK),
-            symbols: family(&names[2], "Eliot Symbols", SYMBOLS_FALLBACK),
-            symbols_dark: family(&names[3], "Eliot Symbols Dark", SYMBOLS_FALLBACK),
+            text: family(&names[0], "Roboto", Some(TEXT_FALLBACK)),
+            mono: family(&names[1], "Roboto Mono", Some(MONO_FALLBACK)),
+            symbols: family(&names[2], "Eliot Symbols", None),
+            symbols_dark: family(&names[3], "Eliot Symbols Dark", None),
         },
         Err(error) => crate::startup::fatal(&format!(
             "The desktop's fonts could not be written into the \"{FOLDER}\" folder beside the executable: {error}"
@@ -82,8 +79,9 @@ pub fn families() -> &'static Families {
 
 /// `fonts/<file>#<face>`, then the fallback families, escaped for a XAML
 /// attribute.
-fn family(file: &str, face: &str, fallback: &str) -> String {
-    format!("{FOLDER}/{file}#{face}, {fallback}")
+fn family(file: &str, face: &str, fallback: Option<&str>) -> String {
+    let fallback = fallback.map(|f| format!(", {f}")).unwrap_or_default();
+    format!("{FOLDER}/{file}#{face}{fallback}")
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;")
