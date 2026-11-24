@@ -954,9 +954,7 @@ impl State {
             if missing_text.is_none() {
                 attach_final_text(&mut data, &final_text);
             }
-            let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
-            self.commit("turn.completed", &stop.turn_id, "completed", data)
-                .await?;
+            let final_text = self.commit_turn_completed(&stop.turn_id, data).await?;
             self.last_turn = Some(TurnFacts {
                 command_id: None,
                 turn_id: stop.turn_id.clone(),
@@ -1076,9 +1074,7 @@ impl State {
         if (self.text_truncated || !is_blank_native_text(&text)) && missing_text.is_none() {
             attach_final_text(&mut data, &text);
         }
-        let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
-        self.commit("turn.completed", &stop.turn_id, "completed", data)
-            .await?;
+        let final_text = self.commit_turn_completed(&stop.turn_id, data).await?;
         let session_usage = self.commit_turn_session_usage(&stop.turn_id).await;
         self.reject_pending_steer("Antigravity run ended before its next PreInvocation");
         if let Some(last) = self.last_turn.as_mut() {
@@ -2807,9 +2803,7 @@ impl State {
         {
             attach_final_text(&mut data, &text);
         }
-        let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
-        self.commit("turn.completed", &turn, "completed", data)
-            .await?;
+        let final_text = self.commit_turn_completed(&turn, data).await?;
         let session_usage = self.commit_turn_session_usage(&turn).await;
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
@@ -2877,8 +2871,30 @@ impl State {
         Ok(())
     }
 
+    async fn commit_turn_completed(&mut self, turn: &str, mut data: Value) -> Result<String> {
+        self.policy.redact_values(&mut data);
+        let final_text = data
+            .get("final_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        self.commit_redacted("turn.completed", turn, "completed", data)
+            .await?;
+        Ok(final_text)
+    }
+
     async fn commit(&mut self, kind: &str, turn: &str, item: &str, mut data: Value) -> Result<()> {
         self.policy.redact_values(&mut data);
+        self.commit_redacted(kind, turn, item, data).await
+    }
+
+    async fn commit_redacted(
+        &mut self,
+        kind: &str,
+        turn: &str,
+        item: &str,
+        data: Value,
+    ) -> Result<()> {
         if serde_json::to_vec(&data).map_or(true, |bytes| bytes.len() > MAX_EVENT_BYTES) {
             return Err(Error::new(
                 "frame_too_large",
