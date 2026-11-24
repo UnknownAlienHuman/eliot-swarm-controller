@@ -90,6 +90,36 @@ impl Directory {
         self.chain.last().unwrap()
     }
 
+    /// Enumerate the current no-follow directory while its chain stays open.
+    pub(crate) fn entries(&self) -> std::io::Result<std::fs::ReadDir> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            // Linux permits renaming open ancestors. Resolve the directory
+            // through its descriptor so enumeration uses the opened object.
+            std::fs::read_dir(format!("/proc/self/fd/{}", self.handle().as_raw_fd()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        std::fs::read_dir(&self.path)
+    }
+
+    /// Open just this child relative to its existing parent handle. The
+    /// entry name is one native component supplied by a directory iterator.
+    pub(crate) fn push_entry_directory(&mut self, entry: &std::fs::DirEntry) -> Result<()> {
+        let name = entry.file_name();
+        let file = native::open(self.handle(), &name, true, false).map_err(io)?;
+        check(&file, true)?;
+        self.chain.push(file);
+        self.path.push(name);
+        Ok(())
+    }
+
+    pub(crate) fn pop_entry_directory(&mut self) {
+        self.chain.pop();
+        self.path.pop();
+    }
+
     pub(crate) fn file(&self, name: &str) -> Result<File> {
         plain(name)?;
         let file =

@@ -2324,6 +2324,12 @@ pub struct DiskUsageView {
     pub artifacts: DiskUsageDirectory,
     pub worktrees: DiskUsageDirectory,
     pub plugins: DiskUsageDirectory,
+    /// Age of the last completed measurement attempt, if one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_age_ms: Option<u64>,
+    /// A measurement is in progress. The displayed buckets may be cached.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub refreshing: bool,
     pub owner_decision_worktrees: Option<usize>,
     pub owner_decision_error_code: Option<String>,
 }

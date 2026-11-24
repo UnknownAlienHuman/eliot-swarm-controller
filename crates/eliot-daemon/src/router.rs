@@ -701,7 +701,7 @@ impl Router {
                 let request: DaemonStatusRequest =
                     eliot_core::api::discovery::decode_params(params.clone())?;
                 request.validate()?;
-                self.status().await
+                self.status(request.disk_usage_freshness).await
             }
             "autonomy.get" => {
                 require_owner(&principal)?;

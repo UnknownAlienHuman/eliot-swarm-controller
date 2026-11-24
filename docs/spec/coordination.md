@@ -531,7 +531,8 @@ transaction. Restart recovery clears only commandless open claims.
 Command retention clears the open reference of the exact completed notice it
 deletes. Native acceptance starts the wake-attempt cooldown
 (`turn.started` stamps `last_notice_at`).
-A daemon driver re-pages due recipients every 2 seconds: current `idle`,
+A daemon driver re-pages due recipients every 2 seconds from the indexed
+recipients of unread wake-enabled mail. Current `idle`,
 non-observer agents holding unread mail past the normal cooldown are
 re-offered through the same atomic claim, so an agent that idles with no
 new event still wakes once due. Normal queued mail and older-generation
