@@ -1528,7 +1528,7 @@ fn validate_control_applied_outcome(
     Ok(())
 }
 
-fn settle_interrupt_after_fallback_tx(
+pub(super) fn settle_interrupt_after_fallback_tx(
     tx: &Transaction<'_>,
     interrupt_id: &str,
     stop: &Command,

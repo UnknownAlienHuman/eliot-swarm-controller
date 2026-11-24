@@ -206,7 +206,7 @@ impl Store {
                 id: request.id.clone(),
                 command_id: stop.command_id.clone(),
                 resolution: CommandResolution::Applied,
-                reason: "Owned processes exited and the native reader drained. A native stop receipt was unavailable.".into(),
+                reason: "Owned processes exited and the native reader drained.".into(),
             };
             events.push(resolve_command_tx(
                 &tx,
@@ -217,7 +217,14 @@ impl Store {
                 now,
             )?);
             if let Some(fallback) = &stop.interrupt_fallback {
-                settle_reviewed_interrupt_fallback_tx(&tx, &record, fallback, now, &mut events)?;
+                super::lifecycle::settle_interrupt_after_fallback_tx(
+                    &tx,
+                    &fallback.command_id,
+                    &record.command,
+                    (agent_num, stop.generation),
+                    now,
+                    &mut events,
+                )?;
             }
             if let Some(turn_id) = &stop.interrupted_turn {
                 let turn = TurnResolveRequest {
@@ -987,121 +994,6 @@ impl Store {
     }
 }
 
-fn settle_reviewed_interrupt_fallback_tx(
-    tx: &Transaction<'_>,
-    stop: &CommandRecord,
-    fallback: &InterruptFallbackSettlement,
-    now: i64,
-    events: &mut Vec<eliot_core::Event>,
-) -> Result<()> {
-    let (Some(agent), Some(generation)) = (stop.target, stop.command.generation) else {
-        return Err(Error::new(
-            "source_integrity",
-            "reviewed interrupt fallback stop has no Agent generation",
-        ));
-    };
-    let reason = if stop.command.args["interrupt_runtime_unavailable"] == true {
-        "interrupt_runtime_unavailable_agent_stopped"
-    } else {
-        "interrupt_unconfirmed_agent_stopped"
-    };
-    if stop.state != CommandState::Unknown
-        || stop.command.verb != "stop"
-        || stop.command.args["force"] != true
-        || stop.expected_turn_id.as_deref() != fallback.turn_id.as_deref()
-        || fallback.reason != reason
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "reviewed interrupt fallback no longer matches its stop binding",
-        ));
-    }
-    let exact_link: bool = tx
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM commands child
-                JOIN commands interrupt ON interrupt.id=child.parent_command
-                WHERE child.id=?1 AND child.parent_command=?2
-                  AND child.link_kind='interrupt_stop' AND child.verb='stop'
-                  AND child.principal='owner'
-                  AND child.target=?3 AND child.generation=?4
-                  AND child.expected_turn_id IS ?5
-                  AND json_extract(child.args,'$.force')=1
-                  AND interrupt.principal='owner' AND interrupt.verb='interrupt'
-                  AND interrupt.target=child.target
-                  AND interrupt.generation=child.generation
-                  AND interrupt.turn_id IS child.expected_turn_id
-                  AND interrupt.turn_id IS ?5
-                  AND interrupt.state IN ('dispatched','unknown')
-            )",
-            params![
-                stop.command.id,
-                fallback.command_id,
-                agent,
-                generation,
-                fallback.turn_id,
-            ],
-            |row| row.get(0),
-        )
-        .map_err(sql_error)?;
-    if !exact_link {
-        return Err(Error::new(
-            "source_integrity",
-            "reviewed Owner interrupt fallback link changed",
-        ));
-    }
-    let interrupt = load_command_record(tx, &fallback.command_id)?
-        .ok_or_else(|| Error::new("source_integrity", "linked Owner interrupt disappeared"))?;
-    if !interrupt.command.is_owner_interrupt()
-        || interrupt.target != Some(agent)
-        || interrupt.command.generation != Some(generation)
-        || interrupt.command.turn_id.as_deref() != fallback.turn_id.as_deref()
-        || !matches!(
-            interrupt.state,
-            CommandState::Dispatched | CommandState::Unknown
-        )
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "linked Owner interrupt no longer matches the proven fallback stop",
-        ));
-    }
-    let message = if reason == "interrupt_runtime_unavailable_agent_stopped" {
-        "Swarm found no live plugin for the interrupt and proved the Agent stopped."
-    } else {
-        "Harness did not confirm the interrupt within 10 seconds. Swarm stopped the Agent."
-    };
-    let outcome = json!({
-        "command_id": fallback.command_id,
-        "turn_id": fallback.turn_id,
-        "reason": reason,
-        "message": message,
-        "fallback_stop_id": stop.command.id,
-    });
-    update_command_state(
-        tx,
-        &fallback.command_id,
-        CommandState::Applied,
-        Some(&outcome),
-        None,
-        now,
-    )?;
-    events.push(insert_daemon_command_event(
-        tx,
-        now,
-        "command.applied",
-        Some(agent),
-        Some(generation),
-        &fallback.command_id,
-        json!({
-            "command_id": fallback.command_id,
-            "state": "applied",
-            "outcome": outcome,
-        }),
-    )?);
-    Ok(())
-}
-
 fn historical_settlement_page(
     connection: &Connection,
     request: &SettleStoppedRequest,
@@ -1148,13 +1040,13 @@ fn historical_settlement_page(
                   AND json_type(dispatch.data,'$.live_at_dispatch')='false'
             )
          LEFT JOIN commands AS interrupt
-            ON interrupt.id=c.parent_command AND c.link_kind='interrupt_stop'
+            ON interrupt.id=c.parent_command AND c.link_kind='interrupt_stop' AND c.ordinal=0
            AND c.principal='owner'
            AND c.verb='stop' AND json_extract(c.args,'$.force')=1
            AND interrupt.principal='owner' AND interrupt.verb='interrupt'
            AND interrupt.target=c.target AND interrupt.generation=c.generation
            AND interrupt.turn_id IS c.expected_turn_id
-           AND interrupt.state IN ('dispatched','unknown')
+           AND interrupt.state='unknown'
          WHERE c.state = 'unknown' AND c.verb = 'stop' AND a.observe_only = 0
            AND c.id > COALESCE(?1, '')
            AND (a.generation > c.generation OR
@@ -1285,6 +1177,7 @@ fn historical_settlement_page(
     let mut request_replies = Vec::new();
     let mut awaiting_proof = Vec::new();
     let mut turns = std::collections::HashSet::new();
+    let mut interrupts = std::collections::HashSet::new();
     let mut lost = std::collections::HashSet::new();
     for (command_id, candidate) in candidates.into_iter().take(HISTORICAL_SETTLEMENT_PAGE) {
         match candidate {
@@ -1306,7 +1199,8 @@ fn historical_settlement_page(
                         command_id,
                         mark_stopped: is_lost && lost.insert(agent),
                         interrupted_turn,
-                        interrupt_fallback,
+                        interrupt_fallback: interrupt_fallback
+                            .filter(|fallback| interrupts.insert(fallback.command_id.clone())),
                     });
                 } else {
                     awaiting_proof.push(command_id);
