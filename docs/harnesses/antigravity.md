@@ -364,8 +364,8 @@ attribution, so occupancy changes (compaction can reduce `used`) can never
 read as token expenditure. The adapter folds `usage_update` into the
 retained `SessionUsage` snapshot and commits it as `session.usage` when
 accepted (source `antigravity:usage_update`), with `observed_at` captured at
-acceptance: `used`/`size` replace the retained context
-counters and a supplied cost replaces the retained cumulative cost with
+acceptance: `used`/`size` replace the retained context counters together,
+with missing members left null. A supplied cost replaces the retained cumulative cost with
 its verbatim unit. No cumulative input/output/cache counters exist on the `usage_update`
 surface (`cumulative_tokens` stays null), and occupancy/cost are never
 mapped to `TurnUsage`: the session stream alone cannot supply per-turn

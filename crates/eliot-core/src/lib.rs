@@ -1024,19 +1024,11 @@ impl TurnUsage {
                 .and_then(|(visible, reasoning)| visible.checked_add(reasoning));
         }
         self.reasoning_tokens = self.reasoning_tokens.or(self.thinking_tokens);
-        self.total_tokens = if capabilities.input_token_accounting
-            == api::InputTokenAccounting::ExcludesCacheWrites
-            && self.cache_write_tokens.is_none()
-        {
-            None
-        } else {
-            self.input_tokens
-                .zip(self.cache_read_tokens)
-                .zip(self.output_tokens)
-                .and_then(|((input, cached), output)| {
-                    input.checked_add(cached)?.checked_add(output)
-                })
-        };
+        self.total_tokens = self
+            .input_tokens
+            .zip(self.cache_read_tokens)
+            .zip(self.output_tokens)
+            .and_then(|((input, cached), output)| input.checked_add(cached)?.checked_add(output));
         self
     }
 
@@ -1120,17 +1112,13 @@ fn uncached_input(
     match accounting {
         api::InputTokenAccounting::IncludesCacheReads => subtract_cached_input(input, cached),
         // Cache creation spends fresh input tokens that can serve future cache hits.
-        api::InputTokenAccounting::ExcludesCacheWrites => {
-            written.map_or(Some(input), |written| input.checked_add(written))
-        }
+        api::InputTokenAccounting::ExcludesCacheWrites => input.checked_add(written?),
         api::InputTokenAccounting::Uncached => Some(input),
     }
 }
 
 fn subtract_cached_input(input: i64, cached: Option<i64>) -> Option<i64> {
-    cached.map_or(Some(input), |cached| {
-        input.checked_sub(cached).filter(|input| *input >= 0)
-    })
+    input.checked_sub(cached?).filter(|input| *input >= 0)
 }
 
 pub fn usage_counter(value: Option<&Value>) -> Option<i64> {
@@ -1269,24 +1257,25 @@ impl ContextWindowTracker {
 }
 
 impl SessionUsage {
+    /// A measured occupancy can support an absolute ceiling without a window.
+    pub fn valid_context_used_tokens(&self) -> Option<i64> {
+        self.context_used_tokens.filter(|used| {
+            *used >= 0
+                && self
+                    .context_window_tokens
+                    .is_none_or(|window| window > 0 && *used <= window)
+        })
+    }
+
     /// Returns an observed occupancy and its compatible context window.
     pub fn context_tokens(&self) -> Option<(i64, i64)> {
-        let (used, window) = self.context_used_tokens.zip(self.context_window_tokens)?;
-        (window > 0 && (0..=window).contains(&used)).then_some((used, window))
+        self.valid_context_used_tokens()
+            .zip(self.context_window_tokens)
     }
 
     pub fn retain_valid_context(&mut self) {
-        if self.context_used_tokens.is_some_and(|used| used < 0) {
-            self.context_used_tokens = None;
-        }
-        if let Some(window) = self.context_window_tokens {
-            if window <= 0 {
-                self.context_window_tokens = None;
-                self.context_used_tokens = None;
-            } else if self.context_used_tokens.is_some_and(|used| used > window) {
-                self.context_used_tokens = None;
-            }
-        }
+        self.context_used_tokens = self.valid_context_used_tokens();
+        self.context_window_tokens = self.context_window_tokens.filter(|window| *window > 0);
     }
 
     pub fn normalized(mut self, harness: &str) -> Self {

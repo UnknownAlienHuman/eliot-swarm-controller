@@ -13,32 +13,42 @@ impl Router {
             || agent.observe_only
             || agent.is_automatic_provider_probe()
             || agent.is_harness_check()
+            || !self.inner.attention.session_growth.enabled
             || self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN
         {
             return Ok(());
         }
-        let (warning, usage, ceiling_claimed, ceiling_notice_claimed) = {
+        let thresholds = self.inner.observe.lock_recover().growth;
+        let (warning, usage, ceiling_claimed) = {
             let store = self.inner.store.lock().await;
+            let usage = store.get_session_usage(&agent.id, agent.generation)?;
+            let growth = eliot_core::evaluate_session_growth(
+                &agent.harness,
+                usage.as_ref(),
+                usage.as_ref().and_then(|usage| usage.session_file_bytes),
+                &thresholds,
+            );
+            let warning = growth
+                .map(|growth| {
+                    store.latest_session_growth_incident(
+                        &agent.id,
+                        agent.generation,
+                        growth.basis_name(),
+                    )
+                })
+                .transpose()?
+                .flatten();
             (
-                store.latest_session_growth_incident(&agent.id, agent.generation)?,
-                store.get_session_usage(&agent.id, agent.generation)?,
+                warning,
+                usage,
                 store.generation_attention_step_claimed(
                     &agent.id,
                     agent.generation,
                     SESSION_GROWTH_CEILING_REASON,
                     None,
                 )?,
-                store.generation_attention_step_claimed(
-                    &agent.id,
-                    agent.generation,
-                    SESSION_GROWTH_CEILING_REASON,
-                    Some(SESSION_GROWTH_CEILING_NOTICE_STEP),
-                )?,
             )
         };
-        if !self.inner.attention.session_growth.enabled {
-            return Ok(());
-        }
         let context_ceiling = agent
             .profile_snapshot
             .get("context_ceiling_tokens")
@@ -47,20 +57,10 @@ impl Router {
         let ceiling_sample = context_ceiling
             .zip(usage.as_ref())
             .and_then(|(ceiling, usage)| {
-                let used = usage.context_used_tokens.filter(|used| *used >= 0)?;
-                (used > ceiling).then(|| (used, ceiling, (*usage).clone()))
+                let used = usage.valid_context_used_tokens()?;
+                (used > ceiling).then(|| (*usage).clone())
             });
-        if warning.is_none() && ceiling_sample.is_none() {
-            if ceiling_claimed
-                && !ceiling_notice_claimed
-                && let Some(notice) = self.claim_ceiling_notice(agent, None, None).await?
-            {
-                return self.report_session_growth(agent, &notice).await;
-            }
-            return Ok(());
-        }
-
-        if let Some((used, ceiling, sample)) = ceiling_sample {
+        if let Some(sample) = ceiling_sample {
             let incident_id = session_growth_ceiling_incident_id(agent);
             let compact = eliot_core::compact_hint_for_harness(&agent.harness).is_some();
             let action_id = ulid::Ulid::new().to_string();
@@ -92,11 +92,7 @@ impl Router {
                         && current.active_turn.is_none()
                 });
                 let current_usage = store.get_session_usage(&agent.id, agent.generation)?;
-                let growth_is_current = current_usage.as_ref() == Some(&sample)
-                    && current_usage
-                        .as_ref()
-                        .and_then(|usage| usage.context_used_tokens)
-                        .is_some_and(|current_used| current_used == used && current_used > ceiling);
+                let growth_is_current = current_usage.as_ref() == Some(&sample);
                 if !agent_is_current || !growth_is_current {
                     return Ok(());
                 }
@@ -117,7 +113,7 @@ impl Router {
                         }
                         .to_owned(),
                         command_id: action.as_ref().map(|_| action_id.clone()),
-                        turn_id: warning.as_ref().and_then(|(_, turn_id)| turn_id.clone()),
+                        turn_id: None,
                     };
                     if let Some(event) = store.claim_generation_attention_step(
                         &agent.id,
@@ -134,13 +130,7 @@ impl Router {
 
             // Claim and route one follow-up notice even if dispatch returns an
             // uncertain result. The durable claim prevents replay after restart.
-            let notice = self
-                .claim_ceiling_notice(
-                    agent,
-                    warning.as_ref().and_then(|(_, turn_id)| turn_id.clone()),
-                    None,
-                )
-                .await?;
+            let notice = self.claim_ceiling_notice(agent, &sample).await?;
             let dispatch_result = match (action_claimed, action.as_ref()) {
                 (true, Some(action)) if compact => self
                     .submit(action, &Principal::Owner, "daemon.session_growth")
@@ -170,13 +160,6 @@ impl Router {
             return Ok(());
         };
         if ceiling_claimed {
-            if !ceiling_notice_claimed
-                && let Some(notice) = self
-                    .claim_ceiling_notice(agent, turn_id, Some((seq, None)))
-                    .await?
-            {
-                return self.report_session_growth(agent, &notice).await;
-            }
             // A later legacy warning in this generation may overlap a ceiling
             // reaction; never let it repeat a compaction or handoff.
             return Ok(());
@@ -215,13 +198,19 @@ impl Router {
                     && current.state == AgentState::Idle
                     && current.active_turn.is_none()
             });
-            let growth_is_current = store
-                .latest_session_growth_incident(&agent.id, agent.generation)?
-                .is_some_and(|(current_seq, _)| current_seq == seq)
-                && store
-                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &thresholds)?
-                    .is_some();
-            if !agent_is_current || !growth_is_current {
+            let current_growth = store.session_growth_view(
+                &agent.harness,
+                &agent.id,
+                agent.generation,
+                &thresholds,
+            )?;
+            let Some(basis) = current_growth.and_then(|growth| growth.basis) else {
+                return Ok(());
+            };
+            let warning_is_current = store
+                .latest_session_growth_incident(&agent.id, agent.generation, &basis)?
+                .is_some_and(|(current_seq, _)| current_seq == seq);
+            if !agent_is_current || !warning_is_current {
                 return Ok(());
             }
             // Recheck under the Store lock so a concurrent ceiling reaction
@@ -257,17 +246,15 @@ impl Router {
     async fn claim_ceiling_notice(
         &self,
         agent: &Agent,
-        turn_id: Option<String>,
-        warning: Option<(i64, Option<String>)>,
+        sample: &eliot_core::SessionUsage,
     ) -> Result<Option<AttentionStep>> {
         let reaction = AttentionStep {
             incident_id: session_growth_ceiling_incident_id(agent),
             step: SESSION_GROWTH_CEILING_NOTICE_STEP.to_owned(),
             outcome: "unknown".to_owned(),
             command_id: None,
-            turn_id,
+            turn_id: None,
         };
-        let thresholds = self.inner.observe.lock_recover().growth;
         let mut store = self.inner.store.lock().await;
         let current = store.get_agent(&agent.id)?;
         let agent_is_current = current.is_some_and(|current| {
@@ -275,17 +262,12 @@ impl Router {
                 && current.state == AgentState::Idle
                 && current.active_turn.is_none()
         });
-        let warning_is_current = if let Some((seq, _)) = warning {
-            store
-                .latest_session_growth_incident(&agent.id, agent.generation)?
-                .is_some_and(|(current_seq, _)| current_seq == seq)
-                && store
-                    .session_growth_view(&agent.harness, &agent.id, agent.generation, &thresholds)?
-                    .is_some()
-        } else {
-            true
-        };
-        if !agent_is_current || !warning_is_current {
+        if !agent_is_current
+            || store
+                .get_session_usage(&agent.id, agent.generation)?
+                .as_ref()
+                != Some(sample)
+        {
             return Ok(None);
         }
         let Some(event) = store.claim_generation_attention_step(

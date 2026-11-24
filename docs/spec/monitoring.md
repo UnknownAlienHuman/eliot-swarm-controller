@@ -1506,14 +1506,18 @@ harness self-check fact.
   `daemon.session_file_bytes`, or a configured profile's absolute
   `context_ceiling_tokens`). A context ceiling uses the latest actual
   `context_used_tokens` count and does not require a known window; ratio warnings
-  still require a valid used/window pair. The warning clears when the retained
-  signal drops back under threshold. An absent or invalid context count cannot
-  trigger a context reaction. Suppliers are harness-native only: Codex
+  still require a valid used/window pair. A warning clears when its signal
+  drops below threshold, becomes unavailable, or yields to a higher-priority
+  growth basis. The idle reaction requires a current qualifying sample. A
+  retained ratio or file-size event can authorize that reaction only when its
+  own measurement is valid and its basis matches the current warning. An
+  absent or invalid context count cannot trigger or sustain a context reaction.
+  Retained journal rows remain available as recorded. Suppliers are harness-native only: Codex
   `thread/tokenUsage/updated` (latest context occupancy against `modelContextWindow`
   for the same turn or model), Claude stream-json plus the reported model window
   and transcript file size, Muse `session/contextUsage`, Antigravity ACP
-  `usage_update`, and OpenCode's latest assistant-message input plus complete
-  cache read/write counters from terminal readback. OpenCode has no capacity or
+  `usage_update`, and OpenCode's latest assistant-message input, cache and output
+  counters from terminal readback. OpenCode has no capacity or
   session-file-size source, and the Muse event log exposes no size; those signals
   remain unavailable rather than guessed.
 - `harness_checks`: one durable fact per harness, not an event: the installed

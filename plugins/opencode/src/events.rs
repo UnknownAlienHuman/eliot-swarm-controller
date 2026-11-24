@@ -2855,26 +2855,21 @@ impl EventProcessor {
         }
         data["outcome"] = json!(outcome);
         data["native_status"] = json!(event_type);
-        if let Some(readback) = readback
-            && let Some(context_used_tokens) = readback.context_used_tokens
-        {
-            let usage = SessionUsage {
-                context_used_tokens: Some(context_used_tokens),
-                source: Some("opencode:assistant_message_tokens".to_owned()),
-                observed_at: None,
-                ..SessionUsage::default()
-            };
-            let native_id = event_id(
-                &terminal.session_id,
-                turn_id,
-                &readback.idle_id,
-                "session.usage",
-                "opencode",
-                "OpenCode",
-            )?;
-            self.commit_event("session.usage", native_id, json!({"usage": usage}))
-                .await?;
-        }
+        let usage = SessionUsage {
+            context_used_tokens: readback.and_then(|readback| readback.context_used_tokens),
+            source: Some("opencode:assistant_message_tokens".to_owned()),
+            ..SessionUsage::default()
+        };
+        let native_id = event_id(
+            &terminal.session_id,
+            turn_id,
+            readback.map_or(turn_id, |readback| readback.idle_id.as_str()),
+            "session.usage",
+            "opencode",
+            "OpenCode",
+        )?;
+        self.commit_event("session.usage", native_id, json!({"usage": usage}))
+            .await?;
         let native_id = event_id(
             &terminal.session_id,
             turn_id,
@@ -3961,7 +3956,7 @@ fn main_loop_usage(
 }
 
 /// The newest assistant message in the exact input-to-idle slice supplies one
-/// per-call context count only when input and both cache counters are present.
+/// per-call context count only when all disjoint counters are present.
 fn latest_call_context_tokens(
     usages: &HashMap<String, (usize, Option<AssistantTokens>)>,
     idle_position: usize,
@@ -3973,10 +3968,17 @@ fn latest_call_context_tokens(
         .min_by_key(|entry| entry.0)?;
     let tokens = tokens.as_ref()?;
     let cache = tokens.cache.as_ref()?;
-    let input = tokens.input.filter(|value| *value >= 0)?;
-    let cache_read = cache.read.filter(|value| *value >= 0)?;
-    let cache_write = cache.write.filter(|value| *value >= 0)?;
-    input.checked_add(cache_read)?.checked_add(cache_write)
+    [
+        tokens.input,
+        cache.read,
+        cache.write,
+        tokens.output,
+        tokens.reasoning,
+    ]
+    .into_iter()
+    .try_fold(0i64, |total, count| {
+        total.checked_add(count.filter(|value| *value >= 0)?)
+    })
 }
 
 /// One Store claim plus one vendor resolve for a bound hook. The Store
