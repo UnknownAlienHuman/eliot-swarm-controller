@@ -13,28 +13,19 @@ Output: this directory.
 - Roboto keeps its weight axis (400-700) at normal width; Roboto Mono keeps 400-700.
   Both are subset to Latin, Latin Extended, Greek, Cyrillic and common symbols.
 - The icons are Material Symbols Rounded at optical size 20 and weight 400, cut to the
-  glyphs in ICONS: each outline glyph (FILL 0) at its own code point and the filled glyph
+  glyphs of the brand book's `glyph` tokens (../tokens.json): each outline glyph (FILL 0) at its own code point and the filled glyph
   (FILL 1) at 0xF0000 + (code point - 0xE000). "Eliot Symbols" is grade 0 (light themes),
   "Eliot Symbols Dark" grade -25 (dark themes), as the brand book specifies.
 """
 
 import io
+import json
 import sys
 from pathlib import Path
 
 from fontTools.ttLib import TTFont
 from fontTools.varLib.instancer import instantiateVariableFont
 from fontTools import subset
-
-# Material Symbols names the desktop uses (m3::glyph).
-ICONS = """add search folder description alt_route settings stop more_horiz more_vert info inbox close
-arrow_back arrow_forward left_panel_close left_panel_open chevron_right chevron_left expand_more
-expand_less arrow_downward arrow_upward content_copy memory shield monitoring build terminal
-edit_document check star lock warning auto_awesome bolt data_usage open_in_new folder_open
-keyboard route cloud code tune chat archive delete drive_file_move play_arrow edit sell list hub
-schedule error check_circle pending subdirectory_arrow_right hourglass_top flag merge refresh
-snooze filter_list wrap_text open_in_full width note_add inventory_2 restart_alt pause_circle
-attach_file difference history stop_circle group person_search""".split()
 
 FILLED_BASE = 0xF0000
 TEXT_UNICODES = (
@@ -86,12 +77,12 @@ def subset_font(font: TTFont, unicodes, keep_layout: bool) -> None:
 
 def instance(src: Path, limits: dict) -> TTFont:
     """The instanced font, saved and read back so the subsetter sees plain tables."""
-    font = TTFont(src)
+    font = TTFont(src, recalcTimestamp=False)
     instantiateVariableFont(font, limits, inplace=True)
     buffer = io.BytesIO()
     font.save(buffer)
     buffer.seek(0)
-    return TTFont(buffer)
+    return TTFont(buffer, recalcTimestamp=False)
 
 
 def text_font(src: Path, out: Path, limits: dict, original: str) -> None:
@@ -153,17 +144,15 @@ def main() -> None:
     src = Path(sys.argv[1])
     here = Path(__file__).parent
     points = dict(line.split() for line in (src / "MaterialSymbolsRounded.codepoints").read_text().splitlines() if line.strip())
-    missing = [name for name in ICONS if name not in points]
-    assert not missing, missing
-    codes = sorted({int(points[name], 16) for name in ICONS})
+    # The brand book's icons: each token names its Material glyph and code point.
+    glyphs = json.loads((here.parent / "tokens.json").read_text(encoding="utf-8"))["glyph"]["tokens"]
+    for glyph in glyphs:
+        assert points.get(glyph["material"]) == glyph["value"].lower(), glyph
+    codes = sorted({int(glyph["value"], 16) for glyph in glyphs})
     text_font(src / "Roboto.ttf", here / "Roboto.ttf", {"wght": (400, 700), "wdth": 100}, "Roboto")
     text_font(src / "RobotoMono.ttf", here / "RobotoMono.ttf", {"wght": (400, 700)}, "Roboto Mono")
     icon_font(src / "MaterialSymbolsRounded.ttf", codes, 0, "Eliot Symbols", here / "EliotSymbols.ttf")
     icon_font(src / "MaterialSymbolsRounded.ttf", codes, -25, "Eliot Symbols Dark", here / "EliotSymbolsDark.ttf")
-    # The Rust glyph table for m3::glyph.
-    for name in ICONS:
-        code = int(points[name], 16)
-        print(f"{name} {code:04X} {FILLED_BASE + code - 0xE000:05X}")
 
 
 if __name__ == "__main__":

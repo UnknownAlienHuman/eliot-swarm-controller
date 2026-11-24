@@ -264,12 +264,19 @@ pub(super) fn button(look: Look) -> String {
 }
 
 /// WinUI's ComboBox template (`combo_box.xaml`, MIT) at the design's
-/// dropdown chevron (14 DIPs; WinUI's is 12) with the focus highlight
+/// dropdown chevron (the brand book's glyph and size; WinUI's is 12) with the focus highlight
 /// following the pill: the highlight sits 4 DIPs outside the field.
 pub(super) fn combo_box() -> String {
     const HIGHLIGHT_OUTSET: f64 = 4.0;
     include_str!("combo_box.xaml")
         .replace("@CHEVRON@", &icon::CHEVRON.to_string())
+        .replace(
+            "@CHEVRON_GLYPH@",
+            &crate::brand::glyph::CHEVRON_DOWN
+                .chars()
+                .map(|c| format!("&#x{:X};", u32::from(c)))
+                .collect::<String>(),
+        )
         .replace(
             "@HIGHLIGHT_RADIUS@",
             &(radius::PILL + HIGHLIGHT_OUTSET).to_string(),

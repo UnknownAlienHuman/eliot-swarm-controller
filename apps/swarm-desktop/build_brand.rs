@@ -19,6 +19,7 @@ pub fn generate(tokens: &Path, out: &Path) {
     shadows(&root, &mut code);
     scalars(&root, &mut code);
     types(&root, &mut code);
+    glyphs(&root, &mut code);
     std::fs::write(out, code).expect("brand.rs is writable");
 }
 
@@ -227,6 +228,7 @@ fn scalars(root: &Value, code: &mut String) {
         ("radius", "px"),
         ("spacing", "px"),
         ("opacity", ""),
+        ("scale", ""),
         ("spring", "ms"),
         ("icon", ""),
     ] {
@@ -309,4 +311,51 @@ fn types(root: &Value, code: &mut String) {
             .unwrap();
         }
     }
+}
+
+/// The `glyph` module: one `&str` per icon token, the filled ones at
+/// `0xF0000 + code - 0xE000`, and `filled` to turn an outline glyph into
+/// its filled form.
+fn glyphs(root: &Value, code: &mut String) {
+    code.push_str(
+        "/// The desktop's icons: Material Symbols Rounded code points in the shipped\n\
+         /// Eliot Symbols font (`crate::fonts`); `filled` gives a glyph's filled form.\n\
+         pub mod glyph {\n\
+         \x20   /// The filled form of an outline glyph: `0xF0000 + code - 0xE000`.\n\
+         \x20   pub fn filled(outline: &str) -> String {\n\
+         \x20       outline\n\
+         \x20           .chars()\n\
+         \x20           .map(|c| {\n\
+         \x20               u32::from(c)\n\
+         \x20                   .checked_sub(0xE000)\n\
+         \x20                   .and_then(|offset| char::from_u32(0xF0000 + offset))\n\
+         \x20                   .unwrap_or(c)\n\
+         \x20           })\n\
+         \x20           .collect()\n\
+         \x20   }\n\n",
+    );
+    for token in tokens(root, "glyph") {
+        let name = name(token);
+        let ident = upper(
+            name.strip_prefix("glyph-")
+                .unwrap_or_else(|| panic!("glyph token {name} is named glyph-…")),
+        );
+        let value = token["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} has a hex code point"));
+        let base = u32::from_str_radix(value, 16)
+            .unwrap_or_else(|_| panic!("{name}'s code point {value} is hex"));
+        assert!(
+            (0xE000..=0xFFFF).contains(&base),
+            "{name}'s code point {value} is in the private use area"
+        );
+        let point = if token["filled"].as_bool().unwrap_or(false) {
+            0xF0000 + base - 0xE000
+        } else {
+            base
+        };
+        doc_line(code, "    ", &doc(token));
+        writeln!(code, "    pub const {ident}: &str = \"\\u{{{point:X}}}\";").unwrap();
+    }
+    code.push_str("}\n");
 }

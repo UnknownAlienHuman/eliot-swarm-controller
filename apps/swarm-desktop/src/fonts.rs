@@ -126,12 +126,13 @@ fn write_fonts() -> std::io::Result<[String; 4]> {
     Ok(names)
 }
 
-/// Write `bytes` as `dir/name` unless a file of that length is there:
+/// Write `bytes` as `dir/name` unless that file already holds exactly
+/// these bytes (a stale or damaged copy of the same name is replaced):
 /// through a `.part` file and a rename, so a reader never sees half a file.
 fn write_once(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     let path = dir.join(name);
-    let length = |path: &Path| std::fs::metadata(path).map(|m| m.len()).ok();
-    if length(&path) == Some(bytes.len() as u64) {
+    let current = |path: &Path| std::fs::read(path).is_ok_and(|held| held == bytes);
+    if current(&path) {
         return Ok(());
     }
     let partial = dir.join(format!("{name}.{}.part", std::process::id()));
@@ -139,7 +140,7 @@ fn write_once(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
     if let Err(error) = std::fs::rename(&partial, &path) {
         let _ = std::fs::remove_file(&partial);
         // Another desktop may have written the same file first.
-        if length(&path) != Some(bytes.len() as u64) {
+        if !current(&path) {
             return Err(error);
         }
     }
