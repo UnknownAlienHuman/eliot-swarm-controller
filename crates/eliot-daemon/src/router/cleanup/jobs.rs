@@ -37,15 +37,14 @@ impl Router {
             .cleanup_replay(&name, &request.id, APPLY, &payload)?
             .is_some()
         {
-            let mut active = self.cleanup_worker_is_live(&request.id);
+            let active = self.cleanup_worker_is_live(&request.id);
             if !active {
                 // The exact retry can also reconcile a previously dispatched
                 // worktree command whose durable applied result arrived late.
                 store.begin_cleanup_apply(&name, &request, now_ms(), true)?;
-                active = self.cleanup_worker_is_live(&request.id);
             }
             let (_, retained) = store.cleanup_job_receipt(&name, &request.id)?;
-            return encoded(page_status(&request.id, retained, active)?.apply);
+            return encoded(visible_apply(decode_receipt(retained)?, active));
         }
         self.check_cleanup_admission()?;
         let (plan, mut response, _) = store.begin_cleanup_apply(&name, &request, now_ms(), true)?;

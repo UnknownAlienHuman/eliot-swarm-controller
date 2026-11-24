@@ -198,8 +198,9 @@ response and the same scope, project and age cutoff. The CLI passes it as
 `--after <token>` and MCP passes the string as `params.continuation`.
 The daemon also accepts legacy JSON continuations. A progress page can contain
 zero candidates with a continuation while the daemon scans the retained inventory.
-The backfill cursor advances only across completed probe batches. A failed probe
-rejects the page. A time slice that ends mid-batch can return progress through
+The backfill cursor advances across completed probes, including reported per-Agent
+failures. A failure to enumerate the Agent batch rejects the page. A time slice
+that ends mid-batch can return progress through
 the last completed batch, with the unfinished batch retried on continuation.
 The desktop advances through those pages and offers Next page for more candidates.
 
@@ -222,7 +223,9 @@ registrations group starts unchecked.
 
 The current limits are 64 candidates, 4,096 retained artifacts and 1,024 retained
 plans. On Windows, the [`CleanupTree` artifact-directory scan](../../crates/eliot-daemon/src/platform/script_file.rs#L391)
-is bounded to 10,000 filesystem entries, depth 64 and five seconds per scan.
+is bounded to 262,144 filesystem entries and depth 64. Interactive plans use
+their remaining page budget for a scan. Bulk planning and apply allow up to
+120 seconds per scan under daemon custody.
 Managed-worktree removal uses a separate [write-fence inventory](../../crates/eliot-daemon/src/platform/worktree_guard.rs#L34),
 bounded to 20,000 entries and depth 64 with a ten-second deadline for each
 prepare and activation pass. Exceeding an applicable bound refuses its operation

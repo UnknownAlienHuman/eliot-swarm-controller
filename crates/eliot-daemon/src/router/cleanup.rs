@@ -259,7 +259,9 @@ impl Router {
                 } else if let Some(settled) = settled {
                     match settled.outcome.as_str() {
                         "removed" => ("removed", item.reason.as_str(), settled.bytes_reclaimed),
-                        "skipped" => ("kept", settled.reason.as_deref().unwrap_or("skipped"), 0),
+                        "skipped" | "failed" => {
+                            ("kept", settled.reason.as_deref().unwrap_or("skipped"), 0)
+                        }
                         _ => ("unknown", settled.reason.as_deref().unwrap_or("unknown"), 0),
                     }
                 } else {
