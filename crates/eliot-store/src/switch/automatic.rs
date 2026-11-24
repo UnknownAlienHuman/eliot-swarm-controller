@@ -50,7 +50,6 @@ fn lineage_for(
 #[derive(Clone, Debug)]
 pub(super) struct WithheldProviderEvidence {
     pub route: String,
-    pub profile: Option<String>,
     pub event_seq: i64,
     pub expires_at: i64,
 }
@@ -86,7 +85,7 @@ pub(super) fn withheld_provider_evidence(
                    SELECT 1 FROM generations restored_generation
                    JOIN events restored ON restored.agent=restored_generation.agent
                      AND restored.generation=restored_generation.generation
-                   WHERE restored.kind='provider.response_restored'
+                   WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
                      AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
                      AND (
                          json_extract(restored.data, '$.route_key') = json_extract(e.data, '$.route_key')
@@ -135,7 +134,6 @@ pub(super) fn withheld_provider_evidence(
         };
         evidence.push(WithheldProviderEvidence {
             route,
-            profile,
             event_seq,
             expires_at,
         });
@@ -156,9 +154,9 @@ pub(super) fn withheld_provider_routes(
         .collect())
 }
 
-/// Append a route restoration fact for an exact, already committed successful
-/// native turn. The fact names the newest active refusal it clears; that seq
-/// also clears older refusals for the same route across this task lineage.
+/// Append restoration in the same transaction as the successful native turn.
+/// The newest active refusal's sequence also clears older refusals on that
+/// route in the same task lineage.
 pub(crate) fn provider_response_restored_event_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
@@ -199,9 +197,7 @@ pub(crate) fn provider_response_restored_event_tx(
     if !committed_success {
         return Ok(None);
     }
-    let Some(route_key) = core::provider_response_route_key(&agent.profile_snapshot) else {
-        return Ok(None);
-    };
+    let route_key = core::provider_response_route_key(&agent.profile_snapshot);
     let lineage = lineage_for(tx, agent_num, agent.generation)?
         .map_or(agent_num, |(lineage_agent, _)| lineage_agent);
     let evidence_seq: Option<i64> = tx
@@ -221,7 +217,7 @@ pub(crate) fn provider_response_restored_event_tx(
                AND NOT EXISTS (
                    SELECT 1 FROM generations rg
                    JOIN events restored ON restored.agent=rg.agent AND restored.generation=rg.generation
-                   WHERE restored.kind='provider.response_restored'
+                   WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
                      AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
                      AND (json_extract(restored.data, '$.route_key')=?4
                           OR (json_extract(e.data, '$.route_key') IS NULL
@@ -791,7 +787,7 @@ impl Store {
                    AND COALESCE(json_extract(e.data, '$.reset_at'), e.ts + ?2) > ?3
                    AND NOT EXISTS (
                        SELECT 1 FROM events restored
-                       WHERE restored.kind='provider.response_restored'
+                       WHERE restored.kind='provider.response_restored' AND restored.source='daemon'
                          AND CAST(json_extract(restored.data, '$.evidence_seq') AS INTEGER) >= e.seq
                          AND (restored.agent=a.id AND restored.generation=a.generation
                               OR EXISTS(SELECT 1 FROM handoff_task_lineages lineage

@@ -237,7 +237,7 @@ fn readback(
         "turn_evidence": evidence,
     });
     if outcome == TurnOutcome::Failure
-        && let Ok(fact) = serde_json::from_value::<core::api::ProviderResponseWithheldFact>(
+        && let Ok(fact) = serde_json::from_value::<eliot_core::api::ProviderResponseWithheldFact>(
             turn["provider_response_withheld_fact"].clone(),
         )
     {
