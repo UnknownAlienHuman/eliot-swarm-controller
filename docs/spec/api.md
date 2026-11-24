@@ -777,7 +777,7 @@ The daemon retains one durable automatic claim per harness outage until a positi
 read-only probe closes it. An explicit request for open work reports `open`. A request
 inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
 eligible only after five minutes have passed since the last claim and the prior launch
-is known closed or failed. Store schema 122 retains the claim across daemon restarts.
+is known closed or failed. Store schema 123 retains the claim across daemon restarts.
 The running companion keeps its process handle across reconnects. A lost claim reply
 or a lost companion leaves the launch fenced while its outcome is uncertain. Swarm
 publishes `x.user.notify` when the desktop confirms the sign-in console is open.
