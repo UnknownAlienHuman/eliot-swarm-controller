@@ -949,7 +949,9 @@ impl Component for DesktopApp {
             revealed: None,
         };
         // Before the first controls exist (see `app_resources::install`).
-        if let Err(error) = crate::app_resources::install(app.palette().roles()) {
+        if let Err(error) =
+            crate::app_resources::install(app.palette().roles(), app.appearance.animations)
+        {
             app.status = format!("WinUI M3 resources not applied: {error}");
         }
         if let Err(error) = crate::motion::install() {
@@ -957,7 +959,7 @@ impl Component for DesktopApp {
         }
         app.note_window_size();
         if let Ok(data_dir) = app.data_dir.clone() {
-            app.watch_high_contrast(context);
+            app.watch_accessibility(context);
             let _start = app.start_connection(data_dir, 0, context);
         }
         // On the UI thread, before its message loop runs.

@@ -1,8 +1,9 @@
 //! Hand-declared WinRT interfaces for the few WinUI calls Reactor 0.100.0
-//! does not expose (`app_resources`, `motion`, `flyout`). Reactor's own
-//! bindings are crate-private, so each caller declares only the vtable
-//! slots it calls, with ids and slot numbers read from the Windows App SDK
-//! metadata (`Microsoft.UI.Xaml.winmd` 2.3.0, `Microsoft.UI.winmd` 2.1.3).
+//! does not expose (`app_resources`, `motion`, `flyout`, `shadow`).
+//! Reactor's own bindings are crate-private, so each caller declares only
+//! the vtable slots it calls, with ids and slot numbers read from the
+//! Windows App SDK metadata (`Microsoft.UI.Xaml.winmd` 2.3.0,
+//! `Microsoft.UI.winmd` 2.1.3).
 //! The event handlers those callers add are windows-core delegate boxes
 //! around a plain function ([`delegate`]).
 #![allow(
@@ -45,6 +46,37 @@ macro_rules! runtime_class {
     };
 }
 pub(crate) use runtime_class;
+
+/// `Windows.UI.Color`: the title bar's colors (`app_resources`) and the
+/// shadows' (`shadow`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct UiColor {
+    pub a: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl windows_core::imp::TypeKind for UiColor {
+    type TypeKind = windows_core::imp::CopyType;
+}
+
+impl windows_core::RuntimeType for UiColor {
+    const SIGNATURE: windows_core::imp::ConstBuffer =
+        windows_core::imp::ConstBuffer::from_slice(b"struct(Windows.UI.Color;u1;u1;u1;u1)");
+}
+
+impl From<crate::theme::Rgb8> for UiColor {
+    fn from(value: crate::theme::Rgb8) -> Self {
+        Self {
+            a: 255,
+            r: value.r,
+            g: value.g,
+            b: value.b,
+        }
+    }
+}
 
 /// A raw interface pointer as the ABI passes it.
 pub(crate) type Raw = *mut c_void;

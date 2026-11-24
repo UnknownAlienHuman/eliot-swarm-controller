@@ -46,6 +46,8 @@ mod reparent;
 #[cfg(windows)]
 mod scroll_end;
 #[cfg(windows)]
+mod shadow;
+#[cfg(windows)]
 mod shortcuts;
 #[cfg(windows)]
 mod startup;

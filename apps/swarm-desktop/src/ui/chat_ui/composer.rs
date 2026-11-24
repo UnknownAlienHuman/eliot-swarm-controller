@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use super::*;
 use crate::configure::locked_words;
 use crate::picker::{effort_label, effort_name};
+use crate::shadow::ShadowHost;
 use crate::state::Drafts;
 use eliot_core::api::{HarnessModelsResponse, ModelsCatalogResponse};
 use launch_ui::Pop;
@@ -708,6 +709,10 @@ pub(in crate::ui) struct ComposerInput {
 /// unresolved submission) and every control go to the window.
 pub(in crate::ui) struct Composer {
     input: ComposerInput,
+    /// The card's `elevation-1` and the main action's night glow: real
+    /// shadows on the theme's layers.
+    card_shadow: ShadowHost,
+    glow: ShadowHost,
 }
 
 impl Composer {
@@ -743,11 +748,19 @@ impl Component for Composer {
     fn create(input: &ComposerInput, _context: &ComponentContext<Self>) -> Self {
         Self {
             input: input.clone(),
+            card_shadow: ShadowHost::new(
+                tokens::radius::COMPOSER,
+                m3::elevation_layers(input.palette),
+            ),
+            glow: ShadowHost::new(tokens::radius::FAB, m3::glow_layers(input.palette)),
         }
     }
 
     fn input_changed(&mut self, input: &ComposerInput, _context: &ComponentContext<Self>) {
         self.input = input.clone();
+        self.card_shadow
+            .set_layers(m3::elevation_layers(input.palette));
+        self.glow.set_layers(m3::glow_layers(input.palette));
     }
 
     fn update(&mut self, message: Message, _context: &ComponentContext<Self>) {
@@ -813,7 +826,7 @@ impl Component for Composer {
                     .content(chips),
                 Border::new()
                     .grid_column(1)
-                    .content(composer_actions(input, blank, context)),
+                    .content(composer_actions(input, blank, &self.glow, context)),
             ));
         // Home: the project and worktree chips above the field; attached
         // files as chips over it.
@@ -847,6 +860,7 @@ impl Component for Composer {
             ))
             .content(m3::composer_card(
                 palette,
+                &self.card_shadow,
                 Grid::new(),
                 StackPanel::new()
                     .spacing(tokens::spacing::SM)
@@ -865,9 +879,22 @@ impl Component for Composer {
 fn composer_actions(
     input: &ComposerInput,
     draft_blank: bool,
+    glow: &ShadowHost,
     context: &mut ViewContext<Composer>,
 ) -> View {
     let (palette, enabled) = (input.palette, input.enabled);
+    // The 40-DIP square action glows in the night themes while it can be
+    // pressed (Send, Stop, Steer; not Resume or a disabled action).
+    let glows = match &input.primary {
+        Primary::Turn {
+            running: Some(_), ..
+        } => enabled,
+        Primary::Turn { running: None, .. } | Primary::Start => enabled && !draft_blank,
+        Primary::Retry(_)
+        | Primary::Resume(..)
+        | Primary::ReadingResume
+        | Primary::ReadingRunning => false,
+    };
     let primary: View = match &input.primary {
         Primary::Retry(agent) => m3::filled(palette)
             .is_enabled(enabled)
@@ -966,10 +993,23 @@ fn composer_actions(
     } else {
         View::empty()
     };
+    // The glow's host shares the action's cell, under it; the action keeps
+    // its key whether it glows or not.
+    let mut action = Vec::new();
+    if glows {
+        action.push(KeyedView::new("glow", glow.view()));
+    }
+    action.push(KeyedView::new("action", primary));
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
-        .children((hint, input.usage.clone(), primary))
+        .children((
+            hint,
+            input.usage.clone(),
+            Grid::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .keyed_children(action),
+        ))
 }
 
 /// Files attached in the composer: one outlined chip each (file glyph,
