@@ -2,7 +2,7 @@ use super::{WRITE_LANE, existing, repository_path};
 use crate::git_monitor::GitProbe;
 use eliot_core::{Error, Result};
 use eliot_store::{CheckpointRetentionGeneration, Store};
-use std::{fmt::Write as _, path::Path, time::Duration};
+use std::{collections::HashSet, fmt::Write as _, path::Path, time::Duration};
 use tokio::{sync::Mutex, time::Instant};
 
 const SCAN_LIMIT: usize = 32;
@@ -39,7 +39,16 @@ pub(crate) async fn maintain(
     let deadline = Instant::now() + SWEEP_TIME;
     if let Some(cutoff) = cutoff {
         for generation in &generations {
-            sweep_generation(&git, &root, generation, cutoff, deadline).await?;
+            let protected = store
+                .lock()
+                .await
+                .checkpoint_restore_refs(generation.agent_id, generation.generation)?;
+            // Older Stores may have discarded the last pointer before this
+            // build. Where no durable readback remains, expiry cannot prove
+            // which ref was the last restorable one.
+            if !protected.is_empty() {
+                sweep_generation(&git, &root, generation, &protected, cutoff, deadline).await?;
+            }
             *after = Some((generation.agent_id, generation.generation));
         }
     }
@@ -54,6 +63,7 @@ async fn sweep_generation(
     git: &GitProbe,
     root: &Path,
     generation: &CheckpointRetentionGeneration,
+    protected: &HashSet<String>,
     cutoff: i64,
     deadline: Instant,
 ) -> Result<()> {
@@ -79,7 +89,6 @@ async fn sweep_generation(
             "private checkpoint refs could not be listed",
         ));
     }
-    let current = generation.checkpoint_ref.as_deref();
     let mut writes = String::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let Some((reference, oid)) = line.split_once(' ') else {
@@ -96,9 +105,7 @@ async fn sweep_generation(
                     && ts.parse::<i64>().is_ok_and(|ts| ts <= cutoff)
                     && ulid::Ulid::from_string(id).is_ok()
             });
-        // A task binding can change between captures. Keep the exact Store
-        // pointer the restore API accepts for each retained generation.
-        if old && eliot_core::api::is_git_oid(oid) && current != Some(reference) {
+        if old && eliot_core::api::is_git_oid(oid) && !protected.contains(reference) {
             writeln!(&mut writes, "delete {reference} {oid}")
                 .map_err(|_| Error::new("internal", "checkpoint deletion could not be encoded"))?;
         }

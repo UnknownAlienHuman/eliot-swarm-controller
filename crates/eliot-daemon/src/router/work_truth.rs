@@ -418,6 +418,7 @@ impl Router {
                         return Ok::<_, Error>(None);
                     }
                     let basis = store.git_checkpoint_basis(agent, generation)?;
+                    intent.input.task_ref = store.work_task_ref(agent, generation)?;
                     intent.input.captured_bytes = limits
                         .generation_bytes
                         .saturating_sub(basis.captured_bytes)
@@ -459,6 +460,7 @@ impl Router {
             policy: self.secret_policy_snapshot(),
         })
         .await;
+        input.task_ref = intent.input.task_ref;
         self.inner
             .store
             .lock()
@@ -467,7 +469,8 @@ impl Router {
         if let (Some(reference), Some(oid)) = (&input.checkpoint_ref, &input.oid) {
             let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
             work_truth::publish_checkpoint(&root, reference, oid).await?;
-            self.reconcile_checkpoint_ref(&mut input).await?;
+            self.reconcile_checkpoint_ref(agent, generation, &mut input)
+                .await?;
         }
         // A turn that changed nothing adds nothing to Git. Its report joins
         // the journal with the next change or when the session ends.
@@ -502,7 +505,12 @@ impl Router {
         Ok(Some(input))
     }
 
-    async fn reconcile_checkpoint_ref(&self, input: &mut GitCheckpointInput) -> Result<()> {
+    async fn reconcile_checkpoint_ref(
+        &self,
+        agent: &str,
+        generation: i64,
+        input: &mut GitCheckpointInput,
+    ) -> Result<()> {
         if input.state != GitCheckpointState::Snapshot {
             return Ok(());
         }
@@ -515,7 +523,15 @@ impl Router {
         let root = crate::work_truth_repo::existing(&self.inner.data_root).await?;
         match work_truth::checkpoint_reference(&root, reference).await? {
             Some(actual) if &actual == expected => {
-                if let Err(error) = work_truth::prune_checkpoints(&root, reference).await {
+                let protected = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .checkpoint_restore_refs(eliot_core::parse_agent_id(agent)?, generation)?;
+                if let Err(error) =
+                    work_truth::prune_checkpoints(&root, reference, &protected).await
+                {
                     self.log_work_truth_error("daemon.checkpoint_prune_failed", &error);
                 }
             }
@@ -547,7 +563,10 @@ impl Router {
             ..
         } in intents
         {
-            if let Err(error) = self.reconcile_checkpoint_ref(&mut input).await {
+            if let Err(error) = self
+                .reconcile_checkpoint_ref(&agent, generation, &mut input)
+                .await
+            {
                 self.log_work_truth_error("daemon.checkpoint_recovery_failed", &error);
                 continue;
             }

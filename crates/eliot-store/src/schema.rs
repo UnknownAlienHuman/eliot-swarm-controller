@@ -1,12 +1,13 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = WORK_TASK_BINDINGS_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHECKPOINT_RESTORE_POINTS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
 const SWITCH_CHECKOUT_VERSION: i64 = 115;
 const HANDOFF_BUDGET_VERSION: i64 = 116;
 const WORK_TASK_BINDINGS_VERSION: i64 = 117;
+const CHECKPOINT_RESTORE_POINTS_VERSION: i64 = 118;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -2746,6 +2747,10 @@ impl Store {
             (
                 WORK_TASK_BINDINGS_VERSION,
                 include_str!("../migrations/git_work_tasks.sql"),
+            ),
+            (
+                CHECKPOINT_RESTORE_POINTS_VERSION,
+                include_str!("../migrations/git_checkpoint_restore_points.sql"),
             ),
         ] {
             if current < version {

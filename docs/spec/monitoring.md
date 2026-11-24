@@ -760,13 +760,14 @@ contains a manifest and the exact safe blobs. Its manifest binds the project Git
 directory and captured HEAD, then records separate staged-index and worktree layers.
 Capture constructs the commit and returns its proposed ref and OID; the Router publishes
 the ref after it reserves and stores the checkpoint intent. Restart reconciles that
-intent against the exact ref and OID. The newest 20 published refs per generation are
-kept. Retention sweeps old checkpoints of terminal Agents using the event-retention
-window. It preserves the exact checkpoint the Owner can restore for each retained
-generation, including a task that moved to a successor. The daemon collects unreachable
-objects within a time limit in the private Git write lane. Unsettled checkpoint
-intents defer collection. An unchanged worktree writes no Git object. A failed capture
-is recorded and never blocks a turn, stop, handoff or removal.
+intent against the exact ref and OID. The generation keeps its newest 20 refs and any
+older refs the Store still offers for restore. Each task keeps its latest snapshot
+in every generation where it captured work, including after a handoff. Unchanged,
+clean and failed captures preserve the last snapshot. A clean checkout alone gives
+no evidence of merge. Owner deletion of the Agent drops its restore entries.
+Retention sweeps old refs of terminal Agents using the event-retention window and
+collects unreachable objects in the private Git write lane. Unsettled checkpoint intents
+defer collection. The capture and its wait for the write lane have a 90-second budget.
 
 Before writing an object, the daemon scans every candidate path and the exact bytes for
 both layers. It writes those bytes with Git filters and encoding conversion disabled.

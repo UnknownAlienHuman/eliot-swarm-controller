@@ -32,6 +32,7 @@ mod restore;
 pub(crate) use restore::restore_checkpoint;
 
 const GIT_TIME: Duration = Duration::from_secs(30);
+const CHECKPOINT_CAPTURE_TIME: Duration = Duration::from_secs(90);
 /// Owner decision on #922: the newest 20 checkpoints per generation.
 pub(crate) const KEEP_CHECKPOINTS: usize = 20;
 const _: usize = KEEP_CHECKPOINTS;
@@ -134,10 +135,19 @@ pub(crate) async fn checkpoint(request: CheckpointRequest<'_>) -> GitCheckpointI
     let trigger = request.trigger;
     let turn_id = request.turn_id.clone();
     let policy = Arc::clone(&request.policy);
-    let _write_lane = crate::work_truth_repo::write_lane().await;
-    match capture(request).await {
-        Ok(input) => input,
-        Err(error) => GitCheckpointInput::failed(
+    let charge = request
+        .limits
+        .generation_bytes
+        .saturating_sub(request.generation_used)
+        .min(request.limits.total_bytes);
+    match tokio::time::timeout(CHECKPOINT_CAPTURE_TIME, async {
+        let _write_lane = crate::work_truth_repo::write_lane().await;
+        capture(request).await
+    })
+    .await
+    {
+        Ok(Ok(input)) => input,
+        Ok(Err(error)) => GitCheckpointInput::failed(
             trigger,
             turn_id,
             bound_chars(
@@ -145,6 +155,15 @@ pub(crate) async fn checkpoint(request: CheckpointRequest<'_>) -> GitCheckpointI
                 240,
             ),
         ),
+        Err(_) => {
+            let mut input = GitCheckpointInput::failed(
+                trigger,
+                turn_id,
+                "checkpoint capture timed out".to_owned(),
+            );
+            input.captured_bytes = charge;
+            input
+        }
     }
 }
 
@@ -223,6 +242,7 @@ async fn capture(request: CheckpointRequest<'_>) -> Result<GitCheckpointInput> {
         head: None,
         checkpoint_ref: None,
         oid: None,
+        task_ref: None,
         fingerprint: Some(fingerprint.clone()),
         paths: Vec::new(),
         paths_truncated: false,
@@ -927,7 +947,11 @@ fn set_withheld(input: &mut GitCheckpointInput, mut withheld: Vec<GitCheckpointW
     input.withheld = withheld;
 }
 
-pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> {
+pub(crate) async fn prune_checkpoints(
+    root: &Path,
+    current: &str,
+    protected: &HashSet<String>,
+) -> Result<()> {
     let _write_lane = crate::work_truth_repo::write_lane().await;
     let git = GitProbe::new()?;
     let Some((prefix, _)) = current.rsplit_once('/') else {
@@ -954,7 +978,11 @@ pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> 
         .collect();
     references.sort_unstable();
     let excess = references.len().saturating_sub(KEEP_CHECKPOINTS - 1);
-    for reference in &references[..excess] {
+    for reference in references
+        .into_iter()
+        .take(excess)
+        .filter(|reference| !protected.contains(*reference))
+    {
         let result = git
             .workspace_input_command(root, &["update-ref", "-d", reference], &[], deadline)
             .await?;

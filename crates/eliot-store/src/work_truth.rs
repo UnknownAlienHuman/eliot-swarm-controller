@@ -17,6 +17,9 @@ pub struct GitCheckpointInput {
     pub head: Option<String>,
     pub checkpoint_ref: Option<String>,
     pub oid: Option<String>,
+    /// Exact task selected when this capture was reserved.
+    #[serde(default)]
+    pub task_ref: Option<String>,
     pub fingerprint: Option<String>,
     pub paths: Vec<String>,
     pub paths_truncated: bool,
@@ -37,6 +40,7 @@ impl GitCheckpointInput {
             head: None,
             checkpoint_ref: None,
             oid: None,
+            task_ref: None,
             fingerprint: None,
             paths: Vec::new(),
             paths_truncated: false,
@@ -64,7 +68,6 @@ pub struct GitCheckpointIntent {
 pub struct CheckpointRetentionGeneration {
     pub agent_id: i64,
     pub generation: i64,
-    pub checkpoint_ref: Option<String>,
 }
 
 pub enum GitCheckpointReservation {
@@ -304,15 +307,29 @@ impl Store {
                 ));
             }
             validate_id_age(&request.id, now)?;
-            let oid = self
-                .agent_work_truth(&request.agent, request.generation)?
-                .and_then(|truth| truth.checkpoint)
-                .filter(|checkpoint| {
-                    checkpoint.state == GitCheckpointState::Snapshot
-                        && checkpoint.checkpoint_ref.as_deref() == Some(&request.checkpoint_ref)
-                })
-                .and_then(|checkpoint| checkpoint.oid)
-                .ok_or_else(|| Error::new("not_found", "checkpoint reference is not current"))?;
+            let oid: String = self
+                .connection
+                .query_row(
+                    "SELECT oid FROM git_checkpoints
+                     WHERE agent = ?1 AND generation = ?2 AND checkpoint_ref = ?3
+                       AND oid IS NOT NULL
+                     UNION SELECT oid FROM git_checkpoint_restore_points
+                     WHERE agent = ?1 AND generation = ?2 AND checkpoint_ref = ?3",
+                    params![
+                        parse_agent_id(&request.agent)?,
+                        request.generation,
+                        request.checkpoint_ref
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?
+                .ok_or_else(|| {
+                    Error::new(
+                        "not_found",
+                        "checkpoint reference is not retained for restore",
+                    )
+                })?;
             if self.workspace_has_active_agents(workspace)? {
                 return Err(Error::new("busy", "restore workspace has an active Agent"));
             }
@@ -539,7 +556,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT checkpoint.agent, checkpoint.generation, checkpoint.checkpoint_ref
+                "SELECT checkpoint.agent, checkpoint.generation
                  FROM git_checkpoints checkpoint
                  LEFT JOIN agents agent ON agent.id = checkpoint.agent
                  WHERE checkpoint.session_end_pending = 0
@@ -569,12 +586,30 @@ impl Store {
                     Ok(CheckpointRetentionGeneration {
                         agent_id: row.get(0)?,
                         generation: row.get(1)?,
-                        checkpoint_ref: row.get(2)?,
                     })
                 },
             )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
+    }
+
+    /// The exact generation and per-task snapshots retention must keep.
+    pub fn checkpoint_restore_refs(&self, agent: i64, generation: i64) -> Result<HashSet<String>> {
+        self.ensure_committed_reads()?;
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT checkpoint_ref FROM git_checkpoints
+             WHERE agent = ?1 AND generation = ?2 AND checkpoint_ref IS NOT NULL
+             UNION SELECT checkpoint_ref FROM git_checkpoint_restore_points
+             WHERE agent = ?1 AND generation = ?2",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(params![agent, generation], |row| row.get(0))
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
             .map_err(sql_error)
     }
 
@@ -973,8 +1008,10 @@ impl Store {
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
                      ON CONFLICT(agent, generation) DO UPDATE SET state = excluded.state,
                          trigger = excluded.trigger, turn_id = excluded.turn_id,
-                         head = CASE excluded.state WHEN 'failed' THEN head ELSE excluded.head END, checkpoint_ref = CASE excluded.state WHEN 'failed' THEN checkpoint_ref ELSE excluded.checkpoint_ref END,
-                         oid = CASE excluded.state WHEN 'failed' THEN oid ELSE excluded.oid END, fingerprint = excluded.fingerprint,
+                         head = CASE excluded.state WHEN 'failed' THEN head ELSE excluded.head END,
+                         checkpoint_ref = CASE excluded.state WHEN 'snapshot' THEN excluded.checkpoint_ref ELSE checkpoint_ref END,
+                         oid = CASE excluded.state WHEN 'snapshot' THEN excluded.oid ELSE oid END,
+                         fingerprint = excluded.fingerprint,
                          paths = CASE excluded.state WHEN 'failed' THEN paths ELSE excluded.paths END, paths_truncated = CASE excluded.state WHEN 'failed' THEN paths_truncated ELSE excluded.paths_truncated END,
                          withheld = CASE WHEN excluded.state = 'failed'
                              AND excluded.withheld = '[]' THEN withheld ELSE excluded.withheld END,
@@ -1009,6 +1046,21 @@ impl Store {
                 )
                 .map_err(sql_error)?;
             }
+            if let (GitCheckpointState::Snapshot, Some(reference), Some(oid)) =
+                (input.state, &input.checkpoint_ref, &input.oid)
+            {
+                tx.execute(
+                    "INSERT INTO git_checkpoint_restore_points(agent, generation, task_ref, checkpoint_ref, oid)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(agent, generation, task_ref) DO UPDATE SET
+                         checkpoint_ref = excluded.checkpoint_ref, oid = excluded.oid",
+                    params![num, generation, input.task_ref.as_deref().unwrap_or_default(), reference, oid],
+                ).map_err(sql_error)?;
+            }
+            let (reference, oid): (Option<String>, Option<String>) = tx.query_row(
+                "SELECT checkpoint_ref, oid FROM git_checkpoints WHERE agent = ?1 AND generation = ?2",
+                params![num, generation], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).optional().map_err(sql_error)?.unwrap_or_default();
             let event = insert_daemon_event(
                 &tx,
                 now,
@@ -1021,8 +1073,8 @@ impl Store {
                     "trigger": input.trigger,
                     "turn_id": input.turn_id,
                     "head": input.head,
-                    "ref": input.checkpoint_ref,
-                    "oid": input.oid,
+                    "ref": reference,
+                    "oid": oid,
                     "files": input.paths.len(),
                     "paths_truncated": input.paths_truncated,
                     "withheld": input.withheld.len(),

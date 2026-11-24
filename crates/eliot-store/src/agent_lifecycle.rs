@@ -1067,6 +1067,7 @@ fn delete_tree_tx(tx: &Transaction<'_>, members: &[i64], now: i64) -> Result<()>
         ("artifacts", "agent"),
         ("chat_organization", "agent"),
         ("git_checkpoints", "agent"),
+        ("git_checkpoint_restore_points", "agent"),
         ("git_work_tasks", "agent"),
     ] {
         delete_db!(tx.execute(
