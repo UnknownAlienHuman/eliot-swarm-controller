@@ -1072,10 +1072,11 @@ impl Store {
                 native_event,
                 &next,
             )?;
-            // The inserted turn binds the exact config revision that Muse
-            // admitted. Use it even if a newer overlay exists on the Agent.
+            // The inserted turn binds the exact admitted revision even if
+            // the Agent has a newer overlay.
             if !observed
-                && next.harness == "muse"
+                && core::api::HarnessCapabilities::of(&next.harness)
+                    .provider_response_model_verification
                 && native_event.kind == "turn.started"
                 && let Some(turn) = next.active_turn.as_deref()
             {

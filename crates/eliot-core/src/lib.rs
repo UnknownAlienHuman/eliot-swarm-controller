@@ -2351,7 +2351,8 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 next.native_ref = Some(native_ref);
             }
             if let Some(effective) = optional_effective(event)? {
-                let admitted = (agent.harness == "muse")
+                let admitted = api::HarnessCapabilities::of(&agent.harness)
+                    .provider_response_model_verification
                     .then(|| effective["model"].as_str().map(str::to_owned))
                     .flatten();
                 next.effective = Some(effective);
@@ -2765,15 +2766,11 @@ fn record_serving_model(agent: &mut Agent, model: String) {
 
 fn record_unverified_provider_model(agent: &mut Agent, reason: Option<&str>) {
     if let Some(Value::Object(effective)) = agent.effective.as_mut() {
-        let model = if agent.harness == "muse" {
-            effective
-                .get("admitted_model")
-                .or_else(|| agent.profile_snapshot.get("model"))
-                .cloned()
-                .unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
+        let model = effective
+            .get("admitted_model")
+            .or_else(|| agent.profile_snapshot.get("model"))
+            .cloned()
+            .unwrap_or(Value::Null);
         effective.insert("model".to_owned(), model);
         effective.insert("model_verified".to_owned(), Value::Bool(false));
         if let Some(reason) = reason {
@@ -2781,7 +2778,7 @@ fn record_unverified_provider_model(agent: &mut Agent, reason: Option<&str>) {
                 "model_unverified_reason".to_owned(),
                 Value::String(reason.to_owned()),
             );
-        } else if agent.harness == "muse" {
+        } else {
             effective.remove("model_unverified_reason");
         }
     }
