@@ -65,6 +65,8 @@ pub mod height {
     pub const NEW_TASK: f64 = brand::SIZE_NEW_TASK;
     /// The conversation header.
     pub const HEADER: f64 = brand::SIZE_HEADER;
+    /// Standalone fields; the Home question's project button.
+    pub const FIELD: f64 = brand::SIZE_FIELD;
     /// The sidebar's title row.
     pub const TITLE_ROW: f64 = brand::SIZE_TITLE_ROW;
     /// The header's status pill.
@@ -93,6 +95,18 @@ pub mod text {
     pub const CHIP: TypeStyle = brand::LABEL_LARGE;
     pub const LABEL: TypeStyle = brand::LABEL_MEDIUM;
     pub const CAPTION: TypeStyle = brand::BODY_SMALL;
+    /// Filled buttons, New task, the selected sidebar row.
+    pub const EMPHASIZED: TypeStyle = brand::LABEL_LARGE_EMPHASIZED;
+    /// A sidebar row's trailing word, age or +/− counts.
+    pub const TRAILING: TypeStyle = brand::LABEL_SMALL;
+    /// Badges and counters (the Inbox count).
+    pub const BADGE: TypeStyle = brand::LABEL_SMALL_EMPHASIZED;
+    /// A small card's or popover's title ("Usage").
+    pub const SMALL_TITLE: TypeStyle = brand::TITLE_SMALL;
+    /// The daemon screen's title.
+    pub const PAGE: TypeStyle = brand::HEADLINE_MEDIUM;
+    /// A worker row's label under its manager (the canvas's nested row).
+    pub const KID_SIZE: f64 = brand::SIZE_KID_TEXT;
 }
 
 /// The 4-DIP grid in DIPs.
@@ -214,6 +228,8 @@ pub mod state {
     pub const DISABLED_CONTAINER: f64 = brand::DISABLED_CONTAINER;
     /// Disabled selection marks and other non-text affordances.
     pub const DISABLED_CONTENT: f64 = brand::DISABLED_CONTENT;
+    /// New task's shortcut hint over its label color.
+    pub const SHORTCUT: f64 = brand::SHORTCUT_OPACITY;
     pub const SCRIM: f64 = brand::SCRIM_OPACITY;
     pub const PLOT_STUB_OPACITY: f64 = brand::PLOT_STUB_OPACITY;
 }
@@ -237,6 +253,37 @@ pub mod layout {
     pub const READING_WIDTH: f64 = crate::brand::SIZE_READING;
     /// The home screen's composer and suggestions.
     pub const HOME_WIDTH: f64 = 760.0;
+    /// From the main card's top to the Home question.
+    pub const HOME_TOP: f64 = crate::brand::SIZE_HOME_TOP;
+    /// The main card's distance from the window's top, right and bottom
+    /// edges, beside the sidebar on the window ground.
+    pub const CARD_GAP: f64 = super::spacing::SM;
+    /// The main card's corner.
+    pub const CARD_RADIUS: f64 = crate::brand::RADIUS_EXTRA_LARGE;
+    /// The daemon screen's column.
+    pub const OFFLINE_WIDTH: f64 = crate::brand::SIZE_OFFLINE;
+    /// The Usage popover beside the sidebar.
+    pub const USAGE_POPOVER_WIDTH: f64 = crate::brand::SIZE_USAGE_POPOVER;
+    /// A thin quota meter.
+    pub const METER: f64 = crate::brand::SIZE_METER;
+    /// The brand mark in the sidebar's title row and the daemon screen's
+    /// shape.
+    pub const MARK: f64 = crate::brand::SIZE_MARK;
+    pub const MARK_LARGE: f64 = crate::brand::SIZE_MARK_LG;
+    /// A sidebar row's state-mark slot (the dots sit centred in it).
+    pub const MARK_SLOT: f64 = crate::brand::SIZE_ICON_XS;
+    /// A task row's dots: waiting for you, idle.
+    pub const DOT_WAIT: f64 = crate::brand::SIZE_DOT_WAIT;
+    pub const DOT_IDLE: f64 = crate::brand::SIZE_DOT;
+    /// The shape loader of a working row.
+    pub const LOADER_SMALL: f64 = crate::brand::SIZE_LOADER_SM;
+    /// The sidebar Usage row's ring.
+    pub const ROW_RING: f64 = crate::brand::SIZE_ROW_RING;
+    /// A badge's height and least width (the Inbox count).
+    pub const BADGE: f64 = crate::brand::SIZE_BADGE;
+    /// A worker row's step in under its manager: past the mark slot and
+    /// its gap, so its mark sits under the manager's title.
+    pub const KID_INDENT: f64 = MARK_SLOT + super::spacing::SM;
     /// The Settings content, centred.
     pub const SETTINGS_WIDTH: f64 = 720.0;
     /// The label column of every form.
@@ -261,9 +308,6 @@ pub mod layout {
     pub const NUMBER_WIDTH: f64 = 120.0;
     /// The composer's folder field (a new task outside the projects).
     pub const FOLDER_WIDTH: f64 = 280.0;
-    /// A worktree project's name at most in its sidebar row, so the
-    /// subproject beside it keeps the rest of the row.
-    pub const PROJECT_NAME_WIDTH: f64 = 104.0;
     /// One nesting step of a Markdown list in an answer.
     pub const LIST_INDENT: f64 = 20.0;
     /// A Markdown list's marker column ("•", "12."): the item's text starts
@@ -280,11 +324,16 @@ pub mod layout {
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).
     pub const COMPOSER_MIN_HEIGHT: f64 = 44.0;
+    /// The menu part of a split button (Start task ▾).
+    pub const SPLIT_MENU: f64 = crate::brand::SIZE_SPLIT_MENU;
+    /// Home's bar beside the trimmed project and model labels: +, the
+    /// place and access chips, Start task with its menu, the gaps and the
+    /// card insets, so the bar fits 760 with Auto (a layout budget).
+    pub const HOME_BAR_FIXED: f64 = 480.0;
     /// Hide the keyboard hint in a composer narrower than this.
     pub const COMPOSER_HINT_MIN_WIDTH: f64 = 560.0;
     /// Bottom row space reserved for fixed controls, padding and gaps.
     pub const COMPOSER_ACTIONS_WIDTH: f64 = 190.0;
-    pub const COMPOSER_ACCESS_WIDTH: f64 = 112.0;
     pub const COMPOSER_LABEL_MIN_WIDTH: f64 = 80.0;
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;

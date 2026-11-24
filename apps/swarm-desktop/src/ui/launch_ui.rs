@@ -49,6 +49,12 @@ pub(super) enum Pop {
     Effort,
     /// The usage ring's popover: the tightest limits and Manage usage.
     Usage,
+    /// The Home question's project name: the same project list as the
+    /// composer's project chip, under the title.
+    TitleProject,
+    /// The sidebar's Usage row: every harness's limits, the holds and
+    /// Open usage settings (`Hold.dc.html`).
+    Quotas,
 }
 
 /// The project popover's row that shows the folder field.
@@ -137,6 +143,9 @@ pub(super) enum LaunchMsg {
     /// The capacity notice's Queue it: submit the refused launch as a
     /// queued intent (`launch.enqueue`).
     QueueRequested,
+    /// Start task's menu Queue it: the composer's task as a queued intent
+    /// (`launch.enqueue`), started when the arbiter admits it.
+    QueueDraft,
     /// `launch.enqueue` settled.
     Queued(MutationResult<eliot_core::api::LaunchIntentView>),
 }
@@ -853,6 +862,7 @@ impl DesktopApp {
             LaunchMsg::LaunchRequested => self.request_launch(context),
             LaunchMsg::LaunchSubmitted(outcome) => self.launch_submitted(outcome, context),
             LaunchMsg::QueueRequested => self.request_queue(context),
+            LaunchMsg::QueueDraft => self.queue_draft(context),
             LaunchMsg::Queued(outcome) => self.queued(outcome, context),
             LaunchMsg::ProfilesListed(result) => match result {
                 Ok(list) => {
@@ -891,6 +901,23 @@ impl DesktopApp {
     }
 
     fn open_popover(&mut self, pop: Pop, context: &ComponentContext<Self>) {
+        // The sidebar's Usage popover opens wherever the sidebar shows;
+        // opening it reads the limits and holds once (its screen is open).
+        if pop == Pop::Quotas {
+            if self
+                .launch
+                .open
+                .is_some_and(|open| chip_of(open) != chip_of(pop))
+            {
+                crate::flyout::hide(crate::flyout::POPOVER_ANCHOR);
+            }
+            self.launch.preset = None;
+            self.launch.open = Some(pop);
+            self.request_show(context);
+            crate::shortcuts::set_popover(HookPopover::Panel);
+            self.read_usage(context);
+            return;
+        }
         // The composer for a new task, a preset's Model field in Settings,
         // or the open conversation's composer (its effort popover, model
         // picker and usage).
@@ -957,7 +984,7 @@ impl DesktopApp {
                 self.launch.access_highlight = Some(self.launch.access());
                 crate::shortcuts::set_popover(HookPopover::List);
             }
-            Pop::Project => {
+            Pop::Project | Pop::TitleProject => {
                 self.launch.project_query.clear();
                 self.launch.highlight = Some(
                     self.selected_project()
@@ -978,6 +1005,7 @@ impl DesktopApp {
                 crate::shortcuts::set_popover(HookPopover::Picker);
             }
             Pop::Usage => crate::shortcuts::set_popover(HookPopover::List),
+            Pop::Quotas => {}
         }
         self.ensure_catalog_watch(context);
     }
@@ -1114,7 +1142,7 @@ impl DesktopApp {
             _ => {}
         }
         match pop {
-            Pop::Manage | Pop::Usage => {}
+            Pop::Manage | Pop::Usage | Pop::Quotas => {}
             Pop::Effort => {
                 let efforts = self.agent_efforts();
                 let at = self
@@ -1191,7 +1219,7 @@ impl DesktopApp {
                     _ => {}
                 }
             }
-            Pop::Project => {
+            Pop::Project | Pop::TitleProject => {
                 let rows = self.project_rows();
                 let at = self
                     .launch
@@ -1261,7 +1289,7 @@ impl DesktopApp {
     fn focus_field(&mut self, tries: u8, context: &ComponentContext<Self>) {
         if !matches!(
             self.launch.open,
-            Some(Pop::Model | Pop::Manage | Pop::Project)
+            Some(Pop::Model | Pop::Manage | Pop::Project | Pop::TitleProject)
         ) {
             return;
         }
@@ -1342,9 +1370,13 @@ impl DesktopApp {
         });
     }
 
-    fn request_launch(&mut self, context: &ComponentContext<Self>) {
+    /// The composer's task, ready to start or queue: its data directory,
+    /// target, text (with its attachments) and place; `None` after saying
+    /// why it cannot go (a submission in flight, a waiting queue offer, no
+    /// text, no project).
+    fn launch_draft(&mut self) -> Option<(PathBuf, LaunchTarget, String, client::LaunchPlace)> {
         if self.submitting() {
-            return;
+            return None;
         }
         // The refused draft waits in the queue offer: it is queued (the
         // same-id retry) or dismissed before another send. Its notice, with
@@ -1354,27 +1386,25 @@ impl DesktopApp {
                 self.alert(alert);
             }
             self.set_status(reason);
-            return;
+            return None;
         }
-        let Ok(data_dir) = self.data_dir.clone() else {
-            return;
-        };
+        let data_dir = self.data_dir.clone().ok()?;
         let target = match self.launch_target() {
             Ok(target) => target,
             Err(error) => {
                 self.alert(format!("Cannot start: {error}."));
-                return;
+                return None;
             }
         };
         let text = profiles::normalize_newlines(self.chat.drafts.borrow().text(None));
         if text.trim().is_empty() {
             self.alert("Describe the task first.");
-            return;
+            return None;
         }
         let text = crate::attachments::compose(&text, self.attached_to(NEW_TASK_COMPOSER));
         if !self.launch.chat && self.launch.workspace.trim().is_empty() {
             self.alert("Choose a project, a folder, or No project (chat).");
-            return;
+            return None;
         }
         self.close_popover();
         let place = if self.launch.chat {
@@ -1383,6 +1413,36 @@ impl DesktopApp {
             client::LaunchPlace::Worktree(self.launch.workspace.clone())
         } else {
             client::LaunchPlace::Workspace(self.launch.workspace.clone())
+        };
+        Some((data_dir, target, text, place))
+    }
+
+    /// Start task's menu Queue it: the composer's task as a queued intent
+    /// (`launch.enqueue`, as `swarm launch --queue`). It takes the path of
+    /// a capacity refusal's Queue it: the draft moves into the offer, the
+    /// intent keeps one ledger-held id (an unconfirmed reply is queued
+    /// again with it from the notice), and a refusal gives the text back.
+    fn queue_draft(&mut self, context: &ComponentContext<Self>) {
+        let Some((_, target, text, place)) = self.launch_draft() else {
+            return;
+        };
+        let launch_rev = self.chat.drafts.borrow().launch_rev();
+        self.launch.queue_offer = Some(QueueOffer {
+            alert: "Queueing the task…".to_owned(),
+            target,
+            place,
+            text,
+            launch_rev,
+            intent: None,
+        });
+        self.chat.drafts.borrow_mut().clear_launch();
+        self.clear_attached(NEW_TASK_COMPOSER);
+        self.request_queue(context);
+    }
+
+    fn request_launch(&mut self, context: &ComponentContext<Self>) {
+        let Some((data_dir, target, text, place)) = self.launch_draft() else {
+            return;
         };
         // Bound now: the picker stays editable while the launch is in flight.
         let submitted = Submitted {
@@ -1913,6 +1973,8 @@ fn chip_of(pop: Pop) -> u8 {
         Pop::Access => 1,
         Pop::Project => 2,
         Pop::Usage => 3,
+        Pop::TitleProject => 4,
+        Pop::Quotas => 5,
     }
 }
 

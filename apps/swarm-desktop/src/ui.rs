@@ -73,6 +73,7 @@ mod scripts_ui;
 mod settings_ui;
 mod shell_ui;
 mod sidebar_ui;
+mod usage_ui;
 pub(crate) use crate::tokens;
 
 use automation_ui::AutomationMsg;
@@ -384,6 +385,8 @@ struct DesktopApp {
     monitor: monitor_ui::MonitorState,
     /// The Owner inbox: its items and the navigation's counts.
     inbox: inbox_ui::InboxState,
+    /// The Usage popover's holds and when the limits were read.
+    usage: usage_ui::UsageState,
     automation: automation_ui::AutomationState,
     /// The open project page and its reads.
     project: project_ui::ProjectState,
@@ -940,6 +943,7 @@ impl Component for DesktopApp {
             },
             monitor: monitor_ui::MonitorState::default(),
             inbox: inbox_ui::InboxState::default(),
+            usage: usage_ui::UsageState::default(),
             automation: automation_ui::AutomationState::default(),
             project: project_ui::ProjectState::default(),
             menu: menu_ui::MenuState::default(),

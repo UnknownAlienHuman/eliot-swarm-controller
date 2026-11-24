@@ -155,6 +155,7 @@ unsafe extern "system" fn invoke<I: Interface>(this: Raw, sender: Raw, args: Raw
     // SAFETY: `this` is the box `delegate` allocated for `I`.
     let this = unsafe { &*(this as *const DelegateBox<I, Callback>) };
     let callback = this.invoke;
+    let _boundary = crate::startup::native_boundary();
     if let Err(panic) = std::panic::catch_unwind(|| callback(sender, args)) {
         crate::startup::caught_panic("a WinUI event handler", &*panic);
     }

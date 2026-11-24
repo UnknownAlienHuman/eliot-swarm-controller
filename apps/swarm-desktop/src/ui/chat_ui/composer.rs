@@ -84,8 +84,10 @@ impl DesktopApp {
             column
         };
         // A narrow composer drops its hint and trims its chips' labels to
-        // the room left, so the buttons and the chevrons stay whole.
-        let hint = width.is_none_or(|width| width >= tokens::layout::COMPOSER_HINT_MIN_WIDTH);
+        // the room left, so the buttons and the chevrons stay whole. Home's
+        // split Start task names its action: no hint there.
+        let hint =
+            !home && width.is_none_or(|width| width >= tokens::layout::COMPOSER_HINT_MIN_WIDTH);
         let label = |others: f64| {
             width.map_or(tokens::layout::PROJECT_CHIP_WIDTH, |width| {
                 (width - tokens::layout::COMPOSER_ACTIONS_WIDTH - others).clamp(
@@ -95,11 +97,9 @@ impl DesktopApp {
             })
         };
         let chips: View = match (agent.as_deref(), detail) {
-            (None, _) => self.composer_chips(
-                label(tokens::layout::COMPOSER_ACCESS_WIDTH),
-                context,
-                palette,
-            ),
+            (None, _) => {
+                self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context, palette)
+            }
             (Some(_), Some(detail)) => self.model_chip(detail, label(0.0), context, palette),
             (Some(_), None) => View::empty(),
         };
@@ -134,14 +134,20 @@ impl DesktopApp {
             placeholder,
             field: self.chat.composer_ref.clone(),
             retry,
-            project: if home {
-                self.composer_project_row(context, palette)
+            folder: if home {
+                self.composer_folder_row(context)
             } else {
-                View::empty()
+                None
             },
             attached: self.attached_to(&self.composer_target()).to_vec(),
             chips,
-            usage: self.usage_indicator(context, palette),
+            // Home's bar is the design's (+, the chips, Start task): the
+            // limits are the sidebar's Usage row there.
+            usage: if home {
+                View::empty()
+            } else {
+                self.usage_indicator(context, palette)
+            },
             primary,
             hint,
             enabled: !self.submitting(),
@@ -684,8 +690,9 @@ pub(in crate::ui) struct ComposerInput {
     field: ElementRef<TextBox>,
     /// An unresolved submission: an edit abandons it, in the window.
     retry: bool,
-    /// Home's project and worktree chips above the field.
-    project: View,
+    /// Home's folder field above the field, for a folder outside the
+    /// projects.
+    folder: Option<View>,
     attached: Vec<String>,
     chips: View,
     usage: View,
@@ -828,12 +835,14 @@ impl Component for Composer {
                     .grid_column(1)
                     .content(composer_actions(input, blank, &self.glow, context)),
             ));
-        // Home: the project and worktree chips above the field; attached
-        // files as chips over it.
+        // Home (`Main.dc.html`): the field first, then one bar (+, the
+        // project, place, model and access chips, Start task); a folder
+        // outside the projects takes its field above. Attached files as
+        // chips over the field.
         let home = input.agent.is_none();
         let mut rows: Vec<KeyedView> = Vec::new();
-        if home {
-            rows.push(KeyedView::new("project", input.project.clone()));
+        if let Some(folder) = &input.folder {
+            rows.push(KeyedView::new("folder", folder.clone()));
         }
         if !input.attached.is_empty() {
             rows.push(KeyedView::new(
@@ -848,16 +857,11 @@ impl Component for Composer {
             .width(input.width)
             .max_width(input.widest)
             .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(Thickness::new(
-                0.0,
-                tokens::spacing::INSET,
-                0.0,
-                if home {
-                    tokens::spacing::HOME_GROUP_GAP
-                } else {
-                    tokens::spacing::LG
-                },
-            ))
+            .margin(if home {
+                Thickness::uniform(0.0)
+            } else {
+                Thickness::new(0.0, tokens::spacing::INSET, 0.0, tokens::spacing::LG)
+            })
             .content(m3::composer_card(
                 palette,
                 &self.card_shadow,
@@ -963,12 +967,7 @@ fn composer_actions(
                 .content(m3::send_icon())
                 .tooltip("Send"),
         },
-        Primary::Start => m3::send_button(palette)
-            .is_enabled(enabled && !draft_blank)
-            .automation_name("Start task (Enter)")
-            .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
-            .content(m3::send_icon())
-            .tooltip("Send"),
+        Primary::Start => start_split(palette, enabled, draft_blank, context),
     };
     // The design's hint before the ring and the FAB.
     let hint = match &input.primary {
@@ -1053,4 +1052,74 @@ fn attachment_chips(
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::CHIP_GAP)
         .keyed_children(chips)
+}
+
+/// Home's split Start task (`Main.dc.html`, the SplitButton component):
+/// the filled action (the up arrow and "Start task", emphasized) and, 2
+/// DIPs after it, its 34-DIP menu: Queue it (the task as a queued intent)
+/// and Attach an existing session…, which the desktop does not have yet
+/// (disabled, the reason in its label).
+fn start_split(
+    palette: Palette,
+    enabled: bool,
+    draft_blank: bool,
+    context: &mut ViewContext<Composer>,
+) -> View {
+    use super::menu_ui::{Action, Entry};
+    let ready = enabled && !draft_blank;
+    let items = vec![
+        if ready {
+            MenuItem::item(Action::QueueLaunch.label(), Action::QueueLaunch.label())
+        } else {
+            MenuItem::disabled(Action::QueueLaunch.label(), Action::QueueLaunch.label())
+        },
+        MenuItem::disabled(Action::AttachSession.label(), Action::AttachSession.label()),
+    ];
+    // The menu offers Queue it only (the other item is disabled).
+    let offered = [Entry::item(Action::QueueLaunch)];
+    debug_assert!(super::menu_ui::offers(&offered, Action::QueueLaunch));
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(tokens::spacing::ROW_GAP)
+        .vertical_alignment(VerticalAlignment::Center)
+        .children((
+            m3::filled(palette)
+                .is_enabled(ready)
+                .automation_name("Start task (Enter)")
+                .on_click(context.message(Message::Launch(LaunchMsg::LaunchRequested)))
+                .content(
+                    StackPanel::new()
+                        .orientation(Orientation::Horizontal)
+                        .spacing(tokens::spacing::SM)
+                        .margin(Thickness::new(
+                            tokens::spacing::MD - tokens::spacing::ROW,
+                            0.0,
+                            tokens::spacing::TEXT_INSET - tokens::spacing::ROW,
+                            0.0,
+                        ))
+                        .children((
+                            m3::icon(m3::glyph::ARROW_UP),
+                            m3::text("Start task", tokens::text::EMPHASIZED)
+                                .vertical_alignment(VerticalAlignment::Center),
+                        )),
+                ),
+            m3::icon_button(palette)
+                .resource_overrides(palette.filled())
+                .width(tokens::layout::SPLIT_MENU)
+                .is_enabled(enabled)
+                .automation_name("More start options")
+                .content(m3::icon(m3::glyph::CHEVRON_DOWN))
+                .menu(Menu::new(
+                    items,
+                    // Capture-free: one identity across renders.
+                    context.callback(|label: String| {
+                        match super::menu_ui::Action::from_label(&label) {
+                            Some(super::menu_ui::Action::QueueLaunch) => {
+                                Message::Launch(LaunchMsg::QueueDraft)
+                            }
+                            _ => Message::Menu(MenuMsg::Ignored),
+                        }
+                    }),
+                )),
+        ))
 }

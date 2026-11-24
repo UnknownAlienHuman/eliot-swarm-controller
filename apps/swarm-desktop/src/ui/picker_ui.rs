@@ -26,63 +26,73 @@ const DEFAULT_EFFORT: &str = "Default effort";
 const MANAGE_GROUP_ROWS: usize = 150;
 
 impl DesktopApp {
-    /// A new task composer's first row, inside its card (Codex's): the
-    /// project selector as a borderless chip, and the folder field for a
-    /// folder outside the projects.
-    pub(super) fn composer_project_row(
-        &self,
-        context: &mut ViewContext<Self>,
-        palette: Palette,
-    ) -> View {
-        let label = if self.launch.chat {
+    /// The new task's project, as its chip and the Home title name it.
+    pub(super) fn launch_project_label(&self) -> String {
+        if self.launch.chat {
             "No project (chat)".to_owned()
         } else if self.launch.workspace.is_empty() {
             "No project".to_owned()
         } else {
             self.place_title(&self.launch.workspace)
-        };
+        }
+    }
+
+    /// The new task's folder field, above the composer's field, for a
+    /// folder outside the projects (none otherwise).
+    pub(super) fn composer_folder_row(&self, context: &mut ViewContext<Self>) -> Option<View> {
+        (!self.launch.chat && (self.launch.custom_workspace || self.nav.projects.is_empty())).then(
+            || {
+                m3::field()
+                    .text(self.launch.workspace.clone())
+                    .placeholder_text("Folder path")
+                    .automation_name("Folder")
+                    .width(tokens::layout::FOLDER_WIDTH)
+                    .horizontal_alignment(HorizontalAlignment::Left)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .on_text_changed(
+                        context
+                            .callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
+                    )
+                    .into()
+            },
+        )
+    }
+
+    /// The new task's project chip (it opens the project list).
+    fn project_chip(
+        &self,
+        label_width: f64,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> View {
+        let label = self.launch_project_label();
         let open = self.launch.open == Some(Pop::Project);
         let glyph = if self.launch.chat {
             m3::glyph::CHAT
         } else {
-            m3::glyph::FOLDER
+            m3::glyph::OPEN_FOLDER
         };
-        let chip = self.popover_chip(
+        self.popover_chip(
             m3::chip(palette)
                 .automation_name(format!(
                     "Project: {label} ({})",
                     if open { "list open" } else { "choose" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project)))),
-            m3::chip_content(
-                Some(glyph),
-                &label,
-                true,
-                tokens::layout::PROJECT_CHIP_WIDTH,
-            ),
+            m3::chip_content(Some(glyph), &label, false, label_width),
             &[Pop::Project],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
             palette,
-        );
-        let folder: View = if !self.launch.chat
-            && (self.launch.custom_workspace || self.nav.projects.is_empty())
-        {
-            m3::field()
-                .text(self.launch.workspace.clone())
-                .placeholder_text("Folder path")
-                .automation_name("Folder")
-                .width(tokens::layout::FOLDER_WIDTH)
-                .vertical_alignment(VerticalAlignment::Center)
-                .on_text_changed(
-                    context.callback(|value| Message::Launch(LaunchMsg::WorkspaceChanged(value))),
-                )
-                .into()
-        } else {
-            View::empty()
-        };
-        // The design's second chip: where the task works.
-        let worktree: View = match self.worktree_chip() {
+        )
+    }
+
+    /// Where the new task works (the design's place chip): "New worktree"
+    /// or "Work locally"; a click switches between them where the folder
+    /// lets it choose, and a project that starts each task in its own
+    /// worktree shows that fixed fact.
+    fn place_chip(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        match self.worktree_chip() {
             launch_ui::WorktreeChip::Hidden => View::empty(),
             launch_ui::WorktreeChip::Fixed => m3::fixed_chip(
                 palette,
@@ -92,41 +102,32 @@ impl DesktopApp {
                 "New worktree: this project starts each task in its own worktree",
             )
             .tooltip("This project starts each task in its own worktree."),
-            launch_ui::WorktreeChip::Toggle(on) => {
-                // Keyed by state: a chip's colors apply when it is created.
-                Grid::new().keyed_children(vec![KeyedView::new(
-                    format!("worktree:{on}"),
-                    m3::chip(palette)
-                        .resource_overrides(palette.toggle_chip(on))
-                        .automation_name(if on {
-                            "New worktree (on): the task works in a new worktree"
-                        } else {
-                            "New worktree (off): the task works in this folder"
-                        })
-                        .on_click(
-                            context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)),
-                        )
-                        .content(m3::chip_content(
-                            Some(m3::glyph::WORKTREE),
-                            "New worktree",
-                            false,
-                            tokens::layout::PROJECT_CHIP_WIDTH,
-                        )),
-                )])
-            }
-        };
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::CHIP_GAP)
-            .children((chip, worktree, folder))
+            launch_ui::WorktreeChip::Toggle(on) => m3::chip(palette)
+                .automation_name(if on {
+                    "New worktree: the task works in a new worktree (switch to work locally)"
+                } else {
+                    "Work locally: the task works in this folder (switch to a new worktree)"
+                })
+                .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
+                .content(m3::chip_content(
+                    Some(m3::glyph::WORKTREE),
+                    if on { "New worktree" } else { "Work locally" },
+                    false,
+                    tokens::layout::PROJECT_CHIP_WIDTH,
+                ))
+                .tooltip(if on {
+                    "The task works in a new worktree. Click to work in this folder."
+                } else {
+                    "The task works in this folder. Click to start it in a new worktree."
+                }),
+        }
     }
 
-    /// The composer's bottom-left chips for a new task: the model chip
-    /// (`Harness · Model · effort`) and the access level, borderless (Full
-    /// access as warning text, Codex's); a preset's access is read-only
-    /// text.
-    /// Home's access and model chips; the model's label trims at
-    /// `label_width` (the composer's room).
+    /// The new task's chips (the design's bar, after +): the project,
+    /// where it works, the model (Auto by default, Swarm's pick in its
+    /// tooltip) and the access level (a preset's is read-only). The
+    /// project's and the model's labels trim at `label_width` (the
+    /// composer's room).
     pub(super) fn composer_chips(
         &self,
         label_width: f64,
@@ -134,11 +135,11 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let auto_profile = self.launch.auto_profile();
-        let label = self.launch.choice.chip_label(auto_profile);
-        let glyph = match self.launch.choice {
-            Choice::Auto => m3::glyph::AUTO,
-            _ => m3::glyph::MODEL,
+        let label = match self.launch.choice {
+            Choice::Auto => "Auto".to_owned(),
+            _ => self.launch.choice.chip_label(auto_profile),
         };
+        let model_open = matches!(self.launch.open, Some(Pop::Model | Pop::Manage));
         let model = self.popover_chip(
             m3::chip(palette)
                 .automation_name(format!(
@@ -146,12 +147,21 @@ impl DesktopApp {
                     self.launch.choice.chip_name(auto_profile)
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model)))),
-            m3::chip_content(Some(glyph), &label, true, label_width),
+            m3::chip_content(Some(m3::glyph::MODEL), &label, false, label_width),
             &[Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
             palette,
         );
+        // Swarm's pick for Auto in the tooltip (a chip carrying its open
+        // flyout takes none).
+        let model = match (&self.launch.choice, model_open) {
+            (Choice::Auto, false) => model.tooltip(match auto_profile {
+                Some(profile) => format!("Routing picks {profile}"),
+                None => self.launch.auto_detail(),
+            }),
+            _ => model,
+        };
         let access: View = match &self.launch.choice {
             Choice::Model(_) => {
                 let access = self.launch.access();
@@ -206,11 +216,53 @@ impl DesktopApp {
                 .tooltip("Set by the preset.")
             }
         };
-        // The design: the access chip, then the model chip.
+        // The design: project, place, model, access, 6 DIPs apart.
         StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(tokens::spacing::CHIP_GAP)
-            .children((access, model))
+            .children((
+                self.project_chip(label_width, context, palette),
+                self.place_chip(context, palette),
+                model,
+                access,
+            ))
+    }
+
+    /// The Home question's project name (`Main.dc.html`'s title button): a
+    /// text button in the title's type with its chevron; it opens the same
+    /// project list as the composer's chip, under itself.
+    pub(super) fn title_project(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let label = self.launch_project_label();
+        let open = self.launch.open == Some(Pop::TitleProject);
+        self.popover_chip(
+            m3::text_button(palette)
+                .height(tokens::height::FIELD)
+                .automation_name(format!(
+                    "Project: {label} ({})",
+                    if open { "list open" } else { "choose" }
+                ))
+                .on_click(
+                    context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::TitleProject))),
+                ),
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::XS)
+                .margin(Thickness::xy(
+                    tokens::spacing::SM - tokens::spacing::ROW,
+                    0.0,
+                ))
+                .children((
+                    m3::text(label, tokens::text::HERO)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                    m3::icon(m3::glyph::CHEVRON_DOWN),
+                )),
+            &[Pop::TitleProject],
+            FlyoutPlacement::Bottom,
+            context,
+            palette,
+        )
     }
 
     /// `chip`, which opens `pops`: while one of them is open (and not for a
@@ -253,7 +305,8 @@ impl DesktopApp {
             Pop::Model => self.model_popover(context, palette),
             Pop::Manage => self.manage_popover(context, palette),
             Pop::Access => self.access_popover(context, palette),
-            Pop::Project => self.project_popover(context, palette),
+            Pop::Project | Pop::TitleProject => self.project_popover(context, palette),
+            Pop::Quotas => self.quotas_popover(context, palette),
             Pop::Effort => self.effort_popover(context, palette),
             Pop::Usage => self.usage_popover(context, palette),
         };

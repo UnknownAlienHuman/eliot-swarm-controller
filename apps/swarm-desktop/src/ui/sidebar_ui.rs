@@ -1,4 +1,4 @@
-//! The sidebar of the approved design (`Main.dc.html`) as its own
+//! The sidebar of the approved design (`Sidebar.dc.html`) as its own
 //! component: the window computes its rows from the listed Agents
 //! ([`DesktopApp::sidebar_input`]: `nav::sections`, the owner's names, the
 //! Monitor's reports, each row's age and work line), and [`Sidebar`] draws
@@ -7,10 +7,9 @@
 //! conversation delivery or a Monitor read leaves the sidebar as it is,
 //! and a sidebar refresh redraws the sidebar, not the conversation.
 
-use super::menu_ui::Target;
+use super::menu_ui::{Action, Target};
 use super::*;
 use crate::nav::Row;
-use crate::theme::StatusTone;
 use crate::theme::winui::Palette;
 
 /// The sidebar's input: everything it draws, compared by value. Ages and
@@ -21,8 +20,6 @@ pub(super) struct SidebarInput {
     pub(super) palette: Palette,
     pub(super) can_back: bool,
     pub(super) can_forward: bool,
-    /// New task is the place shown.
-    pub(super) home: bool,
     /// The Settings page shown, if any (its nav row is selected).
     pub(super) page: Option<settings_ui::Page>,
     /// The Search row opened into its field.
@@ -41,8 +38,12 @@ pub(super) struct SidebarInput {
     /// "Show more (N of M)": its label and whether it is enabled.
     pub(super) more: Option<(String, bool)>,
     pub(super) show_archived: bool,
-    pub(super) fleet: FleetEntry,
+    pub(super) agents: AgentsEntry,
     pub(super) inbox: InboxEntry,
+    /// The footer's Usage row, built by the window: it carries the Usage
+    /// popover's flyout while that is open (captureless callbacks only, so
+    /// it compares equal from one render to the next).
+    pub(super) usage: View,
     /// The rename or tag editor in a row's place.
     pub(super) renaming: Option<Renaming>,
     /// No bulk action is open (a missing folder's Remove is enabled).
@@ -83,21 +84,21 @@ pub(super) struct TaskEntry {
     /// The owner's name for it, else its title.
     pub(super) label: String,
     pub(super) selected: bool,
-    /// The Monitor's open report in words (it needs attention).
-    pub(super) reported: Option<String>,
+    /// The Monitor's open report (it needs attention): its one word for
+    /// the row's end and its words in full.
+    pub(super) reported: Option<(&'static str, String)>,
     /// A running task's work line and its words for the accessible name.
     pub(super) work: Option<(String, String)>,
     /// How long ago it changed ("3m").
     pub(super) age: String,
 }
 
-/// The fleet row: its line, its counts in words, its tone and whether the
-/// Monitor is open.
+/// The Agents row: the tasks working now, the fleet's counts in words and
+/// whether the fleet view (the Monitor pane) is open.
 #[derive(Clone, PartialEq)]
-pub(super) struct FleetEntry {
-    pub(super) line: String,
+pub(super) struct AgentsEntry {
+    pub(super) working: usize,
     pub(super) summary: String,
-    pub(super) tone: StatusTone,
     pub(super) open: bool,
 }
 
@@ -119,6 +120,14 @@ pub(super) struct Renaming {
     pub(super) tags: Vec<String>,
     pub(super) field: ElementRef<TextBox>,
 }
+
+/// The Projects label's "…": the bulk actions over every project (k142),
+/// each after one confirmation, as typed menu actions.
+pub(super) const BULK_MENU: [Action; 3] = [
+    Action::ArchiveAllFinished,
+    Action::DeleteAllStopped,
+    Action::RemoveUnused,
+];
 
 /// The sidebar component; its controls go to the window.
 pub(super) struct Sidebar {
@@ -143,67 +152,23 @@ impl Component for Sidebar {
         let _ = self.send.call(message);
     }
 
-    /// The app title (home) with Back, Forward and Hide; the nav rows New
-    /// task, Search, Automations and Usage; the projects with their tasks
-    /// nested inside them (the open one included, never hoisted); then the
-    /// fleet row and Settings at the bottom. Every row is a 32-DIP pill on
-    /// one content edge (its icon 10 DIPs inside the 8-DIP gutter); nested
-    /// rows indent by one 28-DIP step; a row's actions show on hover or
-    /// selection.
+    /// `Sidebar.dc.html` top to bottom, 2 DIPs apart inside an 8-DIP
+    /// padding: the title row (the brand mark and "Eliot Swarm" for Home,
+    /// Back, Forward, Hide); New task; the places Search, Inbox, Agents and
+    /// Automations; the scrolling Projects (their rows and tasks, workers
+    /// indented under their manager) and Chats; then, over a hairline, Show
+    /// archived, Usage and Settings. Every row is a 32-DIP pill; a row's
+    /// actions show on hover, keyboard focus or selection.
     fn view(&self, input: &SidebarInput, context: &mut ViewContext<Self>) -> View {
         let palette = input.palette;
-        let gutter = tokens::layout::SIDEBAR_GUTTER;
         let gap = tokens::spacing::ROW_GAP;
-        let header = Grid::new()
-            .height(tokens::height::TITLE_ROW)
-            .margin(Thickness::new(
-                gutter,
-                tokens::layout::SIDEBAR_PADDING,
-                gutter + gap,
-                gap,
-            ))
-            .columns([
-                GridLength::STAR,
-                GridLength::Auto,
-                GridLength::Auto,
-                GridLength::Auto,
-            ])
-            .column_spacing(gap)
-            .children((
-                m3::text_chip(palette)
-                    .horizontal_alignment(HorizontalAlignment::Left)
-                    .automation_name("Eliot Swarm: home")
-                    .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
-                    .content(m3::text("Eliot Swarm", tokens::text::TITLE))
-                    .tooltip("Home (Ctrl+N)"),
-                m3::icon_button(palette)
-                    .grid_column(1)
-                    .is_enabled(input.can_back)
-                    .automation_name("Back (Alt+Left)")
-                    .on_click(context.message(Message::Shell(ShellMsg::Back)))
-                    .content(m3::icon(m3::glyph::BACK)),
-                m3::icon_button(palette)
-                    .grid_column(2)
-                    .is_enabled(input.can_forward)
-                    .automation_name("Forward (Alt+Right)")
-                    .on_click(context.message(Message::Shell(ShellMsg::Forward)))
-                    .content(m3::icon(m3::glyph::FORWARD)),
-                m3::icon_button(palette)
-                    .grid_column(3)
-                    .automation_name("Hide sidebar")
-                    .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
-                    .content(m3::icon(m3::glyph::HIDE_SIDEBAR)),
-            ));
+        let header = title_row(input, context);
 
         // The nav rows. A selectable row is keyed by its selection: WinUI
         // reads a button's colors only when its template is applied.
-        let home = input.home;
         let mut nav: Vec<KeyedView> = vec![KeyedView::new(
-            format!("new-task:{home}"),
-            m3::new_task_button(palette)
-                .automation_name("New task (Ctrl+N)")
-                .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
-                .content(m3::nav_content(m3::glyph::NEW_TASK, "New task", "Ctrl+N")),
+            "new-task",
+            new_task_button(palette, context),
         )];
         nav.push(match &input.search {
             Some(search) => KeyedView::new(
@@ -242,68 +207,45 @@ impl Component for Sidebar {
                 m3::row(palette, false)
                     .automation_name("Search tasks (Ctrl+K)")
                     .on_click(context.message(Message::Shell(ShellMsg::SearchToggled(true))))
-                    .content(m3::nav_content(m3::glyph::SEARCH, "Search", "Ctrl+K")),
+                    .content(m3::sidebar_row(
+                        m3::icon(m3::glyph::SEARCH),
+                        "Search",
+                        false,
+                        0.0,
+                        false,
+                        None,
+                        m3::trailing("Ctrl+K", false).into(),
+                    )),
             ),
         });
-        for (page, glyph, label) in [
-            (
-                settings_ui::Page::Automations,
-                m3::glyph::AUTOMATION,
-                "Automations",
-            ),
-            (settings_ui::Page::Usage, m3::glyph::USAGE, "Usage"),
-        ] {
-            let shown = input.page == Some(page);
-            nav.push(KeyedView::new(
-                format!("{label}:{shown}"),
-                m3::row(palette, shown)
-                    .automation_name(label.to_owned())
-                    .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(page))))
-                    .content(m3::nav_content(glyph, label, "")),
-            ));
-        }
+        nav.push(inbox_row(&input.inbox, context, palette));
+        nav.push(agents_row(&input.agents, context, palette));
+        let automations = input.page == Some(settings_ui::Page::Automations);
+        nav.push(KeyedView::new(
+            format!("automations:{automations}"),
+            m3::row(palette, automations)
+                .automation_name("Automations")
+                .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                    settings_ui::Page::Automations,
+                ))))
+                .content(m3::sidebar_row(
+                    m3::nav_icon(m3::glyph::AUTOMATION, automations),
+                    "Automations",
+                    automations,
+                    0.0,
+                    false,
+                    None,
+                    View::empty(),
+                )),
+        ));
         let nav = StackPanel::new()
             .grid_row(1)
             .spacing(gap)
-            .margin(Thickness::xy(gutter, 0.0))
+            .margin(Thickness::new(0.0, gap, 0.0, 0.0))
             .keyed_children(nav);
 
         let filtered = input.filtered;
-        let caption = if filtered {
-            "Matching tasks"
-        } else {
-            "Projects"
-        };
-        let caption_key = format!("caption:{caption}");
-        let caption_over = input.hovered.as_deref() == Some(caption_key.as_str());
-        let caption_actions: View = if filtered || !caption_over {
-            View::empty()
-        } else {
-            // Bulk actions over every project (k142): archive, delete,
-            // remove the unused ones, each after one confirmation.
-            let items: Vec<MenuItem> = super::bulk_ui::ALL_MENU
-                .iter()
-                .map(|(id, label)| MenuItem::item(*id, *label))
-                .collect();
-            m3::icon_button(palette)
-                .horizontal_alignment(HorizontalAlignment::Right)
-                .vertical_alignment(VerticalAlignment::Bottom)
-                .automation_name("Actions for all projects")
-                .content(m3::icon(m3::glyph::MORE))
-                .menu(Menu::new(
-                    items,
-                    // Capture-free: one identity across renders.
-                    context.callback(|id: String| Message::Bulk(BulkMsg::Menu(id))),
-                ))
-        };
-        let mut items: Vec<KeyedView> = vec![KeyedView::new(
-            caption_key.clone(),
-            hover_area(
-                caption_key,
-                Grid::new().children((m3::section_row(caption), caption_actions)),
-                context,
-            ),
-        )];
+        let mut items: Vec<KeyedView> = vec![projects_label(input, context)];
         // A failed organization or queue read says so; the rows keep the
         // group the daemon placed them in.
         for error in &input.errors {
@@ -315,58 +257,24 @@ impl Component for Sidebar {
         if let Some(empty) = input.empty {
             items.push(KeyedView::new("no-projects", nested_note(empty, 0, None)));
         }
-        // A project row is never the selection: its home is New task's
-        // (Main.dc.html), with the project named in the hero and the chip.
-        for place in &input.places {
-            let section = &place.section;
+        // Projects first, then the no-project bucket as Chats.
+        let (chats, projects): (Vec<&PlaceEntry>, Vec<&PlaceEntry>) = input
+            .places
+            .iter()
+            .partition(|place| place.section.key == nav::OTHER_LOCATIONS);
+        for place in projects {
             items.push(place_item(place, input, context));
-            if section.collapsed {
+            if place.section.collapsed {
                 continue;
             }
-            // Queued launches say why they wait; nothing else under the
-            // project but its tasks (owner review 2026-11-19: no team or
-            // totals lines).
-            for (index, line) in section.waits.iter().enumerate() {
-                items.push(KeyedView::new(
-                    format!("wait:{}:{index}:{line}", section.key),
-                    nested_note(line, 1, None),
-                ));
-            }
-            if place.tasks.is_empty() && section.waits.is_empty() {
-                items.push(KeyedView::new(
-                    format!("empty:{}", section.key),
-                    nested_note(
-                        if section.older > 0 {
-                            "No recent tasks"
-                        } else {
-                            "No tasks yet"
-                        },
-                        1,
-                        None,
-                    ),
-                ));
-            }
-            for task in &place.tasks {
-                items.push(task_item(task, input, context));
-            }
-            if section.older > 0 {
-                let label = if section.older_shown {
-                    "Hide older".to_owned()
-                } else {
-                    format!("Show {} older", section.older)
-                };
-                items.push(KeyedView::new(
-                    format!("older:{}:{}", section.key, section.older_shown),
-                    m3::sub_row(palette, false)
-                        .automation_name(format!("{label} in {}", section.name))
-                        .on_click(
-                            context.message(Message::Shell(ShellMsg::OlderToggled(
-                                section.key.clone(),
-                            ))),
-                        )
-                        .content(m3::task_content(1, &label, true, View::empty(), None)),
-                ));
-            }
+            place_rows(place, input, context, &mut items);
+        }
+        for place in chats {
+            items.push(KeyedView::new(
+                "chats-label",
+                m3::section_label_row("Chats", View::empty()),
+            ));
+            place_rows(place, input, context, &mut items);
         }
         // Show more pages the list shown: the server's matches while
         // searching, the recent history otherwise.
@@ -381,82 +289,312 @@ impl Component for Sidebar {
                 m3::sub_row(palette, false)
                     .is_enabled(*enabled)
                     .on_click(context.message(Message::Shell(message)))
-                    .content(m3::task_content(1, label, true, View::empty(), None)),
+                    .content(m3::sidebar_row(
+                        mark_spacer(),
+                        label,
+                        false,
+                        0.0,
+                        false,
+                        Some(palette.variant()),
+                        View::empty(),
+                    )),
             ));
         }
-        let show_archived = input.show_archived;
-        items.push(KeyedView::new(
-            format!("archived:{show_archived}"),
-            m3::row(palette, show_archived)
-                .margin(Thickness::new(0.0, tokens::spacing::INSET, 0.0, 0.0))
-                .automation_name(if show_archived {
-                    "Hide archived (showing archived)"
-                } else {
-                    "Show archived"
-                })
-                .on_click(context.message(Message::Menu(MenuMsg::ArchivedToggled)))
-                .content(m3::nav_content(
-                    m3::glyph::ARCHIVE,
-                    if show_archived {
-                        "Hide archived"
-                    } else {
-                        "Show archived"
-                    },
-                    "",
-                )),
-        ));
         let list = ScrollViewer::new()
             .grid_row(2)
+            .margin(Thickness::new(0.0, gap, 0.0, 0.0))
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .automation_name("Projects and Agents")
-            .content(
-                StackPanel::new()
-                    .spacing(gap)
-                    .margin(Thickness::new(gutter, 0.0, gutter, gutter))
-                    .keyed_children(items),
-            );
+            .content(StackPanel::new().spacing(gap).keyed_children(items));
 
-        let bottom = StackPanel::new()
+        let show_archived = input.show_archived;
+        let footer = Border::new()
             .grid_row(3)
-            .spacing(gap)
-            .margin(Thickness::new(
-                gutter,
-                0.0,
-                gutter,
-                tokens::layout::SIDEBAR_PADDING,
-            ))
-            .keyed_children(vec![
-                KeyedView::new("divider", m3::divider(palette)),
+            .margin(Thickness::new(0.0, gap, 0.0, 0.0))
+            .border_brush(palette.outline())
+            .border_thickness(Thickness::new(0.0, tokens::layout::HAIRLINE, 0.0, 0.0))
+            .padding(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .content(StackPanel::new().spacing(gap).keyed_children(vec![
                 KeyedView::new(
-                    format!("inbox:{}", input.inbox.open),
-                    Border::new()
-                        .margin(Thickness::new(0.0, tokens::spacing::SM - gap, 0.0, 0.0))
-                        .content(inbox_row(&input.inbox, context, palette)),
+                    format!("archived:{show_archived}"),
+                    m3::row(palette, show_archived)
+                        .automation_name(if show_archived {
+                            "Hide archived (showing archived)"
+                        } else {
+                            "Show archived"
+                        })
+                        .on_click(context.message(Message::Menu(MenuMsg::ArchivedToggled)))
+                        .content(m3::sidebar_row(
+                            m3::nav_icon(m3::glyph::INVENTORY, show_archived),
+                            if show_archived {
+                                "Hide archived"
+                            } else {
+                                "Show archived"
+                            },
+                            show_archived,
+                            0.0,
+                            false,
+                            None,
+                            View::empty(),
+                        )),
                 ),
-                KeyedView::new(
-                    format!("fleet:{}", input.fleet.open),
-                    Border::new()
-                        .margin(Thickness::new(0.0, tokens::spacing::SM - gap, 0.0, 0.0))
-                        .content(fleet_row(&input.fleet, context, palette)),
-                ),
+                KeyedView::new("usage", input.usage.clone()),
                 KeyedView::new(
                     "settings",
                     m3::row(palette, false)
-                        .automation_name("Settings")
+                        .automation_name("Settings (Ctrl+,)")
                         .on_click(context.message(Message::Shell(ShellMsg::SettingsOpened)))
-                        .content(m3::nav_content(m3::glyph::SETTINGS, "Settings", "")),
+                        .content(m3::sidebar_row(
+                            m3::icon(m3::glyph::SETTINGS),
+                            "Settings",
+                            false,
+                            0.0,
+                            false,
+                            None,
+                            View::empty(),
+                        )),
                 ),
-            ]);
+            ]));
 
         Grid::new()
+            .margin(Thickness::uniform(tokens::layout::SIDEBAR_GUTTER))
             .rows([
                 GridLength::Auto,
                 GridLength::Auto,
                 GridLength::STAR,
                 GridLength::Auto,
             ])
-            .children((header, nav, list, bottom))
+            .children((header, nav, list, footer))
     }
+}
+
+/// The title row (`.brandrow`): the brand mark and "Eliot Swarm" as one
+/// Home button (the mark takes its `primary-text` content color, the name
+/// stays `on-surface`), then Back, Forward and Hide sidebar.
+fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
+    let palette = input.palette;
+    let gap = tokens::spacing::SM;
+    let home = StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(gap)
+        // The pill's end inset is the row's 4-DIP end padding.
+        .margin(Thickness::new(
+            0.0,
+            0.0,
+            tokens::spacing::XS - tokens::spacing::ROW,
+            0.0,
+        ))
+        .children((
+            m3::shape(crate::brand::SHAPE_MARK, tokens::layout::MARK),
+            m3::text("Eliot Swarm", tokens::text::TITLE)
+                .foreground(palette.text())
+                .vertical_alignment(VerticalAlignment::Center),
+        ));
+    Grid::new()
+        .height(tokens::height::TITLE_ROW)
+        .margin(Thickness::new(0.0, 0.0, tokens::spacing::XS, 0.0))
+        .columns([
+            GridLength::STAR,
+            GridLength::Auto,
+            GridLength::Auto,
+            GridLength::Auto,
+        ])
+        .column_spacing(gap)
+        .children((
+            m3::text_button(palette)
+                .horizontal_alignment(HorizontalAlignment::Left)
+                .automation_name("Eliot Swarm: home")
+                .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
+                .content(home)
+                .tooltip("Home"),
+            m3::icon_button(palette)
+                .grid_column(1)
+                .is_enabled(input.can_back)
+                .automation_name("Back (Alt+Left)")
+                .on_click(context.message(Message::Shell(ShellMsg::Back)))
+                .content(m3::icon(m3::glyph::BACK))
+                .tooltip("Back"),
+            m3::icon_button(palette)
+                .grid_column(2)
+                .is_enabled(input.can_forward)
+                .automation_name("Forward (Alt+Right)")
+                .on_click(context.message(Message::Shell(ShellMsg::Forward)))
+                .content(m3::icon(m3::glyph::FORWARD))
+                .tooltip("Forward"),
+            m3::icon_button(palette)
+                .grid_column(3)
+                .automation_name("Hide sidebar (Ctrl+B)")
+                .on_click(context.message(Message::Shell(ShellMsg::SidebarToggled)))
+                .content(m3::icon(m3::glyph::HIDE_SIDEBAR))
+                .tooltip("Hide sidebar"),
+        ))
+}
+
+/// New task (`.newtask`): `primary-container`, 40 DIPs, the `add` icon,
+/// the label emphasized, Ctrl+N at the shortcut opacity at its end, 16
+/// DIPs in.
+fn new_task_button(palette: Palette, context: &mut ViewContext<Sidebar>) -> View {
+    let inset = tokens::spacing::MD - tokens::spacing::INSET;
+    m3::new_task_button(palette)
+        .automation_name("New task (Ctrl+N)")
+        .on_click(context.message(Message::Shell(ShellMsg::NewTask)))
+        .content(
+            Grid::new()
+                .margin(Thickness::xy(inset, 0.0))
+                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                .column_spacing(tokens::spacing::ROW)
+                .children((
+                    m3::icon(m3::glyph::NEW_TASK),
+                    m3::text("New task", tokens::text::EMPHASIZED)
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center),
+                    m3::text("Ctrl+N", tokens::text::TRAILING)
+                        .grid_column(2)
+                        .opacity(tokens::state::SHORTCUT)
+                        .vertical_alignment(VerticalAlignment::Center),
+                )),
+        )
+}
+
+/// The Projects label (`.lab`) with, on hover or keyboard focus, Add
+/// project (+) and the bulk actions over every project (…); while a
+/// search lists matches, "Matching tasks" and no actions.
+fn projects_label(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> KeyedView {
+    let palette = input.palette;
+    let filtered = input.filtered;
+    let caption = if filtered {
+        "Matching tasks"
+    } else {
+        "Projects"
+    };
+    let caption_key = format!("caption:{caption}");
+    let over = shows_actions(input, &caption_key);
+    let actions: View = if filtered || !over {
+        View::empty()
+    } else {
+        let items = super::menu_ui::menu_items(
+            &BULK_MENU
+                .iter()
+                .map(|action| super::menu_ui::Entry::item(*action))
+                .collect::<Vec<_>>(),
+        );
+        StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .children((
+                m3::icon_button(palette)
+                    .automation_name("Add project")
+                    .on_click(context.message(Message::Shell(ShellMsg::AddProject)))
+                    .content(m3::icon(m3::glyph::NEW_TASK))
+                    .tooltip("Add project"),
+                m3::icon_button(palette)
+                    .automation_name("Actions for all projects")
+                    .content(m3::icon(m3::glyph::MORE))
+                    .menu(Menu::new(
+                        items,
+                        // Capture-free: one identity across renders.
+                        context.callback(|label: String| {
+                            Message::Bulk(BulkMsg::Menu(Action::from_label(&label)))
+                        }),
+                    )),
+            ))
+    };
+    KeyedView::new(
+        caption_key.clone(),
+        hover_area(
+            caption_key,
+            m3::section_label_row(caption, actions),
+            context,
+        ),
+    )
+}
+
+/// A project's (or the Chats bucket's) rows: its queued launches, its
+/// tasks with their workers, "No tasks yet" and Show older.
+fn place_rows(
+    place: &PlaceEntry,
+    input: &SidebarInput,
+    context: &mut ViewContext<Sidebar>,
+    items: &mut Vec<KeyedView>,
+) {
+    let (section, palette) = (&place.section, input.palette);
+    if place.tasks.is_empty() && section.waits.is_empty() {
+        items.push(KeyedView::new(
+            format!("empty:{}", section.key),
+            nested_note(
+                if section.older > 0 {
+                    "No recent tasks"
+                } else {
+                    "No tasks yet"
+                },
+                1,
+                None,
+            ),
+        ));
+    }
+    for task in &place.tasks {
+        items.push(task_item(task, input, context));
+    }
+    // Queued launches and automation waits: the Queued row, why it waits
+    // in its tooltip and accessible name.
+    for (index, line) in section.waits.iter().enumerate() {
+        items.push(KeyedView::new(
+            format!("wait:{}:{index}:{line}", section.key),
+            queued_row(line, palette),
+        ));
+    }
+    if section.older > 0 {
+        let label = if section.older_shown {
+            "Hide older".to_owned()
+        } else {
+            format!("Show {} older", section.older)
+        };
+        items.push(KeyedView::new(
+            format!("older:{}:{}", section.key, section.older_shown),
+            m3::sub_row(palette, false)
+                .automation_name(format!("{label} in {}", section.name))
+                .on_click(
+                    context.message(Message::Shell(ShellMsg::OlderToggled(section.key.clone()))),
+                )
+                .content(m3::sidebar_row(
+                    mark_spacer(),
+                    &label,
+                    false,
+                    0.0,
+                    false,
+                    Some(palette.variant()),
+                    View::empty(),
+                )),
+        ));
+    }
+}
+
+/// An empty mark slot: a row without a mark keeps its title where the
+/// task titles start.
+fn mark_spacer() -> View {
+    Border::new().width(tokens::layout::MARK_SLOT).into()
+}
+
+/// A queued launch or automation wait: the `schedule` icon, what waits,
+/// "Queued", all in the variant tone (a row with no action, so a disabled
+/// one); the reason and who can lift it in its tooltip and name.
+fn queued_row(line: &str, palette: Palette) -> View {
+    let (what, _) = line.split_once(": ").unwrap_or((line, ""));
+    Border::new()
+        .content(
+            m3::row(palette, false)
+                .is_enabled(false)
+                .automation_name(line.to_owned())
+                .content(m3::sidebar_row(
+                    m3::row_mark(palette, m3::RowMark::Queued, "Queued"),
+                    what,
+                    false,
+                    0.0,
+                    false,
+                    None,
+                    m3::trailing("Queued", false).into(),
+                )),
+        )
+        .tooltip(line.to_owned())
 }
 
 /// A project or subproject row with its right-click menu, or the rename
@@ -471,7 +609,6 @@ fn place_item(
         |renaming| matches!(&renaming.target, Target::Project { key, .. } if *key == section.key),
     );
     let row = match renaming {
-        _ if section.key == nav::OTHER_LOCATIONS => place_row(place, input, context),
         Some(renaming) => rename_row(renaming, 0.0, context, input.palette),
         None => with_menu(
             place_row(place, input, context),
@@ -487,43 +624,39 @@ fn place_item(
     };
     KeyedView::new(
         format!(
-            "project:{}:{}:{}:{}:{}:{}:{}",
+            "project:{}:{}:{}:{}:{}:{}:{}:{}",
             section.key,
             section.collapsed,
             place.name,
             place.subproject.as_deref().unwrap_or_default(),
             section.running,
             section.missing,
+            place.selected,
             input.renaming.is_some()
         ),
         row,
     )
 }
 
-/// A project row (folder icon): its chevron and name collapse or expand
-/// it; tasks working now (the server's team totals) show as a count on
-/// the right, collapsed or not; a registered folder that is gone says
-/// "missing" with a one-click Remove. The trailing button starts a new
-/// task in it.
+/// A project row (`Sidebar.dc.html`): its chevron (collapse or expand, a
+/// button of its own on the row's icon), its name (the project page) and
+/// the tasks working now on the right; a registered folder that is gone
+/// says "missing" with a one-click Remove; "…" opens the project menu.
 fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
     let (section, palette, filtered) = (&place.section, input.palette, input.filtered);
     let name = place.name.as_str();
+    let selected = place.selected;
     // The full place, for the tooltip and the accessible name.
     let full = match &place.subproject {
         Some(subproject) => format!("{name} › {subproject}"),
         None => name.to_owned(),
     };
-    let count: View = if section.missing {
-        m3::secondary("missing")
-            .foreground(palette.attention())
-            .into()
-    } else if section.running > 0 {
-        m3::secondary(section.running.to_string()).into()
-    } else {
-        View::empty()
+    let label = match &place.subproject {
+        Some(subproject) => format!("{name} › {subproject}"),
+        None => name.to_owned(),
     };
     let kind = "project";
-    let mut label = format!(
+    let mut spoken = format!(
         "{full}, {kind}, {}",
         if section.collapsed {
             "collapsed"
@@ -532,54 +665,14 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
         }
     );
     if section.running > 0 {
-        label.push_str(&format!(", {} working", section.running));
+        spoken.push_str(&format!(", {} working", section.running));
     }
     if section.missing {
-        label.push_str(", folder missing");
+        spoken.push_str(", folder missing");
     }
-    // The name opens the project page, its tasks in view; the few places
-    // with no one checkout fold.
-    let toggle = Message::Shell(ShellMsg::ProjectToggled(section.key.clone()));
-    let opens = place.opens;
-    let row = m3::row(palette, place.selected)
-        .automation_name(if opens {
-            format!("Open {label}")
-        } else {
-            label
-        })
-        .is_enabled(opens || !filtered)
-        .on_click(context.message(if opens {
-            Message::Shell(ShellMsg::ProjectOpened(
-                section.checkout.clone(),
-                section.key.clone(),
-            ))
-        } else {
-            toggle.clone()
-        }));
     let hover_key = format!("project:{}", section.key);
     let over = shows_actions(input, &hover_key);
     let mut actions: Vec<KeyedView> = Vec::new();
-    if over {
-        actions.push(KeyedView::new(
-            "fold",
-            m3::icon_button(palette)
-                .is_enabled(!filtered)
-                .automation_name(format!(
-                    "{} {name}",
-                    if section.collapsed {
-                        "Expand"
-                    } else {
-                        "Collapse"
-                    }
-                ))
-                .on_click(context.message(toggle))
-                .content(m3::icon(if section.collapsed {
-                    m3::glyph::CHEVRON_RIGHT
-                } else {
-                    m3::glyph::CHEVRON_DOWN
-                })),
-        ));
-    }
     if section.missing {
         if over {
             actions.push(KeyedView::new(
@@ -598,7 +691,7 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                     .content(m3::icon(m3::glyph::DELETE)),
             ));
         }
-    } else if over && section.key != nav::OTHER_LOCATIONS {
+    } else if over {
         actions.push(KeyedView::new(
             "more",
             m3::icon_button(palette)
@@ -621,19 +714,91 @@ fn place_row(place: &PlaceEntry, input: &SidebarInput, context: &mut ViewContext
                 .tooltip("Project actions"),
         ));
     }
-    let reserve = (tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW).max(0.0);
-    let row = row
-        .content(
-            Border::new()
-                .padding(Thickness::new(0.0, 0.0, reserve, 0.0))
-                .content(m3::project_content(
-                    name,
-                    place.subproject.as_deref(),
-                    count,
-                )),
-        )
+    let trailing: View = if !actions.is_empty() {
+        Border::new()
+            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::SM)
+            .into()
+    } else if section.missing {
+        m3::trailing("missing", selected)
+            .foreground(palette.attention())
+            .into()
+    } else if section.running > 0 {
+        m3::trailing(section.running.to_string(), selected).into()
+    } else {
+        View::empty()
+    };
+    // The name opens the project page, its tasks in view; a place with no
+    // one checkout folds instead.
+    let toggle = Message::Shell(ShellMsg::ProjectToggled(section.key.clone()));
+    let opens = place.opens;
+    let row = m3::row(palette, selected)
+        .automation_name(if opens {
+            format!("Open {spoken}")
+        } else {
+            spoken
+        })
+        .is_enabled(opens || !filtered)
+        .on_click(context.message(if opens {
+            Message::Shell(ShellMsg::ProjectOpened(
+                section.checkout.clone(),
+                section.key.clone(),
+            ))
+        } else {
+            toggle.clone()
+        }))
+        .content(m3::sidebar_row(
+            Border::new().width(tokens::icon::ROW).into(),
+            &label,
+            selected,
+            0.0,
+            false,
+            None,
+            trailing,
+        ))
         .tooltip(full);
-    hover_area(hover_key, row_with_actions(row, actions), context)
+    // The chevron is the row's icon: its own button, centred on it.
+    let chevron = m3::icon_button(palette)
+        .resource_overrides(if selected {
+            palette.row(true)
+        } else {
+            palette.icon_button()
+        })
+        .is_enabled(!filtered)
+        .horizontal_alignment(HorizontalAlignment::Left)
+        .margin(Thickness::new(
+            tokens::spacing::ROW + tokens::icon::ROW / 2.0 - tokens::height::CONTROL / 2.0,
+            0.0,
+            0.0,
+            0.0,
+        ))
+        .automation_name(format!(
+            "{} {name}",
+            if section.collapsed {
+                "Expand"
+            } else {
+                "Collapse"
+            }
+        ))
+        .on_click(context.message(toggle))
+        .content(m3::icon(if section.collapsed {
+            m3::glyph::CHEVRON_RIGHT
+        } else {
+            m3::glyph::CHEVRON_DOWN
+        }));
+    let mut cells = vec![
+        KeyedView::new("row", row),
+        KeyedView::new(format!("chevron:{selected}"), chevron),
+    ];
+    if !actions.is_empty() {
+        cells.push(KeyedView::new(
+            "actions",
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .keyed_children(actions),
+        ));
+    }
+    hover_area(hover_key, Grid::new().keyed_children(cells), context)
 }
 
 /// One task or chat row: its right-click menu, or the rename editor.
@@ -649,7 +814,7 @@ fn task_item(
     let view = match renaming {
         Some(renaming) => rename_row(
             renaming,
-            row.depth as f64 * tokens::layout::TREE_INDENT + tokens::layout::TREE_INDENT,
+            row.depth as f64 * tokens::layout::KID_INDENT,
             context,
             input.palette,
         ),
@@ -673,12 +838,42 @@ fn task_item(
     )
 }
 
-/// A task row under its project: indented 28 DIPs per level, so its title
-/// lines up with the project's label: the title and a state dot only for a
-/// task that runs or needs attention, else its age. A running task adds
-/// its work line under the title. A manager with workers shows its expand
-/// chevron among the hover actions. Its accessible name says
-/// "Harness · model" in full.
+/// A task's mark, its one word for the row's end (attention first) and
+/// whether its title takes the variant tone (stopped), as the brand book's
+/// status table says.
+fn task_look(task: &TaskEntry) -> (m3::RowMark, Option<&'static str>, bool) {
+    use eliot_core::AgentState;
+    let agent = &task.row.agent;
+    let held = agent.status_line.as_deref().is_some_and(|line| {
+        line.starts_with("Provider hold") || line.starts_with("Waiting for the provider")
+    });
+    if let Some((word, _)) = task.reported {
+        return (m3::RowMark::Waiting, Some(word), false);
+    }
+    match agent.state {
+        AgentState::Created | AgentState::Starting | AgentState::Busy if held => {
+            (m3::RowMark::Waiting, Some("Provider hold"), false)
+        }
+        AgentState::Created | AgentState::Starting | AgentState::Busy => {
+            (m3::RowMark::Working, None, false)
+        }
+        _ if held => (m3::RowMark::Waiting, Some("Provider hold"), false),
+        AgentState::Waiting => (m3::RowMark::Waiting, Some("Waiting"), false),
+        AgentState::Idle => (m3::RowMark::Idle, None, false),
+        AgentState::Failed => (m3::RowMark::Failed, Some("Failed"), false),
+        AgentState::Lost => (m3::RowMark::Failed, Some("Lost"), false),
+        AgentState::Unknown => (m3::RowMark::Failed, Some("Unknown"), false),
+        AgentState::Stopped => (m3::RowMark::None, None, true),
+    }
+}
+
+/// A task row (`.row`): its state mark, its title and, at the end, one
+/// attention word, else its `+N −M`, else its age; workers indent one step
+/// under their manager, their title at the kid size in the variant tone.
+/// Hovering (or keyboard focus, or the open task) shows the workers'
+/// chevron and "…" in place of the end. The tooltip carries the work line
+/// or the Monitor's report; the accessible name says "Harness · model" in
+/// full.
 fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
     let (row, palette, selected) = (&task.row, input.palette, task.selected);
     let agent = &row.agent;
@@ -696,37 +891,40 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         name.push_str(&format!(", {note}"));
     }
     // The Monitor's incident report leads, then projected status and work.
-    if let Some(words) = &task.reported {
+    let line = task
+        .reported
+        .as_ref()
+        .map(|(_, words)| words.clone())
+        .or_else(|| agent.status_line.clone())
+        .or_else(|| task.work.as_ref().map(|(line, _)| line.clone()));
+    if let Some(words) = task.reported.as_ref().map(|(_, words)| words) {
         name.push_str(&format!(", needs attention: {words}"));
     } else if let Some(status) = &agent.status_line {
         name.push_str(&format!(", {status}"));
     } else if let Some((_, words)) = &task.work {
         name.push_str(&format!(", {words}"));
     }
-    let line = task
-        .reported
-        .clone()
-        .map(|words| (words, true))
-        .or_else(|| {
-            agent
-                .status_line
-                .as_ref()
-                .map(|status| (status.clone(), agent.needs_attention()))
-        })
-        .or_else(|| task.work.as_ref().map(|(line, _)| (line.clone(), false)));
-    // A live task shows its dot (working, attention: a reported one in the
-    // attention tone); a quiet one its age, its title in the variant tone.
-    let dot = if line.as_ref().is_some_and(|(_, attention)| *attention) {
-        Some(m3::status_mark(
-            palette,
-            StatusTone::Attention,
-            tokens::layout::DOT,
-        ))
-    } else {
-        task_dot(palette, agent)
+    let (mark, word, quiet) = task_look(task);
+    let diff = agent
+        .work
+        .as_deref()
+        .filter(|work| work.available)
+        .and_then(|work| match (work.insertions, work.deletions) {
+            (Some(add), Some(del)) if add > 0 || del > 0 => Some((add, del)),
+            _ => None,
+        });
+    let end: View = match (word, diff) {
+        (Some(word), _) => {
+            let block = m3::trailing(word, selected);
+            if mark == m3::RowMark::Failed && !selected {
+                block.foreground(palette.attention()).into()
+            } else {
+                block.into()
+            }
+        }
+        (None, Some((add, del))) => m3::diff_counts(add, del, selected),
+        (None, None) => m3::trailing(task.age.clone(), selected).into(),
     };
-    let quiet = dot.is_none();
-    let trailing: View = dot.unwrap_or_else(|| m3::secondary(task.age.clone()).into());
     let hover_key = format!("agent:{}", agent.id);
     let over = selected || shows_actions(input, &hover_key);
     let mut actions: Vec<KeyedView> = Vec::new();
@@ -754,9 +952,9 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
         ));
     }
     // The design and Codex: a row's actions show under the pointer, with
-    // keyboard focus in the row and on the open task, in place of its dot
-    // or age; a right click, Shift+F10 or the context-menu key opens the
-    // same menu at any time.
+    // keyboard focus in the row and on the open task, in place of its end;
+    // a right click, Shift+F10 or the context-menu key opens the same menu
+    // at any time.
     if over {
         actions.push(KeyedView::new(
             "more",
@@ -774,105 +972,101 @@ fn agent_row(task: &TaskEntry, input: &SidebarInput, context: &mut ViewContext<S
                 .tooltip("Task actions"),
         ));
     }
-    let trailing: View = if over {
+    let end: View = if over {
         Border::new()
-            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::ROW)
+            .width(tokens::height::CONTROL * actions.len() as f64 - tokens::spacing::SM)
             .into()
     } else {
-        trailing
+        end
     };
-    let row_button = m3::sub_row(palette, selected);
-    let row_button = if line.is_some() {
-        row_button
-            .height(tokens::height::TWO_LINE_ROW)
-            .min_height(tokens::height::TWO_LINE_ROW)
-    } else {
-        row_button
-    };
-    let row_button = row_button
+    let kid = row.depth > 0;
+    let tone = (!selected && (quiet || kid)).then(|| palette.variant());
+    let leading = m3::row_mark(palette, mark, word.unwrap_or("Failed"));
+    let row_button = m3::sub_row(palette, selected)
         .automation_name(name)
         .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent.clone()))))
-        .content(m3::task_content(
-            row.depth + 1,
+        .content(m3::sidebar_row(
+            leading,
             title,
-            quiet,
-            trailing,
-            line,
+            selected,
+            row.depth as f64 * tokens::layout::KID_INDENT,
+            kid,
+            tone,
+            end,
         ));
+    let row_button: View = match line {
+        Some(line) => row_button.tooltip(line),
+        None => row_button,
+    };
     hover_area(hover_key, row_with_actions(row_button, actions), context)
 }
 
-/// The Owner inbox in one row: its glyph, "Inbox", the per-kind counts
-/// ("2 requests · 1 stuck", "Nothing waiting") and the total; it opens the
-/// Inbox pane.
-fn inbox_row(inbox: &InboxEntry, context: &mut ViewContext<Sidebar>, palette: Palette) -> View {
+/// The Inbox row: the `inbox` icon, "Inbox" and the count badge; it opens
+/// the Inbox pane. Its name carries the per-kind counts.
+fn inbox_row(
+    inbox: &InboxEntry,
+    context: &mut ViewContext<Sidebar>,
+    palette: Palette,
+) -> KeyedView {
     let open = inbox.open;
-    m3::row(palette, open)
-        .automation_name(format!(
-            "Inbox: {} ({})",
-            inbox.counts,
-            if open { "open" } else { "closed" }
-        ))
-        .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Inbox))))
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::ROW)
-                .children((
-                    Border::new()
-                        .width(tokens::icon::ROW)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::icon(m3::glyph::INBOX)),
-                    StackPanel::new()
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .children((
-                            TextBlock::new()
-                                .text("Inbox")
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                            m3::secondary(inbox.counts.clone())
-                                .text_trimming(TextTrimming::CharacterEllipsis),
-                        )),
-                    if inbox.total > 0 {
-                        m3::badge(palette, &inbox.total.to_string())
-                    } else {
-                        View::empty()
-                    },
-                )),
-        )
+    KeyedView::new(
+        format!("inbox:{open}"),
+        m3::row(palette, open)
+            .automation_name(format!(
+                "Inbox: {} ({})",
+                inbox.counts,
+                if open { "open" } else { "closed" }
+            ))
+            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Inbox))))
+            .content(m3::sidebar_row(
+                m3::nav_icon(m3::glyph::INBOX, open),
+                "Inbox",
+                open,
+                0.0,
+                false,
+                None,
+                if inbox.total > 0 {
+                    m3::count_badge(palette, inbox.total)
+                } else {
+                    View::empty()
+                },
+            ))
+            .tooltip(inbox.counts.clone()),
+    )
 }
 
-/// The fleet in one calm row ("2 working · 1 needs attention", "All
-/// quiet"): its dot in the icon slot, "Monitor" at the end; it opens the
-/// Monitor, and its name carries every count.
-fn fleet_row(fleet: &FleetEntry, context: &mut ViewContext<Sidebar>, palette: Palette) -> View {
-    let open = fleet.open;
-    m3::row(palette, open)
-        .automation_name(format!(
-            "Monitor: {} ({})",
-            fleet.summary,
-            if open { "open" } else { "closed" }
-        ))
-        .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-                .column_spacing(tokens::spacing::ROW)
-                .children((
-                    Border::new()
-                        .width(tokens::icon::ROW)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(m3::status_mark(palette, fleet.tone, tokens::layout::DOT)),
-                    TextBlock::new()
-                        .text(fleet.line.clone())
-                        .grid_column(1)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                    m3::secondary("Monitor")
-                        .grid_column(2)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )),
-        )
+/// The Agents row: the `hub` icon, "Agents" and "N working"; it opens the
+/// fleet view (the Monitor pane). Its name carries every count.
+fn agents_row(
+    agents: &AgentsEntry,
+    context: &mut ViewContext<Sidebar>,
+    palette: Palette,
+) -> KeyedView {
+    let open = agents.open;
+    KeyedView::new(
+        format!("agents:{open}"),
+        m3::row(palette, open)
+            .automation_name(format!(
+                "Agents: {} ({})",
+                agents.summary,
+                if open { "open" } else { "closed" }
+            ))
+            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
+            .content(m3::sidebar_row(
+                m3::nav_icon(m3::glyph::HUB, open),
+                "Agents",
+                open,
+                0.0,
+                false,
+                None,
+                if agents.working > 0 {
+                    m3::trailing(format!("{} working", agents.working), open).into()
+                } else {
+                    View::empty()
+                },
+            ))
+            .tooltip(agents.summary.clone()),
+    )
 }
 
 /// The inline rename editor in place of a row's title, or the tag editor
@@ -1075,16 +1269,10 @@ fn nested_note(text: &str, depth: usize, tone: Option<Brush>) -> View {
     Border::new()
         .min_height(tokens::height::CONTROL)
         .padding(Thickness::new(
-            tokens::spacing::ROW + tokens::layout::TREE_INDENT * depth as f64,
+            tokens::spacing::ROW + tokens::layout::KID_INDENT * depth as f64,
             0.0,
             tokens::spacing::ROW,
             0.0,
         ))
         .content(note)
-}
-
-/// A task's state dot, only while it runs or needs attention: a calm list
-/// carries no marks.
-fn task_dot(palette: Palette, agent: &UiAgent) -> Option<View> {
-    (agent.running() || agent.needs_attention()).then(|| m3::list_dot(palette, agent.state))
 }

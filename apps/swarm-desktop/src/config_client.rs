@@ -305,6 +305,16 @@ pub async fn harness_quota(data_dir: &Path, harness: &str) -> Result<HarnessQuot
     Ok(reply)
 }
 
+/// The provider holds (`provider.holds`, owner-only), first page.
+pub async fn provider_holds(data_dir: &Path) -> Result<eliot_core::api::ProviderHoldsResponse> {
+    let params = eliot_core::api::ProviderHoldsRequest::default();
+    params.validate()?;
+    let reply: eliot_core::api::ProviderHoldsResponse =
+        eliot_daemon::client_call_typed(data_dir, "provider.holds", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
 /// Sanitized configured-profile summaries for the launch picker.
 pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
     let params = ProfileListRequest {};

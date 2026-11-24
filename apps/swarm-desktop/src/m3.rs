@@ -117,16 +117,6 @@ pub fn card_high(palette: Palette) -> Border {
     card(palette).background(palette.container())
 }
 
-/// The status mark of an Agent state in a list; empty for states that need
-/// no mark (ready, ended), so a calm list shows none.
-pub fn list_dot(palette: Palette, state: eliot_core::AgentState) -> View {
-    let tone = StatusTone::of_state(state);
-    match palette.dot(tone) {
-        Some(_) => status_mark(palette, tone, layout::DOT),
-        None => View::empty(),
-    }
-}
-
 /// A status mark of `size` DIPs whose shape tells states apart within the
 /// theme's two status colors: a filled circle for working (accent), needs
 /// you (attention) and ready (outline grey); a ring for starting (accent),
@@ -429,44 +419,6 @@ pub fn nav_content(glyph: &str, label: &str, hint: &str) -> View {
     )
 }
 
-/// A project row's content: the folder, the name at 14/500 and a trailing
-/// view (its count). A linked worktree's subproject follows the name in
-/// the muted caption ("eliot-swarm… › a786 sidebar fixes"): the name trims
-/// first, at most [`layout::PROJECT_NAME_WIDTH`], so sibling worktrees of
-/// one repository never trim to the same text.
-pub fn project_content(name: &str, subproject: Option<&str>, trailing: View) -> View {
-    let title = text(name.to_owned(), style::BUTTON)
-        .vertical_alignment(VerticalAlignment::Center)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    let label: View = match subproject {
-        Some(subproject) => Grid::new()
-            .grid_column(1)
-            .columns([GridLength::Auto, GridLength::STAR])
-            .column_spacing(spacing::XS)
-            .children((
-                title.max_width(layout::PROJECT_NAME_WIDTH),
-                secondary(format!("› {subproject}"))
-                    .grid_column(1)
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .text_trimming(TextTrimming::CharacterEllipsis),
-            )),
-        None => title.grid_column(1).into(),
-    };
-    Grid::new()
-        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
-        .column_spacing(spacing::ROW)
-        .children((
-            Border::new()
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(icon(glyph::FOLDER)),
-            label,
-            Border::new()
-                .grid_column(2)
-                .vertical_alignment(VerticalAlignment::Center)
-                .content(trailing),
-        ))
-}
-
 /// A nested row's content: indented `depth` steps of 28 DIPs, so its title
 /// starts under its parent's label; ended tasks in the variant tone; a
 /// trailing view (a dot, an age). A running task's work line runs under
@@ -610,12 +562,6 @@ pub fn chip_content(glyph: Option<&str>, label: &str, chevron: bool, max: f64) -
         .keyed_children(parts)
 }
 
-/// A borderless chip (the composer's project selector, a menu entry): the
-/// text color, a state layer on hover, no outline.
-pub fn text_chip(palette: Palette) -> Button {
-    button(palette.row(false))
-}
-
 /// One segment of a segmented button (see [`segmented`]): 28 DIPs, the
 /// selection filled in the selected role.
 pub fn segment(palette: Palette, selected: bool) -> Button {
@@ -741,35 +687,25 @@ pub fn tool_content(glyph: &str, label: &str, trailing: View) -> View {
         ))
 }
 
-/// A suggestion card (home): the card corner, tonal, lifting under the
-/// pointer (`.content(suggestion_content(..))` last). Its content color is
-/// the primary role, which its icon takes.
+/// A suggestion card (Home, `.suggest`): the card corner, tonal, lifting
+/// under the pointer; its icon and label in `on-surface`. Its hairline is
+/// [`suggestion_card`]'s (the card style draws no border).
 pub fn suggestion(palette: Palette) -> Button {
     Button::new()
         .resource_overrides(palette.suggestion())
         .style(ButtonStyle::Accent)
-        .min_height(height::SUGGESTION)
-        .horizontal_alignment(HorizontalAlignment::Stretch)
+        .height(height::SUGGESTION - 2.0 * layout::HAIRLINE)
+        .min_height(height::SUGGESTION - 2.0 * layout::HAIRLINE)
         .horizontal_content_alignment(HorizontalAlignment::Left)
 }
 
-/// A suggestion card's content: the 18-DIP icon (in the card's primary
-/// content color) and its 14-DIP label in the text role, 12/14 inset.
-pub fn suggestion_content(palette: Palette, glyph: &str, label: &str) -> View {
-    StackPanel::new()
-        .orientation(Orientation::Horizontal)
-        .spacing(spacing::ROW)
-        .margin(Thickness::xy(
-            spacing::TEXT_INSET - spacing::INSET,
-            spacing::INSET,
-        ))
-        .children((
-            icon(glyph),
-            body(label.to_owned())
-                .foreground(palette.text())
-                .vertical_alignment(VerticalAlignment::Center)
-                .text_trimming(TextTrimming::CharacterEllipsis),
-        ))
+/// A suggestion card's `outline-variant` hairline around its button.
+pub fn suggestion_card(palette: Palette, card: impl Into<View>) -> View {
+    Border::new()
+        .border_brush(palette.outline())
+        .border_thickness(Thickness::uniform(layout::HAIRLINE))
+        .corner_radius(radius::CONTAINER + layout::HAIRLINE)
+        .content(card)
 }
 
 /// A message bubble: the user's in the container role, right-aligned with
@@ -1117,4 +1053,274 @@ pub fn status_ring(status: Brush) -> View {
         .border_brush(status)
         .vertical_alignment(VerticalAlignment::Center)
         .into()
+}
+
+/// An Expressive shape (`brand::SHAPE_*` path data in a 100-unit box) at
+/// `size` DIPs: a `PathIcon` scaled by a `Viewbox`. It takes the
+/// foreground of the control around it.
+pub fn shape(data: &str, size: f64) -> View {
+    Viewbox::new()
+        .width(size)
+        .height(size)
+        .vertical_alignment(VerticalAlignment::Center)
+        .slot(ViewboxSlot::Child, PathIcon::new().data(data.to_owned()))
+}
+
+/// `content` in the color `pick` names where it is not a pressable (the
+/// daemon screen's shape, a failed row's error icon): a disabled carrier
+/// button, which takes no focus and no input (a press reaches the row
+/// around it). Reactor 0.100.0 colors an icon or shape only through the
+/// control around it. `name` is what a screen reader says.
+pub fn carrier(
+    palette: Palette,
+    pick: fn(&crate::brand::Scheme) -> u32,
+    name: &str,
+    size: f64,
+    content: impl Into<View>,
+) -> View {
+    Button::new()
+        .resource_overrides(palette.carrier(pick))
+        .style(ButtonStyle::Subtle)
+        .is_enabled(false)
+        .width(size)
+        .height(size)
+        .min_height(size)
+        .vertical_alignment(VerticalAlignment::Center)
+        .automation_name(name.to_owned())
+        .content(content)
+}
+
+/// A counter (the Inbox count): `tertiary-container`, a 16-DIP pill,
+/// `label-small-emphasized`; more than 99 reads "99+".
+pub fn count_badge(palette: Palette, count: usize) -> View {
+    let (container, on) = palette.badge();
+    let label = if count > 99 {
+        "99+".to_owned()
+    } else {
+        count.to_string()
+    };
+    Border::new()
+        .min_width(layout::BADGE)
+        .height(layout::BADGE)
+        .corner_radius(layout::BADGE / 2.0)
+        .background(container)
+        .padding(Thickness::xy(spacing::XS, 0.0))
+        .vertical_alignment(VerticalAlignment::Center)
+        .content(
+            text(label, style::BADGE)
+                .foreground(on)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center),
+        )
+}
+
+/// A sidebar row's trailing word, age or shortcut (`label-small`, the
+/// variant tone; on the selection, its content color).
+pub fn trailing(value: impl Into<String>, selected: bool) -> TextBlock {
+    let block = text(value, style::TRAILING).vertical_alignment(VerticalAlignment::Center);
+    if selected {
+        block.foreground(palette().on_selected())
+    } else {
+        block.foreground(palette().variant())
+    }
+}
+
+/// A task row's `+N −M` (`label-small`: `add` and `error`; on the
+/// selection, its content color).
+pub fn diff_counts(insertions: u64, deletions: u64, selected: bool) -> View {
+    let palette = palette();
+    let (add, del) = if selected {
+        (palette.on_selected(), palette.on_selected())
+    } else {
+        (palette.add(), palette.attention())
+    };
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(spacing::XS)
+        .vertical_alignment(VerticalAlignment::Center)
+        .children((
+            text(format!("+{}", group_digits(insertions)), style::TRAILING).foreground(add),
+            text(
+                format!("\u{2212}{}", group_digits(deletions)),
+                style::TRAILING,
+            )
+            .foreground(del),
+        ))
+}
+
+/// `1234567` as `1,234,567`.
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// A task row's state mark (brand book, Color, status in rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowMark {
+    /// Working or starting: the loader in `primary`.
+    Working,
+    /// Waiting for you: an 8-DIP `tertiary` dot.
+    Waiting,
+    /// Idle or ready: a 6-DIP `outline` dot.
+    Idle,
+    /// Queued: the `schedule` icon (the row's variant content).
+    Queued,
+    /// Failed, lost or unknown: the `error` icon in `error`.
+    Failed,
+    /// Stopped: no mark.
+    None,
+}
+
+/// The view of a row's state mark: dots and the loader in a 16-DIP slot,
+/// the icons in the 20-DIP icon slot (as the design draws them). `word`
+/// names a carried icon for a screen reader.
+pub fn row_mark(palette: Palette, mark: RowMark, word: &str) -> View {
+    let slot = |content: View| -> View {
+        Border::new()
+            .width(layout::MARK_SLOT)
+            .height(layout::MARK_SLOT)
+            .vertical_alignment(VerticalAlignment::Center)
+            .content(content)
+    };
+    let dot = |fill: Brush, size: f64| -> View {
+        Ellipse::new()
+            .fill(fill)
+            .width(size)
+            .height(size)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center)
+            .into()
+    };
+    match mark {
+        // WinUI's indeterminate ring in `primary` (the app's ring
+        // resources): the brand's shape loader needs a re-templated
+        // control (the motion increment).
+        RowMark::Working => slot(
+            ProgressRing::new()
+                .is_indeterminate(true)
+                .width(layout::LOADER_SMALL)
+                .height(layout::LOADER_SMALL)
+                .min_width(layout::LOADER_SMALL)
+                .min_height(layout::LOADER_SMALL)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .vertical_alignment(VerticalAlignment::Center)
+                .into(),
+        ),
+        RowMark::Waiting => slot(dot(palette.waiting(), layout::DOT_WAIT)),
+        RowMark::Idle => slot(dot(palette.idle_dot(), layout::DOT_IDLE)),
+        RowMark::Queued => icon(glyph::SCHEDULE),
+        RowMark::Failed => carrier(
+            palette,
+            |s| s.error,
+            word,
+            icon_size::ROW,
+            icon(glyph::ERROR),
+        ),
+        RowMark::None => View::empty(),
+    }
+}
+
+/// A sidebar row's content (`Sidebar.dc.html` `.row`): the leading mark
+/// or icon, the label (`label-large`; emphasized when selected) and the
+/// trailing view, 8 DIPs apart; the row's inset is 10 at the start and 8
+/// at the end; a worker `indent`s past its manager's mark, its label at
+/// the kid size. `tone` recolors the label alone (a stopped task's).
+pub fn sidebar_row(
+    leading: View,
+    label: &str,
+    selected: bool,
+    indent: f64,
+    kid: bool,
+    tone: Option<Brush>,
+    trailing: View,
+) -> View {
+    let mut title = text(
+        label.to_owned(),
+        if selected {
+            style::EMPHASIZED
+        } else {
+            style::BUTTON
+        },
+    )
+    .vertical_alignment(VerticalAlignment::Center)
+    .text_trimming(TextTrimming::CharacterEllipsis);
+    if kid {
+        title = title.font_size(style::KID_SIZE);
+    }
+    if let Some(tone) = tone {
+        title = title.foreground(tone);
+    }
+    Grid::new()
+        .margin(Thickness::new(indent, 0.0, spacing::SM - spacing::ROW, 0.0))
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+        .column_spacing(spacing::SM)
+        .children((
+            Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(leading),
+            title.grid_column(1),
+            Border::new()
+                .grid_column(2)
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(trailing),
+        ))
+}
+
+/// A nav row's icon: outlined, filled when its row is selected.
+pub fn nav_icon(glyph: &str, selected: bool) -> View {
+    if selected {
+        icon(&glyph::filled(glyph))
+    } else {
+        icon(glyph)
+    }
+}
+
+/// A section label row (`.lab`): the label in `label-medium`, the variant
+/// tone, 10 DIPs in, its actions at the end (4 DIPs in).
+pub fn section_label_row(value: &str, actions: View) -> View {
+    Border::new()
+        .height(height::CONTROL)
+        .padding(Thickness::new(spacing::ROW, 0.0, spacing::XS, 0.0))
+        .content(
+            Grid::new()
+                .columns([GridLength::STAR, GridLength::Auto])
+                .children((
+                    muted(value.to_owned(), style::LABEL)
+                        .automation_heading_level(AutomationHeadingLevel::Level3)
+                        .vertical_alignment(VerticalAlignment::Center),
+                    Border::new()
+                        .grid_column(1)
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(actions),
+                )),
+        )
+}
+
+/// A thin quota meter: the share `value` (0 to 100) in `primary` (`error`
+/// when `low`) on a `secondary-container` track, fully rounded.
+pub fn meter(palette: Palette, value: f64, low: bool) -> View {
+    let value = value.clamp(0.0, 100.0);
+    let fill = if low {
+        palette.attention()
+    } else {
+        palette.primary()
+    };
+    Border::new()
+        .height(layout::METER)
+        .corner_radius(layout::METER / 2.0)
+        .background(palette.meter_track())
+        .content(
+            Grid::new()
+                .columns([GridLength::Star(value), GridLength::Star(100.0 - value)])
+                .children((Border::new()
+                    .corner_radius(layout::METER / 2.0)
+                    .background(fill),)),
+        )
 }
