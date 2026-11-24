@@ -3,19 +3,10 @@ use super::*;
 const SCRIPT_ACTION_ID_DOMAIN: &str = "eliot.script.action.command.v1";
 
 fn valid_script_output_action_request(request: &SubmitCommand) -> bool {
-    if request.verb == "emit" {
-        return request.validate().is_ok()
-            && request.target.is_none()
-            && request.expected_generation.is_none()
-            && request.expected_turn_id.is_none()
-            && request.request_id.is_none()
-            && !request.probe
-            && request.args.is_object()
-            && serde_json::from_value::<core::api::EmitDefinitionArgs>(request.args.clone())
-                .is_ok_and(|definition| definition.validate().is_ok());
-    }
-    matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
-        && rules::valid_rule_action_request(request, true)
+    // The caller checks shared bindings and submit_tx decodes emit payloads.
+    request.verb == "emit"
+        || (matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
+            && rules::valid_rule_action_request(request, true))
 }
 
 #[derive(Clone, Debug, PartialEq)]

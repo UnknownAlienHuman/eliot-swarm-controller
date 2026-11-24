@@ -11,9 +11,10 @@ use super::{
 use crate::common::now_ms;
 use eliot_core::{
     Agent, Command, CommandState, Error, Event, FailureOrigin, Result, TurnOutcome, TurnState,
-    api::{FrozenGitFetch, ProjectRegistrationView, UserEventCommand},
+    api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use eliot_plugin::session::native_no_write;
+use eliot_store::UserEventDispatch;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -300,21 +301,23 @@ impl Router {
         self.signal_progress();
     }
 
-    /// Decode the retained command and atomically commit the event and settlement.
-    pub(super) async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
-        let decoded =
-            UserEventCommand::decode(&dispatched.verb, dispatched.args).and_then(|event| {
-                let (kind, data) = event.event()?;
-                Ok((
-                    matches!(event, UserEventCommand::AttentionEmit(_)),
-                    kind,
-                    data,
-                ))
-            });
-        let (attention, kind, mut data) = match decoded {
-            Ok(event) => event,
-            Err(error) => {
-                let location = if dispatched.verb == "attention.emit" {
+    /// Publish the local event only after Store commits its settlement.
+    pub(super) async fn execute_user_event_command(&self, id: &str, verb: &str) {
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result =
+                store.commit_user_event(id, |data| self.redact_native_value(data), now_ms());
+            if let Ok(UserEventDispatch::Applied(events)) = &result
+                && !events.is_empty()
+            {
+                self.publish_locked(events);
+            }
+            result
+        };
+        match committed {
+            Ok(UserEventDispatch::Applied(_)) => {}
+            Ok(UserEventDispatch::Rejected(error)) => {
+                let location = if verb == "attention.emit" {
                     "router.dispatch.attention_gate"
                 } else {
                     "router.dispatch.user_event_gate"
@@ -326,58 +329,15 @@ impl Router {
                     Some(self.command_error_outcome(&error, "code")),
                 )
                 .await;
-                self.signal_progress();
-                return;
             }
-        };
-        // The reserved attention topic is never bound through the public
-        // `emit` verb: admission rejects it, and a retained pre-fix command
-        // that still reaches execution is rejected here. Only the internal
-        // `attention.emit` verb below may use the bound commit.
-        if !attention && kind == super::ATTENTION_USER_EVENT_KIND {
-            let error = self.sanitized_failure(
-                &Error::new(
-                    "invalid",
-                    "the reserved attention topic is never bound through emit",
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Unknown,
+                    Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
                 )
-                .with_where("router.dispatch.user_event_gate")
-                .with_origin(
-                    FailureOrigin::Swarm,
-                    "user event gate: reserved attention topic through emit",
-                ),
-                "router.dispatch.user_event_gate",
-            );
-            self.settle(
-                id,
-                CommandState::Rejected,
-                Some(self.command_error_outcome(&error, "code")),
-            )
-            .await;
-            self.signal_progress();
-            return;
-        }
-        self.redact_native_value(&mut data);
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result = if attention {
-                store.commit_attention_event_applied(id, &kind, data, now_ms())
-            } else {
-                store.commit_user_event_applied(id, &kind, data, now_ms())
-            };
-            if let Ok(change) = &result
-                && !change.events.is_empty()
-            {
-                self.publish_locked(&change.events);
+                .await;
             }
-            result
-        };
-        if let Err(error) = committed {
-            self.settle(
-                id,
-                CommandState::Unknown,
-                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
-            )
-            .await;
         }
         self.signal_progress();
     }

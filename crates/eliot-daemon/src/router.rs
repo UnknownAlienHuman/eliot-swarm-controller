@@ -8480,9 +8480,6 @@ fn normalize_resume(request: &mut SubmitCommand) -> Result<()> {
     Ok(())
 }
 
-/// Persisted kind of the internal attention event.
-pub(crate) const ATTENTION_USER_EVENT_KIND: &str = "x.user.agent.attention";
-
 fn validate_plugin_command_args(request: &SubmitCommand) -> Result<()> {
     let args = request
         .args

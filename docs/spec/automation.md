@@ -1170,7 +1170,7 @@ are validated literally at admission (no templates; bounded, secret-checked
 payloads). The typed local-event command carries the decoded payload through
 admission. The original command JSON remains the digest and replay input,
 including explicit nulls. Rule-derived commands decode at Store admission.
-At dispatch, the Router decodes the retained command and the Store commits one
+At dispatch, the Store decodes the retained command and commits one
 event (`x.user.notify` with `{message,title?}` or `x.user.<topic>` with
 `{data,key?}`) together with its
 Applied settlement in a single Store transaction, then publishes the committed
