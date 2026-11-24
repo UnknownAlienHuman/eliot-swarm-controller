@@ -46,12 +46,18 @@ impl WorkspaceInvalidation {
             let common = canonical_root(common.ok_or_else(watch_unavailable)?)?;
             let admin = crate::workspace_git::linked_watch_admin(&root, &common)
                 .ok_or_else(watch_unavailable)?;
+            let admin = canonical_root(admin.to_str().ok_or_else(watch_unavailable)?)?;
             let registry = common.join("worktrees");
             paths.extend([
                 (registry, RecursiveMode::NonRecursive),
                 (admin.clone(), RecursiveMode::NonRecursive),
                 (common.clone(), RecursiveMode::NonRecursive),
             ]);
+            if let Some(common_parent) = common.parent()
+                && !paths.iter().any(|(path, _)| path == common_parent)
+            {
+                paths.push((common_parent.to_owned(), RecursiveMode::NonRecursive));
+            }
             for name in ["refs", "info", "reftable"] {
                 let path = common.join(name);
                 if path.is_dir() {
@@ -160,6 +166,8 @@ impl WatchScope {
             || path == self.dot_git
             || self.linked.as_ref().is_some_and(|(admin, common)| {
                 path == admin
+                    || path == common
+                    || path == common.join("worktrees")
                     || path == admin.join("commondir")
                     || path == admin.join("gitdir")
                     || ["refs", "info", "reftable"]
