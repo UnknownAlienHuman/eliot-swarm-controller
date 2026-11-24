@@ -957,8 +957,8 @@ with kind `project.check.finished`, its triggering edit sequence and exit code.
 The turn-end reminder accepts a zero-exit receipt for the same generation and
 turn window when its triggering edit sequence covers the latest observed edit.
 An exact native check must start after the latest edit and retain a matching
-zero exit. A passing Goal round for the same revision also counts after the
-latest edit, including when it settles after turn completion.
+zero exit. A passing Goal round that settles the current Goal revision also
+counts after the latest edit, including when it settles after turn completion.
 Older native command events without a truncation flag count when the exact
 command is short enough to rule out truncation. Fact counters use later
 confirmed check, command or Git evidence where available. Without a confirming

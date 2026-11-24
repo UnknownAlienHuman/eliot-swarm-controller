@@ -197,7 +197,7 @@ impl Store {
                 WHERE e.agent = ?1 AND e.generation = ?2 AND e.seq > ?8 AND e.ts >= ?4
                   AND e.kind = 'goal.round' AND e.source = 'daemon'
                   AND json_extract(e.data, '$.mode') = 'eliot'
-                  AND json_extract(e.data, '$.revision') = ?9
+                  AND json_extract(e.data, '$.revision') + 1 = ?9
                   AND json_extract(e.data, '$.outcome') = 'completed'
                   AND json_type(e.data, '$.exit_code') = 'integer'
                   AND json_extract(e.data, '$.exit_code') = 0
