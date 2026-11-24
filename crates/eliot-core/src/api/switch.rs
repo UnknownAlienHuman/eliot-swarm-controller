@@ -115,6 +115,8 @@ pub enum HandoffReason {
     Routing,
     /// The source's provider scope is on a quota or rate-limit hold.
     ProviderHold,
+    /// The provider withheld a response from a failed Codex turn.
+    ProviderResponseWithheld,
     /// The source session was lost or failed.
     SessionLost,
 }
@@ -125,6 +127,7 @@ impl HandoffReason {
             Self::Request => "request",
             Self::Routing => "routing",
             Self::ProviderHold => "provider_hold",
+            Self::ProviderResponseWithheld => "provider_response_withheld",
             Self::SessionLost => "session_lost",
         }
     }

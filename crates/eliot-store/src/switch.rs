@@ -766,6 +766,7 @@ fn continuation_directive(
             "{source} is on a provider {} hold",
             kind.map_or("quota", core::ProviderRestrictionKind::as_str)
         ),
+        HandoffReason::ProviderResponseWithheld => "the provider withheld the response".to_owned(),
         HandoffReason::SessionLost => format!("the {source} session was lost or failed"),
     };
     let caution = if uncertain {
@@ -2044,6 +2045,31 @@ impl Store {
                     }),
                 )?);
             } else {
+                let mut settled_data = json!({
+                    "switch_command": id,
+                    "task_command": request.task_command,
+                    "reason": handoff_reason,
+                    "kind": continuation.and_then(|value| value.kind),
+                    "requested_by": requested_by,
+                    "continued_to": value.created.as_ref()
+                        .filter(|_| state == CommandState::Applied)
+                        .map(|agent| &agent.agent),
+                    "profile": launch.args.get("profile"),
+                    "uncertain": uncertain && state == CommandState::Applied,
+                    "error": value.error,
+                    "state": state,
+                });
+                if handoff_reason == Some(HandoffReason::ProviderResponseWithheld)
+                    && state == CommandState::Applied
+                    && let Some(created) = value.created.as_ref()
+                    && let Some(destination) =
+                        load_agent_by_num(&tx, parse_agent_id(&created.agent)?)?
+                {
+                    settled_data["message"] = json!(format!(
+                        "Provider withheld the response; switched to {}",
+                        destination.profile
+                    ));
+                }
                 events.push(insert_daemon_event(
                     &tx,
                     now,
@@ -2051,20 +2077,7 @@ impl Store {
                     "handoff",
                     Some(parse_agent_id(&request.from)?),
                     Some(request.from_generation),
-                    json!({
-                        "switch_command": id,
-                        "task_command": request.task_command,
-                        "reason": handoff_reason,
-                        "kind": continuation.and_then(|value| value.kind),
-                        "requested_by": requested_by,
-                        "continued_to": value.created.as_ref()
-                            .filter(|_| state == CommandState::Applied)
-                            .map(|agent| &agent.agent),
-                        "profile": launch.args.get("profile"),
-                        "uncertain": uncertain && state == CommandState::Applied,
-                        "error": value.error,
-                        "state": state,
-                    }),
+                    settled_data,
                 )?);
             }
             commit_transaction(tx, &self.write_faulted)?;

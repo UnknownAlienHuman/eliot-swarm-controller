@@ -29,6 +29,79 @@ impl CompletionWorktreeCapture {
     }
 }
 
+fn provider_response_withheld_event_tx(
+    tx: &Transaction<'_>,
+    agent: &Agent,
+    terminal: &core::NativeEvent,
+    now: i64,
+) -> Result<Option<Event>> {
+    if agent.harness != "codex"
+        || agent.observe_only
+        || terminal.kind != "turn.completed"
+        || terminal.data["outcome"].as_str() != Some("failure")
+        || terminal.data["provider_response_withheld"].as_bool() != Some(true)
+    {
+        return Ok(None);
+    }
+    let (Some(turn_id), Some(task_command)) = (
+        terminal.data["turn_id"].as_str(),
+        terminal.data["command_id"].as_str(),
+    ) else {
+        return Ok(None);
+    };
+    if turn_id.is_empty() || task_command.is_empty() {
+        return Ok(None);
+    }
+    let agent_num = parse_agent_id(&agent.id)?;
+    let exact_pending_turn: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM turns t JOIN commands c ON c.id = ?4
+                 WHERE t.agent = ?1 AND t.generation = ?2 AND t.turn_id = ?3
+                   AND t.start_command_id = ?4 AND t.state = 'completed'
+                   AND t.outcome = 'failure' AND t.resolution_source IS NULL
+                   AND t.insertion_seq = (
+                       SELECT MAX(latest.insertion_seq) FROM turns latest
+                       WHERE latest.agent = t.agent AND latest.generation = t.generation
+                   )
+                   AND c.target = ?1 AND c.generation = ?2 AND c.verb = 'send'
+                   AND c.turn_id = ?3 AND c.state = 'applied'
+                   AND (SELECT COUNT(*) FROM turns bound
+                        WHERE bound.agent = ?1 AND bound.generation = ?2
+                          AND bound.start_command_id = ?4) = 1
+                   AND NOT EXISTS(
+                       SELECT 1 FROM events resolved
+                       WHERE resolved.agent = ?1 AND resolved.generation = ?2
+                         AND resolved.kind = 'turn.resolved'
+                         AND json_extract(resolved.data, '$.turn_id') = ?3
+                   )
+                   AND NOT EXISTS(
+                       SELECT 1 FROM events indexed
+                       WHERE indexed.agent = ?1 AND indexed.generation = ?2
+                         AND indexed.kind = 'provider.response_withheld'
+                         AND (json_extract(indexed.data, '$.turn_id') = ?3
+                              OR json_extract(indexed.data, '$.task_command') = ?4)
+                   )
+             )",
+            params![agent_num, agent.generation, turn_id, task_command],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    if !exact_pending_turn {
+        return Ok(None);
+    }
+    insert_daemon_event(
+        tx,
+        now,
+        "provider.response_withheld",
+        "provider",
+        Some(agent_num),
+        Some(agent.generation),
+        json!({"turn_id": turn_id, "task_command": task_command}),
+    )
+    .map(Some)
+}
+
 impl Store {
     /// Validate an exact stream sample. Active-turn samples remain in the
     /// Monitor cache; only an idle sample can refresh the retained projection.
@@ -1073,6 +1146,13 @@ impl Store {
                 native_event,
                 &next,
             )?;
+            if !observed
+                && batch.source == "stream"
+                && let Some(event) =
+                    provider_response_withheld_event_tx(&tx, &next, native_event, now)?
+            {
+                provider_events.push(event);
+            }
             // The inserted turn binds the exact admitted revision even if
             // the Agent has a newer overlay.
             if !observed
