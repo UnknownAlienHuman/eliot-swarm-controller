@@ -19,7 +19,7 @@ pub enum OwnerInboxKind {
     Stuck,
     HarnessCheck,
     HarnessAuth,
-    /// A successor continued after a turn whose effects may be partial.
+    /// A pending handoff or a successor continued after uncertain turn effects.
     Handoff,
     /// Work that is not fully recorded in Git.
     WorkNotInGit,

@@ -792,7 +792,8 @@ fn project_handoffs(
     }
     let mut stmt = projection_query(
         db,
-        "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message')
+        "SELECT e.seq, e.ts, a.id, a.generation, json_extract(e.data,'$.message'),
+                json_extract(e.data,'$.reason')
          FROM events e INDEXED BY events_kind
          JOIN agents a ON a.id = e.agent AND a.generation = e.generation
          WHERE e.kind = 'handoff.waiting' AND a.archived = 0
@@ -803,10 +804,30 @@ fn project_handoffs(
                         WHERE h.kind IN ('quota','rate_limit')
                           AND h.scope = CASE WHEN json_type(a.profile_snapshot,'$.account') = 'text'
                               THEN 'account:' || json_extract(a.profile_snapshot,'$.account') || '.' || a.harness
-                              ELSE 'profile:' || a.profile END)))
+                              ELSE 'profile:' || a.profile END))
+                OR (json_extract(e.data,'$.reason') = 'provider_response_withheld'
+                    AND a.harness = 'codex' AND a.state IN ('idle','lost','failed')
+                    AND EXISTS(SELECT 1 FROM events withheld INDEXED BY events_agent
+                        WHERE withheld.agent = e.agent AND withheld.generation = e.generation
+                          AND withheld.kind = 'provider.response_withheld'
+                          AND json_type(withheld.data,'$.turn_id') = 'text'
+                          AND json_extract(withheld.data,'$.turn_id') <> ''
+                          AND json_type(withheld.data,'$.task_command') = 'text'
+                          AND json_extract(withheld.data,'$.task_command') <> ''
+                          AND withheld.seq < e.seq)))
            AND NOT EXISTS(SELECT 1 FROM events newer INDEXED BY events_agent
                WHERE newer.agent = a.id AND newer.generation = a.generation AND newer.seq > e.seq
-                 AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))",
+                 AND newer.kind IN ('handoff.waiting','handoff.queued','handoff.settled'))
+           AND (json_extract(e.data,'$.reason') <> 'provider_response_withheld'
+                OR (NOT EXISTS(SELECT 1 FROM events newer_success INDEXED BY events_agent
+                        WHERE newer_success.agent = a.id AND newer_success.generation = a.generation
+                          AND newer_success.seq > e.seq
+                          AND newer_success.kind = 'provider.failover_settled'
+                          AND json_extract(newer_success.data,'$.state') = 'applied')
+                    AND NOT EXISTS(SELECT 1 FROM events newer_turn INDEXED BY events_agent
+                        WHERE newer_turn.agent = a.id AND newer_turn.generation = a.generation
+                          AND newer_turn.seq > e.seq
+                          AND newer_turn.kind IN ('turn.started','turn.completed'))))",
         "'waiting:a' || a.id || ':g' || a.generation = ?1",
         bindings,
     )?;
@@ -818,12 +839,31 @@ fn project_handoffs(
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
             ))
         })
         .map_err(sql_error)?;
     for row in rows {
-        let (seq, since, agent, generation, message) = row.map_err(sql_error)?;
-        items.push(item(
+        let (seq, since, agent, generation, message, reason) = row.map_err(sql_error)?;
+        let inspect = action("inspect", "agent.get", json!({"id":format!("a{agent}")}));
+        let (choices, instructions) = if reason == "provider_response_withheld" {
+            (
+                vec![
+                    inspect,
+                    action(
+                        "review_profiles",
+                        "settings.read",
+                        json!({"sections":["profiles","routing"]}),
+                    ),
+                ],
+                Some(
+                    "Review configured profiles and routing to choose another preset, or leave this handoff pending.",
+                ),
+            )
+        } else {
+            (vec![inspect], None)
+        };
+        let mut projected = item(
             OwnerInboxKind::Handoff,
             format!("waiting:a{agent}:g{generation}"),
             format!("event:{seq}"),
@@ -831,12 +871,10 @@ fn project_handoffs(
             since,
             &message,
             None,
-            vec![action(
-                "inspect",
-                "agent.get",
-                json!({"id":format!("a{agent}")}),
-            )],
-        ));
+            choices,
+        );
+        projected.instructions = instructions.map(str::to_owned);
+        items.push(projected);
     }
     Ok(())
 }
