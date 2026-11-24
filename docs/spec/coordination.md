@@ -191,7 +191,8 @@ with `cleanup.status {id}` or repeat the original call with the same id and filt
 The tally includes pages, inventory issue count, applied, skipped by reason, failed,
 unknown, pending, and confirmed bytes reclaimed. A traversal failure retains the
 tally for work already examined and reports its reason. A daemon restart leaves
-interrupted jobs readable and never replays an uncertain effect.
+interrupted jobs readable and never replays an uncertain effect. Active bulk receipts
+are pinned, and write-history retention for them starts at settlement or interruption.
 
 Continue a cleanup review with the opaque `continuation` string from the previous
 response and the same scope, project and age cutoff. The CLI passes it as

@@ -729,13 +729,38 @@ impl Store {
         id: &str,
         method: &str,
         result: &impl serde::Serialize,
+        finished_at: Option<i64>,
     ) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let mut result = serde_json::to_value(result)
+            .map_err(|_| Error::new("internal", "cleanup receipt cannot encode"))?;
+        if let Some(finished_at) = finished_at {
+            result["finished_at"] = Value::from(finished_at);
+        }
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        update_cleanup_result(&tx, principal, id, method, &result)?;
+        commit_transaction(tx, &self.write_faulted)
+    }
+
+    /// An interrupted bulk traversal keeps its last tallies and page receipt.
+    /// Daemon startup has exclusive Store custody and never resumes effects.
+    pub fn interrupt_bulk_cleanup_jobs(&mut self, now: i64) -> Result<()> {
         self.ensure_writer_healthy()?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        update_cleanup_result(&tx, principal, id, method, result)?;
+        tx.execute(
+            "UPDATE writes
+             SET result=json_set(result, '$.state', 'interrupted',
+                          '$.reason', 'cleanup_worker_lost', '$.finished_at', ?1)
+             WHERE method='cleanup.apply_all' AND json_extract(result, '$.state')='running'",
+            [now],
+        )
+        .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)
     }
 

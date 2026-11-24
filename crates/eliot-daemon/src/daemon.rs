@@ -431,6 +431,7 @@ async fn initialize_runtime(
             logging::record(&policy, "daemon.store_migrated", &[], None);
         }
     })?;
+    store.interrupt_bulk_cleanup_jobs(now_ms())?;
     let provider_scopes = crate::config::configured_provider_account_scopes(data_dir.path())
         .map_err(startup_config_failure)?;
     store.attribute_legacy_provider_holds(&provider_scopes)?;

@@ -67,6 +67,7 @@ impl Router {
                 &request.id,
                 APPLY,
                 &response,
+                None,
             );
             router.log_cleanup_error(&request.id, result.and(settle));
         });
@@ -317,14 +318,16 @@ impl Router {
     }
 
     async fn persist_bulk_status(&self, status: &CleanupJobStatus) -> Result<()> {
-        self.inner
-            .store
-            .lock()
-            .await
-            .update_cleanup_job(OWNER, &status.id, APPLY_ALL, status)
+        self.inner.store.lock().await.update_cleanup_job(
+            OWNER,
+            &status.id,
+            APPLY_ALL,
+            status,
+            (status.state != CleanupJobState::Running).then(now_ms),
+        )
     }
 
-    fn check_cleanup_worker_shutdown(&self) -> Result<()> {
+    pub(super) fn check_cleanup_worker_shutdown(&self) -> Result<()> {
         if self.is_force_requested() {
             return Err(Error::new(
                 "interrupted",

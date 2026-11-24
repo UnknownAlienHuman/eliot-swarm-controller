@@ -2374,6 +2374,12 @@ impl Router {
             } else {
                 self.cleanup_remove(name, item, request, false).await
             };
+            if removal
+                .as_ref()
+                .is_err_and(|error| error.code == "interrupted")
+            {
+                return removal.map(|_| ());
+            }
             if automatic && let Err(error) = &removal {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
@@ -2474,6 +2480,7 @@ impl Router {
                     "branch tip moved since the plan was retained",
                 ));
             }
+            self.check_cleanup_worker_shutdown()?;
             Self::delete_local_branch(git, &artifact.identity).await?;
             if let Some(classification) = remote_classification {
                 Self::delete_remote_branch(
@@ -2521,6 +2528,7 @@ impl Router {
                 }
             }
             let (profile, native_ref) = frozen_archive_profile(&agent, artifact)?;
+            self.check_cleanup_worker_shutdown()?;
             return self
                 .inner
                 .plugin_host
@@ -2567,6 +2575,7 @@ impl Router {
             let absence_deadline = Instant::now() + CLEANUP_ABSENCE_OBSERVATION_BUDGET;
             {
                 let store = self.inner.store.lock().await;
+                self.check_cleanup_worker_shutdown()?;
                 if !store.cleanup_authorized(principal, artifact)?
                     || !store.cleanup_agent_quiescent(artifact)?
                 {
@@ -2619,6 +2628,7 @@ impl Router {
             Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             {
                 let store = self.inner.store.lock().await;
+                self.check_cleanup_worker_shutdown()?;
                 if !store.cleanup_authorized(principal, artifact)?
                     || !store.cleanup_agent_quiescent(artifact)?
                 {
@@ -2651,6 +2661,7 @@ impl Router {
                 Self::cleanup_check_daemon_lock(Path::new(&artifact.path))?;
             }
             let store = self.inner.store.lock().await;
+            self.check_cleanup_worker_shutdown()?;
             if artifact.state == "ownership_root" && tree.contains_daemon_lock {
                 return Err(Error::new(
                     "nested_daemon_lock",
@@ -2674,7 +2685,9 @@ impl Router {
             // The reservation fences Agent resume and another artifact
             // attempt after this dispatch check. The pinned tree owns removal
             // while the Store remains available to readers and other Agents.
-            let delete = tokio::task::spawn_blocking(move || tree.remove());
+            let router = self.clone();
+            let delete =
+                tokio::task::spawn_blocking(move || tree.remove(|| router.is_force_requested()));
             drop(store);
             delete
                 .await

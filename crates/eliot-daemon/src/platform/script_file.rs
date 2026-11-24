@@ -474,8 +474,8 @@ impl CleanupTree {
     }
 
     /// Every error after the first attempted disposition is unknown. No retry.
-    pub(crate) fn remove(mut self) -> Result<u64> {
-        for file in self.entries.drain(..) {
+    pub(crate) fn remove(mut self, cancelled: impl Fn() -> bool) -> Result<u64> {
+        for (index, file) in self.entries.drain(..).enumerate() {
             let unknown = |_| {
                 Error::new(
                     "unknown",
@@ -489,6 +489,16 @@ impl CleanupTree {
                     "unknown",
                     "link count changed after preflight; no replay",
                 ));
+            }
+            if cancelled() {
+                return Err(if index == 0 {
+                    Error::new(
+                        "interrupted",
+                        "forced shutdown interrupted cleanup before deletion",
+                    )
+                } else {
+                    Error::new("unknown", "forced shutdown interrupted a partial cleanup")
+                });
             }
             native::delete_handle(&file)
                 .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;

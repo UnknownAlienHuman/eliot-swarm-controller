@@ -1104,6 +1104,14 @@ impl Router {
         }
         self.inner.workspaces.stop_all(true).await;
         self.inner.plugin_host.force_all(false).await;
+        let mut progress = self.progress_receiver();
+        let _ = timeout_at(deadline, async {
+            while self.inner.cleanup_worker.lock_recover().is_some() {
+                progress.changed().await?;
+            }
+            Ok::<(), tokio::sync::watch::error::RecvError>(())
+        })
+        .await;
     }
     pub(crate) async fn recover_workspaces(&self) -> Result<()> {
         for id in self.inner.workspaces.recover().await? {

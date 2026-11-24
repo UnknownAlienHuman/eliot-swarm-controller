@@ -1023,6 +1023,10 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
                AND NOT (method = 'cleanup.apply' AND EXISTS(
                    SELECT 1 FROM cleanup_plans p WHERE p.apply_id=writes.id
                ))
+               AND NOT (method = 'cleanup.apply_all' AND (
+                   json_extract(result, '$.state') IS 'running'
+                   OR COALESCE(json_extract(result, '$.finished_at'), created_at) > ?1
+               ))
              ORDER BY created_at, id LIMIT ?2
          )",
         params![
