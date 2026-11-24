@@ -823,7 +823,12 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
     use std::collections::BTreeSet;
     let mut agents = BTreeSet::new();
     let mut statement = connection
-        .prepare("SELECT DISTINCT owner FROM processes WHERE state IN ('running','unknown')")
+        // Without planner statistics SQLite can scan the covering index over
+        // every retained process, including exited ones.
+        .prepare(
+            "SELECT DISTINCT owner FROM processes INDEXED BY processes_live_owner
+             WHERE state IN ('running','unknown')",
+        )
         .map_err(sql_error)?;
     let owners = statement
         .query_map([], |row| row.get::<_, String>(0))
