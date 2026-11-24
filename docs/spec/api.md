@@ -1032,7 +1032,8 @@ exact-turn association, which acknowledges native admission of those values;
 record on the bound turn. Muse exposes the requested selector in `effective.model`
 as unverified at readiness and on turns lacking provider model evidence, including
 exact echoes. In that case `model_verified` is false and `model_unverified_reason`
-explains the missing evidence. The turn retains its native outcome. Muse verifies
+explains the missing evidence. `swarm show` displays the model and the reason
+when present. The turn retains its native outcome. Muse verifies
 the model only on matching foreground provider evidence. An explicit mismatch
 keeps the effective model unset and names both IDs in the profile hold, the
 Owner inbox and `diagnose`

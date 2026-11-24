@@ -199,6 +199,19 @@ pub(crate) async fn run_show(
                 println!("Policy opt-out: {reason}");
             }
             println!("Harness/profile: {}/{}", agent.harness, agent.profile);
+            if let Some(effective) = &agent.effective
+                && let Some(model) = effective["model"].as_str()
+            {
+                if effective["model_verified"].as_bool() == Some(false) {
+                    if let Some(reason) = effective["model_unverified_reason"].as_str() {
+                        println!("Model: {model} (unverified, {reason})");
+                    } else {
+                        println!("Model: {model} (unverified)");
+                    }
+                } else {
+                    println!("Model: {model}");
+                }
+            }
             if let Some(workspace) = &agent.workspace {
                 println!("Workspace: {workspace}");
             }
