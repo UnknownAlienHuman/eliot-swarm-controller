@@ -790,12 +790,9 @@ of the explicitly selected release scope.
       control template (Uno.Themes' Material styles and Material
       Components' state layers as the pattern): a state layer in the
       content color on hover (8 %) and press (12 %), a ripple from the press
-      point, a slight press scale on M3's emphasized motion (150 ms for
-      states), the FAB's key and ambient shadows drawn under it as the
-      design's CSS shadows render (each blur a Gaussian falloff; WinUI's
-      ThemeShadow draws nothing outside a popup without receivers), deeper on
-      hover; the composer lifted the same way (elevation 0 to 3); popovers
-      and menus are WinUI flyouts with their own entrance and shadow (D11).
+      point, a press scale and a pressed corner on the brand book's springs,
+      the composer lifted on a real shadow (D11); popovers and menus are
+      WinUI flyouts with their own entrance and shadow (D11).
       Shapes: everything pressed is a
       pill (buttons, icon buttons, chips, rows, segments, dropdowns; radius half
       the height), cards and tool rows 12, the composer 20, dialogs 28. The
@@ -1022,9 +1019,18 @@ of the explicitly selected release scope.
     distinct at compile time; Attach to project is its own chooser flyout
     keyed by project id and checkout. The in-window menus and popovers are
     removed.
-  - [ ] **Styles, shapes, motion, shadows, wave.** Carrier control types with
-    implicit styles and styles set by key; spring-sampled template key frames;
-    composition-host shadows; the wave as a re-templated `ProgressBar`.
+  - [x] **Shadows, wave, switch and motion.** The composer's `elevation-1` and
+    the night themes' glow behind its main action are Composition shadows on
+    Reactor's composition host (`shadow.rs`), the brand book's layers per
+    theme; the true-black themes draw the 1-DIP ring. A card's hover lift is
+    WinUI's own `ThemeShadow` in its template (or the ring). The running
+    turn's bar is the wave, a re-templated `ProgressBar`; the switch is
+    Google's 52 × 32 `ToggleSwitch`. Template motion is sampled from the
+    springs: the press scale and the pressed corner on spatial-fast, state
+    layers and the knob's state layer on effects-fast; with Windows'
+    animation effects off every change is instant and the wave is still.
+  - [ ] **Styles and shapes.** Carrier control types with implicit styles and
+    styles set by key, one style per shape.
   - [ ] **Screens.** Sidebar, Home, conversation (header, composer action with
     Add as a note, decision panel, states), right pane (Changes with the review
     digest, Agents, Details, Terminal), project page, Inbox, Agents, Automations,
