@@ -11,14 +11,16 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use eliot_core::api::{
     AgentArchiveRequest, AgentDeleteRequest, AgentGetRequest, AgentGetResponse, AgentListRequest,
     AgentListResponse, AgentResultRequest, AgentResultResponse, AgentTreeResponse, ArchivedFilter,
     ChatAttachRequest, ChatDetachRequest, ChatOrganizationMutationResponse,
-    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CleanupPlan,
-    CleanupPlanRequest, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
+    ChatOrganizationRequest, ChatOrganizationResponse, ChatTagRequest, CleanupApplyRequest,
+    CleanupApplyResponse, CleanupJobState, CleanupJobStatus, CleanupPlan, CleanupPlanRequest,
+    CleanupStatusRequest, CommandCancelRequest, CommandCancelResponse, CommandChildrenRequest,
     CommandChildrenResponse, CommandGetRequest, CommandResolution, CommandResolveRequest,
     CommandResolveResponse, CommandSubmitRequest, CommandSubmitResponse, DaemonStatusRequest,
     DaemonStatusResponse, DiagnoseRequest, DiagnoseResponse, EventsBoundsRequest,
@@ -47,6 +49,7 @@ const MAX_TEXT_BYTES: usize = 512 * 1024;
 pub const MAX_CONCURRENT_READS: usize = 4;
 /// Server-side scan bound per `events.read` call.
 const EVENT_SCAN_ROWS: usize = 1_000;
+const CLEANUP_STATUS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Resolve the daemon data directory with the same environment, saved-selection,
 /// and platform-default precedence as the CLI.
@@ -182,6 +185,81 @@ pub async fn cleanup_plan_page(
             ));
         }
         request.continuation = Some(next.clone());
+    }
+}
+
+/// Apply one reviewed cleanup page and, when the daemon reports an async job,
+/// wait for its terminal status under the original mutation ID.
+pub async fn cleanup_apply_and_wait(
+    data_dir: &Path,
+    request: &CleanupApplyRequest,
+) -> Result<(CleanupApplyResponse, Option<String>)> {
+    let initial: CleanupApplyResponse =
+        eliot_daemon::client_call_typed(data_dir, "cleanup.apply", request).await?;
+    let Some(initial_state) = initial.state.as_ref() else {
+        // An older daemon returned only the settled response fields.
+        return Ok((initial, None));
+    };
+
+    let status_request = CleanupStatusRequest {
+        id: request.id.clone(),
+    };
+    let mut wait = matches!(initial_state, CleanupJobState::Running);
+    loop {
+        if wait {
+            tokio::time::sleep(CLEANUP_STATUS_POLL_INTERVAL).await;
+        }
+        let status: CleanupJobStatus =
+            eliot_daemon::client_call_typed(data_dir, "cleanup.status", &status_request).await?;
+        if status.id != request.id {
+            return Err(Error::new(
+                "source_integrity",
+                "cleanup status returned a different job ID",
+            ));
+        }
+        let CleanupJobStatus {
+            id: _,
+            state,
+            apply,
+            reason,
+            tally: _,
+        } = status;
+        match state {
+            CleanupJobState::Running => wait = true,
+            CleanupJobState::Completed => {
+                let mut apply = apply.ok_or_else(|| {
+                    Error::new("unknown", "completed cleanup job has no page result")
+                })?;
+                apply.state = Some(CleanupJobState::Completed);
+                return Ok((apply, None));
+            }
+            CleanupJobState::Failed => {
+                let mut apply = apply.ok_or_else(|| {
+                    Error::new("unknown", "failed cleanup job has no page result")
+                })?;
+                apply.state = Some(CleanupJobState::Failed);
+                return Ok((
+                    apply,
+                    Some(format!(
+                        "Cleanup failed: {}",
+                        reason.as_deref().unwrap_or("the job reported failure")
+                    )),
+                ));
+            }
+            CleanupJobState::Interrupted => {
+                let mut apply = apply.ok_or_else(|| {
+                    Error::new("unknown", "interrupted cleanup job has no page result")
+                })?;
+                apply.state = Some(CleanupJobState::Interrupted);
+                return Ok((
+                    apply,
+                    Some(format!(
+                        "Cleanup interrupted: {}",
+                        reason.as_deref().unwrap_or("the job was interrupted")
+                    )),
+                ));
+            }
+        }
     }
 }
 

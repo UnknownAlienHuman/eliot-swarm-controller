@@ -363,8 +363,18 @@ pub fn result_lines(
             .filter(|item| item.outcome == outcome)
             .count()
     };
+    let state = reply
+        .state
+        .as_ref()
+        .map(|state| match state {
+            eliot_core::api::CleanupJobState::Running => "Running · ",
+            eliot_core::api::CleanupJobState::Completed => "Completed · ",
+            eliot_core::api::CleanupJobState::Failed => "Failed · ",
+            eliot_core::api::CleanupJobState::Interrupted => "Interrupted · ",
+        })
+        .unwrap_or_default();
     let mut lines = vec![format!(
-        "Removed {} ({}) · kept {} · couldn't confirm {}",
+        "{state}Removed {} ({}) · kept {} · couldn't confirm {}",
         count("removed"),
         size_words(reply.bytes_reclaimed),
         count("skipped"),

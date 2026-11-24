@@ -267,6 +267,15 @@ pub(crate) enum CleanupCommand {
         )]
         after: Option<String>,
     },
+    ApplyAll {
+        #[arg(long, value_parser=["all","project"])]
+        scope: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        /// Exclusive Unix-millisecond creation cutoff, as in `cleanup plan`.
+        #[arg(long, value_name = "UNIX_MS")]
+        older_than: Option<i64>,
+    },
     Apply {
         plan_id: String,
         /// Apply only this safe candidate ID. Repeat to select multiple.
@@ -276,6 +285,10 @@ pub(crate) enum CleanupCommand {
         /// remote as well. Owner-only; never automatic.
         #[arg(long)]
         delete_remote: bool,
+    },
+    Status {
+        /// Mutation/job ID printed by `cleanup apply` or `cleanup apply-all`.
+        id: String,
     },
 }
 #[derive(Args)]
