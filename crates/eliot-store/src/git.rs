@@ -335,7 +335,7 @@ pub struct CodeProgressState {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct GitWorkStateRow {
+pub(super) struct GitWorkStateRow {
     base_oid: Option<String>,
     commits_ahead: Option<i64>,
     files_changed: Option<i64>,
@@ -360,24 +360,28 @@ fn load_git_work_state(
                     last_write_at, last_commit_at
              FROM git_work_state WHERE workspace = ?1",
             [workspace],
-            |row| {
-                Ok(GitWorkStateRow {
-                    base_oid: row.get(0)?,
-                    commits_ahead: row.get(1)?,
-                    files_changed: row.get(2)?,
-                    insertions: row.get(3)?,
-                    deletions: row.get(4)?,
-                    diff_digest: row.get(5)?,
-                    dirty_digest: row.get(6)?,
-                    work_available: row.get::<_, i64>(7)? != 0,
-                    work_error: row.get(8)?,
-                    last_write_at: row.get(9)?,
-                    last_commit_at: row.get(10)?,
-                })
-            },
+            git_work_state_from_row,
         )
         .optional()
         .map_err(sql_error)
+}
+
+pub(super) fn git_work_state_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<GitWorkStateRow> {
+    Ok(GitWorkStateRow {
+        base_oid: row.get("base_oid")?,
+        commits_ahead: row.get("commits_ahead")?,
+        files_changed: row.get("files_changed")?,
+        insertions: row.get("insertions")?,
+        deletions: row.get("deletions")?,
+        diff_digest: row.get("diff_digest")?,
+        dirty_digest: row.get("dirty_digest")?,
+        work_available: row.get::<_, i64>("work_available")? != 0,
+        work_error: row.get("work_error")?,
+        last_write_at: row.get("last_write_at")?,
+        last_commit_at: row.get("last_commit_at")?,
+    })
 }
 
 /// One short Store fact about a workspace's committed Git work, for a
@@ -554,12 +558,14 @@ fn turn_activity_counts(
         )
         .optional()
         .map_err(sql_error)?;
-    Ok(counts.map(|(tools, messages)| {
-        (
-            u64::try_from(tools.max(0)).unwrap_or(0),
-            u64::try_from(messages.max(0)).unwrap_or(0),
-        )
-    }))
+    Ok(counts.map(normalized_turn_counts))
+}
+
+pub(super) fn normalized_turn_counts((tools, messages): (i64, i64)) -> (u64, u64) {
+    (
+        u64::try_from(tools.max(0)).unwrap_or(0),
+        u64::try_from(messages.max(0)).unwrap_or(0),
+    )
 }
 
 impl Store {
@@ -574,7 +580,7 @@ impl Store {
         self.work_summary_by_num(agent_num, generation, workspace, active_turn)
     }
 
-    pub(super) fn work_summary_by_num(
+    fn work_summary_by_num(
         &self,
         agent_num: i64,
         generation: i64,
@@ -599,64 +605,69 @@ impl Store {
             )
             .optional()
             .map_err(sql_error)?;
-        // No Git source row yet: the daemon opens it while preparing the
-        // generation, before the Agent starts, so nothing was read yet. A
-        // failed read marks the row's health instead.
-        let Some((health, last_store_seq)) = source else {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                "pending",
-                turn_counts,
-            ));
+        let work = match source.as_ref() {
+            Some((health, Some(_))) if !matches!(health.as_str(), "error" | "stale") => {
+                load_git_work_state(&self.connection, workspace)?
+            }
+            _ => None,
         };
-        if matches!(health.as_str(), "error" | "stale") {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                "git_unavailable",
-                turn_counts,
-            ));
-        }
-        if last_store_seq.is_none() {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                "pending",
-                turn_counts,
-            ));
-        }
-        let Some(row) = load_git_work_state(&self.connection, workspace)? else {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                "pending",
-                turn_counts,
-            ));
-        };
-        if !row.work_available {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                row.work_error.unwrap_or_else(|| "unavailable".to_owned()),
-                turn_counts,
-            ));
-        }
-        let (Some(commits_ahead), Some(files_changed), Some(insertions), Some(deletions)) = (
-            to_u64_counter(row.commits_ahead),
-            to_u64_counter(row.files_changed),
-            to_u64_counter(row.insertions),
-            to_u64_counter(row.deletions),
-        ) else {
-            return Ok(core::api::WorkSummaryView::unavailable(
-                "unavailable",
-                turn_counts,
-            ));
-        };
-        Ok(core::api::WorkSummaryView {
-            available: true,
-            reason: None,
-            commits_ahead: Some(commits_ahead),
-            files_changed: Some(files_changed),
-            insertions: Some(insertions),
-            deletions: Some(deletions),
-            last_write_at: row.last_write_at,
-            last_commit_at: row.last_commit_at,
-            tool_calls: turn_counts.map(|(tools, _)| tools),
-            messages: turn_counts.map(|(_, msgs)| msgs),
-        })
+        Ok(project_work_summary(true, source, work, turn_counts))
     }
+}
 
+pub(super) fn project_work_summary(
+    has_workspace: bool,
+    source: Option<(String, Option<i64>)>,
+    work: Option<GitWorkStateRow>,
+    turn_counts: Option<(u64, u64)>,
+) -> core::api::WorkSummaryView {
+    if !has_workspace {
+        return core::api::WorkSummaryView::unavailable("no_workspace", turn_counts);
+    }
+    // No Git source row yet: the daemon opens it while preparing the
+    // generation, before the Agent starts, so nothing was read yet. A
+    // failed read marks the row's health instead.
+    let Some((health, last_store_seq)) = source else {
+        return core::api::WorkSummaryView::unavailable("pending", turn_counts);
+    };
+    if matches!(health.as_str(), "error" | "stale") {
+        return core::api::WorkSummaryView::unavailable("git_unavailable", turn_counts);
+    }
+    if last_store_seq.is_none() {
+        return core::api::WorkSummaryView::unavailable("pending", turn_counts);
+    }
+    let Some(row) = work else {
+        return core::api::WorkSummaryView::unavailable("pending", turn_counts);
+    };
+    if !row.work_available {
+        return core::api::WorkSummaryView::unavailable(
+            row.work_error.unwrap_or_else(|| "unavailable".to_owned()),
+            turn_counts,
+        );
+    }
+    let (Some(commits_ahead), Some(files_changed), Some(insertions), Some(deletions)) = (
+        to_u64_counter(row.commits_ahead),
+        to_u64_counter(row.files_changed),
+        to_u64_counter(row.insertions),
+        to_u64_counter(row.deletions),
+    ) else {
+        return core::api::WorkSummaryView::unavailable("unavailable", turn_counts);
+    };
+    core::api::WorkSummaryView {
+        available: true,
+        reason: None,
+        commits_ahead: Some(commits_ahead),
+        files_changed: Some(files_changed),
+        insertions: Some(insertions),
+        deletions: Some(deletions),
+        last_write_at: row.last_write_at,
+        last_commit_at: row.last_commit_at,
+        tool_calls: turn_counts.map(|(tools, _)| tools),
+        messages: turn_counts.map(|(_, msgs)| msgs),
+    }
+}
+
+impl Store {
     pub fn code_progress_state(
         &self,
         agent: &str,

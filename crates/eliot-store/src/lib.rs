@@ -5882,6 +5882,8 @@ pub struct HeavyWindowRow {
     pub data: Value,
 }
 
+const HEAVY_ROLLUP_EPISODES: i64 = 201;
+
 impl Store {
     /// Latest retained `session.usage` snapshot for one Agent generation, or
     /// `None` when no session fact was ever committed. Only the latest
@@ -5922,45 +5924,58 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT 201",
+                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
         let rows = statement
-            .query_map(params![agent_num, generation], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![agent_num, generation, HEAVY_ROLLUP_EPISODES],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(sql_error)?;
-        let mut latest_category = None;
-        let mut latest_ended_at = None;
-        let mut total_cpu_ms: u64 = 0;
-        for row in rows {
-            let raw = row.map_err(sql_error)?;
-            let data: Value = serde_json::from_str(&raw)
-                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
-            if latest_category.is_none() {
-                latest_category = data
-                    .get("category")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
-            }
-            total_cpu_ms = total_cpu_ms.saturating_add(
-                data.get("cpu_ms")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
-            );
-        }
-        let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
-            return Err(Error::new("internal", "heavy episode data is malformed"));
-        };
-        Ok(Some(HeavySummaryView {
-            episodes: count as u64,
-            latest_category: Some(category),
-            latest_ended_at,
-            total_cpu_ms,
-        }))
+        project_heavy_rollup(count, rows.map(|row| row.map_err(sql_error)))
     }
+}
 
+fn project_heavy_rollup(
+    count: i64,
+    rows: impl IntoIterator<Item = Result<String>>,
+) -> Result<Option<HeavySummaryView>> {
+    if count <= 0 {
+        return Ok(None);
+    }
+    let mut latest_category = None;
+    let mut latest_ended_at = None;
+    let mut total_cpu_ms: u64 = 0;
+    for row in rows {
+        let raw = row?;
+        let data: Value = serde_json::from_str(&raw)
+            .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+        if latest_category.is_none() {
+            latest_category = data
+                .get("category")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+        }
+        total_cpu_ms = total_cpu_ms.saturating_add(
+            data.get("cpu_ms")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
+        );
+    }
+    let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
+        return Err(Error::new("internal", "heavy episode data is malformed"));
+    };
+    Ok(Some(HeavySummaryView {
+        episodes: count as u64,
+        latest_category: Some(category),
+        latest_ended_at,
+        total_cpu_ms,
+    }))
+}
+
+impl Store {
     /// Newest journal payload for one kind, if any. Used for diagnostic
     /// readbacks (for example the last `harness_contract_mismatch`); never
     /// for control flow.
@@ -6064,15 +6079,23 @@ impl Store {
         thresholds: &core::SessionGrowthThresholds,
     ) -> Result<Option<SessionGrowthView>> {
         let usage = self.get_session_usage(agent, generation)?;
-        let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
-        let growth =
-            core::evaluate_session_growth(harness, usage.as_ref(), session_bytes, thresholds);
-        Ok(growth.map(|warn| SessionGrowthView {
+        Ok(project_session_growth(harness, usage.as_ref(), thresholds))
+    }
+}
+
+fn project_session_growth(
+    harness: &str,
+    usage: Option<&SessionUsage>,
+    thresholds: &core::SessionGrowthThresholds,
+) -> Option<SessionGrowthView> {
+    let session_bytes = usage.and_then(|usage| usage.session_file_bytes);
+    core::evaluate_session_growth(harness, usage, session_bytes, thresholds).map(|warn| {
+        SessionGrowthView {
             warn: true,
             basis: Some(warn.basis_name().to_owned()),
             message: Some(warn.message),
-        }))
-    }
+        }
+    })
 }
 
 fn agent_config_from_row(

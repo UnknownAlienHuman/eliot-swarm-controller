@@ -4,6 +4,7 @@ use eliot_core::api::{
     AGENT_LIST_STATES, AgentListOrder, AgentStateTotal, AgentSummary, decode_recent_cursor,
     encode_recent_cursor,
 };
+use std::collections::HashMap;
 
 impl Store {
     /// Compact fleet projection for `agent.list`: scope-checked, filtered,
@@ -273,17 +274,24 @@ impl Store {
         if statuses.len() != records.len() {
             return Err(Error::new("internal", "Agent status page is incomplete"));
         }
+        let mut facts = self.fleet_page_facts(&agents)?;
         records
             .into_iter()
             .zip(progress)
             .zip(statuses)
             .map(|((record, last_progress_at), status)| {
+                let facts = facts
+                    .remove(&(record.id, record.generation))
+                    .ok_or_else(|| {
+                        Error::new("internal", "Agent summary page facts are incomplete")
+                    })?;
                 self.summary_from_record(
                     record,
                     now_ms,
                     growth_thresholds,
                     last_progress_at,
                     status,
+                    facts,
                 )
             })
             .collect()
@@ -296,10 +304,18 @@ impl Store {
         growth_thresholds: &core::SessionGrowthThresholds,
         last_progress_at: Option<i64>,
         status: AgentStatusProjection,
+        facts: FleetPageFacts,
     ) -> Result<AgentSummary> {
         let state: AgentState = parse_enum(&record.state, "Agent state")?;
         let id = format_agent_id(record.id);
-        let terminal = self.last_terminal_turn(record.id, record.generation, &record.harness)?;
+        let terminal = facts
+            .terminal
+            .map(|turn| decode_terminal_turn(turn, &record.harness))
+            .transpose()?;
+        let session_usage = facts
+            .session_usage
+            .map(|raw| decode_session_usage(&raw, &record.harness))
+            .transpose()?;
         // Fleet usage prefers the newest terminal turn's native turn usage.
         // When the last turn carries none (Muse never sends turn usage), fall
         // back to the generation's latest retained session snapshot so a
@@ -316,34 +332,32 @@ impl Store {
         {
             Some(usage) => (Some(usage), Some("turn".to_owned())),
             None => {
-                let fallback = self
-                    .get_session_usage(&id, record.generation)?
-                    .and_then(|snapshot| session_fallback_usage(&snapshot));
+                let fallback = session_usage.as_ref().and_then(session_fallback_usage);
                 let scope = fallback.as_ref().map(|_| "session".to_owned());
                 (fallback, scope)
             }
         };
-        let heavy = self.heavy_rollup(&id, record.generation)?;
+        let heavy = if facts.heavy_count > 0 {
+            let episodes: Vec<String> = serde_json::from_str(&facts.heavy_episodes)
+                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            project_heavy_rollup(facts.heavy_count, episodes.into_iter().map(Ok))?
+        } else {
+            None
+        };
         let session_growth =
-            self.session_growth_view(&record.harness, &id, record.generation, growth_thresholds)?;
-        let work = Some(self.work_summary_by_num(
-            record.id,
-            record.generation,
-            record.workspace.as_deref(),
-            record.active_turn.as_deref(),
-        )?);
-        let preview = self.first_input_preview(record.id)?;
-        let repo_common_dir = self
-            .connection
-            .query_row(
-                "SELECT repo_common_dir FROM workspaces WHERE agent = ?1",
-                [record.id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        let (organization, tags, organization_revision) =
-            organization::agent_organization(&self.connection, record.id)?;
+            project_session_growth(&record.harness, session_usage.as_ref(), growth_thresholds);
+        let work = Some(git::project_work_summary(
+            record.workspace.is_some(),
+            facts.git_source,
+            facts.git_work,
+            facts.turn_counts.map(git::normalized_turn_counts),
+        ));
+        let tags = facts
+            .tags
+            .as_deref()
+            .map(organization::decode_tags)
+            .transpose()?
+            .unwrap_or_default();
         // The retained `effective.model` of the row already read (the value
         // `agent.get`/`agent.result` return), so the list needs no extra read.
         let model = record
@@ -364,12 +378,12 @@ impl Store {
             id,
             generation: record.generation,
             project: record.project,
-            repo_common_dir,
+            repo_common_dir: facts.repo_common_dir,
             workspace: record.workspace,
             harness: record.harness,
             name: record.name.filter(|name| !name.trim().is_empty()),
             profile: Some(record.profile).filter(|profile| !profile.trim().is_empty()),
-            preview,
+            preview: facts.preview.filter(|preview| !preview.trim().is_empty()),
             state,
             parent: record.parent.map(format_agent_id),
             // A NULL root only arises from raw test rows without hierarchy
@@ -400,9 +414,9 @@ impl Store {
             project_scope: record.project_scope,
             heavy,
             session_growth,
-            organization,
+            organization: facts.organization,
             tags,
-            organization_revision,
+            organization_revision: facts.organization_revision,
             model,
             work,
             provider_hold: status.provider_hold,
@@ -410,76 +424,155 @@ impl Store {
         })
     }
 
-    /// The opening characters of the Agent's oldest retained `send` text (a
-    /// launch's linked first input included): one seek on
-    /// `commands_target`. `None` when no send with text is retained.
-    fn first_input_preview(&self, agent: i64) -> Result<Option<String>> {
-        let preview: Option<Option<String>> = self
-            .connection
-            .query_row(
-                "SELECT substr(json_extract(args, '$.text'), 1, ?2)
-                 FROM commands INDEXED BY commands_target
-                 WHERE target = ?1 AND verb = 'send'
-                   AND json_type(args, '$.text') = 'text'
-                 ORDER BY created_at, rowid LIMIT 1",
-                params![agent, core::api::AGENT_PREVIEW_CHARS as i64],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-        Ok(preview
-            .flatten()
-            .filter(|preview| !preview.trim().is_empty()))
-    }
-
-    /// Newest terminal turn for one Agent generation: its canonical outcome
-    /// (legacy rows classify explicitly, never defaulting to success) with
-    /// the retained usage where the Store kept one. No terminal turn reads
-    /// back as no outcome, never a fabricated one.
-    fn last_terminal_turn(
-        &self,
-        agent: i64,
-        generation: i64,
-        harness: &str,
-    ) -> Result<Option<LastTerminalTurn>> {
-        let row: Option<StoredTerminalTurn> = self
-            .connection
-            .query_row(
-                "SELECT turn_id, outcome, status, usage, resolution_source FROM turns
-                 WHERE agent = ?1 AND generation = ?2 AND state = 'completed'
-                 ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1",
-                params![agent, generation],
+    /// Augment the already filtered page with bounded seeks. Starting from
+    /// the page keys keeps the terminal and preview LIMITs local to each
+    /// Agent. The outer joins preserve Agents with none of these facts.
+    fn fleet_page_facts(&self, keys: &[(i64, i64)]) -> Result<HashMap<(i64, i64), FleetPageFacts>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let sql = format!(
+            "SELECT a.id AS agent_id, a.generation AS agent_generation,
+                    terminal.turn_id AS terminal_id, terminal.outcome AS terminal_outcome,
+                    terminal.status AS terminal_status, terminal.usage AS terminal_usage,
+                    terminal.resolution_source, usage.snapshot, w.repo_common_dir,
+                    active.turn_id AS active_id, active.tool_calls, active.messages,
+                    source.health AS git_health, source.last_store_seq,
+                    work.workspace AS git_workspace, work.base_oid, work.commits_ahead,
+                    work.files_changed, work.insertions, work.deletions, work.diff_digest,
+                    work.dirty_digest, work.work_available, work.work_error,
+                    work.last_write_at, work.last_commit_at,
+                    {} AS organization, o.tags, o.revision AS organization_revision,
+                    (SELECT substr(json_extract(args, '$.text'), 1, ?2)
+                     FROM commands INDEXED BY commands_target
+                     WHERE target = a.id AND verb = 'send' AND json_type(args, '$.text') = 'text'
+                     ORDER BY created_at, rowid LIMIT 1) AS preview,
+                    (SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy'
+                     AND agent = a.id AND generation = a.generation) AS heavy_count,
+                    (SELECT json_group_array(data) FROM (
+                         SELECT data FROM events WHERE kind = 'activity.heavy'
+                         AND agent = a.id AND generation = a.generation
+                         ORDER BY seq DESC LIMIT ?3
+                     )) AS heavy_episodes
+             FROM json_each(?1) AS page
+             CROSS JOIN agents a ON a.id = json_extract(page.value, '$[0]')
+                                AND a.generation = json_extract(page.value, '$[1]')
+             LEFT JOIN turns terminal ON terminal.rowid = (
+                 SELECT rowid FROM turns
+                 WHERE agent = a.id AND generation = a.generation AND state = 'completed'
+                 ORDER BY COALESCE(completed_at, started_at, 0) DESC, rowid DESC LIMIT 1
+             )
+             LEFT JOIN turns active ON active.agent = a.id AND active.generation = a.generation
+                                   AND active.turn_id = a.active_turn
+             LEFT JOIN session_usage usage ON usage.agent = a.id AND usage.generation = a.generation
+             LEFT JOIN workspaces w ON w.agent = a.id
+             LEFT JOIN chat_organization o ON o.agent = a.id
+             LEFT JOIN source_state source ON source.agent = a.id
+                 AND source.generation = a.generation AND source.source = 'git'
+                 AND a.workspace IS NOT NULL
+             LEFT JOIN git_work_state work ON work.workspace = a.workspace
+                 AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL",
+            organization::organization_group()
+        );
+        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        statement
+            .query_map(
+                params![
+                    encode_json(&keys)?,
+                    core::api::AGENT_PREVIEW_CHARS as i64,
+                    HEAVY_ROLLUP_EPISODES
+                ],
                 |row| {
                     Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
+                        (row.get("agent_id")?, row.get("agent_generation")?),
+                        FleetPageFacts::read(row)?,
                     ))
                 },
             )
-            .optional()
-            .map_err(sql_error)?;
-        row.map(|(turn_id, outcome, status, usage, source)| {
-            let source: Option<TurnResolutionSource> = source
-                .as_deref()
-                .map(|value| parse_enum(value, "turn resolution source"))
-                .transpose()?;
-            let canonical = match outcome {
-                Some(value) => TurnOutcome::parse(&value).ok_or_else(|| {
-                    Error::new("internal", format!("invalid stored turn outcome: {value}"))
-                })?,
-                None => TurnOutcome::classify_legacy_status_for_harness(harness, status.as_deref()),
-            };
-            let outcome = source.map_or(canonical, |source| source.reported_outcome(canonical));
-            let usage = usage
-                .map(|value| decode_turn_usage(&value, harness))
-                .transpose()?;
-            Ok((turn_id, outcome, source, usage))
-        })
-        .transpose()
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sql_error)
     }
+}
+
+struct FleetPageFacts {
+    terminal: Option<StoredTerminalTurn>,
+    session_usage: Option<String>,
+    repo_common_dir: Option<String>,
+    preview: Option<String>,
+    heavy_count: i64,
+    heavy_episodes: String,
+    turn_counts: Option<(i64, i64)>,
+    git_source: Option<(String, Option<i64>)>,
+    git_work: Option<git::GitWorkStateRow>,
+    organization: Option<String>,
+    tags: Option<String>,
+    organization_revision: Option<i64>,
+}
+
+impl FleetPageFacts {
+    fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let terminal = match row.get("terminal_id")? {
+            Some(id) => Some((
+                id,
+                row.get("terminal_outcome")?,
+                row.get("terminal_status")?,
+                row.get("terminal_usage")?,
+                row.get("resolution_source")?,
+            )),
+            None => None,
+        };
+        let turn_counts = if row.get::<_, Option<String>>("active_id")?.is_some() {
+            Some((row.get("tool_calls")?, row.get("messages")?))
+        } else {
+            None
+        };
+        let git_source = match row.get("git_health")? {
+            Some(health) => Some((health, row.get("last_store_seq")?)),
+            None => None,
+        };
+        let git_work = if row.get::<_, Option<String>>("git_workspace")?.is_some() {
+            Some(git::git_work_state_from_row(row)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            terminal,
+            session_usage: row.get("snapshot")?,
+            repo_common_dir: row.get("repo_common_dir")?,
+            preview: row.get("preview")?,
+            heavy_count: row.get("heavy_count")?,
+            heavy_episodes: row.get("heavy_episodes")?,
+            turn_counts,
+            git_source,
+            git_work,
+            organization: row.get("organization")?,
+            tags: row.get("tags")?,
+            organization_revision: row.get("organization_revision")?,
+        })
+    }
+}
+
+/// Legacy terminal rows classify explicitly, without defaulting to success.
+fn decode_terminal_turn(
+    (turn_id, outcome, status, usage, source): StoredTerminalTurn,
+    harness: &str,
+) -> Result<LastTerminalTurn> {
+    let source: Option<TurnResolutionSource> = source
+        .as_deref()
+        .map(|value| parse_enum(value, "turn resolution source"))
+        .transpose()?;
+    let canonical = match outcome {
+        Some(value) => TurnOutcome::parse(&value).ok_or_else(|| {
+            Error::new("internal", format!("invalid stored turn outcome: {value}"))
+        })?,
+        None => TurnOutcome::classify_legacy_status_for_harness(harness, status.as_deref()),
+    };
+    let outcome = source.map_or(canonical, |source| source.reported_outcome(canonical));
+    let usage = usage
+        .map(|value| decode_turn_usage(&value, harness))
+        .transpose()?;
+    Ok((turn_id, outcome, source, usage))
 }
 
 /// Indexed equality filters for the compact `agent.list` fleet projection.
