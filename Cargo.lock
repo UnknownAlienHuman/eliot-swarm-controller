@@ -571,6 +571,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_parser",
  "ulid",
  "windows-sys 0.61.2",
 ]

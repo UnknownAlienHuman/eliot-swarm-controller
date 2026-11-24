@@ -10,9 +10,11 @@ use eliot_core::api::{
 use eliot_store::Store;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
+use toml::de::{DeTable, Deserializer};
 
 const HISTORY_LIMIT: usize = 100;
 pub(super) static SETTINGS_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -257,6 +259,39 @@ fn project_source_sections(source: &str, sections: &[&str]) -> String {
     projected
 }
 
+fn decode_settings_config(
+    source: &str,
+    document: toml::Spanned<DeTable<'_>>,
+) -> core::Result<FileConfig> {
+    FileConfig::deserialize(Deserializer::from(document))
+        .map_err(|error| super::map_toml_error(source, error))
+}
+
+/// Keep source spans when checking a subset of a syntactically valid file.
+/// A broken document still uses independently recoverable source blocks.
+fn read_projection<'a>(
+    source: &'a str,
+    document: Option<&toml::Spanned<DeTable<'a>>>,
+    sections: &[&str],
+) -> (Cow<'a, str>, core::Result<FileConfig>) {
+    if let Some(document) = document {
+        let selected = document
+            .get_ref()
+            .iter()
+            .filter(|(key, _)| sections.contains(&key.get_ref().as_ref()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        return (
+            Cow::Borrowed(source),
+            decode_settings_config(source, toml::Spanned::new(document.span(), selected)),
+        );
+    }
+    let projected = project_source_sections(source, sections);
+    let config =
+        toml::from_str(&projected).map_err(|error| super::map_toml_error(&projected, error));
+    (Cow::Owned(projected), config)
+}
+
 /// One section of an already-parsed file as the settings reader shows it.
 fn section_value(parsed: &toml::Table, name: &str) -> core::Result<JsonValue> {
     let Some(value) = parsed.get(name) else {
@@ -440,8 +475,11 @@ pub(crate) fn read_snapshot(
     let requested: BTreeSet<_> = sections.iter().copied().collect();
     let mut issues = Vec::new();
     let mut unreadable_sections = BTreeSet::new();
-    let (table, invalid_sections, syntax_error) = match toml::from_str::<toml::Table>(source) {
-        Ok(table) => (table, BTreeMap::new(), false),
+    let (document, table, invalid_sections) = match DeTable::parse(source).and_then(|document| {
+        let table = toml::Table::deserialize(Deserializer::from(document.clone()))?;
+        Ok((document, table))
+    }) {
+        Ok((document, table)) => (Some(document), table, BTreeMap::new()),
         Err(error) => {
             let offset = error.span().map(|span| span.start);
             let section = offset
@@ -479,25 +517,29 @@ pub(crate) fn read_snapshot(
                     );
                 }
             }
-            (table, invalid_sections, true)
+            (None, table, invalid_sections)
         }
     };
+    let document = document.as_ref();
 
     let mut strict_config = None;
-    let mut full_invalid = syntax_error;
-    if !syntax_error {
-        match parse_config(source) {
+    let mut full_invalid = document.is_none();
+    if let Some(document) = document {
+        match decode_settings_config(source, document.clone()) {
             Ok(config) => {
-                if let Err(error) = validate_parsed(&config, source) {
+                if let Err(error) = validate_config_shape(&config) {
                     add_error_issue(&mut issues, source, &error, &requested, policy);
                     full_invalid = true;
+                } else {
+                    if let Err(error) = validate_parsed(&config, source) {
+                        add_error_issue(&mut issues, source, &error, &requested, policy);
+                        full_invalid = true;
+                    }
+                    strict_config = Some(config);
                 }
-                strict_config = Some(config);
             }
             Err(error) => {
-                if super::parse_config_document(source).is_err()
-                    && let Some(section) = section_for_error(source, &error)
-                {
+                if let Some(section) = section_for_error(source, &error) {
                     unreadable_sections.insert(section_name(section).to_owned());
                 }
                 add_error_issue(&mut issues, source, &error, &requested, policy);
@@ -513,13 +555,17 @@ pub(crate) fn read_snapshot(
                 continue;
             }
             let dependencies = validation_dependencies(*section);
-            let projected = project_source_sections(source, dependencies);
-            if let Err(error) = validate_candidate(&projected) {
+            let (projected, config) = read_projection(source, document, dependencies);
+            let unreadable = config.is_err();
+            if let Err(error) = config.and_then(|config| {
+                validate_config_shape(&config)?;
+                validate_parsed(&config, &projected)
+            }) {
                 let responsible_section = section_for_error(&projected, &error);
                 if responsible_section == Some(*section)
                     || (responsible_section.is_none() && dependencies.len() == 1)
                 {
-                    if super::parse_config_document(&projected).is_err() {
+                    if unreadable {
                         unreadable_sections.insert(section_name(*section).to_owned());
                     }
                     add_section_error_issue(&mut issues, &error, *section, &requested, policy);
@@ -528,10 +574,31 @@ pub(crate) fn read_snapshot(
         }
     }
 
-    let profile_projection = project_source_sections(source, &["profiles", "accounts", "proxies"]);
-    let projected_profile_config = parse_config(&profile_projection).ok();
-    let profile_config = strict_config.as_ref().or(projected_profile_config.as_ref());
-    let profile_reason = profiles_edit::editability(source, Some(&table), profile_config, policy);
+    let profile_config = strict_config.or_else(|| {
+        let (_, config) = read_projection(source, document, &["profiles", "accounts", "proxies"]);
+        config
+            .ok()
+            .filter(|config| validate_config_shape(config).is_ok())
+    });
+    let profiles_inline = document.is_some_and(|document| {
+        document.get_ref().iter().any(|(key, _)| {
+            if key.get_ref() != "profiles" {
+                return false;
+            }
+            let prefix = source[..key.span().start].rsplit('\n').next().unwrap_or("");
+            !prefix
+                .trim_start_matches('\u{FEFF}')
+                .trim()
+                .starts_with('[')
+        })
+    });
+    let profile_reason = profiles_edit::editability(
+        source,
+        &table,
+        profiles_inline,
+        profile_config.as_ref(),
+        policy,
+    );
     let profiles_withheld = profile_reason.is_some();
     if let Some(reason) = profile_reason
         && requested.contains(&SettingsSection::Profiles)
@@ -637,12 +704,17 @@ pub(crate) fn read_snapshot(
             continue;
         }
         let name = section_name(section);
-        let source_section = project_source_sections(source, &[name]);
+        let (source_section, config) = read_projection(source, document, &[name]);
         issue.removable = invalid_sections.contains_key(name)
             || table.get(name).is_some_and(|value| !value.is_table())
-            || super::parse_config_document(&source_section).is_err()
+            || config.is_err()
             || (validation_dependencies(section) == [name]
-                && validate_candidate(&source_section).is_err());
+                && config
+                    .and_then(|config| {
+                        validate_config_shape(&config)?;
+                        validate_parsed(&config, &source_section)
+                    })
+                    .is_err());
     }
     let warnings = values
         .get(&SettingsSection::OwnerRules)

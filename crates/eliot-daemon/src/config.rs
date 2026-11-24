@@ -11,13 +11,13 @@
 use crate::harness_capabilities::ProfileCapabilities;
 use core::api::harness::NativeRoute;
 use core::api::native_profile::{
-    ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
+    ANTIGRAVITY_MODES, CLAUDE_EFFORT_LEVELS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
     CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
 };
 use eliot_core as core;
 use eliot_plugin::session::split_provider_model;
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::Read;
@@ -1876,7 +1876,12 @@ fn read_config(data_root: &Path) -> core::Result<Option<(FileConfig, String)>> {
 /// The one `config.toml` parser: strict (`deny_unknown_fields`) with
 /// located errors.
 fn parse_config(source: &str) -> core::Result<FileConfig> {
-    let config = parse_config_document(source)?;
+    let config = toml::from_str(source).map_err(|error| map_toml_error(source, error))?;
+    validate_config_shape(&config)?;
+    Ok(config)
+}
+
+fn validate_config_shape(config: &FileConfig) -> core::Result<()> {
     if config.owner_rules.text.len() > eliot_core::api::MAX_OWNER_RULES_BYTES
         || config.owner_rules.text.contains('\0')
     {
@@ -1948,14 +1953,7 @@ fn parse_config(source: &str) -> core::Result<FileConfig> {
             }
         }
     }
-    Ok(config)
-}
-
-/// Deserialize the strict configuration shape without applying the semantic
-/// checks below. Settings uses this distinction to keep safely parsed fields
-/// editable when a section-level value is out of bounds.
-fn parse_config_document(source: &str) -> core::Result<FileConfig> {
-    toml::from_str(source).map_err(|error| map_toml_error(source, error))
+    Ok(())
 }
 
 const HANDOFF_FALLBACK_KEY: &str = "handoff_fallback";
@@ -2207,24 +2205,99 @@ fn snapshot_from_entry(
             ),
         ],
     )?;
-    // The configured identity selects the vocabulary of the named TOML profile.
-    if harness == "muse" {
-        return muse_snapshot_from_entry(name, entry, table_offset, source);
-    }
-    if harness == "claude" {
-        return claude_snapshot_from_entry(name, entry, table_offset, source);
-    }
-    if harness == "opencode" {
-        return opencode_snapshot_from_entry(name, entry, table_offset, source);
-    }
-    if harness == "antigravity" {
-        return antigravity_snapshot_from_entry(name, entry, table_offset, source);
-    }
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
+        if harness == "opencode" && split_provider_model(model).is_none() {
+            return Err(site.error(
+                "model",
+                "must be provider/model with non-empty slash segments and no variant suffix",
+                "profile_error",
+            ));
+        }
     }
-    let effort = validated_effort(site, entry.effort.as_deref())?;
+    let effort = match harness {
+        "claude" => validated_choice(
+            site,
+            "effort",
+            entry
+                .effort
+                .as_deref()
+                .filter(|value| !value.trim().is_empty()),
+            CLAUDE_EFFORT_LEVELS,
+            "unknown Claude effort level (low, medium, high, xhigh, or max)",
+            "profile_error",
+        )?,
+        "antigravity" => None,
+        // OpenCode uses the catalogue's Model.Variant id.
+        _ => validated_effort(site, entry.effort.as_deref())?,
+    };
+    let mut snapshot = profile_snapshot(harness, model, effort);
+    let (native_name, minimal, allow) = match harness {
+        "muse" => {
+            freeze_muse_fields(site, entry, &mut snapshot)?;
+            ("Muse", false, false)
+        }
+        "claude" => {
+            freeze_claude_fields(site, entry, &mut snapshot)?;
+            ("Claude", true, false)
+        }
+        "opencode" => {
+            validate_opencode_fields(site, entry)?;
+            ("OpenCode", true, false)
+        }
+        "antigravity" => {
+            freeze_antigravity_fields(site, entry, &mut snapshot)?;
+            ("Antigravity", true, true)
+        }
+        _ => {
+            freeze_codex_fields(site, entry, &mut snapshot)?;
+            ("Codex", true, true)
+        }
+    };
+    let tail = validate_profile_tail(name, entry, table_offset, source)?;
+    if harness == "opencode" {
+        freeze_opencode_route(site, entry, &tail, &mut snapshot)?;
+    }
+    let control = || validated_control(name, entry.control.as_deref(), source, table_offset);
+    let claude_control = (harness == "claude").then(control).transpose()?;
+    freeze_mcp_policy(&mut snapshot, site, entry, native_name, minimal, allow)?;
+    let control = claude_control.map_or_else(control, Ok)?;
+    snapshot.insert("control".to_owned(), json!(control));
+    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
+    Ok(Value::Object(snapshot))
+}
+
+/// Start the frozen profile with its validated shared selectors. The wire
+/// representation omits unselected model and effort on both launch paths.
+pub(crate) fn profile_snapshot(
+    harness: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> JsonMap<String, Value> {
+    #[derive(Serialize)]
+    struct Selectors<'a> {
+        harness: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        effort: Option<&'a str>,
+    }
+    let Value::Object(fields) = json!(Selectors {
+        harness,
+        model,
+        effort
+    }) else {
+        unreachable!("profile selectors serialize as an object");
+    };
+    fields
+}
+
+fn freeze_codex_fields(
+    site: ProfileSite<'_>,
+    entry: &ProfileEntry,
+    snapshot: &mut JsonMap<String, Value>,
+) -> core::Result<()> {
     let collaboration_mode = validated_choice(
         site,
         "collaboration_mode",
@@ -2271,17 +2344,8 @@ fn snapshot_from_entry(
             ),
         ],
     )?;
-    let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert("harness".to_owned(), Value::String("codex".to_owned()));
     if let Some(limit) = entry.project_doc_max_bytes {
-        snapshot.insert("project_doc_max_bytes".to_owned(), Value::from(limit));
-    }
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
-    if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
+        snapshot.insert("project_doc_max_bytes".to_owned(), json!(limit));
     }
     if let Some(collaboration_mode) = collaboration_mode {
         snapshot.insert(
@@ -2297,27 +2361,7 @@ fn snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(approval_policy.to_owned()),
     );
-    freeze_mcp_policy(
-        &mut snapshot,
-        name,
-        entry,
-        table_offset,
-        source,
-        McpHarnessSupport {
-            harness: "Codex",
-            minimal: true,
-            allow: true,
-        },
-    )?;
-    insert_control(
-        &mut snapshot,
-        name,
-        entry.control.as_deref(),
-        source,
-        table_offset,
-    )?;
-    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
-    Ok(Value::Object(snapshot))
+    Ok(())
 }
 
 /// Shared profile fields validated after the harness-specific fields.
@@ -2445,22 +2489,11 @@ fn insert_profile_tail(
 /// `--disable-sandbox` for full access); collaboration presets, adopted routes,
 /// read-only permissions and approval policies stay rejected until their native
 /// mappings land.
-fn muse_snapshot_from_entry(
-    name: &str,
+fn freeze_muse_fields(
+    site: ProfileSite<'_>,
     entry: &ProfileEntry,
-    table_offset: usize,
-    source: &str,
-) -> core::Result<Value> {
-    let site = ProfileSite {
-        name,
-        source,
-        offset: table_offset,
-    };
-    let model = entry.model.as_deref();
-    if let Some(model) = model {
-        validate_model(name, model, source, table_offset)?;
-    }
-    let effort = validated_effort(site, entry.effort.as_deref())?;
+    snapshot: &mut JsonMap<String, Value>,
+) -> core::Result<()> {
     let approval = validated_choice(
         site,
         "approval",
@@ -2509,30 +2542,9 @@ fn muse_snapshot_from_entry(
             ),
         ],
     )?;
-    let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert("harness".to_owned(), Value::String("muse".to_owned()));
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
-    if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
-    }
     if let Some(approval) = approval {
         snapshot.insert("approval".to_owned(), Value::String(approval.to_owned()));
     }
-    freeze_mcp_policy(
-        &mut snapshot,
-        name,
-        entry,
-        table_offset,
-        source,
-        McpHarnessSupport {
-            harness: "Muse",
-            minimal: false,
-            allow: false,
-        },
-    )?;
     snapshot.insert(
         "permissions".to_owned(),
         Value::String(permissions.to_owned()),
@@ -2541,15 +2553,7 @@ fn muse_snapshot_from_entry(
         "approval_policy".to_owned(),
         Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
     );
-    insert_control(
-        &mut snapshot,
-        name,
-        entry.control.as_deref(),
-        source,
-        table_offset,
-    )?;
-    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
-    Ok(Value::Object(snapshot))
+    Ok(())
 }
 
 /// Freeze a Claude profile. The PR2 slice carries an exact model id, an
@@ -2559,34 +2563,11 @@ fn muse_snapshot_from_entry(
 /// callback, and the CLI `--effort` level (low, medium, high, xhigh, max).
 /// Collaboration presets, non-default permissions, and a non-`never`
 /// Eliot-side `approval_policy` stay rejected until their mappings land.
-fn claude_snapshot_from_entry(
-    name: &str,
+fn freeze_claude_fields(
+    site: ProfileSite<'_>,
     entry: &ProfileEntry,
-    table_offset: usize,
-    source: &str,
-) -> core::Result<Value> {
-    let site = ProfileSite {
-        name,
-        source,
-        offset: table_offset,
-    };
-    let model = entry.model.as_deref();
-    if let Some(model) = model {
-        validate_model(name, model, source, table_offset)?;
-    }
-    // Claude Code 2.1.278 `--effort <level>`: the CLI's closed vocabulary.
-    // Absent effort keeps the CLI default; no value is fabricated.
-    let effort = validated_choice(
-        site,
-        "effort",
-        entry
-            .effort
-            .as_deref()
-            .filter(|value| !value.trim().is_empty()),
-        &CLAUDE_EFFORTS,
-        "unknown Claude effort level (low, medium, high, xhigh, or max)",
-        "profile_error",
-    )?;
+    snapshot: &mut JsonMap<String, Value>,
+) -> core::Result<()> {
     let permission_mode = validated_choice(
         site,
         "approval",
@@ -2637,12 +2618,6 @@ fn claude_snapshot_from_entry(
             ),
         ],
     )?;
-    let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert("harness".to_owned(), Value::String("claude".to_owned()));
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
     snapshot.insert(
         "permissions".to_owned(),
         Value::String(CodexPermissions::WorkspaceWrite.as_str().to_owned()),
@@ -2654,30 +2629,7 @@ fn claude_snapshot_from_entry(
     if let Some(mode) = permission_mode {
         snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
     }
-    insert_control(
-        &mut snapshot,
-        name,
-        entry.control.as_deref(),
-        source,
-        table_offset,
-    )?;
-    if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
-    }
-    freeze_mcp_policy(
-        &mut snapshot,
-        name,
-        entry,
-        table_offset,
-        source,
-        McpHarnessSupport {
-            harness: "Claude",
-            minimal: true,
-            allow: false,
-        },
-    )?;
-    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
-    Ok(Value::Object(snapshot))
+    Ok(())
 }
 
 /// Names of configured OpenCode profiles backed by the daemon config file.
@@ -2714,31 +2666,7 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
 ///
 /// A typed local provider selects one of its own models and uses optional
 /// environment-backed authentication in place of a canonical integration.
-fn opencode_snapshot_from_entry(
-    name: &str,
-    entry: &ProfileEntry,
-    table_offset: usize,
-    source: &str,
-) -> core::Result<Value> {
-    let site = ProfileSite {
-        name,
-        source,
-        offset: table_offset,
-    };
-    let model = entry.model.as_deref();
-    if let Some(model) = model {
-        validate_model(name, model, source, table_offset)?;
-    }
-    if model.is_some_and(|model| split_provider_model(model).is_none()) {
-        return Err(site.error(
-            "model",
-            "must be provider/model with non-empty slash segments and no variant suffix",
-            "profile_error",
-        ));
-    }
-    // A frozen effort selects the installed `Model.Variant` id on launch
-    // (`Model.Ref.variant`); the live native catalogue proves membership.
-    let effort = validated_effort(site, entry.effort.as_deref())?;
+fn validate_opencode_fields(site: ProfileSite<'_>, entry: &ProfileEntry) -> core::Result<()> {
     let no_mapping = "the OpenCode slice has no mapping for this preset";
     reject_unmapped(
         site,
@@ -2776,21 +2704,23 @@ fn opencode_snapshot_from_entry(
             ));
         }
     }
-    let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert("harness".to_owned(), Value::String("opencode".to_owned()));
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
-    if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort.to_owned()));
-    }
+    Ok(())
+}
+
+fn freeze_opencode_route(
+    site: ProfileSite<'_>,
+    entry: &ProfileEntry,
+    tail: &ProfileTail,
+    snapshot: &mut JsonMap<String, Value>,
+) -> core::Result<()> {
     if let Some(provider) = entry.local_provider.as_ref() {
         let field_error = |field, message: &str| site.error(field, message, "profile_error");
         provider
             .validate(&tail.pass_env)
             .map_err(|message| field_error("local_provider", &message))?;
-        if !model
+        if !entry
+            .model
+            .as_deref()
             .and_then(split_provider_model)
             .is_some_and(|(id, model)| provider.contains_model(id, model))
         {
@@ -2814,48 +2744,18 @@ fn opencode_snapshot_from_entry(
             Value::String(selector.trim().to_owned()),
         );
     }
-    freeze_mcp_policy(
-        &mut snapshot,
-        name,
-        entry,
-        table_offset,
-        source,
-        McpHarnessSupport {
-            harness: "OpenCode",
-            minimal: true,
-            allow: false,
-        },
-    )?;
-    insert_control(
-        &mut snapshot,
-        name,
-        entry.control.as_deref(),
-        source,
-        table_offset,
-    )?;
-    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
-    Ok(Value::Object(snapshot))
+    Ok(())
 }
 
 /// Freeze an Antigravity profile. The L6.4 slice carries an exact model id, an
 /// optional native `cmd` pin (discovery selects the `agy` CLI), an optional native `mode` and an explicit
 /// `dangerously_skip_permissions` flag. Effort, approval, collaboration,
 /// permission and approval-policy presets have no mapping and stay rejected.
-fn antigravity_snapshot_from_entry(
-    name: &str,
+fn freeze_antigravity_fields(
+    site: ProfileSite<'_>,
     entry: &ProfileEntry,
-    table_offset: usize,
-    source: &str,
-) -> core::Result<Value> {
-    let site = ProfileSite {
-        name,
-        source,
-        offset: table_offset,
-    };
-    let model = entry.model.as_deref();
-    if let Some(model) = model {
-        validate_model(name, model, source, table_offset)?;
-    }
+    snapshot: &mut JsonMap<String, Value>,
+) -> core::Result<()> {
     reject_unmapped(
         site,
         &[(
@@ -2898,15 +2798,6 @@ fn antigravity_snapshot_from_entry(
             ),
         ],
     )?;
-    let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert(
-        "harness".to_owned(),
-        Value::String("antigravity".to_owned()),
-    );
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model.to_owned()));
-    }
     if let Some(mode) = mode {
         snapshot.insert("mode".to_owned(), Value::String(mode.to_owned()));
     }
@@ -2914,27 +2805,7 @@ fn antigravity_snapshot_from_entry(
         "dangerously_skip_permissions".to_owned(),
         Value::Bool(entry.dangerously_skip_permissions.unwrap_or(false)),
     );
-    freeze_mcp_policy(
-        &mut snapshot,
-        name,
-        entry,
-        table_offset,
-        source,
-        McpHarnessSupport {
-            harness: "Antigravity",
-            minimal: true,
-            allow: true,
-        },
-    )?;
-    insert_control(
-        &mut snapshot,
-        name,
-        entry.control.as_deref(),
-        source,
-        table_offset,
-    )?;
-    insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
-    Ok(Value::Object(snapshot))
+    Ok(())
 }
 
 fn bind_route_and_capacity(
@@ -3230,25 +3101,6 @@ fn validated_control<'a>(
 }
 
 /// The one frozen `control` insert for resolved profile snapshots.
-fn insert_control(
-    snapshot: &mut serde_json::Map<String, Value>,
-    profile: &str,
-    control: Option<&str>,
-    source: &str,
-    offset: usize,
-) -> core::Result<()> {
-    let control = validated_control(profile, control, source, offset)?;
-    snapshot.insert("control".to_owned(), Value::String(control.to_owned()));
-    Ok(())
-}
-
-/// Which worker MCP policy pieces a harness plugin implements.
-struct McpHarnessSupport<'a> {
-    harness: &'a str,
-    minimal: bool,
-    allow: bool,
-}
-
 /// Validate the worker MCP inheritance policy and freeze it with the profile
 /// snapshot. `minimal`/`allow` name whether the harness plugin implements an
 /// isolation mechanism for `minimal` and selective
@@ -3259,68 +3111,39 @@ struct McpHarnessSupport<'a> {
 /// A non-empty allow list always requires `minimal`, so an allowed set
 /// cannot silently ride on the default.
 fn freeze_mcp_policy(
-    snapshot: &mut serde_json::Map<String, Value>,
-    name: &str,
+    snapshot: &mut JsonMap<String, Value>,
+    site: ProfileSite<'_>,
     entry: &ProfileEntry,
-    table_offset: usize,
-    source: &str,
-    support: McpHarnessSupport<'_>,
+    harness: &str,
+    supports_minimal: bool,
+    supports_allow: bool,
 ) -> core::Result<()> {
-    let harness = support.harness;
-    let supports_minimal = support.minimal;
-    let supports_allow = support.allow;
     // An unset `mcp` takes the default `minimal` only where the harness maps
     // it; Muse has no minimal mapping, so its profiles
     // keep loading as `inherit` instead of failing after the default change.
     let policy = match entry.mcp.as_deref() {
         None if !supports_minimal => core::McpPolicy::Inherit,
-        raw => core::McpPolicy::parse(raw).map_err(|error| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "mcp",
-                &error.message,
-                "profile_error",
-            )
-        })?,
+        raw => core::McpPolicy::parse(raw)
+            .map_err(|error| site.error("mcp", &error.message, "profile_error"))?,
     };
-    let allow =
-        core::validate_allow_list(entry.mcp_allow.as_deref().unwrap_or(&[])).map_err(|error| {
-            profile_field_error(
-                source,
-                table_offset,
-                name,
-                "mcp_allow",
-                &error.message,
-                "profile_error",
-            )
-        })?;
+    let allow = core::validate_allow_list(entry.mcp_allow.as_deref().unwrap_or(&[]))
+        .map_err(|error| site.error("mcp_allow", &error.message, "profile_error"))?;
     if !allow.is_empty() && policy == core::McpPolicy::Inherit {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+        return Err(site.error(
             "mcp_allow",
             "mcp_allow requires mcp = \"minimal\"",
             "profile_error",
         ));
     }
     if policy == core::McpPolicy::Minimal && !supports_minimal {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+        return Err(site.error(
             "mcp",
             &format!("mcp = \"minimal\" has no {harness} mapping"),
             "unsupported",
         ));
     }
     if !allow.is_empty() && !supports_allow {
-        return Err(profile_field_error(
-            source,
-            table_offset,
-            name,
+        return Err(site.error(
             "mcp_allow",
             &format!("mcp_allow has no {harness} mapping"),
             "unsupported",
