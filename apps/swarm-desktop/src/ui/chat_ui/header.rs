@@ -168,14 +168,12 @@ impl DesktopApp {
                 }
             }
             if let Some(target) = &task {
-                more.extend(
-                    self.developer_entries(target)
-                        .into_iter()
-                        .map(|(_, label)| MenuItem::item(label.clone(), label)),
-                );
+                more.extend(menu_ui::menu_items(&self.developer_entries(target)));
             }
             items.push(MenuItem::submenu("more", "More", more));
             items.extend(menu_ui::menu_items(&destructive));
+            // A chosen item comes back as its label only.
+            menu_ui::debug_assert_unique(&items);
             items
         });
         // The status pill: the state in words, then what runs it, and the

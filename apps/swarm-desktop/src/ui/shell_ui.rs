@@ -1036,13 +1036,18 @@ impl DesktopApp {
                         if let Some((row, x, y)) = crate::motion::focused_row_anchor()
                             && let Some(target) = self.row_target(&row)
                         {
-                            self.menu_update(MenuMsg::Requested(target, x, y), context);
+                            self.menu_update(MenuMsg::Requested(target, x, y, true), context);
                         }
                     }
-                    Shortcut::Enter(_) if self.menu.renaming.is_some() => {
-                        self.menu_update(MenuMsg::RenameCommitted, context);
+                    Shortcut::Enter(_, press) if self.menu.renaming.is_some() => {
+                        // The Enter that chose Rename or Tags in the native
+                        // menu reaches the hook before the menu's click; it
+                        // must not commit the field it opened.
+                        if press > self.menu.rename_enter {
+                            self.menu_update(MenuMsg::RenameCommitted, context);
+                        }
                     }
-                    Shortcut::Enter(epoch) => {
+                    Shortcut::Enter(epoch, _) => {
                         // Enter on a suggestion reached with the arrows, with
                         // no other input since and the box still showing it.
                         if let Some((label, id, at)) = self.nav.search.highlighted.take()
@@ -2184,7 +2189,8 @@ impl DesktopApp {
                 panel,
             ));
         // One cell: the window, the row-menu button that carries the
-        // sidebar's menu flyout, and the confirmation dialog.
+        // sidebar's menu flyout, the attach chooser's button, and the
+        // confirmation dialog.
         let overlay = if self.handoff.open {
             self.handoff_dialog(context)
         } else if self.settings.cleanup_confirm {
@@ -2196,7 +2202,12 @@ impl DesktopApp {
         } else {
             self.task_dialog(context, palette)
         };
-        let window = Grid::new().children((columns_grid, self.menu_anchor(context), overlay));
+        let window = Grid::new().children((
+            columns_grid,
+            self.menu_anchor(context),
+            self.attach_anchor(context, palette),
+            overlay,
+        ));
         // Reactor updates a Button's resource overrides in place, but WinUI
         // resolves a template's ThemeResource values only when the template
         // is applied or the theme changes, and the theme change arrives before

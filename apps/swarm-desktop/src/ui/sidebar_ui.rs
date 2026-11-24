@@ -1015,6 +1015,7 @@ fn with_menu(row: View, target: Target, context: &mut ViewContext<Sidebar>) -> V
                     target.clone(),
                     info.window_x,
                     info.window_y,
+                    false,
                 ))
             } else {
                 Message::Menu(MenuMsg::Ignored)

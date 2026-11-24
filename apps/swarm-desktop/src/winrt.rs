@@ -34,6 +34,18 @@ macro_rules! winrt_interface {
 }
 pub(crate) use winrt_interface;
 
+/// A runtime class name, for its activation factory
+/// (`windows_core::factory`).
+macro_rules! runtime_class {
+    ($name:ident, $class:literal) => {
+        struct $name;
+        impl windows_core::RuntimeName for $name {
+            const NAME: &'static str = $class;
+        }
+    };
+}
+pub(crate) use runtime_class;
+
 /// A raw interface pointer as the ABI passes it.
 pub(crate) type Raw = *mut c_void;
 
@@ -91,11 +103,24 @@ pub(crate) fn delegate<I: Interface<Vtable = DelegateVtbl>>(
     unsafe { I::from_raw(Box::into_raw(boxed).cast()) }
 }
 
-/// The `Invoke` slot of [`delegate`]'s vtables.
+/// The `Invoke` slot of [`delegate`]'s vtables. A panic in the callback
+/// (a flyout's `Closed`, a focus or pointer event) stops at this ABI
+/// boundary: unwinding out of an `extern "system"` function aborts the
+/// process, so it is caught and noted in `desktop.log` instead.
 unsafe extern "system" fn invoke<I: Interface>(this: Raw, sender: Raw, args: Raw) -> HRESULT {
     // SAFETY: `this` is the box `delegate` allocated for `I`.
     let this = unsafe { &*(this as *const DelegateBox<I, Callback>) };
-    (this.invoke)(sender, args);
+    let callback = this.invoke;
+    if let Err(panic) =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(sender, args)))
+    {
+        let what = panic
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_owned());
+        crate::startup::note(&format!("a WinUI event handler panicked: {what}"));
+    }
     HRESULT(0)
 }
 

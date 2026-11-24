@@ -15,7 +15,9 @@
 //!   focused element and tells the window, which finds the row holding it
 //!   (automation id [`ROW_ID_PREFIX`], [`resolve_focused_row`]) so the row
 //!   shows its "⋯" to the keyboard as to the pointer; Shift+F10 or the
-//!   context-menu key opens its menu at the row ([`focused_row_anchor`]).
+//!   context-menu key opens its menu at the row ([`focused_row_anchor`]),
+//!   and keyboard focus goes back to the row when that menu closes without
+//!   a choice ([`focus_row`]).
 //! - **Elements by automation id.** [`find`] walks the content root
 //!   breadth-first for an automation id; [`element_bottom_left`] places a
 //!   menu under an element.
@@ -38,13 +40,13 @@ use std::collections::VecDeque;
 use std::mem::offset_of;
 
 use windows_core::imp::ConstBuffer;
-use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface, RuntimeName};
+use windows_core::{GUID, HRESULT, HSTRING, IInspectable, IUnknown, Interface};
 use windows_reference::IReference;
 
 use crate::ui::tokens::layout;
 use crate::winrt::{
     DelegateVtbl, Getter, InspectableSlots, Raw, borrowed, delegate, delegate_vtable, get,
-    winrt_interface,
+    runtime_class, winrt_interface,
 };
 
 /// The automation id prefix of a sidebar row's container, followed by the
@@ -58,8 +60,6 @@ const BUTTON_CLASS: &str = "Microsoft.UI.Xaml.Controls.Button";
 const MAX_ANCESTORS: usize = 24;
 /// How deep under the Button its ripple is looked for.
 const MAX_TEMPLATE_DEPTH: usize = 8;
-/// The most elements one search by automation id visits.
-const MAX_SEARCH: usize = 6000;
 
 /// `Windows.Foundation.Point`.
 #[repr(C)]
@@ -100,13 +100,20 @@ struct UIElementVtbl {
     _216: usize,
     /// 217 `TransformToVisual(UIElement)`.
     transform_to_visual: unsafe extern "system" fn(Raw, Raw, *mut Raw) -> HRESULT,
+    _218_225: [usize; 8],
+    /// 226 `Focus(FocusState)`.
+    focus: unsafe extern "system" fn(Raw, i32, *mut bool) -> HRESULT,
 }
 const _: () = {
     assert!(offset_of!(UIElementVtbl, put_render_transform_origin) == 20 * SLOT);
     assert!(offset_of!(UIElementVtbl, xaml_root) == 109 * SLOT);
     assert!(offset_of!(UIElementVtbl, add_handler) == 215 * SLOT);
     assert!(offset_of!(UIElementVtbl, transform_to_visual) == 217 * SLOT);
+    assert!(offset_of!(UIElementVtbl, focus) == 226 * SLOT);
 };
+
+/// `FocusState.Keyboard`: focus as the keyboard moves it (with its visual).
+const FOCUS_KEYBOARD: i32 = 2;
 
 #[repr(C)]
 struct GeneralTransformVtbl {
@@ -292,14 +299,6 @@ impl windows_core::RuntimeType for PointerEventHandler {
         ConstBuffer::from_slice(b"delegate({a48a71e1-8bb4-5597-9e31-903a3f6a04fb})");
 }
 
-macro_rules! runtime_class {
-    ($name:ident, $class:literal) => {
-        struct $name;
-        impl RuntimeName for $name {
-            const NAME: &'static str = $class;
-        }
-    };
-}
 runtime_class!(FocusManager, "Microsoft.UI.Xaml.Input.FocusManager");
 runtime_class!(UIElement, "Microsoft.UI.Xaml.UIElement");
 runtime_class!(VisualTreeHelper, "Microsoft.UI.Xaml.Media.VisualTreeHelper");
@@ -421,6 +420,29 @@ pub fn focused_row_anchor() -> Option<(String, f64, f64)> {
     Some((key, x, y))
 }
 
+/// Put keyboard focus on the sidebar row `key` (`agent:<id>`,
+/// `project:<key>`): the first button inside its container. False when the
+/// row is gone or refuses focus.
+pub fn focus_row(key: &str) -> bool {
+    (|| -> Option<bool> {
+        let row = find(&format!("{ROW_ID_PREFIX}{key}"))?;
+        let tree = tree()?;
+        let button = find_under(&tree, &row, MAX_TEMPLATE_DEPTH, &|element| {
+            element
+                .GetRuntimeClassName()
+                .is_ok_and(|class| class == BUTTON_CLASS)
+        })?;
+        let element: IUIElement = button.cast().ok()?;
+        let mut focused = false;
+        // SAFETY: slot 226 of IUIElement is Focus(FocusState).
+        unsafe { (element.vtable().focus)(element.as_raw(), FOCUS_KEYBOARD, &mut focused) }
+            .ok()
+            .ok()?;
+        Some(focused)
+    })()
+    .unwrap_or(false)
+}
+
 /// The window's content root (`XamlRoot.Content`), once an element took
 /// focus.
 pub fn root() -> Option<IInspectable> {
@@ -428,18 +450,15 @@ pub fn root() -> Option<IInspectable> {
 }
 
 /// The element with automation id `id`, breadth-first from the content
-/// root. Nothing is kept once it is found.
+/// root. The walk visits the whole tree when it has to: a flyout's anchor
+/// is never given up because the window holds many elements (a long
+/// transcript). Nothing is kept once it is found.
 pub fn find(id: &str) -> Option<IInspectable> {
     let tree = tree()?;
     let statics =
         windows_core::factory::<AutomationProperties, IAutomationPropertiesStatics>().ok()?;
     let mut queue = VecDeque::from([root()?]);
-    let mut visited = 0;
     while let Some(node) = queue.pop_front() {
-        visited += 1;
-        if visited > MAX_SEARCH {
-            return None;
-        }
         for child in children(&tree, &node) {
             if automation_id(&statics, &child).is_some_and(|found| found == id) {
                 return Some(child);

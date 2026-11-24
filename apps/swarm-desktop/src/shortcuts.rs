@@ -80,8 +80,9 @@ pub enum Shortcut {
     /// A key while a popover is open (taken from the focused control).
     Popover(PopoverKey),
     /// Enter outside a popover, passed on to the focused control; carries
-    /// the input epoch at the press (see [`last_input`]).
-    Enter(u64),
+    /// the input epoch at the press (see [`last_input`]) and the press's
+    /// number (see [`enter_presses`]).
+    Enter(u64, u64),
     /// Keyboard focus moved (`crate::motion::resolve_focused_row` says
     /// whether a sidebar row holds it).
     FocusMoved,
@@ -131,6 +132,8 @@ static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 /// Counts inputs that end a keyboard walk through suggestions: any key
 /// other than ↑/↓/Enter, and every pointer press.
 static INPUT_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Counts Enter presses (first press, not auto-repeat) outside a popover.
+static ENTER_PRESSES: AtomicU64 = AtomicU64::new(0);
 /// The last key press was Enter without Shift (cleared by any other key and
 /// when [`take_plain_enter`] consumes it), and when it was pressed.
 static PLAIN_ENTER: AtomicU8 = AtomicU8::new(0);
@@ -165,6 +168,13 @@ pub fn set_popover(popover: Popover) {
 /// A flyout `crate::flyout` showed with `epoch` closed.
 pub fn flyout_closed(epoch: u64) {
     send(Shortcut::FlyoutClosed(epoch));
+}
+
+/// The Enter presses counted so far. The hook counts a press as the key
+/// goes down, before WinUI hands it to a control, so a press that chose a
+/// menu item is counted before the item's click reaches the window.
+pub fn enter_presses() -> u64 {
+    ENTER_PRESSES.load(Ordering::SeqCst)
 }
 
 /// How the last input arrived, how long ago (ms) and the input epoch.
@@ -390,7 +400,8 @@ unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) ->
                 VK_RETURN => {
                     note_input(Input::Enter);
                     if first {
-                        send(Shortcut::Enter(INPUT_EPOCH.load(Ordering::SeqCst)));
+                        let press = ENTER_PRESSES.fetch_add(1, Ordering::SeqCst) + 1;
+                        send(Shortcut::Enter(INPUT_EPOCH.load(Ordering::SeqCst), press));
                     }
                 }
                 _ => note_input(Input::Key),
