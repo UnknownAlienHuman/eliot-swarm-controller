@@ -1124,23 +1124,24 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "WITH pending AS MATERIALIZED (
-                    SELECT id, parent_command, link_kind, ordinal
+                "WITH unsettled AS MATERIALIZED (
+                    SELECT id, parent_command, link_kind, ordinal, state
                     FROM commands INDEXED BY commands_unsettled_created
                     WHERE state IN ('accepted','queued','dispatched','unknown')
-                      AND state IN ('accepted','queued')
                  )
                  SELECT id, principal, method, target, expected_generation, generation,
                         expected_turn_id, turn_id, request_id, verb, args, state, outcome,
                         created_at, updated_at, probe, selector, config_revision
                  FROM commands
                  WHERE id IN (
-                     SELECT id FROM pending
-                     WHERE link_kind = 'rule_action' AND ordinal IS NOT NULL
+                     SELECT id FROM unsettled
+                     WHERE state IN ('accepted','queued')
+                       AND link_kind = 'rule_action' AND ordinal IS NOT NULL
                      UNION ALL
-                     SELECT start.id FROM pending input
+                     SELECT start.id FROM unsettled input
                      CROSS JOIN commands start ON start.id = input.parent_command
-                     WHERE input.link_kind = 'send' AND input.ordinal = 0
+                     WHERE input.state IN ('accepted','queued')
+                       AND input.link_kind = 'send' AND input.ordinal = 0
                        AND start.link_kind = 'rule_action' AND start.ordinal IS NOT NULL
                        AND start.verb IN ('launch','resume') AND start.state = 'applied'
                    )
