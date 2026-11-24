@@ -6787,8 +6787,7 @@ impl Router {
                 store_write_faulted: None,
             }
         } else {
-            let blockers = self.status_blockers().await?;
-            let drain = self.drain_report().await?;
+            let (blockers, drain) = self.blockers_and_drain().await?;
             DaemonShutdownResponse {
                 state: if blockers.is_empty() {
                     CommandState::Applied

@@ -2,7 +2,7 @@
 
 use super::{Router, STATUS_BLOCKER_MAX};
 use eliot_core::{
-    AgentState, Command, CommandState, Error, Result, SecretPolicy,
+    Agent, AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
         AutonomyRequest, DaemonHealthSummary, DaemonSidebarResponse, DaemonStatusResponse,
         DrainReport, OwnedProcessKind, OwnedProcessSummary, OwnerInboxItem, OwnerInboxKind,
@@ -13,6 +13,18 @@ use eliot_core::{
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
 use std::collections::HashSet;
+
+struct ControlFacts {
+    agents: Vec<Agent>,
+    agents_total: usize,
+    active_observers: Vec<bool>,
+    unsettled_commands: Vec<Command>,
+    unsettled_total: usize,
+    live_owners: Vec<eliot_store::LiveProcessOwner>,
+    live_owners_total: usize,
+    write_faulted: bool,
+    unknown_commands: Vec<String>,
+}
 
 impl Router {
     pub(super) async fn sidebar_status(&self) -> Result<Value> {
@@ -72,8 +84,7 @@ impl Router {
             owner_inbox,
             profile_command_issues,
         } = self.sidebar_fields(inbox);
-        let blockers = self.status_blockers().await?;
-        let drain = self.drain_report().await?;
+        let (blockers, drain) = self.blockers_and_drain().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();
         let mut disk_usage = self
@@ -121,10 +132,9 @@ impl Router {
                 store.artifact_capacity()?,
             )
         };
-        let mut unknown_commands = self.unknown_ids();
-        let unknown_commands_count = unknown_commands.len();
-        let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
-        unknown_commands.truncate(STATUS_BLOCKER_MAX);
+        let unknown_commands = drain.unknown_commands.clone();
+        let unknown_commands_count = drain.unknown_commands_count;
+        let unknown_commands_truncated = drain.unknown_commands_truncated;
         let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
         let unsettled_commands_truncated = unsettled_commands.len() < unsettled_total;
         let unsettled_command_details = unsettled_commands
@@ -332,30 +342,17 @@ impl Router {
     /// outcome. The unsettled section excludes the same predicate in SQL
     /// before the bound so the receipt never double-lists them; its count
     /// covers the excluding page.
-    pub(super) async fn drain_report(&self) -> Result<DrainReport> {
-        self.clear_terminal_unknown_cache().await;
+    async fn drain_report_from(&self, facts: &ControlFacts) -> Result<DrainReport> {
         // Retained unknowns leave the unsettled section in SQL before the
         // bound (one predicate over durable facts, no id lists), so they can
         // neither occupy the bounded prefix nor hide a live command in the
         // receipt.
         let (mut retained_unresolved, retained_total) = self.retained_unresolved_unknowns().await?;
-        let (agents, agents_total, unsettled_commands, unsettled_total, custody) = {
-            let store = self.inner.store.lock().await;
-            (
-                store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?,
-                store.count_nonterminal_agents()?,
-                store.list_unsettled_commands_excluding_retained(STATUS_BLOCKER_MAX)?,
-                store.count_unsettled_commands_excluding_retained()?,
-                store.live_process_owners(STATUS_BLOCKER_MAX)?,
-            )
-        };
-        let (live_owners, live_total) = custody;
-        let agents_total = usize::try_from(agents_total.max(0)).unwrap_or(usize::MAX);
-        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
         // Running turns derive solely from the Agent page: any omitted Agent
         // may hide a turn, so the Agent omission decides this flag.
-        let running_turns_truncated = agents.len() < agents_total;
-        let mut running_turns = agents
+        let running_turns_truncated = facts.agents.len() < facts.agents_total;
+        let mut running_turns = facts
+            .agents
             .iter()
             .filter_map(|agent| {
                 agent
@@ -382,7 +379,8 @@ impl Router {
         // instead of double-listing here. The count covers the listed page
         // and the flag stays true whenever the excluding store total exceeds
         // it for any reason.
-        let unsettled_details = unsettled_commands
+        let unsettled_details = facts
+            .unsettled_commands
             .iter()
             .map(|command| UnsettledCommandSummary {
                 id: command.id.clone(),
@@ -393,15 +391,16 @@ impl Router {
             })
             .collect::<Vec<_>>();
         let unsettled_commands_count = unsettled_details.len();
-        let unsettled_commands_truncated = unsettled_details.len() < unsettled_total;
-        let mut unknown_commands = self.unknown_ids();
+        let unsettled_commands_truncated = unsettled_details.len() < facts.unsettled_total;
+        let mut unknown_commands = facts.unknown_commands.clone();
         let unknown_commands_count = unknown_commands.len();
         let unknown_commands_truncated = unknown_commands.len() > STATUS_BLOCKER_MAX;
         unknown_commands.truncate(STATUS_BLOCKER_MAX);
-        let mut owned_processes = live_owners
-            .into_iter()
+        let mut owned_processes = facts
+            .live_owners
+            .iter()
             .map(|owner| OwnedProcessSummary {
-                agent: owner.agent,
+                agent: owner.agent.clone(),
                 generation: owner.generation,
                 kind: if owner.workspace {
                     OwnedProcessKind::Workspace
@@ -417,7 +416,7 @@ impl Router {
                 right.kind as u8,
             ))
         });
-        let owned_processes_truncated = owned_processes.len() < live_total;
+        let owned_processes_truncated = owned_processes.len() < facts.live_owners_total;
         owned_processes.truncate(STATUS_BLOCKER_MAX);
         let owned_processes_count = owned_processes.len();
         // The total is the exact SQL count over all stored unknowns; the
@@ -446,8 +445,9 @@ impl Router {
         })
     }
 
-    pub(super) async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
+    async fn read_control_facts(&self, report_drain: bool) -> Result<ControlFacts> {
         self.clear_terminal_unknown_cache().await;
+        let unknown_commands = self.unknown_ids();
         // Retained unknowns retire the drain wait everywhere: the Store
         // excludes the predicate in SQL before the unsettled bound, so
         // retained entries can neither occupy a blocker slot nor hide a
@@ -455,14 +455,7 @@ impl Router {
         // the overflow fallback below: any command the bound omits keeps
         // blocking, while a fleet of only retained unknowns still drains
         // because the predicate already excluded every one of them.
-        let (
-            agents,
-            active_observers,
-            unsettled_commands,
-            unsettled_total,
-            live_owners_total,
-            write_faulted,
-        ) = {
+        {
             let store = self.inner.store.lock().await;
             let agents = store.list_nonterminal_agents(STATUS_BLOCKER_MAX)?;
             let active_observers = agents
@@ -481,21 +474,45 @@ impl Router {
             // Store custody is the owned-process source of truth beside the
             // workspace slots: a live owned process record blocks even when
             // no slot claims it.
-            let live_owners_total = store.live_process_owners(1)?.1;
-            (
+            let (live_owners, live_owners_total) =
+                store.live_process_owners(if report_drain { STATUS_BLOCKER_MAX } else { 1 })?;
+            let agents_total = if report_drain {
+                usize::try_from(store.count_nonterminal_agents()?.max(0)).unwrap_or(usize::MAX)
+            } else {
+                agents.len()
+            };
+            Ok(ControlFacts {
                 agents,
+                agents_total,
                 active_observers,
                 unsettled_commands,
-                unsettled_total,
+                unsettled_total: usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX),
+                live_owners,
                 live_owners_total,
-                store.is_write_faulted(),
-            )
-        };
+                write_faulted: store.is_write_faulted(),
+                unknown_commands,
+            })
+        }
+    }
+
+    pub(super) async fn status_blockers(&self) -> Result<Vec<StatusBlocker>> {
+        let facts = self.read_control_facts(false).await?;
+        self.status_blockers_from(&facts).await
+    }
+
+    pub(super) async fn blockers_and_drain(&self) -> Result<(Vec<StatusBlocker>, DrainReport)> {
+        let facts = self.read_control_facts(true).await?;
+        let blockers = self.status_blockers_from(&facts).await?;
+        let drain = self.drain_report_from(&facts).await?;
+        Ok((blockers, drain))
+    }
+
+    async fn status_blockers_from(&self, facts: &ControlFacts) -> Result<Vec<StatusBlocker>> {
         let mut blockers = Vec::new();
         if let Some(id) = self.inner.cleanup_worker.lock_recover().clone() {
             blockers.push(StatusBlocker::CleanupActive { id });
         }
-        if self.inner.workspaces.has_owned_processes() || live_owners_total > 0 {
+        if self.inner.workspaces.has_owned_processes() || facts.live_owners_total > 0 {
             blockers.push(StatusBlocker::WorkspaceProcesses);
         }
         let discovery_readers = self.inner.plugin_host.reader_count();
@@ -504,7 +521,7 @@ impl Router {
                 count: discovery_readers,
             });
         }
-        for (agent, source_active) in agents.into_iter().zip(active_observers) {
+        for (agent, &source_active) in facts.agents.iter().zip(&facts.active_observers) {
             let observer_present = self
                 .inner
                 .plugin_host
@@ -524,10 +541,10 @@ impl Router {
             });
         }
         let mut unsettled_ids = HashSet::new();
-        for command in unsettled_commands {
+        for command in &facts.unsettled_commands {
             unsettled_ids.insert(command.id.clone());
             blockers.push(StatusBlocker::CommandUnsettled {
-                command_id: command.id,
+                command_id: command.id.clone(),
                 state: command.state,
             });
         }
@@ -582,13 +599,12 @@ impl Router {
         // decision, so any live command the bound omits keeps blocking with
         // its exact unlisted remainder. The remainder counts only entries
         // the list omits: every listed id above is already in the total.
-        let unsettled_total = usize::try_from(unsettled_total.max(0)).unwrap_or(usize::MAX);
-        if unsettled_total > unsettled_ids.len() {
+        if facts.unsettled_total > unsettled_ids.len() {
             blockers.push(StatusBlocker::CommandUnsettledMore {
-                count: unsettled_total - unsettled_ids.len(),
+                count: facts.unsettled_total - unsettled_ids.len(),
             });
         }
-        if write_faulted {
+        if facts.write_faulted {
             blockers.push(StatusBlocker::StoreWriteFaulted);
         }
         // Filter retained and already-unsettled ids before the list bound and
@@ -599,11 +615,11 @@ impl Router {
         let mut blocking_unknown = Vec::new();
         {
             let store = self.inner.store.lock().await;
-            for id in self.unknown_ids() {
-                if unsettled_ids.contains(&id) {
+            for id in &facts.unknown_commands {
+                if unsettled_ids.contains(id) {
                     continue;
                 }
-                if store.is_retained_unknown(&id).unwrap_or(false) {
+                if store.is_retained_unknown(id).unwrap_or(false) {
                     continue;
                 }
                 blocking_unknown.push(id);
@@ -611,7 +627,7 @@ impl Router {
         }
         for id in blocking_unknown.iter().take(STATUS_BLOCKER_MAX) {
             blockers.push(StatusBlocker::CommandUnknown {
-                command_id: id.clone(),
+                command_id: (*id).clone(),
             });
         }
         if blocking_unknown.len() > STATUS_BLOCKER_MAX {
