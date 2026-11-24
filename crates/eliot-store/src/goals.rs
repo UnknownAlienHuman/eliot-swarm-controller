@@ -3317,6 +3317,8 @@ struct GoalCostBase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     boundary_completed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_native_ref: Option<String>,
@@ -3558,6 +3560,7 @@ pub(super) fn resolve_pending_goal_cost_base_tx(
         amount_micros: cost_micros(amount),
         observed_at: Some(observed_at),
         boundary_completed_at: Some(completed_at),
+        boundary_turn_id: Some(boundary_turn_id.to_owned()),
         ..GoalCostBase::default()
     };
     row.state.counters.cost_spent_micros = Some(0);
@@ -3597,10 +3600,25 @@ fn goal_cost_reading_tx(
         }));
     };
     let last_completed = latest_completed_turn_at(tx, agent_num, generation)?;
-    let is_baseline_boundary = turns_used == 0
+    let newer_completion = last_completed.filter(|done| *done > observed_at);
+    let is_baseline_boundary = if let (Some(turn_id), Some(completed_at)) =
+        (base.boundary_turn_id.as_deref(), newer_completion)
+        && turns_used == 0
         && base.observed_at == Some(observed_at)
-        && base.boundary_completed_at.is_some()
-        && base.boundary_completed_at == last_completed;
+        && base.boundary_completed_at == Some(completed_at)
+    {
+        tx.query_row(
+            "SELECT turn_id = ?4 FROM turns WHERE agent = ?1 AND generation = ?2
+             AND completed_at = ?3 ORDER BY insertion_seq DESC, rowid DESC LIMIT 1",
+            params![agent_num, generation, completed_at, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false)
+    } else {
+        false
+    };
     let reading = match snapshot_cost(&usage) {
         None => GoalCostReading::Unverified("the latest session snapshot has no cost"),
         Some((_, unit)) if unit != limit.unit => {
@@ -3612,9 +3630,7 @@ fn goal_cost_reading_tx(
         Some(_) if base.source.is_some() && usage.source != base.source => {
             GoalCostReading::Unverified("the native session changed")
         }
-        Some(_)
-            if !is_baseline_boundary && last_completed.is_some_and(|done| done > observed_at) =>
-        {
+        Some(_) if newer_completion.is_some() && !is_baseline_boundary => {
             GoalCostReading::Unverified("no session cost after the last turn")
         }
         Some((amount, _)) => match cost_micros(amount).checked_sub(base.amount_micros) {
