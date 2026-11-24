@@ -385,7 +385,7 @@ fn require_handoff_bounds(
     reason: Option<HandoffReason>,
 ) -> Result<()> {
     if reason == Some(HandoffReason::ProviderResponseWithheld)
-        && core::same_codex_provider_route(&source.profile_snapshot, successor)
+        && core::same_provider_response_route(&source.profile_snapshot, successor)
     {
         return Err(Error::new(
             "not_allowed",

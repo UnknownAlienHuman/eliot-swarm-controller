@@ -194,9 +194,9 @@ fn names(snapshot: &Value, key: &str) -> Option<std::collections::BTreeSet<Strin
     }
 }
 
-/// Direct Codex presets share the provider session route. For adopted routes,
+/// Direct presets of the same harness share its provider session route. For adopted routes,
 /// the Responses endpoint identifies the route across renamed presets.
-pub fn same_codex_provider_route(source: &Value, candidate: &Value) -> bool {
+pub fn same_provider_response_route(source: &Value, candidate: &Value) -> bool {
     fn endpoint(snapshot: &Value) -> Option<Url> {
         snapshot
             .pointer("/route_binding/provider_base_url")
@@ -204,7 +204,10 @@ pub fn same_codex_provider_route(source: &Value, candidate: &Value) -> bool {
             .and_then(|url| validate_http_url(url).ok())
     }
 
-    if source["harness"] != "codex" || candidate["harness"] != "codex" {
+    let Some(harness) = source["harness"].as_str() else {
+        return false;
+    };
+    if candidate["harness"] != harness {
         return false;
     }
     match (endpoint(source), endpoint(candidate)) {

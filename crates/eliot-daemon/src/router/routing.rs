@@ -795,7 +795,7 @@ impl Router {
         }
         if let Some(source) = &preflight.handoff_source {
             if preflight.skip_source_provider_route
-                && eliot_core::same_codex_provider_route(source, &snapshot)
+                && eliot_core::same_provider_response_route(source, &snapshot)
             {
                 return Ok(Err(RouteSkipReason::ProviderFailure));
             }

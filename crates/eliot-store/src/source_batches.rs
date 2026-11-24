@@ -35,7 +35,7 @@ fn provider_response_withheld_event_tx(
     terminal: &core::NativeEvent,
     now: i64,
 ) -> Result<Option<Event>> {
-    if agent.harness != "codex"
+    if !core::api::HarnessCapabilities::of(&agent.harness).provider_response_withholding
         || agent.observe_only
         || terminal.kind != "turn.completed"
         || terminal.data["outcome"].as_str() != Some("failure")

@@ -806,7 +806,7 @@ fn project_handoffs(
                               THEN 'account:' || json_extract(a.profile_snapshot,'$.account') || '.' || a.harness
                               ELSE 'profile:' || a.profile END))
                 OR (json_extract(e.data,'$.reason') = 'provider_response_withheld'
-                    AND a.harness = 'codex' AND a.state IN ('idle','lost','failed')
+                    AND a.state IN ('idle','lost','failed')
                     AND EXISTS(SELECT 1 FROM events withheld INDEXED BY events_agent
                         WHERE withheld.agent = e.agent AND withheld.generation = e.generation
                           AND withheld.kind = 'provider.response_withheld'
