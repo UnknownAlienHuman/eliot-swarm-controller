@@ -2284,44 +2284,28 @@ fn valid_inject_request(request: &SubmitCommand) -> bool {
 fn valid_targetless_rule_run_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "run"
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && request.args.is_object()
 }
 
 fn valid_targetless_user_event_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && is_user_event_verb(request.verb.as_str())
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && request.args.is_object()
 }
 
 fn valid_targetless_coordination_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && is_coordination_verb(request.verb.as_str())
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && request.args.is_object()
 }
 
 fn valid_targetless_git_fetch_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "git.fetch"
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && super::projects::decode_frozen_git_fetch(&request.args).is_ok()
 }
 
@@ -2329,21 +2313,13 @@ fn valid_targetless_git_integrate_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.selector.is_none()
         && request.verb == "git.integrate"
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && super::projects::decode_frozen_git_integrate(&request.args).is_ok()
 }
 fn valid_targetless_git_publish_request(request: &SubmitCommand) -> bool {
     request.validate().is_ok()
         && request.verb == "git.publish"
-        && request.target.is_none()
-        && request.expected_generation.is_none()
-        && request.expected_turn_id.is_none()
-        && request.request_id.is_none()
-        && !request.probe
+        && !request.has_agent_bindings()
         && serde_json::from_value::<core::api::FrozenGitPublish>(request.args.clone())
             .is_ok_and(|frozen| frozen.validate().is_ok())
 }

@@ -24,16 +24,21 @@ impl CommandSubmitRequest {
         }
     }
 
-    /// Validate the absence of Agent/request bindings and probe markers while
-    /// retaining the caller's existing error text. Authority and current
-    /// generation/turn state remain transaction-time Store checks.
-    pub fn validate_no_agent_bindings(&self, message: &str) -> Result<()> {
-        if self.target.is_some()
+    /// Whether the request carries a target, generation, turn, request or
+    /// probe binding. The selector has its own verb-specific rules.
+    pub fn has_agent_bindings(&self) -> bool {
+        self.target.is_some()
             || self.expected_generation.is_some()
             || self.expected_turn_id.is_some()
             || self.request_id.is_some()
             || self.probe
-        {
+    }
+
+    /// Validate the absence of Agent/request bindings and probe markers while
+    /// retaining the caller's existing error text. Authority and current
+    /// generation/turn state remain transaction-time Store checks.
+    pub fn validate_no_agent_bindings(&self, message: &str) -> Result<()> {
+        if self.has_agent_bindings() {
             Err(Error::new("invalid", message))
         } else {
             Ok(())

@@ -2082,11 +2082,7 @@ impl Router {
     ) -> Result<PreparedSubmission> {
         if request.verb != "git.integrate"
             || request.selector.is_some()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
+            || request.has_agent_bindings()
         {
             return Err(Error::new(
                 "invalid",
@@ -2460,13 +2456,7 @@ impl Router {
         principal: &Principal,
         expected_registration: Option<&ProjectRegistrationView>,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "git.fetch"
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "git.fetch" || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "git.fetch must be targetless and have no Agent or request bindings",
@@ -2555,13 +2545,7 @@ impl Router {
         principal: &Principal,
         expected_registration: Option<&ProjectRegistrationView>,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "git.publish"
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "git.publish" || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "git.publish must be a targetless project-check action",
@@ -2769,14 +2753,7 @@ impl Router {
         mut request: SubmitCommand,
         context: FrozenScriptContext,
     ) -> Result<PreparedSubmission> {
-        if request.verb != "run"
-            || !request.id.is_empty()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
-        {
+        if request.verb != "run" || !request.id.is_empty() || request.has_agent_bindings() {
             return Err(Error::new(
                 "invalid",
                 "Owner event Run must be targetless and unbound",
@@ -2808,11 +2785,7 @@ impl Router {
     ) -> Result<PreparedSubmission> {
         if request.verb != "run"
             || !request.id.is_empty()
-            || request.target.is_some()
-            || request.expected_generation.is_some()
-            || request.expected_turn_id.is_some()
-            || request.request_id.is_some()
-            || request.probe
+            || request.has_agent_bindings()
             || context.timer().is_none()
         {
             return Err(Error::new(
