@@ -113,8 +113,8 @@ engine, second scheduler or critic loop.
       projection. Turn-end reminders recognize fast project-check receipts and
       exact completed native checks.
       The age filter narrows the Owner inbox before paging. Checked review has
-      a recipe installer, direct named profiles with quota readback reserve
-      capacity by default, and Windows permission guards recognize executable
+      a recipe installer, the Owner can configure quota reserves per profile,
+      and Windows permission guards recognize executable
       basenames and quoted paths.
 - [x] **Store-derived deadlines and attention (#873).** Three Claude Haiku
       checks raised the project deadline. OpenCode's timed-out check passed on
