@@ -102,9 +102,13 @@ pub struct CleanupGitBinding {
     pub planned_tip: Option<String>,
 }
 
-#[derive(schemars::JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    schemars::JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupScope {
+    #[default]
+    Default,
     SelfTree,
     Project,
     All,
@@ -113,6 +117,7 @@ pub enum CleanupScope {
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CleanupPlanRequest {
+    #[serde(default)]
     pub scope: CleanupScope,
     #[serde(default)]
     pub project: Option<String>,
@@ -335,10 +340,22 @@ pub struct CleanupCandidate {
 
 #[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CleanupInventoryIssue {
+    pub agent: String,
+    pub generation: i64,
+    pub path: Option<String>,
+    pub reason: String,
+    pub detail: String,
+}
+
+#[derive(schemars::JsonSchema, Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupPlan {
     pub plan_id: String,
     pub created_at: i64,
     pub items: Vec<CleanupCandidate>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inventory_issues: Vec<CleanupInventoryIssue>,
     pub truncated: bool,
     /// Opaque token for the next page, absent when the listing is complete.
     /// Echo it as `continuation` to continue in final candidate order.

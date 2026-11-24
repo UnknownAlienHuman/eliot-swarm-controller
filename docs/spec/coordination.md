@@ -29,9 +29,13 @@ directories are recorded only by the Agent that created them through
 Existing worktree and native-subject facts are also reconciled
 when planning, without scanning arbitrary filesystem roots.
 
-`cleanup.plan {scope:self_tree|project|all,project?,older_than?,continuation?}` changes
+`cleanup.plan {scope?:self_tree|project|all,project?,older_than?,continuation?}` changes
 no filesystem objects. It retains a bounded snapshot with per-item size, reason and
 `safe`/`keep` verdict. The cutoff is an exclusive Unix-millisecond creation time.
+Omitted scope resolves to `all` for the authenticated Owner and `self_tree` for Agents.
+Backfill reports an unreadable or missing source in the page's `inventory_issues`
+with Agent, generation, path when available, and bounded reason and detail. It
+continues inventory for other entries. These diagnostics grant no cleanup authority.
 Manual plans select `registered` rows. Settled rows (`removed`, `unknown`,
 `skipped(...)`) are attempt history read back from retained plans, and filtering
 them before the page cap keeps a settled prefix from starving later eligible
@@ -78,7 +82,11 @@ plan/apply and `stand down` retain their independent root, registry, marker,
 owner-binding and #885 two-pass cleanup checks.
 
 Plans anchor the managed workspace identity and branch tip. Apply rechecks the
-same identity and exact local tip before mutation. Missing or changed local identity,
+same identity and exact local tip before mutation. A proven missing directory for
+a retained artifact can surface as `safe(already_absent)`. Apply verifies it is
+still absent and settles zero bytes. For a worktree, apply uses the existing
+missing-worktree reconciliation and preserves the local branch. A reappearing
+directory requires a fresh plan. Changed local identity,
 checked-out branches, filesystem guards and Git readiness still keep/refuse the
 candidate with their concrete reason. A present
 `daemon.lock` with a live owner keeps a data directory. Only a provably dead
