@@ -251,6 +251,16 @@ pub(crate) fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>
     }
 }
 
+fn require_stand_codex_proxy(profile: &Value) -> core::Result<()> {
+    if !profile["route_binding"].is_object() {
+        return Err(core::Error::new(
+            "stand_codex_login_unsupported",
+            "Codex ChatGPT/OAuth login is unavailable in a private stand; select a named Codex profile with an adopted Responses proxy",
+        ));
+    }
+    Ok(())
+}
+
 /// Compare the actual environment and any retained native store before the plugin
 /// can start Codex. A retained binding can repin the home after environment setup.
 pub(crate) fn verify_stand_codex_route(
@@ -265,6 +275,7 @@ pub(crate) fn verify_stand_codex_route(
     let Some(home) = stand_home else {
         return Ok(());
     };
+    require_stand_codex_proxy(profile)?;
     let home = canonical_stand_codex_home(home)?;
     match std::fs::symlink_metadata(home.join("config.toml")) {
         Ok(metadata) if metadata.is_file() && !crate::platform::is_reparse_point(&metadata) => {}
@@ -285,7 +296,10 @@ pub(crate) fn verify_stand_codex_route(
     let matches_home = |value: &Value| {
         value.as_str().is_some_and(|path| {
             let path = Path::new(path);
-            path.is_absolute() && crate::operator::data_dirs_match(path, &home)
+            path.is_absolute()
+                && path
+                    .canonicalize()
+                    .is_ok_and(|path| crate::operator::data_dirs_match(&path, &home))
         })
     };
     if profile["stand_native_store"] == true
@@ -315,6 +329,7 @@ pub(crate) fn capture_native_store_inputs(
         core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
             .requires_frozen_store_inputs
     }) {
+        require_stand_codex_proxy(profile)?;
         if let Err(error) = std::fs::create_dir(home)
             && error.kind() != std::io::ErrorKind::AlreadyExists
         {
@@ -344,7 +359,7 @@ pub(crate) fn capture_native_store_inputs(
     for &selector in CODEX_STORE_SELECTORS {
         let selected = home
             .as_ref()
-            .map(|path| path.as_os_str().to_owned())
+            .map(|path| core::display_path(&path.to_string_lossy()).into())
             .or_else(|| admitted_selector(names, selector).and_then(std::env::var_os));
         let value = selected
             .map(|value| {
