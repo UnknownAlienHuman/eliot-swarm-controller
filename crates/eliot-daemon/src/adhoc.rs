@@ -855,13 +855,13 @@ fn verify_reader(
     harness: &str,
     deadline: Instant,
 ) -> core::Result<(String, Option<String>)> {
-    let decl = discovery_for(harness)?;
+    let decl = discovery_for(harness).ok();
     let cmd = resolve_native_executable(cmd, harness)?;
-    let version = match decl.strategy {
-        InstallStrategy::MetadataVersion(read) => read(Path::new(&cmd)),
-        _ => probe_optional_native_version(&cmd, Some(&decl), deadline)?,
+    let version = match decl.map(|decl| decl.strategy) {
+        Some(InstallStrategy::MetadataVersion(read)) => read(Path::new(&cmd)),
+        _ => probe_optional_native_version(&cmd, decl.as_ref(), deadline)?,
     };
-    if let Some(probe) = decl.capability_probe
+    if let Some(probe) = decl.and_then(|decl| decl.capability_probe)
         && version.is_none()
     {
         return Err(core::Error::new("unsupported", probe.refusal));

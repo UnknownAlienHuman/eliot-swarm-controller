@@ -2500,8 +2500,10 @@ owned generation's live session catalogue on every call and reports any read
 failure. An unscoped OpenCode read uses native configuration and auth in place.
 A named OpenCode profile reads an isolated preview of its launch inventory.
 Both may take an existing absolute `workspace` to apply that directory's configuration.
-The daemon resolves the workspace once and uses the canonical directory for both
-the cache key and the native read.
+The daemon uses the canonical directory for the cache key and native read. An
+invalid workspace returns `invalid`. A directory that cannot be canonicalized
+returns `unavailable`. If its canonical spelling is outside UTF-8, the native
+reader uses the supplied workspace spelling.
 The Agent's harness must match and observed Agents are `not_allowed`. Every response
 carries `configure`, the harness's mid-session `configure` support from the
 same table `configure` admission uses: `model_refusal`/`effort_refusal` are
@@ -2531,7 +2533,11 @@ workspace reuse the result for up to 30 seconds. Unverified sources return
 live session catalogue reads continue to use the owned generation.
 Both readers return the same bounded typed model rows. The live reply also
 binds the exact Agent and generation. OpenCode's optional metadata supplements
-only the IDs returned by its primary catalogue.
+only the IDs returned by its primary catalogue. The read skips rows with unusable
+IDs and discards malformed optional fields on otherwise usable rows. The `note`
+marks a partial catalogue when either read discards malformed metadata. A
+dedicated read uses canonical provenance for an unknown label. A live read
+requires `session` provenance and the exact generation binding.
 Public `scope` names the profile and route without
 private store paths. Every response carries `scope`, `fetched_at_ms`, `ttl_ms`,
 `stale` and a nonsecret `credential` reference. Native model IDs remain verbatim.

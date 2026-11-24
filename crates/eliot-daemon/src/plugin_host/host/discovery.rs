@@ -251,21 +251,17 @@ impl PluginHost {
         workspace: Option<String>,
         deadline: Instant,
     ) -> Result<ModelCatalogue> {
-        if !profile
+        let Some(harness) = profile
             .get("harness")
             .and_then(Value::as_str)
-            .is_some_and(is_supported_harness)
-        {
+            .filter(|harness| is_supported_harness(harness))
+        else {
             return Err(Error::new(
                 "unsupported",
                 "harness.models needs a codex, claude, muse, opencode or antigravity profile",
             ));
-        }
-        let options = profile["harness"]
-            .as_str()
-            .map(HarnessCapabilities::of)
-            .unwrap_or_default()
-            .model_reader;
+        };
+        let options = HarnessCapabilities::of(harness).model_reader;
         let request = ModelListParams {
             target_environment: Some(environment),
             profile,
@@ -625,6 +621,7 @@ impl PluginHost {
             return metadata;
         }
         if let (Ok(catalogue), Ok(metadata)) = (&mut catalogue.result, metadata.result) {
+            catalogue.degraded |= metadata.degraded;
             overlay_model_metadata(catalogue, &metadata);
         }
         catalogue
@@ -694,16 +691,7 @@ impl PluginHost {
                 .map_err(|_| Error::new("internal", "model.list params encoding failed"))?;
             let value = reader.client.call("model.list", request, until).await?;
             reject_reserved_metadata(&value, &metadata_secrets, "model.list")?;
-            let catalogue: ModelCatalogue = serde_json::from_value(value)
-                .map_err(|_| Error::new("source_integrity", "model.list catalogue is malformed"))?;
-            catalogue.validate_count("model.list")?;
-            if catalogue.provenance == eliot_plugin::protocol::CatalogueProvenance::Session {
-                return Err(Error::new(
-                    "source_integrity",
-                    "model.list returned a live session catalogue",
-                ));
-            }
-            Ok(catalogue)
+            ModelCatalogue::decode(value, None)
         };
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>

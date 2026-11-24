@@ -457,38 +457,31 @@ impl Router {
             if route.identity.is_none() {
                 return Err(unverified());
             }
-            let workspace_key = if let Some(path) = workspace {
+            let workspace = if let Some(path) = workspace {
                 Some(
                     crate::adhoc::blocking_discovery(deadline, move || {
-                        let path = std::path::Path::new(&path);
-                        let invalid_workspace = || {
-                            Error::new(
+                        let input = std::path::Path::new(&path);
+                        if !input.is_absolute() || !input.is_dir() {
+                            return Err(Error::new(
                                 "invalid",
                                 "model preview workspace must be an existing absolute directory",
+                            ));
+                        }
+                        let root = input.canonicalize().map_err(|_| {
+                            Error::new(
+                                "unavailable",
+                                "model preview workspace could not be verified",
                             )
-                        };
-                        if !path.is_absolute() {
-                            return Err(invalid_workspace());
-                        }
-                        let root = path.canonicalize().map_err(|_| invalid_workspace())?;
-                        if !root.is_dir() {
-                            return Err(invalid_workspace());
-                        }
-                        Ok(root)
+                        })?;
+                        let native_path = root.to_str().map(str::to_owned).unwrap_or(path);
+                        Ok((root, native_path))
                     })
                     .await??,
                 )
             } else {
                 None
             };
-            let workspace = workspace_key
-                .as_ref()
-                .map(|path| {
-                    path.to_str().map(str::to_owned).ok_or_else(|| {
-                        Error::new("invalid", "model preview workspace path is not UTF-8")
-                    })
-                })
-                .transpose()?;
+            let (workspace_key, workspace) = workspace.unzip();
             let cmd = profile["cmd"].as_str().unwrap_or(harness);
             let verify = |cmd: String, version: Option<String>| {
                 let unversioned = || {
@@ -2190,16 +2183,8 @@ fn native_models_response(
     cmd: &str,
     scope: String,
     credential: String,
-    mut raw: ModelCatalogue,
+    raw: ModelCatalogue,
 ) -> Result<HarnessModelsResponse> {
-    raw.models.retain(|model| !model.id.trim().is_empty());
-    for model in &mut raw.models {
-        model.display_name = model
-            .display_name
-            .take()
-            .filter(|name| eliot_core::api::harness::native_model_display_name(name).is_some());
-        model.source = None;
-    }
     let entries = raw.models;
     if let Some(documented) = HarnessCapabilities::of(harness).documented_models
         && entries.is_empty()
@@ -2209,20 +2194,17 @@ fn native_models_response(
             documented.empty_native_inventory,
         ));
     }
-    let default = raw.default.filter(|default| !default.trim().is_empty());
+    let default = raw.default;
     // Adapters own vendor-specific view notes; the daemon supplies only the
     // shared default presentation when an adapter declares no callback.
-    let (catalogue, note) = HarnessCapabilities::of(harness)
+    let (catalogue, mut note) = HarnessCapabilities::of(harness)
         .model_catalogue_presentation
-        .map(|present| {
-            present(
-                cmd,
-                raw.provenance.as_str(),
-                entries.is_empty(),
-                default.as_deref(),
-            )
-        })
+        .map(|present| present(cmd, raw.provenance, entries.is_empty(), default.as_deref()))
         .unwrap_or(("native", None));
+    if raw.degraded {
+        let warning = "Partial catalogue: some native metadata was ignored.";
+        note = Some(note.map_or_else(|| warning.to_owned(), |note| format!("{note} {warning}")));
+    }
     Ok(HarnessModelsResponse {
         harness: harness.to_owned(),
         catalogue: catalogue.to_owned(),

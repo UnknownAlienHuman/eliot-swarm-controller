@@ -24,8 +24,8 @@ use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{
-        AgentModelCatalogue, AgentModelsParams, CatalogueProvenance, ModelCatalogue,
-        ModelListParams, ModelListPart, NativeArchiveParams, stream_sources,
+        AgentModelCatalogue, AgentModelsParams, ModelListParams, ModelListPart,
+        NativeArchiveParams, stream_sources,
     },
     retry::{Retry, RetryOperation},
     session::{
@@ -2884,13 +2884,8 @@ impl OpenCodePlugin {
             .list_native_models(Instant::now() + std::time::Duration::from_secs(5))
             .await?;
         serde_json::to_value(AgentModelCatalogue {
-            agent_id: session.agent_id.clone(),
-            generation: session.generation,
-            catalogue: ModelCatalogue {
-                models: session_catalogue_entries(&catalogue),
-                default: None,
-                provenance: CatalogueProvenance::Session,
-            },
+            binding: params,
+            models: session_catalogue_entries(&catalogue),
         })
         .map_err(|_| Error::new("internal", "OpenCode session catalogue encoding failed"))
     }
@@ -4390,17 +4385,15 @@ fn session_catalogue_entries(catalogue: &[NativeModelEntry]) -> Vec<HarnessModel
             {
                 return None;
             }
-            let efforts = catalogue_entry_variants(entry);
-            let display_name = entry
-                .name
-                .as_deref()
-                .and_then(eliot_core::api::harness::native_model_display_name)
-                .map(str::to_owned);
             Some(HarnessModelEntry {
                 id,
                 default: false,
-                efforts,
-                display_name,
+                efforts: catalogue_entry_variants(entry),
+                display_name: entry
+                    .name
+                    .as_deref()
+                    .and_then(eliot_core::api::harness::native_model_display_name)
+                    .map(str::to_owned),
                 default_effort: None,
                 source: None,
             })
