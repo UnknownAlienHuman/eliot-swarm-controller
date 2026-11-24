@@ -387,6 +387,7 @@ fn encode_record(
                 | "command_id"
                 | "turn_id"
                 | "request_id"
+                | "restore_id"
                 | "source"
                 | "batch_id"
                 | "event_kind"

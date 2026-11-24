@@ -153,13 +153,19 @@ pub(crate) fn stop_restore_writer(intent: &CheckpointRestoreIntent) -> Result<()
             &checkpoint_restore_job_name(&intent.writer_key),
             identity,
         )?;
-        if restore_writer_closed(intent)? {
-            return Ok(());
+        // A Job can report an empty process list before the writer's process
+        // handle is signalled. Keep the reservation until both observations agree.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !restore_writer_closed(intent)? {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::new(
+                    "unknown",
+                    "restore writer exit could not be confirmed",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        Err(Error::new(
-            "unknown",
-            "restore writer exit could not be confirmed",
-        ))
+        Ok(())
     }
     #[cfg(not(windows))]
     {

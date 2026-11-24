@@ -136,7 +136,7 @@ impl Router {
                 crate::logging::record(
                     &self.secret_policy_snapshot(),
                     "checkpoint.restore.custody_check_failed",
-                    &[("id", id)],
+                    &[("restore_id", id)],
                     Some(&error),
                 );
                 (false, Some(error.code))
