@@ -265,10 +265,11 @@ pub(super) struct Appearance {
 
 impl Appearance {
     pub(super) fn new() -> Self {
+        let (high_contrast, animations) = crate::shortcuts::read_accessibility();
         Self {
             dark: false,
-            high_contrast: crate::accessibility::high_contrast_on(),
-            animations: crate::accessibility::animations_on(),
+            high_contrast,
+            animations,
         }
     }
 
@@ -877,8 +878,13 @@ impl DesktopApp {
             ShellMsg::SchemeObserved(scheme) => {
                 let before = self.palette();
                 self.appearance.dark = scheme == ColorScheme::Dark;
-                self.appearance.high_contrast = crate::accessibility::high_contrast_on();
+                // High Contrast (and animation effects) through the reading
+                // the settings hook keeps, so its next comparison starts
+                // from what the window shows and never sends a no-op.
+                let (high_contrast, animations) = crate::shortcuts::read_accessibility();
+                self.appearance.high_contrast = high_contrast;
                 self.palette_changed(before, context);
+                self.accessibility_changed(high_contrast, animations, context);
                 // The first observation colors the title bar even when the
                 // palette is the starting one.
                 self.sync_title_bar();
@@ -2212,9 +2218,13 @@ impl DesktopApp {
                 .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
                 .content(self.panel_view(context, palette))
         };
+        // Its `elevation-1` is a real shadow on the composition host
+        // (`crate::shadow`), as the composer's; the true-black themes ring
+        // it.
+        self.card_shadow.set_layers(m3::elevation_layers(palette));
         let card = m3::lifted(
             palette,
-            crate::theme::elevation::Level::One,
+            &self.card_shadow,
             radius,
             Grid::new().grid_column(1).margin(Thickness::new(
                 0.0,

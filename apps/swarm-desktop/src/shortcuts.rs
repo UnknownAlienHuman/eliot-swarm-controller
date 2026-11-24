@@ -512,6 +512,7 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 /// `CallWndProc`: a message sent to one of the thread's windows; `lparam`
 /// points to its `CWPSTRUCT`. Passed on unchanged.
 unsafe extern "system" fn sent_messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _boundary = crate::startup::native_boundary();
     if let Err(panic) = std::panic::catch_unwind(|| sent_seen(code, lparam)) {
         crate::startup::caught_panic("the settings hook", &*panic);
     }
@@ -528,6 +529,16 @@ fn accessibility_now() -> (u8, bool, bool) {
         high_contrast,
         animations,
     )
+}
+
+/// Read High Contrast and animation effects now and keep them as the
+/// settings hook's last reading: the one place the window's state and the
+/// hook's comparison both come from, so a reading the window takes itself
+/// (a scheme change) never leaves the hook comparing against a stale value.
+pub fn read_accessibility() -> (bool, bool) {
+    let (packed, high_contrast, animations) = accessibility_now();
+    ACCESSIBILITY.store(packed, Ordering::SeqCst);
+    (high_contrast, animations)
 }
 
 /// The settings hook's work: when Windows announces a changed setting or
