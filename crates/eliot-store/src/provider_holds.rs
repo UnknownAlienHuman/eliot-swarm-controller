@@ -210,10 +210,35 @@ impl Store {
 
     pub fn model_mismatch_hold(&self, profile: &str) -> Result<Option<ProviderHold>> {
         self.ensure_committed_reads()?;
-        get(&self.connection, &core::model_hold_scope(profile))
+        Ok(get(&self.connection, &core::model_hold_scope(profile))?
+            .filter(|hold| hold.kind == ProviderRestrictionKind::ModelMismatch))
     }
 
-    /// Read the authorized, live targets of a SEND selector before admission.
+    /// Hydrate a target only when its frozen profile has a mismatch hold.
+    pub fn model_hold_target(&self, id: &str, generation: Option<i64>) -> Result<Option<Agent>> {
+        self.ensure_committed_reads()?;
+        let id = parse_agent_id(id)?;
+        let held = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM agents AS a
+                JOIN provider_holds AS h ON h.scope = ?3 || a.profile
+                WHERE a.id = ?1 AND (?2 IS NULL OR a.generation = ?2)
+                  AND a.observe_only = 0 AND h.kind = 'model_mismatch'
+            )",
+                params![id, generation, core::model_hold_scope("")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if held {
+            load_agent_by_num(&self.connection, id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Check for a held selector member before hydrating the authorized tree.
     /// Admission expands and checks the selector again in its transaction.
     pub fn model_hold_selector_targets(
         &self,
@@ -221,6 +246,29 @@ impl Store {
         selector: &str,
     ) -> Result<Vec<Agent>> {
         self.ensure_committed_reads()?;
+        let root = core::api::parse_tree_selector(selector)?;
+        let ids = super::hierarchy::subtree_member_nums(
+            &self.connection,
+            root,
+            self.hierarchy_limits.max_selector_targets,
+        )?;
+        let held = self
+            .connection
+            .query_row(
+                "SELECT EXISTS (
+                SELECT 1 FROM json_each(?1) AS member
+                JOIN agents AS a ON a.id = member.value
+                JOIN provider_holds AS h ON h.scope = ?2 || a.profile
+                WHERE a.observe_only = 0 AND a.state NOT IN ('stopped', 'failed', 'lost')
+                  AND h.kind = 'model_mismatch'
+            )",
+                params![encode_json(&ids)?, core::model_hold_scope("")],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?;
+        if !held {
+            return Ok(Vec::new());
+        }
         let mut agents = super::hierarchy::snapshot_selector_members(
             &self.connection,
             principal,
@@ -274,7 +322,11 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             Ok(vec![event])
         })();
-        self.fault_on_persistence_error(&result);
+        // Refresh is optional. A failed pre-commit operation can leave the
+        // writer usable after rollback. Uncertain commits stay fenced.
+        if !self.connection.is_autocommit() {
+            self.write_faulted.set(true);
+        }
         result
     }
 

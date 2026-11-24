@@ -774,7 +774,7 @@ impl Router {
         }
         if preflight.check_candidate_holds() {
             if !preflight.preview {
-                self.refresh_model_hold(name, &snapshot).await?;
+                self.refresh_model_hold(name, &snapshot).await;
             }
             let store = self.inner.store.lock().await;
             let probe_at = preflight.offer_due_probe.then(now_ms);

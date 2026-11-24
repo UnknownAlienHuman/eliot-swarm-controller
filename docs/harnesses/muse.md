@@ -107,9 +107,10 @@ continues to use the Owner's native configuration.
 On Windows the adapter reads the installed launcher's
 `.muse-update-checked-at` before starting an owned host. When the check
 is due, the daemon starts a bounded `muse.cmd --version` child on the installed
-channel. A machine-wide guard serializes the launcher check. The host starts
-independently, and stopping the Agent leaves the vendor's background update
-running outside the Agent's Job. Omitted `cmd` resolves from
+channel. A machine-wide guard serializes the launcher check. After 15 seconds,
+the daemon attempts to terminate and reap the wrapper if it is still running.
+The host starts independently, and stopping the Agent leaves the vendor's
+background update running outside the Agent's Job. Omitted `cmd` resolves from
 the vendor manifest again on the next launch. The interval comes from the
 daemon's `MUSE_UPDATE_INTERVAL_SECONDS` environment setting, with a default
 of 3600 seconds. Profile environment entries cannot suppress updates.
