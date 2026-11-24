@@ -93,9 +93,7 @@ impl Router {
     ) -> Result<(Option<Value>, String, Option<HarnessCandidate>)> {
         if let Some(name) = profile {
             let mut snapshot = self.resolve_profile_cached(name)?;
-            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                std::env::var_os(name)
-            })?;
+            crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
             if snapshot.get("harness").and_then(Value::as_str) != Some(harness) {
                 return Err(Error::new(
                     "invalid",
@@ -146,7 +144,7 @@ impl Router {
             snapshot["auth_integration"] = Value::from(integration);
         }
         crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
-        crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
+        crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
         Ok((Some(snapshot), "adhoc".to_owned(), discovered))
     }
 

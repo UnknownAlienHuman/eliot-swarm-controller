@@ -683,9 +683,10 @@ impl Router {
         } else {
             match self.resolve_profile_cached(name) {
                 Ok(mut snapshot) => {
-                    if crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                        std::env::var_os(name)
-                    })
+                    if crate::config::capture_native_store_inputs(
+                        &mut snapshot,
+                        &self.inner.data_root,
+                    )
                     .is_err()
                     {
                         return Ok(Err(RouteSkipReason::InvalidProfile));

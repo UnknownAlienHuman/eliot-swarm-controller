@@ -240,12 +240,109 @@ fn claude_route_selectors_resolved(
         })
 }
 
-/// Called only for a newly resolved launch/attach profile, after retained-ID miss.
+fn stand_codex_home(data_root: &Path) -> core::Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(data_root.join(crate::stand_cleanup::STAND_MARKER)) {
+        Ok(_) => Ok(Some(data_root.join("codex-home"))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(core::Error::new(
+            "platform_io",
+            format!("inspect stand marker: {error}"),
+        )),
+    }
+}
+
+/// Compare the actual environment and any retained native store before the plugin
+/// can start Codex. A retained binding can repin the home after environment setup.
+pub(crate) fn verify_stand_codex_route(
+    data_root: &Path,
+    harness: &str,
+    profile: &Value,
+    environment: &Value,
+) -> core::Result<()> {
+    if !core::api::HarnessCapabilities::of(harness).requires_frozen_store_inputs {
+        return Ok(());
+    }
+    let Some(home) = stand_codex_home(data_root)? else {
+        return Ok(());
+    };
+    crate::stand_cleanup::check_directory_chain(&home)?;
+    let home = canonical_stand_codex_home(&home)?;
+    let matches_home = |value: &Value| {
+        value.as_str().is_some_and(|path| {
+            let path = Path::new(path);
+            path.is_absolute() && crate::operator::data_dirs_match(path, &home)
+        })
+    };
+    if CODEX_STORE_SELECTORS
+        .iter()
+        .all(|&name| matches_home(&environment[name]))
+        && profile
+            .get("native_store_binding")
+            .is_none_or(|binding| matches_home(&binding["home"]) && matches_home(&binding["root"]))
+    {
+        return Ok(());
+    }
+    Err(core::Error::new(
+        "profile_error",
+        "Codex on a private stand requires its stand-owned home and SQLite root; launch a fresh Agent if the retained store is outside the stand",
+    ))
+}
+
+/// Called only for a newly resolved launch, attach or metadata profile.
 pub(crate) fn capture_native_store_inputs(
     profile: &mut Value,
-    selector_lookup: impl FnMut(&str) -> Option<OsString>,
+    data_root: &Path,
 ) -> core::Result<()> {
-    capture_native_store_inputs_inner(profile, selector_lookup, |name| std::env::var_os(name))
+    let home =
+        if core::api::HarnessCapabilities::of(profile["harness"].as_str().unwrap_or_default())
+            .requires_frozen_store_inputs
+        {
+            stand_codex_home(data_root)?
+        } else {
+            None
+        };
+    let home = if let Some(home) = home {
+        if let Err(error) = std::fs::create_dir(&home)
+            && error.kind() != std::io::ErrorKind::AlreadyExists
+        {
+            return Err(core::Error::new(
+                "platform_io",
+                format!("create stand Codex home: {error}"),
+            ));
+        }
+        crate::stand_cleanup::check_directory_chain(&home)?;
+        let names = profile["pass_env"].as_array_mut().ok_or_else(|| {
+            core::Error::new("invalid", "resolved profile pass_env must be an array")
+        })?;
+        for &selector in CODEX_STORE_SELECTORS {
+            if admitted_selector(names, selector).is_none() {
+                names.push(Value::from(selector));
+            }
+        }
+        Some(canonical_stand_codex_home(&home)?)
+    } else {
+        None
+    };
+    capture_native_store_inputs_inner(
+        profile,
+        |name| match &home {
+            Some(home)
+                if CODEX_STORE_SELECTORS
+                    .iter()
+                    .any(|key| env_name_matches(name, key)) =>
+            {
+                Some(home.as_os_str().to_owned())
+            }
+            _ => std::env::var_os(name),
+        },
+        |name| std::env::var_os(name),
+    )
+}
+
+fn canonical_stand_codex_home(path: &Path) -> core::Result<PathBuf> {
+    path.canonicalize().map_err(|error| {
+        core::Error::new("platform_io", format!("resolve stand Codex home: {error}"))
+    })
 }
 
 fn capture_native_store_inputs_inner(

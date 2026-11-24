@@ -3957,9 +3957,7 @@ impl Router {
             })
             .await??;
             crate::config::stamp_cloud_mcp_hostname(&mut snapshot, &self.inner.data_root);
-            crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                std::env::var_os(name)
-            })?;
+            crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
             crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
             let harness = snapshot
                 .get("harness")
@@ -4055,9 +4053,7 @@ impl Router {
                     ));
                 }
                 let mut snapshot = self.resolve_profile_cached(name)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                    std::env::var_os(name)
-                })?;
+                crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
                 crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
@@ -4095,9 +4091,7 @@ impl Router {
                     None => required_text(&request.args, "profile")?.to_owned(),
                 };
                 let mut snapshot = self.resolve_profile_cached(&profile_name)?;
-                crate::config::capture_native_store_inputs(&mut snapshot, |name| {
-                    std::env::var_os(name)
-                })?;
+                crate::config::capture_native_store_inputs(&mut snapshot, &self.inner.data_root)?;
                 crate::config::capture_build_inputs(&mut snapshot, |name| std::env::var_os(name))?;
                 let harness = snapshot
                     .get("harness")
@@ -4847,7 +4841,7 @@ impl Router {
         )
         .await?;
         crate::adhoc::write_profile_command_snapshot(&mut profile, candidate)?;
-        crate::config::capture_native_store_inputs(&mut profile, |name| std::env::var_os(name))?;
+        crate::config::capture_native_store_inputs(&mut profile, &self.inner.data_root)?;
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
@@ -7471,7 +7465,7 @@ async fn freeze_attach_profile(
     )
     .await?;
     crate::adhoc::write_profile_command_snapshot(&mut snapshot, candidate)?;
-    crate::config::capture_native_store_inputs(&mut snapshot, |name| std::env::var_os(name))?;
+    crate::config::capture_native_store_inputs(&mut snapshot, data_root)?;
     install_frozen_profile(request, &harness, snapshot, true)
 }
 

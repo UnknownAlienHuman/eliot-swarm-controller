@@ -79,6 +79,17 @@ impl PluginHost {
         environment: &Value,
         observation: Option<&Agent>,
     ) -> ReaderOpen {
+        if let Err(error) = crate::config::verify_stand_codex_route(
+            &self.state.data_root,
+            harness,
+            profile,
+            environment,
+        ) {
+            return ReaderOpen {
+                result: Err(error),
+                cleanup_confirmed: true,
+            };
+        }
         let (instance_dir, credential) = match self.create_instance_dir(key) {
             Ok(instance) => instance,
             Err(error) => {
