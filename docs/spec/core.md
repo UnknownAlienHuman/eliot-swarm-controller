@@ -205,17 +205,22 @@ Readers accept persisted rows carrying any of these reasons.
 
 With the default [restart policy](configuration.md#agent-restart-policy), the
 daemon reopens an eligible retained idle session after restart through a
-generation-bound `resume` without text, and resumes an eligible retained
-generation that was live through a `resume` carrying a framed Swarm note as
-the new generation's first input. Roots resume before their children.
+generation-bound `resume` without text, including an idle generation whose
+owned exit and reader drain are proven at restart. It resumes an eligible
+retained generation that was live through a `resume` carrying a framed Swarm
+note as the new generation's first input. Roots resume before their children.
 Descendants wait for restart-affected ancestors to resume. A completed Owner
 Stop or a failed or rejected restart Resume ends automatic attempts for that
 generation.
 Eligibility requires exact custody closure and settled commands, requests,
-and Goal rounds for the prior generation. The exact turn interrupted by the
-restart may remain unknown. The new generation keeps the native subject and
-its retained settings. The note names the interrupted turn and asks the Agent
-to inspect its workspace before continuing. That turn and other uncertain
+and Goal rounds for the prior generation. Idle continuation is selected only
+from the retained `owned_exit_before_restart` event, which Store writes after
+proving there was no active or unknown turn, pending request, or open command.
+Unresolved commands, turns, requests, Goal rounds, Owner Stops, or restart-
+affected ancestors continue to fence admission. The exact turn interrupted by
+the restart may remain unknown. The new generation keeps the native subject
+and its retained settings. The note names the interrupted turn and asks the
+Agent to inspect its workspace before continuing. That turn and other uncertain
 effects keep their `unknown` outcome until normal settlement. A terminal
 `send` refusal identifies the next explicit action for that Agent.
 

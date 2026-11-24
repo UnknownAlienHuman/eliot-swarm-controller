@@ -987,6 +987,11 @@ of the explicitly selected release scope.
       Retry first and a confirmed new empty data directory last; a new directory is
       remembered only once its daemon answers.
 
+- [ ] **Idle Agent restart continuation (#984).** Store selects a retained idle
+      session for promptless, generation-bound Resume after owned exit and reader
+      drain are proven; unresolved work remains fenced. Private runtime proof and
+      the required static checks remain outstanding for this branch.
+
 - [x] **Owner pages for autonomous Swarm (#883, 2026-11-22).** The project editor
       edits the launch policy (#868) with Validate and Save on the read revision,
       shows the store's refusal, and counts the last day's launches with policy

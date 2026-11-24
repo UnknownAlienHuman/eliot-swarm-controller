@@ -3123,8 +3123,11 @@ connection has been sealed. Confirmed cancellation discards its backup.
 
 After commit, the old daemon retires its owned Agent processes and leaves
 the existing Store recovery facts for the next boot. Startup and rollback
-both honor `on_restart` and continue eligible Agents with interrupted work or
-undelivered input at restart.
+both honor `on_restart` and continue eligible Agents with interrupted work,
+undelivered input, or a retained idle session whose owned exit and reader drain
+are proven at restart. Store fences continuation while commands, turns,
+requests, Goal rounds, Owner Stops, or restart-affected ancestors remain
+unresolved.
 An independent watchdog bounds exit after restart commit at 110 seconds.
 It closes Windows Job custody through process exit and signals the captured
 Agent process groups on Linux, subject to the platform's custody limits.
