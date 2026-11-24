@@ -487,10 +487,7 @@ pub(super) fn validate_git_publish_intent_tx(
     registration
         .validate()
         .map_err(|_| Error::new("source_integrity", "stored project registration is invalid"))?;
-    if registration.id != frozen.repository
-        || registration.revision != frozen.registration_revision
-        || registration.checkout != frozen.canonical_checkout
-        || registration.repo_common_dir != frozen.common_dir
+    if !frozen.matches_registration(&registration)
         || !registration
             .actions
             .iter()
@@ -506,21 +503,7 @@ pub(super) fn validate_git_publish_intent_tx(
         .ok_or_else(|| Error::new("not_allowed", "git.publish Agent is not retained"))?;
     let workspace = workspace::load_workspace(tx, agent_num)?
         .ok_or_else(|| Error::new("not_allowed", "git.publish managed workspace is absent"))?;
-    if agent.id != frozen.agent
-        || agent.generation != frozen.generation
-        || agent.active_turn.is_some()
-        || agent.workspace.as_deref() != Some(frozen.workspace.as_str())
-        || workspace.agent != frozen.agent
-        || workspace.target_generation != frozen.generation
-        || workspace.phase != WorkspacePhase::Ready
-        || workspace.worktree_path != frozen.workspace
-        || workspace.worktree_path == registration.checkout
-        || workspace.project != registration.checkout
-        || workspace.repo_path != registration.checkout
-        || workspace.repo_common_dir != registration.repo_common_dir
-        || workspace.base_oid != frozen.base_oid
-        || workspace.requested_branch != frozen.branch
-    {
+    if !frozen.matches_managed_workspace(&registration, &agent, &workspace) {
         return Err(Error::new(
             "not_allowed",
             "git.publish Agent or managed worktree state changed",
