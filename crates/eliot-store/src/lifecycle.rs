@@ -1639,6 +1639,32 @@ pub(super) fn stop_exited_idle_on_restart_tx(
     Ok(true)
 }
 
+fn undelivered_launch_send_id_tx(
+    tx: &Transaction<'_>,
+    agent: i64,
+    generation: i64,
+) -> Result<Option<String>> {
+    tx.query_row(
+        "SELECT send.id
+         FROM commands send
+         JOIN commands launch ON launch.id = send.parent_command
+         WHERE send.id = launch.id || '/send'
+           AND launch.verb = 'launch'
+           AND send.verb = 'send'
+           AND send.link_kind = 'send'
+           AND send.ordinal = 0
+           AND send.target = ?1
+           AND send.generation = ?2
+           AND send.state IN ('accepted', 'queued')
+         ORDER BY send.created_at, send.rowid
+         LIMIT 1",
+        params![agent, generation],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_error)
+}
+
 pub(super) fn transition_lost_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
@@ -1663,8 +1689,14 @@ pub(super) fn transition_lost_tx(
     }
 
     // Persist this before loss settlement changes commands and turn state.
+    let undelivered_launch_send_id = if reason == core::DAEMON_RESTART_REASON {
+        undelivered_launch_send_id_tx(tx, agent_num, generation)?
+    } else {
+        None
+    };
     let restart_undelivered_input = reason == core::DAEMON_RESTART_REASON
         && (super::coordination::notice_pending_count_tx(tx, agent_num)?.is_some()
+            || undelivered_launch_send_id.is_some()
             || tx
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM commands
@@ -1747,6 +1779,9 @@ pub(super) fn transition_lost_tx(
     }
     if reason == core::DAEMON_RESTART_REASON {
         data["undelivered_input"] = json!(restart_undelivered_input);
+        if let Some(send_id) = undelivered_launch_send_id {
+            data["undelivered_send_id"] = json!(send_id);
+        }
     }
     if let Some(turn_id) = &agent.active_turn {
         data["turn_id"] = json!(turn_id);

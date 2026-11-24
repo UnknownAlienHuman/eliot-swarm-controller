@@ -1109,8 +1109,21 @@ recorded exited processes, a closed OS source and closed native sources, backed
 by the Host's owned-exit record or exact restart reconciliation. Recovery records
 `agent.stopped` with reason `owned_exit_before_restart` and preserves the turn and
 command history as recorded. A process still recorded as running at restart becomes
-unknown. The restart event also captures accepted or queued direct sends and
-unread wake-enabled mail awaiting delivery. Under the
+unknown. A generation-0 `Created` Agent still has its accepted initial launch;
+dispatch atomically advances it to `Starting` and marks that launch
+dispatched, so startup recovers the pre-effect accepted launch through ordinary
+command recovery. A dispatched launch is indeterminate and is never repeated.
+Before the first turn, if the generation is `Starting` or newly `idle` and its
+exact linked initial SEND `<launch-id>/send` is still accepted or queued,
+`agent.lost` records that command ID as
+`undelivered_send_id` before the SEND is cancelled. The event also sets
+`undelivered_input`. Once custody is closed, Restart Resume carries that exact
+retained text as one fresh linked SEND in the new generation. Store admission
+rechecks the event's exact command ID, parent link, cancelled state and text in
+the same transaction; the original `<launch-id>/send` stays cancelled. A linked
+SEND that was dispatched remains `unknown` and is not captured or replayed. The
+restart event also captures accepted or queued direct sends and unread
+wake-enabled mail awaiting delivery. Under the
 [restart policy](configuration.md#agent-restart-policy),
 automatic continuation requires either interrupted work or that captured input;
 truly idle sessions remain stopped/lost until a direct send. Archived Agents and

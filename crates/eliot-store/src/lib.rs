@@ -607,8 +607,9 @@ impl Store {
 
     /// Admit one internal restart Resume only while its durable restart
     /// candidate remains eligible in this same Store transaction. The request
-    /// carries no linked input, or only new linked text: the framed Swarm
-    /// note naming the interrupted turn.
+    /// carries no linked input, or only new linked text: a framed Swarm note
+    /// or the exact initial launch input proven undispatched at restart. The
+    /// latter is revalidated against its retained command in this transaction.
     pub fn submit_restart_resume(&mut self, request: SubmitCommand, now: i64) -> Result<Admission> {
         let promptless = request.args == json!({});
         let noted = request
@@ -2741,6 +2742,10 @@ impl Store {
             )?);
         }
 
+        // A generation-0 Created Agent still has its accepted initial launch:
+        // dispatch advances it to Starting and marks that launch dispatched
+        // in this same transaction. Ordinary accepted-command recovery
+        // handles that pre-effect case; do not classify it as lost.
         let mut statement = tx
             .prepare(
                 "SELECT id, generation, state = 'idle' FROM agents
