@@ -583,6 +583,8 @@ reports its own snapshot watermark. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.
+`project.overview` and `chat.organization` read scope limits before their
+Store projections. Response encoding runs after the Store mutex is released.
 
 ### Chat organization
 
@@ -781,7 +783,11 @@ inside the five-minute attempt cooldown reports `cooldown`. Another manual attem
 eligible only after five minutes have passed since the last claim and the prior launch
 is known closed or failed. Store schema 123 retains the claim across daemon restarts.
 The companion records the suspended console's PID and creation time before running
-it. A later companion can retire a dead console using that exact identity. A live
+it. An identical `Prepared` report for a live claim returns the committed
+receipt. The companion may retry that report while it still owns the same
+suspended process, then starts it only after a positive receipt. Recovery
+checks OS process identity outside the Store mutex and retires only a matching
+recorded console proven dead. A live
 console keeps its claim. Swarm publishes `x.user.notify` when the desktop confirms
 an unresolved console is open. A signed-in probe clears the inbox item and bound
 provider auth holds, then wakes launch arbitration.

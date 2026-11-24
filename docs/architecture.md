@@ -34,8 +34,13 @@ platform to build first.
 | `eliot-plugin` | shared wire types, framing and native lifecycle mechanisms | core + transport/serialization; no Store |
 | `eliot-daemon` | API, router, bus, process/plugin ownership | core, store, plugin protocol |
 | `plugins/*` (codex, claude, opencode, Muse, antigravity) | harness translation and native readback, one process per Agent generation | plugin protocol; no daemon/Store dependency |
-| `apps/swarm-desktop` | optional Windows companion UI | daemon API and `settings.*` only; keeps no other preference store |
+| `apps/swarm-desktop` | optional Windows companion UI | daemon API and `settings.*`, with the Owner sign-in exception below |
 | `eliot` | CLI and composition/entry points | application crates and built-in plugin entry points |
+
+The interactive desktop can run the adapter's fixed sign-in and sign-in
+status commands for the local Owner. The daemon retains claim and recovery
+authority. The vendor handles credentials, and the desktop executes Agent
+work through the daemon API.
 
 Inside `eliot-daemon`, keep monitoring, workspaces, automation and coordination as clear
 logical modules when their roadmap layer starts. A module need not have a matching

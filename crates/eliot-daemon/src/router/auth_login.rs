@@ -51,24 +51,51 @@ pub(super) fn supports_login(harness: &str) -> bool {
             .is_some()
 }
 
-fn recover_attempts(store: &mut eliot_store::Store, now: i64) -> Result<()> {
-    #[cfg(windows)]
-    return store.recover_harness_logins(now, |console| {
-        u64::try_from(console.start_time).is_ok_and(|start_time| {
-            matches!(
-                crate::platform::windows::recorded_process_alive(console.pid, start_time),
-                Ok(false)
-            )
-        })
-    });
-    #[cfg(not(windows))]
-    {
-        let _ = (store, now);
+impl Router {
+    async fn recover_auth_attempts(&self) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let now = now_ms();
+            let candidates = self
+                .inner
+                .store
+                .lock()
+                .await
+                .harness_login_console_candidates(now)?;
+            let gone = if candidates.is_empty() {
+                Vec::new()
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    candidates
+                        .into_iter()
+                        .filter(|console| {
+                            u64::try_from(console.start_time).is_ok_and(|start_time| {
+                                matches!(
+                                    crate::platform::windows::recorded_process_alive(
+                                        console.pid,
+                                        start_time
+                                    ),
+                                    Ok(false)
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .map_err(|_| Error::new("internal", "could not observe sign-in consoles"))?
+            };
+            self.inner
+                .store
+                .lock()
+                .await
+                .recover_harness_logins(now, |console| {
+                    gone.iter()
+                        .any(|old| old.pid == console.pid && old.start_time == console.start_time)
+                })?;
+        }
         Ok(())
     }
-}
 
-impl Router {
     pub(super) fn harness_auth_applies(&self, harness: &str, snapshot: &Value) -> bool {
         let env = &snapshot["pass_env_values"];
         let profile = HarnessCapabilities::of(harness).profile;
@@ -158,10 +185,13 @@ impl Router {
         if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
             return Err(Error::new("unavailable", "daemon is shutting down"));
         }
+        self.recover_auth_attempts().await?;
         let status = {
             let mut store = self.inner.store.lock().await;
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_OPEN {
+                return Err(Error::new("unavailable", "daemon is shutting down"));
+            }
             let now = now_ms();
-            recover_attempts(&mut store, now)?;
             if inbox_decision {
                 super::owner_inbox::check_binding(&store)?;
             }
@@ -205,24 +235,33 @@ impl Router {
     pub(super) async fn auth_desktop_poll(&self, params: &Value) -> Result<Value> {
         decode_params::<AuthDesktopPollRequest>(params.clone())?;
         let _write = self.inner.restart_writes.read().await;
-        let mut store = self.inner.store.lock().await;
-        let now = now_ms();
         if self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN && !self.is_restart_requested() {
-            recover_attempts(&mut store, now)?;
+            self.recover_auth_attempts().await?;
         }
-        let pending = store.harness_auth_pending(now)?;
+        let pending = self
+            .inner
+            .store
+            .lock()
+            .await
+            .harness_auth_pending(now_ms())?;
         Ok(json!(AuthDesktopPollResponse { pending }))
     }
 
     pub(super) async fn auth_desktop_claim(&self, params: &Value) -> Result<Value> {
         let request: AuthDesktopClaimRequest = decode_params(params.clone())?;
-        let mut store = self.inner.store.lock().await;
         let response = if supports_login(&request.harness)
             && self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN
         {
-            let now = now_ms();
-            recover_attempts(&mut store, now)?;
-            store.claim_harness_login(&request.harness, &request.revision, now)?
+            self.recover_auth_attempts().await?;
+            let mut store = self.inner.store.lock().await;
+            if self.inner.mode.load(Ordering::SeqCst) == MODE_OPEN {
+                store.claim_harness_login(&request.harness, &request.revision, now_ms())?
+            } else {
+                AuthDesktopClaimResponse {
+                    attempt: None,
+                    start_by_ms: None,
+                }
+            }
         } else {
             AuthDesktopClaimResponse {
                 attempt: None,

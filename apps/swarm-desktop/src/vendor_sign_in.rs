@@ -141,16 +141,15 @@ async fn run() {
                 let console =
                     match prepare_vendor_login_console(command, &work.revision, start_by_ms) {
                         Ok(prepared) => {
-                            let receipt = report(
+                            let accepted = report_prepared(
                                 &data_dir,
                                 &work.harness,
                                 &work.revision,
-                                Some(&attempt),
-                                AuthDesktopState::Prepared,
-                                Some(prepared.identity()),
+                                &attempt,
+                                prepared.identity(),
                             )
                             .await;
-                            if !receipt.is_ok_and(|receipt| receipt.accepted) {
+                            if !accepted {
                                 continue;
                             }
                             prepared.start().ok()
@@ -174,6 +173,38 @@ async fn run() {
             }
         }
     }
+}
+
+/// Read back the same receipt while the caller still owns the suspended console.
+async fn report_prepared(
+    data_dir: &Path,
+    harness: &str,
+    revision: &str,
+    attempt: &str,
+    console: AuthConsoleIdentity,
+) -> bool {
+    for _ in 0..3 {
+        let receipt = tokio::time::timeout(
+            Duration::from_secs(2),
+            report(
+                data_dir,
+                harness,
+                revision,
+                Some(attempt),
+                AuthDesktopState::Prepared,
+                Some(console),
+            ),
+        )
+        .await;
+        match receipt {
+            Ok(Ok(receipt)) => return receipt.accepted,
+            Ok(Err(error)) if !matches!(error.code.as_str(), "unknown" | "unavailable") => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 async fn report(

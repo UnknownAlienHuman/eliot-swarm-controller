@@ -119,6 +119,12 @@ pub(crate) struct ScopeState {
     pub changed: BTreeSet<String>,
 }
 
+pub(crate) struct WorkObservation {
+    pub(crate) head: Option<String>,
+    pub(crate) dirty: bool,
+    pub(crate) fingerprint: Result<String>,
+}
+
 struct Status {
     head: Option<String>,
     branch: Option<String>,
@@ -980,6 +986,11 @@ impl GitProbe {
     /// content `dirty_digest` over the dirty set. A read past the monitor's
     /// caps or of a workspace that is not an exact Git root fails.
     pub(crate) async fn work_fingerprint(&self, workspace: &str) -> Result<String> {
+        self.work_observation(workspace).await?.fingerprint
+    }
+
+    /// A failed content digest leaves the successful status facts available.
+    pub(crate) async fn work_observation(&self, workspace: &str) -> Result<WorkObservation> {
         let root = canonical_root(workspace)?;
         let deadline = Instant::now() + PROBE_TIME;
         let overrides = self.safe_overrides(&root, deadline).await?;
@@ -995,12 +1006,14 @@ impl GitProbe {
                 )
                 .await?,
         )?;
-        let (dirty_digest, _) = dirty_worktree_digest(&root, &status.dirty)
-            .map_err(|reason| unavailable(&format!("workspace content digest: {reason}")))?;
-        Ok(work_fingerprint_from_parts(
-            status.head.as_deref(),
-            &dirty_digest,
-        ))
+        let fingerprint = dirty_worktree_digest(&root, &status.dirty)
+            .map(|(digest, _)| work_fingerprint_from_parts(status.head.as_deref(), &digest))
+            .map_err(|reason| unavailable(&format!("workspace content digest: {reason}")));
+        Ok(WorkObservation {
+            head: status.head,
+            dirty: !status.dirty.is_empty(),
+            fingerprint,
+        })
     }
 
     /// HEAD and the changed paths of a Goal's workspace.

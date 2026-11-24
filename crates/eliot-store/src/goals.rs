@@ -3273,16 +3273,18 @@ fn goal_continuation_spent_budget(
 /// completes; otherwise the round budget, turn budget and no-progress streak
 /// block in that order. Counters are already updated for this check.
 /// Cost baseline of a Goal with `max_cost`: the native session's cumulative
-/// cost at `set` in the budget's unit, and the session it came from. A zero
+/// cost in the last snapshot at `set`, in the budget's unit. A zero
 /// baseline without a source binds the first session the Goal sees.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct GoalCostBase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<String>,
     amount_micros: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observed_at: Option<i64>,
 }
 
-/// The cost spent since `set`, or why it cannot be trusted.
+/// The cost since the recorded baseline, or why it cannot be trusted.
 enum GoalCostReading {
     Spent { micros: i64, source: Option<String> },
     Unverified(&'static str),
@@ -3347,10 +3349,11 @@ fn goal_cost_base_tx(
         return Ok(None);
     };
     match latest_session_usage(tx, agent_num, generation)? {
-        Some((usage, _)) => match snapshot_cost(&usage) {
+        Some((usage, observed_at)) => match snapshot_cost(&usage) {
             Some((amount, unit)) if unit == limit.unit => Ok(Some(GoalCostBase {
                 source: usage.source.clone(),
                 amount_micros: cost_micros(amount),
+                observed_at: Some(observed_at),
             })),
             Some(_) => Err(Error::new(
                 "unsupported",
@@ -3369,7 +3372,7 @@ fn goal_cost_base_tx(
     }
 }
 
-/// The cost spent since `set`, read after a check. Missing, stale, mixed,
+/// The cost since the recorded baseline, read after a check. Missing, stale, mixed,
 /// reset or decreasing data is unverified, never zero.
 fn goal_cost_reading_tx(
     tx: &Transaction<'_>,
@@ -3636,6 +3639,11 @@ fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Res
             .as_ref()
             .map(core::api::GoalScopeBase::start),
         cost_status,
+        cost_baseline_observed_at: row
+            .state
+            .cost_base
+            .as_ref()
+            .and_then(|base| base.observed_at),
         last_round_key: row.last_round_key,
         round_marker,
         updated_at: row.updated_at,

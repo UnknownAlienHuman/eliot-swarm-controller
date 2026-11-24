@@ -1807,7 +1807,7 @@ pub(crate) struct GoalSetArgs {
     /// blocks the Goal for review instead of completing it.
     #[arg(long = "check-input", value_name = "GLOB")]
     pub(crate) check_inputs: Vec<String>,
-    /// Money budget over the Agent's native session cost since set, for
+    /// Money budget over native session cost since the baseline snapshot, for
     /// example 0.25; needs --cost-unit.
     #[arg(long, value_name = "AMOUNT", requires = "cost_unit")]
     pub(crate) max_cost: Option<String>,

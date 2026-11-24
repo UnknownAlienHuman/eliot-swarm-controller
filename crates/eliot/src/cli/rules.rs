@@ -138,6 +138,9 @@ fn print_goal_summary(goal: &GoalView) {
         println!("Paused: {reason}");
     }
     println!("Cost: {}", goal.cost_status);
+    if let Some(at) = goal.cost_baseline_observed_at {
+        println!("Cost baseline snapshot observed at {at} ms since Unix epoch");
+    }
 }
 
 pub(crate) async fn run_provider(

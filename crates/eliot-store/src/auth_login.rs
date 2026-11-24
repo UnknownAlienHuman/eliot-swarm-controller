@@ -172,6 +172,29 @@ impl Store {
         })
     }
 
+    /// Read the recorded identities that need an OS exit observation. The
+    /// caller releases the Store before observing them.
+    pub fn harness_login_console_candidates(&self, now: i64) -> Result<Vec<AuthConsoleIdentity>> {
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT console_pid, console_start FROM harness_auth
+             WHERE console_pid IS NOT NULL AND console_start IS NOT NULL
+               AND (phase='open' OR (phase='claimed' AND claim_until<=?1))",
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map([now], |row| {
+                Ok(AuthConsoleIdentity {
+                    pid: row.get(0)?,
+                    start_time: row.get(1)?,
+                })
+            })
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
+    }
+
     /// Expire unused grants and settle consoles only after exact process exit.
     pub fn recover_harness_logins(
         &mut self,
@@ -277,6 +300,29 @@ impl Store {
                 _ => return Err(Error::new("invalid", "incomplete sign-in report binding")),
             }
             .map_err(sql_error)?;
+            let prepared_replay = if changed == 0
+                && let (Prepared, Some(attempt), Some(console)) =
+                    (report.state, report.attempt.as_deref(), report.console)
+            {
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM harness_auth
+                     WHERE harness=?1 AND revision=?2 AND attempt=?3 AND resolved=0
+                       AND phase='claimed' AND claim_until>?6
+                       AND console_pid=?4 AND console_start=?5)",
+                    params![
+                        report.harness,
+                        report.revision,
+                        attempt,
+                        console.pid,
+                        console.start_time,
+                        now
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?
+            } else {
+                false
+            };
             let resolved = changed == 1 && matches!(report.state, SignedIn);
             let mut events = if resolved {
                 settle_auth_holds(&tx, &report.harness, now)?
@@ -312,7 +358,7 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             Ok((
                 AuthDesktopReportResponse {
-                    accepted: changed == 1,
+                    accepted: changed == 1 || prepared_replay,
                 },
                 resolved,
                 events,

@@ -260,7 +260,7 @@ pub struct GoalDefinition {
     /// separate review. Workspace files named by the check argv are added.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub check_inputs: Vec<String>,
-    /// Money budget over the Agent's native session cost since `set`, in
+    /// Money budget over the Agent's native session cost since its baseline snapshot, in
     /// that native unit (never converted). Checked after each failed check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_cost: Option<GoalCostLimit>,
@@ -504,7 +504,7 @@ pub struct GoalCounters {
     pub last_retry_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_check_at: Option<i64>,
-    /// Session cost spent since `set` in the `max_cost` unit, in millionths,
+    /// Session cost since the baseline snapshot in the `max_cost` unit, in millionths,
     /// as of the last round. Absent without a budget or while unverified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_spent_micros: Option<i64>,
@@ -709,6 +709,10 @@ pub struct GoalView {
     /// `untracked` without `max_cost`; otherwise the spent and budgeted
     /// amounts, or why the spent cost is unverified.
     pub cost_status: String,
+    /// Epoch milliseconds of the native snapshot used as the cost baseline.
+    /// Absent for a launch-zero baseline or a Goal without a recorded time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_baseline_observed_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_round_key: Option<String>,
     /// Live in-flight round if any, else the latest unknown marker of this
@@ -744,6 +748,15 @@ impl GoalView {
         }
         self.definition.validate()?;
         self.counters.validate()?;
+        if self
+            .cost_baseline_observed_at
+            .is_some_and(|at| at < 0 || self.definition.max_cost.is_none())
+        {
+            return Err(Error::new(
+                "invalid",
+                "goal cost baseline observation is invalid",
+            ));
+        }
         if self.cost_status.trim().is_empty() || self.cost_status.len() > 256 {
             return Err(Error::new("invalid", "goal cost status must be short text"));
         }

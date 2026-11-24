@@ -1038,7 +1038,11 @@ configured threshold, which together determine the fallback. Reports include
 the observed gap and history basis when available. `swarm doctor` shows the
 windows and the number of successful turns that contributed to each one.
 The sweep shares a bounded threshold cache across concurrent observations.
-A committed Store change invalidates it, including changes to retained history.
+Independent misses read their snapshots concurrently and publish only while
+their Store version still matches. Any committed Store write invalidates the
+cache. This can reduce hits during active writes. Pair-specific invalidation
+would need to track turn and command history, source coverage, project bindings
+and pruning, so the cache uses SQLite's committed data version.
 History reads use each Agent's indexed newest successful turn to stop once
 remaining Agents cannot contribute to the selected twenty.
 Stopped Agents do not open source-unhealthy incidents; existing ones retire
@@ -1404,7 +1408,10 @@ daemon run. `swarm status` shows a summary for each. Readers discard malformed
 published markers and log the discard. A concurrent daemon panic can wait
 briefly for the marker writer before attempting its own distinct file.
 
-`daemon.status` also exposes retention and drain information. Compact
+`daemon.status` also exposes retention and drain information. Its blockers
+and drain report share one read of the nonterminal Agent page, unsettled
+commands excluding retained unknowns, and process custody. Shutdown decisions
+read fresh blockers, including current readers and workers. Compact
 `agent.list` reads and history-derived attention thresholds use SQLite read
 snapshots outside the Store writer lock. Compact list requests wait for a reader
 slot before scheduling blocking work, with up to four snapshots active at once.
