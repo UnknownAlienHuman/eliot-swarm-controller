@@ -37,22 +37,43 @@ pub mod elevation {
         pub spread: f64,
     }
 
-    impl Shadow {
-        const fn new(offset: f64, blur: f64, spread: f64) -> Self {
-            Self {
-                offset,
-                blur,
-                spread,
+    impl Level {
+        /// 0 for level 1, 1 for level 2.
+        pub const fn index(self) -> usize {
+            match self {
+                Level::One => 0,
+                Level::Two => 1,
+            }
+        }
+
+        /// The brand book's layers of this level in each theme (key first,
+        /// then ambient; one ring in the true-black themes).
+        pub const fn layers(self) -> [&'static [crate::brand::Shadow]; 6] {
+            match self {
+                Level::One => crate::brand::ELEVATION_1,
+                Level::Two => crate::brand::ELEVATION_2,
             }
         }
     }
 
-    /// The key and the ambient shadow of `level` (material-web
-    /// `elevation/internal/_elevation.scss`, the design's System board).
-    pub const fn shadows(level: Level) -> [Shadow; 2] {
-        match level {
-            Level::One => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(1.0, 3.0, 1.0)],
-            Level::Two => [Shadow::new(1.0, 2.0, 0.0), Shadow::new(2.0, 6.0, 2.0)],
+    /// The key and the ambient shadow of `level`, as the brand book draws
+    /// them in the Light theme (every shadowed theme shares the geometry;
+    /// only the opacity differs, see [`super::Lift`]).
+    pub fn shadows(level: Level) -> [Shadow; 2] {
+        let geometry = |layer: &crate::brand::Shadow| Shadow {
+            offset: layer.y,
+            blur: layer.blur,
+            spread: layer.spread,
+        };
+        match level.layers()[0] {
+            [key, ambient, ..] => [geometry(key), geometry(ambient)],
+            _ => {
+                [Shadow {
+                    offset: 0.0,
+                    blur: 0.0,
+                    spread: 0.0,
+                }; 2]
+            }
         }
     }
 
@@ -61,16 +82,17 @@ pub mod elevation {
     pub fn level_bands(level: Level) -> &'static [Vec<Band>; 2] {
         static CACHE: [std::sync::OnceLock<[Vec<Band>; 2]>; 2] =
             [const { std::sync::OnceLock::new() }; 2];
-        let index = match level {
-            Level::One => 0,
-            Level::Two => 1,
-        };
-        CACHE[index].get_or_init(|| shadows(level).map(bands))
+        CACHE[level.index()].get_or_init(|| shadows(level).map(bands))
     }
 
-    /// The night themes' glow around the FAB: a centred blur of `radius`.
+    /// The night themes' glow around the composer's action: a centred blur
+    /// of `radius`.
     pub const fn glow(radius: f64) -> Shadow {
-        Shadow::new(0.0, radius, 0.0)
+        Shadow {
+            offset: 0.0,
+            blur: radius,
+            spread: 0.0,
+        }
     }
 
     /// One drawn band of a shadow: its outer edge `reach` DIPs past the
@@ -204,11 +226,12 @@ impl Theme {
     }
 }
 
-/// How raised things lift off their surface: Material's shadows at a key
-/// and an ambient opacity, or (true-black themes) a hairline ring.
+/// How raised things lift off their surface: the brand book's shadows at
+/// each level's key and ambient opacity (index 0 is level 1), or
+/// (true-black themes) a hairline ring.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Lift {
-    Shadow { key: f64, ambient: f64 },
+    Shadow { key: [f64; 2], ambient: [f64; 2] },
     Ring(Rgb8),
 }
 
@@ -288,13 +311,13 @@ pub struct Roles {
     pub accent_ramp: [Rgb8; 6],
 }
 
-/// `0xAARRGGBB` without its alpha.
-const fn rgb(argb: u32) -> Rgb8 {
+/// A brand-book color token (`0xAARRGGBB`) without its alpha.
+pub(crate) const fn rgb(argb: u32) -> Rgb8 {
     Rgb8::hex(argb & 0x00ff_ffff)
 }
 
-/// The alpha of `0xAARRGGBB`, 0–1.
-fn alpha(argb: u32) -> f64 {
+/// The alpha of a brand-book color token (`0xAARRGGBB`), 0–1.
+pub(crate) fn alpha(argb: u32) -> f64 {
     f64::from(argb >> 24) / 255.0
 }
 
@@ -307,14 +330,22 @@ impl Roles {
         let s = crate::brand::SCHEMES[index];
         let primary = rgb(s.primary);
         let dark = theme.dark();
-        // In-tree lifts draw `elevation-1`: a hairline ring in the
-        // true-black themes, else its key and ambient shadow opacities.
-        let lift = match crate::brand::ELEVATION_1[index] {
-            [ring] if ring.blur == 0.0 => Lift::Ring(rgb(ring.color)),
-            [key, ambient, ..] => Lift::Shadow {
-                key: alpha(key.color),
-                ambient: alpha(ambient.color),
+        // A hairline ring in the true-black themes, else each level's key
+        // and ambient shadow opacities.
+        let opacities = |layers: &[crate::brand::Shadow]| match layers {
+            [key, ambient, ..] => Some((alpha(key.color), alpha(ambient.color))),
+            _ => None,
+        };
+        let lift = match (
+            crate::brand::ELEVATION_1[index],
+            opacities(crate::brand::ELEVATION_1[index]),
+            opacities(crate::brand::ELEVATION_2[index]),
+        ) {
+            (_, Some((key1, ambient1)), Some((key2, ambient2))) => Lift::Shadow {
+                key: [key1, key2],
+                ambient: [ambient1, ambient2],
             },
+            ([ring, ..], ..) => Lift::Ring(rgb(ring.color)),
             _ => Lift::Ring(rgb(s.outline_variant)),
         };
         let glow = crate::brand::GLOW_SHADOW[index].first().map(|shadow| Glow {
@@ -774,12 +805,8 @@ pub mod winui {
             match self.roles {
                 Some(r) => {
                     let v = r.scheme.overlay_border;
-                    Brush::Solid(Color::argb(
-                        (v >> 24) as u8,
-                        (v >> 16) as u8,
-                        (v >> 8) as u8,
-                        v as u8,
-                    ))
+                    let c = super::rgb(v);
+                    Brush::Solid(Color::argb((v >> 24) as u8, c.r, c.g, c.b))
                 }
                 None => Brush::Theme(ThemeBrush::CardStroke),
             }

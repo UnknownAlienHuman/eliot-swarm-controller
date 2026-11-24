@@ -56,7 +56,12 @@ pub mod glyph {
     pub fn filled(outline: &str) -> String {
         outline
             .chars()
-            .map(|c| char::from_u32(0xF0000 + u32::from(c) - 0xE000).unwrap_or(c))
+            .map(|c| {
+                u32::from(c)
+                    .checked_sub(0xE000)
+                    .and_then(|offset| char::from_u32(0xF0000 + offset))
+                    .unwrap_or(c)
+            })
             .collect()
     }
 
@@ -385,6 +390,7 @@ pub fn lifted(
     };
     let bands: Vec<Border> = match roles.lift {
         crate::theme::Lift::Shadow { key, ambient } => {
+            let (key, ambient) = (key[level.index()], ambient[level.index()]);
             let [key_bands, ambient_bands] = elevation::level_bands(level);
             let shadow = |bands: &'static [Band], opacity| {
                 bands

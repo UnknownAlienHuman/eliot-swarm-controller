@@ -94,10 +94,7 @@ fn layer(color: Rgb8, opacity: f64) -> Value {
     Value::Brush(color, alpha(opacity))
 }
 
-/// A brand-book color token (`0xAARRGGBB`) without its alpha.
-fn rgb(argb: u32) -> Rgb8 {
-    Rgb8::new((argb >> 16) as u8, (argb >> 8) as u8, argb as u8)
-}
+use crate::theme::rgb;
 
 /// A menu's or popup's edge: `overlay-border` in the dark themes, none in
 /// the light ones.
@@ -150,18 +147,20 @@ fn lift(s: &Roles) -> Vec<(&'static str, Value)> {
     use crate::theme::Lift;
     let (key, ambient, ring) = match s.lift {
         Lift::Shadow { key, ambient } => (
-            layer(SHADOW_COLOR, key),
-            layer(SHADOW_COLOR, ambient),
+            key.map(|opacity| layer(SHADOW_COLOR, opacity)),
+            ambient.map(|opacity| layer(SHADOW_COLOR, opacity)),
             clear(s),
         ),
-        Lift::Ring(color) => (clear(s), clear(s), opaque(color)),
+        Lift::Ring(color) => ([clear(s); 2], [clear(s); 2], opaque(color)),
     };
     let glow = s
         .glow
         .map_or(clear(s), |glow| layer(glow.color, glow.alpha));
     vec![
-        (templates::LIFT_KEY, key),
-        (templates::LIFT_AMBIENT, ambient),
+        (templates::LIFT_KEY[0], key[0]),
+        (templates::LIFT_KEY[1], key[1]),
+        (templates::LIFT_AMBIENT[0], ambient[0]),
+        (templates::LIFT_AMBIENT[1], ambient[1]),
         (templates::LIFT_RING, ring),
         (templates::GLOW, glow),
     ]

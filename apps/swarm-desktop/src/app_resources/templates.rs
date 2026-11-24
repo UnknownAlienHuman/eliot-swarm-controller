@@ -29,8 +29,9 @@ use crate::ui::tokens::{icon, layout, radius, spacing};
 /// opacity (each band takes its share as its own opacity), the hairline
 /// ring of the true-black themes and the night themes' glow. Transparent
 /// where a theme has none.
-pub(super) const LIFT_KEY: &str = "EliotLiftKey";
-pub(super) const LIFT_AMBIENT: &str = "EliotLiftAmbient";
+/// The key and ambient shadow brushes of elevation levels 1 and 2.
+pub(super) const LIFT_KEY: [&str; 2] = ["EliotLiftKey", "EliotLiftKey2"];
+pub(super) const LIFT_AMBIENT: [&str; 2] = ["EliotLiftAmbient", "EliotLiftAmbient2"];
 pub(super) const LIFT_RING: &str = "EliotLiftRing";
 pub(super) const GLOW: &str = "EliotGlow";
 
@@ -129,10 +130,10 @@ fn shadow(name: &str, level: Level, radius: f64, opacity: f64) -> String {
         format!("<Grid x:Name=\"{name}\" Opacity=\"{opacity}\" IsHitTestVisible=\"False\">");
     let [key, ambient] = elevation::level_bands(level);
     for band in ambient {
-        out += &band_border(radius, *band, LIFT_AMBIENT);
+        out += &band_border(radius, *band, LIFT_AMBIENT[level.index()]);
     }
     for band in key {
-        out += &band_border(radius, *band, LIFT_KEY);
+        out += &band_border(radius, *band, LIFT_KEY[level.index()]);
     }
     out += &format!(
         "<Border CornerRadius=\"{corner}\" Margin=\"-{stroke}\" BorderThickness=\"{stroke}\" \

@@ -1,10 +1,12 @@
 """Builds the desktop's shipped fonts from Google's originals (fontTools 4.60.1).
 
-Inputs (one directory, passed as the first argument), downloaded 2026-11-24:
-  Roboto.ttf          github.com/google/fonts ofl/roboto/Roboto[wdth,wght].ttf (SIL OFL 1.1)
-  RobotoMono.ttf      github.com/google/fonts ofl/robotomono/RobotoMono[wght].ttf (SIL OFL 1.1)
+Inputs (one directory, passed as the first argument), downloaded 2026-11-24 at these revisions:
+  Roboto.ttf          github.com/google/fonts 6183fc0d2636 ofl/roboto/Roboto[wdth,wght].ttf
+                      (SIL OFL 1.1)
+  RobotoMono.ttf      github.com/google/fonts b01086459d9d ofl/robotomono/RobotoMono[wght].ttf
+                      (SIL OFL 1.1)
   MaterialSymbolsRounded.ttf and .codepoints
-                      github.com/google/material-design-icons variablefont/
+                      github.com/google/material-design-icons 10ecc1479061 variablefont/
                       MaterialSymbolsRounded[FILL,GRAD,opsz,wght] (Apache License 2.0)
 Output: this directory.
 
@@ -43,6 +45,22 @@ TEXT_UNICODES = (
 )
 
 
+def describe(font: TTFont, description: str, licence: str, url: str) -> None:
+    """Record that the file is a modified subset, and under which licence."""
+    names = font["name"]
+    for name_id in (10, 13, 14):
+        names.removeNames(nameID=name_id)
+    names.setName(description, 10, 3, 1, 0x409)
+    names.setName(licence, 13, 3, 1, 0x409)
+    names.setName(url, 14, 3, 1, 0x409)
+
+
+OFL = ("This Font Software is licensed under the SIL Open Font License, Version 1.1.",
+       "https://openfontlicense.org")
+APACHE = ("Licensed under the Apache License, Version 2.0.",
+          "https://www.apache.org/licenses/LICENSE-2.0")
+
+
 def rename(font: TTFont, family: str) -> None:
     names = font["name"]
     for record in list(names.names):
@@ -76,9 +94,10 @@ def instance(src: Path, limits: dict) -> TTFont:
     return TTFont(buffer)
 
 
-def text_font(src: Path, out: Path, limits: dict) -> None:
+def text_font(src: Path, out: Path, limits: dict, original: str) -> None:
     font = instance(src, limits)
     subset_font(font, TEXT_UNICODES, keep_layout=True)
+    describe(font, f"Modified by Eliot Swarm: a subset of {original}, instanced at normal width.", *OFL)
     font.save(out)
 
 
@@ -121,6 +140,12 @@ def icon_font(src: Path, codes, grade: float, family: str, out: Path) -> None:
     outline["cmap"].tables = four + [twelve]
     outline["maxp"].numGlyphs = len(order)
     rename(outline, family)
+    describe(
+        outline,
+        "Modified by Eliot Swarm: a subset of Material Symbols Rounded, instanced at optical "
+        f"size 20, weight 400 and grade {grade:g}; filled glyphs added at 0xF0000 + code - 0xE000.",
+        *APACHE,
+    )
     outline.save(out)
 
 
@@ -131,8 +156,8 @@ def main() -> None:
     missing = [name for name in ICONS if name not in points]
     assert not missing, missing
     codes = sorted({int(points[name], 16) for name in ICONS})
-    text_font(src / "Roboto.ttf", here / "Roboto.ttf", {"wght": (400, 700), "wdth": 100})
-    text_font(src / "RobotoMono.ttf", here / "RobotoMono.ttf", {"wght": (400, 700)})
+    text_font(src / "Roboto.ttf", here / "Roboto.ttf", {"wght": (400, 700), "wdth": 100}, "Roboto")
+    text_font(src / "RobotoMono.ttf", here / "RobotoMono.ttf", {"wght": (400, 700)}, "Roboto Mono")
     icon_font(src / "MaterialSymbolsRounded.ttf", codes, 0, "Eliot Symbols", here / "EliotSymbols.ttf")
     icon_font(src / "MaterialSymbolsRounded.ttf", codes, -25, "Eliot Symbols Dark", here / "EliotSymbolsDark.ttf")
     # The Rust glyph table for m3::glyph.

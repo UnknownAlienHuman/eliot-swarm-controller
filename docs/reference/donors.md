@@ -85,6 +85,23 @@ shapes, elevation and motion in `apps/swarm-desktop/src/app_resources/templates.
   the drop-down glyph size (the design's 14-DIP chevron), the focus
   highlight corner and inlined StaticResource values differ; WinUI hard-codes
   the 12-DIP glyph in the template, so no style setter can change it.
+- **Fonts (D11, 2026-11-24):** shipped inside `swarm-desktop` and written
+  with their licence texts into `fonts/` beside the executable
+  (`apps/swarm-desktop/src/fonts.rs`); the subsets and the licence texts are
+  in `apps/swarm-desktop/design/fonts/`, built by `make_fonts.py`
+  (fontTools 4.60.1). Licences read at these revisions on 2026-11-24.
+  - Roboto and Roboto Mono:
+    [google/fonts](https://github.com/google/fonts) `ofl/roboto` at
+    `6183fc0d2636` and `ofl/robotomono` at `b01086459d9d`, SIL OFL 1.1, no
+    Reserved Font Name. Subset to Latin, Greek and Cyrillic and instanced at
+    normal width; the name table says so.
+  - Material Symbols Rounded:
+    [google/material-design-icons](https://github.com/google/material-design-icons)
+    `variablefont/` at `10ecc1479061`, Apache-2.0. Cut to the desktop's
+    icons at optical size 20, weight 400 and grade 0 or -25. Filled glyphs
+    are added at `0xF0000 + code - 0xE000`, and the font is renamed Eliot
+    Symbols. The name table states the modification and the licence (Apache
+    §4(b)).
 
 ## Provider quota pattern (k92, inspected 2026-11-16)
 

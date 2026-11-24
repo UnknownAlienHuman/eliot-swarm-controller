@@ -29,7 +29,7 @@ fn tokens<'a>(root: &'a Value, family: &str) -> &'a [Value] {
 }
 
 fn name(token: &Value) -> &str {
-    token["name"].as_str().expect("every token has a name")
+    checked(token["name"].as_str().expect("every token has a name"))
 }
 
 /// A token's usage as a one-line doc comment.
@@ -38,6 +38,27 @@ fn doc(token: &Value) -> String {
         .as_str()
         .unwrap_or("")
         .replace(char::is_control, " ")
+}
+
+/// Write `usage` as a doc comment at `indent`, or nothing when empty.
+fn doc_line(code: &mut String, indent: &str, usage: &str) {
+    if !usage.trim().is_empty() {
+        writeln!(code, "{indent}/// {usage}").unwrap();
+    }
+}
+
+/// A token name that makes a Rust identifier: lowercase ASCII words joined
+/// by `-`, starting with a letter.
+fn checked(name: &str) -> &str {
+    let valid = name.starts_with(|c: char| c.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    assert!(
+        valid,
+        "token name {name:?} is not lowercase-words-with-dashes"
+    );
+    name
 }
 
 fn upper(name: &str) -> String {
@@ -63,6 +84,11 @@ fn hex(value: &str) -> u32 {
 
 /// One theme's value of a color token, following `var(--role)` aliases.
 fn color_of(all: &[Value], token: &Value, theme: &str) -> u32 {
+    color_at(all, token, theme, 0)
+}
+
+fn color_at(all: &[Value], token: &Value, theme: &str, depth: usize) -> u32 {
+    assert!(depth < 8, "{} aliases itself in a cycle", name(token));
     let value = token["value"]
         .as_str()
         .or_else(|| token["value"][theme].as_str())
@@ -76,7 +102,7 @@ fn color_of(all: &[Value], token: &Value, theme: &str) -> u32 {
             .iter()
             .find(|t| name(t) == alias)
             .unwrap_or_else(|| panic!("{} aliases a known role", name(token)));
-        return color_of(all, target, theme);
+        return color_at(all, target, theme, depth + 1);
     }
     hex(value)
 }
@@ -87,7 +113,7 @@ fn colors(root: &Value, code: &mut String) {
     code.push_str("#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct Scheme {\n");
     for token in all {
         let usage = doc(token);
-        writeln!(code, "    /// {usage}").unwrap();
+        doc_line(code, "    ", &usage);
         writeln!(code, "    pub {}: u32,", snake(name(token))).unwrap();
     }
     code.push_str("}\n\n");
@@ -153,7 +179,9 @@ fn shadows(root: &Value, code: &mut String) {
     for token in tokens(root, "shadow") {
         let mut layers_per_theme = Vec::new();
         for theme in THEMES {
-            let value = token["value"][theme].as_str().expect("shadow value");
+            let value = token["value"][theme]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} has a {theme} shadow", name(token)));
             let layers: Vec<String> = if value == "none" {
                 Vec::new()
             } else {
@@ -172,7 +200,7 @@ fn shadows(root: &Value, code: &mut String) {
             layers_per_theme.push(layers);
         }
         let usage = doc(token);
-        writeln!(code, "/// {usage}").unwrap();
+        doc_line(code, "", &usage);
         writeln!(code, "pub const {}: [&[Shadow]; 6] = [", upper(name(token))).unwrap();
         for layers in layers_per_theme {
             writeln!(code, "    &[{}],", layers.join(", ")).unwrap();
@@ -204,7 +232,7 @@ fn scalars(root: &Value, code: &mut String) {
     ] {
         for token in tokens(root, family) {
             let usage = doc(token);
-            writeln!(code, "/// {usage}").unwrap();
+            doc_line(code, "", &usage);
             writeln!(
                 code,
                 "pub const {}: f64 = {:?};",
@@ -216,7 +244,7 @@ fn scalars(root: &Value, code: &mut String) {
     }
     for token in tokens(root, "duration") {
         let usage = doc(token);
-        writeln!(code, "/// {usage}").unwrap();
+        doc_line(code, "", &usage);
         writeln!(
             code,
             "pub const {}: u64 = {};",
@@ -231,7 +259,7 @@ fn scalars(root: &Value, code: &mut String) {
             .trim_start_matches("cubic-bezier(")
             .trim_end_matches(')');
         let usage = doc(token);
-        writeln!(code, "/// {usage}").unwrap();
+        doc_line(code, "", &usage);
         writeln!(
             code,
             "pub const {}: &str = \"{}\";",
@@ -261,16 +289,21 @@ fn types(root: &Value, code: &mut String) {
     let groups = root["type"]["groups"].as_array().expect("type.groups");
     for group in groups {
         let mono = group["family"].as_str() == Some("mono");
-        for style in group["styles"].as_array().expect("styles") {
+        for style in group["styles"]
+            .as_array()
+            .unwrap_or_else(|| panic!("type group {} has styles", group["name"]))
+        {
             let usage = doc(style);
-            writeln!(code, "/// {usage}").unwrap();
+            doc_line(code, "", &usage);
             writeln!(
                 code,
                 "pub const {}: TypeStyle = TypeStyle {{ size: {:?}, line_height: {:?}, weight: {}, letter_spacing: {:?}, mono: {mono} }};",
                 upper(name(style)),
                 number(&style["fontSize"], "px"),
                 number(&style["lineHeight"], "px"),
-                style["fontWeight"].as_u64().expect("weight"),
+                style["fontWeight"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{} has a numeric fontWeight", name(style))),
                 style.get("letterSpacing").map_or(0.0, |v| number(v, "px")),
             )
             .unwrap();
