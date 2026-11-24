@@ -16,6 +16,7 @@ use crate::theme::winui::Palette;
 use eliot_core::api::{
     OwnerDecideRequest, OwnerDecideResponse, OwnerInboxItem, OwnerInboxItemRef, OwnerInboxKind,
     OwnerInboxResponse, ProfileCommandIssue,
+    auth_login::{AuthLoginResponse, AuthLoginStatus},
 };
 
 /// The choice that asks the daemon for its recommended action.
@@ -33,6 +34,10 @@ pub(super) enum InboxMsg {
     /// Decide an item: its reference as shown, the choice (`recommended`,
     /// an offered choice or `snooze`) and the button's words.
     Decide(OwnerInboxItemRef, String, String),
+    /// Queue the shown harness sign-in directly through `auth.login`.
+    AuthLogin(String, String),
+    /// The direct sign-in result for one inbox revision.
+    AuthLoginResult(String, Box<MutationResult<AuthLoginResponse>>),
     /// A decision's outcome: its ledger key, item cursor, choice and words.
     Decided(
         String,
@@ -71,8 +76,12 @@ pub(super) struct InboxState {
     ids: HashMap<String, String>,
     /// Items (cursors) whose decision is running.
     deciding: HashSet<String>,
+    /// Harness and revision pairs whose direct sign-in call is running.
+    auth_signing: HashSet<String>,
     /// The last outcome per item cursor.
     outcomes: HashMap<String, Outcome>,
+    /// The last direct sign-in outcome per harness and exact revision.
+    auth_outcomes: HashMap<String, Outcome>,
     /// The last refusal, with its item's cursor: shown above the items
     /// once a read no longer lists that item (a stale choice), until the
     /// next decision.
@@ -100,6 +109,7 @@ fn kind_title(kind: OwnerInboxKind) -> &'static str {
         OwnerInboxKind::Stuck => "Stuck",
         OwnerInboxKind::Handoff => "Handoffs to check",
         OwnerInboxKind::WorkNotInGit => "Work not in Git",
+        OwnerInboxKind::HarnessAuth => "Harness sign-in",
     }
 }
 
@@ -117,6 +127,7 @@ fn kind_count(kind: OwnerInboxKind, count: usize) -> String {
         OwnerInboxKind::Stuck => ("stuck", "stuck"),
         OwnerInboxKind::Handoff => ("handoff to check", "handoffs to check"),
         OwnerInboxKind::WorkNotInGit => ("item not in Git", "items not in Git"),
+        OwnerInboxKind::HarnessAuth => ("sign-in", "sign-ins"),
     };
     eliot_core::count_words(count as u64, one, many)
 }
@@ -180,6 +191,15 @@ impl DesktopApp {
                         let shown: HashSet<String> =
                             inbox.items.iter().map(OwnerInboxItem::cursor).collect();
                         inbox.outcomes.retain(|key, _| shown.contains(key));
+                        let shown_auth: HashSet<String> = inbox
+                            .items
+                            .iter()
+                            .filter(|item| item.kind == OwnerInboxKind::HarnessAuth)
+                            .map(|item| format!("{}@{}", item.subject, item.revision))
+                            .collect();
+                        inbox
+                            .auth_outcomes
+                            .retain(|key, _| shown_auth.contains(key));
                     }
                     Err(error) => inbox.error = Some(error),
                 }
@@ -212,6 +232,47 @@ impl DesktopApp {
                     let result = client::block_on(client::owner_decide(&data_dir, &request));
                     Message::Inbox(InboxMsg::Decided(key, at, choice, words, Box::new(result)))
                 });
+            }
+            InboxMsg::AuthLogin(harness, revision) => {
+                let task = format!("{harness}@{revision}");
+                if self.inbox.auth_signing.contains(&task) {
+                    return;
+                }
+                let Ok(data_dir) = self.data_dir.clone() else {
+                    return;
+                };
+                self.inbox.auth_signing.insert(task.clone());
+                self.inbox.auth_outcomes.remove(&task);
+                let _task = context.spawn_background(move |_| {
+                    let result = client::block_on(client::auth_login(
+                        &data_dir,
+                        &harness,
+                        Some(revision.clone()),
+                    ));
+                    Message::Inbox(InboxMsg::AuthLoginResult(task, Box::new(result)))
+                });
+            }
+            InboxMsg::AuthLoginResult(task, result) => {
+                self.inbox.auth_signing.remove(&task);
+                let outcome = match *result {
+                    Ok(response) => Outcome {
+                        text: match response.status {
+                            AuthLoginStatus::Queued => "Sign-in requested.".to_owned(),
+                            AuthLoginStatus::Open => "A sign-in window is already open.".to_owned(),
+                            AuthLoginStatus::Cooldown => {
+                                "Sign-in is cooling down. Try again later.".to_owned()
+                            }
+                        },
+                        error: false,
+                    },
+                    Err(error) => Outcome {
+                        text: error.user_message(),
+                        error: true,
+                    },
+                };
+                self.inbox.auth_outcomes.insert(task, outcome);
+                self.read_inbox(context);
+                self.read_inbox_counts(context);
             }
             InboxMsg::Decided(key, at, choice, words, result) => {
                 let subject = at
@@ -423,7 +484,10 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let at = item.cursor();
-        let busy = self.inbox.deciding.contains(&at);
+        let auth_task = format!("{}@{}", item.subject, item.revision);
+        let busy = self.inbox.deciding.contains(&at)
+            || (item.kind == OwnerInboxKind::HarnessAuth
+                && self.inbox.auth_signing.contains(&auth_task));
         let agent = subject_agent(&item.subject);
         let subject = match agent {
             Some(agent) => self.agent_title(agent),
@@ -444,12 +508,21 @@ impl DesktopApp {
         let mut buttons: Vec<KeyedView> = Vec::new();
         if let Some(recommended) = &item.recommended {
             let words = choice_words(&recommended.choice);
+            let click =
+                if item.kind == OwnerInboxKind::HarnessAuth && recommended.choice == "sign_in" {
+                    context.message(Message::Inbox(InboxMsg::AuthLogin(
+                        item.subject.clone(),
+                        item.revision.clone(),
+                    )))
+                } else {
+                    decide(RECOMMENDED, &words)
+                };
             buttons.push(KeyedView::new(
                 "recommended",
                 m3::filled(palette)
                     .is_enabled(!busy)
                     .automation_name(format!("{words} (recommended): {subject}"))
-                    .on_click(decide(RECOMMENDED, &words))
+                    .on_click(click)
                     .content(m3::label(&words)),
             ));
         }
@@ -462,9 +535,17 @@ impl DesktopApp {
                 continue;
             }
             let words = choice_words(&choice.choice);
-            // An answer needs the question's own form: open its Agent.
-            let (label, click) = match (choice.choice.as_str(), agent) {
-                ("answer", Some(agent)) => (
+            // Sign-in is a direct auth.login operation; an answer needs the
+            // question's own form, so open its Agent.
+            let (label, click) = match (item.kind, choice.choice.as_str(), agent) {
+                (OwnerInboxKind::HarnessAuth, "sign_in", _) => (
+                    "Sign in".to_owned(),
+                    context.message(Message::Inbox(InboxMsg::AuthLogin(
+                        item.subject.clone(),
+                        item.revision.clone(),
+                    ))),
+                ),
+                (_, "answer", Some(agent)) => (
                     format!("{words}…"),
                     context.message(Message::Inbox(InboxMsg::OpenAgent(agent.to_owned()))),
                 ),
@@ -487,7 +568,12 @@ impl DesktopApp {
                 .on_click(decide(SNOOZE, "Snooze"))
                 .content(m3::label("Snooze")),
         ));
-        let outcome: View = match self.inbox.outcomes.get(&at) {
+        let visible_outcome = if item.kind == OwnerInboxKind::HarnessAuth {
+            self.inbox.auth_outcomes.get(&auth_task)
+        } else {
+            self.inbox.outcomes.get(&at)
+        };
+        let outcome: View = match visible_outcome {
             Some(outcome) => {
                 let text = m3::secondary(outcome.text.clone())
                     .text_wrapping(TextWrapping::Wrap)
@@ -498,6 +584,9 @@ impl DesktopApp {
                 } else {
                     text.into()
                 }
+            }
+            None if busy && item.kind == OwnerInboxKind::HarnessAuth => {
+                m3::secondary("Requesting sign-in…").into()
             }
             None if busy => m3::secondary("Deciding…").into(),
             None => View::empty(),

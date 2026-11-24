@@ -113,6 +113,7 @@ pub struct HarnessCheckFailure<'a> {
     pub key: Option<&'a str>,
     pub quota: bool,
     pub preflight: bool,
+    pub auth_pending: bool,
 }
 
 fn row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HarnessCheckRow> {
@@ -369,6 +370,7 @@ impl Store {
                     )
                     .map_err(sql_error)?;
                 let confirmed = !failure.quota
+                    && !failure.auth_pending
                     && attempts == core::HARNESS_CHECK_MAX_ATTEMPTS
                     && failure.key.is_some()
                     && first.as_deref() == failure.key;
@@ -380,7 +382,9 @@ impl Store {
                         Some(bound_error(failure.message)?),
                     )
                 } else {
-                    let attempts = attempts - i64::from(failure.quota && failure.preflight);
+                    let without_effect =
+                        failure.auth_pending || (failure.quota && failure.preflight);
+                    let attempts = attempts - i64::from(without_effect);
                     let reason = if attempts >= core::HARNESS_CHECK_MAX_ATTEMPTS {
                         core::NOT_CHECKED_ATTEMPT_LIMIT
                     } else if failure.quota {
@@ -404,7 +408,7 @@ impl Store {
                             version_key,
                             attempts,
                             now.saturating_add(cooldown * 1000),
-                            failure.key, failure.quota && failure.preflight,
+                            failure.key, without_effect,
                         ],
                     )
                     .map_err(sql_error)?;
@@ -478,7 +482,10 @@ impl Store {
         self.ensure_committed_reads()?;
         self.connection
             .query_row(
-                "SELECT json_extract(data, '$.native_error.code') FROM events
+                "SELECT coalesce(json_extract(data, '$.native_error.code'),
+                                 CASE json_extract(data, '$.provider_restriction.kind')
+                                     WHEN 'auth' THEN 'auth_required' END)
+                 FROM events
              WHERE agent = ?1 AND generation = ?2 AND kind = 'turn.completed'
                AND json_extract(data, '$.turn_id') = ?3
              ORDER BY seq DESC LIMIT 1",

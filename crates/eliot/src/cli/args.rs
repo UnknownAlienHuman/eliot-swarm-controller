@@ -75,6 +75,8 @@ pub(crate) enum CliCommand {
     Settings(SettingsArgs),
     /// Start, stop or update the local daemon, or manage logon startup.
     Daemon(DaemonArgs),
+    /// Request an Owner-mediated native harness login.
+    Auth(AuthArgs),
     /// Create or tear down an isolated live-proof stand.
     Stand(StandArgs),
     /// Read daemon state without starting a daemon.
@@ -224,6 +226,21 @@ pub(crate) struct AutonomyArgs {
     /// Start of the window (RFC 3339, Unix milliseconds, or a duration ago such as 48h).
     #[arg(long, value_name = "TIME")]
     pub(crate) since: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct AuthArgs {
+    #[command(subcommand)]
+    pub(crate) command: AuthCommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum AuthCommand {
+    /// Queue or reopen the Owner login action for one harness.
+    Login {
+        #[arg(long, value_name = "HARNESS")]
+        harness: String,
+    },
 }
 
 #[derive(Args)]

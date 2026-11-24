@@ -1,6 +1,7 @@
 mod attention;
 mod attribution;
 mod auth;
+mod auth_login;
 mod background_wake;
 mod catalog;
 mod checkpoint_restore;
@@ -538,6 +539,7 @@ impl Router {
             .and_then(|auth| auth.remove("swarm_mcp_call_id"));
         let (principal, params, owner_peer) = self.authenticate(wire_params, peer).await?;
         *log_principal = diagnostic_principal(&principal);
+        auth_login::authorize_local(method, &principal, owner_peer.as_ref(), remote.is_some())?;
         let owner_process = (matches!(principal, Principal::Owner)
             && discovery::is_mutation(method))
         .then(|| self.owner_process(owner_peer.as_ref()));
@@ -771,6 +773,10 @@ impl Router {
             "harness.list" => self.harness_list(&params, &principal).await,
             "harness.models" => self.harness_models(&params, &principal).await,
             "harness.quota" => self.harness_quota(&params, &principal).await,
+            "auth.login" => self.auth_login(&params).await,
+            "auth.desktop.poll" => self.auth_desktop_poll(&params).await,
+            "auth.desktop.claim" => self.auth_desktop_claim(&params).await,
+            "auth.desktop.report" => self.auth_desktop_report(&params).await,
             "harness.doctor" => self.harness_doctor(&params, &principal).await,
             "models.catalog" => self.models_catalog(&params, &principal).await,
             "agent.history" => self.agent_history(&params, &principal).await,

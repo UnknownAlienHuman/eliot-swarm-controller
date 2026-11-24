@@ -503,6 +503,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
+| `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical DTOs](../../crates/eliot-core/src/api/harness.rs) define requests, entries, failures and quota vocabulary. Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible. A partial listing supports continuation and the next first page retries failed reads. An `after` cursor missing from the current listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles caching, discovery and page availability. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
@@ -738,8 +739,8 @@ Errors include
 `secret_in_payload`, `frame_too_large`, `mailbox_full`, `version_conflict`, `claim_limit`, `internal`.
 
 `auth_required` on a failed Claude start means the native CLI reported it
-was signed out before any session or prompt was dispatched. The retained
-message names the executable and the command the owner can run to sign in.
+was signed out before any session or prompt was dispatched. Swarm records
+the failure and queues the [Owner sign-in](#owner-harness-sign-in).
 
 `capacity_unavailable` is a pre-effect rejection from a retained prior-generation
 reservation or a configured Eliot `max_live` scope, not a vendor quota or entitlement
@@ -753,6 +754,43 @@ service-management APIs remain `unsupported` in this increment.
 enum; plugin-specific codes may be preserved. Unfamiliar post-I/O error codes classify
 as `Unknown` under [Core policy](../../crates/eliot-core/src/command.rs), never proof
 of failure or permission to replay the effect.
+
+## Owner harness sign-in
+
+`swarm auth login --harness H` is an Owner-local `auth.login` call using
+[`AuthLoginRequest` and `AuthLoginResponse`](../../crates/eliot-core/src/api/auth_login.rs).
+The CLI sends `{harness: H, revision: null}` and prints the returned status, or the
+response DTO with `--json`. `queued`, `open` and `cooldown` describe request state;
+none establishes that a vendor account is signed in. The CLI carries no credential and
+does not run a vendor command.
+
+The Owner inbox projects a `harness_auth` item for a sign-in action. Its `sign_in`
+choice names `auth.login` and is revision-bound to the displayed harness request.
+`owner.decide.bulk` excludes `sign_in`; an interactive credential action is never
+submitted as a generic batch recommendation. Without an interactive desktop session,
+the daemon keeps the work queued. The desktop claims the exact harness and revision,
+runs the vendor's native interactive flow in the Owner's desktop session, and reports
+the result through the bounded desktop sign-in DTOs. The CLI request itself never
+opens a headless vendor process or asserts that the desktop action completed.
+
+The daemon dispatches one automatic console per harness outage. An unused grant
+expires after 15 seconds and returns to the queue. An explicit request for open work
+reports `open`. A request
+inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
+eligible only after five minutes have passed since the last claim and the prior launch
+is known closed or failed. Store schema 123 retains the claim across daemon restarts.
+The companion records the suspended console's PID and creation time before running
+it. A later companion can retire a dead console using that exact identity. A live
+console keeps its claim. Swarm publishes `x.user.notify` when the desktop confirms
+an unresolved console is open. A signed-in probe clears the inbox item and bound
+provider auth holds, then wakes launch arbitration.
+
+The native vendor handles the console, browser and credential storage. Swarm passes
+fixed argv and leaves the console streams with the vendor. It never collects passwords,
+codes, tokens or credential-file contents for sign-in. The status command runs in
+the same desktop context and returns only its classified result to the daemon.
+Each harness's supported command
+and explicit unsupported boundary is owned by the [plugin protocol](plugin-protocol.md#owner-sign-in).
 
 ## Agent and daemon read views
 
@@ -3200,6 +3238,7 @@ swarm stand down <PATH>
 swarm stand list
 swarm stand prune
 swarm status
+swarm auth login --harness H [--json]
 swarm autonomy [--since TIME] [--json]
 swarm store compact
 swarm maintenance compact

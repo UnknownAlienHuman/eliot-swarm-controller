@@ -3,7 +3,8 @@
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
-    NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
+    NativeAuthCapability, NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation,
+    NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
     UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
@@ -15,6 +16,17 @@ use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_auth: Some(NativeAuthCapability {
+            login: Some(NativeAuthCommand {
+                resolve: || auth_command(&["auth", "login", "--standalone"]),
+            }),
+            signed_in_check: Some(NativeAuthCheck {
+                command: NativeAuthCommand {
+                    resolve: || auth_command(&crate::native::auth::list_argv()),
+                },
+                classify: classify_auth_status,
+            }),
+        }),
         native_route: NativeRoute::AuthIntegration,
         profile: ProfileCapabilities {
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
@@ -77,5 +89,29 @@ pub fn declaration() -> HarnessCapabilities {
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         output_excludes_reasoning: true,
         ..HarnessCapabilities::default()
+    }
+}
+
+fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
+    let exe = crate::install::candidate_paths()
+        .ok()?
+        .into_iter()
+        .find(|path| path.is_absolute())?;
+    Some((exe, args.iter().copied().map(Into::into).collect()))
+}
+
+fn classify_auth_status(code: Option<i32>, stdout: &[u8], _: &[u8]) -> NativeAuthState {
+    #[derive(serde::Deserialize)]
+    struct Integration {
+        connections: Vec<serde::de::IgnoredAny>,
+    }
+
+    if code != Some(0) {
+        return NativeAuthState::Unknown;
+    }
+    match serde_json::from_slice::<Vec<Integration>>(stdout) {
+        Ok(rows) if rows.iter().any(|row| !row.connections.is_empty()) => NativeAuthState::SignedIn,
+        Ok(_) => NativeAuthState::SignedOut,
+        Err(_) => NativeAuthState::Unknown,
     }
 }

@@ -26,24 +26,13 @@ pub(crate) async fn require_auth(
     cwd: &Path,
     environment: &[(OsString, OsString)],
 ) -> Result<()> {
-    check_auth_status(program, &auth_status(program, cwd, environment).await?)
+    check_auth_status(&auth_status(program, cwd, environment).await?)
 }
 
-fn check_auth_status(program: &OsStr, status: &Value) -> Result<()> {
+fn check_auth_status(status: &Value) -> Result<()> {
     match status.get("loggedIn").and_then(Value::as_bool) {
         Some(true) => Ok(()),
-        Some(false) => {
-            let program = program.to_string_lossy();
-            let command = if cfg!(windows) {
-                format!("& '{}' auth login", program.replace('\'', "''"))
-            } else {
-                format!("'{}' auth login", program.replace('\'', "'\\''"))
-            };
-            Err(Error::new(
-                "auth_required",
-                format!("Claude CLI is signed out. Run {command} in a terminal, then start again."),
-            ))
-        }
+        Some(false) => Err(Error::new("auth_required", "Claude CLI is signed out.")),
         None => Err(Error::new(
             "native_not_dispatched",
             "Claude CLI auth status did not report a boolean loggedIn field",

@@ -1,7 +1,8 @@
 //! Muse native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeQuotaReadback,
+    AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeAuthCapability,
+    NativeAuthCheck, NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback,
     NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
@@ -16,6 +17,17 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_auth: Some(NativeAuthCapability {
+            login: Some(NativeAuthCommand {
+                resolve: || auth_command(&["login"]),
+            }),
+            signed_in_check: Some(NativeAuthCheck {
+                command: NativeAuthCommand {
+                    resolve: || auth_command(&["usage", "--json"]),
+                },
+                classify: classify_auth_status,
+            }),
+        }),
         native_route: NativeRoute::FixedCredential("ambient"),
         profile: ProfileCapabilities {
             approval_field: Some("approval"),
@@ -79,6 +91,60 @@ pub fn declaration() -> HarnessCapabilities {
         session_input_includes_cache_reads: true,
         ..HarnessCapabilities::default()
     }
+}
+
+#[cfg(windows)]
+fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
+    use std::path::{Path, PathBuf};
+
+    let launcher = Path::new(crate::install::LAUNCHER_DIR).join(".muse-launcher.ps1");
+    // Calling the vendor's launcher directly preserves the subcommand position.
+    // The installed CMD shim prepends TUI flags to usage on some installations.
+    let powershell = [
+        ("ProgramFiles", r"PowerShell\7\pwsh.exe"),
+        (
+            "SystemRoot",
+            r"System32\WindowsPowerShell\v1.0\powershell.exe",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(root, exe)| Some(PathBuf::from(std::env::var_os(root)?).join(exe)))
+    .find(|path| path.is_absolute() && path.is_file())?;
+    if !launcher.is_file() {
+        return None;
+    }
+    let mut argv = vec![
+        "-NoProfile".into(),
+        "-File".into(),
+        launcher.into_os_string(),
+    ];
+    argv.extend(args.iter().copied().map(std::ffi::OsString::from));
+    Some((powershell, argv))
+}
+
+#[cfg(not(windows))]
+fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
+    let exe = eliot_plugin::install::find_on_path("muse").filter(|path| path.is_absolute())?;
+    Some((exe, args.iter().copied().map(Into::into).collect()))
+}
+
+fn classify_auth_status(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> NativeAuthState {
+    if code == Some(0)
+        && serde_json::from_slice::<Value>(stdout).is_ok_and(|value| value["allowance"].is_object())
+    {
+        return NativeAuthState::SignedIn;
+    }
+    if code == Some(1)
+        && [stdout, stderr].into_iter().any(|bytes| {
+            std::str::from_utf8(bytes).is_ok_and(|text| {
+                text.lines()
+                    .any(|line| line.trim().starts_with("muse usage: not logged in:"))
+            })
+        })
+    {
+        return NativeAuthState::SignedOut;
+    }
+    NativeAuthState::Unknown
 }
 
 fn native_access_bounds(snapshot: &Value) -> Option<NativeAccessBounds> {

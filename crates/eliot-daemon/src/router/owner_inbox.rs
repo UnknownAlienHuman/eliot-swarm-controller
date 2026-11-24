@@ -126,7 +126,7 @@ impl Router {
                 | "provider.holds"
                 | "diagnose"
         );
-        if !read_only {
+        if !read_only && action.method != "auth.login" {
             action.args["id"] = json!(id);
         }
         let result = OWNER_DECISION
@@ -148,6 +148,21 @@ impl Router {
                             .await;
                     }
                     match action.method.as_str() {
+                        "auth.login" => {
+                            if context.remote.is_some()
+                                || context
+                                    .owner_process
+                                    .and_then(|process| process.pid)
+                                    .is_none()
+                            {
+                                return Err(Error::new(
+                                    "not_allowed",
+                                    "vendor sign-in requires a local Owner connection",
+                                ));
+                            }
+                            let request = decode_params(action.args)?;
+                            Ok(json!(self.request_auth_login(request, true).await?))
+                        }
                         "command.submit"
                             if matches!(
                                 action.args["verb"].as_str(),

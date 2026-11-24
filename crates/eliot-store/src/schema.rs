@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = MUSE_TURN_MODEL_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = AUTH_LOGIN_SCHEMA_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -12,6 +12,7 @@ const MODEL_MISMATCH_HOLD_VERSION: i64 = 119;
 const REPEAT_FAILURE_ALERTS_VERSION: i64 = 120;
 const NATIVE_FOLLOWUP_SCHEMA_VERSION: i64 = 121;
 const MUSE_TURN_MODEL_VERSION: i64 = 122;
+const AUTH_LOGIN_SCHEMA_VERSION: i64 = 123;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -48,6 +49,9 @@ impl Store {
         }
         if current < MUSE_TURN_MODEL_VERSION {
             self.migrate_muse_turn_models()?;
+        }
+        if current < AUTH_LOGIN_SCHEMA_VERSION {
+            self.migrate_auth_login(AUTH_LOGIN_SCHEMA_VERSION)?;
         }
         Ok(())
     }

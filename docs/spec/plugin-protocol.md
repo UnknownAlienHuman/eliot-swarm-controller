@@ -119,6 +119,40 @@ Read-only native CLI helpers bound stdout and process exit under the caller's de
 Claude auth status can consume its JSON result on either exit status. The same shared
 reader reaps the owned helper on a deadline or read failure.
 
+## Owner sign-in
+
+Harness sign-in runs only from the local Owner's interactive desktop session. The CLI's
+`auth.login` call queues or reopens Owner work; it does not launch a vendor executable.
+The desktop polls bounded `AuthDesktopWork` rows. A `probe` runs the read-only status
+command. A claim with `can_claim` authorizes one login invocation bound to the exact
+harness, revision and attempt. A typed sign-in refusal can queue this work automatically.
+The desktop reports `signed_in` or `signed_out` for the exact revision. Before
+resuming the vendor process, it records the suspended process identity with a
+`prepared` report within the 15-second claim deadline. The exact attempt then accepts
+`open`, `closed` or `failed` while the incident remains unresolved. Positive
+read-only status clears bound provider auth holds.
+
+Every login invocation uses fixed argument vectors and the Owner's native configuration.
+The new console gives the vendor its own interactive streams. Swarm does not capture
+interactive vendor output, user-entered values or authentication files. Durable claims
+and the five-minute retry
+cooldown fence one automatic attempt per harness outage; an explicit retry requires
+five elapsed minutes and a known closed or failed prior launch.
+
+| Harness | Interactive argv | Read-only confirmation | Limit |
+| --- | --- | --- | --- |
+| Codex | `login` | `login status` | The Owner's existing native Codex sign-in is used in place. |
+| Claude Code | `auth login` | `auth status --json` | Parse the JSON status even when the vendor command exits nonzero. |
+| Muse | `login` | `usage --json` | Invoke through the installed vendor PowerShell launcher; the public wrapper prepends an incompatible flag. |
+| OpenCode | `auth login --standalone` | `auth list --format json --standalone` | The native picker supports browser, API-key and local integrations. Confirmation covers recorded provider connections only. |
+| Antigravity | `unsupported` | `unsupported` | Installed AGY 1.5.16 exposes no auth/login subcommand; return `unsupported` without starting a process or substituting another flow. |
+
+The Muse 1.4.25, OpenCode 2.2.7 and Antigravity 1.5.16 observations above were
+checked on 2026-11-24. Installed versions are diagnostic; requalify command behavior
+when a vendor installation changes. A harness without the listed native operation
+returns `unsupported` before process start. There is no shell fallback, guessed
+subcommand, browser-only claim, or credential export/import path.
+
 ## Manifest
 
 An initial plugin may declare:

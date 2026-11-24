@@ -18,6 +18,7 @@ pub enum OwnerInboxKind {
     LaunchQueue,
     Stuck,
     HarnessCheck,
+    HarnessAuth,
     /// A successor continued after a turn whose effects may be partial.
     Handoff,
     /// Work that is not fully recorded in Git.
@@ -25,7 +26,7 @@ pub enum OwnerInboxKind {
 }
 
 impl OwnerInboxKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::HarnessRequest,
         Self::UnknownCommand,
         Self::UnknownTurn,
@@ -35,6 +36,7 @@ impl OwnerInboxKind {
         Self::LaunchQueue,
         Self::Stuck,
         Self::HarnessCheck,
+        Self::HarnessAuth,
         Self::Handoff,
         Self::WorkNotInGit,
     ];
@@ -50,6 +52,7 @@ impl OwnerInboxKind {
             Self::LaunchQueue => "launch_queue",
             Self::Stuck => "stuck",
             Self::HarnessCheck => "harness_check",
+            Self::HarnessAuth => "harness_auth",
             Self::Handoff => "handoff",
             Self::WorkNotInGit => "work_not_in_git",
         }

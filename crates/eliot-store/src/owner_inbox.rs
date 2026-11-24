@@ -24,6 +24,7 @@ pub(crate) fn project(
     project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
     project_holds(connection, now, &mut items, &mut liveness, &[])?;
     project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
+    super::auth_login::project_harness_auth(connection, now, &mut items, &mut liveness, &[])?;
     project_agents(connection, now, &mut items, &mut liveness, &[])?;
     project_goals(connection, now, &mut items, &mut liveness, &[])?;
     project_launch_intents(connection, now, &mut items, &mut liveness, &[])?;
@@ -68,6 +69,7 @@ pub(crate) fn project_item(
         OwnerInboxKind::UnknownTurn => (project_unknown_turns, subject),
         OwnerInboxKind::Hold => (project_holds, subject),
         OwnerInboxKind::HarnessCheck => (project_harness_checks, subject),
+        OwnerInboxKind::HarnessAuth => (super::auth_login::project_harness_auth, subject),
         OwnerInboxKind::Agent => (project_agents, subject),
         OwnerInboxKind::BlockedGoal => (project_goals, subject),
         OwnerInboxKind::Handoff => (project_handoffs, subject),

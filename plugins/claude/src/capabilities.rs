@@ -3,7 +3,8 @@
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
-    NativeAccessBounds, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
+    NativeAccessBounds, NativeAuthCapability, NativeAuthCheck, NativeAuthCommand,
+    NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
     ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
@@ -16,6 +17,17 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_auth: Some(NativeAuthCapability {
+            login: Some(NativeAuthCommand {
+                resolve: || auth_command(&["auth", "login"]),
+            }),
+            signed_in_check: Some(NativeAuthCheck {
+                command: NativeAuthCommand {
+                    resolve: || auth_command(&["auth", "status", "--json"]),
+                },
+                classify: classify_auth_status,
+            }),
+        }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
             approval_field: Some("permission_mode"),
@@ -97,6 +109,28 @@ pub fn declaration() -> HarnessCapabilities {
         legacy_result_status: true,
         input_token_accounting: InputTokenAccounting::ExcludesCacheWrites,
         ..HarnessCapabilities::default()
+    }
+}
+
+fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
+    let exe = crate::install::candidate_paths()
+        .ok()?
+        .into_iter()
+        .find(|path| path.is_absolute())?;
+    Some((exe, args.iter().copied().map(Into::into).collect()))
+}
+
+fn classify_auth_status(code: Option<i32>, stdout: &[u8], _: &[u8]) -> NativeAuthState {
+    #[derive(serde::Deserialize)]
+    struct Status {
+        #[serde(rename = "loggedIn")]
+        logged_in: bool,
+    }
+
+    match (code, serde_json::from_slice::<Status>(stdout).ok()) {
+        (Some(0), Some(Status { logged_in: true })) => NativeAuthState::SignedIn,
+        (Some(0 | 1), Some(Status { logged_in: false })) => NativeAuthState::SignedOut,
+        _ => NativeAuthState::Unknown,
     }
 }
 

@@ -101,6 +101,9 @@ impl Router {
             };
             let claimed = {
                 let mut store = self.inner.store.lock().await;
+                if store.harness_auth_held(&harness)? {
+                    continue;
+                }
                 store.claim_harness_check(&harness, &version, &profile, now)?
             };
             if !claimed {
@@ -296,6 +299,8 @@ impl Router {
         step: &str,
         error: &Error,
     ) {
+        self.note_harness_auth_required(harness, Some(&error.code))
+            .await;
         let result = self.inner.store.lock().await.record_harness_check_failure(
             harness,
             version,
@@ -306,6 +311,8 @@ impl Router {
                 key: None,
                 quota: eliot_core::is_quota_refusal(&error.code),
                 preflight: true,
+                auth_pending: error.code == "auth_required"
+                    && super::auth_login::supports_login(harness),
             },
             now_ms(),
         );
@@ -388,6 +395,8 @@ impl Router {
     /// Block only when a second exact attempt repeats an attributable
     /// refusal. Transport, timeouts and unclassified errors stay inconclusive.
     async fn record_drive_failure(&self, work: &HarnessCheckWork, step: &str, error: &Error) {
+        self.note_harness_auth_required(&work.harness, Some(&error.code))
+            .await;
         let quota =
             eliot_core::is_quota_refusal(&error.code) || self.check_held_for_drive(work).await;
         let attributable = error.code == "model_not_found"
@@ -405,6 +414,8 @@ impl Router {
                 key: key.as_deref(),
                 quota,
                 preflight: false,
+                auth_pending: error.code == "auth_required"
+                    && super::auth_login::supports_login(&work.harness),
             },
             now_ms(),
         );

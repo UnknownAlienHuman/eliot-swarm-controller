@@ -1,7 +1,8 @@
 //! Codex native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeQuotaReadback, NativeRoute,
+    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeAuthCapability, NativeAuthCheck,
+    NativeAuthCommand, NativeAuthInvocation, NativeAuthState, NativeQuotaReadback, NativeRoute,
     ProfileCapabilities, ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
@@ -16,6 +17,17 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_auth: Some(NativeAuthCapability {
+            login: Some(NativeAuthCommand {
+                resolve: || auth_command(&["login"]),
+            }),
+            signed_in_check: Some(NativeAuthCheck {
+                command: NativeAuthCommand {
+                    resolve: || auth_command(&["login", "status"]),
+                },
+                classify: classify_auth_status,
+            }),
+        }),
         native_route: NativeRoute::ResponsesProxy {
             reserved_providers: &[
                 "openai",
@@ -94,6 +106,29 @@ pub fn declaration() -> HarnessCapabilities {
         version_prefixes: &["codex-cli", "codex"],
         input_token_accounting: InputTokenAccounting::IncludesCacheReads,
         ..HarnessCapabilities::default()
+    }
+}
+
+fn auth_command(args: &[&str]) -> Option<NativeAuthInvocation> {
+    use eliot_plugin::install::{find_on_path, native_exe_name};
+
+    let exe = find_on_path(&native_exe_name("codex")).filter(|path| path.is_absolute())?;
+    Some((exe, args.iter().copied().map(Into::into).collect()))
+}
+
+fn classify_auth_status(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> NativeAuthState {
+    let has_line = |predicate: fn(&str) -> bool| {
+        [stdout, stderr]
+            .into_iter()
+            .filter_map(|bytes| std::str::from_utf8(bytes).ok())
+            .any(|text| text.lines().map(str::trim).any(predicate))
+    };
+    match code {
+        Some(0) if has_line(|line| line.starts_with("Logged in")) => NativeAuthState::SignedIn,
+        Some(1) if has_line(|line| line.eq_ignore_ascii_case("Not logged in")) => {
+            NativeAuthState::SignedOut
+        }
+        _ => NativeAuthState::Unknown,
     }
 }
 

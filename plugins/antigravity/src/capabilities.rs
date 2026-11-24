@@ -12,6 +12,8 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        // Installed AGY help exposes neither a standalone sign-in command nor sign-in status.
+        native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
         profile: ProfileCapabilities {
             command_refusal: Some(|cmd| {

@@ -668,6 +668,8 @@ impl Router {
         match start {
             Ok(mut value) => {
                 if classify_start_result(&value) == CommandState::Failed {
+                    self.note_harness_auth_required(&harness, value["code"].as_str())
+                        .await;
                     let native_start_refused = value.get("native_ref").is_none();
                     self.redact_native_value(&mut value);
                     Self::ensure_outcome_failure_fields(
@@ -697,9 +699,13 @@ impl Router {
                 }
             }
             Err(crate::router::plugin_host::StartError::NotSpawned(error)) => {
+                self.note_harness_auth_required(&harness, Some(&error.code))
+                    .await;
                 self.settle_unspawned_start(id, &error).await;
             }
             Err(crate::router::plugin_host::StartError::Uncertain(error)) => {
+                self.note_harness_auth_required(&harness, Some(&error.code))
+                    .await;
                 self.settle_plugin_error(id, &error).await;
             }
         }

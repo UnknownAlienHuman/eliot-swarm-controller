@@ -59,6 +59,8 @@ pub use platform::data_dir::{
     DataDir, ForeignDataDirAce, data_dir_acl_report, owner_stopped, persist_selected_root,
     resolve_data_dir, resolve_selected_root,
 };
+#[cfg(windows)]
+pub use platform::windows::{VendorLoginConsole, prepare_vendor_login_console};
 pub use router::discovery::is_mutation_id_method;
 pub use router::discovery::mutation_id_methods;
 
