@@ -114,6 +114,8 @@ The adapter verifies the thread's effective sandbox before publishing
 `session.ready`, even when Codex does not expose the readiness method. The requested
 permissions are sent unchanged. `read-only` and `danger-full-access` do not use the
 Windows workspace-write readiness check.
+With a mismatched native sandbox, confirmed app-server cleanup settles the start
+as failed with the sandbox reason and exact native thread in the command outcome.
 
 See the [official Windows sandbox documentation](https://developers.openai.com/codex/windows)
 and the [0.167.1 sandbox selection](https://github.com/openai/codex/blob/rust-v0.167.1/codex-rs/config/src/config_toml.rs)

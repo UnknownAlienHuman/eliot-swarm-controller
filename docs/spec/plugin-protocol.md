@@ -140,7 +140,7 @@ parser owns the input vocabulary used for offline settings validation.
 | Method | Essential fields | Meaning |
 | --- | --- | --- |
 | `initialize` | protocol, frozen plugin config, private instance directory, optional `store_root` (required by OpenCode) | return actual manifest |
-| `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven-no-effect failure returns `"state": "failed"` with a short non-secret `reason` instead of an error, and the launch settles failed, never unknown |
+| `agent.start` | agent/generation, profile, workspace, target environment, note, source plan/state, optional resume subject/linked initial input | establish session; input/result settle separately; a proven startup refusal returns a bound `"state": "failed"` with a short non-secret `reason` |
 | `agent.command` | agent/generation, command id, verb/args, exact turn/request where required | applied/rejected/failed/unknown, native mechanism and application point |
 | `agent.stop` | agent/generation, command id | gracefully close the bound controlled native session and drain its events |
 | `agent.snapshot` | controlled command/turn binding, or exact subject plus `observation` page query | bounded readback; private history never acknowledges controlled effects |
@@ -380,6 +380,13 @@ match the retained subject pair exactly before reducing the event. `data.command
 absent or null; when supplied, it must match the unique Resume command for that target
 generation. The plugin need not add command correlation when its readiness observation does
 not carry it.
+
+A bound failed start follows a pre-dispatch refusal or a definitive verification
+refusal before `session.ready` and input, after confirmed native cleanup. When the
+native subject was established, the failed result includes its `native_scope` and
+`native_ref`. Store retains that subject in the command outcome and the failure
+does not authorize automatic pre-dispatch worktree rollback. Unconfirmed cleanup
+retains an unknown outcome.
 
 If a just-created OpenCode session fails verification and its removal cannot
 be proved, the plugin returns `unknown` and keeps the server running with the

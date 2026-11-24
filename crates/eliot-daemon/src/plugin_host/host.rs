@@ -3277,21 +3277,28 @@ fn validate_send_result(value: Value) -> Result<Value> {
     Ok(value)
 }
 
-/// True for a validated `agent.start` result carrying the plugin's
-/// authoritative proven-no-effect verdict. Only `validate_start_result`
-/// decides admission; this splits the admitted shapes so a failed start
-/// retires instead of entering the live actor loop.
+/// A validated failed start retires instead of entering the live actor loop.
 fn is_failed_start_result(value: &Value) -> bool {
     value.get("state").and_then(Value::as_str) == Some("failed")
 }
 
 fn validate_start_result(value: &Value, agent: &Agent, command: &Command) -> Result<()> {
-    // Ready establishes the session; failed is the plugin's authoritative
-    // proven-no-effect verdict (returned instead of an error only for checks
-    // before any native session effect). Both require the exact
-    // agent/generation/command binding.
+    // Both results require the exact Agent, generation and command binding.
+    // A failed start with a native effect carries the exact subject pair.
     let state = value.get("state").and_then(Value::as_str);
+    let failed_subject_valid = state != Some("failed")
+        || match (value.get("native_scope"), value.get("native_ref")) {
+            (None, None) => true,
+            (Some(scope), Some(reference)) => {
+                scope.as_str().is_some_and(|scope| !scope.trim().is_empty())
+                    && reference
+                        .as_str()
+                        .is_some_and(|reference| !reference.trim().is_empty())
+            }
+            _ => false,
+        };
     if matches!(state, Some("ready") | Some("failed"))
+        && failed_subject_valid
         && value.get("agent_id").and_then(Value::as_str) == Some(agent.id.as_str())
         && value.get("generation").and_then(Value::as_i64) == Some(agent.generation)
         && value.get("command_id").and_then(Value::as_str) == Some(command.id.as_str())

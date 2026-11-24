@@ -1444,12 +1444,17 @@ impl CodexPlugin {
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("unavailable");
+            let network = readback
+                .sandbox
+                .get("networkAccess")
+                .and_then(Value::as_bool)
+                .map_or_else(String::new, |value| format!(" (networkAccess={value})"));
             let error = discard_failed_start(
                 &mut session,
                 Error::new(
                     "profile_error",
                     format!(
-                        "Codex returned sandbox type {actual:?} with a policy that does not match the requested {:?} permissions",
+                        "Codex returned sandbox type {actual:?}{network} with a policy that does not match the requested {:?} permissions",
                         plan.permissions
                     ),
                 )
@@ -1467,8 +1472,11 @@ impl CodexPlugin {
                     "owned app-server cleanup is unconfirmed; no input was sent",
                 ));
             }
+            let mut failure = eliot_plugin::session::failed_start_value(params, error);
+            failure["native_scope"] = json!(session.native_scope);
+            failure["native_ref"] = json!(readback.thread.id);
             self.failed_start = Some(FailedStart);
-            return Err(error);
+            return Ok(failure);
         }
         // Expose the daemon-materialized coordination skill before any
         // input is sent: without it the Agent would start believing it has
