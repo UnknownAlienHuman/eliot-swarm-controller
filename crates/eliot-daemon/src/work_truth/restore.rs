@@ -1,7 +1,9 @@
 use super::*;
-use crate::platform::data_dir::replace_file;
+use crate::platform::{OwnedChild, data_dir::replace_file};
 use eliot_core::api::CheckpointRestoreRequest;
+use eliot_store::{CheckpointRestoreIntent, Store};
 use std::io::Write;
+use tokio::sync::Mutex;
 
 pub(crate) struct CheckpointRestoreOutcome {
     pub(crate) head: String,
@@ -14,6 +16,160 @@ struct RestoredFile {
     project_oid: Option<String>,
 }
 
+pub(crate) struct CheckpointRestoreWriter<'a> {
+    pub(crate) store: &'a Mutex<Store>,
+    pub(crate) id: &'a str,
+}
+
+impl CheckpointRestoreWriter<'_> {
+    #[expect(
+        clippy::disallowed_types,
+        reason = "This binds the prepared Git leaf to the restore receipt before it writes."
+    )]
+    pub(crate) async fn spawn(&self, command: tokio::process::Command) -> Result<OwnedChild> {
+        #[cfg(windows)]
+        {
+            use crate::platform::custody::AgentSpawnError;
+            let boot = crate::platform::windows::host_boot_id()?;
+            let mut store = self.store.lock().await;
+            let key = format!("{}-{}", store.custody_namespace()?, self.id);
+            store.arm_checkpoint_restore_writer(self.id, &boot)?;
+            match OwnedChild::spawn_checkpoint_restore_writer(command, &key, boot, |identity| {
+                store.record_checkpoint_restore_writer(self.id, identity)
+            }) {
+                Ok(child) => Ok(child),
+                Err(
+                    AgentSpawnError::NotSpawned(error) | AgentSpawnError::ProgramUnrunnable(error),
+                ) => {
+                    store.close_checkpoint_restore_writer(self.id)?;
+                    Err(error)
+                }
+                Err(AgentSpawnError::Uncertain(_)) => Err(Error::new(
+                    "unknown",
+                    "checkpoint restore writer startup did not settle",
+                )),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use crate::platform::unix;
+            let boot = unix::host_boot_id()?;
+            let mut store = self.store.lock().await;
+            let key = format!("{}-{}", store.custody_namespace()?, self.id);
+            let custody = unix::restore_writer_custody(&key)
+                .map_err(|_| Error::new("unavailable", "cannot bind restore writer custody"))?;
+            store.arm_checkpoint_restore_writer(self.id, &boot)?;
+            let mut command = command;
+            unix::inherit_restore_writer_custody(&mut command, &custody);
+            let child = OwnedChild::spawn_leaf(command);
+            drop(custody);
+            match child {
+                Ok(child) => Ok(child),
+                Err(error) => {
+                    store.close_checkpoint_restore_writer(self.id)?;
+                    Err(error)
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = command;
+            Err(Error::new(
+                "unsupported",
+                "checkpoint restore Git custody is unavailable",
+            ))
+        }
+    }
+
+    pub(crate) async fn close(&self) -> Result<()> {
+        self.store
+            .lock()
+            .await
+            .close_checkpoint_restore_writer(self.id)
+    }
+}
+
+pub(crate) fn restore_writer_closed(intent: &CheckpointRestoreIntent) -> Result<bool> {
+    let Some(_boot) = &intent.writer_boot else {
+        return Ok(true);
+    };
+    if !intent.writer_custody_bound {
+        return Err(Error::new(
+            "custody_unproven",
+            "the restore writer has no custody binding to this Store",
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use crate::platform::{custody::checkpoint_restore_job_name, windows};
+        if !windows::named_job_closed(&checkpoint_restore_job_name(&intent.writer_key))? {
+            return Ok(false);
+        }
+        match &intent.writer_identity {
+            Some(identity) => {
+                windows::recorded_process_alive(identity.pid, identity.start_time).map(|live| !live)
+            }
+            None => Ok(true),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use crate::platform::unix;
+        if unix::host_boot_id()? != *_boot {
+            return Ok(true);
+        }
+        match unix::restore_writer_custody(&intent.writer_key) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => Ok(false),
+            Err(_) => Err(Error::new(
+                "unavailable",
+                "restore writer custody could not be checked",
+            )),
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Err(Error::new(
+            "unsupported",
+            "checkpoint restore Git custody is unavailable on this platform",
+        ))
+    }
+}
+
+pub(crate) fn stop_restore_writer(intent: &CheckpointRestoreIntent) -> Result<()> {
+    if restore_writer_closed(intent)? {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        use crate::platform::{custody::checkpoint_restore_job_name, windows};
+        let identity = intent.writer_identity.as_ref().ok_or_else(|| {
+            Error::new(
+                "custody_unproven",
+                "restore writer identity was not recorded",
+            )
+        })?;
+        windows::terminate_named_restore_job(
+            &checkpoint_restore_job_name(&intent.writer_key),
+            identity,
+        )?;
+        if restore_writer_closed(intent)? {
+            return Ok(());
+        }
+        Err(Error::new(
+            "unknown",
+            "restore writer exit could not be confirmed",
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        Err(Error::new(
+            "custody_unproven",
+            "there is no verified restore writer signal target",
+        ))
+    }
+}
+
 /// Restore both index and worktree layers from the daemon-owned repository.
 /// The target must be clean at the captured HEAD; all paths and bytes are
 /// validated before importing any object into the project repository.
@@ -21,8 +177,10 @@ pub(crate) async fn restore_checkpoint(
     data_root: &Path,
     request: &CheckpointRestoreRequest,
     expected_oid: &str,
+    expected_common_dir: &str,
     policy: &SecretPolicy,
     limits: CheckpointLimits,
+    writer: &CheckpointRestoreWriter<'_>,
 ) -> Result<CheckpointRestoreOutcome> {
     let CheckpointRestoreRequest {
         workspace,
@@ -129,7 +287,11 @@ pub(crate) async fn restore_checkpoint(
     )
     .await?;
     let common_dir = canonical_root(&common_dir)?;
-    if common_dir.to_string_lossy().as_ref() != manifest.repository_common_dir.as_str() {
+    if common_dir.to_string_lossy().as_ref() != manifest.repository_common_dir.as_str()
+        || workspace_path_key(&common_dir.to_string_lossy())
+            != workspace_path_key(expected_common_dir)
+        || workspace_path_key(&root.to_string_lossy()) != workspace_path_key(workspace)
+    {
         return Err(Error::new(
             "conflict",
             "restore target belongs to a different Git repository",
@@ -203,13 +365,13 @@ pub(crate) async fn restore_checkpoint(
         };
         if imported.insert(project_oid.to_owned()) {
             let written = git
-                .workspace_input_with(
+                .checkpoint_restore_write(
                     &root,
                     &["hash-object", "-w", "--stdin", "--no-filters"],
                     &project_overrides,
-                    None,
                     bytes,
                     Instant::now() + GIT_TIME,
+                    writer,
                 )
                 .await?;
             if written.code != 0 || first_line(&written.stdout)? != project_oid {
@@ -226,16 +388,29 @@ pub(crate) async fn restore_checkpoint(
     for file in &staged {
         append_restore_index_info(&mut staged_info, file, &zero)?;
     }
+    if !staged_info.is_empty() && !cfg!(any(windows, target_os = "linux")) {
+        return Err(Error::new(
+            "unsupported",
+            "checkpoint restore Git custody is unavailable on this platform",
+        ));
+    }
+    writer
+        .store
+        .lock()
+        .await
+        .mark_checkpoint_restore_applying(writer.id)?;
     for file in &worktree {
         apply_disk_file(&root, file)?;
     }
     if !staged_info.is_empty() {
         let staged_index = git
-            .workspace_input_command(
+            .checkpoint_restore_write(
                 &root,
                 &["update-index", "-z", "--index-info"],
+                &project_overrides,
                 &staged_info,
                 Instant::now() + GIT_TIME,
+                writer,
             )
             .await?;
         if staged_index.code != 0 {

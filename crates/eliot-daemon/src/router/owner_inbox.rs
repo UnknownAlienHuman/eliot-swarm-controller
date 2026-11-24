@@ -178,6 +178,17 @@ impl Router {
                             .await
                         }
                         "command.resolve" => self.command_resolve(&action.args, principal).await,
+                        "checkpoint.restore.release" => {
+                            self.release_checkpoint_restore(&action.args, principal, false)
+                                .await
+                        }
+                        "checkpoint.restore.abandon" => {
+                            self.release_checkpoint_restore(&action.args, principal, true)
+                                .await
+                        }
+                        "checkpoint.restore.stop" => {
+                            self.stop_checkpoint_restore(&action.args, principal).await
+                        }
                         "command.cancel" => self.command_cancel(&action.args, principal).await,
                         "command.settle_stopped" => {
                             self.command_settle_stopped(&action.args, principal).await

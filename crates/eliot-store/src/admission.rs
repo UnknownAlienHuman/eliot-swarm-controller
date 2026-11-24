@@ -1048,6 +1048,7 @@ fn admit_launch_tx(
         ));
     }
     workspace::require_managed_path_ready(tx, &workspace)?;
+    work_truth::require_no_checkpoint_restore(tx, &workspace)?;
     if !linked_switch_launch {
         switch::require_checkout_owner_tx(tx, Some(&workspace), None)?;
     }
@@ -1606,6 +1607,7 @@ fn admit_resume_tx(
     cleanup::require_no_cleanup_attempt(tx, &agent)?;
     if let Some(path) = &agent.workspace {
         workspace::require_managed_path_ready(tx, path)?;
+        work_truth::require_no_checkpoint_restore(tx, path)?;
     }
     if !eliot_core::api::is_supported_harness(&agent.harness) {
         return Err(Error::new(

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = MAIL_NOTICE_REVISION_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHECKPOINT_RESTORE_CUSTODY_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -16,6 +16,8 @@ const AUTH_LOGIN_SCHEMA_VERSION: i64 = 123;
 const MAIL_PENDING_WAKE_VERSION: i64 = 124;
 const ATTENTION_LOOKUPS_VERSION: i64 = 125;
 const MAIL_NOTICE_REVISION_VERSION: i64 = 126;
+const CHECKPOINT_RESTORE_INTENT_VERSION: i64 = 127;
+const CHECKPOINT_RESTORE_CUSTODY_VERSION: i64 = 128;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -65,7 +67,53 @@ impl Store {
         if current < MAIL_NOTICE_REVISION_VERSION {
             self.migrate_mail_notice_revision()?;
         }
+        if current < CHECKPOINT_RESTORE_INTENT_VERSION {
+            self.migrate_checkpoint_restore_intents()?;
+        }
+        if current < CHECKPOINT_RESTORE_CUSTODY_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "ALTER TABLE checkpoint_restore_intents ADD COLUMN writer_namespace TEXT;
+                 ALTER TABLE checkpoint_restore_intents ADD COLUMN custody_error TEXT;",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [CHECKPOINT_RESTORE_CUSTODY_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
         Ok(())
+    }
+
+    fn migrate_checkpoint_restore_intents(&mut self) -> Result<()> {
+        let tx = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_error)?;
+        tx.execute_batch(
+            "CREATE TABLE checkpoint_restore_intents (
+                 id TEXT PRIMARY KEY NOT NULL REFERENCES writes(id),
+                 workspace TEXT NOT NULL UNIQUE,
+                 common_dir TEXT NOT NULL,
+                 writer_boot TEXT,
+                 applying INTEGER NOT NULL DEFAULT 0,
+                 writer_identity TEXT
+             );
+             CREATE INDEX checkpoint_restore_common_dir
+                 ON checkpoint_restore_intents(common_dir);",
+        )
+        .map_err(sql_error)?;
+        tx.execute(
+            "INSERT INTO schema_migrations(version) VALUES (?1)",
+            [CHECKPOINT_RESTORE_INTENT_VERSION],
+        )
+        .map_err(sql_error)?;
+        tx.commit().map_err(sql_error)
     }
 
     fn migrate_attention_lookups(&mut self) -> Result<()> {

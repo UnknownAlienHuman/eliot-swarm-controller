@@ -1250,6 +1250,43 @@ impl GitProbe {
         self.run(root, args, &overrides, input, deadline).await
     }
 
+    /// Run a restore mutation and retain custody until the Git leaf has exited.
+    pub(crate) async fn checkpoint_restore_write(
+        &self,
+        root: &Path,
+        args: &[&str],
+        overrides: &[(String, String)],
+        input: &[u8],
+        deadline: Instant,
+        writer: &crate::work_truth::CheckpointRestoreWriter<'_>,
+    ) -> Result<Captured> {
+        let command = self.build_command(root, args, overrides, None)?;
+        if Instant::now() >= deadline {
+            return Err(unavailable("checkpoint restore Git deadline elapsed"));
+        }
+        let child = writer.spawn(command).await?;
+        let result = Self::capture_git_child(child, input, deadline, |stdout| {
+            bounded_read(stdout, OUTPUT_BYTES)
+        })
+        .await;
+        if !result
+            .as_ref()
+            .is_err_and(|error| error.code == "git_cleanup_unconfirmed")
+        {
+            writer.close().await?;
+        }
+        let (code, stdout) = result.map_err(|error| {
+            Error::new(
+                "unknown",
+                format!(
+                    "checkpoint restore Git write did not settle: {}",
+                    error.message
+                ),
+            )
+        })?;
+        Ok(Captured { code, stdout })
+    }
+
     /// The sanitized configuration for a batch of plumbing commands.
     pub(crate) async fn batch_overrides(
         &self,
@@ -1642,7 +1679,7 @@ impl GitProbe {
         if Instant::now() >= deadline {
             return Err(unavailable("Git observation deadline elapsed"));
         }
-        let mut child = if allow_helpers {
+        let child = if allow_helpers {
             OwnedChild::spawn(command)?
         } else {
             OwnedChild::spawn_leaf(command).map_err(|error| {
@@ -1653,17 +1690,34 @@ impl GitProbe {
                 }
             })?
         };
-        let stdout = child
-            .take_stdout()
-            .ok_or_else(|| unavailable("Git stdout is unavailable"))?;
-        let stderr = child
-            .take_stderr()
-            .ok_or_else(|| unavailable("Git stderr is unavailable"))?;
-        let mut stdin = child
-            .take_stdin()
-            .ok_or_else(|| unavailable("Git stdin is unavailable"))?;
+        Box::pin(Self::capture_git_child(child, input, deadline, read_stdout))
+            .await
+            .map_err(|error| {
+                if error.code == "git_cleanup_unconfirmed" {
+                    unavailable(&error.message)
+                } else {
+                    error
+                }
+            })
+    }
+
+    async fn capture_git_child<T, F: Future<Output = Result<T>>>(
+        mut child: OwnedChild,
+        input: &[u8],
+        deadline: Instant,
+        read_stdout: impl FnOnce(ChildStdout) -> F,
+    ) -> Result<(i32, T)> {
         let result = {
             let capture = async {
+                let stdout = child
+                    .take_stdout()
+                    .ok_or_else(|| unavailable("Git stdout is unavailable"))?;
+                let stderr = child
+                    .take_stderr()
+                    .ok_or_else(|| unavailable("Git stderr is unavailable"))?;
+                let mut stdin = child
+                    .take_stdin()
+                    .ok_or_else(|| unavailable("Git stdin is unavailable"))?;
                 let write = async move {
                     if !input.is_empty() {
                         stdin
@@ -1704,7 +1758,10 @@ impl GitProbe {
         let _ = child.terminate();
         let cleanup = Instant::now() + CLEANUP_TIME;
         if !matches!(timeout_at(cleanup, child.wait()).await, Ok(Ok(_))) {
-            return Err(unavailable("Git process cleanup is unconfirmed"));
+            return Err(Error::new(
+                "git_cleanup_unconfirmed",
+                "Git process cleanup is unconfirmed",
+            ));
         }
         #[cfg(windows)]
         if !matches!(
@@ -1713,7 +1770,10 @@ impl GitProbe {
                 .await,
             Ok(true)
         ) {
-            return Err(unavailable("Git family cleanup is unconfirmed"));
+            return Err(Error::new(
+                "git_cleanup_unconfirmed",
+                "Git family cleanup is unconfirmed",
+            ));
         }
         result.map_err(|_| unavailable("Git observation timed out"))?
     }

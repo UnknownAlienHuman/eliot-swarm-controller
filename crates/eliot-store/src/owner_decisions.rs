@@ -427,6 +427,7 @@ fn complete_action(action: &mut OwnerAction, supplied: Option<&Map<String, Value
     let (target, supplied, permitted): (&mut Value, Option<&Map<String, Value>>, &[&str]) =
         match action.method.as_str() {
             "command.resolve" | "turn.resolve" => (&mut action.args, supplied, &["reason"]),
+            "checkpoint.restore.abandon" => (&mut action.args, supplied, &["confirm", "reason"]),
             "provider.clear_hold" => (&mut action.args, supplied, &["corrective_evidence"]),
             "command.submit" if approval || action.args["verb"] == "answer" => {
                 let supplied = match supplied {

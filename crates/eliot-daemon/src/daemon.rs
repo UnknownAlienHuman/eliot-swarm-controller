@@ -547,6 +547,7 @@ async fn initialize_runtime(
         events
     };
     router.note_events(&recovered);
+    router.recover_checkpoint_restores().await?;
     router.reconcile_git_integrations(None).await?;
     router.recover_git_checkpoints().await?;
     logging::record(&policy, "daemon.recovered", &[], None);

@@ -459,6 +459,34 @@ impl OwnedChild {
         }
     }
 
+    #[cfg(windows)]
+    #[expect(
+        clippy::disallowed_types,
+        reason = "Restore records its exact suspended Git leaf before it can write."
+    )]
+    pub(crate) fn spawn_checkpoint_restore_writer(
+        command: Command,
+        id: &str,
+        boot: String,
+        record: impl FnOnce(&eliot_core::ProcessIdentity) -> Result<()>,
+    ) -> std::result::Result<Self, AgentSpawnError> {
+        let job = super::windows::Job::new_named_leaf(&checkpoint_restore_job_name(id))
+            .map_err(AgentSpawnError::NotSpawned)?;
+        Self::spawn_in_job_checked(command, job, |child| {
+            let pid = child.id().ok_or_else(|| {
+                Error::new(
+                    "process_identity",
+                    "suspended restore writer has no process id",
+                )
+            })?;
+            record(&eliot_core::ProcessIdentity {
+                pid,
+                host_boot_id: boot,
+                start_time: super::windows::process_start_time(pid)?,
+            })
+        })
+    }
+
     /// Start one Agent generation's plugin in custody that a later daemon can
     /// check after replacement: a Job named from the Store custody namespace on
     /// Windows, or a Unix group whose recorded leader identifies it.
@@ -734,6 +762,11 @@ pub(crate) fn agent_custody_name(namespace: &str, agent: &str, generation: i64) 
     // Global, not session-local: a daemon restarted in another logon session
     // must not mistake a still-live Job for a missing one.
     format!("Global\\eliot-{namespace}-{agent}-{generation}")
+}
+
+#[cfg(windows)]
+pub(crate) fn checkpoint_restore_job_name(id: &str) -> String {
+    agent_custody_name("checkpoint-restore", id, 1)
 }
 
 /// Check the custody of a generation that an earlier daemon started.

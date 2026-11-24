@@ -1028,6 +1028,7 @@ fn prune_writes_tx(tx: &Transaction<'_>, cutoff: i64) -> Result<i64> {
              SELECT id FROM writes WHERE created_at <= ?1
                AND method NOT LIKE 'inference.%'
                AND NOT EXISTS (SELECT 1 FROM launch_intents q WHERE q.id = writes.id)
+               AND NOT EXISTS (SELECT 1 FROM checkpoint_restore_intents r WHERE r.id = writes.id)
                AND NOT (method = 'goal.round'
                         AND json_extract(result, '$.outcome') IS json_extract(?3, '$'))
                AND NOT (method = 'cleanup.apply' AND EXISTS(

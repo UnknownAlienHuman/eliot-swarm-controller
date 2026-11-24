@@ -223,6 +223,43 @@ pub(crate) fn prepare_leaf_command(
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn restore_writer_custody(
+    key: &str,
+) -> std::io::Result<std::os::unix::net::UnixDatagram> {
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixDatagram},
+    };
+    // This abstract socket never receives traffic. Its name stays occupied
+    // until the last copy of the inherited writer descriptor closes.
+    let name = format!("eliot-checkpoint-restore-{key}");
+    UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(name.as_bytes())?)
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "The owned Git leaf inherits its per-restore custody descriptor."
+)]
+pub(crate) fn inherit_restore_writer_custody(
+    command: &mut tokio::process::Command,
+    custody: &std::os::unix::net::UnixDatagram,
+) {
+    use std::{os::fd::AsRawFd, os::unix::process::CommandExt};
+    let fd = custody.as_raw_fd();
+    // SAFETY: the caller holds the socket across spawn. This only changes the
+    // forked child's descriptor flags with an async-signal-safe syscall.
+    unsafe {
+        command.as_std_mut().pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn verify_unprivileged_leaf() -> std::io::Result<()> {
     let (mut real, mut effective, mut saved) = (0, 0, 0);
     // SAFETY: all three outputs point to writable uid_t-sized local values.

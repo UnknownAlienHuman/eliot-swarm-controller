@@ -29,7 +29,9 @@ use std::{
 use tokio::time::Instant;
 
 mod restore;
-pub(crate) use restore::restore_checkpoint;
+pub(crate) use restore::{
+    CheckpointRestoreWriter, restore_checkpoint, restore_writer_closed, stop_restore_writer,
+};
 
 const GIT_TIME: Duration = Duration::from_secs(30);
 const CHECKPOINT_CAPTURE_TIME: Duration = Duration::from_secs(90);
