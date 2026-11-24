@@ -56,17 +56,7 @@ fn default_visible(conn: &Connection) -> Result<String> {
     ))
 }
 
-fn organization_watermark(conn: &Connection) -> Result<i64> {
-    conn.query_row(
-        "SELECT MAX(COALESCE((SELECT MAX(seq) FROM events), 0),
-                COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0))",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(sql_error)
-}
-
-fn decode_tags(raw: &str) -> Result<Vec<String>> {
+pub(super) fn decode_tags(raw: &str) -> Result<Vec<String>> {
     let tags: Vec<String> = serde_json::from_str(raw)
         .map_err(|_| Error::new("source_integrity", "stored tags invalid"))?;
     if tags.len() > eliot_core::api::MAX_ORG_TAGS {
@@ -188,7 +178,7 @@ fn organization_roots(conn: &Connection, project: &str, archived: &str) -> Resul
 /// A legacy Agent whose retained project label is a checkout path groups
 /// under the registration of that exact path, without rewriting the
 /// retained label; two registrations on one path stay unplaced (ambiguous).
-fn organization_group() -> String {
+pub(super) fn organization_group() -> String {
     let path = checkout_key_sql("a.project");
     let checkout = checkout_key_sql("r.checkout");
     format!(
@@ -548,7 +538,7 @@ impl Store {
         owner_only(principal, "read organization")?;
         self.ensure_committed_reads()?;
         let conn = &self.connection;
-        let watermark = organization_watermark(conn)?;
+        let watermark = event_high_water(conn)?;
         // Existence ignores the cursor: a single-project read names its
         // group even when the cursor already passed it.
         if request.project.is_some()

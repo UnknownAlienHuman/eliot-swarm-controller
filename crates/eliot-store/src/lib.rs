@@ -240,6 +240,7 @@ pub use harness_checks::{HarnessCheckFailure, HarnessCheckRow};
 mod hierarchy;
 pub mod inference;
 mod lifecycle;
+pub use lifecycle::{PreparedRuleCoordination, RuleCoordinationDispatch, UserEventDispatch};
 mod native_children;
 pub mod overview;
 mod reparent;
@@ -327,6 +328,19 @@ fn validate_remote_command_context(
         }
     }
     Ok(())
+}
+
+/// Event sequence stays monotonic when retained event rows are pruned.
+fn event_high_water(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "SELECT MAX(
+             COALESCE((SELECT MAX(seq) FROM events), 0),
+             COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
+         )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
 }
 
 fn commit_transaction(tx: Transaction<'_>, write_faulted: &Cell<bool>) -> Result<()> {
@@ -638,10 +652,7 @@ impl Store {
         request: SubmitCommand,
         now: i64,
     ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, None, now, false);
-        self.fault_on_persistence_error(&result);
-        result
+        self.submit_with_context(principal, request, None, SubmissionContext::default(), now)
     }
 
     /// Admit one internal restart Resume only while its durable restart
@@ -670,7 +681,7 @@ impl Store {
             ));
         }
         self.ensure_writer_healthy()?;
-        let result = self.submit_inner("owner", request, None, now, true);
+        let result = self.submit_restart_resume_inner(request, now);
         self.fault_on_persistence_error(&result);
         result
     }
@@ -680,7 +691,7 @@ impl Store {
     pub fn submit_with_context(
         &mut self,
         principal: &str,
-        request: SubmitCommand,
+        request: impl Into<CommandSubmission>,
         preparation: Option<WorkspacePreparationInput>,
         context: SubmissionContext<'_>,
         now: i64,
@@ -690,10 +701,9 @@ impl Store {
             owner_process,
             ..
         } = context;
-        if remote.is_none() && owner_process.is_none() {
-            return self.submit_inner_checked(principal, request, preparation, now);
+        if remote.is_some() || owner_process.is_some() {
+            context.validate(principal)?;
         }
-        context.validate(principal)?;
         self.ensure_writer_healthy()?;
         let result = (|| {
             let tx = self
@@ -753,19 +763,6 @@ impl Store {
             ));
         }
         Ok(None)
-    }
-
-    fn submit_inner_checked(
-        &mut self,
-        principal: &str,
-        request: SubmitCommand,
-        preparation: Option<WorkspacePreparationInput>,
-        now: i64,
-    ) -> Result<Admission> {
-        self.ensure_writer_healthy()?;
-        let result = self.submit_inner(principal, request, preparation, now, false);
-        self.fault_on_persistence_error(&result);
-        result
     }
 
     /// Resolve a targetless Git fetch retry using only its caller-authored
@@ -889,41 +886,23 @@ impl Store {
         }
         Ok(None)
     }
-    fn submit_inner(
+    fn submit_restart_resume_inner(
         &mut self,
-        principal: &str,
         request: SubmitCommand,
-        preparation: Option<WorkspacePreparationInput>,
         now: i64,
-        restart_idle_resume: bool,
     ) -> Result<Admission> {
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let limits = self.hierarchy_limits;
-        let mut admission = if restart_idle_resume {
-            admission::submit_restart_resume_tx(
-                &tx,
-                request,
-                now,
-                limits,
-                self.capacity_policy.as_deref(),
-            )?
-        } else {
-            admission::submit_tx(
-                &tx,
-                principal,
-                request,
-                preparation,
-                now,
-                false,
-                limits,
-                self.capacity_policy.as_deref(),
-            )?
-        };
-        if restart_idle_resume
-            && admission.is_new
+        let mut admission = admission::submit_restart_resume_tx(
+            &tx,
+            request,
+            now,
+            self.hierarchy_limits,
+            self.capacity_policy.as_deref(),
+        )?;
+        if admission.is_new
             && let (Some(agent), Some(generation)) = (
                 admission.command.target.as_deref(),
                 admission.command.generation,
@@ -2680,16 +2659,7 @@ impl Store {
     }
 
     pub fn high_water(&self) -> Result<i64> {
-        self.connection
-            .query_row(
-                "SELECT MAX(
-                     COALESCE((SELECT MAX(seq) FROM events), 0),
-                     COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0)
-                 )",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(sql_error)
+        event_high_water(&self.connection)
     }
 
     /// On daemon restart, stop proven exited idle generations, fence remaining
@@ -5132,6 +5102,37 @@ pub struct SubmissionContext<'a> {
     pub owner_automation: bool,
 }
 
+/// A durable envelope with any local event already decoded at preflight.
+/// Keeping both private binds the validation to the original digest input.
+pub struct CommandSubmission {
+    request: SubmitCommand,
+    event: Option<core::api::UserEventCommand>,
+}
+
+impl CommandSubmission {
+    pub fn user_event(request: SubmitCommand) -> Result<Self> {
+        let event = core::api::UserEventCommand::decode(&request.verb, request.args.clone())?;
+        event.validate_admission()?;
+        Ok(Self {
+            request,
+            event: Some(event),
+        })
+    }
+
+    pub fn request(&self) -> &SubmitCommand {
+        &self.request
+    }
+}
+
+impl From<SubmitCommand> for CommandSubmission {
+    fn from(request: SubmitCommand) -> Self {
+        Self {
+            request,
+            event: None,
+        }
+    }
+}
+
 impl SubmissionContext<'_> {
     fn validate(self, principal: &str) -> Result<()> {
         validate_remote_command_context(principal, self.remote)?;
@@ -5893,6 +5894,8 @@ pub struct HeavyWindowRow {
     pub data: Value,
 }
 
+const HEAVY_ROLLUP_EPISODES: i64 = 201;
+
 impl Store {
     /// Latest retained `session.usage` snapshot for one Agent generation, or
     /// `None` when no session fact was ever committed. Only the latest
@@ -5933,45 +5936,58 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT 201",
+                "SELECT data FROM events WHERE kind = 'activity.heavy' AND agent = ?1 AND generation = ?2 ORDER BY seq DESC LIMIT ?3",
             )
             .map_err(sql_error)?;
         let rows = statement
-            .query_map(params![agent_num, generation], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                params![agent_num, generation, HEAVY_ROLLUP_EPISODES],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(sql_error)?;
-        let mut latest_category = None;
-        let mut latest_ended_at = None;
-        let mut total_cpu_ms: u64 = 0;
-        for row in rows {
-            let raw = row.map_err(sql_error)?;
-            let data: Value = serde_json::from_str(&raw)
-                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
-            if latest_category.is_none() {
-                latest_category = data
-                    .get("category")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
-            }
-            total_cpu_ms = total_cpu_ms.saturating_add(
-                data.get("cpu_ms")
-                    .and_then(Value::as_u64)
-                    .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
-            );
-        }
-        let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
-            return Err(Error::new("internal", "heavy episode data is malformed"));
-        };
-        Ok(Some(HeavySummaryView {
-            episodes: count as u64,
-            latest_category: Some(category),
-            latest_ended_at,
-            total_cpu_ms,
-        }))
+        project_heavy_rollup(count, rows.map(|row| row.map_err(sql_error)))
     }
+}
 
+fn project_heavy_rollup(
+    count: i64,
+    rows: impl IntoIterator<Item = Result<String>>,
+) -> Result<Option<HeavySummaryView>> {
+    if count <= 0 {
+        return Ok(None);
+    }
+    let mut latest_category = None;
+    let mut latest_ended_at = None;
+    let mut total_cpu_ms: u64 = 0;
+    for row in rows {
+        let raw = row?;
+        let data: Value = serde_json::from_str(&raw)
+            .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+        if latest_category.is_none() {
+            latest_category = data
+                .get("category")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+        }
+        total_cpu_ms = total_cpu_ms.saturating_add(
+            data.get("cpu_ms")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
+        );
+    }
+    let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
+        return Err(Error::new("internal", "heavy episode data is malformed"));
+    };
+    Ok(Some(HeavySummaryView {
+        episodes: count as u64,
+        latest_category: Some(category),
+        latest_ended_at,
+        total_cpu_ms,
+    }))
+}
+
+impl Store {
     /// Newest journal payload for one kind, if any. Used for diagnostic
     /// readbacks (for example the last `harness_contract_mismatch`); never
     /// for control flow.
@@ -6075,15 +6091,23 @@ impl Store {
         thresholds: &core::SessionGrowthThresholds,
     ) -> Result<Option<SessionGrowthView>> {
         let usage = self.get_session_usage(agent, generation)?;
-        let session_bytes = usage.as_ref().and_then(|usage| usage.session_file_bytes);
-        let growth =
-            core::evaluate_session_growth(harness, usage.as_ref(), session_bytes, thresholds);
-        Ok(growth.map(|warn| SessionGrowthView {
+        Ok(project_session_growth(harness, usage.as_ref(), thresholds))
+    }
+}
+
+fn project_session_growth(
+    harness: &str,
+    usage: Option<&SessionUsage>,
+    thresholds: &core::SessionGrowthThresholds,
+) -> Option<SessionGrowthView> {
+    let session_bytes = usage.and_then(|usage| usage.session_file_bytes);
+    core::evaluate_session_growth(harness, usage, session_bytes, thresholds).map(|warn| {
+        SessionGrowthView {
             warn: true,
             basis: Some(warn.basis_name().to_owned()),
             message: Some(warn.message),
-        }))
-    }
+        }
+    })
 }
 
 fn agent_config_from_row(

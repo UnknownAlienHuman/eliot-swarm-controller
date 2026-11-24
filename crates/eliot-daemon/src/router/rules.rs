@@ -540,13 +540,7 @@ impl Router {
             ));
         }
         if action.verb == "run" {
-            if !action.id.is_empty()
-                || action.target.is_some()
-                || action.expected_generation.is_some()
-                || action.expected_turn_id.is_some()
-                || action.request_id.is_some()
-                || action.probe
-            {
+            if !action.id.is_empty() || action.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     "timer Run must be targetless and unbound",
@@ -662,13 +656,7 @@ impl Router {
             ));
         }
         if request.verb == "run" {
-            if !request.id.is_empty()
-                || request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
+            if !request.id.is_empty() || request.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     "event Run must be targetless and unbound",

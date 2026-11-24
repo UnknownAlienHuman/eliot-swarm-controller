@@ -9,6 +9,9 @@
 //! the theme resource keys of the real controls; under Windows High
 //! Contrast it maps nothing, so the system colors apply.
 
+/// The state layers, for the WinUI resources and button families (Windows
+/// only, like their users).
+#[cfg(windows)]
 pub use crate::tokens::state;
 
 /// The design's elevation: level 1 (the main card, the composer, a

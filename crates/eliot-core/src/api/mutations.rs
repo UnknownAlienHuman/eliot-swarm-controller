@@ -24,6 +24,27 @@ impl CommandSubmitRequest {
         }
     }
 
+    /// Whether the request carries a target, generation, turn, request or
+    /// probe binding. The selector has its own verb-specific rules.
+    pub fn has_agent_bindings(&self) -> bool {
+        self.target.is_some()
+            || self.expected_generation.is_some()
+            || self.expected_turn_id.is_some()
+            || self.request_id.is_some()
+            || self.probe
+    }
+
+    /// Validate the absence of Agent/request bindings and probe markers while
+    /// retaining the caller's existing error text. Authority and current
+    /// generation/turn state remain transaction-time Store checks.
+    pub fn validate_no_agent_bindings(&self, message: &str) -> Result<()> {
+        if self.has_agent_bindings() {
+            Err(Error::new("invalid", message))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Only shared wire shape belongs here. In particular, optional binding
     /// values retain their existing verb/principal-specific admission errors.
     pub fn validate(&self) -> Result<()> {
@@ -47,44 +68,23 @@ impl CommandSubmitRequest {
                 "provider probes are supported only for send",
             ));
         }
-        if matches!(self.verb.as_str(), "git.fetch" | "git.integrate")
-            && (self.target.is_some()
-                || self.expected_generation.is_some()
-                || self.expected_turn_id.is_some()
-                || self.request_id.is_some()
-                || self.probe)
-        {
-            return Err(Error::new(
-                "invalid",
+        if matches!(self.verb.as_str(), "git.fetch" | "git.integrate") {
+            self.validate_no_agent_bindings(
                 "Git fetch/integrate are targetless and have no Agent bindings",
-            ));
+            )?;
         }
         if self.verb == "git.integrate" && self.selector.is_some() {
             return Err(Error::new("invalid", "git.integrate cannot use a selector"));
         }
-        if is_user_event_verb(self.verb.as_str())
-            && (self.target.is_some()
-                || self.expected_generation.is_some()
-                || self.expected_turn_id.is_some()
-                || self.request_id.is_some()
-                || self.probe)
-        {
-            return Err(Error::new(
-                "invalid",
+        if is_user_event_verb(self.verb.as_str()) {
+            self.validate_no_agent_bindings(
                 "notify/emit are targetless and have no Agent bindings",
-            ));
+            )?;
         }
-        if is_coordination_verb(self.verb.as_str())
-            && (self.target.is_some()
-                || self.expected_generation.is_some()
-                || self.expected_turn_id.is_some()
-                || self.request_id.is_some()
-                || self.probe)
-        {
-            return Err(Error::new(
-                "invalid",
+        if is_coordination_verb(self.verb.as_str()) {
+            self.validate_no_agent_bindings(
                 "mail.send/var.set are targetless and have no Agent bindings",
-            ));
+            )?;
         }
         Ok(())
     }

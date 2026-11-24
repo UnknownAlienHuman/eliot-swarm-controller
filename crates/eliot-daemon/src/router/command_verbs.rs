@@ -14,6 +14,7 @@ use eliot_core::{
     api::{FrozenGitFetch, ProjectRegistrationView},
 };
 use eliot_plugin::session::native_no_write;
+use eliot_store::{PreparedRuleCoordination, UserEventDispatch};
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::{
@@ -300,139 +301,68 @@ impl Router {
         self.signal_progress();
     }
 
-    /// Execute a dispatched local `notify`/`emit`: commit its validated DTO
-    /// as one persisted `x.user.*` event together with its Applied
-    /// settlement in a single Store transaction, publishing the committed
-    /// batch in order while still serialized with the writer. No external
-    /// send.
-    pub(super) async fn execute_user_event_command(&self, id: &str, dispatched: Command) {
-        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
-        {
-            Ok(kind_data) => kind_data,
-            Err(error) => {
-                let error = self.sanitized_failure(&error, "router.dispatch.user_event_gate");
+    /// Publish the local event only after Store commits its settlement.
+    pub(super) async fn execute_user_event_command(&self, id: &str, verb: &str) {
+        let committed = {
+            let mut store = self.inner.store.lock().await;
+            let result =
+                store.commit_user_event(id, |data| self.redact_native_value(data), now_ms());
+            if let Ok(UserEventDispatch::Applied(events)) = &result
+                && !events.is_empty()
+            {
+                self.publish_locked(events);
+            }
+            result
+        };
+        match committed {
+            Ok(UserEventDispatch::Applied(_)) => {}
+            Ok(UserEventDispatch::Rejected(error)) => {
+                let location = if verb == "attention.emit" {
+                    "router.dispatch.attention_gate"
+                } else {
+                    "router.dispatch.user_event_gate"
+                };
+                let error = self.sanitized_failure(&error, location);
                 self.settle(
                     id,
                     CommandState::Rejected,
                     Some(self.command_error_outcome(&error, "code")),
                 )
                 .await;
-                self.signal_progress();
-                return;
             }
-        };
-        // The reserved attention topic is never bound through the public
-        // `emit` verb: admission rejects it, and a retained pre-fix command
-        // that still reaches execution is rejected here. Only the internal
-        // `attention.emit` verb below may use the bound commit.
-        if kind == super::ATTENTION_USER_EVENT_KIND {
-            let error = self.sanitized_failure(
-                &Error::new(
-                    "invalid",
-                    "the reserved attention topic is never bound through emit",
+            Err(error) => {
+                self.settle(
+                    id,
+                    CommandState::Unknown,
+                    Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
                 )
-                .with_where("router.dispatch.user_event_gate")
-                .with_origin(
-                    FailureOrigin::Swarm,
-                    "user event gate: reserved attention topic through emit",
-                ),
-                "router.dispatch.user_event_gate",
-            );
-            self.settle(
-                id,
-                CommandState::Rejected,
-                Some(self.command_error_outcome(&error, "code")),
-            )
-            .await;
-            self.signal_progress();
-            return;
-        }
-        self.redact_native_value(&mut data);
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result = store.commit_user_event_applied(id, &kind, data, now_ms());
-            if let Ok(change) = &result
-                && !change.events.is_empty()
-            {
-                self.publish_locked(&change.events);
+                .await;
             }
-            result
-        };
-        if let Err(error) = committed {
-            self.settle(
-                id,
-                CommandState::Unknown,
-                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
-            )
-            .await;
         }
         self.signal_progress();
     }
 
-    /// Execute a dispatched internal `attention.emit` command: commit its
-    /// validated report as one bound `x.user.agent.attention` event with its
-    /// Applied settlement in a single Store transaction. The Store admits the
-    /// `attention.emit` verb only from the internal attention producer, and
-    /// the bound commit additionally requires that verb, so a public emit
-    /// can never acquire an authoritative subject binding.
-    pub(super) async fn execute_attention_event_command(&self, id: &str, dispatched: Command) {
-        let (kind, mut data) = match super::user_event_kind_data(&dispatched.verb, &dispatched.args)
-        {
-            Ok(kind_data) => kind_data,
+    /// Publish the committed effect and settlement before waking recipients.
+    pub(super) async fn execute_rule_coordination(&self, command: &Command) {
+        let id = &command.id;
+        let verb = &command.verb;
+        let prepared = match PreparedRuleCoordination::decode(command) {
+            Ok(prepared) => prepared,
             Err(error) => {
-                let error = self.sanitized_failure(&error, "router.dispatch.attention_gate");
                 self.settle(
                     id,
                     CommandState::Rejected,
-                    Some(self.command_error_outcome(&error, "code")),
+                    Some(json!({"code": error.code})),
                 )
                 .await;
                 self.signal_progress();
                 return;
             }
         };
-        self.redact_native_value(&mut data);
         let committed = {
             let mut store = self.inner.store.lock().await;
-            let result = store.commit_attention_event_applied(id, &kind, data, now_ms());
-            if let Ok(change) = &result
-                && !change.events.is_empty()
-            {
-                self.publish_locked(&change.events);
-            }
-            result
-        };
-        if let Err(error) = committed {
-            self.settle(
-                id,
-                CommandState::Unknown,
-                Some(json!({"code": error.code, "cause": "user_event_commit_failed"})),
-            )
-            .await;
-        }
-        self.signal_progress();
-    }
-
-    /// Execute a dispatched rule `mail.send`: commit the frozen queued-mail
-    /// effect together with its Applied settlement in a single Store
-    /// transaction, publishing the committed batch in order while still
-    /// serialized with the writer, then fan out mailbox wakes only after
-    /// commit through the existing coordination wake path.
-    pub(super) async fn execute_mail_send_command(&self, id: &str, dispatched: Command) {
-        if let Err(error) = self.validate_coordination_command(&dispatched) {
-            self.settle(
-                id,
-                CommandState::Rejected,
-                Some(json!({"code": error.code})),
-            )
-            .await;
-            self.signal_progress();
-            return;
-        }
-        let limits = self.inner.mail.limits();
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result = store.commit_mail_send_applied(id, limits, now_ms());
+            let result =
+                store.commit_rule_coordination(prepared, self.inner.mail.limits(), now_ms());
             if let Ok(change) = &result
                 && !change.events.is_empty()
             {
@@ -441,112 +371,26 @@ impl Router {
             result
         };
         match committed {
-            Ok(change) if !change.events.is_empty() => {
-                self.wake_mail_recipients(&change.value).await;
+            Ok(change) => {
+                for recipient in &change.mail_recipients {
+                    self.offer_notice(recipient).await;
+                }
             }
-            Ok(_) => {}
             Err(error) => {
+                let cause = if verb == "mail.send" {
+                    "mail_commit_failed"
+                } else {
+                    "var_commit_failed"
+                };
                 self.settle(
                     id,
                     coordination_commit_error_state(&error.code),
-                    Some(json!({"code": error.code, "cause": "mail_commit_failed"})),
+                    Some(json!({"code": error.code, "cause": cause})),
                 )
                 .await;
             }
         }
         self.signal_progress();
-    }
-
-    /// Execute a dispatched rule `var.set`: commit the frozen versioned
-    /// variable effect together with its Applied settlement in a single Store
-    /// transaction, publishing the committed batch (`var.changed` first) in
-    /// order while still serialized with the writer.
-    pub(super) async fn execute_var_set_command(&self, id: &str, dispatched: Command) {
-        if let Err(error) = self.validate_coordination_command(&dispatched) {
-            self.settle(
-                id,
-                CommandState::Rejected,
-                Some(json!({"code": error.code})),
-            )
-            .await;
-            self.signal_progress();
-            return;
-        }
-        let committed = {
-            let mut store = self.inner.store.lock().await;
-            let result = store.commit_var_set_applied(id, now_ms());
-            if let Ok(change) = &result
-                && !change.events.is_empty()
-            {
-                self.publish_locked(&change.events);
-            }
-            result
-        };
-        if let Err(error) = committed {
-            self.settle(
-                id,
-                coordination_commit_error_state(&error.code),
-                Some(json!({"code": error.code, "cause": "var_commit_failed"})),
-            )
-            .await;
-        }
-        self.signal_progress();
-    }
-
-    fn validate_coordination_command(&self, dispatched: &Command) -> Result<()> {
-        if dispatched.target.is_some() || dispatched.generation.is_some() {
-            return Err(Error::new(
-                "invalid",
-                "coordination command must be targetless",
-            ));
-        }
-        match dispatched.verb.as_str() {
-            "mail.send" => serde_json::from_value::<eliot_core::api::MailDefinitionArgs>(
-                dispatched.args.clone(),
-            )
-            .map_err(|_| Error::new("invalid", "mail.send definition is malformed"))?
-            .validate(),
-            "var.set" => serde_json::from_value::<eliot_core::api::VarDefinitionArgs>(
-                dispatched.args.clone(),
-            )
-            .map_err(|_| Error::new("invalid", "var.set definition is malformed"))?
-            .validate(),
-            _ => Err(Error::new("invalid", "not a coordination command")),
-        }
-    }
-
-    async fn wake_mail_recipients(&self, settled: &Command) {
-        let recipients: Vec<String> = settled
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.get("deliveries"))
-            .and_then(|deliveries| deliveries.as_array())
-            .map(|deliveries| {
-                deliveries
-                    .iter()
-                    .filter_map(|delivery| {
-                        delivery
-                            .get("recipient")
-                            .and_then(|recipient| recipient.as_str())
-                            .map(str::to_owned)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if recipients.is_empty() {
-            if let Ok(definition) =
-                serde_json::from_value::<eliot_core::api::MailDefinitionArgs>(settled.args.clone())
-                && definition.validate().is_ok()
-            {
-                for recipient in &definition.to {
-                    self.offer_notice(recipient).await;
-                }
-            }
-            return;
-        }
-        for recipient in &recipients {
-            self.offer_notice(recipient).await;
-        }
     }
 
     /// Attach an observer through the owned plugin and settle the validated

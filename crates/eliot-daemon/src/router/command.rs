@@ -1572,20 +1572,12 @@ impl Router {
                 .await;
             return;
         }
-        if is_user_event_verb(dispatched.verb.as_str()) {
-            self.execute_user_event_command(&id, dispatched).await;
+        if is_user_event_verb(&dispatched.verb) || dispatched.verb == "attention.emit" {
+            self.execute_user_event_command(&id, &dispatched.verb).await;
             return;
         }
-        if dispatched.verb == "attention.emit" {
-            self.execute_attention_event_command(&id, dispatched).await;
-            return;
-        }
-        if dispatched.verb == "mail.send" {
-            self.execute_mail_send_command(&id, dispatched).await;
-            return;
-        }
-        if dispatched.verb == "var.set" {
-            self.execute_var_set_command(&id, dispatched).await;
+        if is_coordination_verb(&dispatched.verb) {
+            self.execute_rule_coordination(&dispatched).await;
             return;
         }
         let target = match dispatched.target.as_deref() {

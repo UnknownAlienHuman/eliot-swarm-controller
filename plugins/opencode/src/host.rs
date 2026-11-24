@@ -17,13 +17,15 @@ use crate::{
         },
     },
 };
+use eliot_core::api::HarnessModelEntry;
 use eliot_core::local_provider::LocalProvider;
 use eliot_core::{ContextItem, Error, FailureOrigin, InjectPoint, McpPolicy, Result, SecretPolicy};
 use eliot_plugin::{
     AgentCommandParams, AgentSnapshotParams, AgentStartParams, AgentStopParams, InitializeParams,
     MAX_TEXT_BYTES, Peer, PeerClient, PluginManifest, RpcRequest,
     protocol::{
-        AgentModelsParams, ModelListParams, ModelListPart, NativeArchiveParams, stream_sources,
+        AgentModelCatalogue, AgentModelsParams, ModelListParams, ModelListPart,
+        NativeArchiveParams, stream_sources,
     },
     retry::{Retry, RetryOperation},
     session::{
@@ -2881,10 +2883,11 @@ impl OpenCodePlugin {
             .http
             .list_native_models(Instant::now() + std::time::Duration::from_secs(5))
             .await?;
-        let mut result = session_catalog_json(&catalogue);
-        result["agent_id"] = json!(session.agent_id);
-        result["generation"] = json!(session.generation);
-        Ok(result)
+        serde_json::to_value(AgentModelCatalogue {
+            binding: params,
+            models: session_catalogue_entries(&catalogue),
+        })
+        .map_err(|_| Error::new("internal", "OpenCode session catalogue encoding failed"))
     }
 
     /// Native `configure`: switch the retained session's model and/or
@@ -4368,12 +4371,10 @@ fn parse_configure_model(args: &Value) -> Result<ConfigureModelRequest> {
     Ok(ConfigureModelRequest { model, effort })
 }
 
-/// Live `GET /api/model` entries in `model.list` response shape with
-/// `session` provenance. Entries without a usable provider/model pair
-/// are skipped, never guessed; the endpoint names no default.
-fn session_catalog_json(catalogue: &[NativeModelEntry]) -> Value {
+/// Project live `GET /api/model` entries with a usable provider/model pair.
+fn session_catalogue_entries(catalogue: &[NativeModelEntry]) -> Vec<HarnessModelEntry> {
     let mut ids = HashSet::new();
-    let models: Vec<Value> = catalogue
+    catalogue
         .iter()
         .filter_map(|entry| {
             let provider = entry.provider_id.as_deref()?;
@@ -4384,21 +4385,20 @@ fn session_catalog_json(catalogue: &[NativeModelEntry]) -> Value {
             {
                 return None;
             }
-            let efforts = catalogue_entry_variants(entry);
-            let display_name = entry
-                .name
-                .as_deref()
-                .and_then(eliot_core::api::harness::native_model_display_name)
-                .map(str::to_owned);
-            Some(json!({
-                "id": id,
-                "default": false,
-                "efforts": efforts,
-                "display_name": display_name,
-            }))
+            Some(HarnessModelEntry {
+                id,
+                default: false,
+                efforts: catalogue_entry_variants(entry),
+                display_name: entry
+                    .name
+                    .as_deref()
+                    .and_then(eliot_core::api::harness::native_model_display_name)
+                    .map(str::to_owned),
+                default_effort: None,
+                source: None,
+            })
         })
-        .collect();
-    json!({"models": models, "default": Value::Null, "provenance": "session"})
+        .collect()
 }
 
 fn catalogue_entry_for<'a>(

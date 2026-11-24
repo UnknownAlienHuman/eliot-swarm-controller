@@ -278,6 +278,127 @@ pub enum ModelListPart {
     Variants,
 }
 
+/// Normalized catalogue rows from either metadata reader. Vendor formats
+/// are decoded in the adapter before this private protocol boundary.
+pub struct ModelCatalogue {
+    pub models: Vec<eliot_core::api::HarnessModelEntry>,
+    pub default: Option<String>,
+    pub provenance: &'static str,
+    pub degraded: bool,
+}
+
+impl ModelCatalogue {
+    pub fn decode(
+        mut value: Value,
+        session: Option<&AgentModelsParams>,
+    ) -> eliot_core::Result<Self> {
+        let mut degraded = false;
+        let provenance = if let Some(binding) = session {
+            if value["provenance"] != "session"
+                || value["agent_id"].as_str() != Some(binding.agent_id.as_str())
+                || value["generation"].as_i64() != Some(binding.generation)
+            {
+                return Err(Error::new(
+                    "source_integrity",
+                    "plugin session catalogue did not bind to the requested live Agent generation",
+                ));
+            }
+            "session"
+        } else {
+            match value["provenance"].as_str() {
+                Some("preview") => "preview",
+                Some("session") => {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "dedicated model reader returned session provenance",
+                    ));
+                }
+                Some("canonical") => "canonical",
+                _ => {
+                    degraded = value.get("provenance").is_some();
+                    "canonical"
+                }
+            }
+        };
+        let default = match value.get_mut("default").map(Value::take) {
+            Some(Value::String(text)) if session.is_none() => {
+                Some(text).filter(|text| !text.trim().is_empty())
+            }
+            None | Some(Value::Null) => None,
+            Some(_) => {
+                degraded = true;
+                None
+            }
+        };
+        let Some(Value::Array(rows)) = value.get_mut("models").map(Value::take) else {
+            return Err(Error::new(
+                "source_integrity",
+                "plugin catalogue is malformed",
+            ));
+        };
+        let max = eliot_core::api::harness::MAX_HARNESS_MODELS;
+        if rows.len() > max {
+            return Err(Error::new(
+                "source_integrity",
+                format!("plugin catalogue exceeds {max} entries"),
+            ));
+        }
+        let row_count = rows.len();
+        let models: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| catalogue_row(row, &mut degraded))
+            .collect();
+        Ok(Self {
+            degraded: degraded || models.len() != row_count,
+            models,
+            default,
+            provenance,
+        })
+    }
+}
+
+fn catalogue_row(
+    mut value: Value,
+    degraded: &mut bool,
+) -> Option<eliot_core::api::HarnessModelEntry> {
+    use eliot_core::api::harness::{MAX_HARNESS_MODEL_ID_BYTES, native_model_display_name};
+
+    let row = value.as_object_mut()?;
+    let id = row.get("id")?.as_str()?;
+    if id.trim().is_empty()
+        || id.len() > MAX_HARNESS_MODEL_ID_BYTES
+        || id.chars().any(char::is_control)
+    {
+        return None;
+    }
+    row.remove("source");
+    let fields = row.len();
+    row.retain(|key, field| match key.as_str() {
+        "default" => field.is_boolean(),
+        "display_name" => {
+            field.is_null() || field.as_str().and_then(native_model_display_name).is_some()
+        }
+        "default_effort" => field.is_null() || field.is_string(),
+        "efforts" => {
+            field.is_null()
+                || field
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(Value::is_string))
+        }
+        _ => true,
+    });
+    *degraded |= row.len() != fields;
+    serde_json::from_value(value).ok()
+}
+
+#[derive(Serialize)]
+#[serde(tag = "provenance", rename = "session")]
+pub struct AgentModelCatalogue {
+    #[serde(flatten)]
+    pub binding: AgentModelsParams,
+    pub models: Vec<eliot_core::api::HarnessModelEntry>,
+}
+
 /// One launch's verified native-store selection and optional plugin-owned
 /// startup metadata from the same read. The daemon freezes both at dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize)]

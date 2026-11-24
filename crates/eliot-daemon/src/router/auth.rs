@@ -295,12 +295,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                     format!("project rule is not approved for {}", request.verb),
                 ));
             }
-            if request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
+            if request.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     format!("{} command must be targetless and unbound", request.verb),
@@ -315,12 +310,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                     "project rule is not approved for run",
                 ));
             }
-            if request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
+            if request.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     "Run command must be targetless and unbound",
@@ -339,12 +329,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                     "project rule is not approved for this action",
                 ));
             }
-            if request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
+            if request.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     "notify/emit command must be targetless and unbound",
@@ -361,12 +346,7 @@ pub(super) fn authorize_command(principal: &Principal, request: &mut SubmitComma
                     "project rule is not approved for this action",
                 ));
             }
-            if request.target.is_some()
-                || request.expected_generation.is_some()
-                || request.expected_turn_id.is_some()
-                || request.request_id.is_some()
-                || request.probe
-            {
+            if request.has_agent_bindings() {
                 return Err(Error::new(
                     "invalid",
                     "mail.send/var.set command must be targetless and unbound",
