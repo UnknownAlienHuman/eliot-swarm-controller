@@ -16,8 +16,8 @@ use super::{
     Change, DaemonEventInput, Error, MAX_EVENT_BYTES, Result, Store, canonical, command_binding,
     commit_transaction, decode_json, digest_id_bound, encode_json, enforce_page_bytes,
     has_pending_send_input, has_unknown_gate, history_expired, insert_daemon_event_for_command,
-    insert_daemon_event_input, load_agent_by_num, load_command_record, provider_holds, sql_error,
-    validate_id_age, validate_limit, validate_ulid, write_binding,
+    insert_daemon_event_input, insert_write_tx, load_agent_by_num, load_command_record,
+    provider_holds, sql_error, validate_id_age, validate_limit, validate_ulid, write_binding,
 };
 use crate::LEGACY_ATTENTION_ADVISORY_MAIL_PREDICATE;
 use eliot_core::{
@@ -2387,10 +2387,5 @@ pub(super) fn retain_write_tx_allow_digest(
             "coordination write result exceeds 64 KiB",
         ));
     }
-    db!(tx.execute(
-        "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, principal, method, payload_digest, result_json, now],
-    ));
-    Ok(())
+    insert_write_tx(tx, id, principal, method, payload_digest, &result_json, now).map_err(sql_error)
 }

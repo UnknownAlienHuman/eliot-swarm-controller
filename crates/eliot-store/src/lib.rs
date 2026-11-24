@@ -1144,11 +1144,8 @@ impl Store {
             });
         }
         validate_id_age(id, now)?;
-        db!(tx.execute(
-            "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, principal, method, digest, result_json, now],
-        ));
+        insert_write_tx(&tx, id, principal, method, &digest, &result_json, now)
+            .map_err(sql_error)?;
         let committed = if seal {
             tx.pragma_update(None, "query_only", true)
                 .map_err(sql_error)
@@ -4804,6 +4801,23 @@ fn has_open_request_reply(
 }
 
 type StoredWriteBinding = (String, String, Vec<u8>, String);
+
+fn insert_write_tx(
+    tx: &Transaction<'_>,
+    id: &str,
+    principal: &str,
+    method: &str,
+    digest: &[u8],
+    result_json: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, principal, method, digest, result_json, now],
+    )?;
+    Ok(())
+}
 
 fn write_binding(connection: &Connection, id: &str) -> Result<Option<StoredWriteBinding>> {
     connection

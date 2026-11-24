@@ -212,12 +212,7 @@ fn retain_goal_result<T: Serialize>(
             format!("{method} result exceeds the frame bound"),
         ));
     }
-    db!(tx.execute(
-        "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id, principal, method, payload_digest, result_json, now],
-    ));
-    Ok(())
+    insert_write_tx(tx, id, principal, method, payload_digest, &result_json, now).map_err(sql_error)
 }
 
 #[derive(Clone, Debug)]

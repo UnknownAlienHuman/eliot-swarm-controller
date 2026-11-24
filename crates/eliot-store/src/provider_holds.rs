@@ -2,8 +2,8 @@
 
 use super::{
     Change, Error, ProviderProbeCandidate, Result, Store, canonical, command_binding,
-    commit_transaction, decode_json, encode_json, load_agent_by_num, require_nonempty, sql_error,
-    validate_id_age, write_binding,
+    commit_transaction, decode_json, encode_json, insert_write_tx, load_agent_by_num,
+    require_nonempty, sql_error, validate_id_age, write_binding,
 };
 mod admin;
 use admin::{clear_hold_tx, get, get_many, list_page};
@@ -906,17 +906,14 @@ impl Store {
             Vec::new()
         };
         let result_json = encode_json(&value)?;
-        tx.execute(
-            "INSERT INTO writes(id, principal, method, payload_digest, result, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                request.id,
-                principal,
-                CLEAR_HOLD_METHOD,
-                payload_digest,
-                result_json,
-                now,
-            ],
+        insert_write_tx(
+            &tx,
+            &request.id,
+            principal,
+            CLEAR_HOLD_METHOD,
+            &payload_digest,
+            &result_json,
+            now,
         )
         .map_err(sql_error)?;
         commit_transaction(tx, &self.write_faulted)?;
