@@ -551,13 +551,15 @@ impl DesktopApp {
                     .margin(Thickness::uniform(tokens::spacing::XL))
                     .spacing(tokens::spacing::MD)
                     .children((
-                        m3::carrier(
-                            palette,
-                            |s| s.primary,
-                            "Eliot Swarm",
-                            tokens::layout::MARK_LARGE,
-                            m3::shape(crate::brand::SHAPE_CLOVER, tokens::layout::MARK_LARGE),
-                        ),
+                        Border::new()
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .content(m3::carrier(
+                                palette,
+                                |s| s.primary,
+                                "Eliot Swarm",
+                                tokens::layout::MARK_LARGE,
+                                m3::shape(crate::brand::SHAPE_CLOVER, tokens::layout::MARK_LARGE),
+                            )),
                         m3::text(title, tokens::text::PAGE)
                             .automation_heading_level(AutomationHeadingLevel::Level1)
                             .horizontal_alignment(HorizontalAlignment::Center)
