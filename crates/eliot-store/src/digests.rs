@@ -17,6 +17,37 @@ use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+// `a` is the recipient’s exact closed generation. Match both the retained
+// restart loss and the unread, delivered result it registered while live.
+pub(super) const CLOSED_COMPLETION_PARENT: &str = r#"
+    a.state IN ('lost', 'stopped') AND a.archived = 0 AND a.observe_only = 0
+    AND a.capacity_generation IS NULL
+    AND EXISTS (
+        SELECT 1 FROM events restart
+        WHERE restart.agent = a.id AND restart.generation = a.generation
+          AND ((restart.kind = 'agent.lost'
+                AND json_extract(restart.data, '$.reason') = 'daemon_restart'
+                AND json_extract(restart.data, '$.previous_state') = 'idle')
+               OR (restart.kind = 'agent.stopped'
+                   AND json_extract(restart.data, '$.reason') = 'owned_exit_before_restart'))
+          AND NOT EXISTS (
+              SELECT 1 FROM commands c
+              WHERE c.target = a.id AND c.generation = a.generation
+                AND (c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+                     OR (c.verb = 'stop' AND c.principal = 'owner' AND c.state = 'applied')
+                     OR (c.verb = 'resume' AND c.created_at >= restart.ts
+                         AND c.state IN ('rejected', 'failed')))
+          )
+    )
+    AND EXISTS (
+        SELECT 1 FROM messages m
+        JOIN completion_digests d ON d.delivered_mail_id = m.delivery_id
+        WHERE m.recipient = a.id AND m.recipient_generation = a.generation
+          AND m.read_at IS NULL AND m.wake = 1 AND m.sender = 'swarm'
+          AND d.parent = a.id AND d.requester = 'agent:a' || a.id || ':' || a.generation
+    )
+"#;
+
 /// One stored digest registration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DigestRow {
@@ -168,6 +199,62 @@ fn parse_row(stored: StoredDigestRow) -> Result<DigestRow> {
 }
 
 impl Store {
+    /// Recheck an exact completion recipient under the daemon Store writer.
+    pub fn closed_completion_parent_eligible(&self, agent: &str, generation: i64) -> Result<bool> {
+        let agent = parse_agent_id(agent)?;
+        let candidate: bool = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM agents a WHERE a.id = ?1
+                     AND a.generation = ?2 AND ({CLOSED_COMPLETION_PARENT}))"
+                ),
+                params![agent, generation],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        Ok(candidate
+            && super::capacity::has_owned_exit_and_reader_drain_tx(
+                &self.connection,
+                agent,
+                generation,
+            )?)
+    }
+
+    /// Linked input for the exact automatic continuation of a restart-lost turn.
+    pub fn completion_restart_input(
+        &self,
+        agent: &str,
+        generation: i64,
+        turn_id: &str,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT input.id
+                 FROM commands resume
+                 JOIN restart_resume_intents intent ON intent.command_id = resume.id
+                 JOIN commands input ON input.parent_command = resume.id
+                     AND input.id = resume.id || '/send' AND input.link_kind = 'send'
+                     AND input.ordinal = 0 AND input.verb = 'send'
+                     AND input.target = resume.target AND input.generation = ?2 + 1
+                 WHERE resume.target = ?1 AND resume.expected_generation = ?2
+                   AND resume.verb = 'resume'
+                   AND resume.state IN ('accepted', 'queued', 'dispatched', 'applied')
+                   AND EXISTS (
+                       SELECT 1 FROM events lost
+                       WHERE lost.agent = ?1 AND lost.generation = ?2
+                         AND lost.kind = 'agent.lost'
+                         AND json_extract(lost.data, '$.reason') = 'daemon_restart'
+                         AND json_extract(lost.data, '$.turn_id') = ?3
+                   )
+                 ORDER BY resume.created_at DESC, resume.rowid DESC LIMIT 1",
+                params![parse_agent_id(agent)?, generation, turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_error)
+    }
+
     /// Register a digest. Same id plus same payload replays the retained row;
     /// same id plus a different payload (or principal) rejects `id_conflict`.
     /// The registration id doubles as the later digest mail id, so it must
