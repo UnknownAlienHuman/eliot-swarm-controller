@@ -3865,14 +3865,13 @@ fn build_target_environment(
         .into_string()
         .map_err(|_| Error::new("invalid", "managed target PATH is not valid Unicode"))?;
     insert_environment(&mut environment, "PATH", path_value);
-    let environment = Value::Object(environment);
     crate::config::verify_stand_codex_route(
         stand_codex_home,
         &agent.harness,
         &agent.profile_snapshot,
-        &environment,
+        Some(&environment),
     )?;
-    Ok((environment, Value::Object(mcp_environment)))
+    Ok((Value::Object(environment), Value::Object(mcp_environment)))
 }
 
 fn insert_environment(environment: &mut Map<String, Value>, name: &str, value: String) {

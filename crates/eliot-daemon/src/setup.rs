@@ -175,6 +175,7 @@ pub(crate) fn build_environment(
     profile: &Value,
     agent: &str,
     target_generation: i64,
+    stand_codex_home: Option<&Path>,
 ) -> Result<Vec<(OsString, OsString)>> {
     if eliot_core::parse_agent_id(agent).is_err() || target_generation <= 0 {
         return Err(invalid(
@@ -182,6 +183,12 @@ pub(crate) fn build_environment(
         ));
     }
     let mut environment = crate::router::build_process_environment(profile)?;
+    crate::config::verify_stand_codex_route(
+        stand_codex_home,
+        profile["harness"].as_str().unwrap_or_default(),
+        profile,
+        Some(&environment),
+    )?;
     environment.insert("ELIOT_AGENT_ID".to_owned(), Value::String(agent.to_owned()));
     environment.insert(
         "ELIOT_AGENT_GENERATION".to_owned(),

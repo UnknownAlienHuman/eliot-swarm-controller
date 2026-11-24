@@ -83,7 +83,7 @@ impl PluginHost {
             self.state.stand_codex_home.as_deref(),
             harness,
             profile,
-            environment,
+            environment.as_object(),
         ) {
             return ReaderOpen {
                 result: Err(error),

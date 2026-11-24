@@ -257,7 +257,7 @@ pub(crate) fn verify_stand_codex_route(
     stand_home: Option<&Path>,
     harness: &str,
     profile: &Value,
-    environment: &Value,
+    environment: Option<&JsonMap<String, Value>>,
 ) -> core::Result<()> {
     if !core::api::HarnessCapabilities::of(harness).requires_frozen_store_inputs {
         return Ok(());
@@ -289,9 +289,11 @@ pub(crate) fn verify_stand_codex_route(
         })
     };
     if profile["stand_native_store"] == true
-        && CODEX_STORE_SELECTORS
-            .iter()
-            .all(|&name| matches_home(&environment[name]))
+        && CODEX_STORE_SELECTORS.iter().all(|&name| {
+            environment
+                .and_then(|env| env.get(name))
+                .is_some_and(&matches_home)
+        })
         && profile
             .get("native_store_binding")
             .is_none_or(|binding| matches_home(&binding["home"]) && matches_home(&binding["root"]))

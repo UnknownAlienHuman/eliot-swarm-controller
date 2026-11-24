@@ -700,7 +700,11 @@ impl Router {
             }
         }
         if is_start_verb(command.verb.as_str())
-            && let Err(error) = self.inner.workspaces.prepare(id).await
+            && let Err(error) = self
+                .inner
+                .workspaces
+                .prepare(id, self.inner.stand_codex_home.as_deref())
+                .await
         {
             self.settle_workspace_prepare_error(command, &error).await;
             return false;
