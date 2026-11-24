@@ -759,13 +759,12 @@ re-arbitrate on committed `capacity.released` (not on `stop` acceptance), and a
 project in the same pass claim a slot on the blocked shared scope ahead of the waiting
 project. An already-dispatched or unknown command retains its reservation until verified closure.
 
-A completed Codex turn can carry the typed `provider_response_withheld` fact. The
-plugin sets it on a failed terminal from live, rollout and history readback; the
-exact withheld sentence is the only evidence Codex exposes. Store records
-`provider.response_withheld` once for the exact pending send-bound turn, whether
-the terminal arrives on the stream, observe or transcript source, and binds it to
-the turn's persisted command when the terminal names none. Observer-only Agents
-and observed-path batches never emit it.
+A completed Codex turn can carry the typed `provider_response_withheld` fact. Store
+records `provider.response_withheld` once for the exact pending send-bound turn from
+live delivery, backfill or daemon recovery readback. Backfill can use the turn's
+persisted command binding when the terminal names none. Observer-only Agents and
+turns without an exact local send cannot trigger handoff. The event records the
+terminal source and labels exact-message detection as `text_fallback`.
 The daemon's [automatic handoff policy](configuration.md#automatic-handoff-918)
 uses it to continue the work with its retained task inputs and sources on another
 eligible preset. The original command and terminal outcome remain in history.

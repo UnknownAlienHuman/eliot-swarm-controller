@@ -2821,7 +2821,7 @@ impl CodexPlugin {
         // daemon may use the marker as evidence provenance; it is never a
         // settlement signal and carries no retained plugin projection.
         let turn_evidence = last_turn.as_ref().map(|turn| {
-            if turn.terminal {
+            if turn.terminal && turn.provider_response_withheld_evidence.is_none() {
                 "thread/read+thread/turns/list+thread/items/list"
             } else {
                 "thread/read+thread/turns/list"
@@ -3113,7 +3113,16 @@ async fn read_owned_turn(
     if !terminal && status != "inProgress" {
         return Ok(None);
     }
-    let final_text = if terminal {
+    let withheld_evidence = if status == "failed" {
+        turn.get("error")
+            .and_then(|error| {
+                serde_json::from_value::<super::native::types::NativeTurnError>(error.clone()).ok()
+            })
+            .and_then(|error| error.response_withheld_evidence())
+    } else {
+        None
+    };
+    let final_text = if terminal && withheld_evidence.is_none() {
         read_final_text(client, thread_id, turn_id, secrets).await?
     } else {
         None
@@ -3124,6 +3133,7 @@ async fn read_owned_turn(
         status: Some(status.to_owned()),
         final_text,
         terminal,
+        provider_response_withheld_evidence: withheld_evidence,
     }))
 }
 

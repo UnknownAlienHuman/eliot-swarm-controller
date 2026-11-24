@@ -514,19 +514,19 @@ pub struct NativeTurnError {
 /// a response for a session without an authorized hardware key. No structured
 /// `codexErrorInfo` variant is known for this hold, so this sentence is the
 /// fallback evidence on every terminal path (live, readback and history).
-pub(crate) const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
+const PROVIDER_RESPONSE_WITHHELD_MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
 
 /// Outer whitespace is benign; nested metadata and other output are not part
 /// of this signal.
-pub(crate) fn is_provider_response_withheld_message(message: &str) -> bool {
-    message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE
+pub(crate) fn response_withheld_evidence_from_message(message: &str) -> Option<&'static str> {
+    (message.trim() == PROVIDER_RESPONSE_WITHHELD_MESSAGE).then_some("text_fallback")
 }
 
 impl NativeTurnError {
     /// Match only the required `TurnError.message` value from Codex's native
     /// terminal envelope.
-    pub(crate) fn is_provider_response_withheld(&self) -> bool {
-        is_provider_response_withheld_message(&self.message)
+    pub(crate) fn response_withheld_evidence(&self) -> Option<&'static str> {
+        response_withheld_evidence_from_message(&self.message)
     }
 
     /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded

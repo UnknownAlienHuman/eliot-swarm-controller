@@ -74,15 +74,7 @@ struct HistoryTurn {
     #[serde(default)]
     items_view: Option<String>,
     #[serde(default)]
-    error: Option<HistoryTurnError>,
-}
-
-/// Only the required `TurnError.message` is read; the rest of the native error
-/// stays outside this readback projection.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoryTurnError {
-    message: String,
+    error: Option<crate::native::types::NativeTurnError>,
 }
 
 struct SubjectRead {
@@ -912,17 +904,21 @@ impl ObserverSession {
                 return Err(integrity());
             }
             reject_immutable_secret(&turn.id, &self.metadata_secrets)?;
-            let value = json!({
+            let mut value = json!({
                 "turn_id": turn.id,
                 "status": if turn.status == "inProgress" {"in_progress"} else {&turn.status},
                 "started_at": turn.started_at.map(milliseconds).transpose()?,
                 "completed_at": turn.completed_at.map(milliseconds).transpose()?,
                 "duration_ms": turn.duration_ms,
-                "provider_response_withheld": turn.status == "failed"
-                    && turn.error.as_ref().is_some_and(|error| {
-                        crate::native::types::is_provider_response_withheld_message(&error.message)
-                    }),
             });
+            if turn.status == "failed"
+                && let Some(evidence) = turn
+                    .error
+                    .and_then(|error| error.response_withheld_evidence())
+            {
+                value["provider_response_withheld"] = json!(true);
+                value["provider_response_withheld_evidence"] = json!(evidence);
+            }
             entries.push(value);
         }
         Ok((entries, response.next_cursor))

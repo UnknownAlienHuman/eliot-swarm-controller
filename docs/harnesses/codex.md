@@ -541,18 +541,19 @@ arguments/digests or replay input. See
 ### Terminal provider response-withheld signal
 
 Codex 0.167.1's native `TurnError` requires `message` and may include
-`additionalDetails`, `codexErrorInfo` and `misalignment` metadata. A response is
-classified as withheld only when the exactly bound `turn/completed` has status
-`failed` and its `turn.error.message`, after trimming outer whitespace, exactly
-matches:
+`additionalDetails`, `codexErrorInfo` and `misalignment` metadata. Its generated
+schema has no dedicated provider-withholding code. The adapter falls back to the
+failed turn's exact error message after trimming outer whitespace. It applies the
+same classification to stream terminals, native turn readback and rollout history.
+The fallback matches this message.
 
 > You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.
 
-The matcher reads the required message of the terminal error. A match adds typed
-`provider_response_withheld: true` and provider `origin_evidence` before optional
-usage, native error and final text fields. It takes precedence over structured
-restriction and before-work classification for that event. The native error message
-uses the shared secret-redaction and bounded `native_error` projection.
+A match sets `provider_response_withheld: true` and records
+`provider_response_withheld_evidence: "text_fallback"`. The stream also records
+provider origin before optional usage, native error and final text fields. The
+withheld classification takes precedence over ordinary provider holds on that
+terminal. Native error text uses the shared redaction and bounded projection.
 
 ## Usage attribution
 

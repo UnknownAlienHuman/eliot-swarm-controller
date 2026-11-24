@@ -676,8 +676,12 @@ fn normalize_live_event(
             data["error"] = json!({"message": message});
             // Rollout errors carry only the message, so the exact sentence is
             // the sole (fallback) evidence for a provider hold on this path.
-            if !aborted && super::native::types::is_provider_response_withheld_message(message) {
+            if !aborted
+                && let Some(evidence) =
+                    super::native::types::response_withheld_evidence_from_message(message)
+            {
                 data["provider_response_withheld"] = Value::Bool(true);
+                data["provider_response_withheld_evidence"] = json!(evidence);
             }
             true
         }
@@ -1392,20 +1396,24 @@ fn project_line(
                 return Err(integrity());
             }
             if view == "turns" {
-                let withheld = line
+                let withheld_evidence = line
                     .payload
                     .pointer("/error/message")
                     .and_then(Value::as_str)
-                    .is_some_and(super::native::types::is_provider_response_withheld_message);
-                entries.push(json!({
+                    .and_then(super::native::types::response_withheld_evidence_from_message);
+                let mut entry = json!({
                     "turn_id": turn_id,
                     "status": if line.payload.get("error").is_some_and(|error| !error.is_null()) {"failed"} else {"completed"},
                     "started_at": started_at.map(super::milliseconds).transpose()?,
                     "completed_at": completed_at.map(super::milliseconds).transpose()?,
                     "duration_ms": duration_ms,
                     "ordinal": line.ordinal,
-                    "provider_response_withheld": withheld,
-                }));
+                });
+                if let Some(evidence) = withheld_evidence {
+                    entry["provider_response_withheld"] = Value::Bool(true);
+                    entry["provider_response_withheld_evidence"] = json!(evidence);
+                }
+                entries.push(entry);
             }
             if active.is_some() {
                 state.active_turn = None;

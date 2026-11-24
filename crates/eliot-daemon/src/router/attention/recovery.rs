@@ -236,6 +236,12 @@ fn readback(
         "final_text": turn["final_text"].as_str(),
         "turn_evidence": evidence,
     });
+    if outcome == TurnOutcome::Failure
+        && turn["provider_response_withheld_evidence"].as_str() == Some("text_fallback")
+    {
+        data["provider_response_withheld"] = json!(true);
+        data["provider_response_withheld_evidence"] = json!("text_fallback");
+    }
     // The adapter knows why no reply text is presented (it exceeded the event
     // bound, or a normal completion supplied none): the recovered terminal
     // keeps that reason, as the adapter's own write does.

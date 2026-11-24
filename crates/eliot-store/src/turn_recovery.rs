@@ -147,6 +147,11 @@ impl Store {
             &native,
             &next,
         )?;
+        if let Some(event) = super::source_batches::provider_response_withheld_event_tx(
+            &tx, &next, &native, "readback", now,
+        )? {
+            events.push(event);
+        }
         for command in commands {
             events.push(insert_daemon_command_event(
                 &tx,
