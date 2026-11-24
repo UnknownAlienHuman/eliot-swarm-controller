@@ -1018,6 +1018,11 @@ pub fn manage_groups(
                 }
             };
             let group = &mut groups[index];
+            // The catalogue can list one model twice (observed live); its
+            // switch is one setting, so it is listed once.
+            if group.all.contains(&model.id) {
+                continue;
+            }
             let visible = prefs.model_visible(code, &model.provider, &model.id);
             group.all.push(model.id.clone());
             group.shown += usize::from(visible);
