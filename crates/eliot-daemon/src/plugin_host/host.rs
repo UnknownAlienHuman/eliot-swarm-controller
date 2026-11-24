@@ -22,7 +22,9 @@ use eliot_core::{
     api::{ArtifactKind, ArtifactView},
 };
 use eliot_plugin::{
-    AgentCommandParams, PluginManifest, StderrCapture, StderrView, spawn_plugin_stderr,
+    AgentCommandParams, PluginManifest, StderrCapture, StderrView,
+    protocol::{AgentModelsParams, ModelCatalogue},
+    spawn_plugin_stderr,
     sync::LockExt,
 };
 use eliot_store::{AgentLossEvidence, OwnedExitProof};
@@ -1559,7 +1561,11 @@ impl PluginHost {
             })
     }
 
-    pub(crate) async fn agent_models(&self, agent_id: &str, generation: i64) -> Result<Value> {
+    pub(crate) async fn agent_models(
+        &self,
+        agent_id: &str,
+        generation: i64,
+    ) -> Result<ModelCatalogue> {
         let key = AgentKey {
             id: agent_id.to_owned(),
             generation,
@@ -1580,11 +1586,12 @@ impl PluginHost {
             }
             (entry.client.clone(), Arc::clone(&entry.source_credentials))
         };
-        let params = serde_json::to_value(eliot_plugin::protocol::AgentModelsParams {
+        let binding = AgentModelsParams {
             agent_id: key.id.clone(),
             generation,
-        })
-        .map_err(|_| Error::new("internal", "agent.models params encoding failed"))?;
+        };
+        let params = serde_json::to_value(&binding)
+            .map_err(|_| Error::new("internal", "agent.models params encoding failed"))?;
         let result = client
             .call(
                 "agent.models",
@@ -1605,7 +1612,7 @@ impl PluginHost {
                 "agent.models returned reserved credentials",
             ));
         }
-        validate_models_catalog_result(result, &key)
+        ModelCatalogue::decode(result, Some(&binding))
     }
 
     pub(crate) fn check_steer_target(&self, agent: &Agent) -> Result<()> {
@@ -3342,50 +3349,6 @@ fn complete_plugin_command(
             let _ = reply.send(result);
         }
     }
-}
-
-/// A read-only live session catalogue: the `model.list` response shape
-/// with `session` provenance. No state is claimed; the shape alone proves
-/// the read.
-fn validate_models_catalog_result(value: Value, key: &AgentKey) -> Result<Value> {
-    if value.get("provenance").and_then(Value::as_str) != Some("session")
-        || value.get("agent_id").and_then(Value::as_str) != Some(key.id.as_str())
-        || value.get("generation").and_then(Value::as_i64) != Some(key.generation)
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "plugin session catalogue did not bind to the requested live Agent generation",
-        ));
-    }
-    let models = value
-        .get("models")
-        .and_then(Value::as_array)
-        .ok_or_else(|| Error::new("source_integrity", "plugin session catalogue is malformed"))?;
-    if models.len() > 1024 {
-        return Err(Error::new(
-            "source_integrity",
-            "plugin session catalogue exceeds 1024 entries",
-        ));
-    }
-    for model in models {
-        let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
-        if id.trim().is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
-            return Err(Error::new(
-                "source_integrity",
-                "plugin session catalogue entry is malformed",
-            ));
-        }
-    }
-    if value
-        .get("default")
-        .is_some_and(|default| !default.is_null())
-    {
-        return Err(Error::new(
-            "source_integrity",
-            "plugin session catalogue names an unexpected default",
-        ));
-    }
-    Ok(value)
 }
 
 fn validate_send_result(value: Value) -> Result<Value> {

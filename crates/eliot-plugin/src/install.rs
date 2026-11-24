@@ -190,7 +190,8 @@ pub enum InstallStrategy {
 #[derive(Clone, Copy)]
 pub struct InstallProbe {
     pub args: &'static [&'static str],
-    pub executable_marker: &'static str,
+    /// Adapter-owned, non-executing identity check before invoking the probe.
+    pub verify_executable: fn(&Path, std::time::Instant) -> bool,
     pub refusal: &'static str,
 }
 

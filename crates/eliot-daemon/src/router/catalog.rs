@@ -17,6 +17,7 @@ use eliot_core::api::{
     SUPPORTED_HARNESSES,
 };
 use eliot_core::{Error, Result};
+use eliot_plugin::protocol::ModelCatalogue;
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -367,7 +368,7 @@ impl Router {
                 .plugin_host
                 .agent_models(agent, *generation)
                 .await?;
-            catalog::native_models_response(&harness, "", scope, credential, "session", &raw)?
+            catalog::native_models_response(&harness, "", scope, credential, raw)?
         } else {
             self.models_for_snapshot(
                 &harness,
@@ -456,28 +457,31 @@ impl Router {
             if route.identity.is_none() {
                 return Err(unverified());
             }
-            let workspace_key = if let Some(path) = workspace.clone() {
+            let workspace = if let Some(path) = workspace {
                 Some(
                     crate::adhoc::blocking_discovery(deadline, move || {
-                        let path = std::path::Path::new(&path);
-                        if !path.is_absolute() || !path.is_dir() {
+                        let input = std::path::Path::new(&path);
+                        if !input.is_absolute() || !input.is_dir() {
                             return Err(Error::new(
                                 "invalid",
                                 "model preview workspace must be an existing absolute directory",
                             ));
                         }
-                        path.canonicalize().map_err(|_| {
+                        let root = input.canonicalize().map_err(|_| {
                             Error::new(
                                 "unavailable",
                                 "model preview workspace could not be verified",
                             )
-                        })
+                        })?;
+                        let native_path = root.to_str().map(str::to_owned).unwrap_or(path);
+                        Ok((root, native_path))
                     })
                     .await??,
                 )
             } else {
                 None
             };
+            let (workspace_key, workspace) = workspace.unzip();
             let cmd = profile["cmd"].as_str().unwrap_or(harness);
             let verify = |cmd: String, version: Option<String>| {
                 let unversioned = || {
@@ -542,14 +546,8 @@ impl Router {
                 let raw = host
                     .models(profile, route.environment, workspace, read_deadline.into())
                     .await?;
-                let provenance = if raw["provenance"] == "preview" {
-                    "preview"
-                } else {
-                    "canonical"
-                };
-                let mut response = catalog::native_models_response(
-                    &harness, &cmd, scope, credential, provenance, &raw,
-                )?;
+                let mut response =
+                    catalog::native_models_response(&harness, &cmd, scope, credential, raw)?;
                 if source == "workspace" {
                     response.ttl_ms = WORKSPACE_MODEL_TTL_MS;
                 } else if !login_tracked {
@@ -2185,45 +2183,9 @@ fn native_models_response(
     cmd: &str,
     scope: String,
     credential: String,
-    provenance: &str,
-    raw: &Value,
+    raw: ModelCatalogue,
 ) -> Result<HarnessModelsResponse> {
-    let models = raw
-        .get("models")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let mut entries = Vec::new();
-    for model in models {
-        let id = model
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if id.trim().is_empty() {
-            continue;
-        }
-        entries.push(eliot_core::api::HarnessModelEntry {
-            id,
-            display_name: model
-                .get("display_name")
-                .and_then(Value::as_str)
-                .and_then(eliot_core::api::harness::native_model_display_name)
-                .map(str::to_owned),
-            default: model
-                .get("default")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            efforts: model
-                .get("efforts")
-                .and_then(|efforts| serde_json::from_value(efforts.clone()).ok()),
-            default_effort: model
-                .get("default_effort")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            // Live native reads carry no provenance marker.
-            source: None,
-        });
-    }
+    let entries = raw.models;
     if let Some(documented) = HarnessCapabilities::of(harness).documented_models
         && entries.is_empty()
     {
@@ -2232,17 +2194,17 @@ fn native_models_response(
             documented.empty_native_inventory,
         ));
     }
-    let default = raw
-        .get("default")
-        .and_then(Value::as_str)
-        .filter(|default| !default.trim().is_empty())
-        .map(str::to_owned);
+    let default = raw.default;
     // Adapters own vendor-specific view notes; the daemon supplies only the
     // shared default presentation when an adapter declares no callback.
-    let (catalogue, note) = HarnessCapabilities::of(harness)
+    let (catalogue, mut note) = HarnessCapabilities::of(harness)
         .model_catalogue_presentation
-        .map(|present| present(cmd, provenance, entries.is_empty(), default.as_deref()))
+        .map(|present| present(cmd, raw.provenance, entries.is_empty(), default.as_deref()))
         .unwrap_or(("native", None));
+    if raw.degraded {
+        let warning = "Partial catalogue: some native metadata was ignored.";
+        note = Some(note.map_or_else(|| warning.to_owned(), |note| format!("{note} {warning}")));
+    }
     Ok(HarnessModelsResponse {
         harness: harness.to_owned(),
         catalogue: catalogue.to_owned(),
