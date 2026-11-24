@@ -5,6 +5,7 @@ use super::{
     load_agent_by_num, load_turn, parse_agent_id, process_record_from_row, sql_error,
     validate_limit, wakes::unique_wake_command_id,
 };
+use eliot_core::limits::MAX_TOOL_COMMAND_BYTES;
 use eliot_core::{
     BACKGROUND_SERVER_TOPIC, BACKGROUND_WAKE_PRINCIPAL, InjectPoint,
     NATIVE_WAKE_SCOPE_PROCESS_TREE, ProcessIdentity, ProcessRecord, ProcessState, SubmitCommand,
@@ -69,6 +70,8 @@ pub struct BackgroundWakeRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackgroundWakeToolWindow {
     pub item_id: String,
+    /// The bounded command reported at tool start, when available in full.
+    pub command: Option<String>,
     pub started_at: i64,
     pub completed_at: Option<i64>,
     /// Both recorded edges are the harness's own clock, not commit times.
@@ -104,6 +107,7 @@ const BACKGROUND_IF_OPEN: i64 = 2;
 /// One bounded `tool.started` or `tool.completed` row of a completing turn.
 struct ToolEdge {
     item_id: String,
+    command: Option<String>,
     at: i64,
     native_clock: bool,
     background: i64,
@@ -180,7 +184,11 @@ impl Store {
                              WHEN json_extract(data, '$.native_auto_background') IS 1 THEN {BACKGROUND_IF_OPEN}
                              ELSE {BACKGROUND_NONE} END,
                         json_extract(data, '$.native_wake_scope')
-                            IS '{NATIVE_WAKE_SCOPE_PROCESS_TREE}'
+                            IS '{NATIVE_WAKE_SCOPE_PROCESS_TREE}',
+                        CASE WHEN json_type(data, '$.command') = 'text'
+                              AND json_extract(data, '$.command_truncated') IS NOT 1
+                              AND length(CAST(json_extract(data, '$.command') AS BLOB)) <= {MAX_TOOL_COMMAND_BYTES}
+                             THEN json_extract(data, '$.command') END
                  FROM events INDEXED BY events_tool_turn
                  WHERE agent = ?1 AND generation = ?2
                    AND kind = '{kind}'
@@ -201,6 +209,7 @@ impl Store {
                             native_clock: row.get(2)?,
                             background: row.get(3)?,
                             wake_covers_tree: row.get(4)?,
+                            command: row.get(5)?,
                         })
                     },
                 )
@@ -253,6 +262,7 @@ impl Store {
                     harness_waiting,
                     harness_wake_covers_tree: harness_waiting && start.wake_covers_tree,
                     item_id: start.item_id,
+                    command: start.command,
                     started_at: start.at,
                 }
             })

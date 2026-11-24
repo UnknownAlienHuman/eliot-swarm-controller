@@ -957,14 +957,15 @@ inserts can still be delivered by the before-tool and after-tool callbacks.
 ### Automatic background-process wake
 
 For [#879](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/879), [#883](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/883), and [#903](https://github.com/UnknownAlienHuman/eliot-swarm-controller/issues/903), Swarm wakes an Agent whose turn ended
-while a process it started is still running. When a `turn.completed` with outcome
+while a background task it launched is still running. When a `turn.completed` with outcome
 `success` or `failure` commits, the note worker freshly samples that generation's
 custody and picks one top-level [candidate](monitoring.md#background-process-wake-candidates)
-started inside a native tool call of that completing turn: the first process still
-running from the newest such call. A process started
-outside every tool call, such as a harness notify helper at turn end, never arms.
-A process from an earlier turn does not arm either. While the harness still runs a
-call as its own background task, Swarm leaves the wake to the harness. The
+directly launched by a native tool call of that completing turn: the first process still
+running from the newest such call. A compiler-cache server, build daemon or language
+server spawned indirectly by a build tool is not a task the Agent launched. A process
+started outside the completing turn's tool calls, such as a harness notify helper,
+cannot arm. While the harness still runs a call as its own background task, Swarm
+leaves the wake to the harness. The
 [candidate rules](monitoring.md#background-process-wake-candidates) use the
 adapter's task and wake-scope facts to determine whether a survivor can arm when
 `tool.background_ended` commits. Swarm retains one `waiting`

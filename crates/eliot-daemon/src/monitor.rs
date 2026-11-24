@@ -575,8 +575,7 @@ impl Monitoring {
     }
 
     /// Fresh-sample `agent`'s custody tree and pick the first running
-    /// non-server descendant of the newest native tool call of the completing
-    /// turn that contains a process start.
+    /// non-server process directly launched by a native tool of the completing turn.
     pub(crate) async fn inspect_running_background_processes(
         &self,
         agent: &Agent,
@@ -716,9 +715,9 @@ impl Monitoring {
                 harness_tree_pids.insert(sample.record.identity.pid);
                 continue;
             }
-            let Some(binding) = tool_binding(&containing) else {
+            if containing.is_empty() {
                 continue;
-            };
+            }
             let Some(chain) = harness_descendant_chain(
                 sample.record.identity.pid,
                 sample.record.identity.start_time,
@@ -747,6 +746,18 @@ impl Monitoring {
                 server_ancestor_pids.extend(chain);
                 continue;
             }
+            let launching: Vec<_> = containing
+                .into_iter()
+                .filter(|window| {
+                    window
+                        .command
+                        .as_deref()
+                        .is_some_and(|command| tool_launched_process(command, node, &chain, &nodes))
+                })
+                .collect();
+            let Some(binding) = tool_binding(&launching) else {
+                continue;
+            };
             let (command_line, command_truncated) =
                 format_process_command_line(node, sample.record.identity.pid, secrets);
             qualifying.push(QualifiedCandidate {
@@ -776,7 +787,7 @@ impl Monitoring {
                 .any(|pid| qualifying_pids.contains(pid))
         });
 
-        // The newest tool call's first surviving process is the job root even
+        // Prefer the oldest directly attributed survivor of the newest call
         // when a shell runtime (Git Bash) does not keep Windows parent links.
         let Some(winner) = qualifying.into_iter().max_by_key(|candidate| {
             (
@@ -2768,6 +2779,113 @@ fn matches_declared_command(
     })
 }
 
+fn tool_launched_process(
+    command: &str,
+    node: &crate::platform::ProcessNodeInfo,
+    chain: &[u32],
+    nodes: &HashMap<u32, crate::platform::ProcessNodeInfo>,
+) -> bool {
+    // A non-shell intermediary owns its descendants. If the launcher has
+    // exited, Job membership alone cannot tell a detached helper from a job.
+    if chain
+        .iter()
+        .filter_map(|pid| nodes.get(pid))
+        .any(|ancestor| !is_command_shell(&ancestor.argv))
+    {
+        return false;
+    }
+    shell_runs_tool_command(&node.argv, command)
+        || chain
+            .first()
+            .and_then(|pid| nodes.get(pid))
+            .is_some_and(|parent| shell_runs_tool_command(&parent.argv, command))
+        || matches_direct_invocation(command, &node.argv)
+}
+
+fn process_program(path: &str) -> &str {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if cfg!(windows) {
+        name.strip_suffix(".exe")
+            .or_else(|| name.strip_suffix(".EXE"))
+            .unwrap_or(name)
+    } else {
+        name
+    }
+}
+
+fn is_command_shell(argv: &[String]) -> bool {
+    argv.first().is_some_and(|program| {
+        let program = process_program(program).to_ascii_lowercase();
+        eliot_core::SHELL_WRAPPER_PROGRAMS.contains(&program.as_str())
+            || matches!(program.as_str(), "sh" | "bash" | "dash" | "zsh")
+    })
+}
+
+fn shell_runs_tool_command(argv: &[String], command: &str) -> bool {
+    if !is_command_shell(argv) {
+        return false;
+    }
+    argv.windows(2).skip(1).any(|pair| {
+        matches!(
+            pair[0].to_ascii_lowercase().as_str(),
+            "-c" | "-lc" | "-command" | "/c"
+        ) && pair[1].trim() == command.trim()
+    })
+}
+
+/// Recognize a literal leading invocation with optional shell redirection or
+/// backgrounding. A program mentioned in a tool argument is not launch evidence.
+fn matches_direct_invocation(command: &str, argv: &[String]) -> bool {
+    let Some((program, args)) = argv.split_first() else {
+        return false;
+    };
+    let command = command
+        .trim_start()
+        .trim_start_matches(['(', '&'])
+        .trim_start();
+    let parsed = eliot_core::split_windows_command_line(leading_shell_invocation(command));
+    let Some((invocation, words)) = parsed.split_first() else {
+        return false;
+    };
+    let invoked_program = process_program(invocation.trim_matches('\''));
+    let observed_program = process_program(program);
+    let same_program = if cfg!(windows) {
+        invoked_program.eq_ignore_ascii_case(observed_program)
+    } else {
+        invoked_program == observed_program
+    };
+    same_program
+        && words.len() == args.len()
+        && args
+            .iter()
+            .zip(words)
+            .all(|(arg, word)| arg == word.trim_matches('\''))
+}
+
+fn leading_shell_invocation(command: &str) -> &str {
+    let mut quote = None;
+    for (offset, ch) in command.char_indices() {
+        match quote {
+            Some(delimiter) if ch == delimiter => quote = None,
+            Some(_) => {}
+            None if matches!(ch, '\'' | '"') => quote = Some(ch),
+            None if matches!(ch, '<' | '>' | '&' | ';' | '|' | ')' | '\n') => {
+                let invocation = &command[..offset];
+                if matches!(ch, '<' | '>')
+                    && let Some((before_fd, fd)) = invocation.rsplit_once(char::is_whitespace)
+                    && fd.len() == 1
+                    && fd.as_bytes()[0].is_ascii_digit()
+                {
+                    return before_fd;
+                }
+                return invocation;
+            }
+            None => {}
+        }
+    }
+    command
+}
+
 /// The tool call binding of a process start.
 struct ToolBinding {
     /// The item id when exactly one call contains the start.
@@ -2803,13 +2921,14 @@ fn containing_tool_windows(
 }
 
 /// The binding of a process from its containing calls. While the harness
-/// still runs a call as its own background task, a process bound only to that
-/// call is skipped: the harness wakes itself. Once a `tool_process` task ends,
-/// its survivors are ordinary candidates.
+/// still runs a launching call as its own background task, the harness owns
+/// the wake. Once a `tool_process` task ends, directly launched survivors can arm.
 fn tool_binding(containing: &[&eliot_store::BackgroundWakeToolWindow]) -> Option<ToolBinding> {
+    if containing.iter().any(|window| window.harness_waiting) {
+        return None;
+    }
     match containing {
         [] => None,
-        [window] if window.harness_waiting => None,
         [window] => Some(ToolBinding {
             item_id: Some(window.item_id.clone()),
             started_at: window.started_at,
