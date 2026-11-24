@@ -193,16 +193,17 @@ impl GitProbe {
         now: i64,
         for_cleanup: bool,
     ) -> Result<GitSnapshot> {
-        let root = canonical_root(workspace)?;
+        let edit_root = eliot_plugin::edit_path::CanonicalEditRoot::new(workspace)?;
+        let root = edit_root.as_path();
         let root_text = root
             .to_str()
             .ok_or_else(|| unavailable("workspace is not UTF-8"))?;
         let deadline = Instant::now() + PROBE_TIME;
-        let overrides = self.safe_overrides(&root, deadline).await?;
-        self.require_exact_root(&root, &overrides, deadline).await?;
+        let overrides = self.safe_overrides(root, deadline).await?;
+        self.require_exact_root(root, &overrides, deadline).await?;
 
         let gitlinks = if for_cleanup {
-            Gitlinks::RequireUnpopulated(&root)
+            Gitlinks::RequireUnpopulated(root)
         } else {
             Gitlinks::Reject
         };
@@ -213,10 +214,10 @@ impl GitProbe {
             "--untracked-files=all"
         });
         let (index_digest, index) = self
-            .index_snapshot(&root, &overrides, deadline, gitlinks)
+            .index_snapshot(root, &overrides, deadline, gitlinks)
             .await?;
         let status_bytes = self
-            .checked(&root, &status_args, &overrides, &[], deadline)
+            .checked(root, &status_args, &overrides, &[], deadline)
             .await?;
         let status = parse_status(&status_bytes)?;
 
@@ -227,9 +228,7 @@ impl GitProbe {
             if Instant::now() >= deadline {
                 return Err(unavailable("Git observation deadline elapsed"));
             }
-            let path = git_path(&eliot_plugin::edit_path::normalize_from_canonical_root(
-                &root, path,
-            )?)?;
+            let path = git_path(&edit_root.normalize(path)?)?;
             if edited.insert(path.clone()) {
                 hint_bytes += path.len() + 1;
                 if hint_bytes > INPUT_BYTES {
@@ -245,12 +244,15 @@ impl GitProbe {
                 }
             }
         }
+        if !edited_paths.is_empty() && canonical_root(workspace)? != root {
+            return Err(unavailable("Git worktree root changed during hint read"));
+        }
         let ignored = if input.is_empty() {
             BTreeSet::new()
         } else {
             let output = self
                 .run(
-                    &root,
+                    root,
                     &["check-ignore", "--stdin", "-z"],
                     &overrides,
                     &input,
@@ -269,7 +271,7 @@ impl GitProbe {
             attribute_paths.extend(dirty.original_path.iter().cloned());
         }
         let filter_affected = self
-            .filter_attributes(&root, &overrides, attribute_paths, deadline)
+            .filter_attributes(root, &overrides, attribute_paths, deadline)
             .await?;
         // Disabling executable conversions can differ from the owner's normal
         // comparison. Publish bounded raw status as partial, never normal-Git
@@ -304,26 +306,14 @@ impl GitProbe {
         }
 
         let (commits, history_complete, history_gap) = self
-            .history(
-                &root,
-                baseline,
-                status.head.as_deref(),
-                &overrides,
-                deadline,
-            )
+            .history(root, baseline, status.head.as_deref(), &overrides, deadline)
             .await?;
         let (committed_paths, base_complete) = self
-            .committed_paths(
-                &root,
-                base_oid,
-                status.head.as_deref(),
-                &overrides,
-                deadline,
-            )
+            .committed_paths(root, base_oid, status.head.as_deref(), &overrides, deadline)
             .await?;
         let work = self
             .work_probe(
-                &root,
+                root,
                 base_oid,
                 status.head.as_deref(),
                 &status.dirty,
@@ -335,10 +325,10 @@ impl GitProbe {
         // Do not clear attribution from a poll that crossed a checkout/index/status
         // change. The history commands themselves use immutable object IDs.
         let (final_index_digest, _) = self
-            .index_snapshot(&root, &overrides, deadline, gitlinks)
+            .index_snapshot(root, &overrides, deadline, gitlinks)
             .await?;
         let final_status = self
-            .checked(&root, &status_args, &overrides, &[], deadline)
+            .checked(root, &status_args, &overrides, &[], deadline)
             .await?;
         if index_digest != final_index_digest || status_bytes != final_status {
             return Err(unavailable("Git worktree changed during observation"));
