@@ -1208,11 +1208,12 @@ impl PluginHost {
         // A fenced actor may still be waiting on its family and draining its
         // event task. Keep that work within the original stop deadline.
         let runtime_gone = !self.controls_generation(&agent.id, agent.generation);
-        let grace = if native_error.code == "unknown" || runtime_gone {
-            STOP_GRACE * 3 + RPC_GRACE
-        } else {
-            Duration::ZERO
-        };
+        let grace =
+            if runtime_gone || matches!(native_error.code.as_str(), "unknown" | "unavailable") {
+                STOP_GRACE * 3 + RPC_GRACE
+            } else {
+                RPC_GRACE
+            };
         let proof_until = (Instant::now() + grace).min(until);
         match wait_for_stop_exit_proof(&Arc::downgrade(&self.state), agent, proof_until).await {
             Ok(proof) => Ok(json!({
@@ -1227,7 +1228,7 @@ impl PluginHost {
             Err(proof_error) => {
                 let message = format!("{}; {}", native_error.message, proof_error.message);
                 let error = native_error.with_message(message);
-                if runtime_gone {
+                if runtime_gone || !self.controls_generation(&agent.id, agent.generation) {
                     Err(error.with_code("unknown"))
                 } else {
                     Err(error)

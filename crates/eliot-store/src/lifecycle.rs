@@ -2051,14 +2051,20 @@ fn stop_agent_tx(
         .ok_or_else(|| Error::new("not_found", "stop command disappeared during settlement"))?;
     let owner_stop = interrupt_owner_turn && stop.command.principal == "owner";
     let captured_turn = stop.expected_turn_id.as_deref().filter(|_| owner_stop);
+    if let Some(turn_id) = agent.active_turn.as_deref() {
+        super::native_events::settle_unfinished_tools_tx(
+            tx, &agent, agent_num, turn_id, now, events,
+        )?;
+    }
     if let Some(turn_id) = captured_turn {
-        let binding = (agent_num, generation, turn_id);
-        if agent.active_turn.as_deref() == Some(turn_id) {
-            super::native_events::settle_unfinished_tools_tx(
-                tx, &agent, agent_num, turn_id, now, events,
-            )?;
-        }
-        settle_owner_stopped_turn_tx(tx, binding, command_id, now, events)?;
+        settle_owner_interrupted_turn_tx(
+            tx,
+            (agent_num, generation, turn_id),
+            command_id,
+            "stopped_by_owner",
+            now,
+            events,
+        )?;
     }
     if agent.state == AgentState::Stopped {
         return super::goals::pause_for_stop_tx(tx, agent_num, generation, now, events);
@@ -2105,12 +2111,7 @@ fn stop_agent_tx(
             events,
         )?;
     }
-    if let Some(turn_id) = agent.active_turn.as_deref()
-        && captured_turn != Some(turn_id)
-    {
-        super::native_events::settle_unfinished_tools_tx(
-            tx, &agent, agent_num, turn_id, now, events,
-        )?;
+    if let Some(turn_id) = agent.active_turn.as_deref() {
         settle_stopped_turn_unknown_tx(
             tx, agent_num, generation, command_id, turn_id, now, events,
         )?;
@@ -2152,56 +2153,6 @@ fn stop_agent_tx(
     )
 }
 
-fn settle_owner_stopped_turn_tx(
-    tx: &Transaction<'_>,
-    (agent, generation, turn_id): (i64, i64, &str),
-    command_id: &str,
-    now: i64,
-    events: &mut Vec<Event>,
-) -> Result<()> {
-    // An Owner stop that was dispatched after unsolicited loss may still
-    // settle custody. It did not interrupt that earlier turn.
-    let changed = db!(tx.execute(
-        "UPDATE turns SET state = 'completed', status = 'interrupted_by_owner',
-             outcome = 'interrupted', completed_at = COALESCE(completed_at, ?1),
-             resolution_source = 'owner'
-         WHERE agent = ?2 AND generation = ?3 AND turn_id = ?4
-           AND state IN ('running', 'unknown') AND resolution_source IS NULL
-           AND EXISTS (
-               SELECT 1 FROM events
-               WHERE agent = ?2 AND generation = ?3 AND kind = 'command.dispatched'
-                 AND json_extract(data, '$.command_id') = ?5
-                 AND json_extract(data, '$.live_at_dispatch') = 1
-           )",
-        params![now, agent, generation, turn_id, command_id],
-    ));
-    if changed == 0 {
-        return settle_owner_interrupted_turn_tx(
-            tx,
-            (agent, generation, turn_id),
-            command_id,
-            "stopped_by_owner",
-            now,
-            events,
-        );
-    }
-    super::native_events::rollback_inline_mail_tx(tx, agent, generation, turn_id)?;
-    events.push(insert_daemon_event_for_command(
-        tx,
-        command_id,
-        DaemonEventInput::new(
-            now,
-            "turn.resolved",
-            "turn",
-            Some(agent),
-            Some(generation),
-            json!({"command_id": command_id, "turn_id": turn_id, "status": "interrupted",
-                   "resolution_source": "owner", "reason": "stopped_by_owner"}),
-        ),
-    )?);
-    Ok(())
-}
-
 fn settle_owner_interrupted_turn_tx(
     tx: &Transaction<'_>,
     (agent_num, generation, turn_id): (i64, i64, &str),
@@ -2213,23 +2164,48 @@ fn settle_owner_interrupted_turn_tx(
     let Some(turn) = load_turn(tx, agent_num, generation, turn_id)? else {
         return Ok(());
     };
-    if turn.resolution_source.is_some()
-        || turn.state != eliot_core::TurnState::Completed
-        || turn.outcome != Some(eliot_core::TurnOutcome::Interrupted)
-    {
+    if turn.resolution_source.is_some() {
+        return Ok(());
+    }
+    let unresolved = matches!(
+        turn.state,
+        core::TurnState::Running | core::TurnState::Unknown
+    );
+    if unresolved {
+        // An Owner stop dispatched after unsolicited loss can prove custody,
+        // but it did not interrupt the earlier turn.
+        if reason != "stopped_by_owner"
+            || !tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events
+                 WHERE agent = ?1 AND generation = ?2 AND kind = 'command.dispatched'
+                   AND json_extract(data, '$.command_id') = ?3
+                   AND json_extract(data, '$.live_at_dispatch') = 1)",
+                    params![agent_num, generation, command_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?
+        {
+            return Ok(());
+        }
+    } else if turn.outcome != Some(core::TurnOutcome::Interrupted) {
         return Ok(());
     }
     let changed = db!(tx.execute(
-        "UPDATE turns SET status = 'interrupted_by_owner', resolution_source = 'owner'
-         WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3
-           AND state = 'completed' AND outcome = 'interrupted' AND resolution_source IS NULL",
-        params![agent_num, generation, turn_id],
+        "UPDATE turns SET state = 'completed', status = 'interrupted_by_owner',
+           outcome = 'interrupted', completed_at = COALESCE(completed_at, ?4),
+           resolution_source = 'owner'
+         WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+        params![agent_num, generation, turn_id, now],
     ));
     if changed != 1 {
         return Err(Error::new(
             "source_integrity",
             "captured Owner-stopped turn changed before stop settlement",
         ));
+    }
+    if unresolved {
+        super::native_events::rollback_inline_mail_tx(tx, agent_num, generation, turn_id)?;
     }
     events.push(insert_daemon_event_for_command(
         tx,

@@ -790,7 +790,7 @@ async fn drive_agent_dispatch(dispatch: AgentDispatch<'_>) -> bool {
                                     ).await;
                                     (native, graceful, exited)
                                 }
-                                Err(ref error) if error.code == "unknown" => {
+                                Err(ref error) if error.code == "unknown" || client.reader_closed() => {
                                     // The effect is uncertain. Retire owned custody
                                     // without calling the plugin again.
                                     let _ = child.terminate();
