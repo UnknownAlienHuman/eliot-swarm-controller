@@ -1728,9 +1728,10 @@ after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
 
-The Resume refusal selector requires the exact failed `resume` command for the
-immediately preceding generation, the resulting terminal Agent generation, the
-durable `native_start_refused` classification and a nonempty typed reason/location.
+The Resume refusal selector binds the exact failed `resume` command's updated
+generation to the matching `agent.starting` event and resulting terminal Agent
+generation. It also requires the durable `native_start_refused` classification and a
+nonempty typed reason/location. Predecessor work history is read from generation N-1.
 When the resulting generation has no current turn, owed work may come from the exact
 inherited predecessor task checkpoint plus an unfinished predecessor turn. The
 predecessor turn must have no uncertain effects and the Agent must have no unknown

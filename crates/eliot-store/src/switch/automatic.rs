@@ -612,9 +612,8 @@ fn attempt_allowed(connection: &Connection, agent: &Agent, now: i64) -> Result<b
 }
 
 /// A failed no-write Resume may leave owed work on its exact predecessor
-/// generation. Only accept that binding when Resume advanced exactly once,
-/// the new terminal generation inherited the task checkpoint, and predecessor
-/// history contains no unresolved native effects.
+/// generation. Bind its receipt to the current generation's exact agent.starting
+/// event, then use the immediately preceding generation for task history.
 fn safe_failed_resume_predecessor(connection: &Connection, agent: &Agent) -> Result<Option<i64>> {
     let num = parse_agent_id(&agent.id)?;
     let previous = agent.generation.checked_sub(1).unwrap_or_default();
@@ -639,8 +638,12 @@ fn safe_failed_resume_predecessor(connection: &Connection, agent: &Agent) -> Res
                ))
                AND json_extract(c.outcome, '$.native_start_refused') = 1
                AND json_type(c.outcome, '$.restart_resume_refusal.reason') = 'text'
-               AND json_type(c.outcome, '$.restart_resume_refusal.where') = 'text')",
-            params![num, previous],
+               AND json_type(c.outcome, '$.restart_resume_refusal.where') = 'text'
+               AND EXISTS (SELECT 1 FROM events e
+                   WHERE e.agent = c.target AND e.generation = c.generation
+                     AND e.kind = 'agent.starting' AND e.source = 'agent'
+                     AND json_extract(e.data, '$.command_id') = c.id))",
+            params![num, agent.generation],
             |row| row.get(0),
         )
         .map_err(sql_error)?;
@@ -969,7 +972,7 @@ impl Store {
                        OR EXISTS (
                            SELECT 1 FROM commands c
                            WHERE c.target = agents.id
-                             AND c.generation + 1 = agents.generation
+                             AND c.generation = agents.generation
                              AND c.verb = 'resume' AND c.state = 'failed'
                              AND (c.principal = 'owner' OR EXISTS (
                                  SELECT 1 FROM restart_resume_intents r WHERE r.command_id = c.id
@@ -980,6 +983,10 @@ impl Store {
                              AND length(trim(json_extract(c.outcome, '$.restart_resume_refusal.reason'))) > 0
                              AND json_type(c.outcome, '$.restart_resume_refusal.where') = 'text'
                              AND length(trim(json_extract(c.outcome, '$.restart_resume_refusal.where'))) > 0
+                             AND EXISTS (SELECT 1 FROM events e
+                                 WHERE e.agent = c.target AND e.generation = c.generation
+                                   AND e.kind = 'agent.starting' AND e.source = 'agent'
+                                   AND json_extract(e.data, '$.command_id') = c.id)
                        )
                    )
                  ORDER BY updated_at DESC LIMIT ?3",
