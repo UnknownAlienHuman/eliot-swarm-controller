@@ -83,7 +83,7 @@ engine, second scheduler or critic loop.
       current instruction and limits, and the executor's last decisions and
       next step, keeping machine facts and model claims distinct.
 - [x] **A7 Goal cost budget.** `max_cost` budgets the native session cost
-      since a set-time or pre-first-launch-input baseline in its verbatim unit;
+      since the latest snapshot selected at `set` or a launch-zero baseline in its verbatim unit;
       incomplete, stale, mixed-unit, reset or decreasing data is
       `cost_unverified` and blocks, never zero.
 - [x] **A8 Bounded escalation.** The second identical Goal failure in a row

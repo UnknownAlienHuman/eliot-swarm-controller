@@ -1966,9 +1966,13 @@ for the captured Agent generation and Goal revision. A pre-dispatch recovery reu
 already committed baseline rather than replacing it.
 
 **Cost budget.** `max_cost {unit, amount_micros}` budgets the Agent's native
-session cost since `set`, in that verbatim unit (Claude reports `usd_estimate`; units
-are never converted, and subscription quota is a separate resource). At `set` the Store
-records a baseline from the generation's latest `session_usage` snapshot in that unit.
+session cost since the baseline snapshot, in its verbatim unit. Claude reports
+`usd_estimate`. Subscription quota is separate. At `set` the Store captures the
+generation's latest `session_usage` snapshot in that unit and reports its epoch
+timestamp as `cost_baseline_observed_at`. The snapshot may precede `set`, so
+measured spend can include native work between the observation and `set`.
+Older Goals without the retained timestamp continue to report their budget
+and spend with the baseline time unavailable.
 For a launch-installed Goal, Store initializes a zero cost baseline at admission,
 when the new native session has no usage. The baseline binds to the first observed
 session. The Git scope baseline is captured separately after workspace setup.
