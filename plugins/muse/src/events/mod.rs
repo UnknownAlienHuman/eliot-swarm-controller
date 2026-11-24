@@ -3328,8 +3328,12 @@ impl EventProcessor {
         };
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = event_id(session_id, turn, "terminal", "session.usage")?;
-        self.commit_event("session.usage", native_id, json!({"usage": usage}))
-            .await
+        self.commit_event(
+            "session.usage",
+            native_id,
+            json!({"usage": usage, "boundary_turn_id": turn}),
+        )
+        .await
     }
 
     /// Commit `tool.started` for a turn-bound tool item, mirroring the Codex

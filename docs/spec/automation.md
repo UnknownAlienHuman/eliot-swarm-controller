@@ -2032,17 +2032,22 @@ already committed baseline rather than replacing it.
 
 **Cost budget.** `max_cost {unit, amount_micros}` budgets the Agent's native
 session cost since the baseline snapshot, in its verbatim unit. Claude reports
-`usd_estimate`. Subscription quota is separate. At `set` the Store captures the
-generation's latest `session_usage` snapshot in that unit and reports its epoch
-timestamp as `cost_baseline_observed_at`. The snapshot may precede `set`, so
-measured spend can include native work between the observation and `set`.
+`usd_estimate`. Subscription quota is separate. At an idle `set`, the Store
+requires the generation's latest `session_usage` snapshot in that unit to be
+as recent as its last completed turn. It reports the baseline's epoch
+timestamp as `cost_baseline_observed_at`. On a running turn, `set` retains the
+exact turn and native session and reports the cost baseline as pending.
+The Store binds it atomically when it commits a fresh cumulative cost snapshot
+for that exact completed turn, session and unit. The active turn's cost is
+outside the budget. Rounds wait for this boundary. If that boundary cannot
+be verified, the Owner can set the Goal again at a verified idle boundary.
 Older Goals without the retained timestamp continue to report their budget
 and spend with the baseline time unavailable.
 For a launch-installed Goal, Store initializes a zero cost baseline at admission,
 when the new native session has no usage. The baseline binds to the first observed
 session. The Git scope baseline is captured separately after workspace setup.
 `set` is refused as `unsupported` when the harness reports no session cost, reports
-another unit, or ran turns without one. After each failed check, the round commit reads
+another unit, or ran turns without one, once the Agent is idle. After each failed check, the round commit reads
 the latest snapshot. The spent cost is that cumulative amount minus the baseline. It
 counts only for the same native session and unit, from a snapshot observed no earlier
 than the last completed turn, and never with a decreasing cumulative. Anything else is
