@@ -130,7 +130,9 @@ for the exact turn under the event lock and answers both existing and
 subsequently arriving asks `cancelled` once (uncertain writes are never
 repeated). The latch never carries into a new turn. Asks the
 native ends without consuming are closed (`request.closed`) ahead of
-the terminal commit. Verified live 2026-11-15 against installed agy
+the terminal commit. The final text for turn readback comes from the bounded
+terminal payload and is updated after that payload commits. Verified live
+2026-11-15 against installed agy
 1.5.9: a `git log` ask approved (command ran, final answer returned),
 denied (tool refused, empty turn honestly marked), and
 interrupt-cancelled (ask closed, turn cancelled).

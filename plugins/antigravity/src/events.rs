@@ -954,7 +954,8 @@ impl State {
             if missing_text.is_none() {
                 attach_final_text(&mut data, &final_text);
             }
-            self.commit("turn.completed", &stop.turn_id, "completed", data.clone())
+            let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
+            self.commit("turn.completed", &stop.turn_id, "completed", data)
                 .await?;
             self.last_turn = Some(TurnFacts {
                 command_id: None,
@@ -962,7 +963,7 @@ impl State {
                 status: stop.status.to_owned(),
                 native_status: stop.native_status,
                 final_text_unavailable: missing_text,
-                final_text: data["final_text"].as_str().unwrap_or_default().to_owned(),
+                final_text,
                 native_error: stop.error,
                 terminal: true,
             });
@@ -1075,16 +1076,13 @@ impl State {
         if (self.text_truncated || !is_blank_native_text(&text)) && missing_text.is_none() {
             attach_final_text(&mut data, &text);
         }
-        self.commit("turn.completed", &stop.turn_id, "completed", data.clone())
+        let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
+        self.commit("turn.completed", &stop.turn_id, "completed", data)
             .await?;
         let session_usage = self.commit_turn_session_usage(&stop.turn_id).await;
         self.reject_pending_steer("Antigravity run ended before its next PreInvocation");
         if let Some(last) = self.last_turn.as_mut() {
-            last.final_text = data
-                .get("final_text")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+            last.final_text = final_text;
         }
         self.record_settlement(stop.turn_id, false);
         self.pending = None;
@@ -2809,17 +2807,13 @@ impl State {
         {
             attach_final_text(&mut data, &text);
         }
-        self.commit("turn.completed", &turn, "completed", data.clone())
+        let final_text = data["final_text"].as_str().unwrap_or_default().to_owned();
+        self.commit("turn.completed", &turn, "completed", data)
             .await?;
         let session_usage = self.commit_turn_session_usage(&turn).await;
         self.reject_pending_steer(
             "Antigravity turn ended before its next PreInvocation steer point",
         );
-        let final_text = data
-            .get("final_text")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
         if let Some(last) = self.last_turn.as_mut() {
             last.final_text = final_text;
         }
