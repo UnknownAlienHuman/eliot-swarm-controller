@@ -499,6 +499,23 @@ pub mod winui {
             })
         }
 
+        /// A chip that takes no input (a fixed fact): disabled, drawn as a
+        /// chip at rest, its outline and content in the variant tone (the
+        /// attention tone for Full access).
+        pub fn fixed_chip(self, attention: bool) -> ResourceOverrides {
+            self.with(|r| {
+                let (outline, on) = if attention {
+                    (r.attention.mix(r.surface, 0.55), r.attention_text)
+                } else {
+                    (r.border, r.variant)
+                };
+                ResourceOverrides::new()
+                    .set("ButtonBackgroundDisabled", Color::transparent())
+                    .set("ButtonBorderBrushDisabled", color(outline))
+                    .set("ButtonForegroundDisabled", color(on))
+            })
+        }
+
         /// The outline of a chip in the attention tone (Full access).
         pub fn attention_outline(self) -> Brush {
             self.role(

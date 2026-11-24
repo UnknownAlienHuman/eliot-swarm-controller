@@ -1106,7 +1106,7 @@ fn start_split(
             m3::icon_button(palette)
                 .resource_overrides(palette.filled())
                 .width(tokens::layout::SPLIT_MENU)
-                .is_enabled(enabled)
+                .is_enabled(ready)
                 .automation_name("More start options")
                 .content(m3::icon(m3::glyph::CHEVRON_DOWN))
                 .menu(Menu::new(

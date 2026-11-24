@@ -172,11 +172,16 @@ impl DesktopApp {
             palette,
         );
         // Keyed by its colors (a button's resources apply when its
-        // template does) and by whether its flyout is attached.
-        Grid::new().keyed_children(vec![KeyedView::new(
-            format!("usage:{open}:{low}:{}", tightest.is_some()),
-            row,
-        )])
+        // template does) and by whether its flyout is attached; while it
+        // is open the key holds, so a reading that lands meanwhile never
+        // re-creates the button under its open flyout (which would close
+        // it).
+        let key = if open {
+            "usage:open".to_owned()
+        } else {
+            format!("usage:{low}:{}", tightest.is_some())
+        };
+        Grid::new().keyed_children(vec![KeyedView::new(key, row)])
     }
 
     /// The Usage popover (`Hold.dc.html`): "Usage" with when the limits

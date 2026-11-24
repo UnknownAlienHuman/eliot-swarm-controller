@@ -373,7 +373,10 @@ impl Component for Sidebar {
 /// stays `on-surface`), then Back, Forward and Hide sidebar.
 fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
     let palette = input.palette;
+    // The design's 8 between the buttons leaves "Eliot Swarm" too little of
+    // the 248-DIP row; they keep the half step.
     let gap = tokens::spacing::SM;
+    let buttons_gap = tokens::spacing::XS;
     let home = StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(gap)
@@ -399,7 +402,7 @@ fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
             GridLength::Auto,
             GridLength::Auto,
         ])
-        .column_spacing(gap)
+        .column_spacing(buttons_gap)
         .children((
             m3::text_button(palette)
                 .horizontal_alignment(HorizontalAlignment::Left)

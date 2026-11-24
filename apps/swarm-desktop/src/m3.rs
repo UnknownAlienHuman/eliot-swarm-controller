@@ -487,9 +487,12 @@ pub fn attention_chip(palette: Palette) -> Button {
 }
 
 /// A fact shown as a chip but not a control (a preset's access, a project
-/// that always takes a worktree): the chip's outline and label, no state
-/// layer. Full access is its label alone in the attention tone, as the
-/// design draws it (Reactor 0.100.0 sets no icon color outside a button).
+/// that always takes a worktree): a chip that takes no input, drawn as the
+/// chip at rest (its outline, its icon and label in `on-surface-variant`;
+/// Full access in the attention tone). It is a disabled chip carrying the
+/// rest colors, so its icon takes its color too (Reactor 0.100.0 colors an
+/// icon only through the control around it); its tooltip goes on the
+/// cell around it.
 pub fn fixed_chip(
     palette: Palette,
     attention: bool,
@@ -497,37 +500,21 @@ pub fn fixed_chip(
     label: &str,
     name: &str,
 ) -> View {
-    let outline = if attention {
-        palette.attention_outline()
-    } else {
-        palette.border()
-    };
-    let mut label_view = text(label.to_owned(), style::CHIP)
-        .vertical_alignment(VerticalAlignment::Center)
-        .max_width(layout::PROJECT_CHIP_WIDTH)
-        .text_trimming(TextTrimming::CharacterEllipsis);
-    if attention {
-        label_view = label_view.foreground(palette.attention());
-    }
-    let mut parts: Vec<KeyedView> = Vec::new();
-    if let Some(glyph) = glyph.filter(|_| !attention) {
-        parts.push(KeyedView::new("icon", small_icon(glyph)));
-    }
-    parts.push(KeyedView::new("label", label_view));
     Border::new()
-        .automation_name(name.to_owned())
-        .height(height::CHIP)
-        .corner_radius(radius::CHIP)
-        .border_brush(outline)
-        .border_thickness(Thickness::uniform(layout::HAIRLINE))
-        .padding(Thickness::xy(spacing::ROW, 0.0))
         .vertical_alignment(VerticalAlignment::Center)
         .content(
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(spacing::CHIP_GAP)
-                .vertical_alignment(VerticalAlignment::Center)
-                .keyed_children(parts),
+            Button::new()
+                .resource_overrides(palette.fixed_chip(attention))
+                .is_enabled(false)
+                .height(height::CHIP)
+                .min_height(height::CHIP)
+                .automation_name(name.to_owned())
+                .content(chip_content(
+                    glyph,
+                    label,
+                    false,
+                    layout::PROJECT_CHIP_WIDTH,
+                )),
         )
 }
 
