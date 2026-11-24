@@ -270,17 +270,12 @@ impl Store {
                 "scheduled timer parent does not match its slot identity",
             ));
         }
-        let expected_children = parent
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.get("children"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                Error::new(
-                    "source_integrity",
-                    "scheduled timer parent has no child set",
-                )
-            })?;
+        let expected_children = recorded_rule_children(&parent).ok_or_else(|| {
+            Error::new(
+                "source_integrity",
+                "scheduled timer parent has no child set",
+            )
+        })?;
         let child_id = derived_timer_id(
             "action-0",
             principal,
@@ -1280,12 +1275,7 @@ pub(super) fn validate_timer_script_run_admitted_origin_tx(
             "timer Run has an unsupported or differently-authorized parent",
         ));
     }
-    let firing_children = parent
-        .command
-        .outcome
-        .as_ref()
-        .and_then(|outcome| outcome.get("children"))
-        .and_then(Value::as_array)
+    let firing_children = recorded_rule_children(&parent.command)
         .ok_or_else(|| Error::new("source_integrity", "timer parent has no fixed child set"))?;
     if !firing_children
         .iter()
