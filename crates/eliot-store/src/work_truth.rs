@@ -1166,9 +1166,11 @@ impl Store {
             }
             let command = load_command(&self.connection, &id)?
                 .ok_or_else(|| Error::new("source_integrity", "task correction disappeared"))?;
-            let text = required_string(&command.args, "text")?;
+            let text = input_before_owner_rules(&command).ok_or_else(|| {
+                Error::new("source_integrity", "task correction text is unreadable")
+            })?;
             if let Some(input) =
-                crate::TaskInstruction::from_command(&command, policy.redact_text(&text))
+                crate::TaskInstruction::from_command(&command, policy.redact_text(text))
             {
                 corrections.push(input);
             }

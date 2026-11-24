@@ -12,7 +12,7 @@ mod launch_queue;
 mod launch_refusal;
 mod launch_result;
 mod online_backup;
-pub use launch_queue::{ArbitratedTimer, PendingLaunch, TimerWait};
+pub use launch_queue::{ArbitratedTimer, LAUNCH_SOURCE_SNAPSHOT_ARG, PendingLaunch, TimerWait};
 mod cleanup;
 pub use cleanup::{CleanupInventoryPage, cleanup_worktree_command_id};
 mod git_integration_custody;
@@ -55,6 +55,18 @@ pub use scripts::ScriptRunAdmission;
 pub use turn_recovery::{ActiveTurnRecovery, RecoveredTurn};
 pub use usage::ResolvedUsageScope;
 pub use workspace::StandWorkspaceRecord;
+
+/// Server-derived immutable input metadata carried by a prepared launch or send.
+pub const LAUNCH_SOURCE_RULES_ARG: &str = "_launch_source_owner_rules";
+pub const SEND_SOURCE_BASE_BYTES_ARG: &str = "_owner_rules_base_bytes";
+
+pub fn input_before_owner_rules(command: &Command) -> Option<&str> {
+    let input = command.args.get("text")?.as_str()?;
+    match command.args.get(SEND_SOURCE_BASE_BYTES_ARG) {
+        Some(bytes) => input.get(..usize::try_from(bytes.as_u64()?).ok()?),
+        None => Some(input),
+    }
+}
 
 use eliot_core::api::{
     HeavySummaryView, InstructionDeliveryView, OwnerRulesDeliveryStatus, OwnerRulesDeliveryView,
@@ -1509,9 +1521,15 @@ impl Store {
                     ));
                 }
                 tx.execute(
-                    "UPDATE commands SET args = json_set(args, '$.text', ?1), updated_at = ?2
-                     WHERE id = ?3",
-                    params![delivered_text, now, command_id],
+                    "UPDATE commands SET args = json_set(args, '$.text', ?1, ?2, ?3), updated_at = ?4
+                     WHERE id = ?5",
+                    params![
+                        delivered_text,
+                        format!("$.{SEND_SOURCE_BASE_BYTES_ARG}"),
+                        expected_text.len() as i64,
+                        now,
+                        command_id
+                    ],
                 )
                 .map_err(sql_error)?;
             }

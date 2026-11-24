@@ -1,5 +1,7 @@
 //! Durable interactive intent and the existing automation timer's wait readback.
 use super::*;
+
+pub const LAUNCH_SOURCE_SNAPSHOT_ARG: &str = "_queued_source_snapshot";
 use eliot_core::api::{
     AssignmentWaitView, LaunchIntentState, LaunchIntentView, LaunchQueueListRequest,
     LaunchQueueRequest, LaunchQueueView, LaunchWaitReason, ManagerBudgetRequest, ManagerBudgetView,
@@ -143,6 +145,50 @@ fn insert_receipt(
 }
 
 impl Store {
+    /// Freeze the first arbitration materialization into the already-persisted
+    /// request JSON. The write is serialized with other arbitration attempts;
+    /// a loser receives the winner's exact snapshot.
+    pub fn retain_launch_source_snapshot(
+        &mut self,
+        id: &str,
+        candidate: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT request FROM launch_intents WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some(stored) = stored else {
+                return Err(Error::new("bad_state", "launch intent is no longer queued"));
+            };
+            let mut request: SubmitCommand = decode(&stored)?;
+            if let Some(snapshot) = request.args.get(LAUNCH_SOURCE_SNAPSHOT_ARG) {
+                let snapshot = snapshot.clone();
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(snapshot);
+            }
+            request.args[LAUNCH_SOURCE_SNAPSHOT_ARG] = candidate.clone();
+            tx.execute(
+                "UPDATE launch_intents SET request=?1 WHERE id=?2",
+                params![encode_json(&request)?, id],
+            )
+            .map_err(sql_error)?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(candidate.clone())
+        })();
+        self.fault_on_persistence_error(&result);
+        result
+    }
+
     pub fn replay_launch_intent(
         &self,
         principal: &str,

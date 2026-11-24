@@ -644,7 +644,7 @@ impl Router {
             return Ok(());
         };
         let policy = self.secret_policy_snapshot();
-        let raw = command.args["text"].as_str().unwrap_or_default();
+        let raw = eliot_store::input_before_owner_rules(&command).unwrap_or_default();
         let text = work_truth::redact_record(raw, &policy);
         let owner_authored = !row
             .profile_choice

@@ -29,11 +29,7 @@ pub(super) fn append_owner_rules(
     digest: &str,
     rules: &str,
 ) -> Result<String, eliot_core::Error> {
-    let quoted = eliot_core::fence_untrusted_text(rules);
-    let block = format!(
-        "Apply the Swarm owner rules in this block (settings revision {revision}, SHA-256 {digest}).\n{quoted}"
-    );
-    let delivered = sources::append_block(input, &block);
+    let delivered = sources::append_block(input, &owner_rules_block(revision, digest, rules));
     if delivered.len() > MAX_EVENT_BYTES {
         return Err(eliot_core::Error::new(
             "frame_too_large",
@@ -41,6 +37,17 @@ pub(super) fn append_owner_rules(
         ));
     }
     Ok(delivered)
+}
+
+pub(super) fn owner_rules_reservation(revision: &str, digest: &str, rules: &str) -> usize {
+    owner_rules_block(revision, digest, rules).len() + 2
+}
+
+fn owner_rules_block(revision: &str, digest: &str, rules: &str) -> String {
+    let quoted = eliot_core::fence_untrusted_text(rules);
+    format!(
+        "Apply the Swarm owner rules in this block (settings revision {revision}, SHA-256 {digest}).\n{quoted}"
+    )
 }
 
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {
@@ -245,18 +252,10 @@ pub(super) fn apply_delivery(capture: &mut Capture, delivery: super::sources::So
 }
 
 pub(super) fn reuse_explicit_delivery(capture: &mut Capture, retained: &Value) {
-    let Some(path) = capture.source_path.as_deref() else {
-        return;
-    };
-    let Some(digest) = capture
-        .facts
-        .files
-        .iter()
-        .find(|file| file.path == capture.facts.primary_path)
-        .and_then(|file| file.sha256.as_deref())
-    else {
-        return;
-    };
+    let path = capture
+        .source_path
+        .as_deref()
+        .unwrap_or(&capture.facts.primary_path);
     let Some(deliveries) = retained.as_array() else {
         return;
     };
@@ -265,7 +264,6 @@ pub(super) fn reuse_explicit_delivery(capture: &mut Capture, retained: &Value) {
         .filter_map(|value| serde_json::from_value::<sources::SourceDelivery>(value.clone()).ok())
         .find(|delivery| {
             (delivery.path == path || cfg!(windows) && delivery.path.eq_ignore_ascii_case(path))
-                && delivery.sha256.as_deref() == Some(digest)
                 && delivery.file_status == InstructionFileStatus::Present
                 && matches!(
                     delivery.status,

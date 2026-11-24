@@ -1627,17 +1627,29 @@ fallback, and doctor reports the missing profile path and discovered replacement
 when available.
 
 `sources` (launch and `send`, CLI `--source PATH`, at most 16 distinct paths) names
-files the Agent must read. Before admission the daemon reads each one from the launch
-workspace, or for `send` from the target Agent's workspace, and replaces `sources` with a
-delivered block appended to `text`. Each section carries the path, original file
-SHA-256 prefix and byte size, and the completeness of the delivered text.
-The texts share what the 64 KiB persisted input text
-leaves after the prompt, smallest first, so a short file is never cut to make room.
+files the Agent must read. Before admitting an ordinary launch or send, the daemon
+reads each one from the launch workspace, or for `send` from the target Agent's
+workspace. The daemon replaces `sources` with a delivered block appended to `text`.
+Each section carries the path, original file SHA-256 prefix and byte size, and the
+completeness of the delivered text.
+The original input, required-source excerpts, any primary-instruction excerpt,
+any first-input Owner rules block and all framing share one 64 KiB UTF-8 byte budget.
+The original input, frozen first-input rules and required framing get space first.
+The renderer gives the remaining bytes to source excerpts, smallest first, and
+reports each cut source's completeness.
 Known secrets are redacted. A redacted attachment is labeled as such, including when
 its redacted text fits in full.
 A file that is missing, outside the workspace, not regular, binary (including NUL bytes) or larger than 8 MiB
 gets a `not delivered (reason)` line instead of being skipped. Delivery proves the text
 reached the input. A same-ID retry of an admitted request reuses its retained text.
+A queued launch freezes its required-source snapshot on the first arbitration attempt
+that materializes it. The retained intent stores each source's path, availability,
+original size and digest when available, redacted text size and a redacted UTF-8
+prefix of at most 64 KiB per source. A
+transactional first-writer update makes later arbitration attempts render the same
+source version; after admission, the bounded snapshot is rendered into the input and
+removed from command arguments. The final source excerpt may be shorter to leave room
+for the primary instruction and frozen Owner rules.
 
 A parentless Owner launch names a stored `profile`, requests the configured default
 by omitting profile/harness, or names an ad-hoc

@@ -1859,13 +1859,25 @@ impl Router {
     ) -> Result<Option<Value>> {
         let store = self.inner.store.lock().await;
         store.ensure_committed_reads()?;
+        if [
+            sources::RETAINED_SOURCE_SNAPSHOT,
+            eliot_store::SEND_SOURCE_BASE_BYTES_ARG,
+        ]
+        .iter()
+        .any(|key| request.args.get(key).is_some())
+        {
+            return Err(Error::new(
+                "invalid",
+                "source delivery metadata is daemon-owned",
+            ));
+        }
         // A same-ID retry of a launch or send with `sources` replays the text
         // its first admission delivered, when that text is this request's
         // prompt plus the delivered block.
         if matches!(request.verb.as_str(), "launch" | "send")
             && request.args.get("sources").is_some()
             && let Some(retained) = store.get_command(&request.id)?
-            && let Some(stored) = retained.args.get("text").and_then(Value::as_str)
+            && let Some(stored) = eliot_store::input_before_owner_rules(&retained)
             && sources::is_delivery_of(
                 stored,
                 request
@@ -3221,6 +3233,10 @@ impl Router {
         routing: routing::LaunchRouting<'_>,
         defer_launch_goal: bool,
     ) -> Result<PreparedSubmission> {
+        let queued_source_snapshot = request
+            .args
+            .as_object_mut()
+            .and_then(|args| args.remove(sources::RETAINED_SOURCE_SNAPSHOT));
         if request
             .args
             .get(eliot_core::PROVIDER_PROBE_LAUNCH_ARG)
@@ -3352,6 +3368,9 @@ impl Router {
         // Required sources are read and delivered before the secret check, so
         // their redacted text is checked like any other input text.
         if matches!(request.verb.as_str(), "launch" | "send") {
+            if let Some(snapshot) = queued_source_snapshot {
+                request.args[sources::RETAINED_SOURCE_SNAPSHOT] = snapshot;
+            }
             let delivered = self.deliver_sources(&mut request).await?;
             if request.verb == "launch" && !delivered.is_empty() {
                 request.args["instruction_sources"] = json!(delivered);
@@ -8958,6 +8977,8 @@ fn reject_launch_derived_keys(args: &Value) -> Result<()> {
         "project_transfer_launch",
         "profile_choice",
         "instruction_sources",
+        sources::RETAINED_SOURCE_SNAPSHOT,
+        sources::LAUNCH_OWNER_RULES,
         "source_plan",
         "target_environment",
         "workspace_preparation",

@@ -753,11 +753,14 @@ impl Router {
                 return false;
             }
         };
-        if agent.chat {
-            return self.capture_launch_owner_rules_delivery(id, &agent).await;
+        if !self
+            .capture_launch_owner_rules_delivery(command, &agent)
+            .await
+        {
+            return false;
         }
-        if existing.is_some() {
-            return self.capture_launch_owner_rules_delivery(id, &agent).await;
+        if agent.chat || existing.is_some() {
+            return true;
         }
 
         let workspace = agent.workspace.clone();
@@ -783,6 +786,29 @@ impl Router {
         );
         let mut expected_text = None;
         let mut delivered_text = None;
+        let owner_rules_reserve = match self.launch_first_input_owner_rules_reserve(&agent).await {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                self.reject_undispatched_error(id, &error).await;
+                return false;
+            }
+        };
+        if owner_rules_reserve != 0
+            && linked
+                .as_ref()
+                .and_then(eliot_store::input_before_owner_rules)
+                .is_some_and(|text| {
+                    text.len().saturating_add(owner_rules_reserve)
+                        > eliot_core::limits::MAX_EVENT_BYTES
+                })
+        {
+            let error = Error::new(
+                "frame_too_large",
+                "launch input and frozen Owner rules exceed the persisted-text limit",
+            );
+            self.reject_undispatched_error(id, &error).await;
+            return false;
+        }
         if capture.should_deliver_primary {
             match (agent.workspace.as_deref(), linked.as_ref()) {
                 (Some(workspace), Some(linked)) => {
@@ -792,6 +818,7 @@ impl Router {
                                 std::path::Path::new(workspace),
                                 text,
                                 &capture.facts.primary_path,
+                                owner_rules_reserve,
                             )
                             .await
                         {
@@ -823,7 +850,7 @@ impl Router {
                 now_ms(),
             );
         match result {
-            Ok(_) => self.capture_launch_owner_rules_delivery(id, &agent).await,
+            Ok(_) => true,
             Err(error) => {
                 self.abandon_unreadable_command(id, &error).await;
                 false
@@ -831,7 +858,39 @@ impl Router {
         }
     }
 
-    async fn capture_launch_owner_rules_delivery(&self, id: &str, agent: &Agent) -> bool {
+    async fn launch_first_input_owner_rules_reserve(&self, agent: &Agent) -> Result<usize> {
+        use eliot_core::api::{OwnerRulesDeliveryMethod, OwnerRulesDeliveryStatus};
+        let view = self
+            .inner
+            .store
+            .lock()
+            .await
+            .get_agent_owner_rules_delivery(&agent.id)?;
+        let Some(view) = view else { return Ok(0) };
+        if view.method != OwnerRulesDeliveryMethod::FirstInput
+            || matches!(
+                view.status,
+                OwnerRulesDeliveryStatus::Delivered
+                    | OwnerRulesDeliveryStatus::Unknown
+                    | OwnerRulesDeliveryStatus::NotDelivered
+            )
+        {
+            return Ok(0);
+        }
+        let text = crate::config::settings::owner_rules_for_delivery(
+            &self.inner.data_root,
+            &view.digest,
+            &self.secret_policy_snapshot(),
+        )?;
+        Ok(super::instructions::owner_rules_reservation(
+            &view.revision,
+            &view.digest,
+            &text,
+        ))
+    }
+
+    async fn capture_launch_owner_rules_delivery(&self, command: &Command, agent: &Agent) -> bool {
+        let id = &command.id;
         let existing = self
             .inner
             .store
@@ -858,7 +917,19 @@ impl Router {
                 return false;
             }
         }
-        let view = match self.read_owner_rules_receipt(&agent.harness) {
+        let frozen = match command.args.get(super::sources::LAUNCH_OWNER_RULES) {
+            Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value(value.clone())
+                .map(Some)
+                .map_err(|_| {
+                    Error::new(
+                        "source_integrity",
+                        "launch owner rules receipt is malformed",
+                    )
+                }),
+            None => self.read_owner_rules_receipt(&agent.harness),
+        };
+        let view = match frozen {
             Ok(Some(view)) => view,
             Ok(None) => return true,
             Err(error) => {

@@ -241,12 +241,34 @@ impl Router {
         let mut route = intent.route.clone();
         let automatic = intent.owner_automation || matches!(principal, Principal::Agent { .. });
         let outcome = async {
+            let mut frozen_request = intent.request.clone();
+            if frozen_request.args.get("sources").is_some()
+                && frozen_request
+                    .args
+                    .get(super::sources::RETAINED_SOURCE_SNAPSHOT)
+                    .is_none()
+            {
+                let candidate = self
+                    .capture_queued_source_snapshot(&frozen_request)
+                    .await?
+                    .ok_or_else(|| Error::new("source_integrity", "source snapshot is missing"))?
+                    .to_value()?;
+                if self.secret_policy_snapshot().contains_value(&candidate) {
+                    return Err(Error::new(
+                        "secret_in_payload",
+                        "queued source contains a known credential",
+                    ));
+                }
+                let retained = self
+                    .inner
+                    .store
+                    .lock()
+                    .await
+                    .retain_launch_source_snapshot(&intent.view.id, &candidate)?;
+                frozen_request.args[super::sources::RETAINED_SOURCE_SNAPSHOT] = retained;
+            }
             let prepared = self
-                .prepare_arbitrated_launch(
-                    intent.request.clone(),
-                    &principal,
-                    intent.owner_automation,
-                )
+                .prepare_arbitrated_launch(frozen_request, &principal, intent.owner_automation)
                 .await?;
             let project = if prepared.request.args.get("parent").is_some() {
                 self.queued_launch_project(&prepared.request).await?
