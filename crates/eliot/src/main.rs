@@ -75,22 +75,17 @@ fn main() -> ExitCode {
             Ok(exit_code) => exit_code,
             Err(error) => report_failure(Failure::new(1, error.to_string())),
         }
-    } else if let Some(CliCommand::Mcp(McpArgs {
-        http: false,
-        require_agent,
-        ..
-    })) = &cli.command
-    {
-        // The per-Agent bridge forwards async I/O. Its blocking stdio pool
-        // stays separate without reserving scheduler workers in every Agent.
-        let mut builder = if *require_agent {
-            tokio::runtime::Builder::new_current_thread()
-        } else {
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder.worker_threads(2);
-            builder
-        };
-        match builder.enable_all().build() {
+    } else if matches!(
+        &cli.command,
+        Some(CliCommand::Mcp(McpArgs { http: false, .. }))
+    ) {
+        // Each native client starts its own thin stdio bridge. A host-sized
+        // scheduler in each bridge duplicates idle threads across the fleet.
+        match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+        {
             Ok(runtime) => runtime.block_on(run_inner(cli)),
             Err(error) => report_failure(Failure::new(1, error.to_string())),
         }
