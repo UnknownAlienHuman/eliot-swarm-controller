@@ -208,6 +208,15 @@ impl Store {
         list_page(&self.connection, after, limit)
     }
 
+    /// Read all committed holds for the supplied exact scopes in one query.
+    pub fn provider_holds_for_scopes(
+        &self,
+        scopes: &[String],
+    ) -> Result<BTreeMap<String, ProviderHold>> {
+        self.ensure_committed_reads()?;
+        get_many(&self.connection, scopes)
+    }
+
     pub fn model_mismatch_hold(&self, profile: &str) -> Result<Option<ProviderHold>> {
         self.ensure_committed_reads()?;
         Ok(get(&self.connection, &core::model_hold_scope(profile))?

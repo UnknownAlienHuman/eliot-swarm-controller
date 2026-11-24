@@ -16,7 +16,10 @@ use eliot_core::{Error, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::{sync::atomic::Ordering, time::Instant};
+use std::{
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
 
 impl Router {
     /// Read-only harness installation facts: no model turn, no inference.
@@ -746,11 +749,7 @@ impl Router {
         })
     }
 
-    /// One owner-scoped read-only search over every installed harness
-    /// catalogue. Results are cached per harness executable and version with
-    /// a bounded TTL; concurrent callers coalesce on the aggregate lock. The
-    /// optional query filters case-insensitively over model id, display
-    /// name, provider and harness. The response is bounded and paginated.
+    /// Page the installed harness catalogues for the current settings revision.
     pub(super) async fn models_catalog(
         &self,
         params: &Value,
@@ -777,68 +776,59 @@ impl Router {
                 "daemon is shutting down and rejects new discovery",
             ));
         }
-        // The aggregate budget starts here and covers inventory: a slow
-        // inventory leaves less (or no) time for per-harness reads, which
-        // then fail open into the partial aggregate below.
-        let discovery_deadline = tokio::time::Instant::from_std(deadline);
-        let query = request.query.as_deref().unwrap_or("").to_owned();
-        let limit = request.effective_limit();
-        let after = request.after.clone();
-        // Coalesce concurrent callers: the first rebuilds, the rest share
-        // the fresh aggregate until its TTL lapses.
-        let _coalesce =
-            tokio::time::timeout_at(discovery_deadline, self.inner.catalog_aggregate_lock.lock())
-                .await
-                .map_err(|_| crate::adhoc::discovery_timeout())?;
-        // Harness inventory with versions for the aggregate key.
-        let harnesses = Self::harness_inventory(deadline).await?.harnesses;
-        let key = catalog::aggregate_key(&harnesses);
-        let now = now_ms();
-        if let Some(hit) =
-            self.inner
-                .catalog_cache
-                .lock_recover()
-                .get_aggregate(&key, now, after.is_some())
-        {
-            return Self::catalog_page(
-                request,
-                &hit.harnesses,
-                &hit.models,
-                &hit.failures,
-                &query,
-                limit,
-                after.as_deref(),
-                hit.fetched_at_ms,
-                hit.ttl_ms,
-            );
+        let settings_revision = self.catalog_settings_revision();
+        if let Some(snapshot) = self.cached_catalog(request, settings_revision.as_deref()) {
+            return self.catalog_page(request, &snapshot, deadline).await;
         }
-        // Provider holds for availability: a hold whose scope names the
-        // harness marks that harness's models held.
-        const HOLD_LIMIT: usize = 1000;
-        let holds = {
-            let store = tokio::time::timeout_at(discovery_deadline, self.inner.store.lock())
-                .await
-                .map_err(|_| crate::adhoc::discovery_timeout())?;
-            store.list_provider_holds(None, HOLD_LIMIT).ok()
-        };
-        let held_harness = |harness: &str| {
-            let page = holds.as_ref()?;
-            let scope = format!("profile:{}", crate::adhoc::adhoc_profile_name(harness));
-            if page.holds.iter().any(|hold| {
-                hold.scope == scope
-                    && matches!(
-                        hold.state,
-                        eliot_core::ProviderHoldState::Held
-                            | eliot_core::ProviderHoldState::Probing
-                    )
-            }) {
-                Some(true)
-            } else if page.holds.len() < HOLD_LIMIT {
-                Some(false)
-            } else {
-                None
+        let snapshot = {
+            let _coalesce =
+                tokio::time::timeout_at(deadline.into(), self.inner.catalog_aggregate_lock.lock())
+                    .await
+                    .map_err(|_| crate::adhoc::discovery_timeout())?;
+            let settings_revision = self.catalog_settings_revision();
+            match self.cached_catalog(request, settings_revision.as_deref()) {
+                Some(snapshot) => snapshot,
+                None => {
+                    let snapshot = Arc::new(self.build_catalog(settings_revision, deadline).await?);
+                    if self.catalog_settings_revision() == snapshot.settings_revision {
+                        self.inner.catalog_cache.lock_recover().aggregate = Some(snapshot.clone());
+                    }
+                    snapshot
+                }
             }
         };
+        self.catalog_page(request, &snapshot, deadline).await
+    }
+
+    fn catalog_settings_revision(&self) -> Option<String> {
+        crate::config::settings::current_revision(&self.inner.data_root)
+            .ok()
+            .flatten()
+    }
+
+    fn cached_catalog(
+        &self,
+        request: &ModelsCatalogRequest,
+        settings_revision: Option<&str>,
+    ) -> Option<Arc<catalog::CachedAggregate>> {
+        self.inner
+            .catalog_cache
+            .lock_recover()
+            .aggregate
+            .as_ref()
+            .filter(|entry| entry.settings_revision.as_deref() == settings_revision)
+            .filter(|entry| quota_fresh(entry.fetched_at_ms, entry.ttl_ms, now_ms()))
+            .filter(|entry| request.after.is_some() || entry.failures.is_empty())
+            .cloned()
+    }
+
+    async fn build_catalog(
+        &self,
+        settings_revision: Option<String>,
+        deadline: Instant,
+    ) -> Result<catalog::CachedAggregate> {
+        let discovery_deadline = tokio::time::Instant::from_std(deadline);
+        let harnesses = Self::harness_inventory(deadline).await?.harnesses;
         let mut models: Vec<ModelsCatalogEntry> = Vec::new();
         let mut failures: Vec<ModelsCatalogFailure> = Vec::new();
         let mut quotas = HashMap::new();
@@ -898,13 +888,9 @@ impl Router {
                     None
                 }
             };
-            let mut ad_hoc_quota_for_cache: Option<catalog::ScopedQuota> = None;
             if let Some(response) = ad_hoc_response {
-                let held = held_harness(harness);
-                let quota = if response.credential == "auth:available" {
-                    None
-                } else {
-                    tokio::time::timeout_at(
+                if response.credential != "auth:available"
+                    && let Ok(Ok(quota)) = tokio::time::timeout_at(
                         discovery_deadline,
                         self.harness_quota_until(
                             HarnessQuotaRequest {
@@ -915,19 +901,16 @@ impl Router {
                         ),
                     )
                     .await
-                    .ok()
-                    .and_then(Result::ok)
-                };
-                for model in response.models {
-                    models.push(catalog::catalog_entry(
-                        harness,
-                        model,
-                        held,
-                        quota.as_ref(),
-                        now_ms(),
-                    ));
+                    && quota.route_verified
+                {
+                    quotas.insert(harness.to_owned(), quota);
                 }
-                ad_hoc_quota_for_cache = quota;
+                models.extend(
+                    response
+                        .models
+                        .into_iter()
+                        .map(|model| catalog::catalog_entry(harness, model)),
+                );
             }
             // Profile models are independent preset rows. They remain visible
             // when ad-hoc discovery returns the same id, and never inherit the
@@ -996,7 +979,6 @@ impl Router {
                             model,
                             &name,
                             frozen_effort.as_deref(),
-                            now_ms(),
                         ));
                     }
                 }
@@ -1013,9 +995,6 @@ impl Router {
                         failures.push(entry);
                     }
                 }
-            }
-            if let Some(quota) = ad_hoc_quota_for_cache.filter(|quota| quota.route_verified) {
-                quotas.insert(harness.to_owned(), quota);
             }
         }
         models.sort_by(|left, right| {
@@ -1040,81 +1019,79 @@ impl Router {
         } else {
             catalog::PARTIAL_AGGREGATE_TTL_MS
         };
-        self.inner
-            .catalog_cache
-            .lock_recover()
-            .insert_aggregate(catalog::CachedAggregate {
-                key: key.clone(),
-                harnesses: harnesses.clone(),
-                models: models.clone(),
-                quotas,
-                failures: failures.clone(),
-                fetched_at_ms,
-                ttl_ms,
-            });
-        Self::catalog_page(
-            request,
-            &harnesses,
-            &models,
-            &failures,
-            &query,
-            limit,
-            after.as_deref(),
+        Ok(catalog::CachedAggregate {
+            settings_revision,
+            harnesses,
+            models,
+            quotas,
+            failures,
             fetched_at_ms,
             ttl_ms,
-        )
+        })
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "The operation's distinct inputs remain explicit at its established call boundary."
-    )]
-    fn catalog_page(
-        request: &eliot_core::api::ModelsCatalogRequest,
-        harnesses: &[eliot_core::api::HarnessEntry],
-        models: &[eliot_core::api::ModelsCatalogEntry],
-        failures: &[eliot_core::api::ModelsCatalogFailure],
-        query: &str,
-        limit: usize,
-        after: Option<&str>,
-        fetched_at_ms: i64,
-        ttl_ms: u64,
+    /// Page the retained metadata and project availability from committed holds
+    /// and fresh quota evidence.
+    async fn catalog_page(
+        &self,
+        request: &ModelsCatalogRequest,
+        snapshot: &catalog::CachedAggregate,
+        deadline: Instant,
     ) -> Result<ModelsCatalogResponse> {
         use eliot_core::api::catalog_matches;
-        // The aggregate is sorted once before caching; filtering preserves the
-        // same order for every page and continuation cursor.
-        let mut filtered: Vec<eliot_core::api::ModelsCatalogEntry> = models
+
+        let query = request.query.as_deref().unwrap_or("");
+        let limit = request.effective_limit();
+        let mut matched = snapshot
+            .models
             .iter()
-            .filter(|entry| catalog_matches(entry, query))
-            .cloned()
-            .collect();
-        let start = match after {
-            None => 0,
-            Some(cursor) => filtered
-                .iter()
-                .position(|entry| entry.cursor() == cursor)
-                .map(|index| index + 1)
-                .ok_or_else(|| {
-                    Error::new(
-                        "invalid",
-                        "catalogue cursor is no longer in the listing; restart from the first page",
-                    )
-                })?,
-        };
-        let page: Vec<eliot_core::api::ModelsCatalogEntry> =
-            filtered.into_iter().skip(start).take(limit).collect();
-        let next = if page.len() == limit {
-            page.last().map(eliot_core::api::ModelsCatalogEntry::cursor)
+            .filter(|entry| catalog_matches(entry, query));
+        if let Some(cursor) = request.after.as_deref()
+            && !matched.any(|entry| entry.cursor() == cursor)
+        {
+            return Err(Error::new(
+                "invalid",
+                "catalogue cursor is no longer in the listing; restart from the first page",
+            ));
+        }
+        let mut models: Vec<_> = matched.by_ref().take(limit).cloned().collect();
+        let next = if matched.next().is_some() {
+            models.last().map(ModelsCatalogEntry::cursor)
         } else {
             None
         };
+        let scopes: HashMap<_, _> = models
+            .iter()
+            .filter(|model| model.profile.is_none())
+            .map(|model| {
+                let profile = crate::adhoc::adhoc_profile_name(&model.harness);
+                (model.harness.clone(), format!("profile:{profile}"))
+            })
+            .collect();
+        if !scopes.is_empty() {
+            let exact_scopes: Vec<_> = scopes.values().cloned().collect();
+            let holds = tokio::time::timeout_at(deadline.into(), self.inner.store.lock())
+                .await
+                .ok()
+                .and_then(|store| store.provider_holds_for_scopes(&exact_scopes).ok());
+            let now = now_ms();
+            for model in models.iter_mut().filter(|model| model.profile.is_none()) {
+                let held = holds
+                    .as_ref()
+                    .zip(scopes.get(&model.harness))
+                    .map(|(holds, scope)| holds.contains_key(scope));
+                model.availability =
+                    availability(held, snapshot.quotas.get(&model.harness), &model.id, now)
+                        .to_owned();
+            }
+        }
         let response = ModelsCatalogResponse {
-            harnesses: harnesses.to_owned(),
-            models: page,
+            harnesses: snapshot.harnesses.clone(),
+            models,
             next,
-            fetched_at_ms,
-            ttl_ms,
-            failures: failures.to_owned(),
+            fetched_at_ms: snapshot.fetched_at_ms,
+            ttl_ms: snapshot.ttl_ms,
+            failures: snapshot.failures.clone(),
         };
         request.validate_response(&response)?;
         Ok(response)
@@ -1378,55 +1355,19 @@ fn endpoint_authority(url: &str) -> &str {
 pub(crate) struct CatalogCache {
     models: HashMap<String, HarnessModelsResponse>,
     quotas: HashMap<String, HarnessQuotaResponse>,
-    /// One aggregated `models.catalog` entry keyed by harness
-    /// executable+version. Concurrent callers coalesce on the daemon
-    /// `catalog_aggregate` async lock: the first rebuilds, the rest share the
-    /// fresh entry until its TTL lapses.
-    aggregate: Option<CachedAggregate>,
+    aggregate: Option<Arc<CachedAggregate>>,
 }
 
-/// Aggregated `models.catalog` behind the paged response: the full sorted
-/// model list plus the harness inventory it was built from, keyed by the
-/// nonsecret executable+version fingerprint.
-#[derive(Clone, Debug)]
-pub(crate) struct CachedAggregate {
-    /// `harness\0cmd\0version` per harness, sorted; a version or executable
-    /// change invalidates the entry.
-    pub(crate) key: String,
-    pub(crate) harnesses: Vec<HarnessEntry>,
-    pub(crate) models: Vec<ModelsCatalogEntry>,
-    pub(crate) quotas: HashMap<String, ScopedQuota>,
-    /// Installed harnesses whose read failed; non-empty makes it partial.
-    pub(crate) failures: Vec<ModelsCatalogFailure>,
-    pub(crate) fetched_at_ms: i64,
-    pub(crate) ttl_ms: u64,
-}
-
-impl CachedAggregate {
-    pub(crate) fn fresh(&self, now: i64) -> bool {
-        self.fetched_at_ms >= 0
-            && now >= 0
-            && (now.saturating_sub(self.fetched_at_ms) as u64) <= self.ttl_ms
-    }
-}
-
-/// Fingerprint for the aggregate cache: per-harness executable and version.
-/// Status-only changes (uninstalled with no executable) still fingerprint by
-/// harness code so a later install invalidates.
-pub(crate) fn aggregate_key(harnesses: &[HarnessEntry]) -> String {
-    let mut parts: Vec<String> = harnesses
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}\0{}\0{}",
-                entry.harness,
-                entry.cmd.as_deref().unwrap_or(""),
-                entry.version.as_deref().unwrap_or("")
-            )
-        })
-        .collect();
-    parts.sort();
-    parts.join("\n")
+/// One sorted catalogue snapshot shared across pages. Holds and quota
+/// freshness are evaluated when projecting each requested page.
+struct CachedAggregate {
+    settings_revision: Option<String>,
+    harnesses: Vec<HarnessEntry>,
+    models: Vec<ModelsCatalogEntry>,
+    quotas: HashMap<String, ScopedQuota>,
+    failures: Vec<ModelsCatalogFailure>,
+    fetched_at_ms: i64,
+    ttl_ms: u64,
 }
 
 impl CatalogCache {
@@ -1455,39 +1396,6 @@ impl CatalogCache {
     pub(crate) fn insert_quota(&mut self, key: String, entry: HarnessQuotaResponse) {
         evict_quotas(&mut self.quotas, entry.fetched_at_ms);
         self.quotas.insert(key, entry);
-    }
-
-    /// The fresh aggregate for `key`. A partial one answers only a
-    /// continuation page (`after` set): a first page rebuilds it.
-    pub(crate) fn get_aggregate(
-        &self,
-        key: &str,
-        now: i64,
-        continuation: bool,
-    ) -> Option<CachedAggregate> {
-        self.aggregate
-            .as_ref()
-            .filter(|entry| entry.key == key && entry.fresh(now))
-            .filter(|entry| continuation || entry.failures.is_empty())
-            .cloned()
-            .map(|mut entry| {
-                for model in &mut entry.models {
-                    if model.availability == eliot_core::api::harness::CATALOG_AVAILABLE {
-                        model.availability = availability(
-                            Some(false),
-                            entry.quotas.get(&model.harness),
-                            &model.id,
-                            now,
-                        )
-                        .to_owned();
-                    }
-                }
-                entry
-            })
-    }
-
-    pub(crate) fn insert_aggregate(&mut self, entry: CachedAggregate) {
-        self.aggregate = Some(entry);
     }
 }
 
@@ -1622,18 +1530,8 @@ pub(crate) fn models_key(scope: &str, cmd: &str, version: Option<&str>) -> Optio
     version.map(|version| format!("{scope}\0{cmd}\0{version}"))
 }
 
-/// Build one unified `models.catalog` entry from a harness catalogue
-/// entry: the provider derives from the id, the label uses the native display
-/// name when available, and availability comes
-/// from holds/quota (`unknown` without affirmative evidence), and the entry
-/// `source` marker is copied verbatim.
-pub(crate) fn catalog_entry(
-    harness: &str,
-    model: eliot_core::api::HarnessModelEntry,
-    held: Option<bool>,
-    quota: Option<&ScopedQuota>,
-    now: i64,
-) -> eliot_core::api::ModelsCatalogEntry {
+/// Project model metadata. An aggregate page sets availability for ad-hoc rows.
+fn catalog_entry(harness: &str, model: eliot_core::api::HarnessModelEntry) -> ModelsCatalogEntry {
     use eliot_core::api::catalog_provider;
     eliot_core::api::ModelsCatalogEntry {
         harness: harness.to_owned(),
@@ -1643,7 +1541,7 @@ pub(crate) fn catalog_entry(
         efforts: model.efforts,
         default_effort: model.default_effort,
         default: model.default,
-        availability: availability(held, quota, &model.id, now).to_owned(),
+        availability: eliot_core::api::harness::CATALOG_UNKNOWN.to_owned(),
         source: model.source,
         profile: None,
     }
@@ -1651,14 +1549,13 @@ pub(crate) fn catalog_entry(
 
 /// Build one named-profile preset entry carrying only its frozen model and
 /// effort. The picker launches this row with the named profile.
-pub(crate) fn profile_catalog_entry(
+fn profile_catalog_entry(
     harness: &str,
     model: eliot_core::api::HarnessModelEntry,
     profile: &str,
     frozen_effort: Option<&str>,
-    now: i64,
-) -> eliot_core::api::ModelsCatalogEntry {
-    let mut entry = catalog_entry(harness, model, None, None, now);
+) -> ModelsCatalogEntry {
+    let mut entry = catalog_entry(harness, model);
     entry.efforts = frozen_effort.map(|effort| vec![effort.to_owned()]);
     entry.default_effort = frozen_effort.map(str::to_owned);
     entry.default = false;

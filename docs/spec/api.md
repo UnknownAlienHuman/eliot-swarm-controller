@@ -503,7 +503,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
-| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues; request, entries, failures and quota vocabulary: [canonical DTOs](../../crates/eliot-core/src/api/harness.rs). Membership never proves availability: affirmative fresh native quota and complete hold readback are required. Failed harness reads remain visible; a partial listing supports continuation but the next first page retries failed reads. An `after` cursor that is not in the current listing (the models changed between pages) is an `invalid` error with the message `catalogue cursor is no longer in the listing; restart from the first page`; it is never a restart from page one. Executable/version-bound caching and concurrent-read coalescing belong to the [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs). |
+| `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical DTOs](../../crates/eliot-core/src/api/harness.rs) define requests, entries, failures and quota vocabulary. Failed harness reads remain visible. A partial listing supports continuation and the next first page retries failed reads. An `after` cursor missing from the current listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles caching, discovery and page availability. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
 | `settings.read/save` | owner-only unified section read/save, including revisioned `owner_rules.text` and budget warnings, revision CAS, dry run, restart indication and bounded author history; see configuration |
 | `project.transfer` | Owner-only transfer intent, optional replacement launch, atomic commit or cancellation with typed readback. See [Project transfer](coordination.md#project-transfer). |
@@ -2357,10 +2357,13 @@ Candidate `version` retains the bounded raw first line when available, or is
 null when the probe is unavailable. Inventory presence does not make an
 executable eligible for automatic Claude selection; that requires a successful
 `--version` probe with a parseable numeric version.
-Inventory and native discovery run on the blocking pool. The
-`models.catalog` 90-second deadline covers the aggregate lock, inventory
-worker and per-harness reads. Expiry during a per-harness read can return a
-partial catalog. Cold version lookup and election are atomic for the resolved
+Inventory and native discovery run on the blocking pool. `models.catalog`
+serves fresh aggregate pages from the current settings revision without
+running inventory. New settings, expiry, or a first page after a partial
+listing rebuild the aggregate. The 90-second deadline covers waiting for a
+rebuild, inventory and per-harness reads. Expiry during a per-harness read can
+return a partial catalogue. Native executable and version changes are picked
+up on the next rebuild. Cold version lookup and election are atomic for the resolved
 binary. Followers share its result within their deadline. On Unix the
 resolved payload must have an ELF or Mach-O header before a probe, including
 for explicit paths. Inventory, model discovery, quota and launch resolve one
@@ -2454,8 +2457,11 @@ window without credits); a full secondary window or a metered
 `rateLimitsByLimitId` bucket never skips a route. Callers never reparse raw
 quota JSON into booleans. Freshness is enforced through the same projection
 entry point in both consumers. A response past its TTL leaves routing status
-and availability `unknown`. Aggregate cache hits reproject availability
-against the observation and reset times. `details.state` is `ready` or
+and availability `unknown`. Every aggregate page projects ad-hoc availability
+from current exact profile holds and the cached quota's observation and reset
+times. Missing hold readback leaves availability `unknown`. Named presets
+carry their own selection and do not borrow ad-hoc hold or quota evidence.
+`details.state` is `ready` or
 `error`; `details.origin` is
 `provider` or `environment`. A failed read remains `status:"supported"` with
 `state:"error"`, a sanitized reason and no windows. Unsupported native integration
