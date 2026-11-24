@@ -828,6 +828,14 @@ fn reserve_switch_tx(
     if source.generation != request.from_generation {
         return Err(Error::new("stale_generation", "source generation moved"));
     }
+    // The replay digest still binds the caller payload. Only the retained
+    // worker request freezes the additional, Store-discovered SEND IDs.
+    args["commands"] = json!(handoff::switch_transfer_commands(
+        tx,
+        &source,
+        &request.commands,
+        source.is_terminal()
+    )?);
     let source_checkout_root = args
         .get(SOURCE_CHECKOUT_ROOT)
         .and_then(Value::as_str)
@@ -1783,7 +1791,13 @@ impl Store {
                         self.hierarchy_limits,
                         transfer,
                     )?;
-                    super::work_truth::inherit_work_task_tx(&tx, &source, &destination, now)?;
+                    super::work_truth::inherit_work_task_tx(
+                        &tx,
+                        &source,
+                        &destination,
+                        &change.value.transfers,
+                        now,
+                    )?;
                     Store::transfer_handoff_lineage_tx(&tx, &source, &destination)?;
                     let target_root = target_checkout_root.as_deref().ok_or_else(|| {
                         Error::new("source_integrity", "switch target checkout root is missing")
@@ -2436,7 +2450,7 @@ fn source_tx(
     }
     handoff::transfer_source_ready(tx, &source)?;
     project_transfer::require_no_intent(tx, &source.project)?;
-    handoff::source_inputs(
+    let (_, inputs) = handoff::source_inputs(
         tx,
         &source,
         &request.task_command,
@@ -2444,6 +2458,12 @@ fn source_tx(
         None,
         policy,
     )?;
+    if inputs.len() as i64 > limits.max_selector_targets {
+        return Err(Error::new(
+            "fanout_limit",
+            "switch selection exceeds configured bound",
+        ));
+    }
     goals::require_handoff_source_goal(tx, &source, policy)?;
     require_switch_children(tx, &source, limits)?;
     // Continue-in-project binds the target registration at reserve time, so

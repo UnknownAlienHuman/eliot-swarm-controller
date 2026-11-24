@@ -3,7 +3,7 @@
 use super::*;
 use eliot_core::api::{
     AgentHandoffView, AgentWorkTruthView, CheckpointRestoreRequest, CheckpointRestoreResponse,
-    GitCheckpointState, GitCheckpointView, GitCheckpointWithheld, HandoffReason,
+    GitCheckpointState, GitCheckpointView, GitCheckpointWithheld, HandoffReason, SendTransfer,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +60,13 @@ pub struct GitCheckpointIntent {
     pub input: GitCheckpointInput,
 }
 
+#[derive(Clone, Debug)]
+pub struct CheckpointRetentionGeneration {
+    pub agent_id: i64,
+    pub generation: i64,
+    pub checkpoint_ref: Option<String>,
+}
+
 pub enum GitCheckpointReservation {
     Reserved,
     Deferred,
@@ -109,14 +116,39 @@ pub(super) fn inherit_work_task_tx(
     tx: &Transaction<'_>,
     from: &Agent,
     to: &Agent,
+    transfers: &[SendTransfer],
     now: i64,
 ) -> Result<()> {
-    inherit_work_task_generation_tx(
-        tx,
-        (parse_agent_id(&from.id)?, from.generation),
-        (parse_agent_id(&to.id)?, to.generation),
-        now,
+    let from = (parse_agent_id(&from.id)?, from.generation);
+    let to = (parse_agent_id(&to.id)?, to.generation);
+    inherit_work_task_generation_tx(tx, from, to, now)?;
+    for transfer in transfers {
+        inherit_work_task_binding_tx(tx, from, to, &transfer.original, &transfer.successor, now)?;
+    }
+    Ok(())
+}
+
+fn inherit_work_task_binding_tx(
+    tx: &Transaction<'_>,
+    from: (i64, i64),
+    to: (i64, i64),
+    original: &str,
+    successor: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO git_work_tasks(agent, generation, task_command, task_ref, principal, updated_at)
+         SELECT ?3, ?4, ?7, task_ref, principal, ?5
+         FROM git_work_tasks
+         WHERE agent = ?1 AND generation = ?2 AND task_command = ?6
+         ON CONFLICT(agent, generation, task_command) DO UPDATE SET
+             task_ref = excluded.task_ref,
+             principal = COALESCE(excluded.principal, git_work_tasks.principal),
+             updated_at = excluded.updated_at",
+        params![from.0, from.1, to.0, to.1, now, original, successor],
     )
+    .map_err(sql_error)?;
+    Ok(())
 }
 
 pub(super) fn inherit_work_task_generation_tx(
@@ -482,6 +514,125 @@ impl Store {
             })
         })
         .collect()
+    }
+
+    pub fn has_git_checkpoint_intents(&self) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM git_checkpoint_intents)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    /// Old or terminal generations eligible for bounded private-ref cleanup.
+    pub fn checkpoint_retention_generations(
+        &self,
+        after: Option<(i64, i64)>,
+        limit: usize,
+        terminal_cutoff: i64,
+    ) -> Result<Vec<CheckpointRetentionGeneration>> {
+        self.ensure_committed_reads()?;
+        let (after_agent, after_generation) = after.unwrap_or((0, 0));
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT checkpoint.agent, checkpoint.generation, checkpoint.checkpoint_ref
+                 FROM git_checkpoints checkpoint
+                 LEFT JOIN agents agent ON agent.id = checkpoint.agent
+                 WHERE checkpoint.session_end_pending = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM git_checkpoint_intents intent
+                       WHERE intent.agent = checkpoint.agent
+                         AND intent.generation = checkpoint.generation
+                   )
+                   AND checkpoint.generation <= agent.generation
+                   AND agent.state IN ('stopped','failed','lost')
+                   AND agent.updated_at <= ?3
+                   AND (checkpoint.agent > ?1
+                        OR (checkpoint.agent = ?1 AND checkpoint.generation > ?2))
+                 ORDER BY checkpoint.agent, checkpoint.generation
+                 LIMIT ?4",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map(
+                params![
+                    after_agent,
+                    after_generation,
+                    terminal_cutoff,
+                    limit.clamp(1, 32) as i64
+                ],
+                |row| {
+                    Ok(CheckpointRetentionGeneration {
+                        agent_id: row.get(0)?,
+                        generation: row.get(1)?,
+                        checkpoint_ref: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)
+    }
+
+    /// Keep a checkpoint while it is the newest retained snapshot for its
+    /// durable Git task identity, including successor SEND aliases.
+    pub fn checkpoint_ref_is_latest_for_task(&self, reference: &str) -> Result<bool> {
+        self.ensure_committed_reads()?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM git_checkpoints checkpoint
+                     JOIN git_work_tasks task
+                       ON task.agent = checkpoint.agent
+                      AND task.generation = checkpoint.generation
+                     WHERE checkpoint.checkpoint_ref = ?1
+                       AND checkpoint.state IN ('snapshot','failed')
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM git_work_tasks newer_task
+                           JOIN git_checkpoints newer
+                             ON newer.agent = newer_task.agent
+                            AND newer.generation = newer_task.generation
+                           WHERE newer_task.task_ref = task.task_ref
+                             AND newer.state = 'snapshot'
+                             AND newer.checkpoint_ref IS NOT NULL
+                             AND substr(newer.checkpoint_ref, -43) > substr(checkpoint.checkpoint_ref, -43)
+                       )
+                 ) OR EXISTS(
+                     SELECT 1 FROM git_checkpoints checkpoint
+                     WHERE checkpoint.checkpoint_ref = ?1
+                       AND checkpoint.state IN ('snapshot','failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM git_work_tasks task
+                           WHERE task.agent = checkpoint.agent
+                             AND task.generation = checkpoint.generation
+                       )
+                 )",
+                [reference],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
+    pub fn clear_pruned_checkpoint_ref(&mut self, reference: &str) -> Result<()> {
+        self.ensure_writer_healthy()?;
+        let result = self
+            .connection
+            .execute(
+                "UPDATE git_checkpoints
+                 SET state = 'none', checkpoint_ref = NULL, oid = NULL, fingerprint = NULL
+                 WHERE checkpoint_ref = ?1",
+                [reference],
+            )
+            .map(|_| ())
+            .map_err(sql_error);
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     /// Whether this ended generation's whole process tree is proven gone.

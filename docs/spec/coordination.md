@@ -1262,6 +1262,16 @@ omits a Git task record bound to that same SEND. Unknown or still-dispatched inp
 only as quoted history with their state; the successor does not receive them as new SENDs
 and must verify their effects before continuing.
 
+A switch freezes the caller's selected SENDs first and appends other plain SENDs
+with proven no effect in queue order. It includes accepted or queued inputs,
+provider-held inputs refused before dispatch, and generation-stop or loss
+cancellations or refusals eligible for transfer from an ended source. The replay
+digest still binds the caller's request. H2 refuses if new owed input appears.
+At most 64 can move in one switch; excess inputs must be settled before switching. The
+selected task binding and each transferred SEND's existing Git task binding move in the
+same Store transaction, with the latter attached to its successor SEND. Dispatched or
+unknown inputs are not part of this set and are never replayed.
+
 Before external preparation the Store checks A's exact generation and readiness,
 any named task and selected SENDs, transferable Goal, and controlled child
 limits for the prospective root. The parent freezes the launch and handoff IDs

@@ -350,15 +350,86 @@ pub(super) fn source_inputs(
     policy: &core::SecretPolicy,
 ) -> Result<(Option<Command>, Vec<Command>)> {
     let task = continuation_task(connection, from, task_command, principal)?;
+    let transfer_commands =
+        switch_transfer_commands(connection, from, commands, from.is_terminal())?;
     let originals = source_sends(
         connection,
         from,
-        commands,
+        &transfer_commands,
         principal,
         policy,
         from.is_terminal(),
     )?;
     Ok((task, originals))
+}
+
+/// Preserve the caller's explicit order, then append every other SEND this
+/// source can safely transfer in Store order.
+pub(super) fn switch_transfer_commands(
+    connection: &Connection,
+    from: &Agent,
+    commands: &[String],
+    stopped_source: bool,
+) -> Result<Vec<String>> {
+    const SCAN_LIMIT: usize = 256;
+    if commands.len() > core::api::MAX_HANDOFF_SENDS {
+        return Err(Error::new(
+            "fanout_limit",
+            "switch has more transferable SENDs than one handoff can carry; settle some before switching",
+        ));
+    }
+    for id in commands {
+        if is_brief_tx(connection, id)? {
+            return Err(Error::new(
+                "bad_state",
+                format!("handoff brief {id} is context, not a transferable task SEND"),
+            ));
+        }
+    }
+    let mut transfer_commands = commands.to_vec();
+
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM commands INDEXED BY commands_target
+             WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+               AND state IN ('accepted','queued','cancelled','rejected')
+             ORDER BY created_at, rowid LIMIT ?3",
+        )
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(
+            params![
+                parse_agent_id(&from.id)?,
+                from.generation,
+                (SCAN_LIMIT + 1) as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(sql_error)?;
+    for (index, row) in rows.enumerate() {
+        if index == SCAN_LIMIT {
+            return Err(Error::new(
+                "fanout_limit",
+                "switch SEND inventory exceeds its safe scan bound; settle older SENDs before switching",
+            ));
+        }
+        let id = row.map_err(sql_error)?;
+        if is_brief_tx(connection, &id)? {
+            continue;
+        }
+        let record = load_command_record(connection, &id)?
+            .ok_or_else(|| Error::new("source_integrity", "switch SEND disappeared"))?;
+        if transferable_send(&record, stopped_source) && !transfer_commands.contains(&id) {
+            if transfer_commands.len() == core::api::MAX_HANDOFF_SENDS {
+                return Err(Error::new(
+                    "fanout_limit",
+                    "switch has more transferable SENDs than one handoff can carry; settle some before switching",
+                ));
+            }
+            transfer_commands.push(id);
+        }
+    }
+    Ok(transfer_commands)
 }
 
 fn source_task(
@@ -709,6 +780,15 @@ pub(super) fn handoff_tx(
         policy,
         project_transfer || (from_switch && from.is_terminal()),
     )?;
+    if from_switch {
+        let complete = switch_transfer_commands(tx, &from, &request.commands, from.is_terminal())?;
+        if complete != request.commands {
+            return Err(Error::new(
+                "bad_state",
+                "switch gained a transferable SEND after its reservation",
+            ));
+        }
+    }
     let required_task = || {
         task.as_ref()
             .ok_or_else(|| Error::new("source_integrity", "handoff task is missing"))

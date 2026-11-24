@@ -256,8 +256,8 @@ pub use switch::{
 mod swarm_usage;
 mod work_truth;
 pub use work_truth::{
-    CheckpointRestoreAdmission, GIT_CHECKPOINT, GitCheckpointBasis, GitCheckpointInput,
-    GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
+    CheckpointRestoreAdmission, CheckpointRetentionGeneration, GIT_CHECKPOINT, GitCheckpointBasis,
+    GitCheckpointInput, GitCheckpointIntent, GitCheckpointReservation, JournalTurn,
 };
 mod turn_recovery;
 pub(crate) mod usage;

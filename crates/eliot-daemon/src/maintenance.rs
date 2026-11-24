@@ -292,6 +292,7 @@ async fn run_retention(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let mut config = initial;
+    let mut checkpoint_cursor = None;
     let mut interval_seconds = config.retention.maintenance_interval_seconds();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_seconds));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -345,6 +346,21 @@ async fn run_retention(
         )
         .await
         .ok();
+        if let Err(error) = crate::work_truth_repo::maintain(
+            &store,
+            &data_root,
+            checkpoint_cutoff(&config.retention, now_ms()),
+            &mut checkpoint_cursor,
+        )
+        .await
+        {
+            logging::record(
+                &policy,
+                "daemon.checkpoint_retention_failed",
+                &[],
+                Some(&error),
+            );
+        }
         if unbounded_store_over_threshold(
             &config.retention,
             &data_root,
@@ -397,7 +413,7 @@ pub(crate) async fn run_now(
 ) -> Result<RetentionReport> {
     let config = config::load_daemon_config(data_root)?;
     let mut epochs = 0;
-    run_epochs(
+    let report = run_epochs(
         store,
         data_root,
         &config.retention,
@@ -408,7 +424,21 @@ pub(crate) async fn run_now(
             epochs > 1
         },
     )
-    .await
+    .await?;
+    crate::work_truth_repo::maintain(
+        store,
+        data_root,
+        checkpoint_cutoff(&config.retention, now),
+        &mut None,
+    )
+    .await?;
+    Ok(report)
+}
+
+fn checkpoint_cutoff(retention: &config::RetentionConfig, now: i64) -> Option<i64> {
+    retention
+        .events_retention_seconds()
+        .map(|seconds| now.saturating_sub(seconds.saturating_mul(1_000)))
 }
 
 /// Run bounded retention epochs until an epoch drains or a budget runs out:

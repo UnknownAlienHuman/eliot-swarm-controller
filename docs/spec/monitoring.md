@@ -761,7 +761,11 @@ directory and captured HEAD, then records separate staged-index and worktree lay
 Capture constructs the commit and returns its proposed ref and OID; the Router publishes
 the ref after it reserves and stores the checkpoint intent. Restart reconciles that
 intent against the exact ref and OID. The newest 20 published refs per generation are
-kept. An unchanged worktree writes no Git object. A failed capture is recorded and never
+kept. Retention sweeps old checkpoints of terminal Agents using the event-retention
+window. It preserves the newest restorable snapshot for each task and the latest
+snapshot of a generation without a task record. The daemon collects unreachable
+objects within a time limit in the private Git write lane. Unsettled checkpoint
+intents defer collection. An unchanged worktree writes no Git object. A failed capture is recorded and never
 blocks a turn, stop, handoff or removal.
 
 Before writing an object, the daemon scans every candidate path and the exact bytes for

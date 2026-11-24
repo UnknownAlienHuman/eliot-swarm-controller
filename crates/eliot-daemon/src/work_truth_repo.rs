@@ -8,8 +8,17 @@ use std::{
 };
 use tokio::time::Instant;
 
+mod retention;
+pub(crate) use retention::maintain;
+
 const REPOSITORY_NAME: &str = "work-truth.git";
 static INITIALIZATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static WRITE_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serialize every write to the daemon-owned bare repository, including GC.
+pub(crate) async fn write_lane() -> tokio::sync::MutexGuard<'static, ()> {
+    WRITE_LANE.lock().await
+}
 
 fn repository_path(data_root: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(data_root)

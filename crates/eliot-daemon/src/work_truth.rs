@@ -134,6 +134,7 @@ pub(crate) async fn checkpoint(request: CheckpointRequest<'_>) -> GitCheckpointI
     let trigger = request.trigger;
     let turn_id = request.turn_id.clone();
     let policy = Arc::clone(&request.policy);
+    let _write_lane = crate::work_truth_repo::write_lane().await;
     match capture(request).await {
         Ok(input) => input,
         Err(error) => GitCheckpointInput::failed(
@@ -876,6 +877,7 @@ async fn write_checkpoint(
 }
 
 pub(crate) async fn publish_checkpoint(root: &Path, reference: &str, oid: &str) -> Result<()> {
+    let _write_lane = crate::work_truth_repo::write_lane().await;
     let git = GitProbe::new()?;
     let zero = "0".repeat(oid.len());
     let result = git
@@ -926,6 +928,7 @@ fn set_withheld(input: &mut GitCheckpointInput, mut withheld: Vec<GitCheckpointW
 }
 
 pub(crate) async fn prune_checkpoints(root: &Path, current: &str) -> Result<()> {
+    let _write_lane = crate::work_truth_repo::write_lane().await;
     let git = GitProbe::new()?;
     let Some((prefix, _)) = current.rsplit_once('/') else {
         return Err(Error::new(
@@ -1295,6 +1298,7 @@ pub(crate) async fn ensure_task(
 ) -> Result<()> {
     let git = GitProbe::new()?;
     let root = crate::work_truth_repo::open(data_root, workspace).await?;
+    let _write_lane = crate::work_truth_repo::write_lane().await;
     let deadline = Instant::now() + GIT_TIME;
     if task_commit(&git, &root, &record.task_ref, deadline)
         .await
@@ -1777,6 +1781,7 @@ pub(crate) async fn append_journal(
 ) -> Result<()> {
     let git = GitProbe::new()?;
     let root = crate::work_truth_repo::open(data_root, workspace).await?;
+    let _write_lane = crate::work_truth_repo::write_lane().await;
     let deadline = Instant::now() + GIT_TIME;
     let Some(parent) = task_commit(&git, &root, task_ref, deadline).await else {
         return Ok(());
