@@ -2342,15 +2342,6 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
                 next.native_ref = Some(native_ref);
             }
             if let Some(effective) = optional_effective(event)? {
-                let mut effective = effective;
-                if agent.harness == "muse"
-                    && let Some(effective) = effective.as_object_mut()
-                    && effective.get("model").is_none_or(Value::is_null)
-                    && let Some(model) = requested_muse_model(agent)
-                {
-                    effective.insert("model".to_owned(), Value::String(model.to_owned()));
-                    effective.insert("model_verified".to_owned(), Value::Bool(false));
-                }
                 next.effective = Some(effective);
             }
             next.state = AgentState::Idle;
@@ -2363,9 +2354,9 @@ pub fn apply(agent: &Agent, event: &NativeEvent, now: i64) -> Result<(Agent, Vec
             if api::HarnessCapabilities::of(&agent.harness).provider_response_model_verification
                 && let Some(Value::Object(effective)) = next.effective.as_mut()
             {
-                if agent.harness == "muse" {
-                    preserve_requested_muse_model(effective, requested_muse_model(agent));
-                } else {
+                // Muse's session.ready model is its native-admitted selector;
+                // keep it visible while this turn's response remains unverified.
+                if agent.harness != "muse" {
                     effective.insert("model".to_owned(), Value::Null);
                 }
                 effective.insert("model_verified".to_owned(), Value::Bool(false));
@@ -2762,11 +2753,10 @@ fn record_serving_model(agent: &mut Agent, model: String) {
 }
 
 fn record_unnamed_provider_model(agent: &mut Agent) {
-    let requested_model = requested_muse_model(agent).map(str::to_owned);
     if let Some(Value::Object(effective)) = agent.effective.as_mut() {
-        if agent.harness == "muse" {
-            preserve_requested_muse_model(effective, requested_model.as_deref());
-        } else {
+        // Preserve Muse's admitted selector as display data; the missing
+        // provider response still leaves it unverified.
+        if agent.harness != "muse" {
             effective.insert("model".to_owned(), Value::Null);
         }
         effective.insert("model_verified".to_owned(), Value::Bool(false));
@@ -2774,28 +2764,6 @@ fn record_unnamed_provider_model(agent: &mut Agent) {
             "model_unverified_reason".to_owned(),
             Value::String(routing::PROVIDER_MODEL_UNNAMED.to_owned()),
         );
-    }
-}
-
-fn requested_muse_model(agent: &Agent) -> Option<&str> {
-    if agent.harness != "muse" {
-        return None;
-    }
-    agent
-        .profile_snapshot
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-}
-
-fn preserve_requested_muse_model(
-    effective: &mut serde_json::Map<String, Value>,
-    requested_model: Option<&str>,
-) {
-    if effective.get("model").is_none_or(Value::is_null)
-        && let Some(model) = requested_model
-    {
-        effective.insert("model".to_owned(), Value::String(model.to_owned()));
     }
 }
 
