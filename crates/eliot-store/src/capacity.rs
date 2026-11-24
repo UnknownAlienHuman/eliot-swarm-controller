@@ -1136,10 +1136,9 @@ pub(super) fn release_owned_exit_tx(
     release_proven_generation_tx(tx, agent, generation)
 }
 
-/// Record the plugin host's proof that it saw the generation's plugin exit and
-/// drained its reader. Stop and lost transitions close native sources without
-/// a drain, so only this record proves one.
-pub(super) fn record_owned_exit_proof_tx(
+/// Record the plugin host's proof that the generation's reader has drained or
+/// joined after abandonment. The OS source proves process exit independently.
+pub(super) fn record_owned_reader_drain_tx(
     tx: &Transaction<'_>,
     agent: i64,
     generation: i64,

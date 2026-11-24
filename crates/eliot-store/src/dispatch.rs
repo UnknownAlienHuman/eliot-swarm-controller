@@ -698,7 +698,7 @@ fn dispatch_stop_tx(
         Some(agent_num),
         Some(agent.generation),
         id,
-        json!({"command_id": id, "verb": "stop"}),
+        json!({"command_id": id, "verb": "stop", "live_at_dispatch": !agent.is_terminal()}),
     )?);
     Ok(())
 }
