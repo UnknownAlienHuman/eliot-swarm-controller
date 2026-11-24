@@ -1414,19 +1414,21 @@ fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Re
         now,
         ..
     } = scope;
-    persist_session_usage_snapshot(tx, agent_num, generation, now, usage)
+    persist_session_usage_snapshot(tx, agent_num, generation, now, usage)?;
+    Ok(())
 }
 
 /// Replace the generation's current session snapshot in the caller's
 /// transaction. Native journal events and live non-journal samples share this
-/// monotonic projection update.
+/// monotonic projection update. Return the encoded snapshot that the transaction
+/// retains so callers needing a readback can decode it after commit.
 pub(super) fn persist_session_usage_snapshot(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     now: i64,
     usage: &SessionUsage,
-) -> Result<()> {
+) -> Result<String> {
     let snapshot = encode_json(usage)?;
     if snapshot.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
@@ -1459,7 +1461,7 @@ pub(super) fn persist_session_usage_snapshot(
         }
         Some((stored_snapshot, stored_at)) => {
             if stored_snapshot == snapshot || observed_at <= stored_at {
-                return Ok(());
+                return Ok(stored_snapshot);
             }
             db!(tx.execute(
                 "UPDATE session_usage SET snapshot = ?1, observed_at = ?2
@@ -1468,7 +1470,7 @@ pub(super) fn persist_session_usage_snapshot(
             ));
         }
     }
-    Ok(())
+    Ok(snapshot)
 }
 
 pub(super) fn verified_native_event_cause_tx(

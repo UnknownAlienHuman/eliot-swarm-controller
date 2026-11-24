@@ -94,10 +94,11 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            native_events::persist_session_usage_snapshot(&tx, agent_num, generation, now, &usage)?;
+            let snapshot = native_events::persist_session_usage_snapshot(
+                &tx, agent_num, generation, now, &usage,
+            )?;
             commit_transaction(tx, &self.write_faulted)?;
-            self.get_session_usage(agent, generation)?
-                .ok_or_else(|| Error::new("internal", "session usage sample was not retained"))
+            decode_session_usage(&snapshot, &previous.harness)
         })();
         self.fault_on_persistence_error(&result);
         result

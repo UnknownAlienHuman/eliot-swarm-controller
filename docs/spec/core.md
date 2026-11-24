@@ -988,8 +988,9 @@ Session snapshots and whole-turn usage supply their own counters.
 `session_usage` retains the latest serialized `SessionUsage` snapshot per
 Agent generation. Intermediate samples from an active turn update live
 Monitor state in memory. A completed turn with an accepted sample journals
-one `session.usage` observation. A session-only sample can refresh the
-projection without a journal row. `source` names the adapter and native
+one `session.usage` observation. An idle session-only sample can refresh the
+projection without a journal row and returns the effective snapshot after
+commit. `source` names the adapter and native
 signal. `observed_at` is native epoch milliseconds, defaulted at the owning
 boundary. A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
