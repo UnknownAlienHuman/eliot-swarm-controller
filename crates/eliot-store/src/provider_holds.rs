@@ -667,7 +667,7 @@ impl Store {
     ) -> Result<Vec<core::Event>> {
         self.ensure_writer_healthy()?;
         let result = (|| {
-            if expected.kind != ProviderRestrictionKind::Quota
+            if !expected.uses_passive_quota_readback()
                 || expected.state != ProviderHoldState::Held
                 || expected.probe_outcome_unknown
                 || observed_at_ms <= expected.updated_at
@@ -995,7 +995,8 @@ fn automatic_probe_due(hold: &ProviderHold, now: i64) -> bool {
     matches!(
         hold.kind,
         ProviderRestrictionKind::RateLimit | ProviderRestrictionKind::Quota
-    ) && hold.state == ProviderHoldState::Held
+    ) && !hold.uses_passive_quota_readback()
+        && hold.state == ProviderHoldState::Held
         && hold.probe_command.is_none()
         && hold.retry_after.is_none()
         && !automatic_probe_paused(hold)

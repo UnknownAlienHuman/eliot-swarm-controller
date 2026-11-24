@@ -187,8 +187,10 @@ impl Router {
             response.note = Some(
                 match (error.is_some(), details["source"].as_str()) {
                     (true, _) => "Last subscription allowance; latest read failed",
-                    (false, Some("mint")) => "Muse subscription allowance from usage --json",
-                    _ => "Muse subscription usage observed during a turn",
+                    (false, Some("Muse MSP usage/changed")) => {
+                        "Muse subscription usage observed during a turn"
+                    }
+                    _ => "Muse subscription allowance from usage --json",
                 }
                 .to_owned(),
             );

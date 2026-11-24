@@ -319,12 +319,6 @@ pub enum NativeModelEffortVariants {
 // Subscription usage (F15: native quota readback)
 // ---------------------------------------------------------------------------
 
-/// `usage/read` params: a read-only query, not a command. The host mints no
-/// session and performs no model call; params stay empty.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeUsageReadParams {}
-
 /// The current usage window (the provider's 5-hour-class block): verbatim
 /// provider percentages with the reset stamp normalized to epoch
 /// milliseconds. Observed live from `muse-bin-1.4.0-R4161.1` (spec 18742
@@ -357,15 +351,6 @@ pub struct NativeSubscriptionUsage {
     pub weekly: NativeSubscriptionUsageWeekly,
     pub tier: String,
     pub observed_at_ms: i64,
-}
-
-/// `usage/read` result: `{usage?}`, omitted (never `null`) when the host
-/// has observed nothing (ADR 32563 D2: truthful absence, no error).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NativeUsageReadResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<NativeSubscriptionUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

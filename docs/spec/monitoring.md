@@ -952,8 +952,8 @@ through the shared [quota path](api.md). Fresh account-wide headroom observed
 after the refusal clears the exact unchanged hold and wakes launch arbitration.
 The ordinary resume and handoff paths then see the released scope. A failed,
 stale or exhausted read keeps the hold and defers the next background check.
-This check needs the refusing generation's verified route and consumes no
-model turn or probe admission. Unresolved probes remain fenced.
+This check needs the refusing generation's verified route and replaces
+automatic model probes for these holds. Unresolved probes remain fenced.
 Each admitted probe records `provider.hold_probe_started` and known
 completion records `provider.hold_probe_finished`. A successful exact-turn native
 completion with no restriction clears the hold. A known failure keeps the hold,

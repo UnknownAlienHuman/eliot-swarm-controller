@@ -191,10 +191,7 @@ impl Router {
         let mut started = Vec::with_capacity(candidates.len());
         for candidate in candidates {
             if let Some(hold) = holds.get(&candidate.scope)
-                && hold.kind == eliot_core::ProviderRestrictionKind::Quota
-                && hold.source.as_ref().is_some_and(|source| {
-                    HarnessCapabilities::of(&source.harness).reads_retained_quota
-                })
+                && hold.uses_passive_quota_readback()
             {
                 match self.recheck_quota_hold(hold).await {
                     Ok(true) => continue,

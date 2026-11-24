@@ -27,13 +27,14 @@ pub fn declaration() -> HarnessCapabilities {
             ..ModelReaderOptions::default()
         },
         quota_readback: Some(NativeQuotaReadback {
-            method: "usage/read",
+            method: "usage --json",
             unsupported_note: Some(
-                "Installed Muse MSP does not support usage/read and has no retained subscription observation",
+                "Muse usage --json requires the installed Windows vendor launcher",
             ),
+            route_refusal: Some(crate::quota::route_refusal),
             ..quota_readback(
                 QuotaProjectionFormat::UsagePair,
-                |_| "Muse subscription usage observed during a turn; timestamp is the native observation",
+                |_| "Muse subscription allowance",
             )
         }),
         adhoc_effort: Some(AdhocEffort::Freeform),
