@@ -37,8 +37,8 @@ pub fn declaration() -> HarnessCapabilities {
                     .then_some("Antigravity profile selects external auth; native keyring quota would describe another route")
             }),
             ..quota_readback(
-                crate::quota::project_quota,
-                eliot_plugin::quota::projection::account_usage_windows,
+                crate::quota::quota_evidence,
+                crate::quota::quota_usage_windows,
                 |_| "Antigravity account quota; provider read-only values",
             )
         }),

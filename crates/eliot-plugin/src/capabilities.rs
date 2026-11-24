@@ -2,30 +2,20 @@
 
 use eliot_core::api::harness::{
     AdhocAccess, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeQuotaReadback,
-    ProjectInstructionRead, QuotaProjector, QuotaUsageWindows,
+    ProjectInstructionRead, QuotaEvidenceReader, QuotaUsageWindows,
 };
 use eliot_core::api::native_profile::{CodexApprovalPolicy, CodexPermissions};
 use eliot_core::{Error, McpPolicy, Result, api::InstructionReadStatus};
 use serde_json::{Map, Value};
 use std::path::Path;
 
-pub const fn instruction_files(
-    paths: &'static [(&'static str, InstructionReadStatus)],
-) -> ProjectInstructionRead {
-    ProjectInstructionRead {
-        paths,
-        report_version: false,
-        byte_limit: None,
-    }
-}
-
 pub const fn quota_readback(
-    project: QuotaProjector,
+    evidence: QuotaEvidenceReader,
     usage_windows: QuotaUsageWindows,
     description: fn(&Value) -> &'static str,
 ) -> NativeQuotaReadback {
     NativeQuotaReadback {
-        project,
+        evidence,
         usage_windows,
         method: "quota.read",
         adhoc_integration: None,

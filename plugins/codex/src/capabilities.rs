@@ -52,7 +52,7 @@ pub fn declaration() -> HarnessCapabilities {
                 )
             }),
             ..quota_readback(
-                crate::discovery::project_quota,
+                crate::discovery::quota_evidence,
                 crate::discovery::quota_usage_windows,
                 |_| "Codex account/rateLimits/read; provider read-only values",
             )

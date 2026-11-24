@@ -24,7 +24,7 @@
 //! ever issued and no secret is logged. Selectors without a verified
 //! read-only path stay `unsupported`.
 use eliot_core::Result;
-use eliot_core::api::harness::{QuotaMapping, QuotaProjection};
+use eliot_core::api::harness::{QuotaEvidence, QuotaMapping};
 use eliot_plugin::quota as q;
 use serde_json::{Value, json};
 pub(crate) async fn read(raw: &Value) -> Result<Value> {
@@ -132,24 +132,21 @@ async fn read_console(profile: &Value, environment: &Value) -> Result<Value> {
     Ok(reply)
 }
 
-pub(crate) fn project_quota(
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
     let model = model?;
     let (provider, _) = eliot_plugin::session::split_provider_model(model)?;
     match (details.get("integration").and_then(Value::as_str), provider) {
         (Some("opencode-go"), "opencode-go") => {
             let windows = details.get("windows")?.as_array()?;
-            Some(q::projection::windows_projection(
-                windows,
-                &[],
-                true,
-                Some(model),
-                now,
-                "opencode:go",
-            ))
+            Some(QuotaEvidence::Windows {
+                applicable: windows
+                    .iter()
+                    .filter_map(|window| {
+                        q::projection::mapped_window(window, &[], &[], Some(model))
+                    })
+                    .collect(),
+                complete: true,
+            })
         }
         (Some("opencode"), _) => {
             let applicable: Vec<_> = details
@@ -173,15 +170,13 @@ pub(crate) fn project_quota(
                         }
                         _ => return None,
                     };
-                    Some((window, mapping))
+                    Some((q::projection::window_facts(window), mapping))
                 })
                 .collect();
-            Some(q::projection::summarize_windows(
-                &applicable,
-                true,
-                now,
-                "opencode:console",
-            ))
+            Some(QuotaEvidence::Windows {
+                applicable,
+                complete: true,
+            })
         }
         _ => None,
     }

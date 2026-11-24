@@ -41,7 +41,7 @@ pub fn declaration() -> HarnessCapabilities {
         quota_readback: Some(NativeQuotaReadback {
             adhoc_integration: Some("opencode-go"),
             ..quota_readback(
-                crate::quota::project_quota,
+                crate::quota::quota_evidence,
                 eliot_plugin::quota::projection::account_usage_windows,
                 |details| {
                     if details["integration"] == "opencode" {

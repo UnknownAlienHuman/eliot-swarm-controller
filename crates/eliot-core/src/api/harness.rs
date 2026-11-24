@@ -150,22 +150,37 @@ pub enum QuotaMapping {
     Unmapped,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct QuotaProjection {
-    pub exhausted: bool,
-    pub available: bool,
-    pub mapping: QuotaMapping,
-    pub provenance: &'static str,
-    pub headroom: QuotaHeadroom,
+#[derive(Clone, Copy, Debug, Default)]
+pub struct QuotaWindowFacts {
+    pub used_percent: Option<f64>,
+    pub reset_ms: Option<i64>,
+    pub weekly: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct QuotaHeadroom {
-    pub max_used: Option<f64>,
-    pub weekly_used: Option<f64>,
+/// Provider evidence scoped to the selected route and optional model.
+#[derive(Debug)]
+pub enum QuotaEvidence {
+    Windows {
+        applicable: Vec<(QuotaWindowFacts, QuotaMapping)>,
+        complete: bool,
+    },
+    Tiered(TieredQuotaWindows),
 }
 
-pub type QuotaProjector = fn(&serde_json::Value, Option<&str>, i64) -> Option<QuotaProjection>;
+/// Account windows and optional model-specific windows, with native usage signals.
+#[derive(Debug)]
+pub struct TieredQuotaWindows {
+    pub account: [QuotaWindowFacts; 2],
+    pub model: Option<[QuotaWindowFacts; 2]>,
+    pub model_limits_reported: bool,
+    pub spend_control_reached: bool,
+    pub limit_reached: bool,
+    pub remaining_percent: Option<i64>,
+    pub credits_present: bool,
+    pub ordinary_usage_allowed: bool,
+}
+
+pub type QuotaEvidenceReader = fn(&serde_json::Value, Option<&str>) -> Option<QuotaEvidence>;
 pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
 
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
@@ -173,7 +188,7 @@ type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'
 /// Adapter readback shape and route preflight for provider quota.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeQuotaReadback {
-    pub project: QuotaProjector,
+    pub evidence: QuotaEvidenceReader,
     pub usage_windows: QuotaUsageWindows,
     pub method: &'static str,
     pub adhoc_integration: Option<&'static str>,

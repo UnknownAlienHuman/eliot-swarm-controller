@@ -50,7 +50,7 @@ pub fn declaration() -> HarnessCapabilities {
         quota_readback: Some(NativeQuotaReadback {
             route_refusal: Some(external_quota_route),
             ..quota_readback(
-                crate::quota::project_quota,
+                crate::quota::quota_evidence,
                 eliot_plugin::quota::projection::account_usage_windows,
                 |_| "Claude CLI OAuth usage; provider read-only values",
             )

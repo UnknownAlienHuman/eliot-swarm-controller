@@ -45,7 +45,7 @@ pub fn declaration() -> HarnessCapabilities {
             ),
             route_refusal: Some(crate::quota::route_refusal),
             ..quota_readback(
-                crate::quota::project_quota,
+                crate::quota::quota_evidence,
                 crate::quota::quota_usage_windows,
                 crate::allowance::source_note,
             )

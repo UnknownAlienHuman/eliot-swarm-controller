@@ -5,7 +5,7 @@
 //! private process environment. Public scope labels contain only route names.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
-use eliot_core::api::harness::NativeRoute;
+use eliot_core::api::harness::{NativeRoute, QuotaEvidence, QuotaWindowFacts};
 use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry, HarnessListResponse,
     HarnessModelsRequest, HarnessModelsResponse, HarnessQuotaRequest, HarnessQuotaResponse,
@@ -382,7 +382,7 @@ impl Router {
     /// signals into `details`: Codex keeps its `rateLimits` shape, the other
     /// four use `windows[]` with `usedPercent`/`resetsAtMs`. Routing and the
     /// catalogue consume all five through one normalized projection
-    /// ([`catalog::project_quota`]).
+    /// ([`catalog::projected_quota`]).
     /// A method-not-found or schema mismatch stays `unsupported` or `unknown`
     /// naming the checked method; no numbers are fabricated. A quota failure
     /// never selects another model or account.
@@ -1520,7 +1520,13 @@ pub(crate) fn append_failure_message(failure: &mut ModelsCatalogFailure, suffix:
     failure.message = combined[..end].to_owned();
 }
 
-pub(crate) use eliot_core::api::harness::{QuotaHeadroom, QuotaMapping};
+pub(crate) use eliot_core::api::harness::QuotaMapping;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct QuotaHeadroom {
+    pub max_used: Option<f64>,
+    pub weekly_used: Option<f64>,
+}
 
 /// Scoped native evidence and the time used to settle a retained quota hold.
 pub(crate) struct QuotaProjection {
@@ -1555,14 +1561,101 @@ pub(crate) fn projected_quota(
         .as_ref()
         .filter(|details| details.is_object())?;
     let readback = HarnessCapabilities::of(&response.harness).quota_readback?;
-    let evidence = (readback.project)(details, model, now)?;
+    let evidence = (readback.evidence)(details, model)?;
+    let (exhausted, available, mapping, headroom) = match evidence {
+        QuotaEvidence::Windows {
+            applicable,
+            complete,
+        } => {
+            let exhausted = applicable
+                .iter()
+                .any(|(window, _)| window_exhausted(window, now));
+            let mapping = applicable
+                .iter()
+                .filter(|(window, _)| window_exhausted(window, now) == exhausted)
+                .map(|(_, mapping)| *mapping)
+                .min_by_key(|mapping| *mapping != QuotaMapping::ExactId)
+                .unwrap_or(QuotaMapping::Unmapped);
+            let available = complete
+                && !applicable.is_empty()
+                && applicable
+                    .iter()
+                    .all(|(window, _)| window_has_headroom(window, now));
+            let headroom = if complete {
+                quota_headroom(applicable.iter().map(|(window, _)| window), now)
+            } else {
+                QuotaHeadroom::default()
+            };
+            (exhausted, available, mapping, headroom)
+        }
+        QuotaEvidence::Tiered(windows) => {
+            // The primary account bucket and explicit native limit signals govern
+            // exhaustion. Secondary and per-model buckets only affect headroom.
+            let exhausted = windows.spend_control_reached
+                || windows.limit_reached
+                || windows
+                    .remaining_percent
+                    .is_some_and(|remaining| remaining <= 0)
+                || !windows.credits_present && window_exhausted(&windows.account[0], now);
+            let available = !exhausted
+                && windows.ordinary_usage_allowed
+                && windows
+                    .account
+                    .iter()
+                    .all(|window| window_has_headroom(window, now))
+                && (!windows.model_limits_reported
+                    || windows.model.as_ref().is_some_and(|pair| {
+                        pair.iter().all(|window| window_has_headroom(window, now))
+                    }));
+            let mapping = if !exhausted && windows.model.is_some() {
+                QuotaMapping::ExactId
+            } else {
+                QuotaMapping::Group("primary")
+            };
+            let headroom = quota_headroom(
+                windows.account.iter().chain(windows.model.iter().flatten()),
+                now,
+            );
+            (exhausted, available, mapping, headroom)
+        }
+    };
     Some(QuotaProjection {
         observed_at_ms: response.fetched_at_ms,
-        exhausted: evidence.exhausted,
-        available: evidence.available,
-        mapping: evidence.mapping,
-        headroom: evidence.headroom,
+        exhausted,
+        available,
+        mapping,
+        headroom,
     })
+}
+
+fn window_exhausted(window: &QuotaWindowFacts, now: i64) -> bool {
+    window.used_percent.is_some_and(|used| used >= 100.0)
+        && window.reset_ms.is_none_or(|reset| reset > now)
+}
+
+fn window_has_headroom(window: &QuotaWindowFacts, now: i64) -> bool {
+    window.used_percent.is_some_and(|used| used < 100.0)
+        && window.reset_ms.is_some_and(|reset| reset > now)
+}
+
+fn quota_headroom<'a>(
+    windows: impl Iterator<Item = &'a QuotaWindowFacts>,
+    now: i64,
+) -> QuotaHeadroom {
+    let mut headroom = QuotaHeadroom::default();
+    for window in windows {
+        let Some(used) = window
+            .used_percent
+            .filter(|_| window.reset_ms.is_none_or(|reset| reset > now))
+        else {
+            continue;
+        };
+        headroom.max_used = Some(headroom.max_used.map_or(used, |prior| prior.max(used)));
+        if window.weekly {
+            headroom.weekly_used = Some(headroom.weekly_used.map_or(used, |prior| prior.max(used)));
+        }
+    }
+    headroom
 }
 
 fn quota_usage_windows(

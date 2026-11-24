@@ -1,6 +1,6 @@
 //! Translation of the vendor's one-shot subscription allowance command.
 
-use eliot_core::api::harness::{QuotaHeadroom, QuotaMapping, QuotaProjection, QuotaWindowBounds};
+use eliot_core::api::harness::{QuotaEvidence, QuotaWindowBounds};
 use eliot_plugin::quota;
 use serde_json::Value;
 
@@ -219,23 +219,24 @@ fn unavailable(reason: &str) -> Value {
     serde_json::json!({"details":{"state":"unavailable", "code":code, "reason":reason}})
 }
 
-pub(crate) fn project_quota(
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
-    let (windows, complete, provenance) = usage_pair_window_set(details)?;
-    let mut projection =
-        quota::projection::windows_projection(windows, &[], complete, model, now, provenance);
-    if !complete {
-        projection.headroom = QuotaHeadroom::default();
-    } else if provenance != "muse:windows"
-        && let Some(weekly) = details.get("usage").unwrap_or(details).get("weekly")
-        && quota::projection::window_mapping(weekly, &[], model) != QuotaMapping::Unmapped
-    {
-        quota::projection::observe(&mut projection.headroom, weekly, now, true);
-    }
-    Some(projection)
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
+    let (windows, paired) = usage_pair_window_set(details)?;
+    let complete = windows.len() == 2;
+    let weekly = paired
+        .then(|| details.get("usage").unwrap_or(details).get("weekly"))
+        .flatten();
+    let applicable = windows
+        .into_iter()
+        .filter_map(|raw| {
+            let (mut window, mapping) = quota::projection::mapped_window(raw, &[], &[], model)?;
+            window.weekly |= weekly.is_some_and(|weekly| core::ptr::eq(raw, weekly));
+            Some((window, mapping))
+        })
+        .collect();
+    Some(QuotaEvidence::Windows {
+        applicable,
+        complete,
+    })
 }
 
 /// Live and legacy usage pairs expose account usage bounds even without a windows array.
@@ -256,36 +257,20 @@ pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowB
 }
 
 /// Accept live usage pairs, legacy top-level pairs and retained window observations.
-fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool, &'static str)> {
-    if let Some(windows) = details
-        .get("windows")
-        .and_then(Value::as_array)
+fn usage_pair_window_set(details: &Value) -> Option<(Vec<&Value>, bool)> {
+    if let Some(windows) = details["windows"]
+        .as_array()
         .filter(|windows| !windows.is_empty())
     {
-        return Some((windows.iter().collect(), windows.len() == 2, "muse:windows"));
+        return Some((windows.iter().collect(), false));
     }
-    if let Some(usage) = details.get("usage").and_then(Value::as_object) {
-        let mut windows = Vec::new();
-        for key in ["window", "weekly"] {
-            if let Some(window) = usage.get(key).filter(|window| window.is_object()) {
-                windows.push(window);
-            }
-        }
-        if windows.is_empty() {
-            return None;
-        }
-        let complete = windows.len() == 2;
-        return Some((windows, complete, "muse:usage"));
-    }
-    let mut windows = Vec::new();
-    for key in ["window", "weekly"] {
-        if let Some(window) = details.get(key).filter(|window| window.is_object()) {
-            windows.push(window);
-        }
-    }
-    if windows.is_empty() {
-        return None;
-    }
-    let complete = windows.len() == 2;
-    Some((windows, complete, "muse:window/weekly"))
+    let usage = details
+        .get("usage")
+        .filter(|value| value.is_object())
+        .unwrap_or(details);
+    let windows: Vec<_> = ["window", "weekly"]
+        .into_iter()
+        .filter_map(|key| usage.get(key).filter(|window| window.is_object()))
+        .collect();
+    (!windows.is_empty()).then_some((windows, true))
 }

@@ -1,26 +1,21 @@
 //! Shared interpretation of usage windows emitted by quota readers.
 
-use eliot_core::api::harness::{QuotaHeadroom, QuotaMapping, QuotaProjection, QuotaWindowBounds};
+use eliot_core::api::harness::{QuotaEvidence, QuotaMapping, QuotaWindowBounds, QuotaWindowFacts};
 use serde_json::Value;
 
 pub type WindowGroups = &'static [(&'static str, &'static [&'static str])];
 
-pub fn observe(headroom: &mut QuotaHeadroom, window: &Value, now: i64, weekly: bool) {
-    let Some(used) = window_used_percent(window)
-        .filter(|_| window_reset_ms(window).is_none_or(|reset| reset > now))
-    else {
-        return;
-    };
-    headroom.max_used = Some(headroom.max_used.map_or(used, |prior| prior.max(used)));
-    if weekly
-        || window.get("windowDurationMins").and_then(Value::as_u64) == Some(10_080)
-        || window
-            .get("label")
-            .and_then(Value::as_str)
-            .and_then(|label| label.split_ascii_whitespace().last())
-            .is_some_and(|period| period.eq_ignore_ascii_case("weekly"))
-    {
-        headroom.weekly_used = Some(headroom.weekly_used.map_or(used, |prior| prior.max(used)));
+/// Decode the shared window fields emitted by readers, including legacy Unix-second resets.
+pub fn window_facts(window: &Value) -> QuotaWindowFacts {
+    QuotaWindowFacts {
+        used_percent: window_used_percent(window),
+        reset_ms: window_reset_ms(window),
+        weekly: window.get("windowDurationMins").and_then(Value::as_u64) == Some(10_080)
+            || window
+                .get("label")
+                .and_then(Value::as_str)
+                .and_then(|label| label.split_ascii_whitespace().last())
+                .is_some_and(|period| period.eq_ignore_ascii_case("weekly")),
     }
 }
 
@@ -68,58 +63,45 @@ pub fn usage_bound(
 }
 
 pub fn account_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
-    window_values(details)
+    account_usage_windows_with_periods(details, now, &[])
+}
+
+pub fn account_usage_windows_with_periods(
+    details: &Value,
+    now: i64,
+    extra_periods: &[&str],
+) -> Vec<QuotaWindowBounds> {
+    details["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .filter_map(|window| {
             let label = window["label"].as_str()?;
-            window_family(label).is_none().then_some(())?;
+            if window_family(label, extra_periods).is_some() {
+                return None;
+            }
             usage_bound(label, window, None, now)
         })
         .collect()
 }
 
-pub fn window_values(details: &Value) -> impl Iterator<Item = &Value> {
-    details["windows"].as_array().into_iter().flatten()
-}
-
-/// Read the normalized windows contributed by an adapter's native reader.
-pub fn project_windows(
+pub fn window_evidence(
     details: &Value,
     groups: WindowGroups,
+    extra_periods: &[&str],
     model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
+) -> Option<QuotaEvidence> {
     let windows = details["windows"]
         .as_array()
         .filter(|windows| !windows.is_empty())?;
-    Some(windows_projection(
-        windows.iter(),
-        groups,
-        true,
-        model,
-        now,
-        "windows",
-    ))
+    Some(QuotaEvidence::Windows {
+        applicable: windows
+            .iter()
+            .filter_map(|window| mapped_window(window, groups, extra_periods, model))
+            .collect(),
+        complete: true,
+    })
 }
-
-/// Full with a future (or unknown) reset: without reset evidence the window
-/// may already have rolled, so callers treat it as exhausted only when the
-/// provider gives no earlier reset.
-pub fn window_exhausted(window: &Value, now: i64) -> bool {
-    window_used_percent(window).is_some_and(|used| used >= 100.0)
-        && window_reset_ms(window).is_none_or(|reset| reset > now)
-}
-
-/// Affirmative headroom: below 100% with a future reset. The future reset
-/// is required: a full or reset-less window is never availability evidence.
-pub fn window_headroom(window: &Value, now: i64) -> bool {
-    window_used_percent(window).is_some_and(|used| used < 100.0)
-        && window_reset_ms(window).is_some_and(|reset| reset > now)
-}
-
-/// Provider window-label periods emitted by the readers (`5-hour`, `Weekly`,
-/// `Monthly`, Antigravity `quota`). A label that is exactly a period, or
-/// carries no label at all, is account scope.
-const WINDOW_LABEL_PERIODS: &[&str] = &["weekly", "5-hour", "monthly", "quota"];
 
 fn documented_group(
     groups: WindowGroups,
@@ -134,13 +116,16 @@ fn documented_group(
 /// The provider group named by a window label, or `None` for account-scope
 /// (bare-period) labels. An unrecognized family yields `Some` of itself so
 /// the caller can report it unmapped.
-fn window_family(label: &str) -> Option<String> {
+fn window_family(label: &str, extra_periods: &[&str]) -> Option<String> {
     let lower = label.trim().to_ascii_lowercase();
     if lower.is_empty() {
         return None;
     }
-    for period in WINDOW_LABEL_PERIODS {
-        if lower == *period {
+    for period in ["weekly", "5-hour", "monthly"]
+        .into_iter()
+        .chain(extra_periods.iter().copied())
+    {
+        if lower == period {
             return None;
         }
         if let Some(family) = lower.strip_suffix(period) {
@@ -164,14 +149,19 @@ fn model_token_present(model: &str, token: &str) -> bool {
 /// scope, or unmapped (an unrecognized provider label, or a recognized group
 /// the model is not a member of). An unrecognized label applies to no model,
 /// even on an unscoped read.
-pub fn window_mapping(window: &Value, groups: WindowGroups, model: Option<&str>) -> QuotaMapping {
+fn window_mapping(
+    window: &Value,
+    groups: WindowGroups,
+    extra_periods: &[&str],
+    model: Option<&str>,
+) -> QuotaMapping {
     let label = window.get("label").and_then(Value::as_str).unwrap_or("");
     if let Some(model) = model.filter(|model| !model.trim().is_empty())
         && label.eq_ignore_ascii_case(model.trim())
     {
         return QuotaMapping::ExactId;
     }
-    let family = window_family(label);
+    let family = window_family(label, extra_periods);
     let Some(family) = family.as_deref() else {
         return QuotaMapping::Group("account");
     };
@@ -186,72 +176,12 @@ pub fn window_mapping(window: &Value, groups: WindowGroups, model: Option<&str>)
     }
 }
 
-pub fn windows_projection<'a>(
-    windows: impl IntoIterator<Item = &'a Value>,
+pub fn mapped_window(
+    window: &Value,
     groups: WindowGroups,
-    complete: bool,
+    extra_periods: &[&str],
     model: Option<&str>,
-    now: i64,
-    provenance: &'static str,
-) -> QuotaProjection {
-    let applicable: Vec<_> = windows
-        .into_iter()
-        .map(|window| (window, window_mapping(window, groups, model)))
-        .filter(|(_, mapping)| *mapping != QuotaMapping::Unmapped)
-        .collect();
-    summarize_windows(&applicable, complete, now, provenance)
-}
-
-pub fn summarize_windows(
-    applicable: &[(&Value, QuotaMapping)],
-    complete: bool,
-    now: i64,
-    provenance: &'static str,
-) -> QuotaProjection {
-    if applicable.is_empty() {
-        // Windows exist but none maps to this model (for example an
-        // unrecognized `Model group` label, or an Argon bucket read for a
-        // Hydrogen model): report the inert unmapped projection so callers
-        // stay unknown instead of skipping a route or asserting availability.
-        return QuotaProjection {
-            exhausted: false,
-            available: false,
-            mapping: QuotaMapping::Unmapped,
-            provenance,
-            headroom: QuotaHeadroom::default(),
-        };
-    }
-    let exhausted = applicable
-        .iter()
-        .any(|(window, _)| window_exhausted(window, now));
-    // The decisive bucket drives the verdict: the first exhausted window
-    // when anything is exhausted (preferring an exact id), else the exact
-    // id when one matched, else the first applicable group window.
-    let mapping = applicable
-        .iter()
-        .filter(|(window, _)| window_exhausted(window, now) == exhausted)
-        .map(|(_, mapping)| *mapping)
-        .find(|mapping| *mapping == QuotaMapping::ExactId)
-        .or_else(|| {
-            applicable
-                .iter()
-                .filter(|(window, _)| window_exhausted(window, now) == exhausted)
-                .map(|(_, mapping)| *mapping)
-                .next()
-        })
-        .unwrap_or(applicable[0].1);
-    let mut headroom = QuotaHeadroom::default();
-    for (window, _) in applicable {
-        observe(&mut headroom, window, now, false);
-    }
-    QuotaProjection {
-        exhausted,
-        available: complete
-            && applicable
-                .iter()
-                .all(|(window, _)| window_headroom(window, now)),
-        mapping,
-        provenance,
-        headroom,
-    }
+) -> Option<(QuotaWindowFacts, QuotaMapping)> {
+    let mapping = window_mapping(window, groups, extra_periods, model);
+    (mapping != QuotaMapping::Unmapped).then(|| (window_facts(window), mapping))
 }

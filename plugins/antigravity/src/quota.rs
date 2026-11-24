@@ -1,5 +1,5 @@
 //! OpenCodex 2.84.0 quota/antigravity.ts: pattern only, no copied source.
-use eliot_core::api::harness::QuotaProjection;
+use eliot_core::api::harness::{QuotaEvidence, QuotaWindowBounds};
 use eliot_core::{ProviderRestriction, ProviderRestrictionKind, Result};
 use eliot_plugin::quota as q;
 use serde_json::{Value, json};
@@ -174,15 +174,17 @@ fn summary_windows(body: &Value) -> Vec<Value> {
     windows
 }
 
-pub(crate) fn project_quota(
-    details: &Value,
-    model: Option<&str>,
-    now: i64,
-) -> Option<QuotaProjection> {
+const QUOTA_PERIODS: &[&str] = &["quota"];
+
+pub(crate) fn quota_evidence(details: &Value, model: Option<&str>) -> Option<QuotaEvidence> {
     const GROUPS: q::projection::WindowGroups = &[
         ("gemini 4 argon", &["argon"]),
         ("claude/gpt", &["claude", "gpt"]),
         ("gemini", &["gemini"]),
     ];
-    q::projection::project_windows(details, GROUPS, model, now)
+    q::projection::window_evidence(details, GROUPS, QUOTA_PERIODS, model)
+}
+
+pub(crate) fn quota_usage_windows(details: &Value, now: i64) -> Vec<QuotaWindowBounds> {
+    q::projection::account_usage_windows_with_periods(details, now, QUOTA_PERIODS)
 }

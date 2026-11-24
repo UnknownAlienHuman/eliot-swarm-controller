@@ -199,9 +199,9 @@ Catalogue reader stages, vendor-specific catalogue notes and quota readback
 come from the same declarations.
 The quota adapter projects its reader's details into typed model evidence
 and account window bounds. Adapters use the shared window interpretation in
-`eliot-plugin` for common fields and declare their own model groups. The daemon
-owns reader custody, route verification, caching, freshness, routing and hold
-settlement.
+`eliot-plugin` for common fields and declare their own period labels and model
+groups. The daemon owns reader custody, route verification, caching, freshness,
+quota decisions, routing, and hold settlement.
 
 ## Host requests
 
