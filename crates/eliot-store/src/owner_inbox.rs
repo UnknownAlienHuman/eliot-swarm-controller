@@ -999,7 +999,7 @@ fn project_work_not_in_git(
          WHERE a.archived = 0
            AND (c.state = 'failed'
                 OR (c.state = 'snapshot' AND a.state IN ('stopped','lost','failed')))
-           AND NOT EXISTS(SELECT 1 FROM events x INDEXED BY events_kind
+           AND NOT EXISTS(SELECT 1 FROM events x INDEXED BY events_generation_custody
                WHERE x.kind = 'agent.handed_off' AND x.agent = c.agent
                  AND x.generation = c.generation)",
         "c.agent = ?1 AND c.generation = ?2",
