@@ -829,14 +829,11 @@ fn replay_rule_catch_up_tx(
 
 fn load_catch_up_children(connection: &Connection, parent_id: &str) -> Result<Vec<Admission>> {
     let mut statement = connection
-        .prepare(
-            "SELECT id, principal, method, target, expected_generation, generation,
-                    expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                    created_at, updated_at, probe, selector, config_revision
-             FROM commands
-             WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
+        .prepare(concat!(
+            command_record_select!(),
+            " WHERE parent_command = ?1 AND link_kind = 'rule_action' AND ordinal IS NOT NULL
              ORDER BY ordinal",
-        )
+        ))
         .map_err(sql_error)?;
     let rows = statement
         .query_map([parent_id], command_record_from_row)

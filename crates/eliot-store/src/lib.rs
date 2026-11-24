@@ -2,6 +2,15 @@
 
 //! Durable L1 state for Agents, commands, native events, turns, and source acks.
 
+// Keep this projection in the order consumed by command_record_from_row.
+macro_rules! command_record_select {
+    () => {
+        "SELECT id, principal, method, target, expected_generation, generation,
+                expected_turn_id, turn_id, request_id, verb, args, state, outcome,
+                created_at, updated_at, probe, selector, config_revision FROM commands"
+    };
+}
+
 mod assignment;
 mod attention_steps;
 mod autonomy;
@@ -129,11 +138,7 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))";
-const LIST_UNSETTLED_COMMANDS_COLUMNS: &str =
-    "SELECT id, principal, method, target, expected_generation, generation,
-                        expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe, selector, config_revision
-                 FROM commands";
+const COMMAND_RECORD_SELECT: &str = command_record_select!();
 /// Live Agent rows that can still produce work. Shared by the bounded drain
 /// list and its total for the same honest-truncation reason as unsettled
 /// commands.
@@ -2007,7 +2012,7 @@ impl Store {
     pub fn list_retained_unknown_commands(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
         let sql = format!(
-            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {RETAINED_UNKNOWN_PREDICATE} ORDER BY created_at, rowid LIMIT ?1"
+            "{COMMAND_RECORD_SELECT} WHERE {RETAINED_UNKNOWN_PREDICATE} ORDER BY created_at, rowid LIMIT ?1"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
@@ -2025,7 +2030,7 @@ impl Store {
     pub fn list_unsettled_commands(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
         let sql = format!(
-            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
+            "{COMMAND_RECORD_SELECT} WHERE {UNSETTLED_COMMANDS_WHERE} ORDER BY created_at, rowid LIMIT ?1"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
@@ -2049,7 +2054,7 @@ impl Store {
     pub fn list_unsettled_commands_excluding_retained(&self, limit: usize) -> Result<Vec<Command>> {
         validate_limit(limit)?;
         let sql = format!(
-            "{LIST_UNSETTLED_COMMANDS_COLUMNS} WHERE {UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE}) ORDER BY created_at, rowid LIMIT ?1"
+            "{COMMAND_RECORD_SELECT} WHERE {UNSETTLED_COMMANDS_WHERE} AND NOT ({RETAINED_UNKNOWN_PREDICATE}) ORDER BY created_at, rowid LIMIT ?1"
         );
         let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
         let rows = statement
@@ -4618,10 +4623,7 @@ fn command_from_raw(raw: CommandRecordRaw) -> Result<CommandRecord> {
 fn load_command_record(connection: &Connection, id: &str) -> Result<Option<CommandRecord>> {
     let raw = connection
         .query_row(
-            "SELECT id, principal, method, target, expected_generation,
-                    generation, expected_turn_id, turn_id, request_id, verb, args,
-                    state, outcome, created_at, updated_at, probe, selector, config_revision
-             FROM commands WHERE id = ?1",
+            concat!(command_record_select!(), " WHERE id = ?1"),
             [id],
             command_record_from_row,
         )

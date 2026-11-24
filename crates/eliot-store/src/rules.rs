@@ -1123,17 +1123,14 @@ impl Store {
         // becomes runnable. Seek only the open rows.
         let mut statement = self
             .connection
-            .prepare(
+            .prepare(concat!(
                 "WITH unsettled AS MATERIALIZED (
                     SELECT id, parent_command, link_kind, ordinal, state
                     FROM commands INDEXED BY commands_unsettled_created
                     WHERE state IN ('accepted','queued','dispatched','unknown')
-                 )
-                 SELECT id, principal, method, target, expected_generation, generation,
-                        expected_turn_id, turn_id, request_id, verb, args, state, outcome,
-                        created_at, updated_at, probe, selector, config_revision
-                 FROM commands
-                 WHERE id IN (
+                 ) ",
+                command_record_select!(),
+                " WHERE id IN (
                      SELECT id FROM unsettled
                      WHERE state IN ('accepted','queued')
                        AND link_kind = 'rule_action' AND ordinal IS NOT NULL
@@ -1164,7 +1161,7 @@ impl Store {
                    )
                    AND (?1 IS NULL OR id > ?1)
                  ORDER BY id LIMIT ?2",
-            )
+            ))
             .map_err(sql_error)?;
         let rows = statement
             .query_map(params![after, limit as i64], command_record_from_row)
