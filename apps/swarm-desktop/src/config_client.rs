@@ -221,11 +221,24 @@ const CATALOG_MAX_PAGES: usize = 100;
 
 /// The unified model catalogue for the composer's picker: every installed
 /// harness with its version, and the models read page by page until the
-/// daemon reports the end (`next` absent). A listing that changed between
-/// pages fails with the daemon's stale-cursor error instead of mixing two
-/// listings; the picker's next open reads it again. The daemon caches and
-/// coalesces the native reads.
+/// daemon reports the end (`next` absent). If its snapshot revision changes
+/// during paging, restart the listing once; never mix pages from two revisions.
+/// The daemon caches and coalesces the native reads.
 pub async fn models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
+    match read_models_catalog(data_dir).await {
+        Err(error)
+            if error.code == "invalid"
+                && error
+                    .message
+                    .contains("catalogue cursor is no longer in the listing") =>
+        {
+            read_models_catalog(data_dir).await
+        }
+        result => result,
+    }
+}
+
+async fn read_models_catalog(data_dir: &Path) -> Result<ModelsCatalogResponse> {
     let mut request = ModelsCatalogRequest {
         query: None,
         after: None,

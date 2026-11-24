@@ -187,6 +187,25 @@ pub fn result(windows: Vec<Value>, source: &'static str) -> Result<Value> {
 #[cfg(windows)]
 #[allow(
     unsafe_code,
+    reason = "Reading the Windows credential revision requires a narrow FFI call."
+)]
+pub fn windows_credential_last_written(target: &str) -> Option<u64> {
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+    };
+    let target: Vec<u16> = target.encode_utf16().chain([0]).collect();
+    let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+    if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
+        return None;
+    }
+    let timestamp = unsafe { (*credential).LastWritten };
+    unsafe { CredFree(credential.cast()) };
+    Some((u64::from(timestamp.dwHighDateTime) << 32) | u64::from(timestamp.dwLowDateTime))
+}
+
+#[cfg(windows)]
+#[allow(
+    unsafe_code,
     reason = "Windows Credential Manager access requires this narrow FFI call."
 )]
 pub fn windows_credential_json(

@@ -2406,17 +2406,18 @@ Candidate `version` retains the bounded raw first line when available, or is
 null when the probe is unavailable. Inventory presence does not make an
 executable eligible for automatic Claude selection; that requires a successful
 `--version` probe with a parseable numeric version.
-The daemon starts refreshing model catalogues in the background after publishing
-readiness. A refresh checks installation and credential scope, reuses the
-per-source native reader, and has a 90-second discovery budget. The daemon
-rechecks settings, installations and route scope before publishing a new
-aggregate. It refreshes before expiry and retries failed sources after a
-cooldown. `models.catalog` looks up the current source key, projects current
-holds and returns the matching snapshot. A missing snapshot returns
-`unavailable` while refresh proceeds. An expired snapshot for the same key
-may be served with `stale = true`. The aggregate can retain last-good rows for an
-unavailable source and reports its failure on every page. A Store lock timeout
-or failed hold read returns an RPC error. Cold version
+The daemon begins refreshing when the catalogue is requested. An aggregate
+read on a cold or changed source joins the shared refresh within its discovery
+deadline. The desktop keeps its current list while that read settles.
+The daemon rechecks settings, installations and login revisions before
+publishing a new aggregate and projects current holds for each page. For
+recently requested catalogues it refreshes before expiry. Repeated failures
+back off from 30 seconds up to 15 minutes. Background work stops after five
+minutes without demand and discovery admission closes at shutdown.
+An expired snapshot for the same key may be served with `stale = true`.
+The aggregate can retain last-good rows for an unavailable source and reports
+its failure on every page. A Store lock timeout or failed hold read returns
+an RPC error. Cold version
 lookup and election are atomic for the resolved
 binary. Followers share its result within their deadline. On Unix the
 resolved payload must have an ELF or Mach-O header before a probe, including
@@ -2467,13 +2468,16 @@ configured endpoint and executable. Missing selectors, admitted unset
 selectors and admitted empty values are distinct. Concurrent model cache
 misses for the same verified scope and executable share one native read.
 For verified sources, `harness.models` returns a matching cached response and
-schedules refresh on expiry. A cold verified source returns `unavailable`
-while its first refresh proceeds. Expired last-good data is marked
-`stale = true`. Launch default preflight uses a fresh hit when available and
-otherwise leaves default resolution to native launch admission. The daemon
-starts each shared read with its own discovery budget, subject to the native
-reader's limit, and retains custody through cleanup. Validated successful
-responses populate the cache. Explicit workspace previews, legacy or
+refreshes it after expiry. A cold read and launch default preflight start or
+join the shared native read within their own deadlines. Last-good data is
+marked `stale = true` during refresh and includes `refresh_failure` when a
+settled refresh failure permits stale reuse. A verified route without a
+verified executable version returns `unavailable` or the documented alias
+fallback. The daemon gives each shared read its own budget, subject to the
+native reader's limit, and retains custody through cleanup. Validated
+successful responses populate the cache. Known file-backed login changes,
+the Windows Antigravity keyring revision and resolved Swarm sign-in reports
+invalidate old catalogue results. Explicit workspace previews, legacy or
 unverified sources and live session reads continue to use their exact native
 read. Only verified native sources contribute shared aggregate rows.
 Public `scope` names the profile and route without

@@ -249,8 +249,16 @@ impl Router {
             (response, resolved)
         };
         self.signal_progress();
+        if response.accepted
+            && matches!(
+                request.state,
+                AuthDesktopState::SignedIn | AuthDesktopState::SignedOut
+            )
+        {
+            self.inner.catalog_cache.lock_recover().invalidate_auth();
+            self.inner.catalog_refresh.notify_one();
+        }
         if resolved {
-            *self.inner.catalog_cache.lock_recover() = super::catalog::CatalogCache::default();
             self.signal_launch_arbitration();
         }
         Ok(json!(response))

@@ -13,6 +13,10 @@ use serde_json::Value;
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        #[cfg(windows)]
+        model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Keyring(|| {
+            eliot_plugin::quota::windows_credential_last_written(crate::quota::KEYRING_TARGET)
+        })),
         project_instruction_read: crate::instructions::PROJECT_READ,
         model_catalogue_presentation: Some(
             crate::catalog_presentation::model_catalogue_presentation,

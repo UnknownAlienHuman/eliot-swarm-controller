@@ -226,6 +226,8 @@ pub(super) struct LaunchState {
     /// The unified catalogue, once read.
     pub(super) catalog: Option<Fallible<ModelsCatalogResponse>>,
     pub(super) catalog_loading: bool,
+    /// A failed refresh stays visible with the last successful catalogue.
+    pub(super) catalog_refresh_error: Option<String>,
     /// What routing would pick for a new task now (advisory).
     pub(super) preview: Option<Fallible<eliot_core::RoutingDecision>>,
     pub(super) preview_loading: bool,
@@ -407,7 +409,7 @@ impl DesktopApp {
         let presets = self.launch.allowed();
         let auto_detail = self.launch.auto_detail();
         let preset_current = self.preset_choice();
-        picker::rows(&picker::Inputs {
+        let mut rows = picker::rows(&picker::Inputs {
             catalog: self.launch.catalog.as_ref(),
             query: &self.launch.query,
             prefs: &self.prefs,
@@ -420,7 +422,39 @@ impl DesktopApp {
             auto_detail: &auto_detail,
             efforts: &self.launch.efforts,
             claude_efforts: eliot_daemon::CLAUDE_EFFORT_LEVELS,
-        })
+        });
+        if let Some(error) = self.launch.catalog_refresh_error.as_deref() {
+            // The cached catalogue remains usable, but make a failed refresh
+            // visible and retryable in the picker's existing status row.
+            rows.retain(|row| !matches!(row, Row::Note { key, .. } if key == "error"));
+            rows.push(Row::Failure {
+                key: "catalog-refresh".to_owned(),
+                text: format!("Model catalogue refresh failed: {error}"),
+            });
+        }
+        let only_harness = self
+            .launch
+            .preset_target()
+            .map(|(_, harness)| harness.as_str());
+        if let Some(Ok(catalog)) = self.launch.catalog.as_ref() {
+            for failure in &catalog.failures {
+                if only_harness.is_some_and(|harness| harness != failure.harness.as_str()) {
+                    continue;
+                }
+                let key = format!("failure:{}", failure.harness);
+                if rows
+                    .iter()
+                    .any(|row| matches!(row, Row::Failure { key: row_key, .. } if row_key == &key))
+                {
+                    continue;
+                }
+                rows.push(Row::Failure {
+                    key,
+                    text: picker::failure_text(picker::harness_label(&failure.harness), failure),
+                });
+            }
+        }
+        rows
     }
 
     /// The preset picker's current choice: the preset's model and effort.
@@ -487,8 +521,19 @@ impl DesktopApp {
             LaunchMsg::WorkspaceChanged(text) => self.launch.workspace = text,
             LaunchMsg::CatalogLoaded(reply) => {
                 self.launch.catalog_loading = false;
-                // The daemon serves stale rows only for the current source.
-                self.launch.catalog = Some(*reply);
+                match *reply {
+                    Ok(catalog) => {
+                        // The daemon serves stale rows only for the current source.
+                        self.launch.catalog = Some(Ok(catalog));
+                        self.launch.catalog_refresh_error = None;
+                    }
+                    Err(error) => {
+                        if !matches!(self.launch.catalog.as_ref(), Some(Ok(_))) {
+                            self.launch.catalog = Some(Err(error.clone()));
+                        }
+                        self.launch.catalog_refresh_error = Some(error);
+                    }
+                }
                 self.keep_highlight();
             }
             LaunchMsg::CatalogRetry => {

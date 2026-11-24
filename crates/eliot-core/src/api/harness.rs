@@ -230,6 +230,17 @@ pub struct ModelReaderOptions {
     pub interruption_code: Option<&'static str>,
 }
 
+/// Local metadata that changes when an adapter's effective login changes.
+#[derive(Clone, Copy, Debug)]
+pub enum ModelLoginSource {
+    Files {
+        root_env: &'static str,
+        default_root: &'static str,
+        files: &'static [&'static str],
+    },
+    Keyring(fn() -> Option<u64>),
+}
+
 /// Native profile vocabulary used by the daemon and the desktop editor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
@@ -328,6 +339,7 @@ pub struct HarnessCapabilities {
     pub documented_models: Option<DocumentedModelCatalog>,
     pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
+    pub model_login_source: Option<ModelLoginSource>,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,
     /// The native model refusal permits cleanup before any initial turn work.
@@ -889,6 +901,9 @@ pub struct HarnessModelsResponse {
     /// The catalogue is being served past its freshness bound.
     #[serde(default)]
     pub stale: bool,
+    /// The last settled refresh failure for this stale catalogue, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_failure: Option<ModelsCatalogFailure>,
     /// Nonsecret credential identity the read ran under (an environment
     /// name, integration name or ambient marker; never a secret value).
     pub credential: String,
@@ -991,6 +1006,15 @@ impl HarnessModelsResponse {
         validate_scope(&self.scope)?;
         validate_credential(&self.credential)?;
         validate_freshness(self.fetched_at_ms, self.ttl_ms)?;
+        if let Some(failure) = &self.refresh_failure {
+            failure.validate()?;
+            if !self.stale || failure.harness != self.harness {
+                return Err(Error::new(
+                    "invalid",
+                    "refresh failure must match the stale harness catalogue",
+                ));
+            }
+        }
         Ok(())
     }
 }

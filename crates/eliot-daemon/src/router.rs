@@ -203,6 +203,7 @@ struct RouterInner {
     allowance_reads: Mutex<quota::AllowanceReads>,
     profile_cache: Mutex<crate::config::ProfileCache>,
     catalog_refresh: tokio::sync::Notify,
+    catalog_updates: tokio::sync::watch::Sender<catalog::AggregateUpdate>,
     var_writes: Mutex<coordination::VarWriteQueue>,
     var_worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     plugin_host: PluginHost,
@@ -487,6 +488,7 @@ impl Router {
                 allowance_reads: Mutex::new(quota::AllowanceReads::default()),
                 profile_cache: Mutex::new(crate::config::ProfileCache::default()),
                 catalog_refresh: tokio::sync::Notify::new(),
+                catalog_updates: tokio::sync::watch::channel(None).0,
                 var_writes: Mutex::new(coordination::VarWriteQueue::default()),
                 var_worker: AsyncMutex::new(None),
                 plugin_host,
@@ -3722,13 +3724,13 @@ impl Router {
 
     /// Freeze the daemon-owned launch default for a Codex or Muse snapshot
     /// that omits its model: resolve the native default through the
-    /// existing verified catalogue, then retain it
+    /// existing shared catalogue read, then retain it
     /// separately from the caller's omitted request, so the plugins
     /// translate an already-decided launch. `requested.model` stays null;
     /// the effective model is the frozen `daemon_model` (Codex) or the
     /// server default (Muse). Muse defers to the server default, so only
-    /// an empty catalogue refuses there. A cache miss leaves the snapshot
-    /// untouched for the plugin's native admission. Explicit
+    /// an empty catalogue refuses there. A read failure leaves the
+    /// snapshot untouched for the plugin's native admission. Explicit
     /// models, routed Codex profiles (the Responses route requires an
     /// explicit model id) and other harnesses pass through untouched.
     async fn resolve_launch_default(

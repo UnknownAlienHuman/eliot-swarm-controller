@@ -13,6 +13,11 @@ use eliot_plugin::capabilities::{adhoc_launch, quota_readback};
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
+        model_login_source: Some(eliot_core::api::harness::ModelLoginSource::Files {
+            root_env: "XDG_DATA_HOME",
+            default_root: ".local/share",
+            files: &["opencode/auth.json"],
+        }),
         model_catalogue_presentation: Some(
             crate::catalog_presentation::model_catalogue_presentation,
         ),
