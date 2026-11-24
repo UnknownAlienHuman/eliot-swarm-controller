@@ -1592,7 +1592,8 @@ impl Router {
                 self.classify_worktree(
                     &mut candidate,
                     auto_cleanup,
-                    !auto_cleanup && matches!(principal, Principal::Owner),
+                    !matches!(principal, Principal::Owner),
+                    !auto_cleanup,
                 )
                 .await;
                 if bulk && cleanup_operation_failed(&candidate.reason) {
@@ -1841,15 +1842,17 @@ impl Router {
     async fn classify_worktree(
         &self,
         candidate: &mut CleanupCandidate,
-        require_merged: bool,
+        automatic: bool,
+        manager: bool,
         observe_missing: bool,
     ) {
+        let require_merged = automatic || manager;
         if candidate.artifact.state != "registered" {
             candidate.reason = candidate.artifact.state.clone();
             return;
         }
         let preflight = self
-            .worktree_cleanup_preflight(&candidate.artifact, require_merged, observe_missing)
+            .worktree_cleanup_preflight(&candidate.artifact, automatic, observe_missing)
             .await;
         match preflight {
             Ok(None) => {
@@ -2894,15 +2897,26 @@ impl Router {
                     json!({"expected_tip": tip})
                 }
             };
-            let admission = self.admit_prepared_submission(
-                &mut store,
-                principal,
-                PreparedSubmission {
-                    request,
-                    workspace: None,
-                },
-                SubmissionContext::default(),
-            )?;
+            let admission = if principal == "owner" {
+                self.admit_prepared_submission(
+                    &mut store,
+                    principal,
+                    PreparedSubmission {
+                        request,
+                        workspace: None,
+                    },
+                    SubmissionContext::default(),
+                )?
+            } else {
+                self.check_command_admission_mode(&request.verb)?;
+                store.submit_manager_worktree_cleanup(
+                    principal,
+                    apply_id,
+                    &artifact.id,
+                    &request,
+                    now_ms(),
+                )?
+            };
             self.publish_locked(&admission.events);
             admission
         };
@@ -3632,7 +3646,8 @@ impl Router {
             reason: "retirement_preflight".to_owned(),
         };
         if candidate.artifact.kind == ArtifactKind::Worktree {
-            self.classify_worktree(&mut candidate, false, true).await;
+            self.classify_worktree(&mut candidate, false, false, true)
+                .await;
             return candidate;
         }
         let gate = self

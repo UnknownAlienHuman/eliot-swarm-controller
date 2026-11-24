@@ -31,7 +31,11 @@ fn dispatch_target_tx(tx: &Transaction<'_>, command: &CommandRecord) -> Result<(
     projects::validate_project_command_dispatch_tx(tx, command)?;
     if command.command.principal.starts_with("agent:") {
         let caller = hierarchy::parse_caller(tx, &command.command.principal)?;
-        if command.command.verb != "launch" {
+        if command.command.verb == "worktree.remove"
+            && let Some(binding) = command.command.args.get("manager_cleanup")
+        {
+            cleanup::require_manager_cleanup_dispatch(tx, &command.command, binding)?;
+        } else if command.command.verb != "launch" {
             hierarchy::caller_may_command(tx, &caller, &agent)?;
         }
     }
@@ -327,6 +331,28 @@ fn dispatch_resume_tx(
         return Err(Error::new(
             "stale_generation",
             "resume target changed before its new generation was committed",
+        ));
+    }
+    if agent.chat
+        && let Some(workspace) = agent.workspace.as_deref()
+    {
+        db!(tx.execute(
+            "UPDATE artifacts
+             SET generation = ?1, body = json_set(body, '$.generation', ?1)
+             WHERE agent = ?2 AND generation = ?3 AND path = ?4
+               AND json_extract(body, '$.agent') = ?5
+               AND json_extract(body, '$.generation') = ?3
+               AND json_extract(body, '$.path') = ?4
+               AND json_extract(body, '$.kind') = 'other'
+               AND json_extract(body, '$.purpose') = 'Swarm chat directory'
+               AND json_extract(body, '$.state') = 'registered'",
+            params![
+                next_generation,
+                agent_num,
+                old_generation,
+                workspace,
+                agent.id
+            ],
         ));
     }
     Store::inherit_handoff_lineage_tx(tx, agent_num, old_generation, next_generation)?;

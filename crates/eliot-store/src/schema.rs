@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = FAILED_CUSTODY_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHAT_ARTIFACT_RESUME_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -19,6 +19,7 @@ const MAIL_NOTICE_REVISION_VERSION: i64 = 126;
 const CHECKPOINT_RESTORE_INTENT_VERSION: i64 = 127;
 const CHECKPOINT_RESTORE_CUSTODY_VERSION: i64 = 128;
 const FAILED_CUSTODY_VERSION: i64 = 129;
+const CHAT_ARTIFACT_RESUME_VERSION: i64 = 130;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -90,6 +91,30 @@ impl Store {
         }
         if current < FAILED_CUSTODY_VERSION {
             self.migrate_failed_custody(FAILED_CUSTODY_VERSION)?;
+        }
+        if current < CHAT_ARTIFACT_RESUME_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "UPDATE artifacts AS artifact
+                 SET generation = agent.generation,
+                     body = json_set(artifact.body, '$.generation', agent.generation)
+                 FROM agents AS agent
+                 WHERE agent.id = artifact.agent AND agent.chat = 1
+                   AND agent.generation > artifact.generation
+                   AND agent.workspace = artifact.path
+                   AND json_extract(artifact.body, '$.agent') = 'a' || agent.id
+                   AND json_extract(artifact.body, '$.path') = agent.workspace
+                   AND json_extract(artifact.body, '$.generation') = artifact.generation
+                   AND json_extract(artifact.body, '$.kind') = 'other'
+                   AND json_extract(artifact.body, '$.purpose') = 'Swarm chat directory'
+                   AND json_extract(artifact.body, '$.state') = 'registered';
+                 INSERT INTO schema_migrations(version) VALUES (130);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
         }
         Ok(())
     }

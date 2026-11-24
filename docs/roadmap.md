@@ -987,10 +987,15 @@ of the explicitly selected release scope.
       Retry first and a confirmed new empty data directory last; a new directory is
       remembered only once its daemon answers.
 
-- [ ] **Idle Agent restart continuation (#984).** Store selects a retained idle
+- [x] **Idle Agent restart continuation (#984).** Store selects a retained idle
       session for promptless, generation-bound Resume after owned exit and reader
-      drain are proven; unresolved work remains fenced. Private runtime proof and
-      the required static checks remain outstanding for this branch.
+      drain are proven; unresolved work remains fenced. On a private Windows
+      stand on 2026-11-24, Claude Haiku 5.5 reopened the same session from
+      generation 1 to 2 after `daemon update`, with no linked SEND. Holding the
+      old Job open across a second daemon exit kept generation 2 lost until
+      exact closure; it then resumed without input. A separate Agent's
+      dispatched interrupt and open turn stayed unknown with no Resume after
+      its own custody was released.
 
 - [x] **Owner pages for autonomous Swarm (#883, 2026-11-22).** The project editor
       edits the launch policy (#868) with Validate and Save on the read revision,
@@ -1033,15 +1038,22 @@ of the explicitly selected release scope.
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.
 
-- [ ] **K92 Backend quota and chat lifecycle (#407).** Implemented provider
-      readers, durable archive/delete, settings project removal and private chats.
-      Private Windows Owner proof covers real Codex/Claude desktop launch/send,
-      a private chat, archive/unarchive/delete/replay, directory cleanup and Muse
-      stream-observed quota. OpenCode Go numerical readback remains blocked by
-      provider HTTP 403; Antigravity returned real windows before a later HTTP 401.
-      Native first-token time is not exposed by the consumed completed-message
-      surface. Preserve the unrelated native-archive Unknown fence; do not replay it.
+- [ ] **K92 Backend quota and chat lifecycle (#407).** Private Windows Owner
+      proof covers real Codex/Claude desktop launch/send and private chats.
+      Native first-token time remains unavailable on the completed-message
+      surface the daemon consumes.
 
+  - [x] **Chat lifecycle and project removal.** On a private Windows stand on
+    2026-11-24, Claude Haiku 5.5 ran in a chat without a project. Migration 130
+    repaired its generation-1 directory binding from a Store with the chat
+    already at generation 2. Resume preserved the directory in generation 3.
+    Apply skipped the old plan and a fresh plan removed the directory. Archive,
+    unarchive, delete and exact delete replay passed. Settings unregistered an
+    unused project and preserved its checkout.
+  - [ ] **OpenCode Go numerical quota.** Last recorded private readback was
+    refused by the provider with HTTP 403.
+  - [ ] **Antigravity numerical quota.** Private readback returned real windows
+    before a later provider HTTP 401. New numerical evidence remains blocked.
   - [x] **Muse native allowance.** On a private Windows stand with Muse Code
     1.4.25, two Owner quota calls returned the same provider windows. The
     process log recorded one native read and one cache hit. Zero model turns.
@@ -1064,25 +1076,27 @@ of the explicitly selected release scope.
 
 ## Later
 
-- [ ] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
+- [x] **K69 manager cleanup (owner clarification 2026-11-16, #384).**
       Implemented generation/tree artifact custody, bounded plan/apply, handle
       deletion, branch verification, native archive, retirement opt-in, CLI and
-      Advanced Settings. The audit repair binds exclusive per-generation roots,
-      refuses hard links/repositories/configuration, requires a fresh remote
-      default, and preserves frozen native scope and uncertain archive fences.
-      Requalified on 2026-11-16 with a private release daemon and real Muse
-      `muse-spark-1.3-contributor`/low: manager a1 stopped children a2/a3 and
-      applied two plans, removing both managed worktrees, the merged branch,
-      temp/source artifacts and a released held directory (2,715 logical bytes).
-      The unmerged branch, initially dirty worktree, live-held directory, nested
-      repository, hard-linked Cargo targets and a substituted junction were
-      kept/refused as appropriate; sibling registration was denied. Static gate:
-      fmt, locked workspace all-targets build, warnings-denied Clippy and 2,014
-      tests passed. All owned processes exited and the private daemon drained.
-      Frozen Codex archive scope and malformed acknowledgements have source/regression
-      coverage, without a native fault-injection run. Automatic approval review
-      blocked deletion of the private proof directory and five scratch directories
-      left by failing-before tests.
+      Advanced Settings. On a private Windows stand on 2026-11-24, binary
+      SHA-256 `a309e41c19fd9684cb3d16c23b0e94316224a338340159cfa943c3b27ddbe445`
+      ran a self-scoped Claude Code manager configured for `claude-haiku-5-5`
+      without submitting a turn. Principal `agent:a1:1` kept its stopped child's
+      worktree when it became dirty or unmerged after planning. A fresh plan
+      removed the clean, merged worktree and kept its branch tip. All three
+      derived commands retained the manager principal. Direct Agent removal
+      and cross-principal replay were refused. The owned Agents and daemon
+      exited, and the stand was removed. Workspace formatting, locked release
+      all-target builds and warnings-denied release Clippy passed for
+      `eliot-store`, `eliot-daemon`, and `eliot`.
+      Earlier binary SHA-256
+      `765e0b96741d300cfbb97d12dd04bd503c817aac1151c93a1db2b64cccce6ab5`
+      served `claude-haiku-5-5` to manager `agent:a1:1`, which removed a
+      child-registered temp directory. Owner cleanup archived the exact branch
+      tip and verified removal of an OpenCode native session without a model
+      turn. The owned stand was removed. Frozen Codex archive scope and malformed
+      acknowledgements have source coverage without a native fault-injection run.
 
       - [x] **Agent-launched managed child worktrees (2026-11-22).** A private
         Claude manager launched Claude and OpenCode children in parallel, refused

@@ -1606,8 +1606,9 @@ turn. An input-created native session still reports these distinct outcomes.
 An Owner `launch` may set `args.chat:true` and omit `workspace`. It must also
 omit `project`, `parent`, `worktree` and `base`. The daemon freezes the configured
 `[daemon].chats_root`, Store allocates the Agent ID, and the daemon exclusively
-creates `<chats_root>/<agent-id>` as a private directory before native startup.
-The directory identity is registered for artifact cleanup; collisions are refused.
+creates `<chats_root>/<agent-id>-<lowercase-launch-id>` as a private directory
+before native startup. The directory identity is registered for artifact cleanup.
+An existing directory at the resulting path causes launch to refuse.
 The Agent and summaries carry `chat:true` and `project:""`; children inherit this
 classification. Ordinary project discovery is skipped. The command retains the
 root input, and same-ID retries use its frozen path even after settings change.
@@ -2559,6 +2560,9 @@ The named `opencode` integration reads Console workspace budgets and the Go
 allowance through the installed standalone usage operation. The ad-hoc quota
 read explicitly selects Go. Adopted profiles and profiles without a verified
 integration report `unsupported`.
+An HTTP refusal from a verified quota endpoint is a provider read failure.
+For example, OpenCode Go HTTP 403 and Antigravity HTTP 401 produce no new
+quota window or exhaustion evidence.
 These provider readers return `details.windows`: at most 32
 [`QuotaWindow`](../../crates/eliot-core/src/api/harness.rs) values
 `{label, usedPercent, resetsAtMs, windowDurationMins}`. Percent is a finite number
