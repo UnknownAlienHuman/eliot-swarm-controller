@@ -778,10 +778,15 @@ fn project_switch_fences(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
         db,
-        "SELECT c.id, c.updated_at FROM commands c
+        "SELECT c.id, c.updated_at
+         FROM (
+             SELECT DISTINCT switch_command
+             FROM switch_checkout_owners
+             WHERE switch_command IS NOT NULL
+         ) fenced
+         CROSS JOIN commands c ON c.id = fenced.switch_command
          WHERE c.method = 'swarm.switch'
-           AND c.state IN ('unknown','failed','rejected','cancelled')
-           AND EXISTS(SELECT 1 FROM switch_checkout_owners f WHERE f.switch_command = c.id)",
+           AND c.state IN ('unknown','failed','rejected','cancelled')",
         "c.id = ?1",
         bindings,
     )?;

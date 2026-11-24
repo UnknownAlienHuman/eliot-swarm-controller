@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = CHAT_ARTIFACT_RESUME_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = OWNER_INBOX_LOOKUPS_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -20,6 +20,7 @@ const CHECKPOINT_RESTORE_INTENT_VERSION: i64 = 127;
 const CHECKPOINT_RESTORE_CUSTODY_VERSION: i64 = 128;
 const FAILED_CUSTODY_VERSION: i64 = 129;
 const CHAT_ARTIFACT_RESUME_VERSION: i64 = 130;
+const OWNER_INBOX_LOOKUPS_VERSION: i64 = 131;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -112,6 +113,22 @@ impl Store {
                    AND json_extract(artifact.body, '$.purpose') = 'Swarm chat directory'
                    AND json_extract(artifact.body, '$.state') = 'registered';
                  INSERT INTO schema_migrations(version) VALUES (130);",
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < OWNER_INBOX_LOOKUPS_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX owner_inbox_resume_failures ON commands(id, updated_at)
+                   WHERE verb = 'resume' AND principal = 'owner'
+                     AND state IN ('rejected', 'failed');
+                 CREATE INDEX owner_inbox_switch_commands ON switch_checkout_owners(switch_command)
+                   WHERE switch_command IS NOT NULL;
+                 INSERT INTO schema_migrations(version) VALUES (131);",
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;
