@@ -32,28 +32,27 @@ pub struct PreparedRuleCoordination<'a> {
 impl<'a> PreparedRuleCoordination<'a> {
     /// Validate command shape before acquiring the Store writer.
     pub fn decode(command: &'a Command) -> Result<Self> {
-        let subject = match command.verb.as_str() {
-            "mail.send" => "mail",
-            "var.set" => "variable",
-            _ => return Err(Error::new("invalid", "not a coordination command")),
-        };
         if command.target.is_some() || command.generation.is_some() {
             return Err(Error::new(
                 "invalid",
-                format!("{subject} command must be targetless"),
+                "coordination command must be targetless",
             ));
         }
-        let malformed = |_| Error::new("invalid", format!("{subject} definition is malformed"));
-        let definition = if command.verb == "mail.send" {
-            let definition: MailDefinitionArgs =
-                serde_json::from_value(command.args.clone()).map_err(malformed)?;
-            definition.validate()?;
-            RuleCoordinationDefinition::Mail(definition)
-        } else {
-            let definition: VarDefinitionArgs =
-                serde_json::from_value(command.args.clone()).map_err(malformed)?;
-            definition.validate()?;
-            RuleCoordinationDefinition::Variable(definition)
+        let (subject, definition) = match command.verb.as_str() {
+            "mail.send" => {
+                let definition: MailDefinitionArgs =
+                    serde_json::from_value(command.args.clone())
+                        .map_err(|_| Error::new("invalid", "mail.send definition is malformed"))?;
+                definition.validate()?;
+                ("mail", RuleCoordinationDefinition::Mail(definition))
+            }
+            "var.set" => {
+                let definition: VarDefinitionArgs = serde_json::from_value(command.args.clone())
+                    .map_err(|_| Error::new("invalid", "var.set definition is malformed"))?;
+                definition.validate()?;
+                ("variable", RuleCoordinationDefinition::Variable(definition))
+            }
+            _ => return Err(Error::new("invalid", "not a coordination command")),
         };
         Ok(Self {
             command,
