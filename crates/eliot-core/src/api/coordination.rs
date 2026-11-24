@@ -636,20 +636,7 @@ impl VarSetRequest {
     pub fn validate(&self) -> Result<()> {
         validate_write_id(&self.id)
             .map_err(|e| e.with_field("params.id", "nonblank mutation id"))?;
-        if let Some(scope) = self.scope.as_deref() {
-            parse_var_scope(scope).map_err(|e| {
-                e.with_field(
-                    "params.scope",
-                    "global or project:<nonempty name>; tree is unsupported",
-                )
-            })?;
-        }
-        validate_var_key(&self.key).map_err(|e| {
-            e.with_field(
-                "params.key",
-                "nonblank string at most 256 UTF-8 bytes, no NUL",
-            )
-        })?;
+        validate_var_scope_and_key(self.scope.as_deref(), &self.key)?;
         validate_var_value(&self.value).map_err(|e| {
             e.with_field("params.value", "JSON value encoded in at most 16384 bytes")
         })?;
@@ -764,20 +751,7 @@ pub struct VarGetRequest {
 
 impl VarGetRequest {
     pub fn validate(&self) -> Result<()> {
-        if let Some(scope) = self.scope.as_deref() {
-            parse_var_scope(scope).map_err(|e| {
-                e.with_field(
-                    "params.scope",
-                    "global or project:<nonempty name>; tree is unsupported",
-                )
-            })?;
-        }
-        validate_var_key(&self.key).map_err(|e| {
-            e.with_field(
-                "params.key",
-                "nonblank string at most 256 UTF-8 bytes, no NUL",
-            )
-        })?;
+        validate_var_scope_and_key(self.scope.as_deref(), &self.key)?;
         if self.after_version.is_some_and(|version| version < 0) {
             return Err(Error::invalid_field(
                 "params.after_version",
@@ -872,6 +846,23 @@ fn validate_delivery_id(delivery: &str) -> Result<()> {
     }
     parse_agent_id(tail)?;
     Ok(())
+}
+
+fn validate_var_scope_and_key(scope: Option<&str>, key: &str) -> Result<()> {
+    if let Some(scope) = scope {
+        parse_var_scope(scope).map_err(|e| {
+            e.with_field(
+                "params.scope",
+                "global or project:<nonempty name>; tree is unsupported",
+            )
+        })?;
+    }
+    validate_var_key(key).map_err(|e| {
+        e.with_field(
+            "params.key",
+            "nonblank string at most 256 UTF-8 bytes, no NUL",
+        )
+    })
 }
 
 fn validate_var_key(key: &str) -> Result<()> {
