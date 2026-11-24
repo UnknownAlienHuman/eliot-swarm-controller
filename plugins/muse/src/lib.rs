@@ -4,6 +4,7 @@ pub mod capabilities;
 mod events;
 mod host;
 pub mod install;
+mod instructions;
 mod native;
 mod quota;
 

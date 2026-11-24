@@ -5,8 +5,8 @@ use eliot_core::api::{
     HarnessCapabilities,
     inference::sha256_hex,
     instructions::{
-        INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus,
-        InstructionFileView, InstructionReadStatus, InstructionSourceStatus,
+        InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionReadStatus,
+        InstructionSourceStatus,
     },
 };
 use eliot_plugin::MAX_EVENT_BYTES;
@@ -44,13 +44,15 @@ pub(super) fn append_owner_rules(
 }
 
 pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -> Capture {
+    let inventory = HarnessCapabilities::project_instruction_inventory();
     let root = workspace.and_then(|workspace| std::fs::canonicalize(workspace).ok());
     let source_workspace = workspace.map(ToOwned::to_owned);
     let native_read = HarnessCapabilities::of(harness).project_instruction_read;
     let mut remaining = MAX_CATALOG_BYTES;
-    let files = INSTRUCTION_FILE_PATHS
+    let files = inventory
         .iter()
-        .map(|path| {
+        .map(|candidate| {
+            let path = candidate.path;
             let mut file = match root.as_deref() {
                 Some(root) => catalog_file(root, path, &mut remaining),
                 None => empty_file(path, InstructionFileStatus::WorkspaceUnavailable),
@@ -67,27 +69,28 @@ pub(super) fn capture(workspace: Option<&str>, harness: &str, profile: &Value) -
             file
         })
         .collect::<Vec<_>>();
-    let primary = [
-        "AGENTS.md",
-        "AGENTS.override.md",
-        "CLAUDE.md",
-        ".claude/CLAUDE.md",
-        "GEMINI.md",
-        "CLAUDE.local.md",
-        ".claude/CLAUDE.local.md",
-    ]
-    .into_iter()
-    .find(|candidate| {
-        files.iter().any(|file| {
-            file.path == *candidate
-                && !matches!(
-                    file.status,
-                    InstructionFileStatus::Missing | InstructionFileStatus::WorkspaceUnavailable
-                )
+    let fallback_primary = inventory
+        .iter()
+        .min_by_key(|candidate| candidate.primary_rank)
+        .map(|candidate| candidate.path)
+        .unwrap_or_default();
+    let primary = inventory
+        .iter()
+        .filter_map(|candidate| {
+            let file = files.iter().find(|file| file.path == candidate.path)?;
+            (!matches!(
+                file.status,
+                InstructionFileStatus::Missing | InstructionFileStatus::WorkspaceUnavailable
+            ))
+            .then_some((candidate.primary_rank, candidate.path))
         })
-    })
-    .unwrap_or("AGENTS.md");
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, path)| path)
+        .unwrap_or(fallback_primary);
     let source_path = root.as_deref().and_then(|root| {
+        if primary.is_empty() {
+            return None;
+        }
         let path = sources::resolve_source(root, primary).ok()?;
         Some(path.strip_prefix(root).ok()?.to_string_lossy().into_owned())
     });

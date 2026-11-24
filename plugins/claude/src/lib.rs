@@ -5,6 +5,7 @@ mod events;
 mod host;
 pub mod inference;
 pub mod install;
+mod instructions;
 mod native;
 mod owner_scan;
 mod quota;

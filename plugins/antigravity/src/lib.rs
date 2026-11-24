@@ -5,6 +5,7 @@ mod events;
 mod hooks;
 mod host;
 pub mod install;
+mod instructions;
 mod mcp;
 mod native;
 mod profile;

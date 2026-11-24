@@ -165,8 +165,8 @@ pub use hierarchy::{
     parse_tree_selector, selector_child_id,
 };
 pub use instructions::{
-    INSTRUCTION_FILE_PATHS, InstructionDeliveryView, InstructionFileStatus, InstructionFileView,
-    InstructionReadStatus, InstructionSourceStatus,
+    InstructionDeliveryView, InstructionFileStatus, InstructionFileView, InstructionInventoryPath,
+    InstructionReadStatus, InstructionSourceStatus, normalize_instruction_inventory,
 };
 pub use maintenance::{
     MaintenancePurgeLegacyAttentionRequest, MaintenancePurgeLegacyAttentionResponse,

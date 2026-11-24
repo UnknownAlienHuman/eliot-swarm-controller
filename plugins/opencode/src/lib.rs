@@ -5,6 +5,7 @@ mod context_hooks;
 mod events;
 mod host;
 pub mod install;
+mod instructions;
 mod native;
 mod project_mcp;
 mod quota;

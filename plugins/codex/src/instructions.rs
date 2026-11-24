@@ -1,11 +1,25 @@
 //! Codex-native project and user instruction discovery declarations.
 
+use eliot_core::api::InstructionInventoryPath;
 use eliot_core::api::InstructionReadStatus::Documented;
 use eliot_core::api::harness::{ProjectInstructionRead, UserInstructionFiles};
 use eliot_core::api::native_profile::{
     CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, codex_project_doc_override,
 };
 use serde_json::Value;
+
+pub(super) const INSTRUCTION_INVENTORY: &[InstructionInventoryPath] = &[
+    InstructionInventoryPath {
+        path: "AGENTS.md",
+        inventory_rank: 0,
+        primary_rank: 0,
+    },
+    InstructionInventoryPath {
+        path: "AGENTS.override.md",
+        inventory_rank: 1,
+        primary_rank: 1,
+    },
+];
 
 pub(super) const PROJECT_READ: Option<ProjectInstructionRead> = Some(ProjectInstructionRead {
     paths: &[
