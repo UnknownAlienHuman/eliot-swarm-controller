@@ -4,7 +4,7 @@
 //! the filled button, the other offered choices and Snooze; every choice
 //! goes to `owner.decide` bound to the revision shown, so a stale choice
 //! comes back refused (`stale_item`), says why and reads the inbox again.
-//! The per-kind counts in the navigation are `daemon.status` `owner_inbox`,
+//! The per-kind counts in the navigation are `daemon.sidebar` `owner_inbox`,
 //! read on the sidebar's cadence. Wire shapes:
 //! [`eliot_core::api::OwnerInboxItem`] and friends; nothing here derives a
 //! recommendation or a choice.
@@ -62,7 +62,7 @@ struct Outcome {
 
 #[derive(Default)]
 pub(super) struct InboxState {
-    /// Visible items by kind (`daemon.status`).
+    /// Visible items by kind (`daemon.sidebar`).
     pub(super) counts: BTreeMap<OwnerInboxKind, usize>,
     pub(super) profile_command_issues: Vec<ProfileCommandIssue>,
     items: Vec<OwnerInboxItem>,
@@ -287,6 +287,10 @@ impl DesktopApp {
                             AuthLoginStatus::Open => "A sign-in window is already open.".to_owned(),
                             AuthLoginStatus::Cooldown => {
                                 "Sign-in is cooling down. Try again later.".to_owned()
+                            }
+                            AuthLoginStatus::Unknown => {
+                                "Sign-in outcome unknown. Complete sign-in with the vendor."
+                                    .to_owned()
                             }
                         },
                         error: false,

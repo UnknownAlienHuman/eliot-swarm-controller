@@ -3512,8 +3512,15 @@ impl EventProcessor {
         if let Some(session_usage) = session_usage {
             let session_id = self.status.session_id.as_deref().unwrap_or_default();
             let native_id = format!("claude:{session_id}:{session_turn_id}:session.usage");
-            self.commit_event("session.usage", native_id, json!({"usage": session_usage}))
-                .await?;
+            self.commit_event(
+                "session.usage",
+                native_id,
+                json!({
+                    "usage": session_usage,
+                    "boundary_turn_id": session_turn_id,
+                }),
+            )
+            .await?;
         }
         Ok(())
     }

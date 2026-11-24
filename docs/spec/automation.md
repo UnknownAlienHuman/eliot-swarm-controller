@@ -2032,17 +2032,35 @@ already committed baseline rather than replacing it.
 
 **Cost budget.** `max_cost {unit, amount_micros}` budgets the Agent's native
 session cost since the baseline snapshot, in its verbatim unit. Claude reports
-`usd_estimate`. Subscription quota is separate. At `set` the Store captures the
-generation's latest `session_usage` snapshot in that unit and reports its epoch
-timestamp as `cost_baseline_observed_at`. The snapshot may precede `set`, so
-measured spend can include native work between the observation and `set`.
+`usd_estimate`. Subscription quota is separate. At an idle `set`, the Store
+requires the generation's latest `session_usage` snapshot in that unit to be
+as recent as its last completed turn. It reports the baseline's epoch
+timestamp as `cost_baseline_observed_at`. On a running turn, `set` retains the
+exact turn and native session and reports the cost baseline as pending.
+The budget starts with the first turn that begins after the Goal is set.
+The Store binds the baseline atomically when it commits a fresh cumulative
+cost snapshot for the exact completed turn, session and unit. An observation
+carrying the turn's terminal usage binding can establish the baseline when its
+native timestamp is at or after the recorded turn start; it may be observed
+after the terminal commits. If that authenticated snapshot arrives while the turn is
+still running, the Store retains the exact snapshot in the pending Goal state
+without changing its revision. When the verified `turn.completed` commits, the
+same transaction settles the pending baseline from that retained snapshot. A
+later exact-bound snapshot resolves it as before. Both paths require the Goal's
+generation, native reference, turn id, recorded start timestamp, cost unit and
+nonempty source to match; a snapshot without an explicit observation timestamp
+cannot establish the boundary. A newer unrelated session snapshot cannot replace
+the captured turn boundary. Rounds wait for this boundary. If the turn ends without
+verified cost or its completion becomes unknown, the Goal's cost status and
+round refusal identify the unresolved turn. The Owner can set the Goal again
+at a verified idle boundary.
 Older Goals without the retained timestamp continue to report their budget
 and spend with the baseline time unavailable.
 For a launch-installed Goal, Store initializes a zero cost baseline at admission,
 when the new native session has no usage. The baseline binds to the first observed
 session. The Git scope baseline is captured separately after workspace setup.
 `set` is refused as `unsupported` when the harness reports no session cost, reports
-another unit, or ran turns without one. After each failed check, the round commit reads
+another unit, or ran turns without one, once the Agent is idle. After each failed check, the round commit reads
 the latest snapshot. The spent cost is that cumulative amount minus the baseline. It
 counts only for the same native session and unit, from a snapshot observed no earlier
 than the last completed turn, and never with a decreasing cumulative. Anything else is

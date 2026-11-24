@@ -251,7 +251,8 @@ impl PreparedVendorLogin {
         // The daemon can now observe the exact console after a companion exit.
         // The preparation Job contains only the primary process. Vendor-launched
         // processes, including the browser, inherit outside that Job.
-        set_vendor_login_guard(&self.guard, false)?;
+        set_vendor_login_guard(&self.guard, false)
+            .map_err(|error| Error::new("unknown", *error.message))?;
         Ok(VendorLoginConsole(self.process))
     }
 }

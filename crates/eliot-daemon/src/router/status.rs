@@ -5,14 +5,14 @@ use eliot_core::{
     Agent, AgentState, Command, CommandState, Error, Result, SecretPolicy,
     api::{
         AutonomyRequest, DaemonHealthSummary, DaemonSidebarResponse, DaemonStatusResponse,
-        DrainReport, OwnedProcessKind, OwnedProcessSummary, OwnerInboxItem, OwnerInboxKind,
-        RetainedUnknownSummary, RetentionView, RunningTurnSummary, StatusBlocker,
-        UnsettledCommandSummary, WorkspaceCustodyView,
+        DrainReport, OwnedProcessKind, OwnedProcessSummary, OwnerInboxKind, RetainedUnknownSummary,
+        RetentionView, RunningTurnSummary, StatusBlocker, UnsettledCommandSummary,
+        WorkspaceCustodyView,
     },
 };
 use eliot_plugin::sync::LockExt;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 struct ControlFacts {
     agents: Vec<Agent>,
@@ -28,19 +28,15 @@ struct ControlFacts {
 
 impl Router {
     pub(super) async fn sidebar_status(&self) -> Result<Value> {
-        let inbox = self.read_owner_projection().await?.items;
-        serde_json::to_value(self.sidebar_fields(inbox))
+        let owner_inbox = self.read_owner_inbox_counts().await?;
+        serde_json::to_value(self.sidebar_fields(owner_inbox))
             .map_err(|_| Error::new("internal", "daemon sidebar could not be encoded"))
     }
 
-    fn sidebar_fields(&self, inbox: Vec<OwnerInboxItem>) -> DaemonSidebarResponse {
-        let mut owner_inbox = OwnerInboxKind::ALL
-            .into_iter()
-            .map(|kind| (kind, 0))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        for item in inbox {
-            *owner_inbox.entry(item.kind).or_default() += 1;
-        }
+    fn sidebar_fields(
+        &self,
+        owner_inbox: BTreeMap<OwnerInboxKind, usize>,
+    ) -> DaemonSidebarResponse {
         let missing_commands = crate::config::missing_profile_commands(&self.inner.data_root);
         DaemonSidebarResponse {
             owner_inbox,
@@ -74,17 +70,17 @@ impl Router {
         request: eliot_core::api::DaemonStatusRequest,
     ) -> Result<Value> {
         let eliot_store::OwnerProjection {
-            items: inbox,
+            owner_inbox,
             liveness,
             command_without_dispatcher,
             goals_without_progress,
             repeated_failure_inbox_items,
             ..
-        } = self.read_owner_projection().await?;
+        } = self.read_owner_projection(None).await?;
         let DaemonSidebarResponse {
             owner_inbox,
             profile_command_issues,
-        } = self.sidebar_fields(inbox);
+        } = self.sidebar_fields(owner_inbox);
         let (blockers, drain) = self.blockers_and_drain().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();

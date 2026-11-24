@@ -9,6 +9,16 @@ use eliot_core::liveness::{self, AgentWaitEvidence, LivenessObject, Mover};
 use rusqlite::{CachedStatement, Connection, ToSql};
 use serde_json::{Value, json};
 
+pub(super) trait OwnerInboxItemSink {
+    fn push(&mut self, item: OwnerInboxItem);
+}
+
+impl OwnerInboxItemSink for Vec<OwnerInboxItem> {
+    fn push(&mut self, item: OwnerInboxItem) {
+        Vec::push(self, item);
+    }
+}
+
 pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs_owner";
 pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
 const ARTIFACT_LEDGER_SUBJECT: &str = "artifact-ledger";
@@ -47,26 +57,7 @@ pub(crate) fn project(
     now: i64,
 ) -> eliot_core::Result<(Vec<OwnerInboxItem>, SwarmLiveness)> {
     let mut items = Vec::new();
-    let mut liveness = SwarmLiveness::default();
-
-    project_requests(connection, now, &mut items, &mut liveness, &[])?;
-    project_unknown_commands(connection, now, &mut items, &mut liveness, &[])?;
-    project_unknown_restores(connection, now, &mut items, &mut liveness, &[])?;
-    project_resume_failures(connection, now, &mut items, &[])?;
-    project_unknown_turns(connection, now, &mut items, &mut liveness, &[])?;
-    project_holds(connection, now, &mut items, &mut liveness, &[])?;
-    project_harness_checks(connection, now, &mut items, &mut liveness, &[])?;
-    super::auth_login::project_harness_auth(connection, now, &mut items, &mut liveness, &[])?;
-    project_agents(connection, now, &mut items, &mut liveness, &[])?;
-    project_goals(connection, now, &mut items, &mut liveness, &[])?;
-    project_launch_intents(connection, now, &mut items, &mut liveness, &[])?;
-    project_assignment_waits(connection, now, &mut items, &mut liveness, &[])?;
-    project_timers(connection, now, &mut items, &mut liveness, &[])?;
-    project_handoffs(connection, now, &mut items, &mut liveness, &[])?;
-    project_switch_fences(connection, now, &mut items, &mut liveness, &[])?;
-    project_work_not_in_git(connection, now, &mut items, &mut liveness, &[])?;
-    items.extend(project_repeated_failures(connection, now, None)?);
-    items.extend(artifact_capacity_item(connection)?);
+    let liveness = project_into(connection, now, &mut items)?;
 
     items.sort_by(|left, right| {
         left.kind
@@ -74,6 +65,37 @@ pub(crate) fn project(
             .then_with(|| left.subject.cmp(&right.subject))
     });
     Ok((items, liveness))
+}
+
+pub(super) fn project_into(
+    connection: &Connection,
+    now: i64,
+    items: &mut dyn OwnerInboxItemSink,
+) -> eliot_core::Result<SwarmLiveness> {
+    let mut liveness = SwarmLiveness::default();
+
+    project_requests(connection, now, items, &mut liveness, &[])?;
+    project_unknown_commands(connection, now, items, &mut liveness, &[])?;
+    project_unknown_restores(connection, now, items, &mut liveness, &[])?;
+    project_resume_failures(connection, now, items, &[])?;
+    project_unknown_turns(connection, now, items, &mut liveness, &[])?;
+    project_holds(connection, now, items, &mut liveness, &[])?;
+    project_harness_checks(connection, now, items, &mut liveness, &[])?;
+    super::auth_login::project_harness_auth(connection, now, items, &mut liveness, &[])?;
+    project_agents(connection, now, items, &mut liveness, &[])?;
+    project_goals(connection, now, items, &mut liveness, &[])?;
+    project_launch_intents(connection, now, items, &mut liveness, &[])?;
+    project_assignment_waits(connection, now, items, &mut liveness, &[])?;
+    project_timers(connection, now, items, &mut liveness, &[])?;
+    project_handoffs(connection, now, items, &mut liveness, &[])?;
+    project_switch_fences(connection, now, items, &mut liveness, &[])?;
+    project_work_not_in_git(connection, now, items, &mut liveness, &[])?;
+    project_repeated_failures(connection, now, items, None)?;
+    if let Some(item) = artifact_capacity_item(connection)? {
+        items.push(item);
+    }
+
+    Ok(liveness)
 }
 
 /// Reuse the projection for an exact subject, with equality predicates on
@@ -94,12 +116,14 @@ pub(crate) fn project_item(
     if kind == OwnerInboxKind::Stuck
         && let Some(cause) = subject.strip_prefix("repeat:")
     {
-        return Ok(project_repeated_failures(db, now, Some(cause))?.pop());
+        let mut items = Vec::new();
+        project_repeated_failures(db, now, &mut items, Some(cause))?;
+        return Ok(items.pop());
     }
     type Projector = fn(
         &Connection,
         i64,
-        &mut Vec<OwnerInboxItem>,
+        &mut dyn OwnerInboxItemSink,
         &mut SwarmLiveness,
         &[&dyn ToSql],
     ) -> eliot_core::Result<()>;
@@ -231,7 +255,7 @@ pub(crate) fn project_item(
 fn project_resume_failures(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(
@@ -292,8 +316,9 @@ fn project_resume_failures(
 fn project_repeated_failures(
     db: &Connection,
     now: i64,
+    items: &mut dyn OwnerInboxItemSink,
     cause: Option<&str>,
-) -> eliot_core::Result<Vec<OwnerInboxItem>> {
+) -> eliot_core::Result<()> {
     let sql = "SELECT r.cause, r.occurrence, r.opened_at, r.message
          FROM repeat_failure_alerts r LEFT JOIN agents a ON a.id = r.goal_agent
          WHERE r.expires_at > ?1 AND (r.goal_agent IS NULL OR
@@ -323,7 +348,10 @@ fn project_repeated_failures(
             Ok(alert)
         })
         .map_err(sql_error)?;
-    rows.map(|row| row.map_err(sql_error)).collect()
+    for row in rows {
+        items.push(row.map_err(sql_error)?);
+    }
+    Ok(())
 }
 
 fn projection_query<'a>(
@@ -343,7 +371,7 @@ fn projection_query<'a>(
 fn project_requests(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -445,7 +473,7 @@ fn request_choices(
 fn project_unknown_commands(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -638,7 +666,7 @@ fn project_unknown_commands(
 fn project_unknown_restores(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -718,7 +746,7 @@ fn project_unknown_restores(
 fn project_unknown_turns(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -772,7 +800,7 @@ fn project_unknown_turns(
 fn project_switch_fences(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -827,7 +855,7 @@ fn project_switch_fences(
 fn project_handoffs(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     _stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -960,7 +988,7 @@ fn project_handoffs(
 fn project_work_not_in_git(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     _stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1100,7 +1128,7 @@ fn powershell_quote(value: &str) -> String {
 fn project_holds(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1246,7 +1274,7 @@ fn project_holds(
 fn project_harness_checks(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1307,7 +1335,7 @@ fn project_harness_checks(
 fn project_agents(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1586,7 +1614,7 @@ fn agent_wait_evidence(
 fn project_goals(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1722,7 +1750,7 @@ fn mode_name(mode: GoalMode) -> &'static str {
 fn project_launch_intents(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1801,7 +1829,7 @@ fn project_launch_intents(
 fn project_assignment_waits(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
@@ -1902,7 +1930,7 @@ fn project_assignment_waits(
 fn project_timers(
     db: &Connection,
     now: i64,
-    items: &mut Vec<OwnerInboxItem>,
+    items: &mut dyn OwnerInboxItemSink,
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {

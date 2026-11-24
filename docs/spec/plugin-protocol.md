@@ -781,6 +781,23 @@ session signals (Codex `thread/tokenUsage/updated` cumulative total plus
 cost, Claude `result.total_cost_usd`) into the latest merged snapshot and
 commit each changed snapshot when accepted, bound to the exact
 Agent generation with the adapter plus native signal name as `source`.
+When a priced adapter commits the cumulative observation for a confirmed
+turn boundary, it includes `boundary_turn_id` on the `session.usage` event.
+The Store validates the retained turn and native session before using this
+observation to establish a pending Goal cost baseline. A bound observation
+must carry a native timestamp at or after the turn's recorded start; the
+observation may be recorded after the terminal commits. If it arrives before
+the terminal, Store retains the exact accepted
+snapshot in the pending Goal JSON while the turn is running, without advancing
+the Goal revision. The verified `turn.completed` transaction then settles the
+baseline from that retained snapshot. If usage arrives after completion, Store
+resolves it in the usage transaction. Both orders require the exact Agent
+generation, native reference, boundary turn, recorded start timestamp, cost
+unit and nonempty source; an absent observation timestamp is not inferred from
+Store time. The retained snapshot remains the captured boundary even if a later
+session snapshot supersedes it. The Store keeps that observation time and the
+confirmed completion time. Usage remains session-scoped. An unresolved or
+unknown completion does not settle the pending baseline or imply zero spend.
 Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a

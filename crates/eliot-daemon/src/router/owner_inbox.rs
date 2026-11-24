@@ -3,12 +3,12 @@ use eliot_core::{
     Error, Result,
     api::{
         LIVENESS_MAIL_THREAD_PREFIX, MailMode, MailSendRequest, OwnerDecideRequest,
-        OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxRequest, OwnerInboxResponse,
-        SWARM_MAIL_SENDER, discovery::decode_params,
+        OwnerDecideResponse, OwnerInboxItemRef, OwnerInboxKind, OwnerInboxRequest,
+        OwnerInboxResponse, SWARM_MAIL_SENDER, discovery::decode_params,
     },
 };
 use eliot_plugin::sync::LockExt;
-use eliot_store::{OwnerDecisionAdmission, OwnerProjection, Store, StuckStates};
+use eliot_store::{OwnerDecisionAdmission, OwnerInboxPage, OwnerProjection, Store, StuckStates};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -37,14 +37,29 @@ impl Router {
         self.inner.confirmed_stuck.lock_recover().clone()
     }
 
-    pub(super) async fn read_owner_projection(&self) -> Result<OwnerProjection> {
+    pub(super) async fn read_owner_projection(
+        &self,
+        page: Option<OwnerInboxPage>,
+    ) -> Result<OwnerProjection> {
         let path = self.inner.data_root.join("eliot.db");
         let confirmed = self.confirmed_stuck();
         tokio::task::spawn_blocking(move || {
-            Store::read_owner_projection(&path, super::now_ms(), &confirmed)
+            Store::read_owner_projection(&path, super::now_ms(), &confirmed, page)
         })
         .await
         .map_err(|_| Error::new("internal", "owner projection reader failed"))?
+    }
+
+    pub(super) async fn read_owner_inbox_counts(
+        &self,
+    ) -> Result<std::collections::BTreeMap<OwnerInboxKind, usize>> {
+        let path = self.inner.data_root.join("eliot.db");
+        let confirmed = self.confirmed_stuck();
+        tokio::task::spawn_blocking(move || {
+            Store::read_owner_inbox_counts(&path, super::now_ms(), &confirmed)
+        })
+        .await
+        .map_err(|_| Error::new("internal", "owner inbox count reader failed"))?
     }
 
     pub(super) async fn owner_inbox(
@@ -56,30 +71,23 @@ impl Router {
         require_owner(principal)?;
         let request: OwnerInboxRequest = decode_params(params.clone())?;
         let limit = request.effective_limit()?;
-        let OwnerProjection {
-            items,
-            waiting_over_24h,
-            ..
-        } = self.read_owner_projection().await?;
-        let mut items = items
-            .into_iter()
-            .filter(|item| !aged_only || item.waiting_over_24h())
-            .map(|item| (item.cursor(), item))
-            .collect::<Vec<_>>();
-        items.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        let mut page = items
-            .into_iter()
-            .filter(|(cursor, _)| request.after.as_ref().is_none_or(|after| cursor > after))
-            .take(limit + 1)
-            .collect::<Vec<_>>();
+        let projection = self
+            .read_owner_projection(Some(OwnerInboxPage {
+                after: request.after,
+                aged_only,
+                limit,
+            }))
+            .await?;
+        let mut page = projection.items;
         let next = if page.len() > limit {
             page.pop();
-            page.last().map(|(cursor, _)| cursor.clone())
+            page.last().map(|item| item.cursor())
         } else {
             None
         };
+        let mut visible = page;
+        let waiting_over_24h = projection.waiting_over_24h;
         let data_dir = eliot_core::display_path(&self.inner.data_root.to_string_lossy());
-        let mut visible: Vec<_> = page.into_iter().map(|(_, item)| item).collect();
         for item in &mut visible {
             if let Some(instructions) = item.instructions.as_mut() {
                 *instructions = instructions.replace(

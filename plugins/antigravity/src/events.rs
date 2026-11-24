@@ -2347,8 +2347,13 @@ impl State {
         let Some(usage) = self.session_usage.clone() else {
             return Ok(());
         };
-        self.commit("session.usage", turn, "terminal", json!({"usage": usage}))
-            .await?;
+        self.commit(
+            "session.usage",
+            turn,
+            "terminal",
+            json!({"usage": usage, "boundary_turn_id": turn}),
+        )
+        .await?;
         self.session_usage_turn = None;
         Ok(())
     }

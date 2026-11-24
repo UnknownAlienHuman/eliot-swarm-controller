@@ -193,7 +193,7 @@ impl Store {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sql_error)?;
-            let snapshot = native_events::persist_session_usage_snapshot(
+            let (snapshot, _) = native_events::persist_session_usage_snapshot(
                 &tx, agent_num, generation, now, &usage,
             )?;
             commit_transaction(tx, &self.write_faulted)?;

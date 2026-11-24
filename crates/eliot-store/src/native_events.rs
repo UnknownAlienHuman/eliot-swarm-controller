@@ -375,6 +375,11 @@ pub(super) fn persist_effects(
                     usage.as_ref(),
                     *completed_at,
                 )?);
+                if native_event.kind == "turn.completed" && *state == TurnState::Completed {
+                    super::goals::resolve_pending_goal_cost_base_tx(
+                        tx, agent_num, next_agent, turn_id, None, now,
+                    )?;
+                }
                 if native_event.kind == "session.ended" {
                     settle_unfinished_tools_tx(
                         tx,
@@ -1412,23 +1417,35 @@ fn persist_session_usage(scope: EffectScope<'_, '_>, usage: &SessionUsage) -> Re
         agent_num,
         generation,
         now,
-        ..
+        native_event,
+        next_agent,
     } = scope;
-    persist_session_usage_snapshot(tx, agent_num, generation, now, usage)?;
+    let (_, updated) = persist_session_usage_snapshot(tx, agent_num, generation, now, usage)?;
+    if updated && let Some(turn_id) = native_event.data["boundary_turn_id"].as_str() {
+        super::goals::resolve_pending_goal_cost_base_tx(
+            tx,
+            agent_num,
+            next_agent,
+            turn_id,
+            Some(usage),
+            now,
+        )?;
+    }
     Ok(())
 }
 
 /// Replace the generation's current session snapshot in the caller's
 /// transaction. Native journal events and live non-journal samples share this
 /// monotonic projection update. Return the encoded snapshot that the transaction
-/// retains so callers needing a readback can decode it after commit.
+/// retains so callers needing a readback can decode it after commit, and
+/// whether this observation advanced the projection.
 pub(super) fn persist_session_usage_snapshot(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     now: i64,
     usage: &SessionUsage,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let snapshot = encode_json(usage)?;
     if snapshot.len() > MAX_EVENT_BYTES {
         return Err(Error::new(
@@ -1461,7 +1478,7 @@ pub(super) fn persist_session_usage_snapshot(
         }
         Some((stored_snapshot, stored_at)) => {
             if stored_snapshot == snapshot || observed_at <= stored_at {
-                return Ok(stored_snapshot);
+                return Ok((stored_snapshot, false));
             }
             db!(tx.execute(
                 "UPDATE session_usage SET snapshot = ?1, observed_at = ?2
@@ -1470,7 +1487,7 @@ pub(super) fn persist_session_usage_snapshot(
             ));
         }
     }
-    Ok(snapshot)
+    Ok((snapshot, true))
 }
 
 pub(super) fn verified_native_event_cause_tx(

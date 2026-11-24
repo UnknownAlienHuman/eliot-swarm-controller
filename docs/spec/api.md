@@ -503,7 +503,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
 | `harness.list/models/quota` | owner-only installed harness inventory with versions, per-harness read-only native catalogues and provider-supported quota readback; no model turn or inference |
-| `auth.login` | Owner-local request to queue or reopen one native harness sign-in; the typed response reports `queued`, `open` or `cooldown` and contains no credentials |
+| `auth.login` | Owner-local request to queue or reopen one native harness sign-in. The typed response reports `queued`, `open`, `cooldown` or `unknown` and contains no credentials. |
 | `models.catalog` | Owner-only bounded, paginated search across installed harness catalogues. The [canonical response](../../crates/eliot-core/src/api/harness.rs) includes freshness and per-harness failures. Availability requires affirmative fresh native quota and complete hold readback. An `after` cursor from a replaced listing returns `invalid` and tells the caller to restart from the first page. The [catalogue owner](../../crates/eliot-daemon/src/router/catalog.rs) handles background discovery and page availability. |
 | `models.catalog.watch` | Owner-only wait for a changed aggregate revision. A 20-second wait with no change returns a null revision. This read uses the settled in-memory revision and creates no discovery demand. |
 | `script.list/read/save` | Owner-only scripts under approved Run roots: cursor/encoded-byte-bounded list (one root scan per page; continue through empty pages until `next_cursor` is absent), verified-handle bounded read, and serialized revision-guarded replacement. Complete secret-bearing entries are withheld; raw and decoded TOML/JSON keys/values are checked. Saves never execute; external-writer conflict limits and editor environment are specified in [automation](automation.md#script-editing). DTOs/budgets: [`script_edit.rs`](../../crates/eliot-core/src/api/script_edit.rs). |
@@ -763,8 +763,8 @@ of failure or permission to replay the effect.
 `swarm auth login --harness H` is an Owner-local `auth.login` call using
 [`AuthLoginRequest` and `AuthLoginResponse`](../../crates/eliot-core/src/api/auth_login.rs).
 The CLI sends `{harness: H, revision: null}` and prints the returned status, or the
-response DTO with `--json`. `queued`, `open` and `cooldown` describe request state;
-none establishes that a vendor account is signed in. The CLI carries no credential and
+response DTO with `--json`. `queued`, `open`, `cooldown` and `unknown` describe
+request state. Vendor sign-in is established by the status probe. The CLI carries no credential and
 does not run a vendor command.
 
 The Owner inbox projects a `harness_auth` item for a sign-in action. Its `sign_in`
@@ -776,21 +776,25 @@ runs the vendor's native interactive flow in the Owner's desktop session, and re
 the result through the bounded desktop sign-in DTOs. The CLI request itself never
 opens a headless vendor process or asserts that the desktop action completed.
 
-The daemon dispatches one automatic console per harness outage. An unused grant
-expires after 15 seconds and returns to the queue. An explicit request for open work
-reports `open`. A request
-inside the five-minute attempt cooldown reports `cooldown`. Another manual attempt is
-eligible only after five minutes have passed since the last claim and the prior launch
-is known closed or failed. Store schema 123 retains the claim across daemon restarts.
+The daemon dispatches one automatic console per harness outage. The grant expires
+after 15 seconds. Store retains the claim across daemon restarts. An explicit request
+for open work reports `open`. A request inside the five-minute attempt cooldown
+reports `cooldown`. Another manual attempt is eligible only after five minutes have
+passed since the last claim and the prior launch is known closed or failed.
 The companion records the suspended console's PID and creation time before running
 it. An identical `Prepared` report for a live claim returns the committed
 receipt. The companion may retry that report while it still owns the same
 suspended process, then starts it only after a positive receipt. Recovery
-checks OS process identity outside the Store mutex and retires only a matching
-recorded console proven dead. A live
-console keeps its claim. Swarm publishes `x.user.notify` when the desktop confirms
-an unresolved console is open. A signed-in probe clears the inbox item and bound
-provider auth holds, then wakes launch arbitration.
+checks OS process identity outside the Store mutex. A live console keeps its claim.
+An expired claim with no confirmed result settles as `unknown` when the recorded
+process has exited or the desktop never recorded its process identity. Store preserves
+the attempt and any recorded identity, and reports the outcome to the Owner through
+the inbox and `x.user.notify`. Sign-in requests return `unknown` and leave dispatch
+blocked. An exact `Closed` or `Failed` report accepted before recovery establishes a
+known outcome. The Owner can complete an unknown attempt through the vendor. Swarm
+also publishes `x.user.notify` when the desktop confirms an unresolved console is
+open. A signed-in probe clears the inbox item and bound provider auth holds, then
+wakes launch arbitration.
 
 The native vendor handles the console, browser and credential storage. Swarm passes
 fixed argv and leaves the console streams with the vendor. It never collects passwords,
@@ -830,6 +834,15 @@ A stale item returns `stale_item`. A snooze lasts until
 the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
+
+Items are ordered by their opaque cursor; `after` is exclusive. `next` is the
+last returned item's cursor only when another item exists. `daemon.sidebar`
+and full `daemon.status` report counts for exactly the same reportable,
+unsnoozed projection in one read snapshot. Both fold the projection into
+per-kind totals without retaining the complete item vector; status also streams
+its liveness and health summaries. `owner.inbox` streams those summaries while
+buffering at most `limit + 1` matching items, preserving kind/subject ordering,
+the exclusive `after` cursor, and filtering `aged` items before pagination.
 
 For a missing worktree with a retained checkpoint, the inbox instructions include
 `git worktree prune`, `git worktree add`, and the exact
@@ -965,7 +978,9 @@ and refresh state described in [monitoring](monitoring.md). Desktop Storage
 requests `disk_usage_scan_window: true` to include the scan end age as well.
 An empty request returns disk usage buckets.
 The Owner-only `daemon.sidebar` accepts an empty object and returns Owner
-inbox counts and profile command issues for the desktop poll.
+inbox counts and profile command issues for the desktop poll. Counts include
+all visible items of each kind, including items beyond the first page, and use
+the same liveness-confirmation and exact-revision snooze rules as `owner.inbox`.
 
 `maintenance.run` is owner-only and accepts an empty object. It reloads the
 daemon retention settings and runs one bounded retention epoch (the periodic

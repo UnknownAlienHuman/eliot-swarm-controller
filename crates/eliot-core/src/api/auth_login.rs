@@ -16,6 +16,7 @@ pub enum AuthLoginStatus {
     Queued,
     Open,
     Cooldown,
+    Unknown,
 }
 
 impl AuthLoginStatus {
@@ -24,6 +25,7 @@ impl AuthLoginStatus {
             Self::Queued => "queued",
             Self::Open => "open",
             Self::Cooldown => "cooldown",
+            Self::Unknown => "unknown",
         }
     }
 }

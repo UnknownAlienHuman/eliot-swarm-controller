@@ -152,7 +152,11 @@ async fn run() {
                             if !accepted {
                                 continue;
                             }
-                            prepared.start().ok()
+                            match prepared.start() {
+                                Ok(console) => Some(console),
+                                Err(error) if error.code == "unknown" => continue,
+                                Err(_) => None,
+                            }
                         }
                         Err(error) if matches!(error.code.as_str(), "busy" | "stale_item") => {
                             continue;

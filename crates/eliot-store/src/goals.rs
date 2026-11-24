@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 const MAX_GOAL_CHECK_HISTORY_ROWS: i64 = 8_192;
 const NATIVE_FOLLOWUP_WINDOW_MS: i64 = 5 * 60 * 1_000;
+const COST_BASE_PENDING: &str = "awaiting the active turn's session usage boundary";
 
 /// A Swarm note: an `inject` from a Swarm principal. An inject from the Owner
 /// or a manager is never one, whatever its delivery state.
@@ -1498,6 +1499,9 @@ impl Store {
                 format!("goal is {} and takes no rounds", row.state.status.as_str()),
             ));
         }
+        if let Some(reason) = pending_cost_base_reason(&self.connection, &row)? {
+            return Err(Error::new("bad_state", reason));
+        }
         if row.last_round_key.as_deref() == Some(&key.text()) {
             return Err(Error::new(
                 "stale_round",
@@ -1850,6 +1854,12 @@ impl Store {
                 && row.state.status == status
                 && row.state.stop_paused == stop_paused
                 && !row.state.project_default
+                && row.state.cost_base.as_ref().is_none_or(|base| {
+                    base.pending_turn_id.as_ref().is_none_or(|turn_id| {
+                        agent_row.active_turn.as_ref() == Some(turn_id)
+                            && base.pending_native_ref == agent_row.native_ref
+                    })
+                })
                 && encode_json(&row.definition)? == encoded
             {
                 let view = goal_view_on(&tx, &goal_holder, row)?;
@@ -1857,8 +1867,14 @@ impl Store {
                 commit_transaction(tx, &self.write_faulted)?;
                 return Ok(view);
             }
-            let cost_base =
-                goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
+            let cost_base = goal_cost_base_tx(
+                &tx,
+                agent_num,
+                agent_row.generation,
+                definition,
+                turn_count,
+                &agent_row,
+            )?;
             let revision = row.revision + 1;
             let state = GoalStatePersist {
                 transferred_turns: 0,
@@ -1874,7 +1890,13 @@ impl Store {
                     .filter(|_| row.generation == agent_row.generation),
                 counters: GoalCounters {
                     turns_at_set: turn_count,
-                    cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
+                    cost_spent_micros: definition
+                        .max_cost
+                        .as_ref()
+                        .filter(|_| !cost_base_pending(cost_base.as_ref()))
+                        .map(|_| 0),
+                    cost_unverified: cost_base_pending(cost_base.as_ref())
+                        .then(|| COST_BASE_PENDING.to_owned()),
                     ..GoalCounters::default()
                 },
                 cadence_anchor_ms: definition.cadence_ms.map(|_| now),
@@ -1906,8 +1928,14 @@ impl Store {
             commit_transaction(tx, &self.write_faulted)?;
             return Ok(view);
         }
-        let cost_base =
-            goal_cost_base_tx(&tx, agent_num, agent_row.generation, definition, turn_count)?;
+        let cost_base = goal_cost_base_tx(
+            &tx,
+            agent_num,
+            agent_row.generation,
+            definition,
+            turn_count,
+            &agent_row,
+        )?;
         let state = GoalStatePersist {
             transferred_turns: 0,
             unverified_completion_rounds: 0,
@@ -1919,7 +1947,13 @@ impl Store {
             round_reset_revision: None,
             counters: GoalCounters {
                 turns_at_set: turn_count,
-                cost_spent_micros: definition.max_cost.as_ref().map(|_| 0),
+                cost_spent_micros: definition
+                    .max_cost
+                    .as_ref()
+                    .filter(|_| !cost_base_pending(cost_base.as_ref()))
+                    .map(|_| 0),
+                cost_unverified: cost_base_pending(cost_base.as_ref())
+                    .then(|| COST_BASE_PENDING.to_owned()),
                 ..GoalCounters::default()
             },
             cadence_anchor_ms: definition.cadence_ms.map(|_| now),
@@ -2351,6 +2385,9 @@ impl Store {
                 "bad_state",
                 format!("goal is {} and takes no rounds", row.state.status.as_str()),
             ));
+        }
+        if let Some(reason) = pending_cost_base_reason(&tx, &row)? {
+            return Err(Error::new("bad_state", reason));
         }
         if row.revision != expected_revision {
             return Err(Error::new(
@@ -3267,9 +3304,9 @@ fn goal_continuation_spent_budget(
 /// Decide a failed check against the frozen limits. Success always
 /// completes; otherwise the round budget, turn budget and no-progress streak
 /// block in that order. Counters are already updated for this check.
-/// Cost baseline of a Goal with `max_cost`: the native session's cumulative
-/// cost in the last snapshot at `set`, in the budget's unit. A zero
-/// baseline without a source binds the first session the Goal sees.
+/// Cost baseline of a Goal with `max_cost`: a fresh native session snapshot
+/// after the latest completed turn. A zero baseline without a source binds
+/// the first session the Goal sees.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct GoalCostBase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3277,6 +3314,54 @@ struct GoalCostBase {
     amount_micros: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     observed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary_completed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boundary_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_native_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_usage: Option<GoalCostObservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct GoalCostObservation {
+    source: String,
+    amount_micros: i64,
+    observed_at: i64,
+}
+
+fn cost_base_pending(base: Option<&GoalCostBase>) -> bool {
+    base.is_some_and(|base| base.pending_turn_id.is_some())
+}
+
+fn pending_cost_base_reason(connection: &Connection, row: &GoalRow) -> Result<Option<String>> {
+    let Some(turn_id) = row
+        .state
+        .cost_base
+        .as_ref()
+        .and_then(|base| base.pending_turn_id.as_deref())
+    else {
+        return Ok(None);
+    };
+    let state: Option<String> = connection
+        .query_row(
+            "SELECT state FROM turns WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![row.agent_num, row.generation, turn_id],
+            |record| record.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let reason = match state.as_deref() {
+        Some("running") => COST_BASE_PENDING.to_owned(),
+        Some("completed") => {
+            format!("turn {turn_id} completed without a verified same-session cost snapshot")
+        }
+        _ => format!("the completion boundary of turn {turn_id} could not be verified"),
+    };
+    Ok(Some(reason))
 }
 
 /// The cost since the recorded baseline, or why it cannot be trusted.
@@ -3325,46 +3410,203 @@ fn latest_session_usage(
     .transpose()
 }
 
+fn latest_completed_turn_at(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    generation: i64,
+) -> Result<Option<i64>> {
+    tx.query_row(
+        "SELECT MAX(completed_at) FROM turns WHERE agent = ?1 AND generation = ?2",
+        params![agent_num, generation],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
 /// The verbatim cumulative cost of a snapshot, when it has amount and unit.
 fn snapshot_cost(usage: &core::SessionUsage) -> Option<(f64, &str)> {
     let cost = usage.cumulative_cost.as_ref()?;
     Some((cost.amount?, cost.unit.as_deref()?))
 }
 
-/// Baseline at `set` or launch preflight. A budget needs the Agent's native
-/// session cost in its unit: the latest snapshot, or zero before its first turn.
+/// Baseline at `set`. If a turn is active, retain its exact turn and native
+/// session binding and wait for that turn's fresh terminal usage snapshot.
+/// Otherwise require the latest snapshot to follow the last completed turn.
 fn goal_cost_base_tx(
     tx: &Transaction<'_>,
     agent_num: i64,
     generation: i64,
     definition: &GoalDefinition,
     turn_count: i64,
+    agent: &Agent,
 ) -> Result<Option<GoalCostBase>> {
     let Some(limit) = &definition.max_cost else {
         return Ok(None);
     };
+    if let Some(active_turn) = agent.active_turn.as_deref() {
+        let Some(native_ref) = agent
+            .native_ref
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Err(Error::new(
+                "unsupported",
+                "max_cost cannot bind its pending baseline to a native session",
+            ));
+        };
+        let active_turn_is_open: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM turns WHERE agent = ?1 AND generation = ?2
+                 AND turn_id = ?3 AND state = 'running'
+                 AND started_at IS NOT NULL AND completed_at IS NULL)",
+                params![agent_num, generation, active_turn],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
+        if !active_turn_is_open {
+            return Err(Error::new(
+                "unsupported",
+                "max_cost cannot bind its pending baseline to the active turn",
+            ));
+        }
+        return Ok(Some(GoalCostBase {
+            pending_turn_id: Some(active_turn.to_owned()),
+            pending_native_ref: Some(native_ref.to_owned()),
+            ..GoalCostBase::default()
+        }));
+    }
+    let last_completed = latest_completed_turn_at(tx, agent_num, generation)?;
+    if turn_count > 0 && last_completed.is_none() {
+        return Err(Error::new(
+            "unsupported",
+            "no completed turn boundary is available for this Agent",
+        ));
+    }
     match latest_session_usage(tx, agent_num, generation)? {
-        Some((usage, observed_at)) => match snapshot_cost(&usage) {
-            Some((amount, unit)) if unit == limit.unit => Ok(Some(GoalCostBase {
-                source: usage.source.clone(),
-                amount_micros: cost_micros(amount),
-                observed_at: Some(observed_at),
-            })),
-            Some(_) => Err(Error::new(
-                "unsupported",
-                "the Agent reports its session cost in another unit than max_cost",
-            )),
-            None => Err(Error::new(
-                "unsupported",
-                "the Agent's harness reports no session cost",
-            )),
-        },
+        Some((usage, observed_at)) => {
+            if last_completed.is_some_and(|completed_at| observed_at < completed_at) {
+                return Err(Error::new(
+                    "unsupported",
+                    "no session cost was observed after the last completed turn",
+                ));
+            }
+            match snapshot_cost(&usage) {
+                Some((amount, unit)) if unit == limit.unit => Ok(Some(GoalCostBase {
+                    source: usage.source.clone(),
+                    amount_micros: cost_micros(amount),
+                    observed_at: Some(observed_at),
+                    ..GoalCostBase::default()
+                })),
+                Some(_) => Err(Error::new(
+                    "unsupported",
+                    "the Agent reports its session cost in another unit than max_cost",
+                )),
+                None => Err(Error::new(
+                    "unsupported",
+                    "the Agent's harness reports no session cost",
+                )),
+            }
+        }
         None if turn_count == 0 => Ok(Some(GoalCostBase::default())),
         None => Err(Error::new(
             "unsupported",
             "no session cost was observed for this Agent's turns",
         )),
     }
+}
+
+pub(super) fn resolve_pending_goal_cost_base_tx(
+    tx: &Transaction<'_>,
+    agent_num: i64,
+    agent: &Agent,
+    boundary_turn_id: &str,
+    usage: Option<&SessionUsage>,
+    now: i64,
+) -> Result<()> {
+    let Some(mut row) = load_goal_row(tx, agent_num, "eliot")? else {
+        return Ok(());
+    };
+    if row.generation != agent.generation
+        || !matches!(row.state.status, GoalStatus::Active | GoalStatus::Paused)
+    {
+        return Ok(());
+    }
+    let (Some(base), Some(limit)) = (
+        row.state.cost_base.as_mut(),
+        row.definition.max_cost.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    if base.pending_turn_id.as_deref() != Some(boundary_turn_id)
+        || base.pending_native_ref.is_none()
+        || base.pending_native_ref != agent.native_ref
+    {
+        return Ok(());
+    }
+    let observation = if let Some(usage) = usage {
+        let (Some((amount, unit)), Some(source)) = (snapshot_cost(usage), usage.source.as_ref())
+        else {
+            return Ok(());
+        };
+        if unit != limit.unit || source.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(observed_at) = usage.observed_at else {
+            return Ok(());
+        };
+        GoalCostObservation {
+            source: source.clone(),
+            amount_micros: cost_micros(amount),
+            observed_at,
+        }
+    } else if let Some(observation) = base.pending_usage.as_ref() {
+        observation.clone()
+    } else {
+        return Ok(());
+    };
+
+    let boundary: Option<(String, Option<i64>, Option<i64>)> = tx
+        .query_row(
+            "SELECT state, started_at, completed_at FROM turns
+             WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3",
+            params![agent_num, agent.generation, boundary_turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((state, Some(started_at), completed_at)) = boundary else {
+        return Ok(());
+    };
+    if observation.observed_at < started_at {
+        return Ok(());
+    }
+    match (state.as_str(), completed_at) {
+        ("running", None) if usage.is_some() && base.pending_usage.is_none() => {
+            // Preserve the first accepted bound observation until the same turn's
+            // terminal record commits, without advancing the visible Goal revision.
+            base.pending_usage = Some(observation);
+            tx.execute(
+                "UPDATE goals SET state = ?1 WHERE agent = ?2 AND mode = ?3 AND generation = ?4 AND revision = ?5",
+                params![encode_json(&row.state)?, agent_num, row.mode, row.generation, row.revision],
+            )
+            .map_err(sql_error)?;
+            return Ok(());
+        }
+        ("completed", Some(completed_at)) => {
+            *base = GoalCostBase {
+                source: Some(observation.source),
+                amount_micros: observation.amount_micros,
+                observed_at: Some(observation.observed_at),
+                boundary_completed_at: Some(completed_at),
+                boundary_turn_id: Some(boundary_turn_id.to_owned()),
+                ..GoalCostBase::default()
+            };
+        }
+        _ => return Ok(()),
+    }
+    row.state.counters.cost_spent_micros = Some(0);
+    row.state.counters.cost_unverified = None;
+    update_goal_state_tx(tx, agent_num, &row.mode, row.revision, &row.state, now)
 }
 
 /// The cost since the recorded baseline, read after a check. Missing, stale, mixed,
@@ -3385,6 +3627,9 @@ fn goal_cost_reading_tx(
             "no cost baseline is recorded for this session",
         )));
     };
+    if cost_base_pending(Some(base)) {
+        return Ok(Some(GoalCostReading::Unverified(COST_BASE_PENDING)));
+    }
     let Some((usage, observed_at)) = latest_session_usage(tx, agent_num, generation)? else {
         return Ok(Some(if turns_used == 0 {
             GoalCostReading::Spent {
@@ -3395,13 +3640,26 @@ fn goal_cost_reading_tx(
             GoalCostReading::Unverified("no session cost was observed")
         }));
     };
-    let last_completed: Option<i64> = tx
-        .query_row(
-            "SELECT MAX(completed_at) FROM turns WHERE agent = ?1 AND generation = ?2",
-            params![agent_num, generation],
+    let last_completed = latest_completed_turn_at(tx, agent_num, generation)?;
+    let newer_completion = last_completed.filter(|done| *done > observed_at);
+    let is_baseline_boundary = if let (Some(turn_id), Some(completed_at)) =
+        (base.boundary_turn_id.as_deref(), newer_completion)
+        && turns_used == 0
+        && base.observed_at == Some(observed_at)
+        && base.boundary_completed_at == Some(completed_at)
+    {
+        tx.query_row(
+            "SELECT turn_id = ?4 FROM turns WHERE agent = ?1 AND generation = ?2
+             AND completed_at = ?3 ORDER BY insertion_seq DESC, rowid DESC LIMIT 1",
+            params![agent_num, generation, completed_at, turn_id],
             |row| row.get(0),
         )
-        .map_err(sql_error)?;
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false)
+    } else {
+        false
+    };
     let reading = match snapshot_cost(&usage) {
         None => GoalCostReading::Unverified("the latest session snapshot has no cost"),
         Some((_, unit)) if unit != limit.unit => {
@@ -3413,7 +3671,7 @@ fn goal_cost_reading_tx(
         Some(_) if base.source.is_some() && usage.source != base.source => {
             GoalCostReading::Unverified("the native session changed")
         }
-        Some(_) if last_completed.is_some_and(|done| done > observed_at) => {
+        Some(_) if newer_completion.is_some() && !is_baseline_boundary => {
             GoalCostReading::Unverified("no session cost after the last turn")
         }
         Some((amount, _)) => match cost_micros(amount).checked_sub(base.amount_micros) {
@@ -3600,6 +3858,9 @@ impl Store {
 fn goal_view_on(connection: &Connection, goal_holder: &str, row: GoalRow) -> Result<GoalView> {
     let turn_count = count_turns(connection, row.agent_num, row.generation)?;
     let mut counters = row.state.counters.clone();
+    if let Some(reason) = pending_cost_base_reason(connection, &row)? {
+        counters.cost_unverified = Some(reason);
+    }
     counters.turns_used = counters.turns_used.max(
         row.state
             .transferred_turns
@@ -4139,6 +4400,7 @@ pub(crate) fn stuck_goal_round_args(
     if row.state.status != GoalStatus::Active
         || agent_row.observe_only
         || row.generation != agent_row.generation
+        || cost_base_pending(row.state.cost_base.as_ref())
         || idle_round_refusal(connection, agent_num, &agent_row, row.generation, now)?.is_some()
     {
         return Ok(None);
