@@ -35,8 +35,10 @@ pulldown-cmark = { version = "=0.13.1", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-toml.workspace = true
 tokio = { version = "1.53.2", features = ["rt", "net", "sync", "time", "macros"] }
+toml.workspace = true
+# Format-preserving drafts with the workspace's locked TOML parser.
+toml_edit = "=0.25.12"
 ulid.workspace = true
 url.workspace = true
 

@@ -1,19 +1,20 @@
-//! Profile draft editing as pure text operations.
+//! Profile draft editing as source-preserving TOML operations.
 //!
 //! Models and profiles keeps one document draft: the `profiles` settings
 //! section as `[profiles.*]` TOML text (see
 //! [`crate::settings_model::profiles_toml`]). The form and the source view
-//! edit that same text, so there is never a second model to reconcile. Form
-//! edits change one `key = "value"` line inside one profile block; duplicate
-//! copies a block under a new name. Validation and saving stay with the
-//! daemon (`settings.save`, dry run first), which runs its own parser and
-//! launch resolution; nothing here decides validity.
+//! edit that same text, so there is never a second model to reconcile.
+//! `toml_edit` handles TOML structure while retaining source formatting and
+//! comments. Validation and saving stay with the daemon (`settings.save`, dry
+//! run first), which runs its own parser and launch resolution.
 
 use eliot_core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, COMMON_EFFORTS,
     CodexApprovalPolicy, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS, NativeSubagentsPolicy,
 };
 use eliot_daemon::operator::native_subagents_policy;
+use toml_edit::visit_mut::{self, VisitMut};
+use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value};
 
 /// The first choice of an enumerated field: the key is left out, so the
 /// harness default applies.
@@ -123,109 +124,49 @@ pub fn normalize_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// A table header line: its dotted path, and whether it is an
-/// array-of-tables entry (`[[a.b]]`) rather than a table (`[a.b]`).
-struct Header {
-    path: Vec<String>,
-    array: bool,
+fn parse_document(draft: &str) -> Result<DocumentMut, String> {
+    draft
+        .parse()
+        .map_err(|_| "The profile source has invalid TOML; correct it before editing.".to_owned())
 }
 
-impl Header {
-    /// The header line for `path` with this header's bracket kind.
-    fn line(&self, path: &[&str]) -> String {
-        let joined = path.join(".");
-        if self.array {
-            format!("[[{joined}]]\n")
-        } else {
-            format!("[{joined}]\n")
-        }
-    }
+fn profiles(document: &DocumentMut) -> Option<&dyn TableLike> {
+    document.as_table().get("profiles")?.as_table_like()
 }
 
-/// Header of a line (`[a.b]` or `[[a.b]]`), `None` otherwise. Mirrors the
-/// daemon's rule: only whitespace or a comment may follow the bracket.
-fn header_path(line: &str) -> Option<Header> {
-    let trimmed = line.trim();
-    let (array, inner, rest) = if let Some(body) = trimmed.strip_prefix("[[") {
-        let (inner, rest) = body.split_once("]]")?;
-        (true, inner, rest)
-    } else {
-        let (inner, rest) = trimmed.strip_prefix('[')?.split_once(']')?;
-        (false, inner, rest)
-    };
-    let rest = rest.trim_start();
-    if !(rest.is_empty() || rest.starts_with('#')) || inner.trim().is_empty() {
-        return None;
+fn profile(document: &DocumentMut, name: &str) -> Option<&dyn TableLike> {
+    profiles(document)?.get(name)?.as_table_like()
+}
+
+fn profiles_mut(document: &mut DocumentMut) -> Result<&mut dyn TableLike, String> {
+    let root = document.as_table_mut();
+    if !root.contains_key("profiles") {
+        let mut profiles = Table::new();
+        profiles.set_implicit(true);
+        root.insert("profiles", Item::Table(profiles));
     }
-    let path = inner
-        .split('.')
-        .map(|segment| {
-            segment
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'')
-                .to_owned()
-        })
-        .collect();
-    Some(Header { path, array })
+    root.get_mut("profiles")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| "profiles is not a TOML table.".to_owned())
+}
+
+fn profile_mut(document: &mut DocumentMut, name: &str) -> Result<&mut dyn TableLike, String> {
+    profiles_mut(document)?
+        .get_mut(name)
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| format!("profile {name} is not in the draft"))
 }
 
 /// Profile names in draft order.
 pub fn profile_names(draft: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    for line in draft.lines() {
-        if let Some(header) = header_path(line)
-            && header.path.len() == 2
-            && header.path[0] == "profiles"
-            && !names.contains(&header.path[1])
-        {
-            names.push(header.path[1].clone());
-        }
-    }
-    names
-}
-
-/// Byte range of the `[profiles.<name>]` table body (header excluded).
-fn block_range(draft: &str, name: &str) -> Option<(usize, usize, usize)> {
-    let mut offset = 0;
-    let mut header: Option<(usize, usize)> = None;
-    for line in draft.split_inclusive('\n') {
-        if let Some(parsed) = header_path(line) {
-            if let Some((start, body)) = header {
-                return Some((start, body, offset));
-            }
-            let path = &parsed.path;
-            if path.len() == 2 && path[0] == "profiles" && path[1] == name {
-                header = Some((offset, offset + line.len()));
-            }
-        }
-        offset += line.len();
-    }
-    header.map(|(start, body)| (start, body, draft.len()))
-}
-
-/// TOML basic string with the required escapes.
-pub fn quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn key_of(line: &str) -> Option<&str> {
-    let (key, _) = line.split_once('=')?;
-    let key = key.trim();
-    (!key.is_empty() && !key.starts_with('#')).then_some(key)
+    draft
+        .parse::<DocumentMut>()
+        .ok()
+        .and_then(|document| {
+            profiles(&document)
+                .map(|profiles| profiles.iter().map(|(key, _)| key.to_owned()).collect())
+        })
+        .unwrap_or_default()
 }
 
 /// What the form may show for one key.
@@ -238,161 +179,109 @@ pub enum Field {
     Complex,
 }
 
-/// Decode `"text"` (no escapes) or `'text'`, with only a comment after it.
-fn simple_string(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    let quote = raw.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let body = &raw[1..];
-    let close = body.find(quote)?;
-    let value = &body[..close];
-    let rest = body[close + 1..].trim_start();
-    let plain = !value.contains('\\') && !value.contains(['\n', '\r']);
-    (plain && (rest.is_empty() || rest.starts_with('#'))).then(|| value.to_owned())
+/// A single-line string whose original spelling is safe for a form field.
+fn simple_string(value: &Value) -> Option<String> {
+    let text = value.as_str()?;
+    let Value::String(formatted) = value else {
+        return None;
+    };
+    let repr = formatted.display_repr();
+    let quote = repr
+        .chars()
+        .next()
+        .filter(|quote| matches!(quote, '\'' | '"'))?;
+    let body = repr.strip_prefix(quote)?.strip_suffix(quote)?;
+    (body == text && !text.contains(['\n', '\r'])).then(|| text.to_owned())
 }
 
-/// The form state of `key` in profile `name`.
+/// The form state of key in profile name.
 pub fn field(draft: &str, name: &str, key: &str) -> Field {
-    let Some((_, body, end)) = block_range(draft, name) else {
-        return Field::Absent;
+    let Ok(document) = draft.parse::<DocumentMut>() else {
+        return Field::Complex;
     };
-    draft[body..end]
-        .lines()
-        .find(|line| key_of(line) == Some(key))
-        .map_or(Field::Absent, |line| {
-            let raw = line.split_once('=').map_or("", |(_, value)| value);
-            simple_string(raw).map_or(Field::Complex, Field::Simple)
+    profile(&document, name)
+        .and_then(|profile| profile.get(key))
+        .map_or(Field::Absent, |item| {
+            item.as_value()
+                .and_then(simple_string)
+                .map_or(Field::Complex, Field::Simple)
         })
 }
 
-/// Set (or with `None`, remove) one `key = "value"` line in one profile.
+/// Set (or with None, remove) one string field in one profile.
 pub fn set_field(
     draft: &str,
     name: &str,
     key: &str,
     value: Option<&str>,
 ) -> Result<String, String> {
-    set_line(draft, name, key, value.map(quote).as_deref())
+    set_value(
+        draft,
+        name,
+        key,
+        value.map(|value| Value::from(value.to_owned())),
+    )
 }
 
-/// Set (or with `None`, remove) one `key = <raw TOML value>` line in one
-/// profile.
-fn set_line(draft: &str, name: &str, key: &str, raw: Option<&str>) -> Result<String, String> {
-    let (_, body, end) =
-        block_range(draft, name).ok_or_else(|| format!("profile {name} is not in the draft"))?;
-    let section = &draft[body..end];
-    let mut lines: Vec<String> = section.split_inclusive('\n').map(str::to_owned).collect();
-    let position = lines.iter().position(|line| key_of(line) == Some(key));
-    let replacement = raw.map(|raw| format!("{key} = {raw}\n"));
-    match (position, replacement) {
-        (Some(index), Some(line)) => lines[index] = line,
-        (Some(index), None) => {
-            lines.remove(index);
-        }
-        (None, Some(line)) => {
-            // After the last key line, before trailing blank/comment lines.
-            let insert_at = lines
-                .iter()
-                .rposition(|line| key_of(line).is_some())
-                .map_or(0, |index| index + 1);
-            if insert_at > 0 && !lines[insert_at - 1].ends_with('\n') {
-                lines[insert_at - 1].push('\n');
-            }
-            lines.insert(insert_at, line);
-        }
-        (None, None) => return Ok(draft.to_owned()),
-    }
-    Ok(format!(
-        "{}{}{}",
-        &draft[..body],
-        lines.concat(),
-        &draft[end..]
-    ))
-}
-
-#[derive(serde::Deserialize)]
-struct DuplicateDocument {
-    #[serde(default)]
-    profiles: std::collections::HashMap<String, DuplicateProfile>,
-}
-
-#[derive(serde::Deserialize)]
-struct DuplicateProfile {
-    #[serde(default)]
-    cmd: Option<toml::Spanned<String>>,
-}
-
-/// Full source-line range of the profile's top-level `cmd`, if present.
-/// TOML decoding handles quoted and escaped keys, while the value span
-/// identifies every line of a multiline command string.
-fn duplicate_command_range(
+fn set_value(
     draft: &str,
-    from: &str,
-) -> Result<Option<std::ops::Range<usize>>, String> {
-    let document: DuplicateDocument = toml::from_str(draft).map_err(|_| {
-        "The profile source has invalid TOML; correct it before duplicating.".to_owned()
-    })?;
-    let Some(command) = document
-        .profiles
-        .get(from)
-        .and_then(|profile| profile.cmd.as_ref())
-    else {
-        return Ok(None);
-    };
-    let span = command.span();
-    let start = draft[..span.start]
-        .rfind('\n')
-        .map_or(0, |newline| newline + 1);
-    let end = draft[span.end..]
-        .find('\n')
-        .map_or(draft.len(), |newline| span.end + newline + 1);
-    Ok(Some(start..end))
+    name: &str,
+    key: &str,
+    replacement: Option<Value>,
+) -> Result<String, String> {
+    let mut document = parse_document(draft)?;
+    let profile = profile_mut(&mut document, name)?;
+    match replacement {
+        Some(mut replacement) => {
+            if let Some(item) = profile.get_mut(key) {
+                if let Some(existing) = item.as_value() {
+                    *replacement.decor_mut() = existing.decor().clone();
+                }
+                *item = Item::Value(replacement);
+            } else {
+                profile.insert(key, Item::Value(replacement));
+            }
+        }
+        None if profile.get(key).is_some() => {
+            profile.remove(key);
+        }
+        None => return Ok(draft.to_owned()),
+    }
+    Ok(document.to_string())
 }
 
-/// Copy profile `from` (and its `[profiles.from.*]` subtables) as `to`,
-/// leaving the top-level `cmd` omitted so a copy uses the installed default.
+/// Copy profile from (and its nested tables) as to, omitting its
+/// top-level cmd so the copy follows the installed default.
 pub fn duplicate(draft: &str, from: &str, to: &str) -> Result<String, String> {
     let to = to.trim();
-    check_new_name(draft, to)?;
-    let command_range = duplicate_command_range(draft, from)?;
-    let mut copied = String::new();
-    let mut inside = false;
-    let mut offset = 0;
-    for line in draft.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        if command_range
-            .as_ref()
-            .is_some_and(|range| range.contains(&line_start))
-        {
-            continue;
-        }
-        if let Some(header) = header_path(line) {
-            let path = &header.path;
-            inside = path.len() >= 2 && path[0] == "profiles" && path[1] == from;
-            if inside {
-                let mut renamed = vec!["profiles", to];
-                renamed.extend(path[2..].iter().map(String::as_str));
-                copied.push_str(&header.line(&renamed));
-                continue;
-            }
-        }
-        if inside {
-            copied.push_str(line);
-        }
+    let mut document: DocumentMut = draft.parse().map_err(|_| {
+        "The profile source has invalid TOML; correct it before duplicating.".to_owned()
+    })?;
+    check_new_name(&document, to)?;
+
+    let source = profiles(&document)
+        .and_then(|profiles| profiles.get(from))
+        .ok_or_else(|| format!("profile {from} is not in the draft"))?;
+    let mut copied = source.clone();
+    copied
+        .as_table_like_mut()
+        .ok_or_else(|| format!("profile {from} is not in the draft"))?
+        .remove("cmd");
+    AppendTables.visit_item_mut(&mut copied);
+
+    profiles_mut(&mut document)?.insert(to, copied);
+    Ok(document.to_string())
+}
+
+struct AppendTables;
+
+impl VisitMut for AppendTables {
+    fn visit_table_mut(&mut self, table: &mut Table) {
+        // Cloned headers carry their source positions. Place the whole clone
+        // after the original document in the editor's stable display order.
+        table.set_position(Some(isize::MAX));
+        visit_mut::visit_table_mut(self, table);
     }
-    if copied.is_empty() {
-        return Err(format!("profile {from} is not in the draft"));
-    }
-    let mut out = draft.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() && !out.ends_with("\n\n") {
-        out.push('\n');
-    }
-    out.push_str(copied.trim_end_matches('\n'));
-    out.push('\n');
-    Ok(out)
 }
 
 /// A profile's list field (`child_profiles = ["a", "b"]`) as the form
@@ -406,57 +295,55 @@ pub enum ListField {
     Complex,
 }
 
-/// Decode a one-line array of plain strings, with only a comment after it.
-fn simple_list(raw: &str) -> Option<Vec<String>> {
-    let body = raw.trim().strip_prefix('[')?;
-    let (inner, rest) = body.split_once(']')?;
-    let rest = rest.trim_start();
-    if !(rest.is_empty() || rest.starts_with('#')) {
+/// A one-line array of plain strings the form can round-trip.
+fn simple_list(value: &Value) -> Option<Vec<String>> {
+    let array = value.as_array()?;
+    if value.to_string().contains(['\n', '\r']) {
         return None;
     }
-    inner
-        .split(',')
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(|item| {
-            let quote = item.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-            let value = item.strip_prefix(quote)?.strip_suffix(quote)?;
-            (!value.contains(['\\', '"', '\''])).then(|| value.to_owned())
+    array
+        .iter()
+        .map(|value| {
+            let text = simple_string(value)?;
+            (!text.contains(['\\', '"', '\''])).then_some(text)
         })
         .collect()
 }
 
-/// The form state of list `key` in profile `name`.
+/// The form state of list key in profile name.
 pub fn list_field(draft: &str, name: &str, key: &str) -> ListField {
-    let Some((_, body, end)) = block_range(draft, name) else {
-        return ListField::Absent;
+    let Ok(document) = draft.parse::<DocumentMut>() else {
+        return ListField::Complex;
     };
-    draft[body..end]
-        .lines()
-        .find(|line| key_of(line) == Some(key))
-        .map_or(ListField::Absent, |line| {
-            let raw = line.split_once('=').map_or("", |(_, value)| value);
-            simple_list(raw).map_or(ListField::Complex, ListField::Items)
+    profile(&document, name)
+        .and_then(|profile| profile.get(key))
+        .map_or(ListField::Absent, |item| {
+            item.as_value()
+                .and_then(simple_list)
+                .map_or(ListField::Complex, ListField::Items)
         })
 }
 
-/// Set (or with an empty list, remove) one `key = ["a", "b"]` line.
+/// Set (or with an empty list, remove) one array field.
 pub fn set_list_field(
     draft: &str,
     name: &str,
     key: &str,
     values: &[String],
 ) -> Result<String, String> {
-    let raw = (!values.is_empty()).then(|| {
-        let items: Vec<String> = values.iter().map(|value| quote(value)).collect();
-        format!("[{}]", items.join(", "))
-    });
-    set_line(draft, name, key, raw.as_deref())
+    if values.is_empty() {
+        return set_value(draft, name, key, None);
+    }
+    let mut array = Array::new();
+    for value in values {
+        array.push(value.clone());
+    }
+    set_value(draft, name, key, Some(Value::Array(array)))
 }
 
 /// Check a new preset name: the daemon's profile-name alphabet, not yet
 /// in the draft.
-fn check_new_name(draft: &str, name: &str) -> Result<(), String> {
+fn check_new_name(document: &DocumentMut, name: &str) -> Result<(), String> {
     if name.is_empty()
         || !name
             .chars()
@@ -464,31 +351,24 @@ fn check_new_name(draft: &str, name: &str) -> Result<(), String> {
     {
         return Err("A preset name uses letters, digits, hyphen and underscore.".to_owned());
     }
-    if profile_names(draft).iter().any(|existing| existing == name) {
+    if profiles(document).is_some_and(|profiles| profiles.contains_key(name)) {
         return Err(format!("A preset named {name} already exists."));
     }
     Ok(())
 }
 
-/// Append a new `[profiles.<name>]` table for `harness`; its model and
-/// other settings keep the harness defaults until chosen. Leave `cmd`
-/// omitted so the daemon follows the harness's installed default; explicit
-/// Owner command overrides remain in the source.
+/// Append a new profile table for harness; its model and other settings keep
+/// the harness defaults until chosen. Leave cmd omitted so the daemon follows
+/// the installed default; explicit Owner command overrides remain in source.
 pub fn create(draft: &str, name: &str, harness: &str) -> Result<String, String> {
     let name = name.trim();
-    check_new_name(draft, name)?;
-    let mut out = draft.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() && !out.ends_with("\n\n") {
-        out.push('\n');
-    }
-    out.push_str(&format!(
-        "[profiles.{name}]\nharness = {}\n",
-        quote(harness)
-    ));
-    Ok(out)
+    let mut document = parse_document(draft)?;
+    check_new_name(&document, name)?;
+
+    let mut profile = Table::new();
+    profile.insert("harness", Item::Value(Value::from(harness.to_owned())));
+    profiles_mut(&mut document)?.insert(name, Item::Table(profile));
+    Ok(document.to_string())
 }
 
 fn native_subagents_policy_for_profile(draft: &str, name: &str) -> Option<NativeSubagentsPolicy> {
