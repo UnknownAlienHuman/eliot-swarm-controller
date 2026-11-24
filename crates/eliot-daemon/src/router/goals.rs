@@ -1503,7 +1503,7 @@ async fn spawn_auto_round(
     // rules, but must never drive automatic behavior: neither a Goal round
     // nor a deferred mail reoffer. An explicit rule can still target the
     // incident; the automatic idle/Goal/mail nudges stay silent here.
-    if event.kind == "x.user.agent.attention" {
+    if event.kind == eliot_core::api::ATTENTION_EVENT_KIND {
         return;
     }
     let Some(agent) = event.agent.clone() else {

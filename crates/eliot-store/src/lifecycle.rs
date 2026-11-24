@@ -1,5 +1,10 @@
 use super::*;
-use eliot_core::{FailureOrigin, api::UserEventCommand, is_attachment_verb, is_start_verb};
+use eliot_core::{
+    FailureOrigin,
+    api::{ATTENTION_EVENT_KIND, AttentionEventBinding, UserEventCommand},
+    is_attachment_verb, is_start_verb,
+};
+use serde::Deserialize;
 
 pub enum UserEventDispatch {
     Applied(Vec<Event>),
@@ -352,7 +357,7 @@ impl Store {
                 };
             match (attention, kind.as_str()) {
                 // Retained public emits may predate the admission gate.
-                (false, "x.user.agent.attention") => {
+                (false, ATTENTION_EVENT_KIND) => {
                     return Ok(UserEventDispatch::Rejected(
                         Error::new(
                             "invalid",
@@ -364,7 +369,7 @@ impl Store {
                         ),
                     ));
                 }
-                (true, topic) if topic != "x.user.agent.attention" => {
+                (true, kind) if kind != ATTENTION_EVENT_KIND => {
                     return Err(Error::new("invalid", "not an attention user-event command"));
                 }
                 _ => {}
@@ -2189,16 +2194,20 @@ fn settle_stopped_turn_unknown_tx(
 
 /// Bind the report to its current subject in the event transaction.
 fn bind_attention_event_tx(tx: &Transaction<'_>, data: &mut Value) -> Result<(i64, i64)> {
-    let report = data
-        .get("data")
+    #[derive(Deserialize)]
+    struct EventData {
+        data: Option<AttentionEventBinding>,
+    }
+    let report = EventData::deserialize(&*data)
+        .ok()
+        .and_then(|event| event.data)
         .ok_or_else(|| Error::new("invalid", "attention event data must carry its report"))?;
     let agent_id = report
-        .get("agent_id")
-        .and_then(Value::as_str)
+        .agent_id
+        .as_deref()
         .ok_or_else(|| Error::new("invalid", "attention report must carry its agent"))?;
     let generation = report
-        .get("generation")
-        .and_then(Value::as_i64)
+        .generation
         .ok_or_else(|| Error::new("invalid", "attention report must carry its generation"))?;
     let agent_num = parse_agent_id(agent_id)?;
     let current = load_agent_by_num(tx, agent_num)?;
@@ -2210,21 +2219,16 @@ fn bind_attention_event_tx(tx: &Transaction<'_>, data: &mut Value) -> Result<(i6
     };
     if current.generation != generation
         || (current.state == AgentState::Lost
-            && report["reason"] == "source_unhealthy"
-            && report["phase"] == "incident")
+            && report.reason.as_deref() == Some("source_unhealthy")
+            && report.phase.as_deref() == Some("incident"))
     {
         return Err(Error::new(
             "stale_generation",
             "attention evidence targets a stale generation",
         ));
     }
-    let turn_id = report
-        .get("turn_id")
-        .and_then(Value::as_str)
-        .filter(|turn| !turn.trim().is_empty())
-        .map(str::to_owned);
-    if let Some(turn_id) = turn_id {
-        data["turn_id"] = json!(turn_id);
+    if let Some(turn_id) = report.turn_id.filter(|turn| !turn.trim().is_empty()) {
+        data["turn_id"] = Value::String(turn_id);
     }
     Ok((agent_num, generation))
 }

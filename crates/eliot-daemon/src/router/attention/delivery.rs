@@ -2,8 +2,12 @@
 
 use super::super::Principal;
 use super::{AttentionReport, FrozenReport, ReportPhase, Router};
-use eliot_core::api::{EmitDefinitionArgs, MailMode, MailSendRequest};
+use eliot_core::api::{
+    ATTENTION_TOPIC, AttentionEventBinding, EmitDefinitionArgs, MailMode, MailSendRequest,
+    UserEventCommand,
+};
 use eliot_core::{Agent, AgentState, AttentionStep, CommandState, Error, Result};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -43,15 +47,7 @@ pub(super) async fn persist_report_event(router: &Router, delivery: &FrozenRepor
     {
         return Ok(());
     }
-    let data = serde_json::to_value(report)
-        .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
-    let request = EmitDefinitionArgs {
-        topic: "agent.attention".to_owned(),
-        data,
-        key: None,
-    };
-    let args = serde_json::to_value(request)
-        .map_err(|_| Error::new("internal", "attention event args could not be encoded"))?;
+    let args = report_args(report)?;
     let already_admitted = {
         let store = router.inner.store.lock().await;
         store.get_command(&delivery.emit_command_id)?.is_some()
@@ -107,15 +103,7 @@ pub(super) async fn persist_loss_delivery(
     resume_enabled: bool,
 ) -> Result<()> {
     let report = &delivery.report;
-    let data = serde_json::to_value(report)
-        .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
-    let request = EmitDefinitionArgs {
-        topic: "agent.attention".to_owned(),
-        data,
-        key: None,
-    };
-    let args = serde_json::to_value(request)
-        .map_err(|_| Error::new("internal", "attention event args could not be encoded"))?;
+    let args = report_args(report)?;
     let already_admitted = {
         let store = router.inner.store.lock().await;
         store.get_command(&delivery.emit_command_id)?.is_some()
@@ -168,17 +156,26 @@ async fn is_own_loss_emit(router: &Router, delivery: &FrozenReport) -> Result<bo
     let Some(command) = retained else {
         return Ok(false);
     };
-    if command.verb != "attention.emit" {
+    let Ok(UserEventCommand::AttentionEmit(args)) =
+        UserEventCommand::decode(&command.verb, command.args)
+    else {
         return Ok(false);
-    }
-    let ours = serde_json::from_value::<EmitDefinitionArgs>(command.args.clone())
-        .map(|definition| {
-            definition.topic == "agent.attention"
-                && definition.data.get("incident_id").and_then(Value::as_str)
-                    == Some(delivery.report.incident_id.as_str())
-        })
-        .unwrap_or(false);
-    Ok(ours)
+    };
+    Ok(args.topic == ATTENTION_TOPIC
+        && AttentionEventBinding::deserialize(&args.data).is_ok_and(|binding| {
+            binding.incident_id.as_deref() == Some(delivery.report.incident_id.as_str())
+        }))
+}
+
+fn report_args(report: &AttentionReport) -> Result<Value> {
+    let data = serde_json::to_value(report)
+        .map_err(|_| Error::new("internal", "attention report could not be encoded"))?;
+    serde_json::to_value(EmitDefinitionArgs {
+        topic: ATTENTION_TOPIC.to_owned(),
+        data,
+        key: None,
+    })
+    .map_err(|_| Error::new("internal", "attention event args could not be encoded"))
 }
 
 async fn wait_for_applied(router: &Router, command_id: &str) -> Result<()> {
@@ -334,7 +331,7 @@ impl Router {
         // needs this committed subject to make its one eligible wake.
         let emit_id = ulid::Ulid::new().to_string();
         let args = EmitDefinitionArgs {
-            topic: "agent.attention".to_owned(),
+            topic: ATTENTION_TOPIC.to_owned(),
             data: json!({
                 "schema": 1,
                 "incident_id": reaction.incident_id,

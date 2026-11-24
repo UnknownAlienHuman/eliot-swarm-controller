@@ -191,7 +191,10 @@ pub use native_pages::{
     MAX_OBSERVATION_PAGE_ENTRIES, ObservationPage, ObservationQuery,
 };
 pub use native_requests::{AgentDiscoverRequest, AgentHistoryRequest};
-pub use notify::{EmitDefinitionArgs, NotifyDefinitionArgs, UserEventCommand};
+pub use notify::{
+    ATTENTION_EVENT_KIND, ATTENTION_TOPIC, AttentionEventBinding, EmitDefinitionArgs,
+    NotifyDefinitionArgs, UserEventCommand,
+};
 pub use observe::{
     DEFAULT_OBSERVE_WINDOW_SECS, DoctorHarnessEntry, HarnessCheckOutcome, HarnessCheckStatus,
     HarnessDoctorRequest, HarnessDoctorResponse, HeavyAgentTotals, HeavyEpisodeView,

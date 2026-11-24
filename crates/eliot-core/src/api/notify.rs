@@ -10,6 +10,21 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const ATTENTION_TOPIC: &str = "agent.attention";
+pub const ATTENTION_EVENT_KIND: &str = "x.user.agent.attention";
+
+/// The binding carried by every internal attention report, including compact
+/// reports. Other report fields are preserved in the event payload.
+#[derive(Deserialize)]
+pub struct AttentionEventBinding {
+    pub incident_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub generation: Option<i64>,
+    pub turn_id: Option<String>,
+    pub reason: Option<String>,
+    pub phase: Option<String>,
+}
+
 /// Local event commands after decoding the durable command envelope.
 pub enum UserEventCommand {
     Notify(NotifyDefinitionArgs),
@@ -29,22 +44,30 @@ impl UserEventCommand {
     }
 
     pub fn validate_admission(&self) -> Result<()> {
+        self.validate_payload()?;
+        self.validate_topic()
+    }
+
+    pub fn validate_payload(&self) -> Result<()> {
         match self {
-            Self::Notify(args) => args.validate()?,
-            Self::Emit(args) | Self::AttentionEmit(args) => args.validate()?,
+            Self::Notify(args) => args.validate(),
+            Self::Emit(args) | Self::AttentionEmit(args) => args.validate(),
         }
+    }
+
+    pub fn validate_topic(&self) -> Result<()> {
         match self {
             Self::Emit(args)
                 if matches!(
                     args.topic.as_str(),
-                    "agent.attention" | "agent.attention_step"
+                    ATTENTION_TOPIC | "agent.attention_step"
                 ) =>
             {
                 Err(invalid(
                     "monitoring topics are reserved for the internal attention producer",
                 ))
             }
-            Self::AttentionEmit(args) if args.topic != "agent.attention" => Err(invalid(
+            Self::AttentionEmit(args) if args.topic != ATTENTION_TOPIC => Err(invalid(
                 "attention.emit carries only the reserved attention topic",
             )),
             _ => Ok(()),

@@ -3,10 +3,16 @@ use super::*;
 const SCRIPT_ACTION_ID_DOMAIN: &str = "eliot.script.action.command.v1";
 
 fn valid_script_output_action_request(request: &SubmitCommand) -> bool {
-    // The caller checks shared bindings and submit_tx decodes emit payloads.
     request.verb == "emit"
         || (matches!(request.verb.as_str(), "stop" | "send" | "interrupt")
             && rules::valid_rule_action_request(request, true))
+}
+
+fn invalid_script_action() -> Error {
+    Error::new(
+        "invalid",
+        "script output must contain an id-free stop, send, interrupt or emit command",
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -109,13 +115,23 @@ impl Store {
         let mut events = Vec::new();
         let mut child_ids = Vec::with_capacity(actions.len());
         for (index, mut action) in actions.into_iter().enumerate() {
+            if action.verb == "emit" && !action.args.is_object() {
+                return Err(invalid_script_action());
+            }
             action.validate()?;
             if !action.id.is_empty() || !valid_script_output_action_request(&action) {
-                return Err(Error::new(
-                    "invalid",
-                    "script output must contain an id-free stop, send, interrupt or emit command",
-                ));
+                return Err(invalid_script_action());
             }
+            let event = if action.verb == "emit" {
+                let event = core::api::UserEventCommand::decode(&action.verb, action.args.clone())
+                    .map_err(|_| invalid_script_action())?;
+                event
+                    .validate_payload()
+                    .map_err(|_| invalid_script_action())?;
+                Some(event)
+            } else {
+                None
+            };
             let ordinal = i64::try_from(index)
                 .map_err(|_| Error::new("frame_too_large", "script action ordinal overflowed"))?;
             action.id = derived_script_action_id(run_id, ordinal)?;
@@ -131,7 +147,10 @@ impl Store {
             let admission = admission::submit_tx(
                 &tx,
                 &run.command.principal,
-                action,
+                CommandSubmission {
+                    request: action,
+                    event,
+                },
                 None,
                 now,
                 true,

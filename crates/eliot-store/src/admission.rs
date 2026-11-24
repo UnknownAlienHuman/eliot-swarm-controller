@@ -2390,7 +2390,9 @@ fn submit_tx_mode(
                 "notify/emit are targetless commands without Agent bindings"
             };
             require_no_agent_bindings(&request, &preparation, binding_error)?;
-            if event.is_none() {
+            if let Some(event) = event {
+                event.validate_topic()?;
+            } else {
                 core::api::UserEventCommand::decode(&request.verb, request.args.clone())
                     .map_err(|_| {
                         Error::new(
