@@ -121,7 +121,8 @@ impl Store {
         )
     }
 
-    /// Fleet counts include snoozed items. The inbox contains visible items.
+    /// Liveness and command-without-dispatcher counts include snoozed items.
+    /// Goal and repeated-failure counts reflect the visible inbox items.
     pub fn read_owner_projection(
         path: &Path,
         now: i64,
@@ -167,6 +168,14 @@ impl Store {
                 }
                 None => CommandWithoutDispatcherStatus::default(),
             };
+            let snoozes = inbox_snoozes(connection)?;
+            let snoozed = snoozes
+                .iter()
+                .map(|r| (r.kind, r.subject.as_str(), r.revision.as_str()))
+                .collect::<HashSet<_>>();
+            items.retain(|item| {
+                !snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
+            });
             let goals_without_progress = items
                 .iter()
                 .filter(|item| {
@@ -178,14 +187,6 @@ impl Store {
                 .iter()
                 .filter(|item| item.reason == super::owner_inbox::REPEATED_FAILURE_REASON)
                 .count();
-            let snoozes = inbox_snoozes(connection)?;
-            let snoozed = snoozes
-                .iter()
-                .map(|r| (r.kind, r.subject.as_str(), r.revision.as_str()))
-                .collect::<HashSet<_>>();
-            items.retain(|item| {
-                !snoozed.contains(&(item.kind, item.subject.as_str(), item.revision.as_str()))
-            });
             Ok(OwnerProjection {
                 items,
                 liveness,
