@@ -511,6 +511,14 @@ pub struct NativeTurnError {
 }
 
 impl NativeTurnError {
+    /// Match only the required `TurnError.message` value from Codex's native
+    /// terminal envelope. Outer whitespace is benign; nested metadata and
+    /// other output are not part of this signal.
+    pub(crate) fn is_provider_response_withheld(&self) -> bool {
+        const MESSAGE: &str = "You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.";
+        self.message.trim() == MESSAGE
+    }
+
     /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded
     /// from upstream; sandbox/local protocol errors are not provider evidence.
     pub(crate) fn failure_origin(&self) -> eliot_core::FailureOrigin {

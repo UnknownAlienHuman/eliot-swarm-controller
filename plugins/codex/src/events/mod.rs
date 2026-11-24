@@ -1959,7 +1959,12 @@ impl EventProcessor {
             .active_command_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "Codex terminal turn has no Eliot command"))?;
-        let provider_restriction = terminal_provider_restriction(&self.status, &notification);
+        let provider_response_withheld = notification.turn.status == NativeTurnStatus::Failed
+            && notification
+                .turn
+                .error
+                .as_ref()
+                .is_some_and(NativeTurnError::is_provider_response_withheld);
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id.clone(),
@@ -1968,15 +1973,21 @@ impl EventProcessor {
             "outcome": turn_outcome(&notification.turn.status),
             "native_status": turn_status(&notification.turn.status),
         });
-        // The semantic hold signal gets first claim on the bounded terminal data.
+        // Provider facts get first claim on the bounded terminal data.
         if notification.turn.status == NativeTurnStatus::Failed {
-            let origin = notification
-                .turn
-                .error
-                .as_ref()
-                .map(|error| error.failure_origin())
-                .unwrap_or(eliot_core::FailureOrigin::Unknown);
-            let evidence = if origin == eliot_core::FailureOrigin::Provider {
+            let origin = if provider_response_withheld {
+                eliot_core::FailureOrigin::Provider
+            } else {
+                notification
+                    .turn
+                    .error
+                    .as_ref()
+                    .map(|error| error.failure_origin())
+                    .unwrap_or(eliot_core::FailureOrigin::Unknown)
+            };
+            let evidence = if provider_response_withheld {
+                "Codex final failed turn error matches the provider hardware-key response-withheld message"
+            } else if origin == eliot_core::FailureOrigin::Provider {
                 "CodexErrorInfo reports structured upstream rate, quota, auth, model or HTTP failure"
             } else if origin == eliot_core::FailureOrigin::Harness {
                 "native turn error without a structured upstream signal"
@@ -1986,8 +1997,13 @@ impl EventProcessor {
             eliot_plugin::session::attach_failure_origin(
                 &mut data, "codex", origin, evidence, &secrets,
             );
+            if provider_response_withheld {
+                data["provider_response_withheld"] = Value::Bool(true);
+            }
         }
-        if let Some(restriction) = provider_restriction {
+        if !provider_response_withheld
+            && let Some(restriction) = terminal_provider_restriction(&self.status, &notification)
+        {
             attach_provider_restriction(&mut data, restriction, &secrets);
             if !self.status.source_unknown
                 && !self.transport_loss
