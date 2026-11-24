@@ -5,7 +5,10 @@ use crate::{
     bus::Bus,
     common::now_ms,
     logging, maintenance,
-    platform::{DataDir, IpcListener, IpcStream, data_dir::DaemonLock},
+    platform::{
+        DataDir, IpcListener, IpcStream,
+        data_dir::{DaemonInfo, DaemonLock},
+    },
     restart_capacity,
     router::Router,
 };
@@ -1631,14 +1634,7 @@ async fn client_call_with_identity(
     client_call_with_identity_measured(path, method, params, identity, None, None).await
 }
 
-async fn client_call_with_identity_measured(
-    path: &Path,
-    method: &str,
-    params: Value,
-    identity: ClientIdentity,
-    timings: Option<&mut CallTimings>,
-    swarm_mcp_call_id: Option<&str>,
-) -> Result<Value> {
+async fn open_client_daemon_info(path: &Path) -> Result<(DataDir, DaemonInfo)> {
     let data_dir = crate::startup::open_client_data_dir(path)
         .await
         .map_err(|error| with_connect_hint(path, error))?;
@@ -1648,6 +1644,18 @@ async fn client_call_with_identity_measured(
         .ok_or_else(|| {
             with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
         })?;
+    Ok((data_dir, info))
+}
+
+async fn client_call_with_identity_measured(
+    path: &Path,
+    method: &str,
+    params: Value,
+    identity: ClientIdentity,
+    timings: Option<&mut CallTimings>,
+    swarm_mcp_call_id: Option<&str>,
+) -> Result<Value> {
+    let (data_dir, info) = open_client_daemon_info(path).await?;
     let mut auth = match identity {
         ClientIdentity::Owner => {
             let token = data_dir.read_owner_token()?;
@@ -1705,21 +1713,8 @@ pub async fn client_call_with_owner_credential(
     params: Value,
     owner_credential: &str,
 ) -> Result<Value> {
-    if method.trim().is_empty() || !params.is_object() {
-        return Err(Error::new(
-            "invalid",
-            "daemon RPC requires a method and object params",
-        ));
-    }
-    let data_dir = crate::startup::open_client_data_dir(path)
-        .await
-        .map_err(|error| with_connect_hint(path, error))?;
-    let info = data_dir
-        .read_daemon_info()
-        .map_err(|error| with_connect_hint(path, error))?
-        .ok_or_else(|| {
-            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
-        })?;
+    validate_client_call(method, &params)?;
+    let (_data_dir, info) = open_client_daemon_info(path).await?;
     let auth = json!({
         "kind": "owner",
         "credential": owner_credential,
@@ -1742,15 +1737,7 @@ pub async fn client_call_with_remote_context(
     if method.trim().is_empty() || !params.is_object() {
         return Err(Error::new("invalid", "invalid remote RPC"));
     }
-    let data_dir = crate::startup::open_client_data_dir(path)
-        .await
-        .map_err(|error| with_connect_hint(path, error))?;
-    let info = data_dir
-        .read_daemon_info()
-        .map_err(|error| with_connect_hint(path, error))?
-        .ok_or_else(|| {
-            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
-        })?;
+    let (data_dir, info) = open_client_daemon_info(path).await?;
     let token = data_dir
         .read_owner_token()
         .map_err(|error| with_connect_hint(path, error))?;
@@ -1783,15 +1770,7 @@ pub async fn client_call_with_remote_mcp_tool(
     if Ulid::from_string(&remote.call_id).is_err() {
         return Err(Error::new("invalid", "Swarm MCP call id is invalid"));
     }
-    let data_dir = crate::startup::open_client_data_dir(path)
-        .await
-        .map_err(|error| with_connect_hint(path, error))?;
-    let info = data_dir
-        .read_daemon_info()
-        .map_err(|error| with_connect_hint(path, error))?
-        .ok_or_else(|| {
-            with_connect_hint(path, Error::new("unavailable", "daemon is not running"))
-        })?;
+    let (data_dir, info) = open_client_daemon_info(path).await?;
     let token = data_dir
         .read_owner_token()
         .map_err(|error| with_connect_hint(path, error))?;
