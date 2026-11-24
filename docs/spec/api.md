@@ -776,24 +776,25 @@ runs the vendor's native interactive flow in the Owner's desktop session, and re
 the result through the bounded desktop sign-in DTOs. The CLI request itself never
 opens a headless vendor process or asserts that the desktop action completed.
 
-The daemon dispatches one automatic console per harness outage. An unused grant
-expires after 15 seconds and returns to the queue. An explicit request for open work
-reports `open`. A request inside the five-minute attempt cooldown reports `cooldown`.
-Another manual attempt is eligible only after five minutes have passed since the last
-claim and the prior launch is known closed or failed. Store retains the claim across
-daemon restarts.
+The daemon dispatches one automatic console per harness outage. The grant expires
+after 15 seconds. Store retains the claim across daemon restarts. An explicit request
+for open work reports `open`. A request inside the five-minute attempt cooldown
+reports `cooldown`. Another manual attempt is eligible only after five minutes have
+passed since the last claim and the prior launch is known closed or failed.
 The companion records the suspended console's PID and creation time before running
 it. An identical `Prepared` report for a live claim returns the committed
 receipt. The companion may retry that report while it still owns the same
 suspended process, then starts it only after a positive receipt. Recovery
 checks OS process identity outside the Store mutex. A live console keeps its claim.
-If the claim expires and the recorded process has exited without a confirmed open or
-close, Store preserves the attempt and process identity with outcome `unknown`.
-Swarm reports it to the Owner through the inbox and `x.user.notify`. Sign-in requests
-return `unknown` for that attempt and leave dispatch blocked. The Owner can complete
-sign-in through the vendor. Swarm also publishes `x.user.notify` when the desktop
-confirms an unresolved console is open. A signed-in probe clears the inbox item and
-bound provider auth holds, then wakes launch arbitration.
+An expired claim with no confirmed result settles as `unknown` when the recorded
+process has exited or the desktop never recorded its process identity. Store preserves
+the attempt and any recorded identity, and reports the outcome to the Owner through
+the inbox and `x.user.notify`. Sign-in requests return `unknown` and leave dispatch
+blocked. An exact `Closed` or `Failed` report accepted before recovery establishes a
+known outcome. The Owner can complete an unknown attempt through the vendor. Swarm
+also publishes `x.user.notify` when the desktop confirms an unresolved console is
+open. A signed-in probe clears the inbox item and bound provider auth holds, then
+wakes launch arbitration.
 
 The native vendor handles the console, browser and credential storage. Swarm passes
 fixed argv and leaves the console streams with the vendor. It never collects passwords,

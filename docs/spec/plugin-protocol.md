@@ -767,7 +767,10 @@ Agent generation with the adapter plus native signal name as `source`.
 When a priced adapter commits the cumulative observation for a confirmed
 turn boundary, it includes `boundary_turn_id` on the `session.usage` event.
 The Store validates the retained turn and native session before using this
-observation to establish a pending Goal cost baseline. Usage remains session-scoped.
+observation to establish a pending Goal cost baseline. A bound observation
+may carry a native timestamp from the turn itself, beginning at its recorded
+start. The Store keeps that observation time and the confirmed completion time.
+Usage remains session-scoped.
 Cumulative usage replaces
 its prior scope value rather than being summed. OpenCode attributes its final assistant
 message's native token usage to the bound turn's terminal event at message scope; a

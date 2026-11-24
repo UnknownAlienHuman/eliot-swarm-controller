@@ -2037,10 +2037,14 @@ requires the generation's latest `session_usage` snapshot in that unit to be
 as recent as its last completed turn. It reports the baseline's epoch
 timestamp as `cost_baseline_observed_at`. On a running turn, `set` retains the
 exact turn and native session and reports the cost baseline as pending.
-The Store binds it atomically when it commits a fresh cumulative cost snapshot
-for that exact completed turn, session and unit. The active turn's cost is
-outside the budget. Rounds wait for this boundary. If that boundary cannot
-be verified, the Owner can set the Goal again at a verified idle boundary.
+The budget starts with the first turn that begins after the Goal is set.
+The Store binds the baseline atomically when it commits a fresh cumulative
+cost snapshot for the exact completed turn, session and unit. An observation
+stamped during that turn can establish the baseline when it carries the turn's
+terminal usage binding. Rounds wait for this boundary. If the turn ends without
+verified cost or its completion becomes unknown, the Goal's cost status and
+round refusal identify the unresolved turn. The Owner can set the Goal again
+at a verified idle boundary.
 Older Goals without the retained timestamp continue to report their budget
 and spend with the baseline time unavailable.
 For a launch-installed Goal, Store initializes a zero cost baseline at admission,

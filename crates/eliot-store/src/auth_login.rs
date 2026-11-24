@@ -237,7 +237,7 @@ impl Store {
             .map_err(sql_error)
     }
 
-    /// Expire unused grants and settle consoles only after exact process exit.
+    /// Recover expired claims without replaying an uncertain sign-in effect.
     pub fn recover_harness_logins(
         &mut self,
         now: i64,
@@ -274,9 +274,10 @@ impl Store {
                 if console.is_some_and(|identity| !console_gone(identity)) {
                     continue;
                 }
-                if !resolved && phase == "claimed" && console.is_some() {
-                    // A recorded preparation can have resumed before the desktop
-                    // reported Open. Process exit alone cannot settle that effect.
+                if !resolved && phase == "claimed" {
+                    // A claim may have launched before its process identity was
+                    // recorded. Expiry or exact process exit cannot prove that
+                    // the external sign-in effect never opened.
                     tx.execute(
                         "UPDATE harness_auth SET phase='unknown', recovered=1, claim_until=0,
                              retry_at=0 WHERE harness=?1",
@@ -291,16 +292,14 @@ impl Store {
                         None,
                         None,
                         json!({"title": "Harness sign-in outcome unknown", "message":
-                            format!("The {harness} sign-in process exited before Swarm could confirm it opened. Swarm is waiting for verified vendor sign-in.")}),
+                            format!("The {harness} sign-in claim expired without a confirmed result. Complete sign-in through the vendor so Swarm can verify it.")}),
                     )?);
                     continue;
                 }
-                let requeue = !resolved && console.is_none();
                 tx.execute(
-                    "UPDATE harness_auth SET phase=?2, recovered=1, attempt=NULL, claim_until=0,
-                         retry_at=CASE WHEN ?3 THEN 0 ELSE retry_at END,
+                    "UPDATE harness_auth SET phase='closed', recovered=1, attempt=NULL, claim_until=0,
                          console_pid=NULL, console_start=NULL WHERE harness=?1",
-                    params![harness, if requeue { "queued" } else { "closed" }, requeue],
+                    [&harness],
                 )
                 .map_err(sql_error)?;
             }
@@ -532,7 +531,7 @@ pub(super) fn project_harness_auth(
             "queued" => "Swarm is waiting for the interactive desktop to handle sign-in.",
             "claimed" => "Swarm is waiting for the desktop to confirm the sign-in window.",
             "unknown" => {
-                "The sign-in process exited before Swarm could confirm it opened. Complete sign-in with the vendor to clear this item."
+                "Swarm could not confirm whether the sign-in window opened. Complete sign-in with the vendor to clear this item."
             }
             "closed" if recovered => "The previous sign-in console process exited.",
             "closed" => "The sign-in window closed. Swarm is checking the vendor sign-in status.",
