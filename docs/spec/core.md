@@ -155,7 +155,14 @@ Failed generations retain the custody closure basis by Agent and generation.
 The daemon can verify the exact local Windows Job and retained process identities.
 Owner method `agent.custody.resolve` records an explicit assertion for the
 current Failed generation after its native publication authority has closed.
-The assertion is distinguished from an OS-observed exit in the Stop receipt.
+The daemon checks each retained unexited PID against its exact OS start time
+and checks recorded process-family custody where supported. A live identity or
+family, a failed observation, or truncated readback refuses the assertion. Use
+the generation's Stop for custody-proven termination where available. The
+assertion supplies only the remaining unobservable family-exit evidence. Store
+rechecks the observed generation and custody snapshot before retaining the
+assertion and reason. The Stop receipt distinguishes the assertion from a
+daemon-proven family exit.
 If Store rejects the no-spawn proof, ordinary plugin-error settlement records unknown
 and retains capacity; a concurrent authoritative terminal settlement is preserved.
 A successful no-spawn settlement clears that generation's recorded custody name, so it cannot

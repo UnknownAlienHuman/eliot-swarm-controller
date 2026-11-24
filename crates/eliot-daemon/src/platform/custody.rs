@@ -769,6 +769,74 @@ pub(crate) fn checkpoint_restore_job_name(id: &str) -> String {
     agent_custody_name("checkpoint-restore", id, 1)
 }
 
+/// An Owner can resolve the missing family evidence only after all observable
+/// custody has been checked. A failed observation also keeps the fence.
+pub(crate) fn check_failed_exit_assertion(
+    generation: &eliot_store::RetainedGeneration,
+) -> Result<()> {
+    if generation.processes_truncated {
+        return Err(Error::new(
+            "process_custody_unproven",
+            "retained process identities exceed the readback bound; use stop",
+        ));
+    }
+    #[cfg(windows)]
+    let live = windows_recorded_process_live(generation)?
+        || match generation.custody_namespace.as_deref() {
+            Some(namespace) => !super::windows::named_job_closed(&agent_custody_name(
+                namespace,
+                &generation.agent,
+                generation.generation,
+            ))?,
+            None => false,
+        };
+    #[cfg(target_os = "linux")]
+    let live = matches!(
+        restart_custody(generation)?,
+        RestartCustody::Retained {
+            missing: "unix_process_live" | "unix_group_live"
+        }
+    );
+    #[cfg(not(any(windows, target_os = "linux")))]
+    let live = if generation.processes.iter().any(|process| !process.exited) {
+        return Err(Error::new(
+            "process_custody_unproven",
+            "this platform cannot check retained process identities",
+        ));
+    } else {
+        false
+    };
+    if live {
+        return Err(Error::new(
+            "process_custody_live",
+            format!(
+                "an owned process or process family is still live; use swarm stop {} --generation {} for custody-proven termination",
+                generation.agent, generation.generation
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_recorded_process_live(generation: &eliot_store::RetainedGeneration) -> Result<bool> {
+    // The boot marker is an estimate. Check PID and exact creation time even
+    // for a legacy generation without a recorded Job name.
+    for process in generation
+        .processes
+        .iter()
+        .filter(|process| !process.exited)
+    {
+        if super::windows::recorded_process_alive(
+            process.identity.pid,
+            process.identity.start_time,
+        )? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Check the custody of a generation that an earlier daemon started.
 pub fn restart_custody(generation: &eliot_store::RetainedGeneration) -> Result<RestartCustody> {
     if generation.processes_truncated {
@@ -789,21 +857,11 @@ pub fn restart_custody(generation: &eliot_store::RetainedGeneration) -> Result<R
                 missing: "windows_job_live",
             });
         }
-        // Closing the Job only started member termination; the boot marker is an
-        // estimate, so match recorded identities by PID and exact creation time.
-        for process in generation
-            .processes
-            .iter()
-            .filter(|process| !process.exited)
-        {
-            if super::windows::recorded_process_alive(
-                process.identity.pid,
-                process.identity.start_time,
-            )? {
-                return Ok(RestartCustody::Retained {
-                    missing: "windows_process_live",
-                });
-            }
+        // Closing the Job only started member termination.
+        if windows_recorded_process_live(generation)? {
+            return Ok(RestartCustody::Retained {
+                missing: "windows_process_live",
+            });
         }
         Ok(RestartCustody::Closed {
             evidence: "windows_job_closed",

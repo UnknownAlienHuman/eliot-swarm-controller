@@ -58,13 +58,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let current = failed_generation_exit_snapshot(&tx, &snapshot.agent, snapshot.generation)?;
-        if snapshot.processes_truncated || current != *snapshot {
-            return Err(Error::new(
-                "stale_generation",
-                "failed generation custody changed during verification",
-            ));
-        }
+        require_current_exit_snapshot(&tx, &snapshot.agent, snapshot.generation, snapshot)?;
         let namespace: String = tx
             .query_row(
                 "SELECT namespace FROM custody_binding WHERE singleton=1",
@@ -106,6 +100,7 @@ impl Store {
     pub fn resolve_failed_custody(
         &mut self,
         request: &FailedCustodyResolveRequest,
+        observed: &RetainedGeneration,
         now: i64,
     ) -> Result<Change<FailedCustodyResolveResponse>> {
         self.ensure_writer_healthy()?;
@@ -123,7 +118,8 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let agent = require_failed_generation(&tx, &request.agent, request.generation)?;
+        require_current_exit_snapshot(&tx, &request.agent, request.generation, observed)?;
+        let agent = parse_agent_id(&request.agent)?;
         let events = record_failed_exit(
             &tx,
             agent,
@@ -158,6 +154,23 @@ impl Store {
         commit_transaction(tx, &self.write_faulted)?;
         Ok(Change { value, events })
     }
+}
+
+fn require_current_exit_snapshot(
+    tx: &Transaction<'_>,
+    agent: &str,
+    generation: i64,
+    observed: &RetainedGeneration,
+) -> Result<()> {
+    if observed.processes_truncated
+        || failed_generation_exit_snapshot(tx, agent, generation)? != *observed
+    {
+        return Err(Error::new(
+            "stale_generation",
+            "failed generation custody changed during verification",
+        ));
+    }
+    Ok(())
 }
 
 fn require_failed_generation(connection: &Connection, agent: &str, generation: i64) -> Result<i64> {
@@ -199,10 +212,13 @@ fn failed_generation_exit_snapshot(
         )
         .map_err(sql_error)?;
     let owner = format!("agent:{agent}#{generation}");
-    let mut statement = connection.prepare(
-        "SELECT host_boot_id,pid,start_time,role FROM processes WHERE owner=?1 AND state!='exited'
+    let mut statement = connection
+        .prepare(
+            "SELECT host_boot_id,pid,start_time,role,state='exited' FROM processes
+         WHERE owner=?1 AND (state!='exited' OR role='plugin')
          ORDER BY host_boot_id,pid,start_time LIMIT ?2",
-    ).map_err(sql_error)?;
+        )
+        .map_err(sql_error)?;
     let mut processes = statement
         .query_map(params![owner, MAX_PAGE_ENTRIES as i64 + 1], |row| {
             Ok(RecordedProcess {
@@ -212,7 +228,7 @@ fn failed_generation_exit_snapshot(
                     start_time: row.get::<_, i64>(2)? as u64,
                 },
                 role: row.get(3)?,
-                exited: false,
+                exited: row.get(4)?,
             })
         })
         .map_err(sql_error)?

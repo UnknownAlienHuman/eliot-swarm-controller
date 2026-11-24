@@ -1451,20 +1451,33 @@ impl PluginHost {
         request: &eliot_core::api::FailedCustodyResolveRequest,
     ) -> Result<eliot_store::Change<eliot_core::api::FailedCustodyResolveResponse>> {
         let _startup = self.state.startup_gate.lock().await;
-        let mut store = self.state.store.lock().await;
-        if let Some(value) = store.replay_failed_custody_resolution(request)? {
-            return Ok(eliot_store::Change {
-                value,
-                events: Vec::new(),
-            });
-        }
-        if self.controls_generation(&request.agent, request.generation) {
-            return Err(Error::new(
-                "busy",
-                "the daemon still controls this generation; stop it first",
-            ));
-        }
-        store.resolve_failed_custody(request, now_ms())
+        let snapshot = {
+            let store = self.state.store.lock().await;
+            if let Some(value) = store.replay_failed_custody_resolution(request)? {
+                return Ok(eliot_store::Change {
+                    value,
+                    events: Vec::new(),
+                });
+            }
+            if self.controls_generation(&request.agent, request.generation) {
+                return Err(Error::new(
+                    "busy",
+                    "the daemon still controls this generation; stop it first",
+                ));
+            }
+            store.failed_generation_exit_snapshot(&request.agent, request.generation)?
+        };
+        let snapshot = tokio::task::spawn_blocking(move || {
+            crate::platform::custody::check_failed_exit_assertion(&snapshot)?;
+            Ok::<_, Error>(snapshot)
+        })
+        .await
+        .map_err(|_| Error::new("unavailable", "failed custody observation did not return"))??;
+        self.state
+            .store
+            .lock()
+            .await
+            .resolve_failed_custody(request, &snapshot, now_ms())
     }
 
     #[cfg(windows)]

@@ -33,8 +33,8 @@ The 4,096 active-artifact limit applies to new Agent registrations and counts
 registered and uncertain rows. Bound ownership roots and settled tombstones
 consume zero registration slots. Daemon-owned custody records for a launch or
 its managed workspace and native session commit even when the registration limit
-is reached. Daemon custody inserts have a 512-active-row bound per Agent
-generation. Exact repeats preserve the original binding. An ID collision
+is reached. Daemon custody inserts have a 512-active-row bound for each
+`(Agent, generation)` pair. Exact repeats preserve the original binding. An ID collision
 with a different binding fails visibly. Daemon status shows the counts and
 the Owner inbox warns at 80 percent.
 Bounded maintenance prunes expired previews and settled plans and reclaims
@@ -1278,15 +1278,20 @@ row stores the canonical checkout key, current Agent and any in-flight switch; a
 successful handoff moves ownership to B in the H2 transaction.
 Rejection clears the exact switch reservation in the settlement transaction.
 Startup reconciles matching stranded rejected reservations. The canonical
-owner and its custody checks still govern subsequent checkout admission.
+owner remains. Checkout admission's custody check is authoritative after
+rejection, including rejection for unproven process custody, and continues to
+fence every launch or resume by a different Agent until source exit is settled.
 
 A stop for a Failed generation can use exact no-spawn proof or daemon-verified
 closure of the local Windows Job and retained process identities. When that
 proof is unavailable, the Owner can use
 `swarm cmd resolve-custody A --generation N --reason TEXT` after verifying
-the whole process family's exit. The Store retains the exact generation, proof
-basis and reason. Switch and handoff consume that closure while independently
-checking native sources, workspace helpers and unresolved work.
+the whole process family's exit. The daemon refuses the assertion while any
+retained PID and start time still match a live process or a recorded family
+is live, even after daemon restart. The Store retains the exact generation,
+proof basis and reason. Checkout admission, switch and handoff consume that
+closure while independently checking native sources, workspace helpers and
+unresolved work.
 `agent_successors` retains the same-checkout transfer after event retention. A same-checkout
 transfer records the successor even when the caller explicitly repeats the workspace path.
 A second switch from a retired owner is refused and names the current Agent to switch instead. From then on the source
