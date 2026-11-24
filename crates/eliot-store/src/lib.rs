@@ -246,6 +246,18 @@ mod hierarchy;
 pub mod inference;
 mod lifecycle;
 pub use lifecycle::{PreparedRuleCoordination, RuleCoordinationDispatch, UserEventDispatch};
+
+#[derive(Clone, Debug)]
+pub struct NativeBranchSwitchCandidate {
+    pub agent: String,
+    pub generation: i64,
+    pub branch: String,
+    pub workspace: String,
+    pub start_seq: i64,
+    pub terminal_seq: i64,
+    pub started_at_ms: i64,
+    pub completed_at_ms: i64,
+}
 mod native_children;
 pub mod overview;
 mod reparent;
@@ -2687,6 +2699,128 @@ impl Store {
             pruned_through: retention::coverage_pruned_through(&self.connection)?,
             hi: self.high_water()?,
         })
+    }
+
+    /// Bounded lookup of native branch switches tied to one checkout.
+    /// The event pair must share Agent, generation, native item and turn.
+    pub fn native_branch_switch_candidates(
+        &self,
+        workspace: &str,
+        branch: Option<&str>,
+        generation: Option<i64>,
+    ) -> Result<Vec<NativeBranchSwitchCandidate>> {
+        let display_workspace = core::display_path(workspace);
+        let verbatim_workspace = core::verbatim_path(std::path::Path::new(workspace))
+            .to_string_lossy()
+            .into_owned();
+        let start_path = if cfg!(windows) {
+            "lower(json_extract(s.data, '$.cwd')) IN (lower(?1), lower(?2), lower(?3))"
+        } else {
+            "json_extract(s.data, '$.cwd') IN (?1, ?2, ?3)"
+        };
+        let terminal_path = if cfg!(windows) {
+            "lower(json_extract(c.data, '$.git_branch_switch.cwd')) IN (lower(?1), lower(?2), lower(?3))"
+        } else {
+            "json_extract(c.data, '$.git_branch_switch.cwd') IN (?1, ?2, ?3)"
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                &format!("SELECT c.agent, c.generation, c.seq, s.seq, s.ts, s.data, c.data
+                 FROM events c JOIN events s
+                   ON s.agent = c.agent AND s.generation = c.generation AND s.seq < c.seq
+                  AND s.source = 'stream' AND s.kind = 'tool.started'
+                  AND json_extract(s.data, '$.item_id') = json_extract(c.data, '$.git_branch_switch.item_id')
+                  AND json_extract(s.data, '$.turn_id') = json_extract(c.data, '$.git_branch_switch.turn_id')
+                  AND {start_path}
+                  AND json_extract(s.data, '$.tool') = 'commandExecution'
+                 WHERE c.source = 'stream' AND c.kind = 'tool.completed'
+                   AND c.generation IS NOT NULL
+                   AND (?5 IS NULL OR c.generation = ?5)
+                   AND json_extract(c.data, '$.status') = 'completed'
+                   AND json_extract(c.data, '$.exit_code') = 0
+                   AND {terminal_path}
+                   AND (?4 IS NULL OR json_extract(c.data, '$.git_branch_switch.branch') = ?4)
+                 ORDER BY c.seq DESC LIMIT 65")
+            )
+            .map_err(sql_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    workspace,
+                    display_workspace,
+                    verbatim_workspace,
+                    branch,
+                    generation
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(sql_error)?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            let (
+                agent_num,
+                generation,
+                terminal_seq,
+                start_seq,
+                start_ts,
+                start_data,
+                terminal_data,
+            ) = row.map_err(sql_error)?;
+            let start: Value = serde_json::from_str(&start_data)
+                .map_err(|_| Error::new("source_integrity", "invalid native tool start event"))?;
+            let terminal: Value = serde_json::from_str(&terminal_data).map_err(|_| {
+                Error::new("source_integrity", "invalid native tool terminal event")
+            })?;
+            let fact = &terminal["git_branch_switch"];
+            let (
+                Some(item_id),
+                Some(turn_id),
+                Some(branch_value),
+                Some(workspace_value),
+                Some(completed_at),
+            ) = (
+                fact["item_id"].as_str(),
+                fact["turn_id"].as_str(),
+                fact["branch"].as_str(),
+                fact["cwd"].as_str(),
+                fact["native_at_ms"].as_i64(),
+            )
+            else {
+                continue;
+            };
+            if start["item_id"].as_str() != Some(item_id)
+                || start["turn_id"].as_str() != Some(turn_id)
+                || !start["cwd"].as_str().is_some_and(|cwd| {
+                    core::workspace_path_key(cwd) == core::workspace_path_key(workspace_value)
+                })
+                || branch.is_some_and(|branch| branch_value != branch)
+                || core::workspace_path_key(workspace_value) != core::workspace_path_key(workspace)
+            {
+                continue;
+            }
+            candidates.push(NativeBranchSwitchCandidate {
+                agent: format!("a{agent_num}"),
+                generation,
+                branch: branch_value.to_owned(),
+                workspace: workspace_value.to_owned(),
+                start_seq,
+                terminal_seq,
+                started_at_ms: start["native_at_ms"].as_i64().unwrap_or(start_ts),
+                completed_at_ms: completed_at,
+            });
+        }
+        Ok(candidates)
     }
 
     pub fn high_water(&self) -> Result<i64> {

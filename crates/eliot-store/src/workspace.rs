@@ -67,6 +67,89 @@ pub(super) fn workspace_from_row(
     })
 }
 
+fn valid_native_branch_switch_evidence(
+    tx: &Transaction<'_>,
+    agent: i64,
+    drift: &core::WorkspaceBranchDrift,
+    workspace: &str,
+) -> Result<bool> {
+    let (
+        Some(terminal_seq),
+        Some(start_seq),
+        Some(generation),
+        Some(completed_at),
+        Some(started_at),
+        Some(from_branch),
+    ) = (
+        drift.native_event_seq,
+        drift.native_start_seq,
+        drift.native_generation,
+        drift.native_at_ms,
+        drift.native_started_at_ms,
+        drift.native_from_branch.as_deref(),
+    )
+    else {
+        return Ok(false);
+    };
+    if start_seq >= terminal_seq || from_branch == drift.observed_branch {
+        return Ok(false);
+    }
+    let terminal: Option<String> = tx
+        .query_row(
+            "SELECT data FROM events WHERE seq = ?1 AND agent = ?2 AND generation = ?3
+             AND source = 'stream' AND kind = 'tool.completed'",
+            params![terminal_seq, agent, generation],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some(terminal) = terminal else {
+        return Ok(false);
+    };
+    let terminal: Value = serde_json::from_str(&terminal)
+        .map_err(|_| Error::new("source_integrity", "invalid persisted native tool event"))?;
+    let fact = &terminal["git_branch_switch"];
+    let item_id = fact["item_id"].as_str();
+    let turn_id = fact["turn_id"].as_str();
+    if terminal["status"].as_str() != Some("completed")
+        || terminal["exit_code"].as_i64() != Some(0)
+        || terminal["item_id"].as_str() != item_id
+        || terminal["turn_id"].as_str() != turn_id
+        || fact["branch"].as_str() != Some(drift.observed_branch.as_str())
+        || !fact["cwd"]
+            .as_str()
+            .is_some_and(|cwd| core::workspace_path_key(cwd) == core::workspace_path_key(workspace))
+        || fact["native_at_ms"].as_i64() != Some(completed_at)
+        || item_id.is_none()
+        || turn_id.is_none()
+    {
+        return Ok(false);
+    }
+    let start: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT data, ts FROM events WHERE seq = ?1 AND agent = ?2 AND generation = ?3
+             AND source = 'stream' AND kind = 'tool.started'",
+            params![start_seq, agent, generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((start, event_ts)) = start else {
+        return Ok(false);
+    };
+    let start: Value = serde_json::from_str(&start)
+        .map_err(|_| Error::new("source_integrity", "invalid persisted native tool event"))?;
+    let observed_started_at = start["native_at_ms"].as_i64().unwrap_or(event_ts);
+    Ok(start["item_id"].as_str() == item_id
+        && start["turn_id"].as_str() == turn_id
+        && start["cwd"].as_str().is_some_and(|cwd| {
+            core::workspace_path_key(cwd) == core::workspace_path_key(workspace)
+        })
+        && start["tool"].as_str() == Some("commandExecution")
+        && observed_started_at == started_at
+        && observed_started_at <= completed_at)
+}
+
 pub(super) fn load_workspace(
     connection: &Connection,
     agent: i64,
@@ -2616,6 +2699,14 @@ impl Store {
                         let branch_identity_valid = match branch_drift {
                             Some(drift) => {
                                 let owner = load_agent_by_num(&tx, agent_num)?;
+                                let prior_generation_branch = workspace
+                                    .outcome
+                                    .as_ref()
+                                    .and_then(|value| value.get("resume_previous"))
+                                    .and_then(|value| value.get("outcome"))
+                                    .and_then(|value| value.get("result"))
+                                    .and_then(|value| value.get("branch"))
+                                    .and_then(Value::as_str);
                                 reuse
                                     && command.command.verb == "resume"
                                     && matches!(
@@ -2624,11 +2715,21 @@ impl Store {
                                     )
                                     && drift.original_branch == workspace.requested_branch
                                     && drift.observed_branch == branch
-                                    && drift.observed_branch != drift.original_branch
+                                    && drift.prior_generation_branch.as_deref()
+                                        == prior_generation_branch
                                     && core::api::validate_integration_branch(
                                         &drift.observed_branch,
                                     )
                                     .is_ok()
+                                    && drift.native_generation.is_some_and(|generation| {
+                                        generation <= command.command.generation.unwrap_or(-1)
+                                    })
+                                    && valid_native_branch_switch_evidence(
+                                        &tx,
+                                        agent_num,
+                                        drift.as_ref(),
+                                        &workspace.worktree_path,
+                                    )?
                                     && owner.is_some_and(|agent| {
                                         command.command.generation == Some(agent.generation)
                                             && agent.is_terminal()
