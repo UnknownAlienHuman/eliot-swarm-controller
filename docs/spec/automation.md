@@ -930,8 +930,8 @@ weaker send. `inject` requires an event trigger and is unsupported for timers.
 
 Swarm uses the same insertion path for notes about a confirmed edit outside the
 worktree or the frozen Goal scope, repeated command failures, and a turn with edits
-and no observed configured check before completion. Swarm does not queue
-`no_check_before_end` when the Goal's check already ran after the turn started, or
+and no passing configured check covers its latest observed edit. Swarm does not queue
+`no_check_before_end` when passing check evidence covers that edit, or
 when the automatic driver's own enablement, key, probe and gates admit a round for
 that idle point (#904, #868, #881). A recorded Goal check has no `completed_at`
 upper bound: a round commits only while the Agent is idle, so its check lands after
@@ -954,8 +954,11 @@ at most once per turn. Lifecycle notes can queue before the first linked input.
 
 A completed fast project check records a daemon event in the `project` family
 with kind `project.check.finished`, its triggering edit sequence and exit code.
-The turn-end reminder recognizes that receipt for the same generation and turn
-window. It also recognizes an exact native command with a matching completion.
+The turn-end reminder accepts a zero-exit receipt for the same generation and
+turn window when its triggering edit sequence covers the latest observed edit.
+An exact native check must start after the latest edit and retain a matching
+zero exit. A passing Goal round for the same revision also counts after the
+latest edit, including when it settles after turn completion.
 Older native command events without a truncation flag count when the exact
 command is short enough to rule out truncation. Fact counters use later
 confirmed check, command or Git evidence where available. Without a confirming

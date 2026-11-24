@@ -4,8 +4,6 @@ use eliot_core::{ContextEditPath, Event, MAX_CONTEXT_EDIT_PATH_BYTES, Result};
 use serde_json::Value;
 use std::{collections::BTreeSet, fs, path::Path};
 
-const MAX_AGENT_EDITS_READ: usize = 1_000;
-
 pub(super) enum InsertionFact {
     Edits {
         kind: &'static str,
@@ -35,7 +33,7 @@ impl Router {
             return Ok(Vec::new());
         };
 
-        let (agent, launch_goal, goal, edits, turn, evidence) = {
+        let (agent, launch_goal, evidence) = {
             let store = self.inner.store.lock().await;
             let Some(agent) = store.get_agent(agent_id)? else {
                 return Ok(Vec::new());
@@ -46,11 +44,6 @@ impl Router {
             let launch_goal = store.launch_goal_definition(agent_id, generation)?;
             let goal = store.goal_get(agent_id, "eliot")?;
             let terminal = event.kind == "turn.completed";
-            let edits = if terminal {
-                store.list_agent_edits(agent_id, generation, None, MAX_AGENT_EDITS_READ)?
-            } else {
-                Vec::new()
-            };
             let turn = if terminal {
                 event
                     .data
@@ -62,13 +55,23 @@ impl Router {
             } else {
                 None
             };
-            let evidence = match (&turn, &launch_goal) {
-                (Some(turn), Some(goal)) if !goal.check.is_empty() => {
-                    store.turn_insertion_evidence(turn, event.seq, &goal.check)?
+            let evidence = match (&turn, &launch_goal, &goal, agent.workspace.as_deref()) {
+                (Some(turn), Some(definition), Some(goal), Some(workspace))
+                    if !definition.check.is_empty()
+                        && goal.generation == generation
+                        && goal.definition == *definition =>
+                {
+                    Some(store.turn_insertion_evidence(
+                        turn,
+                        event.seq,
+                        workspace,
+                        &definition.check,
+                        goal.revision,
+                    )?)
                 }
-                _ => (Vec::new(), false),
+                _ => None,
             };
-            (agent, launch_goal, goal, edits, turn, evidence)
+            (agent, launch_goal, evidence)
         };
 
         let workspace = agent.workspace.as_deref();
@@ -182,39 +185,16 @@ impl Router {
             }
         }
 
-        if event.kind == "turn.completed"
-            && let (Some(definition), Some(goal), Some(turn)) =
-                (launch_goal.as_ref(), goal.as_ref(), turn.as_ref())
-            && !definition.check.is_empty()
-            && goal.agent == agent_id
-            && goal.generation == generation
-            && goal.definition == *definition
-            && let Some(started_at) = turn.started_at
-        {
-            let completed_at = turn.completed_at.unwrap_or(event.ts);
-            let (native_edits, check_observed) = evidence;
-            let edited = workspace.is_some_and(|root| {
-                native_edits
+        if let (Some(evidence), Some(root)) = (evidence, workspace)
+            && !evidence.passing_check
+            && (evidence.git_edit
+                || evidence
+                    .native_paths
                     .iter()
-                    .any(|path| normalize_hint(root, path).is_ok())
-            }) || edits.iter().any(|edit| {
-                workspace == Some(edit.workspace.as_str())
-                    && edit.updated_at >= started_at
-                    && edit.updated_at <= completed_at
-            });
-            // No upper bound: a Goal round commits only while the Agent is
-            // idle, so its check always lands after this turn and covers the
-            // turn's final files. Bounding it by `completed_at` would report a
-            // finished round for this idle point as a missing check.
-            let check_ran = check_observed
-                || goal
-                    .counters
-                    .last_check_at
-                    .is_some_and(|checked_at| checked_at >= started_at);
-            if edited && !check_ran && !self.goal_auto_round_will_check(agent_id, generation).await
-            {
-                facts.push(InsertionFact::NoCheckBeforeEnd);
-            }
+                    .any(|path| normalize_hint(root, path).is_ok()))
+            && !self.goal_auto_round_will_check(agent_id, generation).await
+        {
+            facts.push(InsertionFact::NoCheckBeforeEnd);
         }
 
         Ok(facts)
