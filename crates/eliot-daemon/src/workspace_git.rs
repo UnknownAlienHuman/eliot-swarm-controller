@@ -1545,7 +1545,7 @@ impl WorkspaceGit {
         if registered_branch != Some(branch.as_str()) {
             return Err(problem(
                 "source_integrity",
-                format!(
+                &format!(
                     "registered branch '{}' differs from observed HEAD branch '{}'",
                     registered_branch.unwrap_or("<detached>"),
                     branch
@@ -1556,7 +1556,7 @@ impl WorkspaceGit {
         if !allow_branch_drift && branch != full_ref {
             return Err(problem(
                 "source_integrity",
-                format!(
+                &format!(
                     "workspace branch differs: original '{}' and observed '{}'",
                     preparation.requested_branch,
                     branch.strip_prefix("refs/heads/").unwrap_or(&branch)

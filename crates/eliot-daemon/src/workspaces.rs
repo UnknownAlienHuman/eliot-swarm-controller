@@ -515,7 +515,17 @@ impl WorkspaceManager {
             }
             match current.phase {
                 WorkspacePhase::Ready => {
-                    let readback = git.inspect_retained(&current).await;
+                    let recorded_drift = current
+                        .outcome
+                        .as_ref()
+                        .filter(|outcome| outcome["reuse"].as_bool() == Some(true))
+                        .map(|outcome| &outcome["result"])
+                        .filter(|result| result["branch_drift"].is_object());
+                    let readback = if recorded_drift.is_some() {
+                        git.inspect_resume_retained(&current).await
+                    } else {
+                        git.inspect_retained(&current).await
+                    };
                     if let Some(error) = workspace_creation_error(&readback) {
                         if agent.generation > 0 {
                             return Err(error);
@@ -523,6 +533,19 @@ impl WorkspaceManager {
                         return Err(problem(
                             "unknown",
                             "ready workspace identity is unavailable",
+                        ));
+                    }
+                    if let Some(recorded) = recorded_drift
+                        && let WorkspaceCreationOutcome::Verified { branch, head, .. } = &readback
+                        && (recorded["branch"].as_str() != Some(branch)
+                            || recorded["head"].as_str() != Some(head))
+                    {
+                        return Err(problem(
+                            "source_integrity",
+                            &format!(
+                                "workspace changed after resume verification: original branch '{}' and observed branch '{}'",
+                                current.requested_branch, branch
+                            ),
                         ));
                     }
                     let _gate = slot.gate.clone().lock_owned().await;
