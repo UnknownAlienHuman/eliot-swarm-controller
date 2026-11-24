@@ -1417,7 +1417,7 @@ fn validate_candidate(source: &str) -> core::Result<()> {
 fn validate_parsed(config: &FileConfig, source: &str) -> core::Result<()> {
     for (name, proxy) in &config.proxies {
         let proxy = proxy.get_ref();
-        if is_builtin_codex_provider(name) {
+        if core::api::HarnessCapabilities::is_reserved_proxy_provider(name) {
             return Err(core::Error::new(
                 "profile_error",
                 "proxy name collides with a builtin Codex provider",

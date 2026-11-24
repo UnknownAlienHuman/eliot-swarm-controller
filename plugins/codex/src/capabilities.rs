@@ -1,8 +1,8 @@
 //! Codex native adapter capability declaration.
 
 use eliot_core::api::harness::{
-    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeQuotaReadback, ProfileCapabilities,
-    ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
+    AdhocEffort, LaunchDefaultPolicy, NativeAccessBounds, NativeQuotaReadback, NativeRoute,
+    ProfileCapabilities, ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{
     CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, NativeSubagentsPolicy, codex_project_doc_override,
@@ -16,6 +16,16 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::ResponsesProxy {
+            reserved_providers: &[
+                "openai",
+                "amazon-bedrock",
+                "amazon-bedrock-runtime",
+                "ollama",
+                "lmstudio",
+                "ollama-chat",
+            ],
+        },
         profile: ProfileCapabilities {
             script_wrapper_cmd: true,
             project_doc_max_bytes: true,

@@ -150,7 +150,9 @@ parser owns the input vocabulary used for offline settings validation.
 Adapters declare their project instruction-file behavior and the user instruction
 paths that doctor compares with committed owner rules.
 The controller and offline desktop settings editor register the same profile
-capabilities from the built-in adapters.
+capabilities from the built-in adapters before using them. Store entry points
+return an error when registration is missing. Adapter declarations identify
+adopted proxy support, catalogue route labels, and the native approval field.
 Claude `AGENTS.md` is `unknown` at prelaunch because the adapter cannot establish
 which project instructions the native loader will select. Swarm's normal project
 source delivery applies, and any installed version is provenance.

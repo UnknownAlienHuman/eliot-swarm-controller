@@ -3,8 +3,8 @@
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, DocumentedModelCatalog, ModelReaderOptions,
-    NativeAccessBounds, NativeQuotaReadback, ProfileCapabilities, ProjectInstructionRead,
-    QuotaProjectionFormat, UserInstructionFiles,
+    NativeAccessBounds, NativeQuotaReadback, NativeRoute, ProfileCapabilities,
+    ProjectInstructionRead, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::{CLAUDE_EFFORT_LEVELS, NativeSubagentsPolicy};
 use eliot_core::api::{
@@ -16,7 +16,9 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            approval_field: Some("permission_mode"),
             model_pin_selectors: true,
             route_selectors_resolved: true,
             route_scope_secret_names: &["CLAUDE_CODE_OAUTH_TOKEN"],

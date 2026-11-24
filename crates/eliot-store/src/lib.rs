@@ -441,6 +441,7 @@ impl Store {
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
+        core::api::HarnessCapabilities::require_registered()?;
         #[cfg(windows)]
         let owned_path = core::verbatim_path(path);
         #[cfg(windows)]
@@ -471,6 +472,7 @@ impl Store {
     where
         F: FnMut(StoreOpenPhase),
     {
+        core::api::HarnessCapabilities::require_registered()?;
         #[cfg(windows)]
         let owned_path = core::verbatim_path(path);
         #[cfg(windows)]

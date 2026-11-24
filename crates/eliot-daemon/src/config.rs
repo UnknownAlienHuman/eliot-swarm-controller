@@ -9,6 +9,7 @@
 //! Snapshots retain admitted environment names. Codex retains its native-store execution inputs. Private
 //! route selectors are bound by digest and resolved only in the process environment.
 use crate::harness_capabilities::ProfileCapabilities;
+use core::api::harness::NativeRoute;
 use core::api::native_profile::{
     ANTIGRAVITY_MODES, CLAUDE_EFFORTS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
     CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
@@ -2974,14 +2975,15 @@ fn bind_route_and_capacity(
     }
 
     if let Some(proxy_name) = entry.proxy.as_deref() {
-        if entry.harness.trim() != "codex" {
+        let route = core::api::HarnessCapabilities::of(entry.harness.trim()).native_route;
+        if !matches!(route, NativeRoute::ResponsesProxy { .. }) {
             return Err(fail(
                 "proxy",
-                "adopted proxy routes require the Codex harness",
+                "this harness does not support adopted Responses proxies",
             ));
         }
         validate_profile_name(proxy_name).map_err(|_| fail("proxy", "invalid proxy reference"))?;
-        if is_builtin_codex_provider(proxy_name) {
+        if route.reserves_proxy_provider(proxy_name) {
             return Err(fail(
                 "proxy",
                 "proxy name collides with a builtin Codex provider",
@@ -3060,19 +3062,6 @@ fn bind_route_and_capacity(
     snapshot["capacity_scopes"] = serde_json::to_value(scopes)
         .map_err(|_| fail("max_live", "capacity scopes could not be encoded"))?;
     Ok(snapshot)
-}
-
-fn is_builtin_codex_provider(name: &str) -> bool {
-    [
-        "openai",
-        "amazon-bedrock",
-        "amazon-bedrock-runtime",
-        "ollama",
-        "lmstudio",
-        "ollama-chat",
-    ]
-    .iter()
-    .any(|provider| name.eq_ignore_ascii_case(provider))
 }
 
 fn default_scratch() -> Vec<String> {

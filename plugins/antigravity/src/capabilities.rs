@@ -2,7 +2,7 @@
 
 use eliot_core::api::harness::{
     AdhocLaunchDefaults, AdhocModel, AdhocPermissions, NativeAccessBounds, NativeQuotaReadback,
-    ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
+    NativeRoute, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{ConfigureSessionMode, HarnessCapabilities};
@@ -12,6 +12,7 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
         profile: ProfileCapabilities {
             command_refusal: Some(|cmd| {
                 (!eliot_plugin::install::cli_identity_matches(cmd, crate::install::CLI_STEM)).then_some(

@@ -24,6 +24,9 @@ fn main() -> ExitCode {
         return report_failure(Failure::new(1, error.to_string()));
     }
     let cli = Cli::parse();
+    if let Err(error) = eliot::register_harness_capabilities() {
+        return report_failure(Failure::new(1, error.to_string()));
+    }
     if let Some(path) = &cli.operator_check_store {
         return match eliot_daemon::operator::check_update_store_copy(path) {
             Ok(()) => ExitCode::SUCCESS,
@@ -45,9 +48,6 @@ fn main() -> ExitCode {
     if let Err(error) =
         eliot_plugin::text_inference::register(eliot_plugin_claude::inference::ADAPTER)
     {
-        return report_failure(Failure::new(1, error.to_string()));
-    }
-    if let Err(error) = eliot::register_harness_capabilities() {
         return report_failure(Failure::new(1, error.to_string()));
     }
     let is_plugin = matches!(&cli.command, Some(CliCommand::Plugin(_)));

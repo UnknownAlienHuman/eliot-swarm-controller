@@ -3,7 +3,8 @@
 use eliot_core::McpPolicy;
 use eliot_core::api::harness::{
     AdhocEffort, AdhocLaunchDefaults, AdhocModel, AdhocPermissions, ModelReaderOptions,
-    NativeQuotaReadback, ProfileCapabilities, QuotaProjectionFormat, UserInstructionFiles,
+    NativeQuotaReadback, NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
+    UserInstructionFiles,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
@@ -14,6 +15,7 @@ use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::AuthIntegration,
         profile: ProfileCapabilities {
             route_scope_secret_names: &["OPENCODE_CONFIG_CONTENT"],
             local_provider: true,

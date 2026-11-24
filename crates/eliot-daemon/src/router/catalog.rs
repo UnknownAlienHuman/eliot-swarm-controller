@@ -5,6 +5,7 @@
 //! private process environment. Public scope labels contain only route names.
 
 use super::{MODE_OPEN, Principal, Router, catalog, now_ms, require_owner};
+use eliot_core::api::harness::NativeRoute;
 use eliot_core::api::{
     HARNESS_READ_TTL_MS, HarnessCandidate, HarnessCapabilities, HarnessEntry,
     HarnessModelsResponse, HarnessQuotaResponse, ModelsCatalogEntry, ModelsCatalogFailure,
@@ -1310,29 +1311,31 @@ pub(crate) fn describe_snapshot(
             scope.push_str(&account);
         }
     }
-    match harness {
-        "codex" => match snapshot.get("route_binding").and_then(Value::as_object) {
-            Some(binding) => {
-                let name = binding
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unnamed");
-                scope.push_str(&format!(" route:{name}"));
-                if let Some(base) = binding.get("provider_base_url").and_then(Value::as_str) {
-                    scope.push_str(&format!(" provider:{}", endpoint_authority(base)));
+    match HarnessCapabilities::of(harness).native_route {
+        NativeRoute::ResponsesProxy { .. } => {
+            match snapshot.get("route_binding").and_then(Value::as_object) {
+                Some(binding) => {
+                    let name = binding
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unnamed");
+                    scope.push_str(&format!(" route:{name}"));
+                    if let Some(base) = binding.get("provider_base_url").and_then(Value::as_str) {
+                        scope.push_str(&format!(" provider:{}", endpoint_authority(base)));
+                    }
+                    credential = binding
+                        .get("client_key_env_name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .map_or_else(|| "none".to_owned(), |name| format!("env:{name}"));
                 }
-                credential = binding
-                    .get("client_key_env_name")
-                    .and_then(Value::as_str)
-                    .filter(|name| !name.trim().is_empty())
-                    .map_or_else(|| "none".to_owned(), |name| format!("env:{name}"));
+                None => {
+                    scope.push_str(" route:direct");
+                    credential = "ambient".to_owned();
+                }
             }
-            None => {
-                scope.push_str(" route:direct");
-                credential = "ambient".to_owned();
-            }
-        },
-        "opencode" => {
+        }
+        NativeRoute::AuthIntegration => {
             if let Some(integration) = snapshot
                 .get("auth_integration")
                 .and_then(Value::as_str)
@@ -1352,16 +1355,8 @@ pub(crate) fn describe_snapshot(
                 }
             }
         }
-        "claude" => {
-            credential = "claude-cli-oauth".to_owned();
-        }
-        "antigravity" => {
-            credential = "antigravity-cli-keyring".to_owned();
-        }
-        "muse" => {
-            credential = "ambient".to_owned();
-        }
-        _ => {}
+        NativeRoute::FixedCredential(label) => credential = label.to_owned(),
+        NativeRoute::Unspecified => {}
     }
     (scope, credential)
 }

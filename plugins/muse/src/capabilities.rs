@@ -2,7 +2,7 @@
 
 use eliot_core::api::harness::{
     AdhocEffort, LaunchDefaultPolicy, ModelReaderOptions, NativeAccessBounds, NativeQuotaReadback,
-    ProfileCapabilities, QuotaProjectionFormat,
+    NativeRoute, ProfileCapabilities, QuotaProjectionFormat,
 };
 use eliot_core::api::native_profile::NativeSubagentsPolicy;
 use eliot_core::api::{
@@ -16,7 +16,9 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        native_route: NativeRoute::FixedCredential("ambient"),
         profile: ProfileCapabilities {
+            approval_field: Some("approval"),
             native_subagents_policy: Some(NativeSubagentsPolicy::allow_by_default()),
             ..ProfileCapabilities::default()
         },

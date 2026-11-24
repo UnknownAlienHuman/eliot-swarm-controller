@@ -202,6 +202,8 @@ pub struct ProfileCapabilities {
     pub command_refusal: Option<fn(&str) -> Option<&'static str>>,
     pub local_provider: bool,
     pub project_doc_max_bytes: bool,
+    /// Native approval selector in profile summaries. The default field is `approval_policy`.
+    pub approval_field: Option<&'static str>,
     pub native_subagents_policy: Option<super::native_profile::NativeSubagentsPolicy>,
 }
 
@@ -211,11 +213,35 @@ impl ProfileCapabilities {
     }
 }
 
+/// How an adapter binds and describes its native provider route.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum NativeRoute {
+    #[default]
+    Unspecified,
+    FixedCredential(&'static str),
+    ResponsesProxy {
+        reserved_providers: &'static [&'static str],
+    },
+    AuthIntegration,
+}
+
+impl NativeRoute {
+    pub fn reserves_proxy_provider(self, name: &str) -> bool {
+        match self {
+            Self::ResponsesProxy { reserved_providers } => reserved_providers
+                .iter()
+                .any(|provider| name.eq_ignore_ascii_case(provider)),
+            _ => false,
+        }
+    }
+}
+
 /// Prelaunch capability declaration supplied by each built-in adapter.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HarnessCapabilities {
     /// Native profile vocabulary supplied by this adapter.
     pub profile: ProfileCapabilities,
+    pub native_route: NativeRoute,
     /// How to freeze a launch without a saved profile and seed its installed preset.
     pub adhoc_launch: Option<AdhocLaunchDefaults>,
     /// `None` when the adapter has no ad-hoc effort mapping.
@@ -383,13 +409,10 @@ pub fn register_harness_capabilities(
 }
 
 impl HarnessCapabilities {
-    fn registered() -> Option<&'static Declarations> {
-        let entries = BUILTIN_CAPABILITIES.get();
-        debug_assert!(
-            entries.is_some(),
-            "built-in adapter capabilities must be registered"
-        );
-        entries
+    fn registered() -> &'static Declarations {
+        BUILTIN_CAPABILITIES
+            .get()
+            .expect("built-in adapter capabilities must be registered at the entry point")
     }
 
     /// Require registration before the daemon can open its Store.
@@ -409,7 +432,7 @@ impl HarnessCapabilities {
 
     /// Capabilities of a supported native harness, or `None` for any other name.
     pub fn for_harness(harness: &str) -> Option<Self> {
-        Self::registered()?
+        Self::registered()
             .iter()
             .find_map(|(name, caps)| (*name == harness).then_some(*caps))
     }
@@ -417,20 +440,23 @@ impl HarnessCapabilities {
     /// Whether `stem` (lowercased executable basename without extension) belongs
     /// to one of the supported harness executables.
     pub fn is_harness_executable_stem(stem: &str) -> bool {
-        Self::registered().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|(_, caps)| caps.executable_stems.contains(&stem))
-        })
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.executable_stems.contains(&stem))
     }
 
     /// Whether `family` belongs to any supported harness's native-child grant.
     pub fn is_native_child_family(family: &str) -> bool {
-        Self::registered().is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|(_, caps)| caps.native_child_families.contains(&family))
-        })
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.native_child_families.contains(&family))
+    }
+
+    /// Whether the name would collide with a built-in provider on an adopted route.
+    pub fn is_reserved_proxy_provider(name: &str) -> bool {
+        Self::registered()
+            .iter()
+            .any(|(_, caps)| caps.native_route.reserves_proxy_provider(name))
     }
 }
 
