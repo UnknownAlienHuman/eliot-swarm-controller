@@ -536,7 +536,10 @@ fn attention_quiet_gap(
            )
          ORDER BY event.seq LIMIT ?8"
     } else {
-        "SELECT event.seq, event.ts, event.source FROM events AS event
+        // Seek the exact turn before checking sequence and time. The time
+        // index alone can visit activity from unrelated turns in a generation.
+        "SELECT event.seq, event.ts, event.source
+         FROM events AS event INDEXED BY attention_native_turn_activity
          WHERE event.agent = ?1 AND event.generation = ?2 AND event.native_id IS NOT NULL
            AND event.seq > ?3 AND event.seq < ?4
            AND event.ts BETWEEN ?5 AND ?6
@@ -638,7 +641,7 @@ fn history_clock_gapped(
          )"
     } else {
         "SELECT EXISTS(
-             SELECT 1 FROM events AS event
+             SELECT 1 FROM events AS event INDEXED BY attention_native_turn_activity
              WHERE event.agent = ?1 AND event.generation = ?2 AND event.native_id IS NOT NULL
                AND event.seq > ?3 AND event.seq < ?4
                AND event.ts NOT BETWEEN ?5 AND ?6
