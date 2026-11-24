@@ -742,24 +742,12 @@ impl WorkspaceGit {
         let source = self.source(preparation, deadline).await?;
         let target = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target)?;
-        let entries = self.entries(&source.root, deadline).await?;
-        self.creation_absent(preparation, &source, &target, &entries, deadline)
-            .await
-    }
-
-    async fn creation_absent(
-        &self,
-        preparation: &WorkspacePreparation,
-        source: &Repository,
-        target: &Path,
-        entries: &[WorktreeEntry],
-        deadline: Instant,
-    ) -> Result<bool> {
         let branch = branch_ref(&preparation.requested_branch);
+        let entries = self.entries(&source.root, deadline).await?;
         Ok(!entries
             .iter()
             .any(|entry| entry.path == target || entry.branch.as_deref() == Some(branch.as_str()))
-            && absent(target)?
+            && absent(&target)?
             && self
                 .branch_oid(&source.root, &preparation.requested_branch, deadline)
                 .await?
@@ -771,14 +759,7 @@ impl WorkspaceGit {
         preparation: &WorkspacePreparation,
     ) -> Result<WorkspaceCreationOutcome> {
         let deadline = Instant::now() + READ_TIME;
-        let source = self.source(preparation, deadline).await?;
-        let target = destination_path(&preparation.worktree_path)?;
-        separate_target(&source, &target)?;
-        let entries = self.entries(&source.root, deadline).await?;
-        if self
-            .creation_absent(preparation, &source, &target, &entries, deadline)
-            .await?
-        {
+        if self.creation_is_absent(preparation).await? {
             return Ok(WorkspaceCreationOutcome::Failed {
                 code: "not_created".to_owned(),
                 message: "no workspace path, branch, or registration exists".to_owned(),
@@ -789,9 +770,7 @@ impl WorkspaceGit {
                 ),
             });
         }
-        let subject = self
-            .subject_from_registry(preparation, source, &target, &entries, deadline)
-            .await?;
+        let subject = self.subject(preparation, deadline).await?;
         if subject.head != preparation.base_oid {
             return Err(problem(
                 "source_integrity",
@@ -1445,18 +1424,6 @@ impl WorkspaceGit {
         let target_path = destination_path(&preparation.worktree_path)?;
         separate_target(&source, &target_path)?;
         let entries = self.entries(&source.root, deadline).await?;
-        self.subject_from_registry(preparation, source, &target_path, &entries, deadline)
-            .await
-    }
-
-    async fn subject_from_registry(
-        &self,
-        preparation: &WorkspacePreparation,
-        source: Repository,
-        target_path: &Path,
-        entries: &[WorktreeEntry],
-        deadline: Instant,
-    ) -> Result<Subject> {
         let mut matches = entries.iter().filter(|entry| entry.path == target_path);
         let entry = matches
             .next()
@@ -1474,7 +1441,7 @@ impl WorkspaceGit {
                 "registered workspace branch differs from the requested branch",
             ));
         }
-        let target = self.repository(&path_text(target_path)?, deadline).await?;
+        let target = self.repository(&path_text(&target_path)?, deadline).await?;
         let registry_root = canonical_root(&path_text(&source.common_dir.join("worktrees"))?)?;
         if target.common_dir != source.common_dir
             || target.git_dir.parent() != Some(registry_root.as_path())
@@ -1491,25 +1458,18 @@ impl WorkspaceGit {
                 "workspace Git registration is not reciprocal",
             ));
         }
-        let head = entry
-            .head
-            .as_deref()
-            .ok_or_else(|| problem("source_integrity", "workspace registration omitted HEAD"))?;
-        // Read attachment, exact branch and commit together. The current
-        // branch marker is empty for detached HEAD, even at the same OID.
-        let checked = self
-            .read(
+        let branch = self
+            .read_line(&target.root, &["symbolic-ref", "--quiet", "HEAD"], deadline)
+            .await?;
+        let head = self
+            .read_line(
                 &target.root,
-                &[
-                    "for-each-ref",
-                    "--format=%(HEAD)%00%(refname)%00%(objectname)%00%(objecttype)",
-                    "--",
-                    &full_ref,
-                ],
+                &["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"],
                 deadline,
             )
             .await?;
-        if checked != format!("*\0{full_ref}\0{head}\0commit\n").as_bytes() {
+        if branch != full_ref || !is_git_oid(&head) || entry.head.as_deref() != Some(head.as_str())
+        {
             return Err(problem(
                 "source_integrity",
                 "workspace HEAD, branch, or registration disagree",
@@ -1518,8 +1478,8 @@ impl WorkspaceGit {
         Ok(Subject {
             source,
             target,
-            branch: full_ref,
-            head: head.to_owned(),
+            branch,
+            head,
         })
     }
 
