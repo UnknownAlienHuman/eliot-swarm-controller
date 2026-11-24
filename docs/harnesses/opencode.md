@@ -128,7 +128,8 @@ tag is `Other` with a diagnostic. Compaction reasons recognize `auto` and
 `manual`; an unknown reason projects only as `unknown` with a diagnostic.
 Unknown interruption reasons are diagnosed without changing the terminal
 status established by the exact `session.execution.*` event type. Malformed
-JSON and oversized SSE frames still end the stream.
+JSON ends the stream. An oversized SSE frame is drained to its boundary,
+recorded as a coverage gap, and the stream continues.
 
 The 30-minute inactivity deadline starts at turn association and resets on
 bound execution activity. At expiry, an absent terminal settles the outcome as

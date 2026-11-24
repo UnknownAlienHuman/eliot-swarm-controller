@@ -2085,7 +2085,8 @@ Goal and restarting the daemon leave the burn in place.
 No-progress compares check output digests and the workspace fingerprint
 together. The initial Git status also supplies HEAD and dirty-entry presence
 for the failed-turn work check even if the content digest is unavailable.
-Scope validation still reads both sides of a rename. The fingerprint is HEAD plus the Git monitor's content `dirty_digest`
+Scope validation still reads both sides of a rename. The fingerprint is HEAD
+plus the Git monitor's content `dirty_digest`
 over the dirty set (path, status and file content of files Git does not ignore,
 within the monitor's caps), read from the round's workspace while the Agent is
 idle. Just before each check the daemon reads it and compares it with the read
