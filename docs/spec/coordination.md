@@ -227,7 +227,9 @@ The current limits are 64 candidates, 4,096 retained artifacts and 1,024 retaine
 plans. On Windows, the [`CleanupTree` artifact-directory scan](../../crates/eliot-daemon/src/platform/script_file.rs#L391)
 is bounded to 262,144 filesystem entries and depth 64. Interactive plans use
 their remaining page budget for a scan. Bulk planning and apply allow up to
-120 seconds per scan under daemon custody.
+120 seconds per scan under daemon custody. A Windows root sharing conflict
+gets a bounded retry before any disposition. A persistent conflict keeps the
+artifact with reason `busy`.
 Managed-worktree removal uses a separate [write-fence inventory](../../crates/eliot-daemon/src/platform/worktree_guard.rs#L34),
 bounded to 20,000 entries and depth 64 with a ten-second deadline for each
 prepare and activation pass. Exceeding an applicable bound refuses its operation
