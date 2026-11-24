@@ -41,10 +41,14 @@ pub(crate) async fn ensure_hot_start(
     store: &Mutex<Store>,
     policy: &SecretPolicy,
 ) -> Result<()> {
+    use crate::config::settings;
+    use eliot_core::api::SettingsSection::{Profiles, Routing};
+
     {
+        let snapshot = settings::read_snapshot(data_root, Some(&[Profiles, Routing]), policy)?;
         let needs = {
-            let mut store = store.lock().await;
-            bootstrap_needed(data_root, &mut store, policy)?
+            let store = store.lock().await;
+            bootstrap_needed(snapshot.into_response(&store)?)
         };
         let profiles = if needs {
             let deadline = std::time::Instant::now() + crate::adhoc::DISCOVERY_BUDGET;
@@ -53,8 +57,10 @@ pub(crate) async fn ensure_hot_start(
         } else {
             serde_json::Map::new()
         };
+
+        let snapshot = settings::read_snapshot(data_root, Some(&[Profiles, Routing]), policy)?;
         let mut store = store.lock().await;
-        ensure_bootstrap_settings(data_root, &mut store, policy, profiles)?;
+        ensure_bootstrap_settings(data_root, &mut store, policy, profiles, snapshot)?;
     }
     Ok(())
 }
@@ -75,6 +81,16 @@ pub(crate) async fn discover_project(
     };
     let (revision, configured) = settings::project_configs_snapshot(data_root)?;
     let matching = matching_project(configured, &checkout, &common_dir, linked).await?;
+    let registration_snapshot = if matching.is_none() {
+        use eliot_core::api::SettingsSection::{Profiles, Projects};
+        Some(settings::read_snapshot(
+            data_root,
+            Some(&[Profiles, Projects]),
+            policy,
+        )?)
+    } else {
+        None
+    };
     let mut store = store.lock().await;
     if settings::current_revision(data_root)? != revision {
         return Err(Error::new(
@@ -91,14 +107,23 @@ pub(crate) async fn discover_project(
                 &registered_common,
             )?)
         }
-        None => register_project(
-            data_root,
-            &mut store,
-            &checkout,
-            &common_dir,
-            revision.as_deref(),
-            policy,
-        )?,
+        None => {
+            let snapshot = registration_snapshot.ok_or_else(|| {
+                Error::new(
+                    "source_integrity",
+                    "project registration settings snapshot is missing",
+                )
+            })?;
+            register_project(
+                data_root,
+                &mut store,
+                &checkout,
+                &common_dir,
+                revision.as_deref(),
+                policy,
+                snapshot,
+            )?
+        }
     };
     Ok(ProjectDiscoverResponse { project })
 }
@@ -206,10 +231,8 @@ async fn workspace_identity(workspace: &Path) -> Result<Option<(String, String, 
     }
 }
 
-fn bootstrap_needed(data_root: &Path, store: &mut Store, policy: &SecretPolicy) -> Result<bool> {
-    use crate::config::settings::{self};
+fn bootstrap_needed(read: eliot_core::api::SettingsReadResponse) -> bool {
     use eliot_core::api::SettingsSection::{Profiles, Routing};
-    let read = settings::read_internal(data_root, store, Some(&[Profiles, Routing]), policy)?;
     let current_profiles = read
         .sections
         .get(&Profiles)
@@ -219,7 +242,7 @@ fn bootstrap_needed(data_root: &Path, store: &mut Store, policy: &SecretPolicy) 
         .as_object()
         .map(|profiles| profiles.keys().len())
         .unwrap_or_default();
-    Ok(read.revision.is_none() && profile_names == 0)
+    read.revision.is_none() && profile_names == 0
 }
 
 fn ensure_bootstrap_settings(
@@ -227,11 +250,12 @@ fn ensure_bootstrap_settings(
     store: &mut Store,
     policy: &SecretPolicy,
     mut profiles: serde_json::Map<String, Value>,
+    snapshot: crate::config::settings::SettingsSnapshot,
 ) -> Result<()> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Routing};
 
-    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Routing]), policy)?;
+    let read = snapshot.into_response(&*store)?;
     let current_profiles = read
         .sections
         .get(&Profiles)
@@ -388,11 +412,12 @@ fn register_project(
     common_dir: &str,
     expected_revision: Option<&str>,
     policy: &SecretPolicy,
+    snapshot: crate::config::settings::SettingsSnapshot,
 ) -> Result<Option<ProjectRegistrationView>> {
     use crate::config::settings::{self, SettingsAuthor};
     use eliot_core::api::SettingsSection::{Profiles, Projects};
 
-    let read = settings::read_internal(data_root, &*store, Some(&[Profiles, Projects]), policy)?;
+    let read = snapshot.into_response(&*store)?;
     if read.revision.as_deref() != expected_revision {
         return Err(Error::new(
             "conflict",
