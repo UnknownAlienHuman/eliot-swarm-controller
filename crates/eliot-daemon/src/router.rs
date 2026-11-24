@@ -4076,9 +4076,13 @@ impl Router {
                     .to_owned();
                 let command_bound = if let Some(source) = routing.provider_source {
                     crate::adhoc::inherit_profile_command(&mut snapshot, source, &harness)?;
-                    if eliot_core::provider_switch_authority(&snapshot)?
-                        != eliot_core::provider_switch_authority(source)?
-                    {
+                    let authority_matches = if routing.growth_switch {
+                        eliot_core::growth_switch_authority_matches(source, &snapshot)?
+                    } else {
+                        eliot_core::provider_switch_authority(&snapshot)?
+                            == eliot_core::provider_switch_authority(source)?
+                    };
+                    if !authority_matches {
                         return Err(Error::new(
                             "not_allowed",
                             "profile authority differs from the source generation",

@@ -41,6 +41,8 @@ mod owner_inbox;
 pub use launch_queue::*;
 pub use owner_inbox::*;
 mod provider;
+mod provider_response;
+pub use provider_response::*;
 mod read_validation;
 mod reads;
 mod resolutions;
@@ -254,7 +256,7 @@ pub use swarm_usage::{
 };
 pub use switch::{
     HandoffReason, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SwitchAgent, SwitchLaunch,
-    SwitchRequest, SwitchResponse,
+    SwitchRequest, SwitchResponse, SwitchWarning, SwitchWarningCode,
 };
 pub use timers::{CatchUp, TimerGetRequest, TimerRunRequest, TimerSchedule, TimerStateView};
 pub use usage::{

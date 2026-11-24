@@ -88,6 +88,8 @@ pub(crate) struct TurnFacts {
     pub terminal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_response_withheld_evidence: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_response_withheld_fact: Option<eliot_core::api::ProviderResponseWithheldFact>,
 }
 
 pub(crate) struct EventConfig {
@@ -1961,16 +1963,22 @@ impl EventProcessor {
             .active_command_id
             .clone()
             .ok_or_else(|| Error::new("unknown", "Codex terminal turn has no Eliot command"))?;
-        let withheld_evidence = if notification.turn.status == NativeTurnStatus::Failed {
+        let withheld_fact = if notification.turn.status == NativeTurnStatus::Failed {
             notification
                 .turn
                 .error
                 .as_ref()
-                .and_then(NativeTurnError::response_withheld_evidence)
+                .and_then(NativeTurnError::response_withheld_fact)
         } else {
             None
         };
-        let provider_response_withheld = withheld_evidence.is_some();
+        let withheld_evidence = notification
+            .turn
+            .error
+            .as_ref()
+            .and_then(NativeTurnError::response_withheld_evidence)
+            .filter(|_| withheld_fact.is_some());
+        let provider_response_withheld = withheld_fact.is_some();
         let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let mut data = json!({
             "command_id": command_id.clone(),
@@ -2006,6 +2014,7 @@ impl EventProcessor {
             if let Some(evidence) = withheld_evidence {
                 data["provider_response_withheld"] = Value::Bool(true);
                 data["provider_response_withheld_evidence"] = json!(evidence);
+                data["provider_response_withheld_fact"] = json!(&withheld_fact);
             }
         }
         if !provider_response_withheld
@@ -2084,6 +2093,7 @@ impl EventProcessor {
             final_text: self.final_text.take(),
             terminal: true,
             provider_response_withheld_evidence: withheld_evidence,
+            provider_response_withheld_fact: withheld_fact,
         });
         self.status.active_turn_id = None;
         self.status.active_command_id = None;
@@ -2198,6 +2208,7 @@ impl EventProcessor {
                 final_text: None,
                 terminal: false,
                 provider_response_withheld_evidence: None,
+                provider_response_withheld_fact: None,
             });
         }
         self.status.stopped = true;

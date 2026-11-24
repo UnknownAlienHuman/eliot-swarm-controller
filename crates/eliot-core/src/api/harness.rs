@@ -181,6 +181,10 @@ pub struct TieredQuotaWindows {
 }
 
 pub type QuotaEvidenceReader = fn(&serde_json::Value, Option<&str>) -> Option<QuotaEvidence>;
+/// Adapter-owned identity for a native response route whose withheld responses
+/// must be scoped across profiles.
+pub type ProviderResponseRouteIdentity = fn(&serde_json::Value) -> Option<serde_json::Value>;
+pub type RouteClientKeyEnvSelector = fn(&str) -> bool;
 pub type QuotaUsageWindows = fn(&serde_json::Value, i64) -> Vec<QuotaWindowBounds>;
 
 type QuotaRouteRefusal = fn(&serde_json::Value, &serde_json::Value) -> Option<&'static str>;
@@ -362,6 +366,12 @@ pub struct HarnessCapabilities {
     pub provider_response_model_verification: bool,
     /// Controlled terminal events can carry a provider response-withheld fact.
     pub provider_response_withholding: bool,
+    /// Builds the adapter-specific, nonsecret identity encoded by the stable
+    /// core route digest API.
+    pub provider_response_route_identity: Option<ProviderResponseRouteIdentity>,
+    /// Identifies adapter-owned environment names that select the route itself
+    /// and therefore cannot also serve as its client credential.
+    pub route_client_key_env_selector: Option<RouteClientKeyEnvSelector>,
     /// Failed turns backfill `native_error_message` / `effective_model` on readback.
     pub backfill_failed_turn_readback: bool,
     /// Supports `source.gap` view-projection recovery on active turns.

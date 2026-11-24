@@ -195,6 +195,16 @@ impl SwitchRequest {
                 "switch response binding differs",
             ));
         }
+        if value.warning.as_ref().is_some_and(|warning| {
+            self.launch.profile.as_deref() != Some(warning.profile.as_str())
+                || warning.evidence_seq < 1
+                || warning.expires_at < 0
+        }) {
+            return Err(Error::new(
+                "source_integrity",
+                "switch warning is not bound to its explicit preset or retained evidence",
+            ));
+        }
         if let Some(handoff) = &value.handoff {
             let created = value.created.as_ref().ok_or_else(|| {
                 Error::new("source_integrity", "switch handoff has no destination")
@@ -243,6 +253,21 @@ pub struct SwitchAgent {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SwitchWarningCode {
+    ProviderRouteWithheld,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchWarning {
+    pub code: SwitchWarningCode,
+    pub profile: String,
+    pub evidence_seq: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchResponse {
     pub id: String,
@@ -268,5 +293,7 @@ pub struct SwitchResponse {
     pub disposal_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routing: Option<Box<crate::RoutingDecision>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<SwitchWarning>,
     pub next_action: String,
 }

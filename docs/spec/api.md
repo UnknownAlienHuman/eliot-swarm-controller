@@ -2277,6 +2277,8 @@ The independent operation reserves launch/Handoff IDs before external preparatio
 uses normal launch with no input, waits for exact committed session readiness,
 then reuses H2's atomic transfer. The result exposes current parent/launch states,
 created B and generation, Handoff result, error code and explicit `next_action`.
+An explicit Owner preset with active provider-withheld evidence is admitted
+with the warning in the retained switch result once the route is resolved.
 Applied parent means H2 admission, not native task completion. Failed/unknown brief
 behavior remains H2's queued gate. Same-ID retry only reads retained bindings, even
 during drain; it never launches another B or repeats work. See

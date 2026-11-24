@@ -682,6 +682,11 @@ fn normalize_live_event(
             {
                 data["provider_response_withheld"] = Value::Bool(true);
                 data["provider_response_withheld_evidence"] = json!(evidence);
+                data["provider_response_withheld_fact"] =
+                    json!(eliot_core::api::ProviderResponseWithheldFact::new(
+                        eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+                        None,
+                    ));
             }
             true
         }
@@ -1412,6 +1417,11 @@ fn project_line(
                 if let Some(evidence) = withheld_evidence {
                     entry["provider_response_withheld"] = Value::Bool(true);
                     entry["provider_response_withheld_evidence"] = json!(evidence);
+                    entry["provider_response_withheld_fact"] =
+                        json!(eliot_core::api::ProviderResponseWithheldFact::new(
+                            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+                            None,
+                        ));
                 }
                 entries.push(entry);
             }

@@ -29,21 +29,38 @@ impl CompletionWorktreeCapture {
     }
 }
 
-pub(super) fn provider_response_withheld_event_tx(
+pub(super) fn provider_response_route_event_tx(
     tx: &Transaction<'_>,
     agent: &Agent,
     terminal: &core::NativeEvent,
     terminal_source: &str,
+    terminal_seq: i64,
     now: i64,
 ) -> Result<Option<Event>> {
     if !core::api::HarnessCapabilities::of(&agent.harness).provider_response_withholding
         || agent.observe_only
         || terminal.kind != "turn.completed"
-        || terminal.data["outcome"].as_str() != Some("failure")
-        || terminal.data["provider_response_withheld"].as_bool() != Some(true)
     {
         return Ok(None);
     }
+    match terminal.data["outcome"].as_str() {
+        Some("success") => {
+            return super::switch::provider_response_restored_event_tx(
+                tx,
+                agent,
+                terminal,
+                terminal_seq,
+                now,
+            );
+        }
+        Some("failure") => {}
+        _ => return Ok(None),
+    }
+    let Ok(fact) = serde_json::from_value::<core::api::ProviderResponseWithheldFact>(
+        terminal.data["provider_response_withheld_fact"].clone(),
+    ) else {
+        return Ok(None);
+    };
     let Some(turn_id) = terminal.data["turn_id"]
         .as_str()
         .filter(|id| !id.is_empty())
@@ -100,11 +117,10 @@ pub(super) fn provider_response_withheld_event_tx(
         "profile": agent.profile,
         "route_key": core::provider_response_route_key(&agent.profile_snapshot),
         "terminal_source": terminal_source,
+        "detection": fact.detection,
     });
-    if let Some(evidence @ "text_fallback") =
-        terminal.data["provider_response_withheld_evidence"].as_str()
-    {
-        data["evidence"] = json!(evidence);
+    if let Some(reset_at) = fact.reset_at.filter(|reset_at| *reset_at >= 0) {
+        data["reset_at"] = json!(reset_at);
     }
     insert_daemon_event(
         tx,
@@ -1162,9 +1178,14 @@ impl Store {
                 native_event,
                 &next,
             )?;
-            if let Some(event) =
-                provider_response_withheld_event_tx(&tx, &next, native_event, &batch.source, now)?
-            {
+            if let Some(event) = provider_response_route_event_tx(
+                &tx,
+                &next,
+                native_event,
+                &batch.source,
+                stored.seq,
+                now,
+            )? {
                 provider_events.push(event);
             }
             // The inserted turn binds the exact admitted revision even if

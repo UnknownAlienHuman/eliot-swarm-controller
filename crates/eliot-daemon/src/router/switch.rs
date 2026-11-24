@@ -336,8 +336,18 @@ impl Router {
                     .await?;
                 Some((name, launch.args["profile_choice"].take(), identity))
             } else {
-                if profile_authority.is_some() {
-                    self.check_growth_switch_route(&source).await?;
+                if let Some(authority) = profile_authority {
+                    if eliot_core::provider_switch_authority(&source.profile_snapshot)? != authority
+                    {
+                        return Err(Error::new(
+                            "source_integrity",
+                            "session growth switch source authority changed after reservation",
+                        ));
+                    }
+                    let candidate = request.launch.profile.as_deref().ok_or_else(|| {
+                        Error::new("invalid", "session growth switch requires a named preset")
+                    })?;
+                    self.check_growth_switch_route(&source, candidate).await?;
                 }
                 None
             };
@@ -533,21 +543,12 @@ impl Router {
                         provider_source: (provider_failure.is_some()
                             || profile_authority.is_some())
                         .then_some(&source.profile_snapshot),
+                        growth_switch: profile_authority.is_some(),
                         ..Default::default()
                     },
                     true,
                 )
                 .await?;
-            if let Some(authority) = profile_authority
-                && eliot_core::provider_switch_authority(
-                    &prepared.request.args["profile_snapshot"],
-                )? != authority
-            {
-                return Err(Error::new(
-                    "not_allowed",
-                    "session growth switch authority differs from the source generation",
-                ));
-            }
             if let Some((_, choice, identity)) = provider_route {
                 if routing::switch_account_identity(&prepared.request.args["profile_snapshot"])
                     != identity

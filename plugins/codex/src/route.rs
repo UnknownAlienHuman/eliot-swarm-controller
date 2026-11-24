@@ -32,7 +32,7 @@ impl CodexRoute {
         let binding: RouteBinding = serde_json::from_value(raw.clone())
             .map_err(|_| route_error("Codex frozen route binding is malformed"))?;
         binding
-            .validate()
+            .validate_for("codex")
             .map_err(|_| route_error("Codex frozen route binding is invalid"))?;
 
         // Built-in providers cannot be redefined as adopted Responses routes.

@@ -137,7 +137,9 @@ impl Store {
                 &mut events,
             )?;
         }
-        events.push(insert_daemon_event_input(&tx, event)?);
+        let terminal = insert_daemon_event_input(&tx, event)?;
+        let terminal_seq = terminal.seq;
+        events.push(terminal);
         let (commands, provider_events) = persist_effects(
             &tx,
             &effects,
@@ -147,8 +149,13 @@ impl Store {
             &native,
             &next,
         )?;
-        if let Some(event) = super::source_batches::provider_response_withheld_event_tx(
-            &tx, &next, &native, "readback", now,
+        if let Some(event) = super::source_batches::provider_response_route_event_tx(
+            &tx,
+            &next,
+            &native,
+            "readback",
+            terminal_seq,
+            now,
         )? {
             events.push(event);
         }

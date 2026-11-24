@@ -912,12 +912,11 @@ impl ObserverSession {
                 "duration_ms": turn.duration_ms,
             });
             if turn.status == "failed"
-                && let Some(evidence) = turn
-                    .error
-                    .and_then(|error| error.response_withheld_evidence())
+                && let Some(evidence) = turn.error.and_then(|error| error.response_withheld_fact())
             {
                 value["provider_response_withheld"] = json!(true);
-                value["provider_response_withheld_evidence"] = json!(evidence);
+                value["provider_response_withheld_evidence"] = json!("text_fallback");
+                value["provider_response_withheld_fact"] = json!(evidence);
             }
             entries.push(value);
         }

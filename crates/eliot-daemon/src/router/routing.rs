@@ -11,6 +11,7 @@ pub(super) struct LaunchRouting<'a> {
     pub(super) arbitrated: bool,
     pub(super) owner_automation: bool,
     pub(super) provider_source: Option<&'a Value>,
+    pub(super) growth_switch: bool,
     pub(super) preview: bool,
     pub(super) harness_check_candidate: Option<&'a eliot_core::api::HarnessCandidate>,
 }
@@ -185,21 +186,31 @@ impl RoutePreflight {
 }
 
 impl Router {
-    pub(super) async fn check_growth_switch_route(&self, source: &Agent) -> Result<()> {
+    pub(super) async fn check_growth_switch_route(
+        &self,
+        source: &Agent,
+        candidate: &str,
+    ) -> Result<()> {
+        let mut snapshot = self.resolve_profile_cached(candidate)?;
+        crate::config::capture_native_store_inputs(
+            &mut snapshot,
+            self.inner.stand_codex_home.as_deref(),
+        )?;
         let withheld = self
             .inner
             .store
             .lock()
             .await
             .withheld_provider_routes(source, now_ms())?;
-        let key = eliot_core::provider_response_route_key(&source.profile_snapshot)
-            .unwrap_or_else(|| eliot_core::provider_profile_refusal_marker(&source.profile));
-        if withheld.contains(&key) {
+        let route_withheld = eliot_core::provider_response_route_key(&snapshot)
+            .is_some_and(|key| withheld.contains(&key));
+        if route_withheld
+            || withheld.contains(&eliot_core::provider_profile_refusal_marker(candidate))
+        {
             return Err(Error::new(
                 "provider_route_withheld",
                 format!(
-                    "Preset {} withheld a response for this task and is temporarily ineligible",
-                    source.profile
+                    "Preset {candidate} withheld a response for this task and is temporarily ineligible"
                 ),
             ));
         }

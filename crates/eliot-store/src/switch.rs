@@ -7,6 +7,7 @@ use eliot_core::api::{
 
 mod automatic;
 mod recovery;
+pub(super) use automatic::provider_response_restored_event_tx;
 pub use automatic::{AutomaticHandoff, HANDOFF_QUEUED, HANDOFF_SETTLED, HANDOFF_WAITING};
 pub(super) use recovery::{
     has_releasable_switch_fence, owner_release_switch_fence_tx, release_rejected_switch_fence_tx,
@@ -966,6 +967,7 @@ fn reserve_switch_tx(
         disposal_state: None,
         disposal_reason: None,
         routing: None,
+        warning: None,
         next_action: "preparing_launch".into(),
     };
     let mut parent = SubmitCommand::new(&request.id, "switch");
@@ -1653,6 +1655,7 @@ impl Store {
                 source_checkout_key,
                 provider_failure,
                 profile_authority,
+                owner_automation,
                 continuation,
                 requested_by,
                 ..
@@ -1890,6 +1893,40 @@ impl Store {
                 })?)?;
             let target_agent = load_agent_by_num(&tx, target_num)?
                 .ok_or_else(|| Error::new("source_integrity", "switch launch Agent is missing"))?;
+            let explicit_owner_profile = requested_by.is_none()
+                && profile_authority.is_none()
+                && continuation.is_none()
+                && provider_failure.is_none()
+                && !owner_automation
+                && source.launch.profile.is_some();
+            if explicit_owner_profile {
+                let withheld = automatic::withheld_provider_evidence(&tx, &agent, now)?;
+                let profile = &target_agent.profile;
+                let route = core::provider_response_route_key(&target_agent.profile_snapshot);
+                let profile_marker = core::provider_profile_refusal_marker(profile);
+                if let Some(evidence) = withheld.iter().find(|evidence| {
+                    Some(&evidence.route) == route.as_ref() || evidence.route == profile_marker
+                }) {
+                    let mut plan = stored_result(&parent.outcome)?;
+                    plan.warning = Some(core::api::SwitchWarning {
+                        code: core::api::SwitchWarningCode::ProviderRouteWithheld,
+                        profile: profile.clone(),
+                        evidence_seq: evidence.event_seq,
+                        expires_at: evidence.expires_at,
+                    });
+                    tx.execute(
+                        "UPDATE commands SET outcome=?1 WHERE id=?2",
+                        params![
+                            encode_json(&serde_json::to_value(plan).map_err(|_| Error::new(
+                                "internal",
+                                "cannot encode switch warning"
+                            ))?)?,
+                            id
+                        ],
+                    )
+                    .map_err(sql_error)?;
+                }
+            }
             let (actual_checkout_root, actual_checkout_key) = if generated_target {
                 let root = target_agent.workspace.clone().ok_or_else(|| {
                     Error::new("source_integrity", "generated switch checkout is missing")

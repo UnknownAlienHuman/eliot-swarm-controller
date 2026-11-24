@@ -11,6 +11,54 @@ use eliot_core::{InjectPoint, McpPolicy};
 use eliot_plugin::capabilities::{adhoc_launch, quota_readback, sandbox_permissions};
 use serde_json::Value;
 
+const ROUTE_ACCOUNT_KEY: &str = "account";
+const ROUTE_BINDING_KEY: &str = "route_binding";
+const CODEX_LOGIN_ENV: &str = "CODEX_HOME";
+const ROUTE_KIND_RESPONSES: &str = "codex_responses";
+const ROUTE_KIND_CHATGPT: &str = "codex_chatgpt";
+const CODEX_PROXY_SELECTOR_ENV_NAMES: &[&str] = &["CODEX_HOME", "CODEX_SQLITE_HOME"];
+
+/// Extracts only the nonsecret fields declared above and in Codex's frozen
+/// route binding. Core owns canonical serialization and digesting.
+fn response_route_identity(snapshot: &Value) -> Option<Value> {
+    let account = snapshot[ROUTE_ACCOUNT_KEY].as_str();
+    let identity = if let Some(binding) = snapshot.get(ROUTE_BINDING_KEY) {
+        let route: eliot_core::RouteBinding = serde_json::from_value(binding.clone()).ok()?;
+        route.validate_for("codex").ok()?;
+        let (origin, path) =
+            eliot_core::RouteBinding::provider_url_identity(&route.provider_base_url)?;
+        let key_env = route.client_key_env_name.map(|name| {
+            if cfg!(windows) {
+                name.to_ascii_uppercase()
+            } else {
+                name
+            }
+        });
+        serde_json::json!([ROUTE_KIND_RESPONSES, account, origin, path, key_env])
+    } else {
+        let login_home = snapshot
+            .pointer(&format!("/pass_env_values/{CODEX_LOGIN_ENV}"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+            .map(eliot_core::workspace_path_key);
+        if account.is_none() && login_home.is_none() {
+            return None;
+        }
+        serde_json::json!([ROUTE_KIND_CHATGPT, account, login_home])
+    };
+    Some(identity)
+}
+
+pub(super) fn is_route_selector_env_name(name: &str) -> bool {
+    CODEX_PROXY_SELECTOR_ENV_NAMES.iter().any(|selector| {
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(selector)
+        } else {
+            name == *selector
+        }
+    })
+}
+
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
         instruction_inventory: crate::instructions::INSTRUCTION_INVENTORY,
@@ -74,6 +122,8 @@ pub fn declaration() -> HarnessCapabilities {
         manager_preference: Some(0),
         provider_probe: true,
         provider_response_withholding: true,
+        provider_response_route_identity: Some(response_route_identity),
+        route_client_key_env_selector: Some(is_route_selector_env_name),
         owner_rules_delivery: eliot_core::api::OwnerRulesDeliveryMethod::CodexDeveloperInstructions,
         project_instruction_read: crate::instructions::PROJECT_READ,
         user_instruction_files: crate::instructions::USER_FILES,

@@ -237,10 +237,12 @@ fn readback(
         "turn_evidence": evidence,
     });
     if outcome == TurnOutcome::Failure
-        && turn["provider_response_withheld_evidence"].as_str() == Some("text_fallback")
+        && let Ok(fact) = serde_json::from_value::<core::api::ProviderResponseWithheldFact>(
+            turn["provider_response_withheld_fact"].clone(),
+        )
     {
         data["provider_response_withheld"] = json!(true);
-        data["provider_response_withheld_evidence"] = json!("text_fallback");
+        data["provider_response_withheld_fact"] = json!(fact);
     }
     // The adapter knows why no reply text is presented (it exceeded the event
     // bound, or a normal completion supplied none): the recovered terminal

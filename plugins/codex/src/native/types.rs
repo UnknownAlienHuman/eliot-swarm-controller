@@ -529,6 +529,18 @@ impl NativeTurnError {
         response_withheld_evidence_from_message(&self.message)
     }
 
+    pub(crate) fn response_withheld_fact(
+        &self,
+    ) -> Option<eliot_core::api::ProviderResponseWithheldFact> {
+        self.response_withheld_evidence()?;
+        // The verified Codex withholding protocol provides no reset field.
+        // Do not infer one from unrelated error metadata.
+        Some(eliot_core::api::ProviderResponseWithheldFact::new(
+            eliot_core::api::ProviderResponseWithheldDetection::ExactNativeMessage,
+            None,
+        ))
+    }
+
     /// Installed codex-cli 0.167.1 CodexErrorInfo. HTTP status is forwarded
     /// from upstream; sandbox/local protocol errors are not provider evidence.
     pub(crate) fn failure_origin(&self) -> eliot_core::FailureOrigin {

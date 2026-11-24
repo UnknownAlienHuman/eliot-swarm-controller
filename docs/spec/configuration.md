@@ -1688,17 +1688,21 @@ Held and lost sessions use `handoff_fallback` in configured order. A lost sessio
 can reuse its profile if the fallback list names it. For a withheld response on a
 role-routed Agent, `on_provider_failure = "next"` selects from the remaining presets
 in that role. An explicitly selected preset uses `handoff_fallback` when
-`auto_handoff` is enabled. A Codex response route identifies the frozen account
-and credential selector. Direct Codex uses the fixed ChatGPT endpoint and
+`auto_handoff` is enabled. The adapter declares which frozen account and
+credential selectors identify a response route. Direct Codex uses the fixed ChatGPT endpoint and
 `CODEX_HOME` (or the default login home). Adopted Responses routes use the
 normalized provider endpoint and the configured client-key environment name
 (or its absence). Preset and proxy aliases share that route when these selectors
 match. Only a digest of these selectors is retained in the refusal event.
-Every automatic hop consults the task lineage. It skips the routes used by the 32 most
-recent generations with a retained refusal from the last hour, including the source's
-own generation. Direct Codex uses the configured account when `CODEX_HOME` is
-absent. With neither selector, only the exact refusing preset is skipped. The event retains that preset
-name for lookups after resume. The Store applies the same check in the switch transaction. It also
+Every automatic hop consults the task lineage, including the source's own
+generation. A retained refusal expires at the verified provider reset time
+when supplied, otherwise one hour after it was recorded. The first later
+native successful turn on the same route in that lineage ends the effect of
+the evidence. Direct Codex uses the configured account when `CODEX_HOME` is
+absent. With neither selector, the event uses the exact refusing preset.
+Growth switches check the candidate's frozen route. They can follow an account
+change on the same preset while preserving the other frozen authority fields.
+The Store applies the route check in the switch transaction. It also
 skips the presets this task already left and profiles on hold. Candidates blocked this
 way report `provider_withheld`. When selection or transactional admission refuses the
 successor because of withheld routes, a waiting item records that reason in the Owner
@@ -1713,8 +1717,10 @@ after five minutes and a failed launch or
 transfer after an hour. An unknown outcome is never retried. When a hold clears, the Agent stays on its new profile; moving back is an
 ordinary request. Settings changes apply to the next evaluation.
 
-For a withheld response, the Owner can choose another preset, configure eligible
-routing, or leave the work pending. The daemon records the provider refusal on the
+For a withheld response, the Owner can choose a preset explicitly, configure
+eligible routing, or leave the work pending. An explicit Owner switch to a
+preset with current withheld evidence carries a warning in the result. The
+daemon records the provider refusal on the
 completed turn and names the selected preset in the handoff timeline after the
 transfer. The provider fact applies to the response on the source session.
 

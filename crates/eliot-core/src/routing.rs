@@ -125,6 +125,16 @@ pub const PROVIDER_LAUNCH_OVERRIDE_FIELDS: &[&str] = &[
 /// model and effort can vary. The normal launch still verifies native
 /// readback against the selected frozen permissions and approval policy.
 pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
+    switch_authority(snapshot, true)
+}
+
+/// A growth switch follows the Owner's current account on the same preset.
+/// All other frozen launch authority, including credentials and endpoint, is exact.
+pub fn growth_switch_authority_matches(source: &Value, candidate: &Value) -> Result<bool> {
+    Ok(switch_authority(source, false)? == switch_authority(candidate, false)?)
+}
+
+fn switch_authority(snapshot: &Value, include_account: bool) -> Result<[u8; 32]> {
     if !snapshot.is_object() || snapshot["harness"].as_str().is_none() {
         return Err(Error::new(
             "source_integrity",
@@ -166,6 +176,7 @@ pub fn provider_switch_authority(snapshot: &Value) -> Result<[u8; 32]> {
     let authority = Value::Object(
         fields
             .into_iter()
+            .filter(|key| include_account || *key != "account")
             .filter_map(|key| {
                 snapshot
                     .get(key)
@@ -205,39 +216,7 @@ pub fn provider_response_route_key(snapshot: &Value) -> Option<String> {
     if !capabilities.provider_response_withholding {
         return None;
     }
-    let account = snapshot["account"].as_str();
-    let identity = match snapshot.get("route_binding") {
-        Some(binding) => {
-            let url = validate_http_url(binding["provider_base_url"].as_str()?).ok()?;
-            let key_env = binding["client_key_env_name"].as_str().map(|name| {
-                if cfg!(windows) {
-                    name.to_ascii_uppercase()
-                } else {
-                    name.to_owned()
-                }
-            });
-            serde_json::json!([
-                "codex_responses",
-                account,
-                url.origin().ascii_serialization(),
-                url.path().trim_end_matches('/'),
-                key_env
-            ])
-        }
-        None => {
-            // The direct endpoint is fixed by the adapter. CODEX_SQLITE_HOME
-            // selects the thread database, while CODEX_HOME selects the login.
-            let login_home = snapshot
-                .pointer("/pass_env_values/CODEX_HOME")
-                .and_then(Value::as_str)
-                .filter(|path| !path.is_empty())
-                .map(crate::workspace_path_key);
-            if account.is_none() && login_home.is_none() {
-                return None;
-            }
-            serde_json::json!(["codex_chatgpt", account, login_home])
-        }
-    };
+    let identity = (capabilities.provider_response_route_identity?)(snapshot)?;
     serde_json::to_vec(&identity)
         .ok()
         .map(|bytes| crate::api::inference::sha256_hex(&bytes))
@@ -364,6 +343,16 @@ pub struct RouteBinding {
 }
 
 impl RouteBinding {
+    /// Canonical generic URL components used when an adapter declares a route
+    /// identity based on an HTTP endpoint.
+    pub fn provider_url_identity(value: &str) -> Option<(String, String)> {
+        let url = validate_http_url(value).ok()?;
+        Some((
+            url.origin().ascii_serialization(),
+            url.path().trim_end_matches('/').to_owned(),
+        ))
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !valid_name(&self.name) {
             return Err(invalid_route("invalid route name"));
@@ -386,6 +375,23 @@ impl RouteBinding {
             return Err(invalid_route("invalid route client key environment name"));
         }
 
+        Ok(())
+    }
+
+    /// Validate against the owning adapter's route-selector environment names.
+    pub fn validate_for(&self, harness: &str) -> Result<()> {
+        self.validate()?;
+        let selector = crate::api::HarnessCapabilities::for_harness(harness)
+            .and_then(|capabilities| capabilities.route_client_key_env_selector);
+        if self
+            .client_key_env_name
+            .as_deref()
+            .is_some_and(|name| selector.is_some_and(|is_selector| is_selector(name)))
+        {
+            return Err(invalid_route(
+                "route client key environment name selects the route",
+            ));
+        }
         Ok(())
     }
 }
@@ -832,12 +838,7 @@ fn valid_client_key_env_name(value: &str) -> bool {
         return false;
     }
 
-    let is_selector = if cfg!(windows) {
-        value.eq_ignore_ascii_case("CODEX_HOME") || value.eq_ignore_ascii_case("CODEX_SQLITE_HOME")
-    } else {
-        value == "CODEX_HOME" || value == "CODEX_SQLITE_HOME"
-    };
-    !is_selector
+    true
 }
 
 fn invalid_route(message: &str) -> Error {

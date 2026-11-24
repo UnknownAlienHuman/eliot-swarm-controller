@@ -549,11 +549,14 @@ The fallback matches this message.
 
 > You're approved for Daybreak Blue, but this response cannot be shown as this session was not authenticated with one of your authorized hardware keys. Please re-authenticate with your hardware key and try your request again.
 
-A match sets `provider_response_withheld: true` and records
-`provider_response_withheld_evidence: "text_fallback"`. The stream also records
-provider origin before optional usage, native error and final text fields. The
-withheld classification takes precedence over ordinary provider holds on that
-terminal. Native error text uses the shared redaction and bounded projection.
+A match sets `provider_response_withheld: true` and carries the shared typed
+`provider_response_withheld_fact` with optional absolute Unix-millisecond
+`reset_at`.
+The legacy `provider_response_withheld_evidence: "text_fallback"` field remains
+for older readers. The stream also records provider origin before optional usage,
+native error and final text fields. The withheld classification takes precedence
+over ordinary provider holds on that terminal. Native error text uses the shared
+redaction and bounded projection.
 
 ## Usage attribution
 
