@@ -8,7 +8,7 @@ use super::{MODE_OPEN, Router};
 use crate::daemon::workers::WorkerReporter;
 use eliot_core::{
     Agent, AgentState, AttentionStep, CommandState, Error, Event, Result, SecretPolicy,
-    api::EmitDefinitionArgs,
+    api::{ATTENTION_TOPIC, EmitDefinitionArgs},
 };
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -188,7 +188,7 @@ async fn process_event(router: &Router, event: &Event) -> Result<()> {
         "message": message,
     });
     let args = serde_json::to_value(EmitDefinitionArgs {
-        topic: "agent.attention".to_owned(),
+        topic: ATTENTION_TOPIC.to_owned(),
         data: report,
         key: None,
     })

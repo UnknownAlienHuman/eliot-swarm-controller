@@ -10,6 +10,136 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const ATTENTION_TOPIC: &str = "agent.attention";
+pub const ATTENTION_EVENT_KIND: &str = "x.user.agent.attention";
+
+/// The binding carried by every internal attention report, including compact
+/// reports. Other report fields are preserved in the event payload.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+pub struct AttentionEventBinding {
+    #[serde(deserialize_with = "read_attention_field")]
+    pub incident_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
+    pub agent_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
+    pub generation: Option<i64>,
+    #[serde(deserialize_with = "read_attention_field")]
+    pub turn_id: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
+    pub reason: Option<String>,
+    #[serde(deserialize_with = "read_attention_field")]
+    pub phase: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AttentionReportObject {
+    #[serde(flatten)]
+    binding: AttentionEventBinding,
+}
+
+impl AttentionEventBinding {
+    pub fn from_report(report: &Value) -> Option<Self> {
+        AttentionReportObject::deserialize(report)
+            .ok()
+            .map(|report| report.binding)
+    }
+
+    /// Preserve the distinction between a missing report and a present report
+    /// without a usable Agent binding, including previously retained payloads.
+    pub fn from_event_data(data: &Value) -> Option<Self> {
+        #[derive(Deserialize)]
+        struct EventData {
+            #[serde(default, deserialize_with = "read_present_attention_report")]
+            data: Option<AttentionEventBinding>,
+        }
+        EventData::deserialize(data).ok()?.data
+    }
+}
+
+fn read_present_attention_report<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<AttentionEventBinding>, D::Error> {
+    let report: Option<AttentionReportObject> = read_attention_field(deserializer)?;
+    Ok(Some(
+        report.map(|report| report.binding).unwrap_or_default(),
+    ))
+}
+
+fn read_attention_field<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Field<T> {
+        Typed(T),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Field::deserialize(deserializer)? {
+        Field::Typed(value) => Some(value),
+        Field::Other(_) => None,
+    })
+}
+
+/// Local event commands after decoding the durable command envelope.
+pub enum UserEventCommand {
+    Notify(NotifyDefinitionArgs),
+    Emit(EmitDefinitionArgs),
+    AttentionEmit(EmitDefinitionArgs),
+}
+
+impl UserEventCommand {
+    pub fn decode(verb: &str, args: Value) -> Result<Self> {
+        use super::discovery::decode_params_at;
+        match verb {
+            "notify" => decode_params_at(args, "params.args").map(Self::Notify),
+            "emit" => decode_params_at(args, "params.args").map(Self::Emit),
+            "attention.emit" => decode_params_at(args, "params.args").map(Self::AttentionEmit),
+            _ => Err(invalid("not a local user-event verb")),
+        }
+    }
+
+    pub fn validate_admission(&self) -> Result<()> {
+        self.validate_payload()?;
+        self.validate_topic()
+    }
+
+    pub fn validate_payload(&self) -> Result<()> {
+        match self {
+            Self::Notify(args) => args.validate(),
+            Self::Emit(args) | Self::AttentionEmit(args) => args.validate(),
+        }
+    }
+
+    pub fn validate_topic(&self) -> Result<()> {
+        match self {
+            Self::Emit(args)
+                if matches!(
+                    args.topic.as_str(),
+                    ATTENTION_TOPIC | "agent.attention_step"
+                ) =>
+            {
+                Err(invalid(
+                    "monitoring topics are reserved for the internal attention producer",
+                ))
+            }
+            Self::AttentionEmit(args) if args.topic != ATTENTION_TOPIC => Err(invalid(
+                "attention.emit carries only the reserved attention topic",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    pub fn event(&self) -> Result<(String, Value)> {
+        match self {
+            Self::Notify(args) => Ok(("x.user.notify".to_owned(), args.checked_payload()?)),
+            Self::Emit(args) | Self::AttentionEmit(args) => {
+                Ok((format!("x.user.{}", args.topic), args.checked_payload()?))
+            }
+        }
+    }
+}
+
 /// A bounded local notification: a human message persisted as `x.user.notify`.
 #[derive(schemars::JsonSchema, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,18 +151,19 @@ pub struct NotifyDefinitionArgs {
 
 impl NotifyDefinitionArgs {
     pub fn validate(&self) -> Result<()> {
+        self.checked_payload().map(drop)
+    }
+
+    fn checked_payload(&self) -> Result<Value> {
         validate_text(&self.message, "notify message")?;
         if let Some(title) = &self.title {
             validate_text(title, "notify title")?;
         }
         // Bound the final persisted event payload shape (`{message,title?}`),
         // not just the DTO, so Store never rejects it at commit time.
-        let mut payload = serde_json::json!({"message": self.message});
-        if let Some(title) = &self.title {
-            payload["title"] = Value::String(title.clone());
-        }
+        let payload = serde_json::json!(self);
         bound_payload(&payload, "notify")?;
-        Ok(())
+        Ok(payload)
     }
 }
 
@@ -49,6 +180,10 @@ pub struct EmitDefinitionArgs {
 
 impl EmitDefinitionArgs {
     pub fn validate(&self) -> Result<()> {
+        self.checked_payload().map(drop)
+    }
+
+    fn checked_payload(&self) -> Result<Value> {
         if self.topic.is_empty()
             || self.topic.len() > 128
             || !self
@@ -71,7 +206,7 @@ impl EmitDefinitionArgs {
             payload["key"] = Value::String(key.clone());
         }
         bound_payload(&payload, "emit")?;
-        Ok(())
+        Ok(payload)
     }
 }
 

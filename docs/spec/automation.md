@@ -1167,8 +1167,13 @@ webhook, and no external message is sent. Both are targetless ordinary commands
 (`target = null`, no generation/turn/request binding) whose Core
 [`NotifyDefinitionArgs`/`EmitDefinitionArgs`](../../crates/eliot-core/src/api/notify.rs)
 are validated literally at admission (no templates; bounded, secret-checked
-payloads). Execution commits exactly one persisted event — `x.user.notify`
-with `{message,title?}` or `x.user.<topic>` with `{data}` — together with its
+payloads). Public admission decodes and validates the pure payload before
+taking the Store lock. Store checks the bindings and topic in its admission
+transaction. The original command JSON remains the digest and replay input,
+including explicit nulls. Rule-derived commands decode at Store admission.
+At dispatch, the Store decodes the retained command and commits one
+event (`x.user.notify` with `{message,title?}` or `x.user.<topic>` with
+`{data,key?}`) together with its
 Applied settlement in a single Store transaction, then publishes the committed
 batch (the user event first, then `command.applied`) on the bus; the Applied
 readback carries that event's kind and seq as the standard command readback,
