@@ -2486,9 +2486,11 @@ no process; shutdown/capacity failure remains an environment error. OpenCode's
 native Console operation may refresh its active connection while resolving it.
 
 Muse uses [native `usage --json`](../harnesses/muse.md#subscription-allowance).
-The daemon shares one in-flight allowance read per file-backed sign-in and
-waits at least five minutes after each completion, including failures, before
-starting another. The shared read has its own deadline. A caller whose wait
+The daemon shares one in-flight allowance read per file-backed sign-in. A
+completed read, including a vendor failure or timeout, starts a five-minute
+interval before the next read. Local capacity refusals, cancellation and reader
+unavailability allow the next caller to retry without recording a failure.
+The shared read has its own deadline. A caller whose wait
 expires gets the available cached or retained observation, or unavailable while
 the read continues. The cache retains the last good allowance on a read failure.
 A native unavailable reason supersedes older windows and identifies sign-in

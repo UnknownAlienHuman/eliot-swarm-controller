@@ -444,7 +444,7 @@ impl PluginHost {
         };
         let result = tokio::select! {
             result = tokio::time::timeout_at(until, read) =>
-                result.unwrap_or_else(|_| Err(Error::new("unavailable", "quota.read deadline exceeded"))),
+                result.unwrap_or_else(|_| Err(Error::new("timeout", "quota.read deadline exceeded"))),
             _ = stop.changed() => Err(Error::new("cancelled", "quota.read was cancelled")),
         };
         let result = result.map_err(|error| {

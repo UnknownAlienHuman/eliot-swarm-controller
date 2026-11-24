@@ -3,7 +3,7 @@
 use super::{Router, now_ms};
 use crate::router::plugin_host::MetadataRoute;
 use eliot_core::api::{HARNESS_READ_TTL_MS, HarnessQuotaResponse, harness::QuotaObservation};
-use eliot_core::{Error, Result};
+use eliot_core::{Error, FailureOrigin, Result};
 use eliot_plugin::sync::LockExt;
 use serde_json::{Value, json};
 use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
@@ -136,6 +136,7 @@ impl Router {
             Err(error) => return Err(error),
         };
         let entry = self.inner.allowance_reads.lock_recover().account(key)?;
+        let mut transient_error = None;
         if let Ok(refresh) =
             tokio::time::timeout_at(deadline, entry.refresh.clone().lock_owned()).await
         {
@@ -173,8 +174,16 @@ impl Router {
                         .await
                         .and_then(allowance_details);
                     let mut read = account.cached.lock_recover();
-                    read.next_read = Some(Instant::now() + READ_INTERVAL);
                     match result {
+                        Err(error)
+                            if matches!(
+                                error.code.as_str(),
+                                "busy" | "cancelled" | "unavailable"
+                            ) && error.origin != Some(FailureOrigin::Provider) =>
+                        {
+                            // The next caller can retry without replacing the last observation.
+                            return Some(error);
+                        }
                         Ok(AllowanceReading::Ready(details)) => {
                             if read.good.as_ref().is_none_or(|previous| {
                                 observed_at(&details) >= observed_at(previous)
@@ -199,9 +208,11 @@ impl Router {
                             });
                         }
                     }
+                    read.next_read = Some(Instant::now() + READ_INTERVAL);
+                    None
                 });
                 if let Ok(result) = tokio::time::timeout_at(deadline, task).await {
-                    result
+                    transient_error = result
                         .map_err(|_| Error::new("internal", "native allowance reader stopped"))?;
                 }
             }
@@ -249,14 +260,14 @@ impl Router {
             response.details = Some(details);
             return Ok((true, None));
         }
-        let error = failure.map_or_else(
-            || {
+        let error = failure
+            .map(|failure| failure.error)
+            .or(transient_error)
+            .unwrap_or_else(|| {
                 eliot_plugin::quota::environment(
                     "Native subscription allowance read is still in progress",
                 )
-            },
-            |failure| failure.error,
-        );
+            });
         Ok((true, Some(error)))
     }
 }
@@ -278,7 +289,7 @@ fn allowance_details(mut raw: Value) -> Result<AllowanceReading> {
             let reason = details["reason"].as_str().ok_or_else(invalid)?;
             let error = match details["code"].as_str() {
                 Some("auth_required") => Error::new("auth_required", reason).with_origin(
-                    eliot_core::FailureOrigin::Environment,
+                    FailureOrigin::Environment,
                     "Muse usage requires native sign-in",
                 ),
                 Some("quota_unavailable") => {
