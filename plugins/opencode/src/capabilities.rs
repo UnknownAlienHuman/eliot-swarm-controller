@@ -15,6 +15,9 @@ use eliot_plugin::capabilities::{adhoc_launch, instruction_files, quota_readback
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        model_catalogue_presentation: Some(
+            crate::catalog_presentation::model_catalogue_presentation,
+        ),
         native_auth: Some(NativeAuthCapability {
             login: Some(NativeAuthCommand {
                 resolve: || auth_command(&["auth", "login", "--standalone"]),

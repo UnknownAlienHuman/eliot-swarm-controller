@@ -204,6 +204,14 @@ pub struct DocumentedModelCatalog {
     pub empty_native_inventory: &'static str,
 }
 
+/// Public catalogue status and note for an adapter's translated model list.
+pub type ModelCataloguePresentation = fn(
+    cmd: &str,
+    provenance: &str,
+    empty: bool,
+    default: Option<&str>,
+) -> (&'static str, Option<String>);
+
 /// Requirements for a dedicated native catalogue reader.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ModelReaderOptions {
@@ -308,6 +316,7 @@ pub struct HarnessCapabilities {
     pub models_workspace_preview: bool,
     /// Published native aliases used when a verified live catalogue is unavailable.
     pub documented_models: Option<DocumentedModelCatalog>,
+    pub model_catalogue_presentation: Option<ModelCataloguePresentation>,
     pub model_reader: ModelReaderOptions,
     /// Preview each configured auth integration in its own native store.
     pub models_preview_auth_integrations: bool,

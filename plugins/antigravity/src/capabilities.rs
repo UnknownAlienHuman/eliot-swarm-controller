@@ -12,6 +12,9 @@ use serde_json::Value;
 
 pub fn declaration() -> HarnessCapabilities {
     HarnessCapabilities {
+        model_catalogue_presentation: Some(
+            crate::catalog_presentation::model_catalogue_presentation,
+        ),
         // Installed AGY help exposes neither a standalone sign-in command nor sign-in status.
         native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
