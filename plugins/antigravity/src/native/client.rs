@@ -244,6 +244,10 @@ impl AgyProcess {
 }
 
 impl AgyClient {
+    pub(crate) async fn shutdown_input(&self, deadline: Instant) -> Result<()> {
+        self.writer.shutdown_input(deadline).await
+    }
+
     /// One correlated ACP request/response round trip.
     pub async fn call(&self, method: &str, params: Value, deadline: Instant) -> Result<Value> {
         self.call_inner(method, params, deadline)

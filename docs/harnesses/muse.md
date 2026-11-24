@@ -84,6 +84,12 @@ Each `turn/start` requests `ifBusy: "queue"`. If a native run starts while an
 input is being dispatched, its independent turn id stays visible. The accepted
 queued input keeps the native acknowledgement's turn id. Eliot associates it
 only after the earlier turn ends and that input emits its exact `turn/started`.
+The shared [native wake gate](../spec/automation.md#automatic-background-process-wake)
+cancels an exact commandless run after an explicit interrupt or while the
+profile has a durable hold. The adapter sends `turn/cancel` immediately and
+retains queued inputs for their own turns. Each dispatched SEND uses its own
+expected provider model. A commandless wake uses the latest verified session
+selector.
 
 The installed `turn/steer` result must echo the submitted `commandId`, the exact
 `expectedTurnId` as `turnId`, and `status="accepted"` (1.4.0-R4161.1 exported

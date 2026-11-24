@@ -80,6 +80,9 @@ After the native terminal, a late `queued` frame for that send leaves it pending
 its exact `started` or `cancelled` lifecycle. Once a send is bound, a result settles
 it if it names the bound UUID or supplies no input IDs. A result naming only other
 inputs accounts for the prefix, regardless of the result origin.
+The [native wake gate](../spec/automation.md#automatic-background-process-wake)
+can direct an immediate native interrupt. A guarded wake cannot absorb queued
+input.
 
 ## Transport
 

@@ -1060,6 +1060,14 @@ fn dispatch_control_tx(
         params["request_id"] = Value::String(request_id.to_owned());
     }
     check_rpc_frame("agent.command", &params)?;
+    if command.command.verb == "interrupt"
+        && native_events::explicit_input_principal(&command.command.principal)
+    {
+        db!(tx.execute(
+            "UPDATE agents SET native_wake_interrupted_generation = ?1 WHERE id = ?2",
+            params![agent.generation, agent_num],
+        ));
+    }
     update_command_state(tx, id, CommandState::Dispatched, None, None, now)?;
     events.push(insert_daemon_command_event(
         tx,

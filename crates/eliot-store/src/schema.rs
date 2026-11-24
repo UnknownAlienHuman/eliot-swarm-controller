@@ -55,7 +55,9 @@ impl Store {
             .map_err(sql_error)?;
         tx.execute_batch(
             "ALTER TABLE turns ADD COLUMN native_followup_pending INTEGER NOT NULL DEFAULT 0
-                 CHECK (native_followup_pending IN (0, 1));",
+                 CHECK (native_followup_pending IN (0, 1));
+             ALTER TABLE turns ADD COLUMN native_wake_cancel_reason TEXT;
+             ALTER TABLE agents ADD COLUMN native_wake_interrupted_generation INTEGER;",
         )
         .map_err(sql_error)?;
         tx.execute(

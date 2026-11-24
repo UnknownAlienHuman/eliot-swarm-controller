@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
+    time::Duration,
 };
 
 use eliot_core::{
@@ -742,6 +743,7 @@ impl State {
         &mut self,
         input: &HookInput,
         origin: ProcessBirthIdentity,
+        client: &AgyClient,
     ) -> Result<Option<HookTurnBinding>> {
         if !input.starts_execution()
             || input.conversation_id != self.conversation
@@ -780,17 +782,43 @@ impl State {
             tool_gap_reported: false,
             reply: None,
         });
-        if let Err(error) = self
-            .commit(
-                "turn.started",
-                &turn,
-                "started",
-                json!({"turn_id": turn.clone(), "native_trigger": NATIVE_TRIGGER}),
-            )
+        let id = event_id(
+            &self.conversation,
+            &turn,
+            "started",
+            "turn.started",
+            "agy",
+            "Antigravity",
+        )?;
+        let cancel = match self
+            .source()
+            .commit_native_wake(id, &turn, NATIVE_TRIGGER)
             .await
         {
-            self.pending = None;
-            return Err(error);
+            Ok(cancel) => cancel,
+            Err(error) => {
+                self.pending = None;
+                return Err(error);
+            }
+        };
+        if cancel.is_some() {
+            let until = Instant::now() + Duration::from_secs(5);
+            if let Err(error) = client
+                .notify(
+                    "session/cancel",
+                    Some(json!({"sessionId": self.conversation})),
+                    until,
+                )
+                .await
+            {
+                let _ = client
+                    .shutdown_input(Instant::now() + Duration::from_secs(5))
+                    .await;
+                return Err(error);
+            }
+            self.latch_cancellation(&turn, Some(&turn));
+            self.native_terminal_deadline = Some(Instant::now() + EVENT_DEADLINE);
+            return Ok(None);
         }
         self.refresh_native_terminal_deadline();
         Ok(Some(HookTurnBinding {
@@ -3197,7 +3225,11 @@ async fn handle_hook_callback(
         return Ok(());
     }
     let opened = if origin_is_live && input.starts_execution() {
-        state.lock().await.begin_native_run(&input, origin).await?
+        state
+            .lock()
+            .await
+            .begin_native_run(&input, origin, client)
+            .await?
     } else {
         None
     };

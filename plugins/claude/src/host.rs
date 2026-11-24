@@ -1855,7 +1855,9 @@ fn check_send_ready(session: &AgentSession) -> Result<()> {
     }
     // A self-started native turn with no send takes this input: Claude
     // merges it and the event task binds it to that exact turn.
-    if event_status.active_turn_id.is_some() && !event_status.native_unbound {
+    if event_status.active_turn_id.is_some()
+        && (!event_status.native_unbound || event_status.wake_cancel_pending)
+    {
         return Err(Error::new("busy", "Claude already has an active turn"));
     }
     if session.pending_turn.pending.is_some() {

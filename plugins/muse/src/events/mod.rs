@@ -1654,8 +1654,7 @@ impl EventProcessor {
         if let Some(effort) = effort.as_deref().filter(|effort| !effort.trim().is_empty()) {
             data["effort"] = json!(effort);
         }
-        self.session_expected_model = model;
-        self.reset_turn_model();
+        self.reset_turn_model(model);
         if !context.is_empty() {
             data["context_outcomes"] = json!(next_input_outcomes(&context, &command_id));
         }
@@ -1689,25 +1688,26 @@ impl EventProcessor {
         self.status.active_turn_id = Some(turn_id.clone());
         self.active_native_command_id = native_command_id;
         self.turn_completion_usage = None;
-        self.reset_turn_model();
+        self.reset_turn_model(self.session_expected_model.clone());
         let native_id = event_id(&session_id, &turn_id, &turn_id, "turn.started")?;
-        self.commit_event(
-            "turn.started",
-            native_id,
-            json!({
-                "turn_id": turn_id,
-                "native_trigger": trigger,
-            }),
-        )
-        .await?;
+        let cancellation = self
+            .stream_source()
+            .commit_native_wake(native_id, &turn_id, trigger)
+            .await?;
         self.messages = TurnMessages::default();
+        if cancellation.is_some() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let accepted = provider::cancel(&self.native, &session_id, &turn_id, deadline).await;
+            self.status.model_stop_at = Some(if accepted { deadline } else { Instant::now() });
+            return Ok(());
+        }
         self.apply_stashed_entries().await?;
         Ok(())
     }
 
-    fn reset_turn_model(&mut self) {
+    fn reset_turn_model(&mut self, expected: Option<String>) {
         self.turn_model = TurnModel {
-            expected: self.session_expected_model.clone(),
+            expected,
             ..TurnModel::default()
         };
         self.status.provider_model_turn = None;

@@ -367,6 +367,9 @@ Interrupt sends `session/cancel` and waits for a native terminal. An unanswered
 cancel or the shared native inactivity deadline commits `turn.unknown`. A
 later exact `Stop` that passes the read fence settles the retained turn and
 releases the send gate.
+The [native wake gate](../spec/automation.md#automatic-background-process-wake)
+can direct an immediate `session/cancel` for the exact commandless wake before
+the adapter returns its first hook response.
 
 ## Facts and recovery
 

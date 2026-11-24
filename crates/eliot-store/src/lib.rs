@@ -6318,6 +6318,7 @@ fn is_unbound_native_turn(
                  SELECT 1 FROM turns
                  WHERE agent = ?1 AND generation = ?2 AND turn_id = ?3 AND state = 'running'
                    AND native_trigger IS NOT NULL AND start_command_id IS NULL
+                   AND native_wake_cancel_reason IS NULL
              )",
             params![agent_num, generation, turn_id],
             |row| row.get(0),

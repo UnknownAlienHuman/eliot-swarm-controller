@@ -1474,6 +1474,16 @@ pub struct BatchAck {
     pub dropped_unclassified: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_refusal: Option<PermissionRefusal>,
+    /// Stop the exact commandless wake before handling its output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_wake_cancel: Option<NativeWakeCancellation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeWakeCancellation {
+    pub turn_id: String,
+    pub reason: String,
+    pub message: String,
 }
 
 /// Daemon refusal returned with the durable acknowledgement for one exact

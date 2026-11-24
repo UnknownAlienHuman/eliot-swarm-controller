@@ -979,6 +979,14 @@ started. An Agent declares a long-lived server with `emit` topic
 `background.server` and data `pid` or `command`. A matching process and its shell
 ancestors never arm. The arm reads only bounded fields under a short Store lock.
 
+A dispatched Owner or Agent interrupt suppresses commandless native wakes in
+that generation until the next Owner or Agent SEND binds to a turn. An already
+queued SEND keeps its position and starts after the cancelled wake settles.
+At a commandless turn start, Store checks this interrupt fence and the frozen
+profile's durable model and provider holds. The committed start records the
+reason for any required cancellation. The adapter sends the exact native
+cancel before processing further wake output.
+
 When that exact process identity exits, Swarm delivers one note in the
 [shared insertion frame](#inject-context-at-the-safe-point) at the soonest point.
 That is an `inject` into an active turn whose context points allow it, otherwise

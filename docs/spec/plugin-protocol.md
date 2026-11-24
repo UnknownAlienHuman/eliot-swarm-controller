@@ -765,6 +765,10 @@ and the applied response names the turn it joined. Exact-turn `agent.snapshot`
 uses the session's start command as the session selector for an unbound turn, and
 the returned turn facts omit `command_id`.
 
+The ACK for a commandless `turn.started` can carry `native_wake_cancel` for
+that exact turn. Store retains the same reason on the journaled start. The
+adapter performs the exact cancel before processing further wake output.
+
 A send already admitted by the harness into its native queue replies
 `state: "queued"` with the exact native turn id. The host keeps it dispatched
 until the matching `turn.started` commits its input association.
