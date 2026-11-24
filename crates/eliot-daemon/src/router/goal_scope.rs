@@ -7,7 +7,7 @@
 //! check input changed, or with the change set unverified, blocks it instead
 //! of completing it. Swarm never reverts or deletes anything here.
 
-use super::Router;
+use super::{Router, goals::program};
 use crate::git_monitor::{GitProbe, scope_digests};
 use eliot_core::{
     Error, Result,
@@ -27,7 +27,7 @@ use std::{
 const LISTED_PATHS: usize = 20;
 /// Room a scope finding keeps in the 4 KiB Goal observation.
 const FINDING_BYTES: usize = 1536;
-const CHECK_IDENTITY_VERSION: u8 = 3;
+const CHECK_IDENTITY_VERSION: u8 = 4;
 
 /// The Goal's work since its starting point, or why it is not known.
 pub(super) enum ScopeFinding {
@@ -94,14 +94,17 @@ impl Router {
                 ),
             ));
         }
-        let (check_files, check_identity) = check_files(&state.root, definition, workspace)?;
         let root = state.root.clone();
-        let changed = tokio::task::spawn_blocking(move || {
-            scope_digests(&root, state.changed.iter().map(String::as_str))
+        let definition = definition.clone();
+        let workspace = workspace.to_owned();
+        let (check_files, check_identity, changed) = tokio::task::spawn_blocking(move || {
+            let (check_files, identity) = check_files(&root, &definition, &workspace)?;
+            let changed = scope_digests(&root, state.changed.iter().map(String::as_str))
+                .map_err(unavailable)?;
+            Ok::<_, Error>((check_files, identity, changed))
         })
         .await
-        .map_err(|_| Error::new("internal", "scope read task failed"))?
-        .map_err(unavailable)?;
+        .map_err(|_| Error::new("internal", "scope read task failed"))??;
         Ok(GoalScopeBase {
             root: state
                 .root
@@ -328,14 +331,15 @@ fn check_files(
     let cwd = PathBuf::from(definition.check_cwd.as_deref().unwrap_or(workspace));
     let mut files = BTreeSet::new();
     let mut identities = BTreeMap::new();
-    let mut operands: Vec<PathBuf> = definition
-        .check
-        .first()
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
+    let mut operands = Vec::new();
     let mut unverified_entry_point = false;
     if let Some((program, args)) = definition.check.split_first() {
+        if !program::is_bare_program(program) {
+            operands.push(PathBuf::from(program));
+        }
+        if let Ok(executable) = program::resolve_program(program, Some(&cwd)) {
+            operands.push(executable);
+        }
         match interpreter_entry(program, args) {
             CheckerEntry::Executable => {}
             CheckerEntry::Path(path) => {
@@ -528,21 +532,23 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
             {
                 return Unverified;
             }
-            "-r"
-            | "--require"
-            | "--import"
-            | "--loader"
-            | "--experimental-loader"
-            | "-C"
-            | "--conditions"
-            | "--env-file"
-            | "--env-file-if-exists"
-            | "--experimental-config-file"
-            | "--redirect-warnings"
-            | "--input-type"
-                if node =>
+            _ if node
+                && matches!(
+                    option_name,
+                    "-r" | "--require"
+                        | "--import"
+                        | "--loader"
+                        | "--experimental-loader"
+                        | "-C"
+                        | "--conditions"
+                        | "--env-file"
+                        | "--env-file-if-exists"
+                        | "--experimental-config-file"
+                        | "--redirect-warnings"
+                        | "--input-type"
+                ) =>
             {
-                if args.next().is_none() {
+                if option_name == option && args.next().is_none() {
                     return Unverified;
                 }
             }
@@ -551,6 +557,11 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
                     return Unverified;
                 }
             }
+            "-noprofile" | "-nologo" | "-noninteractive" | "-sta" | "-mta" if powershell => {}
+            "/d" | "/s" | "/q" | "/a" | "/u" | "/e:on" | "/e:off" | "/v:on" | "/v:off" if cmd => {}
+            "--noprofile" | "--norc" | "--posix" | "--login" if shell => {}
+            "--enable-source-maps" | "--no-warnings" | "--trace-warnings" | "--no-deprecation"
+                if node => {}
             option if shell && option.starts_with(['-', '+']) && !option.starts_with("--") => {
                 let mut flags = option[1..].chars();
                 if let Some(mode) = flags.find(|flag| matches!(flag, 'c' | 's' | 'o' | 'O'))
@@ -579,7 +590,11 @@ fn interpreter_entry<'a>(program: &str, args: &'a [String]) -> CheckerEntry<'a> 
                     return Unverified;
                 }
             }
-            option if option.starts_with('-') || (cmd && option.starts_with('/')) => {}
+            option if option.starts_with('-') || (cmd && option.starts_with('/')) => {
+                // Unknown option arity can make the next argv item an option
+                // value rather than a script path. Do not infer an entry point.
+                return Unverified;
+            }
             _ if cmd => return Unverified,
             _ if powershell && !arg.to_ascii_lowercase().ends_with(".ps1") => return Unverified,
             _ => return Script(arg),

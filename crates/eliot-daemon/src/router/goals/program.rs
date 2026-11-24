@@ -13,11 +13,14 @@ pub(super) async fn resolve(program: String, cwd: Option<String>) -> Result<Path
         .map_err(|_| Error::new("unavailable", "Goal executable lookup was interrupted"))?
 }
 
-fn resolve_program(program: &str, cwd: Option<&Path>) -> Result<PathBuf> {
+pub(in crate::router) fn is_bare_program(program: &str) -> bool {
     let path = Path::new(program);
-    let bare = matches!(path.components().next(), Some(Component::Normal(_)))
-        && path.components().count() == 1;
-    let candidates = if bare {
+    matches!(path.components().next(), Some(Component::Normal(_))) && path.components().count() == 1
+}
+
+pub(in crate::router) fn resolve_program(program: &str, cwd: Option<&Path>) -> Result<PathBuf> {
+    let path = Path::new(program);
+    let candidates = if is_bare_program(program) {
         path_candidates(path)
     } else {
         vec![path.to_owned()]

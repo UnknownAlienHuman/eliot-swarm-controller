@@ -1,7 +1,7 @@
 use super::*;
 use crate::platform::{OwnedChild, data_dir::replace_file};
 use eliot_core::api::CheckpointRestoreRequest;
-use eliot_store::{CheckpointRestoreIntent, Store};
+use eliot_store::{CheckpointRestoreIntent, CheckpointRestoreWriterObservation, Store};
 use std::io::Write;
 use tokio::sync::Mutex;
 
@@ -64,7 +64,12 @@ impl CheckpointRestoreWriter<'_> {
             let child = OwnedChild::spawn_leaf(command);
             drop(custody);
             match child {
-                Ok(child) => Ok(child),
+                Ok(child) => {
+                    if let Some(identity) = child.linux_root_identity() {
+                        store.record_checkpoint_restore_writer(self.id, &identity)?;
+                    }
+                    Ok(child)
+                }
                 Err(error) => {
                     store.close_checkpoint_restore_writer(self.id)?;
                     Err(error)
@@ -134,6 +139,44 @@ pub(crate) fn restore_writer_closed(intent: &CheckpointRestoreIntent) -> Result<
             "checkpoint restore Git custody is unavailable on this platform",
         ))
     }
+}
+
+/// Observe the recorded process independently of the family closure probe.
+/// Opening its Job can fail while PID and birth time still prove liveness.
+pub(crate) fn observe_restore_writer(
+    intent: Option<&CheckpointRestoreIntent>,
+) -> CheckpointRestoreWriterObservation {
+    use eliot_core::ProcessState;
+    let identity = intent.and_then(|intent| intent.writer_identity.clone());
+    let mut state = ProcessState::Unknown;
+    if intent.is_some_and(|intent| intent.writer_custody_bound)
+        && let Some(identity) = &identity
+    {
+        #[cfg(windows)]
+        let alive =
+            crate::platform::windows::recorded_process_alive(identity.pid, identity.start_time);
+        #[cfg(target_os = "linux")]
+        let alive = crate::platform::unix::host_boot_id().and_then(|boot| {
+            if boot != identity.host_boot_id {
+                return Ok(false);
+            }
+            crate::platform::unix::recorded_process_alive(identity.pid, identity.start_time)
+        });
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let alive: Result<bool> = {
+            let _ = identity;
+            Err(Error::new(
+                "unsupported",
+                "restore writer observation is unavailable",
+            ))
+        };
+        state = match alive {
+            Ok(true) => ProcessState::Running,
+            Ok(false) => ProcessState::Exited,
+            Err(_) => ProcessState::Unknown,
+        };
+    }
+    CheckpointRestoreWriterObservation { state, identity }
 }
 
 pub(crate) fn stop_restore_writer(intent: &CheckpointRestoreIntent) -> Result<()> {

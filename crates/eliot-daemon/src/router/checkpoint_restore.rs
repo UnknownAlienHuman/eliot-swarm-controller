@@ -178,13 +178,12 @@ impl Router {
         };
         let mut store = self.inner.store.lock().await;
         super::owner_inbox::check_binding(&store)?;
+        let intents = store.checkpoint_restore_intents(Some(&request.restore_id))?;
+        let intent = intents.first();
         let writer_closed = if abandon {
             false
         } else {
-            match store
-                .checkpoint_restore_intents(Some(&request.restore_id))?
-                .first()
-            {
+            match intent {
                 Some(intent) => crate::work_truth::restore_writer_closed(intent)?,
                 None => false,
             }
@@ -193,7 +192,7 @@ impl Router {
             &request.id,
             &request.restore_id,
             writer_closed,
-            reason,
+            reason.map(|reason| (reason, crate::work_truth::observe_restore_writer(intent))),
             now_ms(),
         )?;
         drop(store);

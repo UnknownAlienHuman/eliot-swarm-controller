@@ -817,7 +817,10 @@ If a writer persists, `stop_writer` terminates its exact Windows Job after
 verifying the retained process identity and confirms family exit. If closure
 cannot be verified, the Owner can explicitly confirm `abandon_reservation`
 and record a reason. This releases the reservation even if an external writer
-can still run. Custody probe failures are logged and shown in the inbox.
+can still run. Both the original restore receipt and the inbox decision result
+record the writer observed at abandonment, with its PID and start time when
+recorded. Swarm independently checks that process identity and reports its state
+as running, exited or unknown. Custody probe failures are logged and shown in the inbox.
 
 The final checkpoint of a session waits for the
 [owned exit proof](#process-identity-and-custody): the process family has exited and the

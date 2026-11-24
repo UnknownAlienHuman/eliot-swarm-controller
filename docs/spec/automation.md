@@ -1940,8 +1940,11 @@ untracked files; ignored files excluded; renames as both paths). More than 512 s
 paths are refused rather than recorded incompletely. A changed submodule refuses the
 starting point, or leaves a round's change set unverified, rather than hiding edits.
 The checker executable and identified interpreter scripts inside the workspace
-also join the check inputs. Swarm skips interpreter option flags and the value
-arguments of options it recognizes, including Python launcher version switches. It recognizes
+also join the check inputs. Swarm resolves bare program names with the check's
+executable lookup and tracks the resulting path when it is inside the workspace.
+Swarm skips recognized interpreter flags and their value arguments, including Python
+launcher version switches. An option with unknown arity leaves the entry point
+unverified. Swarm recognizes
 PowerShell positional scripts and `-File`, simple `cmd /c` batch-file
 invocations, and positional scripts for common interpreters. Python `-m`
 resolves ordinary source modules and package entry points in the check directory.

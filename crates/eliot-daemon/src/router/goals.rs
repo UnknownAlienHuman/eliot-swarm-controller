@@ -6,7 +6,7 @@
 //! Unknown check outcomes retain no Goal progress or continuation and never
 //! authorize another check; the reservation retains their error.
 
-mod program;
+pub(super) mod program;
 
 use super::{
     Principal, Router,

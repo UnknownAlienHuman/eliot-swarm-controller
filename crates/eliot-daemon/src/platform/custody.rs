@@ -239,7 +239,7 @@ impl OwnedChild {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn integration_root_identity(&self) -> Option<eliot_core::ProcessIdentity> {
+    pub(crate) fn linux_root_identity(&self) -> Option<eliot_core::ProcessIdentity> {
         let group = self.identity?;
         Some(eliot_core::ProcessIdentity {
             pid: group.pid,

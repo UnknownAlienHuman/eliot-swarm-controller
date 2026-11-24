@@ -30,7 +30,8 @@ use tokio::time::Instant;
 
 mod restore;
 pub(crate) use restore::{
-    CheckpointRestoreWriter, restore_checkpoint, restore_writer_closed, stop_restore_writer,
+    CheckpointRestoreWriter, observe_restore_writer, restore_checkpoint, restore_writer_closed,
+    stop_restore_writer,
 };
 
 const GIT_TIME: Duration = Duration::from_secs(30);
