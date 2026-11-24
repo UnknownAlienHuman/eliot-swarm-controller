@@ -211,9 +211,10 @@ per-call context count when `input`, `cache.read`, `cache.write`, `output`
 and `reasoning` are all present. Their checked sum is committed as
 `session.usage.context_used_tokens` with `source = "opencode:assistant_message_tokens"`
 and no context window. A terminal without a complete sample clears that context
-count. This represents the latest model call;
-it supports an absolute profile context ceiling, while context-ratio checks remain
-unavailable without a reported window.
+count. The sum matches OpenCode's measured compaction anchor for the latest
+model call. It supports an absolute profile context ceiling. Ratio checks
+require a reported window.
+[OpenCode 2.2.7 compaction](https://github.com/anomalyco/opencode/blob/fedc6f208aa2bd54c1019227214568083f6380ad/packages/core/src/session/compaction.ts).
 
 ## Source ownership and recovery
 

@@ -992,8 +992,10 @@ boundary. A strictly newer snapshot
 replaces the retained one; an older or equal-timestamp snapshot or a
 byte-identical duplicate is ignored, so replays and out-of-order deliveries
 can never inflate or regress the readback. `context_used_tokens` carries an actual
-per-call context count (input, cached input and output counted once when
-derived from call counters) and may be retained without a known capacity;
+per-call context count and may be retained without a known capacity. When
+derived from call counters, it includes fresh input, cache creation, cache
+reads, and output including reasoning, each counted once. It measures the
+recorded call's footprint. The next request may have a different context.
 `context_window_tokens` is optional. Shared usage logic reuses an observed window
 when the adapter binds the reading to the same model or native turn. Ratio-based
 occupancy is available only for a positive window with a value between zero and

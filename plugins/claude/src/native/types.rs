@@ -367,39 +367,22 @@ pub(crate) fn result_session_tokens(record: &Value) -> Option<SessionTokenTotals
     })
 }
 
-/// Context occupancy from one native main-thread `assistant` message.
+/// Input footprint from one native main-thread `assistant` message.
 /// Anthropic `message.usage` separates uncached input from cache-read and
-/// cache-creation input. All four nonnegative counters describe one call's
-/// context footprint; omitted cache buckets mean zero, while missing or
-/// malformed required counters and overflow leave the sample unavailable.
+/// cache-creation input. All three counters must be reported for the same call.
 pub(crate) fn assistant_call_input(record: &Value) -> Option<i64> {
     let usage = record.get("message")?.get("usage")?.as_object()?;
-    let optional_cache = |key: &str| match usage.get(key) {
-        Some(Value::Null) | None => Some(0),
-        value => usage_counter(value),
-    };
     eliot_plugin::usage::call_input_tokens(
         "claude",
         usage_counter(usage.get("input_tokens")),
-        optional_cache("cache_read_input_tokens"),
-        optional_cache("cache_creation_input_tokens"),
+        usage_counter(usage.get("cache_read_input_tokens")),
+        usage_counter(usage.get("cache_creation_input_tokens")),
     )
 }
 
 fn assistant_context_used(record: &Value) -> Option<i64> {
     let usage = record.get("message")?.get("usage")?;
     assistant_call_input(record)?.checked_add(usage_counter(usage.get("output_tokens"))?)
-}
-
-/// Model context window from an init or result frame: the installed
-/// stream-json names the capacity `context_window`/`contextWindow` where the
-/// harness reports it. Absent or unusable stays null, never zero or guessed.
-pub(crate) fn frame_context_window(record: &Value) -> Option<i64> {
-    record
-        .get("context_window")
-        .or_else(|| record.get("contextWindow"))
-        .and_then(Value::as_i64)
-        .filter(|window| *window > 0)
 }
 
 /// Config roots that may hold the Claude transcript store: an explicit
@@ -504,8 +487,8 @@ fn transcript_context(
 /// Extract the session-scoped fact from a terminal `result` record:
 /// cumulative token counters from `modelUsage`, cumulative cost from
 /// `total_cost_usd`, the latest single-call context sample retained from a
-/// main-thread assistant message, and the model's window from the result
-/// or the matching init frame. Neither `result.usage` nor cumulative
+/// main-thread assistant message, and the window from the result entry for
+/// that exact model. Neither `result.usage` nor cumulative
 /// `modelUsage` counters supply occupancy. With persistent streaming input
 /// the cumulative halves are cumulative for the session (resumed cost
 /// included) and estimated, so they map to a session-scoped snapshot with
@@ -518,7 +501,6 @@ pub(crate) fn result_session_usage(
     record: &Value,
     latest_model: Option<&str>,
     used: Option<i64>,
-    init_context_window: Option<&(String, i64)>,
 ) -> Option<SessionUsage> {
     let cumulative_tokens = result_session_tokens(record);
     let amount = record
@@ -526,16 +508,8 @@ pub(crate) fn result_session_usage(
         .and_then(Value::as_f64)
         .filter(|amount| amount.is_finite() && *amount >= 0.0);
     let window = latest_model
-        .and_then(|model| {
-            record["modelUsage"]
-                .get(model)
-                .and_then(frame_context_window)
-        })
-        .or_else(|| frame_context_window(record))
-        .or_else(|| {
-            let (initialized_model, window) = init_context_window?;
-            (latest_model? == initialized_model).then_some(*window)
-        });
+        .and_then(|model| record["modelUsage"][model]["contextWindow"].as_i64())
+        .filter(|window| *window > 0);
     if cumulative_tokens.is_none() && amount.is_none() && used.is_none() && window.is_none() {
         return None;
     }

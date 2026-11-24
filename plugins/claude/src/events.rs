@@ -41,9 +41,8 @@ use crate::native::{
         CanUseToolBody, CommandLifecycle, ControlCancelRequest, HookCallbackBody,
         HookCallbackResponse, InitMcpServer, PermissionResult, ResultRecord, assistant_call_input,
         assistant_model, assistant_text, assistant_tool_use_count, assistant_tool_use_ids,
-        assistant_tool_uses, attach_mcp_readback, frame_context_window, init_mcp_servers,
-        result_session_usage, result_usage, transcript_config_roots, transcript_usage_in,
-        user_tool_results,
+        assistant_tool_uses, attach_mcp_readback, init_mcp_servers, result_session_usage,
+        result_usage, transcript_config_roots, transcript_usage_in, user_tool_results,
     },
 };
 
@@ -494,11 +493,6 @@ struct EventProcessor {
     /// next turn terminal so the reducer merges it into the effective set;
     /// absent until the first post-input init arrives.
     init_mcp_servers: Option<Vec<InitMcpServer>>,
-    /// Model context window from the owned stream's `system`/`init` record
-    /// where the harness reports one. Retained on observation and merged
-    /// into the terminal session fact when the result frame carries none;
-    /// absent until observed, never guessed.
-    init_context_window: Option<(String, i64)>,
     /// Served model and native message ID of the latest main-thread call.
     latest_context_message: Option<(String, String)>,
     first_call_usage: FirstCallUsage,
@@ -972,7 +966,6 @@ impl EventProcessor {
             native_provider_restriction: None,
             native_rate_limit_event: None,
             init_mcp_servers: None,
-            init_context_window: None,
             latest_context_message: None,
             first_call_usage: FirstCallUsage::default(),
             closed: false,
@@ -1472,10 +1465,6 @@ impl EventProcessor {
         if record.get("subtype").and_then(Value::as_str) != Some("init") {
             return;
         }
-        self.init_context_window = record["model"]
-            .as_str()
-            .map(str::to_owned)
-            .zip(frame_context_window(record));
         let Some(servers) = init_mcp_servers(record) else {
             return;
         };
@@ -3469,7 +3458,6 @@ impl EventProcessor {
             record,
             latest_model.as_deref(),
             transcript.and_then(|(_, context)| context),
-            self.init_context_window.as_ref(),
         );
         if let Some(usage) = session_usage.as_mut() {
             usage.session_file_bytes = transcript.map(|(size, _)| size);

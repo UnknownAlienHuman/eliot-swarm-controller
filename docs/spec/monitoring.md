@@ -1141,7 +1141,7 @@ are per kind under [daemon attention](configuration.md#automatic-attention-setti
 | `no_code_progress` | Ask once with the duration since the last worktree change and the available tool and message counts, then route one attention notice. |
 | Process loss | After exact custody exit and reader drain, reopen the retained idle session without input once. Startup uses the existing promptless restart reconciliation and honors `on_restart`. Unresolved work stays fenced. |
 | Provider refusal | Keep the existing provider hold, opt-in next-preset routing and bounded due probes. If the hold's automatic probe budget is exhausted or a probe stays unresolved, send one Owner notice. |
-| `session.growth` | At an idle boundary, a configured profile context ceiling compares the latest actual per-call `context_used_tokens` sample with its absolute token limit. Allow one automatic native compaction per generation, claimed in retained `turn_attention_steps` before dispatch. If native compaction is unavailable, use the existing same-profile switch and A6 brief when the source is safe and its task succeeded, even when legacy `switch = false`. Route one attention notice; do not repeat ceiling effects or a later overlapping legacy warning in that generation. Without a ceiling claim, the legacy ratio/file-size reaction remains unchanged and switch fallback stays opt-in. |
+| `session.growth` | At an idle boundary, a configured profile context ceiling compares the latest actual per-call `context_used_tokens` sample with its absolute token limit. Allow one automatic native compaction per generation, claimed in retained `turn_attention_steps` before dispatch. If native compaction is unavailable, use the existing same-profile switch and A6 brief when the source is safe and its task succeeded, even when legacy `switch = false`. A retained ceiling action claim authorizes one notice claim even after occupancy falls. The action claim also prevents a repeated ceiling action or an overlapping legacy reaction. Without a ceiling claim, legacy ratio/file-size switch fallback stays opt-in. |
 | Repeated command failure | Three matching failures of the same command and output in one turn put one concise fact and question into that turn. |
 | `children_unattended` | Queue one report for the manager. |
 
@@ -1508,16 +1508,17 @@ harness self-check fact.
   `context_used_tokens` count and does not require a known window; ratio warnings
   still require a valid used/window pair. A warning clears when its signal
   drops below threshold, becomes unavailable, or yields to a higher-priority
-  growth basis. The idle reaction requires a current qualifying sample. A
+  growth basis. A new ceiling action requires a current qualifying sample. A
   retained ratio or file-size event can authorize that reaction only when its
   own measurement is valid and its basis matches the current warning. An
   absent or invalid context count cannot trigger or sustain a context reaction.
-  Retained journal rows remain available as recorded. Suppliers are harness-native only: Codex
+  Retained journal rows remain available as recorded. Harness-native sources include Codex
   `thread/tokenUsage/updated` (latest context occupancy against `modelContextWindow`
   for the same turn or model), Claude's finalized per-message transcript usage
-  with the stream-json model window and transcript file size, Muse `session/contextUsage`, Antigravity ACP
-  `usage_update`, and OpenCode's latest assistant-message input, cache and output
-  counters from terminal readback. OpenCode has no capacity or
+  with that exact model's terminal `modelUsage` window and transcript file size,
+  Muse `session/contextUsage`, Antigravity ACP `usage_update`, and OpenCode's
+  latest assistant-message input, cache reads, cache writes, output, and reasoning
+  from terminal readback. OpenCode has no capacity or
   session-file-size source, and the Muse event log exposes no size; those signals
   remain unavailable rather than guessed.
 - `harness_checks`: one durable fact per harness, not an event: the installed

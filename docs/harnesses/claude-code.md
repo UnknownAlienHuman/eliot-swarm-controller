@@ -333,13 +333,14 @@ never as usage or billing. For context occupancy, the adapter binds the latest
 main-thread assistant message and reads the finalized usage for that exact
 message from the bounded tail of the native transcript. A streamed assistant
 frame can report output before the count is final. Occupancy is uncached input plus
-cache-read input, cache-creation input, and output tokens. Omitted or null cache
-buckets mean zero; missing or malformed required counters leave occupancy
-unavailable. The terminal `result.usage` and cumulative `modelUsage` counters
-never supply occupancy. The window comes from the same model's
-`result.modelUsage[model].contextWindow`, a window reported directly by
-the result, or an init window for the same model. An unavailable window
-leaves the ratio unavailable. An out-of-range sample leaves occupancy unavailable.
+cache-read input, cache-creation input, and output tokens. The native cache
+counters are nullable, so occupancy requires an explicit value for each counter.
+[Anthropic usage type](https://github.com/anthropics/anthropic-sdk-python/blob/main/src/anthropic/types/usage.py).
+
+The adapter pairs occupancy with `contextWindow` from the terminal result's
+`modelUsage` entry keyed by the exact model in the assistant message. Missing
+capacity leaves the ratio unavailable. An out-of-range sample leaves occupancy
+unavailable. [Claude Code `ModelUsage`](https://code.claude.com/docs/en/agent-sdk/typescript.md#modelusage).
 The transcript file size (`<config>/projects/*/<session>.jsonl`, found by
 exact-filename scan, never a guessed slug) fills `session_file_bytes`.
 Unavailable/malformed individual counters stay null

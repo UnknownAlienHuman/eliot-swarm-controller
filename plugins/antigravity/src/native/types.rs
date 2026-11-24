@@ -596,8 +596,8 @@ pub(crate) fn prompt_params(session_id: &str, text: &str) -> Value {
 /// Merge one `usage_update` body into the retained session snapshot:
 /// `used` replaces the retained context occupancy, `size` the retained
 /// window capacity, and a supplied cost amount replaces the retained
-/// cumulative cost with its verbatim unit. Replace the context fields together
-/// so a partial update cannot pair counts from different observations.
+/// cumulative cost with its verbatim unit. Context observations replace both
+/// context fields together. A cost-only update keeps the last observation.
 pub(crate) fn session_usage_from_update(
     used: Option<i64>,
     size: Option<i64>,
@@ -606,12 +606,14 @@ pub(crate) fn session_usage_from_update(
     previous: Option<&SessionUsage>,
 ) -> Option<SessionUsage> {
     let mut merged = previous.cloned().unwrap_or_default();
-    let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
-    merged.context_used_tokens = used;
-    merged.context_window_tokens = size;
-    merged.retain_valid_context();
-    let mut changed =
-        previous_context != (merged.context_used_tokens, merged.context_window_tokens);
+    let mut changed = false;
+    if used.is_some() || size.is_some() {
+        let previous_context = (merged.context_used_tokens, merged.context_window_tokens);
+        merged.context_used_tokens = used;
+        merged.context_window_tokens = size;
+        merged.retain_valid_context();
+        changed = previous_context != (merged.context_used_tokens, merged.context_window_tokens);
+    }
     if let Some(amount) = cost_amount {
         let cost = SessionCost {
             amount: Some(amount),

@@ -19,6 +19,12 @@ impl Router {
             return Ok(());
         }
         let thresholds = self.inner.observe.lock_recover().growth;
+        let compact = eliot_core::compact_hint_for_harness(&agent.harness).is_some();
+        let ceiling_action_step = if compact {
+            "compact_for_session_growth"
+        } else {
+            "switch_for_session_growth"
+        };
         let (warning, usage, ceiling_claimed) = {
             let store = self.inner.store.lock().await;
             let usage = store.get_session_usage(&agent.id, agent.generation)?;
@@ -45,28 +51,34 @@ impl Router {
                     &agent.id,
                     agent.generation,
                     SESSION_GROWTH_CEILING_REASON,
-                    None,
+                    Some(ceiling_action_step),
                 )?,
             )
         };
+        if ceiling_claimed {
+            // A completed compaction can lower occupancy before notice recovery.
+            if let Some(notice) = self
+                .claim_ceiling_notice(agent, ceiling_action_step)
+                .await?
+            {
+                self.report_session_growth(agent, &notice).await?;
+            }
+            return Ok(());
+        }
         let context_ceiling = agent
             .profile_snapshot
             .get("context_ceiling_tokens")
             .and_then(Value::as_i64)
             .filter(|ceiling| *ceiling > 0);
-        let ceiling_sample = context_ceiling
-            .zip(usage.as_ref())
-            .and_then(|(ceiling, usage)| {
-                let used = usage.valid_context_used_tokens()?;
-                (used > ceiling).then(|| (*usage).clone())
-            });
-        if let Some(sample) = ceiling_sample {
+        if let Some(ceiling) = context_ceiling.filter(|ceiling| {
+            usage
+                .as_ref()
+                .and_then(eliot_core::SessionUsage::valid_context_used_tokens)
+                .is_some_and(|used| used > *ceiling)
+        }) {
             let incident_id = session_growth_ceiling_incident_id(agent);
-            let compact = eliot_core::compact_hint_for_harness(&agent.harness).is_some();
             let action_id = ulid::Ulid::new().to_string();
-            let action = if ceiling_claimed {
-                None
-            } else if compact {
+            let action = if compact {
                 let mut request = SubmitCommand::new(action_id.clone(), "compact");
                 request.target = Some(agent.id.clone());
                 request.expected_generation = Some(agent.generation);
@@ -77,11 +89,6 @@ impl Router {
             } else {
                 self.prepare_growth_switch(agent, &action_id).await?
             };
-            let step = if compact {
-                "compact_for_session_growth"
-            } else {
-                "switch_for_session_growth"
-            };
             let mut action_claimed = false;
             {
                 let mut store = self.inner.store.lock().await;
@@ -91,8 +98,10 @@ impl Router {
                         && current.state == AgentState::Idle
                         && current.active_turn.is_none()
                 });
-                let current_usage = store.get_session_usage(&agent.id, agent.generation)?;
-                let growth_is_current = current_usage.as_ref() == Some(&sample);
+                let growth_is_current = store
+                    .get_session_usage(&agent.id, agent.generation)?
+                    .and_then(|usage| usage.valid_context_used_tokens())
+                    .is_some_and(|used| used > ceiling);
                 if !agent_is_current || !growth_is_current {
                     return Ok(());
                 }
@@ -100,12 +109,12 @@ impl Router {
                     &agent.id,
                     agent.generation,
                     SESSION_GROWTH_CEILING_REASON,
-                    None,
+                    Some(ceiling_action_step),
                 )?;
                 if !already_claimed {
                     let reaction = AttentionStep {
                         incident_id: incident_id.clone(),
-                        step: step.to_owned(),
+                        step: ceiling_action_step.to_owned(),
                         outcome: if action.is_some() {
                             "unknown"
                         } else {
@@ -130,7 +139,7 @@ impl Router {
 
             // Claim and route one follow-up notice even if dispatch returns an
             // uncertain result. The durable claim prevents replay after restart.
-            let notice = self.claim_ceiling_notice(agent, &sample).await?;
+            let notice = self.claim_ceiling_notice(agent, ceiling_action_step).await;
             let dispatch_result = match (action_claimed, action.as_ref()) {
                 (true, Some(action)) if compact => self
                     .submit(action, &Principal::Owner, "daemon.session_growth")
@@ -147,10 +156,10 @@ impl Router {
                 }
                 _ => Ok(()),
             };
-            let notice_result = if let Some(notice) = notice.as_ref() {
-                self.report_session_growth(agent, notice).await
-            } else {
-                Ok(())
+            let notice_result = match notice {
+                Ok(Some(notice)) => self.report_session_growth(agent, &notice).await,
+                Ok(None) => Ok(()),
+                Err(error) => Err(error),
             };
             dispatch_result?;
             return notice_result;
@@ -159,14 +168,7 @@ impl Router {
         let Some((seq, turn_id)) = warning else {
             return Ok(());
         };
-        if ceiling_claimed {
-            // A later legacy warning in this generation may overlap a ceiling
-            // reaction; never let it repeat a compaction or handoff.
-            return Ok(());
-        }
-
         let id = ulid::Ulid::new().to_string();
-        let compact = eliot_core::compact_hint_for_harness(&agent.harness).is_some();
         let switch = self.inner.attention.session_growth.switch;
         let (step, action, skipped) = if compact {
             let mut request = SubmitCommand::new(id.clone(), "compact");
@@ -246,7 +248,7 @@ impl Router {
     async fn claim_ceiling_notice(
         &self,
         agent: &Agent,
-        sample: &eliot_core::SessionUsage,
+        action_step: &str,
     ) -> Result<Option<AttentionStep>> {
         let reaction = AttentionStep {
             incident_id: session_growth_ceiling_incident_id(agent),
@@ -256,6 +258,14 @@ impl Router {
             turn_id: None,
         };
         let mut store = self.inner.store.lock().await;
+        if store.generation_attention_step_claimed(
+            &agent.id,
+            agent.generation,
+            SESSION_GROWTH_CEILING_REASON,
+            Some(SESSION_GROWTH_CEILING_NOTICE_STEP),
+        )? {
+            return Ok(None);
+        }
         let current = store.get_agent(&agent.id)?;
         let agent_is_current = current.is_some_and(|current| {
             current.generation == agent.generation
@@ -263,10 +273,12 @@ impl Router {
                 && current.active_turn.is_none()
         });
         if !agent_is_current
-            || store
-                .get_session_usage(&agent.id, agent.generation)?
-                .as_ref()
-                != Some(sample)
+            || !store.generation_attention_step_claimed(
+                &agent.id,
+                agent.generation,
+                SESSION_GROWTH_CEILING_REASON,
+                Some(action_step),
+            )?
         {
             return Ok(None);
         }
