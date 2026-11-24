@@ -12,6 +12,7 @@ mod common;
 mod config;
 pub mod crash;
 pub(crate) mod daemon;
+mod daemon_process;
 mod fs_invalidation;
 mod git_actions;
 mod git_integration;

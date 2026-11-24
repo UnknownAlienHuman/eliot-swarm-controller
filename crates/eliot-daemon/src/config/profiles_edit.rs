@@ -11,11 +11,17 @@
 //! URLs) are never handed out as source. Other readable settings sections stay
 //! available. Profile saves go through `settings.save`.
 
-use std::path::Path;
+use std::{ops::Range, path::Path};
 
 use eliot_core::SecretPolicy;
 use eliot_core::api::{MAX_LISTED_PROFILES, ProfileListResponse, ProfileSummary, REDACTION_MARKER};
+use serde::Deserialize;
 use serde_json::Value;
+use toml::de::{DeTable, ValueDeserializer};
+use toml_parser::{
+    Source,
+    parser::{Event, EventKind, parse_document},
+};
 
 use super::{core, parse_config, read_config_source, resolve_profile_in};
 
@@ -28,98 +34,68 @@ pub(crate) fn revision_of(source: &str) -> String {
 pub(super) struct Block<'a> {
     pub(super) text: &'a str,
     pub(super) section: Option<String>,
+    profile: Option<String>,
 }
 
-/// Table path of a header line, or `None` for any other line. A header is
-/// `[path]` or `[[path]]` followed only by whitespace or a comment, so a
-/// nested-array value line such as `["a", "b"],` is never taken for one.
-/// Segments are bare keys or quoted keys (which may hold any characters).
-fn header_path(line: &str) -> Option<Vec<String>> {
-    let trimmed = line.trim();
-    let (body, array) = match trimmed.strip_prefix("[[") {
-        Some(body) => (body, true),
-        None => (trimmed.strip_prefix('[')?, false),
-    };
-    let mut path = Vec::new();
-    let mut chars = body.char_indices().peekable();
-    loop {
-        while chars.next_if(|(_, c)| *c == ' ' || *c == '\t').is_some() {}
-        let segment = match chars.peek().map(|(_, c)| *c)? {
-            quote @ ('"' | '\'') => {
-                chars.next();
-                let mut segment = String::new();
-                loop {
-                    let (_, c) = chars.next()?;
-                    if c == quote {
-                        break;
-                    }
-                    if c == '\\' && quote == '"' {
-                        segment.push(chars.next()?.1);
-                    } else {
-                        segment.push(c);
-                    }
-                }
-                segment
-            }
-            _ => {
-                let mut segment = String::new();
-                while let Some((_, c)) =
-                    chars.next_if(|(_, c)| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-                {
-                    segment.push(c);
-                }
-                if segment.is_empty() {
-                    return None;
-                }
-                segment
-            }
-        };
-        path.push(segment);
-        while chars.next_if(|(_, c)| *c == ' ' || *c == '\t').is_some() {}
-        match chars.next()? {
-            (_, '.') => continue,
-            (index, ']') => {
-                let rest = &body[index + 1..];
-                let rest = if array { rest.strip_prefix(']')? } else { rest };
-                let rest = rest.trim_start();
-                return (rest.is_empty() || rest.starts_with('#')).then_some(path);
-            }
-            _ => return None,
-        }
-    }
-}
-
+/// Split at parsed table headers, including arrays of tables. Keep the
+/// original source slices for writes, including the BOM and boundary trivia.
 pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
-    let mut spans: Vec<(usize, usize, Option<String>)> = Vec::new();
+    let input = Source::new(source);
+    let mut spans = Vec::new();
     let mut start = 0;
-    let mut section: Option<String> = None;
-    // A leading UTF-8 BOM is not TOML content: the pinned parser accepts it,
-    // but the header scan must not treat it as part of the first header. Keep
-    // its bytes in a leading non-profile span so reads never hand it to the
-    // editor and saves preserve it byte for byte.
-    if let Some(rest) = source.strip_prefix('\u{FEFF}') {
-        let bom = source.len() - rest.len();
-        spans.push((0, bom, None));
-        start = bom;
-    }
-    let mut offset = start;
-    for line in source[start..].split_inclusive('\n') {
-        if let Some(path) = header_path(line) {
-            if offset > start {
-                spans.push((start, offset, section.clone()));
+    let mut section = None;
+    let mut profile = None;
+    let mut header_start = None;
+    let mut profile_key_expected = false;
+    parse_document(
+        &input.lex().into_vec(),
+        &mut |event: Event| match event.kind() {
+            EventKind::StdTableOpen | EventKind::ArrayTableOpen => {
+                header_start = Some(event.span().start());
+                profile_key_expected = false;
             }
-            start = offset;
-            section = path.first().cloned();
-        }
-        offset += line.len();
-    }
+            EventKind::SimpleKey if header_start.is_some() || profile_key_expected => {
+                if let Some(raw) = input.get(event) {
+                    let mut key = String::new();
+                    let mut error = None;
+                    raw.decode_key(&mut key, &mut error);
+                    let first_key = header_start.take();
+                    profile_key_expected = false;
+                    if error.is_none() {
+                        if let Some(offset) = first_key {
+                            let line = source[..offset]
+                                .rsplit_once('\n')
+                                .map_or(0, |(before, _)| before.len() + 1);
+                            let offset = line
+                                .max(source.len() - source.trim_start_matches('\u{FEFF}').len());
+                            if offset > start {
+                                spans.push((start, offset, section.take(), profile.take()));
+                            }
+                            start = offset;
+                            profile_key_expected = key == "profiles";
+                            section = Some(key);
+                            profile = None;
+                        } else {
+                            profile = Some(key);
+                        }
+                    }
+                }
+            }
+            EventKind::Whitespace | EventKind::KeySep => {}
+            _ => {
+                header_start = None;
+                profile_key_expected = false;
+            }
+        },
+        &mut (),
+    );
     if source.len() > start {
-        spans.push((start, source.len(), section));
+        spans.push((start, source.len(), section, profile));
     }
     // Boundary comments and blank lines belong to neither section. Keep them
     // as separate spans so replacing either neighbor preserves their bytes.
     let mut blocks = Vec::new();
-    for (index, (start, end, section)) in spans.iter().enumerate() {
+    for (index, (start, end, section, profile)) in spans.iter().enumerate() {
         let mut split = *end;
         if section.is_some() && spans.get(index + 1).is_some_and(|next| section != &next.2) {
             for line in source[*start..*end].split_inclusive('\n').rev() {
@@ -133,22 +109,43 @@ pub(super) fn split_blocks(source: &str) -> Vec<Block<'_>> {
         blocks.push(Block {
             text: &source[*start..split],
             section: section.clone(),
+            profile: profile.clone(),
         });
         if split < *end {
             blocks.push(Block {
                 text: &source[split..*end],
                 section: None,
+                profile: None,
             });
         }
     }
     blocks
 }
 
+/// Profile-section ranges in source order, including nested setup blocks.
+/// A range owned by the parent `[profiles]` table has no individual name.
+/// Callers must still parse the isolated ranges before editing them.
+pub fn profile_draft_blocks(source: &str) -> Vec<(Option<String>, Range<usize>)> {
+    let mut offset = 0;
+    split_blocks(source)
+        .into_iter()
+        .filter_map(|block| {
+            let start = offset;
+            offset += block.text.len();
+            (block.section.as_deref() == Some("profiles")).then_some((block.profile, start..offset))
+        })
+        .collect()
+}
+
 /// The bytes owned by one top-level section, retained in source order.
 pub(super) fn section_source(source: &str, name: &str) -> Option<String> {
+    section_from_blocks(&split_blocks(source), name)
+}
+
+pub(super) fn section_from_blocks(blocks: &[Block<'_>], name: &str) -> Option<String> {
     let mut found = false;
     let mut text = String::new();
-    for block in split_blocks(source) {
+    for block in blocks {
         if block.section.as_deref() == Some(name) {
             found = true;
             text.push_str(block.text);
@@ -159,89 +156,83 @@ pub(super) fn section_source(source: &str, name: &str) -> Option<String> {
 
 /// The top-level section that owns a byte offset, when the offset falls
 /// inside a table block.
-pub(super) fn section_at_offset(source: &str, offset: usize) -> Option<String> {
+pub(super) fn section_at_offset<'a>(blocks: &'a [Block<'_>], offset: usize) -> Option<&'a str> {
     let mut start = 0;
-    for block in split_blocks(source) {
+    for (index, block) in blocks.iter().enumerate() {
         let end = start + block.text.len();
-        if offset >= start && (offset < end || (offset == end && end == source.len())) {
-            return block.section.clone();
+        if offset >= start && (offset < end || (offset == end && index + 1 == blocks.len())) {
+            return block.section.as_deref();
         }
         start = end;
     }
     None
 }
 
-fn with_newline(text: &str) -> String {
-    if text.is_empty() || text.ends_with('\n') {
-        text.to_owned()
-    } else {
-        format!("{text}\n")
+/// Prove that replacing the table blocks would account for all profiles.
+/// Recovery must agree with the whole document's profile tree and must not
+/// have assigned a syntax fault to a profile block.
+pub(super) fn profile_source_problem(
+    source: &str,
+    document: &DeTable<'_>,
+    has_syntax_error: bool,
+    recover_profiles: impl FnOnce() -> Result<Option<toml::Value>, ()>,
+) -> Option<&'static str> {
+    let profiles = document.iter().find(|(key, _)| key.get_ref() == "profiles");
+    if let Some((key, _)) = profiles {
+        let before = &source[..key.span().start];
+        if !before
+            .rsplit('\n')
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('\u{FEFF}')
+            .trim_start()
+            .starts_with('[')
+        {
+            return Some(
+                "profiles are defined outside [profiles.*] tables; edit config.toml directly",
+            );
+        }
     }
+    if !has_syntax_error {
+        return None;
+    }
+    let recovered =
+        profiles.map(|(_, value)| toml::Value::deserialize(ValueDeserializer::from(value.clone())));
+    if let Ok(isolated) = recover_profiles()
+        && let Ok(recovered) = recovered.transpose()
+        && recovered == isolated
+    {
+        return None;
+    }
+    Some(
+        "the [profiles.*] sections cannot be separated from the rest of the file; edit config.toml directly",
+    )
 }
 
-/// The verbatim `[profiles.*]` blocks in file order.
-fn profile_text(source: &str) -> String {
-    split_blocks(source)
-        .into_iter()
-        .filter(|block| block.section.as_deref() == Some("profiles"))
-        .map(|block| with_newline(block.text))
-        .collect()
-}
-
-fn located(text: &str, offset: usize) -> String {
-    let before = &text[..offset.min(text.len())];
-    let line = before.matches('\n').count() + 1;
-    let column = before.rsplit('\n').next().map_or(0, str::len) + 1;
-    format!("line {line}, column {column}")
-}
-
-fn parse_table(text: &str, label: &str) -> core::Result<toml::Table> {
-    toml::from_str::<toml::Table>(text).map_err(|error| {
-        let at = error
+pub(super) fn profile_syntax_fault(blocks: &[Block<'_>], errors: &[toml::de::Error]) -> bool {
+    errors.iter().any(|error| {
+        error
             .span()
-            .map(|span| format!(" at {}", located(text, span.start)))
-            .unwrap_or_default();
-        core::Error::new(
-            "profile_error",
-            format!("{label}: {}{at}", error.message().trim()),
-        )
+            .and_then(|span| section_at_offset(blocks, span.start))
+            == Some("profiles")
     })
 }
 
-/// A known secret value or the redaction marker, in the raw text or in any
-/// decoded value of the parsed table (so TOML escapes cannot hide one).
-fn has_secret(policy: &SecretPolicy, text: &str, parsed: Option<&toml::Table>) -> bool {
-    text.contains(REDACTION_MARKER)
-        || policy.contains_value(&Value::String(text.to_owned()))
-        || parsed.is_some_and(|table| {
-            serde_json::to_value(table).is_ok_and(|value| {
-                policy.contains_value(&value) || value.to_string().contains(REDACTION_MARKER)
-            })
-        })
-}
-
-/// Why the profile sections of `source` may not be exposed, if so. `table`
-/// and `config` are the generic and the strict parse of that same `source`
-/// (`None` when the parse failed), so the reader parses the file once per
-/// kind.
+/// Why the profile settings cannot be safely exposed. The typed configuration
+/// and readback values are decoded from the same parsed document.
 pub(super) fn editability(
-    source: &str,
-    table: Option<&toml::Table>,
+    raw_secret: bool,
+    table: &toml::Table,
     config: Option<&super::FileConfig>,
     policy: &SecretPolicy,
 ) -> Option<&'static str> {
-    let Some(table) = table else {
-        return Some("config.toml is not valid TOML; fix it in a text editor first");
-    };
-    let text = profile_text(source);
-    let Ok(profiles) = parse_table(&text, "profiles") else {
-        return Some("the [profiles.*] sections cannot be separated from the rest of the file");
-    };
-    if profiles.get("profiles") != table.get("profiles") || profiles.keys().any(|k| k != "profiles")
-    {
-        return Some("profiles are defined outside [profiles.*] tables; edit config.toml directly");
-    }
-    if has_secret(policy, &text, Some(&profiles)) {
+    let decoded_secret = table
+        .get("profiles")
+        .and_then(|profiles| serde_json::to_value(profiles).ok())
+        .is_some_and(|value| {
+            policy.contains_value(&value) || value.to_string().contains(REDACTION_MARKER)
+        });
+    if raw_secret || decoded_secret {
         return Some(
             "the profile sections contain a known secret value; edit config.toml directly",
         );

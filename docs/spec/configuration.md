@@ -1710,15 +1710,27 @@ row links directly to Routing; reordering candidates uses the same immediate wri
 ## Profile section
 
 The `profiles` section of `settings.read`/`settings.save` carries the `[profiles.*]`
-tables as JSON, under the file revision like every other section; the desktop renders
-its TOML source view from that value and parses the edited view back before saving.
+tables as JSON, under the file revision like every other section. The desktop renders
+its TOML source view from that value. Form edits and duplication operate on parsed TOML
+tables, preserving nested arrays such as `setup`. While the source draft is invalid,
+the desktop retains the profile list and allows edits to independently parseable
+profile blocks. Saving requires a valid full draft. Named and ad-hoc launches share the
+frozen harness, model and effort representation. Named profiles apply common control,
+MCP, executable and setup validation around the harness-specific field mappings.
 Profiles resolve from `config.toml` at launch admission (above), so a saved
 file is what the next launch uses; running or queued work keeps its frozen snapshot, and
 only a successful `configure` changes a live Agent's next-turn model/effort. Daemon
 settings loaded once at startup (`[daemon]` worker limits and `[mail]`) still require a
 restart after the save.
 
-`settings.read` returns every safely readable section plus bounded issues for sections
+The `settings.read` RPC reads and validates one file revision before locking the Store
+for history. Bootstrap and project discovery also prepare settings snapshots before
+locking the Store. Write-side revision checks and publication stay under the writer
+lock. The reader parses valid TOML once for strict validation and section projection.
+Located diagnostics and possible literal secrets require a table-header scan. Malformed
+TOML uses the header spans to independently parse readable section blocks and their
+validation dependencies.
+The API returns every safely readable section plus bounded issues for sections
 that fail parsing, validation or the daemon's redaction policy. A TOML syntax diagnostic
 identifies the affected top-level section when the parser can locate it; other section
 blocks remain available in Settings. A section withheld for safety never includes its
@@ -1730,7 +1742,11 @@ including while another section is invalid.
 
 `settings.save` keeps the complete-section replacement and revision-CAS contract. The
 daemon validates the changed section and its dependencies with the same strict parser
-and validators used for launch configuration, preserves all unselected source blocks,
+and validators used for launch configuration. Parsed table headers identify source
+blocks, so bracket-like text inside a value does not affect which bytes are replaced.
+Profile blocks that cannot be separated safely are withheld with `not_allowed` and
+must be repaired directly in the file before a profile replacement can proceed.
+The writer preserves all unselected source blocks
 and reports remaining issues on the next read. A section cannot be saved when its own
 validation fails; an unrelated broken section does not hide or block a usable section.
 The desktop performs no configuration validation. Profile source still follows the

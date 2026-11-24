@@ -1358,8 +1358,10 @@ safe-config builder. Revalidate repository identity and that config before dispa
 readback. Use explicit Git argv, bounded stdout/stderr and the existing
 [`WorkspaceGit::repository_identity`](../../crates/eliot-daemon/src/workspace_git.rs),
 [`git_path_argument`](../../crates/eliot-daemon/src/git_monitor.rs) and
-[`OwnedChild::spawn`](../../crates/eliot-daemon/src/platform/custody.rs) helpers. The
-optional `manager` credential helper is an explicit canonical file receipt, runs headless,
+[`OwnedChild::spawn`](../../crates/eliot-daemon/src/platform/custody.rs) helpers. Git and
+the script runner share bounded stream capture and platform exit and process-family
+observation. Each caller classifies the resulting facts for its own command contract.
+The optional `manager` credential helper is an explicit canonical file receipt, runs headless,
 and reuses only the existing noninteractive manager login. Its receipt is never persisted
 as a secret or sent on stdin/logs; omission disables helpers and there is no authentication
 fallback or global/auth configuration change.

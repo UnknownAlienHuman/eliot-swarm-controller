@@ -22,7 +22,7 @@ use eliot_plugin::install::{
 };
 use eliot_plugin::session::split_provider_model;
 use eliot_plugin::sync::LockExt;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::path::Path;
 
 pub(crate) const ADHOC_PROFILE_PREFIX: &str = "adhoc-";
@@ -217,8 +217,8 @@ pub(crate) fn adhoc_snapshot(
         ));
     }
     let profile_name = adhoc_profile_name(&harness);
-    let mut snapshot = Map::new();
-    snapshot.insert("harness".to_owned(), Value::String(harness.clone()));
+    let mut snapshot =
+        crate::config::profile_snapshot(&harness, model.as_deref(), effort.as_deref());
     if let Some(cmd) = cmd {
         let validated = validate_profile_cmd(&profile_name, &harness, &cmd)?;
         if defaults.model == AdhocModel::ProviderIntegration
@@ -244,12 +244,6 @@ pub(crate) fn adhoc_snapshot(
             "profile_error",
             format!("ad-hoc {harness} launch requires a discovered native cmd"),
         ));
-    }
-    if let Some(model) = model {
-        snapshot.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(effort) = effort {
-        snapshot.insert("effort".to_owned(), Value::String(effort));
     }
     if let Some(access) = access {
         snapshot.insert("access".to_owned(), Value::from(access.as_str()));
