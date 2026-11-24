@@ -151,6 +151,8 @@ struct UiPending {
     kind: String,
     summary: String,
     questions: Vec<eliot_core::requests::Question>,
+    /// An approval's offered choices (Approve once, Approve always, Deny).
+    choices: Vec<eliot_core::requests::ApprovalChoice>,
 }
 
 /// Readback for the selected Agent.
@@ -176,6 +178,13 @@ struct UiDetail {
     routing: Option<eliot_core::RoutingDecision>,
     /// The latest Owner stop or interrupt the daemon retained as refused.
     control_failure: Option<eliot_core::api::AgentControlFailure>,
+    /// The task's Git branch.
+    branch: Option<String>,
+    /// The hold on the Agent's frozen account or profile, if any.
+    provider_hold: Option<eliot_core::api::AgentProviderHold>,
+    /// The session's context fill: tokens used and the window, when the
+    /// harness reports both.
+    context: Option<(i64, i64)>,
 }
 
 /// Admission of one draft submission (Send, Steer or Resume): bound Agent,
@@ -699,6 +708,11 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
             )
             .map(|request| request.questions)
             .unwrap_or_default(),
+            choices: serde_json::from_value::<eliot_core::requests::ApprovalRequest>(
+                request.details.clone(),
+            )
+            .map(|request| request.choices)
+            .unwrap_or_default(),
         })
         .collect();
     UiDetail {
@@ -716,6 +730,14 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         project_instructions: crate::monitor_view::project_instruction_lines(reply),
         routing: reply.agent.profile_choice.clone(),
         control_failure: reply.last_control_failure.clone(),
+        branch: reply.agent.branch.clone(),
+        provider_hold: reply.provider_hold.clone(),
+        context: reply.session_usage.as_ref().and_then(|usage| {
+            usage
+                .context_used_tokens
+                .zip(usage.context_window_tokens)
+                .filter(|(used, window)| *used >= 0 && *window > 0)
+        }),
     }
 }
 
@@ -944,6 +966,12 @@ impl Component for DesktopApp {
                 stopping: None,
                 stopped: HashMap::new(),
                 loss: None,
+                goal: None,
+                decisions: None,
+                holds: None,
+                hold_waited: None,
+                decision_at: 0,
+                decide_reason: String::new(),
             },
             monitor: monitor_ui::MonitorState::default(),
             inbox: inbox_ui::InboxState::default(),

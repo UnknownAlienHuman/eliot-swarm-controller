@@ -308,7 +308,6 @@ impl DesktopApp {
             Pop::Project | Pop::TitleProject => self.project_popover(context, palette),
             Pop::Quotas => self.quotas_popover(context, palette),
             Pop::Effort => self.effort_popover(context, palette),
-            Pop::Usage => self.usage_popover(context, palette),
         };
         chip.automation_id(crate::flyout::POPOVER_ANCHOR)
             .content(label)

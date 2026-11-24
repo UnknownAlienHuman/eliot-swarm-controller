@@ -300,8 +300,13 @@ pub fn icon_button(palette: Palette) -> Button {
 /// The composer's main action (Send; Stop and Steer recolor it): a raised
 /// 40-DIP square at the medium corner.
 pub fn send_button(palette: Palette) -> Button {
+    fab(palette.filled())
+}
+
+/// A 40-DIP square composer action in one family's colors.
+fn fab(overrides: ResourceOverrides) -> Button {
     Button::new()
-        .resource_overrides(palette.filled())
+        .resource_overrides(overrides)
         .width(height::FAB)
         .height(height::FAB)
         .style(ButtonStyle::TextLink)
@@ -314,12 +319,23 @@ pub fn send_icon() -> View {
 
 /// The composer's Stop turn: the 40-DIP action in `error`.
 pub fn stop_button(palette: Palette) -> Button {
-    send_button(palette).resource_overrides(palette.stop_fab())
+    fab(palette.stop_fab())
 }
 
 /// The composer's Steer: the 40-DIP action in `tertiary`.
 pub fn steer_button(palette: Palette) -> Button {
-    send_button(palette).resource_overrides(palette.steer_fab())
+    fab(palette.steer_fab())
+}
+
+/// The composer's Resume: the 40-DIP action in `secondary-container`.
+pub fn resume_button(palette: Palette) -> Button {
+    fab(palette.resume_fab())
+}
+
+/// The composer's ▾ beside its main action (`.send.more`): 32 wide, the
+/// action's height, in the action's colors (`overrides`).
+pub fn send_menu_button(overrides: ResourceOverrides) -> Button {
+    fab(overrides).width(height::SEND_MENU)
 }
 
 /// The New task button: `primary-container`, 40 DIPs, the square
@@ -577,11 +593,43 @@ pub fn search_field(fill: Brush, field: TextBox) -> View {
         )
 }
 
-/// A tool row: 32 DIPs, the card corner, tonal (running: the running
-/// tint), lifting under the pointer. Give it [`tool_content`].
-pub fn tool_row(palette: Palette, running: bool) -> Button {
+/// A 16-DIP icon: inline beside 12/16 text, in a status pill.
+pub fn xs_icon(glyph: &str) -> View {
+    icon_sized(glyph, icon_size::CHEVRON)
+}
+
+/// A plain status chip that acts (`.chip.plain`: the goal mark): no
+/// outline, full corners, `label-large` on-surface-variant, 32 DIPs.
+pub fn status_chip_button(palette: Palette) -> Button {
     Button::new()
-        .resource_overrides(palette.tool_row(running))
+        .resource_overrides(palette.icon_button())
+        .height(height::CHIP)
+        .min_height(height::CHIP)
+}
+
+/// A small outlined button (`.btn.out.sm`: the header's Changes and
+/// Agents, Deny): the `outline-variant` hairline, on-surface-variant
+/// content, 32 DIPs.
+pub fn outlined_small(palette: Palette) -> Button {
+    button(palette.outlined_plain())
+}
+
+/// A tonal button (`.btn.tonal`: Switch model, Resume): `secondary-container`.
+pub fn tonal(palette: Palette) -> Button {
+    button(palette.tonal_button())
+}
+
+/// A step's trailing time (`body-small`, on-surface-variant, or `tone`).
+pub fn tool_caption(trailing: String, tone: Option<Brush>) -> TextBlock {
+    text(trailing, style::CAPTION).foreground(tone.unwrap_or_else(|| palette().muted()))
+}
+
+/// A work-log step or head (`.step`): 32 DIPs, the card corner, no
+/// container (running: `secondary-container` at 60 %). Give it
+/// [`step_content`].
+pub fn step_row(palette: Palette, running: bool) -> Button {
+    Button::new()
+        .resource_overrides(palette.step_row(running))
         .style(ButtonStyle::Accent)
         .height(height::CONTROL)
         .min_height(height::CONTROL)
@@ -589,41 +637,65 @@ pub fn tool_row(palette: Palette, running: bool) -> Button {
         .horizontal_content_alignment(HorizontalAlignment::Stretch)
 }
 
-/// A tool row's trailing caption: a duration, or the status in `tone`
-/// while it runs.
-pub fn tool_caption(trailing: String, tone: Option<Brush>) -> TextBlock {
-    text(trailing, style::CAPTION).foreground(tone.unwrap_or_else(|| palette().muted()))
-}
-
-/// A tool row's content: a 16-DIP icon, the 13-DIP label, the trailing
-/// caption ([`tool_caption`], or a component that keeps its own running
-/// seconds) and a chevron.
-pub fn tool_content(glyph: &str, label: &str, trailing: View) -> View {
-    let trailing = Border::new()
-        .grid_column(2)
-        .vertical_alignment(VerticalAlignment::Center)
-        .content(trailing);
+/// A step's content: the leading icon or mark, verb and object in
+/// `label-large` on-surface (trimmed), the time on the right; 10 DIPs from
+/// the row's ends.
+pub fn step_content(lead: View, name: &str, trailing: View, palette: Palette) -> View {
     Grid::new()
-        .columns([
-            GridLength::Auto,
-            GridLength::STAR,
-            GridLength::Auto,
-            GridLength::Auto,
-        ])
+        .margin(Thickness::xy(spacing::ROW - spacing::INSET, 0.0))
+        .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
         .column_spacing(spacing::ROW)
         .children((
             Border::new()
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(small_icon(glyph)),
-            text(label.to_owned(), style::CHIP)
+                .content(lead),
+            text(name.to_owned(), style::BUTTON)
                 .grid_column(1)
+                .foreground(palette.text())
                 .vertical_alignment(VerticalAlignment::Center)
                 .text_trimming(TextTrimming::CharacterEllipsis),
-            trailing,
             Border::new()
-                .grid_column(3)
+                .grid_column(2)
                 .vertical_alignment(VerticalAlignment::Center)
-                .content(icon_sized(glyph::CHEVRON_RIGHT, icon_size::CHEVRON)),
+                .content(trailing),
+        ))
+}
+
+/// A 16-DIP icon in `on-surface-variant` beside quiet text (a service
+/// line, an edited file): a carrier, so it takes the role's color.
+pub fn muted_icon(glyph: &str) -> View {
+    carrier(
+        palette(),
+        |s| s.on_surface_variant,
+        "",
+        icon_size::CHEVRON,
+        icon_sized(glyph, icon_size::CHEVRON),
+    )
+}
+
+/// A file chip in an answer (`.fchip`): 24 DIPs, `radius-small`,
+/// `surface-container`; [`file_chip_content`] inside.
+pub fn file_chip(palette: Palette) -> Button {
+    Button::new()
+        .resource_overrides(palette.file_chip())
+        .height(height::BADGE)
+        .min_height(height::BADGE)
+}
+
+/// A file chip's 16-DIP icon and its 13-DIP name, 4 DIPs apart, 8 DIPs
+/// from the chip's ends.
+pub fn file_chip_content(glyph: &str, name: &str) -> View {
+    StackPanel::new()
+        .orientation(Orientation::Horizontal)
+        .spacing(spacing::XS)
+        .margin(Thickness::xy(spacing::SM - spacing::ROW, 0.0))
+        .children((
+            icon_sized(glyph, icon_size::CHEVRON),
+            text(name.to_owned(), style::BODY)
+                .font_size(style::KID_SIZE)
+                .vertical_alignment(VerticalAlignment::Center)
+                .max_width(layout::PROJECT_CHIP_WIDTH)
+                .text_trimming(TextTrimming::CharacterEllipsis),
         ))
 }
 
@@ -648,11 +720,12 @@ pub fn suggestion_card(palette: Palette, card: impl Into<View>) -> View {
         .content(card)
 }
 
-/// A message bubble: the user's in the container role, right-aligned with
-/// the tail at the bottom right (18, 18, 4, 18), 10/14 padding, 14/20.
+/// A message bubble (`.bubble`): `secondary-container`, right-aligned,
+/// `radius-large-increased` with `radius-extra-small` at the sender's
+/// corner (bottom right), 10/14 padding.
 pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>) -> View {
     Border::new()
-        .background(palette.container())
+        .background(palette.selected())
         .corner_radius(CornerRadius::new(
             radius::BUBBLE,
             radius::BUBBLE,
@@ -663,31 +736,6 @@ pub fn bubble(palette: Palette, content: impl Into<View>, max_width: Option<f64>
         .horizontal_alignment(HorizontalAlignment::Right)
         .max_width(max_width)
         .content(content)
-}
-
-/// A steered message: the user's bubble shape filled with the selected
-/// role at half strength, its "Steer" label over the text (the design's
-/// dashed outline has no Reactor stroke; a solid one reads as a field).
-pub fn steer_bubble(palette: Palette, text_value: &str, max_width: Option<f64>) -> View {
-    Border::new()
-        .background(palette.steer())
-        .corner_radius(CornerRadius::new(
-            radius::BUBBLE,
-            radius::BUBBLE,
-            radius::BUBBLE_TAIL,
-            radius::BUBBLE,
-        ))
-        .padding(Thickness::xy(spacing::TEXT_INSET, spacing::ROW))
-        .horizontal_alignment(HorizontalAlignment::Right)
-        .max_width(max_width)
-        .content(
-            StackPanel::new().spacing(spacing::ROW_GAP).children((
-                muted("Steer", style::LABEL),
-                body(text_value.to_owned())
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-            )),
-        )
 }
 
 /// The composer card: the composer role, the extra-large corner, lifted
@@ -717,37 +765,6 @@ pub fn composer_card(
             ))
             .content(content),
     )
-}
-
-/// The header's status pill: 24 DIPs, the tone's container, a 6-DIP dot
-/// and a caption of at most `label_width` that also trims to the room the
-/// pill is given (a grid, as a horizontal stack never trims).
-pub fn status_pill(palette: Palette, tone: StatusTone, label: &str, label_width: f64) -> View {
-    let (container, on) = palette.status_chip(tone);
-    Border::new()
-        .height(height::BADGE)
-        .corner_radius(radius::BADGE)
-        .background(container)
-        .padding(Thickness::xy(spacing::ROW, 0.0))
-        .horizontal_alignment(HorizontalAlignment::Left)
-        .vertical_alignment(VerticalAlignment::Center)
-        .automation_name(label.to_owned())
-        .content(
-            Grid::new()
-                .columns([GridLength::Auto, GridLength::STAR])
-                .column_spacing(spacing::CHIP_GAP)
-                .children((
-                    Border::new()
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .content(status_mark(palette, tone, layout::BADGE_DOT)),
-                    text(label.to_owned(), style::CAPTION)
-                        .grid_column(1)
-                        .foreground(on)
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .max_width(label_width)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
-                )),
-        )
 }
 
 /// A text field (the application's text-box style).

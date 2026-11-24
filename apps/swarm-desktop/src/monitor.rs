@@ -297,7 +297,7 @@ pub fn work_detail_lines(work: &WorkSummaryView, now_ms: i64) -> Vec<String> {
 }
 
 /// A local time of day, with the date when it is not today.
-fn clock(at_ms: i64) -> String {
+pub(crate) fn clock(at_ms: i64) -> String {
     let Some(at) = chrono::DateTime::from_timestamp_millis(at_ms) else {
         return "time unknown".to_owned();
     };

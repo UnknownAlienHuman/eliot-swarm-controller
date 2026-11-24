@@ -63,6 +63,8 @@ pub mod height {
     pub const FAB: f64 = brand::SIZE_COMPOSER_ACTION;
     /// The New task button.
     pub const NEW_TASK: f64 = brand::SIZE_NEW_TASK;
+    /// The ▾ beside the composer's main action.
+    pub const SEND_MENU: f64 = brand::SIZE_SEND_MENU;
     /// The conversation header.
     pub const HEADER: f64 = brand::SIZE_HEADER;
     /// Standalone fields; the Home question's project button.
@@ -309,8 +311,6 @@ pub mod layout {
     /// A nested row's indent (a task under its project, a worker under its
     /// manager): its label starts under its parent's label.
     pub const TREE_INDENT: f64 = 28.0;
-    pub const HEADER_TITLE_MIN_WIDTH: f64 = 96.0;
-    pub const HEADER_STATUS_MIN_WIDTH: f64 = 64.0;
     /// The composer's field grows with its text up to this height.
     pub const COMPOSER_MAX_HEIGHT: f64 = 200.0;
     /// The composer's field below its first line (the design's 44 DIP).
@@ -329,16 +329,23 @@ pub mod layout {
     /// A multiline source editor (TOML, JSON, a script).
     pub const SOURCE_MIN_HEIGHT: f64 = 240.0;
     pub const SOURCE_MAX_HEIGHT: f64 = 420.0;
+    /// The hand-off dialog (`Handoff.dc.html`): ContentDialog's maximum.
+    pub const HANDOFF_DIALOG_WIDTH: f64 = 548.0;
     /// The hand-off dialog's scrolling body.
     pub const DIALOG_MAX_HEIGHT: f64 = 520.0;
     /// A dropdown inside the hand-off dialog.
     pub const DIALOG_PICKER_WIDTH: f64 = 136.0;
     /// A status dot in a row.
     pub const DOT: f64 = crate::brand::SIZE_DOT_WAIT;
-    /// The dot of the header's status pill.
-    pub const BADGE_DOT: f64 = crate::brand::SIZE_DOT;
     /// Dividers.
     pub const HAIRLINE: f64 = crate::brand::SIZE_HAIRLINE;
+    /// The decision panel's `tertiary` outline.
+    pub const DECISION_OUTLINE: f64 = 2.0;
+    /// The decision panel's leading inset inside its outline (the design's
+    /// 18 from the card's edge).
+    pub const DECISION_LEADING: f64 = 16.0;
+    /// The attention strip's inset around its buttons.
+    pub const STRIP_INSET: f64 = 6.0;
     /// Extend the ripple past the control so its final frame fills the shape.
     pub const RIPPLE_INSET: f64 = 24.0;
     pub const FOCUS_RING: f64 = crate::brand::SIZE_FOCUS_RING;
@@ -364,7 +371,6 @@ pub mod layout {
     pub const PROJECT_CHIP_WIDTH: f64 = 280.0;
     /// The access and project menus above the composer.
     pub const MENU_WIDTH: f64 = 420.0;
-    pub const USAGE_MENU_WIDTH: f64 = 320.0;
     pub const EFFORT_MENU_MIN_WIDTH: f64 = 300.0;
     /// The scrolling list of a popover.
     pub const POPOVER_LIST_HEIGHT: f64 = 360.0;

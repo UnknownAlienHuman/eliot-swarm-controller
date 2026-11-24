@@ -1139,6 +1139,31 @@ of the explicitly selected release scope.
       Attention; Accounts & proxies; Cloud MCP; Daemon; Retention; Settings
       file & history), cards of rows, and the save line (Saved, Saving…,
       Not saved with Reload).
+    - [x] **Conversation.** `Conversation`, `Decision`, `Finished`, `Hold` and
+      `Handoff.dc.html`: the 52-DIP header (title over project · branch, the
+      state pill in the brand book's roles, the goal mark from `goal.get`,
+      Changes +/−, Agents, Details and Terminal toggles, the "…" menu in the
+      skeleton's order with Stop Agent and Copy branch name) and the wave while
+      a turn runs; the owner's bubble in `secondary-container` with its time
+      and Steer label; each turn's work log folded into "Worked for … · ran N
+      commands, made M edits" that opens into step rows (icon, verb and
+      object, time; running, failed, folded repeats; the last five while it
+      runs, with what the running step does); answers with Markdown tables as
+      grids and file chips; service lines; the composer's placeholders by
+      state, model chip closed while a turn runs, read-only access chip,
+      context ring, workers line and the split action (Send, Steer, Stop turn,
+      Resume) with Add as a note (`inject` at `soonest`); the decision panel
+      in the composer's place (kind line with 1 of N, the harness's words,
+      the subject, Stop turn, Snooze, Deny and the split Approve with the
+      request's offered choices); the provider-hold strip (Wait, Switch model,
+      Sign in or Pick another model, and the three corrective clears through
+      `provider.clear_hold`); "What went wrong" and "Stopped by a Swarm
+      restart"; the live line; the hand-off dialog as three kinds of
+      destination with the list under the chosen one.
+    - [ ] **Conversation, unproven variants.** The question and confidential
+      panels (Claude asks its question as an approval), the unconfirmed-outcome
+      panel, the Failed, Lost and live-line notices, the Edited files card
+      (only Codex and Muse report changed paths) and the goal mark, each live.
   - [ ] **Owner-level review.** All six themes on a private stand, side by side
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.

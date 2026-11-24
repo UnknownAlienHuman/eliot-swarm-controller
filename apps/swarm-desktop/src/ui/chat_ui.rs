@@ -13,6 +13,7 @@
 //! its turn starts.
 
 mod composer;
+mod decision;
 mod drafts;
 mod header;
 mod live_feed;
@@ -53,7 +54,41 @@ pub(super) enum ChatMsg {
     ControlWatched(String, Box<MutationResult<CommandSubmitResponse>>),
     /// The final state of a watched control, or why it was not read.
     ControlSettled(String, Box<Fallible<Command>>),
-    ApprovalRequested(UiPending, bool),
+    /// Approve or deny the request, with the offered choice when it has
+    /// choices.
+    ApprovalRequested(UiPending, bool, Option<String>),
+    /// An approve choice from the split Approve's menu, by its label: the
+    /// request shown when the click is handled.
+    ApproveChoice(String),
+    /// The open Agent's goal (`goal.get`), for the Agent it was read for.
+    GoalRead(String, Fallible<Option<Box<eliot_core::api::GoalView>>>),
+    /// The open Agent's inbox items (`owner.inbox`), for the decision panel.
+    DecisionsRead(String, Fallible<Vec<eliot_core::api::OwnerInboxItem>>),
+    /// The provider holds with their scopes, for the hold strip.
+    HoldsRead(String, Fallible<Vec<eliot_core::ProviderHold>>),
+    /// Decide an inbox item from the decision panel: its reference, the
+    /// choice and its words.
+    OwnerDecide(eliot_core::api::OwnerInboxItemRef, String, String),
+    OwnerDecided(
+        String,
+        Box<MutationResult<eliot_core::api::OwnerDecideResponse>>,
+    ),
+    /// The reason typed for an unconfirmed outcome.
+    DecideReason(String),
+    /// Previous (-1) or next (1) item of the decision panel.
+    DecisionStep(i32),
+    /// Wait out the hold: the strip hides until the hold changes.
+    HoldWait,
+    /// Clear the hold with the owner's evidence.
+    HoldClear(eliot_core::api::ProviderCorrectiveEvidence),
+    /// Sign in to the held harness (`auth.login`).
+    SignIn,
+    /// Read the conversation again after live updates stopped.
+    LiveRetry,
+    /// Add the draft as a note (`inject`).
+    NoteRequested,
+    /// A note's admission: the Agent, the draft revision it cleared.
+    NoteSubmitted(String, u64, eliot_core::Result<String>),
     AnswerRequested(UiPending),
     ControlSubmitted(String, eliot_core::Result<String>),
     /// A "…" menu entry, or Stop Agent.
@@ -406,6 +441,21 @@ pub(super) struct ChatState {
     /// The open lost Agent's loss in words, read once per generation from
     /// `diagnose` (`None` inside: nothing to say beyond Lost).
     pub(super) loss: Option<(String, i64, Option<String>)>,
+    /// The open Agent's Eliot Goal as last read (`goal.get`): the Agent
+    /// it was read for and the goal, `None` inside when it has none.
+    pub(super) goal: Option<(String, Option<eliot_core::api::GoalView>)>,
+    /// The open Agent's `owner.inbox` items (requests, unconfirmed
+    /// outcomes), for the decision panel.
+    pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>)>,
+    /// The provider holds with their scopes, read while the open Agent is
+    /// held.
+    pub(super) holds: Option<(String, Fallible<Vec<eliot_core::ProviderHold>>)>,
+    /// The hold the owner chose to wait out (Agent, hold start).
+    pub(super) hold_waited: Option<(String, i64)>,
+    /// The decision panel's shown item.
+    pub(super) decision_at: usize,
+    /// The reason typed for an unconfirmed outcome.
+    pub(super) decide_reason: String,
 }
 
 impl DesktopApp {
@@ -533,6 +583,7 @@ impl DesktopApp {
                         self.check_loss(context);
                         self.sync_open_agent();
                         self.ensure_catalog(context);
+                        self.read_conversation_extras(context);
                         let cursor = snapshot.coverage.cursor;
                         let mut generation_changed = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -563,9 +614,13 @@ impl DesktopApp {
                         }
                         self.check_waiting_inputs(context);
                         if first_load {
-                            // The transcript opens at its newest turn by
-                            // its anchor; typing goes to the composer.
-                            self.follow_latest(false, context);
+                            // The transcript opens at its newest turn: its
+                            // far-edge anchor keeps the end only once the
+                            // view is there, and a short history arrives in
+                            // one frame at the top, so it is scrolled there
+                            // once (observed live); typing goes to the
+                            // composer.
+                            self.follow_latest(true, context);
                         }
                         self.set_status("Retained history loaded; following live events.");
                         self.follow_next(Next::Wake { after: cursor }, context);
@@ -651,6 +706,7 @@ impl DesktopApp {
                             self.check_loss(context);
                             self.sync_open_agent();
                             self.ensure_catalog(context);
+                            self.read_conversation_extras(context);
                         }
                         if let Some(convo) = self.chat.convo.as_mut() {
                             if let Some(results) = reread.results.as_ref() {
@@ -753,12 +809,26 @@ impl DesktopApp {
                     .as_ref()
                     .is_some_and(|(read, at, _)| *read == agent && *at == generation)
                 {
-                    // Only a loss Swarm caused itself gets its own words; any
-                    // other cause stays in Agent details ("What went wrong").
-                    let words = summary
-                        .ok()
-                        .filter(monitor::restart_loss)
-                        .map(|_| monitor::RESTART_LOSS_WORDS.to_owned());
+                    // A failed Agent's diagnosis in one line ("What went
+                    // wrong"); a lost one gets words only when Swarm's own
+                    // restart caused it, any other cause stays in Details.
+                    let failed = self
+                        .chat
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.state == eliot_core::AgentState::Failed);
+                    let words = match summary {
+                        Ok(summary) if failed => summary
+                            .summary
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                            .map(str::to_owned),
+                        Ok(summary) if monitor::restart_loss(&summary) => {
+                            Some("Stopped by a Swarm restart".to_owned())
+                        }
+                        _ => None,
+                    };
                     self.chat.loss = Some((agent, generation, words));
                 }
             }
@@ -909,12 +979,118 @@ impl DesktopApp {
                     ))
                 });
             }
-            ChatMsg::ApprovalRequested(request, approve) => {
+            ChatMsg::ApproveChoice(label) => {
+                let choice = self.chat.detail.as_ref().and_then(|detail| {
+                    detail.pending.iter().find_map(|request| {
+                        request
+                            .choices
+                            .iter()
+                            .find(|choice| {
+                                choice.label == label
+                                    && choice.decision
+                                        == eliot_core::requests::ApprovalDecision::Approve
+                            })
+                            .map(|choice| (request.clone(), choice.id.clone()))
+                    })
+                });
+                if let Some((request, choice)) = choice {
+                    self.chat_update(
+                        ChatMsg::ApprovalRequested(request, true, Some(choice)),
+                        context,
+                    );
+                }
+            }
+            ChatMsg::GoalRead(agent, read) => {
+                if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
+                    // A failed read shows no mark rather than a stale one.
+                    self.chat.goal = Some((agent, read.ok().flatten().map(|goal| *goal)));
+                }
+            }
+            ChatMsg::DecisionsRead(agent, read) => {
+                if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
+                    match read {
+                        Ok(items) => self.chat.decisions = Some((agent, items)),
+                        Err(error) => {
+                            self.set_status(format!("The inbox was not read: {error}"));
+                        }
+                    }
+                }
+            }
+            ChatMsg::HoldsRead(agent, read) => {
+                if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
+                    self.chat.holds = Some((agent, read));
+                }
+            }
+            ChatMsg::OwnerDecide(item, choice, words) => {
+                self.owner_decide(item, choice, words, context);
+            }
+            ChatMsg::OwnerDecided(words, result) => self.owner_decided(&words, *result, context),
+            ChatMsg::DecideReason(text) => self.chat.decide_reason = text,
+            ChatMsg::DecisionStep(step) => {
+                self.chat.decision_at = self.chat.decision_at.saturating_add_signed(step as isize);
+            }
+            ChatMsg::HoldWait => {
+                if let (Some(agent), Some(hold)) = (
+                    self.selected_agent_id(),
+                    self.chat
+                        .detail
+                        .as_ref()
+                        .and_then(|detail| detail.provider_hold.as_ref()),
+                ) {
+                    self.chat.hold_waited = Some((agent, hold.held_since));
+                }
+            }
+            ChatMsg::HoldClear(evidence) => self.clear_hold(evidence, context),
+            ChatMsg::SignIn => {
+                let (Some(harness), Ok(data_dir)) = (
+                    self.chat
+                        .detail
+                        .as_ref()
+                        .map(|detail| detail.harness.clone()),
+                    self.data_dir.clone(),
+                ) else {
+                    return;
+                };
+                self.set_status(format!("Requesting a {harness} sign-in…"));
+                let _task = context.spawn_background(move |_| {
+                    let result = client::block_on(client::auth_login(&data_dir, &harness, None))
+                        .map(|reply| format!("{:?}", reply.status).to_lowercase());
+                    Message::Chat(ChatMsg::ControlSubmitted("Sign in".to_owned(), result))
+                });
+            }
+            ChatMsg::LiveRetry => self.start_snapshot(context),
+            ChatMsg::NoteRequested => self.add_note(context),
+            ChatMsg::NoteSubmitted(agent, revision, outcome) => {
+                self.settle_mutation(
+                    outcome
+                        .as_ref()
+                        .err()
+                        .is_none_or(|error| !crate::state::uncertain(error)),
+                );
+                match outcome {
+                    Ok(state) => {
+                        // The note is in: the composer empties.
+                        self.chat.drafts.borrow_mut().ack(&agent, revision);
+                        self.clear_attached(&agent);
+                        self.set_status(format!("Note added: {state}."));
+                    }
+                    Err(error) if crate::state::uncertain(&error) => self.alert(format!(
+                        "Add as a note: not confirmed (trying again reuses its id): {}",
+                        error.user_message()
+                    )),
+                    Err(error) => {
+                        self.alert(format!("Add as a note refused: {}", error.user_message()))
+                    }
+                }
+                self.queue_reread(Invalidation::default(), context);
+            }
+            ChatMsg::ApprovalRequested(request, approve, choice) => {
                 let verb = if approve { "Approve" } else { "Deny" };
                 let key = format!(
-                    "{verb}:{}:{}",
+                    "{verb}:{}:{}:{}",
                     request.binding.agent,
-                    request.binding.request.clone().unwrap_or_default()
+                    request.binding.request.clone().unwrap_or_default(),
+                    choice.as_deref().unwrap_or_default()
                 );
                 self.submit_control(context, verb, key, move |data_dir, mutation_id| {
                     client::block_on(client::submit_approval(
@@ -925,7 +1101,7 @@ impl DesktopApp {
                             generation: request.binding.generation,
                             request: request.binding.request.clone().unwrap_or_default(),
                             approve,
-                            choice: None,
+                            choice,
                             feedback: None,
                         },
                     ))
@@ -1091,6 +1267,46 @@ impl DesktopApp {
                 }
             }
         }
+    }
+
+    /// Add the draft as a note to the open Agent (`inject` at `soonest`):
+    /// into its context at the next safe point of a running turn, else with
+    /// the next input, without starting a turn. The draft stays until the
+    /// daemon admits the note.
+    fn add_note(&mut self, context: &ComponentContext<Self>) {
+        if self.submitting() {
+            return;
+        }
+        let (Some(agent), Some(generation), Ok(data_dir)) = (
+            self.selected_agent_id(),
+            self.chat.detail.as_ref().map(|detail| detail.generation),
+            self.data_dir.clone(),
+        ) else {
+            return;
+        };
+        let text = profiles::normalize_newlines(self.chat.drafts.borrow().text(Some(&agent)));
+        let text = crate::attachments::compose(&text, self.attached_to(&agent));
+        if text.trim().is_empty() {
+            self.alert("Type a note first.");
+            return;
+        }
+        let revision = self.chat.drafts.borrow().revision(&agent);
+        let key = format!("note:{agent}:{generation}:{revision}");
+        let mutation_id = self.ledger.id_for(&key);
+        self.in_flight_key = Some(key);
+        self.alert = None;
+        self.set_status(format!("Add as a note ({mutation_id})…"));
+        let _task = context.spawn_background(move |_| {
+            let outcome = client::block_on(client::submit_inject(
+                &data_dir,
+                mutation_id,
+                &agent,
+                generation,
+                &text,
+            ))
+            .map(|reply| submit_note(&reply));
+            Message::Chat(ChatMsg::NoteSubmitted(agent, revision, outcome))
+        });
     }
 
     /// Stop this Agent generation (its process and session), from the
@@ -1483,7 +1699,6 @@ impl DesktopApp {
             // Home is built below, around the notice and the composer.
             _ => View::empty(),
         };
-        let pending = self.pending_view(column, context, palette);
         let reconnect = self.reconnect_notice(column, palette);
         let alert: View = match (&self.chat.confirm_force, &self.alert) {
             (Some((bound, title)), _) => {
@@ -1562,10 +1777,41 @@ impl DesktopApp {
             }
             (None, None) => self
                 .archived_notice(column, context, palette)
-                .or_else(|| self.loss_notice(column))
+                .or_else(|| self.loss_notice(column, context, palette))
                 .unwrap_or_else(View::empty),
         };
-        let composer = self.composer_view(column, context, palette);
+        // Waiting for the owner: the decision panel takes the composer's
+        // place; otherwise the hold strip and the workers line sit above
+        // the composer.
+        let composer = match self.decision_panel(column, context, palette) {
+            Some(panel) if !home => panel,
+            _ => {
+                let above: Vec<KeyedView> = [
+                    self.hold_strip(context, palette)
+                        .map(|strip| ("strip", strip)),
+                    self.workers_line(palette).map(|line| ("workers", line)),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|(key, view)| KeyedView::new(key, view))
+                .collect();
+                let composer = self.composer_view(column, context, palette);
+                if home || above.is_empty() {
+                    composer
+                } else {
+                    StackPanel::new().grid_row(5).children((
+                        StackPanel::new()
+                            .width(column)
+                            .max_width(tokens::layout::READING_WIDTH)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(above),
+                        composer,
+                    ))
+                }
+            }
+        };
         // Home: the question, the notice, the composer and the suggestions
         // in one column over the (empty) transcript.
         if home {
@@ -1582,15 +1828,21 @@ impl DesktopApp {
                 .children((
                     header,
                     View::fragment((transcript, home)),
-                    pending,
+                    View::empty(),
                     View::empty(),
                     View::empty(),
                 ));
         }
 
         let body = View::fragment((transcript, cover));
-        // Rows: the header, the transcript, (spare), pending requests, the
-        // notice, the composer (its popovers are flyouts on its chips).
+        // The live line under the header (Reconnecting, Live updates
+        // stopped), in the transcript's row over its top.
+        let live = Border::new()
+            .grid_row(1)
+            .vertical_alignment(VerticalAlignment::Top)
+            .content(self.live_line(context, palette));
+        // Rows: the header, the transcript, (spare), (spare), the notice,
+        // the composer or the decision panel (its popovers are flyouts).
         Grid::new()
             .rows([
                 GridLength::Auto,
@@ -1600,7 +1852,7 @@ impl DesktopApp {
                 GridLength::Auto,
                 GridLength::Auto,
             ])
-            .children((header, body, pending, alert, composer))
+            .children((header, View::fragment((body, live)), alert, composer))
     }
 
     /// The reading column's width: the reading width, or the main area less

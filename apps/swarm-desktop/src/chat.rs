@@ -183,6 +183,8 @@ enum Activity {
     /// the turn where it was accepted.
     Steer {
         command: String,
+        /// When the daemon accepted it (its event time).
+        at: i64,
     },
     /// A Swarm note (an `inject` command) delivered into this turn, and
     /// whether a project rule caused it (its frame then names the rule).
@@ -218,6 +220,8 @@ impl TurnKey {
 struct TurnEntry {
     key: TurnKey,
     started_ms: Option<i64>,
+    /// When the turn ended (readback, else its completion event).
+    completed_ms: Option<i64>,
     first_seq: Option<i64>,
     status: TurnStatus,
     command_id: Option<String>,
@@ -247,6 +251,7 @@ impl TurnEntry {
         Self {
             key,
             started_ms: None,
+            completed_ms: None,
             first_seq: None,
             status: TurnStatus::Running,
             command_id: None,
@@ -280,7 +285,7 @@ impl TurnEntry {
             .iter()
             .map(|entry| match entry {
                 Activity::Message { text, .. } => text.len(),
-                Activity::Steer { command } | Activity::Note { command, .. } => command.len(),
+                Activity::Steer { command, .. } | Activity::Note { command, .. } => command.len(),
                 Activity::Tools { rows, .. } => rows
                     .iter()
                     .map(|row| {
@@ -771,6 +776,13 @@ pub enum PartKind {
     /// Text Swarm inserted (a Swarm note, service or peer mail): its frame
     /// line as the label, the quoted content shown when expanded.
     Note,
+    /// A turn's work log head: what its steps did in words (the label),
+    /// and its state, start, duration, running step and step count (the
+    /// text, [`TOOL_FIELDS`] apart). The parts after it up to the answer
+    /// are its body.
+    Log,
+    /// The files a finished turn's steps report changing (the detail).
+    Edited,
 }
 
 /// Why a local input did not start: the `swarm why` summary line and its
@@ -868,7 +880,7 @@ impl TurnEntry {
             .as_deref()
             .into_iter()
             .chain(self.activity.iter().filter_map(|entry| match entry {
-                Activity::Steer { command } | Activity::Note { command, .. } => {
+                Activity::Steer { command, .. } | Activity::Note { command, .. } => {
                     Some(command.as_str())
                 }
                 _ => None,
@@ -893,6 +905,22 @@ impl Conversation {
 
     pub fn agent(&self) -> &str {
         &self.agent
+    }
+
+    /// Whether this conversation shows `command` (a turn's input, a steer,
+    /// a note, a local input).
+    pub fn knows(&self, command: &str) -> bool {
+        self.references(command) || self.local.iter().any(|known| known == command)
+    }
+
+    /// Whether a resident turn's outcome is not confirmed.
+    pub fn has_unconfirmed(&self) -> bool {
+        self.turns.values().any(|turn| {
+            matches!(
+                turn.status,
+                TurnStatus::Unknown | TurnStatus::Completed(Some(TurnOutcome::Unknown))
+            )
+        })
     }
 
     pub fn coverage(&self) -> &Coverage {
@@ -1034,17 +1062,19 @@ impl Conversation {
                     if !turn.read_back {
                         turn.status = TurnStatus::Completed(None);
                     }
+                    turn.completed_ms.get_or_insert(event.ts);
                     invalidation.turns = true;
                     invalidation.detail |= generation == self.coverage.generation;
                 }
                 "command.accepted" if data_str(event, "verb") == Some("steer") => {
                     if let Some(command) = data_str(event, "command_id") {
                         let present = turn.activity.iter().any(|entry| {
-                            matches!(entry, Activity::Steer { command: known } if known == command)
+                            matches!(entry, Activity::Steer { command: known, .. } if known == command)
                         });
                         if !present {
                             turn.activity.push(Activity::Steer {
                                 command: command.to_owned(),
+                                at: event.ts,
                             });
                         }
                         if !self.inputs.contains_key(command) {
@@ -1197,6 +1227,9 @@ impl Conversation {
                 .or_insert_with(|| TurnEntry::new(key));
             if let Some(started) = read.started_at.or(read.completed_at) {
                 turn.started_ms = Some(started);
+            }
+            if let Some(completed) = read.completed_at {
+                turn.completed_ms = Some(completed);
             }
             turn.status = match read.state {
                 TurnState::Running => TurnStatus::Running,
@@ -1498,6 +1531,11 @@ impl Conversation {
     fn turn_item(&self, turn: &TurnEntry) -> TurnItem {
         let key = format!("turn:{}:{}", turn.key.generation, turn.key.id);
         let mut parts = Vec::new();
+        // The owner's message, with when its turn started ("You · 13:58").
+        let you = match turn.started_ms {
+            Some(at) => format!("You \u{b7} {}", crate::monitor::clock(at)),
+            None => "You".to_owned(),
+        };
         match turn.command_id.as_deref() {
             Some(command) => {
                 let text = match self.inputs.get(command) {
@@ -1516,7 +1554,7 @@ impl Conversation {
                     parts.push(Part::new(
                         format!("in:{command}"),
                         PartKind::Input,
-                        "You".to_owned(),
+                        you,
                         text,
                         Vec::new(),
                     ));
@@ -1542,22 +1580,27 @@ impl Conversation {
                         Activity::Message { text, .. } if text.trim() == answer.trim())
                 })
         });
+        let running = turn.status == TurnStatus::Running;
+        // The work log: the agent's notes, steers, Swarm notes and steps in
+        // order, under one head line ([`PartKind::Log`]).
+        let mut activity = Vec::new();
+        let mut tally = LogTally::default();
         for (index, entry) in turn.activity.iter().enumerate() {
             if Some(index) == echoed {
                 continue;
             }
             match entry {
-                Activity::Message { key, text } => parts.push(Part::new(
+                Activity::Message { key, text } => activity.push(Part::new(
                     key.clone(),
                     PartKind::Progress,
                     "Assistant · progress".to_owned(),
                     text.clone(),
                     Vec::new(),
                 )),
-                Activity::Steer { command } => parts.push(Part::new(
+                Activity::Steer { command, at } => activity.push(Part::new(
                     format!("steer:{command}"),
                     PartKind::Steer,
-                    "You · steered".to_owned(),
+                    format!("Steer \u{b7} {}", crate::monitor::clock(*at)),
                     match self.inputs.get(command) {
                         Some(InputText::Loaded(text) | InputText::Note { text, .. }) => {
                             text.clone()
@@ -1588,7 +1631,7 @@ impl Conversation {
                             };
                             let note = eliot_core::swarm_note(text, principal);
                             let frame = note.lines().next().unwrap_or_default().to_owned();
-                            parts.push(Part::new(
+                            activity.push(Part::new(
                                 key,
                                 PartKind::Note,
                                 frame,
@@ -1597,23 +1640,23 @@ impl Conversation {
                             ));
                         }
                         Some(InputText::Inserted(blocks)) => {
-                            parts.extend(inserted_parts(&key, blocks));
+                            activity.extend(inserted_parts(&key, blocks));
                         }
-                        Some(InputText::Loaded(text)) => parts.push(Part::new(
+                        Some(InputText::Loaded(text)) => activity.push(Part::new(
                             key,
                             PartKind::Note,
                             "Swarm note".to_owned(),
                             text.clone(),
                             Vec::new(),
                         )),
-                        Some(InputText::Unavailable(reason)) => parts.push(Part::new(
+                        Some(InputText::Unavailable(reason)) => activity.push(Part::new(
                             key,
                             PartKind::Note,
                             "Swarm note".to_owned(),
                             format!("(note text unavailable: {reason})"),
                             Vec::new(),
                         )),
-                        None => parts.push(Part::new(
+                        None => activity.push(Part::new(
                             key,
                             PartKind::Note,
                             "Swarm note".to_owned(),
@@ -1630,7 +1673,7 @@ impl Conversation {
                     failed,
                 } => {
                     if *total > rows.len() {
-                        parts.push(Part::new(
+                        activity.push(Part::new(
                             format!("{key}:omitted"),
                             PartKind::Notice,
                             "Tools".to_owned(),
@@ -1642,129 +1685,24 @@ impl Conversation {
                             Vec::new(),
                         ));
                     }
+                    // Consecutive identical finished steps fold into one row
+                    // ("Read a file · 3 calls").
+                    let mut steps: Vec<Step> = Vec::new();
                     for row in rows {
-                        // As the design's tool rows: a command shows its
-                        // first line ("cargo clippy -p swarm-desktop"), an
-                        // edit names its file ("Edited nav.rs"); the label
-                        // picks the glyph.
-                        let file = |path: &str| {
-                            std::path::Path::new(path)
-                                .file_name()
-                                .and_then(|name| name.to_str())
-                                .unwrap_or(path)
-                                .to_owned()
-                        };
-                        let first_line = row.command.as_deref().and_then(|command| {
-                            command.lines().map(str::trim).find(|line| !line.is_empty())
-                        });
-                        let (label, name) =
-                            match (row.tool.as_str(), row.paths.as_slice(), first_line) {
-                                (_, _, Some(line)) => ("Command", line.to_owned()),
-                                ("commandExecution", _, None) => {
-                                    ("Command", "Run command".to_owned())
-                                }
-                                ("fileChange", [], _) => ("Edit", "Edit files".to_owned()),
-                                ("fileChange", [one], _) => {
-                                    ("Edit", format!("Edited {}", file(one)))
-                                }
-                                ("fileChange", [first, rest @ ..], _) => (
-                                    "Edit",
-                                    format!("Edited {} and {} more", file(first), rest.len()),
-                                ),
-                                (other, _, None) => ("Tool", other.to_owned()),
-                            };
-                        // A tool the turn ended without hearing the end of
-                        // (a stop, a failure) no longer runs.
-                        let status = match (row.done, row.status.as_deref(), &turn.status) {
-                            (false, _, TurnStatus::Running) => "Running",
-                            (false, _, TurnStatus::Completed(Some(TurnOutcome::Interrupted))) => {
-                                if turn.stopped_by_owner {
-                                    "Stopped by you"
-                                } else {
-                                    "Interrupted"
-                                }
-                            }
-                            (false, _, _) => "Ended · result not reported",
-                            (true, Some(status), _) if is_success(status) => "Completed",
-                            (true, Some(status), _) => status,
-                            (true, None, _) => "Finished · result not reported",
-                        };
-                        // A failed command's row says its exit code; the first line of
-                        // the retained tail follows in the expanded detail.
-                        let status = row.exit_code.map_or_else(
-                            || status.to_owned(),
-                            |code| format!("{status} · exit {code}"),
-                        );
-                        let elapsed = row
-                            .started_ms
-                            .zip(row.completed_ms)
-                            .and_then(|(start, end)| end.checked_sub(start))
-                            .filter(|ms| *ms >= 0);
-                        let duration = elapsed.map_or_else(
-                            || "duration unavailable".to_owned(),
-                            |ms| format!("~{:.1} s", ms as f64 / 1_000.0),
-                        );
-                        let mut detail: Vec<String> = row
-                            .command
-                            .iter()
-                            .flat_map(|command| command.lines())
-                            .map(str::to_owned)
-                            .collect();
-                        if let Some(tail) = row.error_tail.as_deref() {
-                            detail.push(format!(
-                                "Failed with exit {} · {}",
-                                row.exit_code.map_or_else(
-                                    || "code unavailable".to_owned(),
-                                    |code| code.to_string(),
-                                ),
-                                tail.lines().next().unwrap_or_default()
-                            ));
+                        let step = Step::of(row, &turn.status, turn.stopped_by_owner);
+                        tally.count(&step, row);
+                        match steps.last_mut() {
+                            Some(last) if last.folds(&step) => last.fold(step),
+                            _ => steps.push(step),
                         }
-                        detail.extend(row.paths.iter().cloned());
-                        if row.paths_truncated {
-                            detail.push(
-                                "More changed paths were not retained in this card.".to_owned(),
-                            );
-                        }
-                        if row.error_tail.is_none() {
-                            detail.push("Tool output was not retained by the app.".to_owned());
-                        }
-                        if elapsed.is_some() {
-                            detail.push(
-                                "Duration is measured between the recorded start and finish."
-                                    .to_owned(),
-                            );
-                        }
-                        // A running row carries its start, so the view
-                        // counts its elapsed seconds without a new revision.
-                        let started = row
-                            .started_ms
-                            .filter(|_| status == "Running")
-                            .map(|ms| ms.to_string())
-                            .unwrap_or_default();
-                        parts.push(Part::new(
-                            format!("tools:{}", row.item_id),
-                            PartKind::Tools,
-                            label.to_owned(),
-                            [
-                                name.as_str(),
-                                status.as_str(),
-                                duration.as_str(),
-                                started.as_str(),
-                            ]
-                            .iter()
-                            .map(|field| field.to_owned())
-                            .collect::<Vec<_>>()
-                            .join(&TOOL_FIELDS.to_string()),
-                            detail,
-                        ));
                     }
+                    activity.extend(steps.into_iter().map(Step::part));
                 }
             }
         }
 
         if turn.messages_dropped > 0 {
-            parts.push(Part::new(
+            activity.push(Part::new(
                 format!("dropped:{}", turn.key.id),
                 PartKind::Notice,
                 "Progress".to_owned(),
@@ -1779,6 +1717,31 @@ impl Conversation {
                 Vec::new(),
             ));
         }
+        // The head line: "Worked for 4m 12s · ran 6 commands, edited 3
+        // files"; while the turn runs, its start (the view counts the time)
+        // and what the running step does.
+        if running || !activity.is_empty() {
+            let elapsed = turn
+                .started_ms
+                .zip(turn.completed_ms)
+                .and_then(|(start, end)| end.checked_sub(start))
+                .filter(|ms| *ms >= 0);
+            let fields = [
+                if running { "running" } else { "done" }.to_owned(),
+                turn.started_ms.map(|ms| ms.to_string()).unwrap_or_default(),
+                elapsed.map(|ms| ms.to_string()).unwrap_or_default(),
+                tally.doing.unwrap_or_default().to_owned(),
+                tally.steps.to_string(),
+            ];
+            parts.push(Part::new(
+                format!("log:{}", turn.key.id),
+                PartKind::Log,
+                tally.words(),
+                fields.join(&TOOL_FIELDS.to_string()),
+                Vec::new(),
+            ));
+        }
+        parts.extend(activity);
         let final_key = format!("final:{}", turn.key.id);
         let label = match &turn.status {
             TurnStatus::Completed(Some(TurnOutcome::Success)) | TurnStatus::Completed(None) => {
@@ -1805,19 +1768,19 @@ impl Conversation {
                 text,
                 Vec::new(),
             )),
-            (None, TurnStatus::Running) => parts.push(Part::new(
-                final_key,
-                PartKind::Working,
-                label,
-                "Working…".to_owned(),
-                Vec::new(),
-            )),
+            // While the turn runs, the work log's head says so.
+            (None, TurnStatus::Running) => {}
             (None, _) => parts.push(Part::new(
                 final_key,
                 PartKind::Notice,
                 label,
                 if turn.stopped_by_owner {
-                    "Stopped by you.".to_owned()
+                    match turn.started_ms.zip(turn.completed_ms) {
+                        Some((start, end)) if end >= start => {
+                            format!("Stopped by you after {}.", short_duration(end - start))
+                        }
+                        _ => "Stopped by you.".to_owned(),
+                    }
                 } else {
                     "No public final text for this turn.".to_owned()
                 },
@@ -1831,7 +1794,8 @@ impl Conversation {
         if matches!(
             turn.status,
             TurnStatus::Completed(Some(TurnOutcome::Failure))
-        ) {
+        ) && let Some(final_part) = parts.pop()
+        {
             let reason = turn
                 .failure_reason
                 .clone()
@@ -1840,7 +1804,6 @@ impl Conversation {
             if let Some(model) = turn.failure_model.as_deref() {
                 detail.push(format!("Model {model}"));
             }
-            let final_part = parts.pop().expect("final part was just pushed");
             let (text, detail) = match final_part.kind {
                 PartKind::Final => {
                     let mut with_text = vec![reason];
@@ -1855,6 +1818,17 @@ impl Conversation {
                 final_part.label,
                 text,
                 detail,
+            ));
+        }
+        // Under the answer: the files the turn's steps report changing
+        // (only adapters that report changed paths give them).
+        if !running && !tally.edit_paths.is_empty() {
+            parts.push(Part::new(
+                format!("edited:{}", turn.key.id),
+                PartKind::Edited,
+                "Edited files".to_owned(),
+                String::new(),
+                tally.edit_paths.clone(),
             ));
         }
         let revision = parts.iter().fold(text_hash(&turn.key.id), |hash, part| {
@@ -1936,6 +1910,334 @@ fn generation_item(generation: i64, line: &str) -> TurnItem {
 /// `n` and the noun in the right number: "1 tool", "3 tools".
 fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A duration the way the work log says it: "41s", "4m 12s", "1h 05m".
+pub fn short_duration(ms: i64) -> String {
+    let seconds = ms.max(0) / 1_000;
+    match (seconds / 3_600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s:02}s"),
+        (h, m, _) => format!("{h}h {m:02}m"),
+    }
+}
+
+/// What a step does, from its tool: its row's icon and verb. Vendors name
+/// their tools differently (`commandExecution`, `Bash`, `bash`); any other
+/// tool is a plain "Tool".
+fn step_kind(tool: &str, command: bool) -> &'static str {
+    if command {
+        return "Command";
+    }
+    match tool.to_ascii_lowercase().as_str() {
+        "commandexecution" | "bash" | "shell" | "run_shell_command" | "exec" => "Command",
+        "filechange" | "edit" | "write" | "multiedit" | "notebookedit" | "apply_patch"
+        | "patch" | "replace" | "write_file" | "edit_file" | "str_replace_editor" => "Edit",
+        "read" | "read_file" | "view" | "notebookread" | "read_many_files" => "Read",
+        "grep"
+        | "glob"
+        | "search"
+        | "list"
+        | "ls"
+        | "find"
+        | "codebase_search"
+        | "search_file_content"
+        | "list_directory" => "Search",
+        "webfetch" | "websearch" | "web_search" | "web_fetch" | "google_web_search" | "fetch" => {
+            "Web"
+        }
+        "task" | "agent" | "spawn_agent" => "Worker",
+        "todowrite" | "update_plan" | "todo" => "Plan",
+        _ => "Tool",
+    }
+}
+
+/// One work-log step: a tool row in words, or several identical ones
+/// folded together.
+struct Step {
+    item_id: String,
+    kind: &'static str,
+    /// Verb and object ("Ran cargo build", "Edited nav.rs").
+    name: String,
+    /// `run`, `ok`, `fail` or `ended` (stopped or result not reported).
+    class: &'static str,
+    /// The status in words, with a failed command's exit code.
+    status: String,
+    elapsed: Option<i64>,
+    /// The start of a running step: the view counts its seconds.
+    started: Option<i64>,
+    detail: Vec<String>,
+    calls: usize,
+}
+
+impl Step {
+    fn of(row: &ToolRow, turn: &TurnStatus, stopped_by_owner: bool) -> Self {
+        let file = |path: &str| {
+            std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(path)
+                .to_owned()
+        };
+        let line = row
+            .command
+            .as_deref()
+            .and_then(|command| command.lines().map(str::trim).find(|line| !line.is_empty()))
+            .map(str::to_owned);
+        let kind = step_kind(&row.tool, line.is_some());
+        // A tool the turn ended without hearing the end of (a stop, a
+        // failure) no longer runs.
+        let (class, status) = match (row.done, row.status.as_deref(), turn) {
+            (false, _, TurnStatus::Running) => ("run", "Running".to_owned()),
+            (false, _, TurnStatus::Completed(Some(TurnOutcome::Interrupted))) => (
+                "ended",
+                if stopped_by_owner {
+                    "Stopped by you"
+                } else {
+                    "Interrupted"
+                }
+                .to_owned(),
+            ),
+            (false, _, _) => ("ended", "Ended · result not reported".to_owned()),
+            (true, Some(status), _) if is_success(status) => ("ok", "Completed".to_owned()),
+            (true, Some(status), _) => ("fail", status.to_owned()),
+            (true, None, _) => ("ended", "Finished · result not reported".to_owned()),
+        };
+        let status = match row.exit_code {
+            Some(code) => format!("{status} · exit {code}"),
+            None => status,
+        };
+        let object = match row.paths.as_slice() {
+            [] => None,
+            [one] => Some(file(one)),
+            [first, rest @ ..] => Some(format!("{} and {} more", file(first), rest.len())),
+        };
+        let running = class == "run";
+        let name = match (kind, line, object) {
+            ("Command", Some(line), _) if class == "fail" => match row.exit_code {
+                Some(code) => format!("{line} failed (exit {code})"),
+                None => format!("{line} failed"),
+            },
+            ("Command", Some(line), _) if running => format!("Running {line}"),
+            ("Command", Some(line), _) => format!("Ran {line}"),
+            ("Command", None, _) if running => "Running a command".to_owned(),
+            ("Command", None, _) => "Ran a command".to_owned(),
+            ("Edit", _, Some(object)) if running => format!("Editing {object}"),
+            ("Edit", _, Some(object)) => format!("Edited {object}"),
+            ("Edit", _, None) if running => "Editing a file".to_owned(),
+            ("Edit", _, None) => "Edited a file".to_owned(),
+            ("Read", _, Some(object)) => format!("Read {object}"),
+            ("Read", _, None) if running => "Reading a file".to_owned(),
+            ("Read", _, None) => "Read a file".to_owned(),
+            ("Search", _, _) if running => "Searching".to_owned(),
+            ("Search", _, _) => "Searched the code".to_owned(),
+            ("Web", _, _) if running => "Searching the web".to_owned(),
+            ("Web", _, _) => "Searched the web".to_owned(),
+            ("Worker", _, _) if running => "Starting a worker".to_owned(),
+            ("Worker", _, _) => "Started a worker".to_owned(),
+            ("Plan", _, _) => "Updated the plan".to_owned(),
+            (_, _, _) if running => format!("Calling {}", row.tool),
+            (_, _, _) => format!("Called {}", row.tool),
+        };
+        let name = if class == "fail" && kind != "Command" {
+            format!("{name} · failed")
+        } else {
+            name
+        };
+        let elapsed = row
+            .started_ms
+            .zip(row.completed_ms)
+            .and_then(|(start, end)| end.checked_sub(start))
+            .filter(|ms| *ms >= 0);
+        let mut detail: Vec<String> = row
+            .command
+            .iter()
+            .flat_map(|command| command.lines())
+            .map(str::to_owned)
+            .collect();
+        if let Some(tail) = row.error_tail.as_deref() {
+            detail.push(format!(
+                "Failed with exit {} · {}",
+                row.exit_code
+                    .map_or_else(|| "code unavailable".to_owned(), |code| code.to_string()),
+                tail.lines().next().unwrap_or_default()
+            ));
+        }
+        detail.extend(row.paths.iter().cloned());
+        if row.paths_truncated {
+            detail.push("More changed paths were not retained in this card.".to_owned());
+        }
+        if row.error_tail.is_none() {
+            detail.push("Tool output was not retained by the app.".to_owned());
+        }
+        Self {
+            item_id: row.item_id.clone(),
+            kind,
+            name,
+            class,
+            status,
+            elapsed,
+            started: row.started_ms.filter(|_| running),
+            detail,
+            calls: 1,
+        }
+    }
+
+    /// Whether `next` repeats this finished step exactly.
+    fn folds(&self, next: &Step) -> bool {
+        self.class == "ok"
+            && next.class == "ok"
+            && self.kind == next.kind
+            && self.name == next.name
+            && self.detail.len() + next.detail.len() <= 40
+    }
+
+    fn fold(&mut self, next: Step) {
+        self.calls += 1;
+        self.elapsed = self.elapsed.zip(next.elapsed).map(|(a, b)| a + b);
+        self.detail.extend(next.detail);
+    }
+
+    /// The step's part: kind as the label; name, status, duration, start
+    /// and class apart ([`TOOL_FIELDS`]).
+    fn part(self) -> Part {
+        let name = if self.calls > 1 {
+            format!("{} · {} calls", self.name, self.calls)
+        } else {
+            self.name
+        };
+        let duration = self
+            .elapsed
+            .map_or_else(|| "\u{2014}".to_owned(), short_duration);
+        let started = self.started.map(|ms| ms.to_string()).unwrap_or_default();
+        Part::new(
+            format!("tools:{}", self.item_id),
+            PartKind::Tools,
+            self.kind.to_owned(),
+            [
+                name.as_str(),
+                self.status.as_str(),
+                duration.as_str(),
+                started.as_str(),
+                self.class,
+            ]
+            .join(&TOOL_FIELDS.to_string()),
+            self.detail,
+        )
+    }
+}
+
+/// What a turn's steps did, for its work log's head line.
+#[derive(Default)]
+struct LogTally {
+    steps: usize,
+    commands: usize,
+    edits: usize,
+    edits_without_paths: usize,
+    edit_paths: Vec<String>,
+    reads: usize,
+    reads_without_paths: usize,
+    read_paths: Vec<String>,
+    searches: usize,
+    web: usize,
+    workers: usize,
+    plans: usize,
+    tools: usize,
+    /// What the running step does ("Running commands").
+    doing: Option<&'static str>,
+}
+
+impl LogTally {
+    fn count(&mut self, step: &Step, row: &ToolRow) {
+        self.steps += 1;
+        let add = |paths: &mut Vec<String>| {
+            for path in &row.paths {
+                if !paths.contains(path) {
+                    paths.push(path.clone());
+                }
+            }
+        };
+        match step.kind {
+            "Command" => self.commands += 1,
+            "Edit" => {
+                self.edits += 1;
+                if row.paths.is_empty() {
+                    self.edits_without_paths += 1;
+                }
+                add(&mut self.edit_paths);
+            }
+            "Read" => {
+                self.reads += 1;
+                if row.paths.is_empty() {
+                    self.reads_without_paths += 1;
+                }
+                add(&mut self.read_paths);
+            }
+            "Search" => self.searches += 1,
+            "Web" => self.web += 1,
+            "Worker" => self.workers += 1,
+            "Plan" => self.plans += 1,
+            _ => self.tools += 1,
+        }
+        if step.class == "run" {
+            self.doing = Some(match step.kind {
+                "Command" => "Running commands",
+                "Edit" => "Editing files",
+                "Read" | "Search" => "Exploring",
+                "Web" => "Searching the web",
+                "Worker" => "Delegating work",
+                "Plan" => "Planning",
+                _ => "Using tools",
+            });
+        }
+    }
+
+    /// "ran 6 commands, edited 3 files, read 9 files": counts the steps
+    /// prove. Files are counted only where the steps name them; otherwise
+    /// the calls are ("made 2 edits").
+    fn words(&self) -> String {
+        let mut parts = Vec::new();
+        if self.commands > 0 {
+            parts.push(format!(
+                "ran {}",
+                count(self.commands, "command", "commands")
+            ));
+        }
+        if self.edits > 0 {
+            parts.push(if self.edits_without_paths == 0 {
+                format!("edited {}", count(self.edit_paths.len(), "file", "files"))
+            } else {
+                format!("made {}", count(self.edits, "edit", "edits"))
+            });
+        }
+        if self.reads > 0 {
+            parts.push(if self.reads_without_paths == 0 {
+                format!("read {}", count(self.read_paths.len(), "file", "files"))
+            } else {
+                count(self.reads, "read", "reads")
+            });
+        }
+        if self.searches > 0 {
+            parts.push(count(self.searches, "search", "searches"));
+        }
+        if self.web > 0 {
+            parts.push(count(self.web, "web lookup", "web lookups"));
+        }
+        if self.workers > 0 {
+            parts.push(format!(
+                "started {}",
+                count(self.workers, "worker", "workers")
+            ));
+        }
+        if self.plans > 0 {
+            parts.push("updated the plan".to_owned());
+        }
+        if self.tools > 0 {
+            parts.push(count(self.tools, "other tool", "other tools"));
+        }
+        parts.join(", ")
+    }
 }
 
 /// A turn's tool card in words: "Ran 3 tools" once all finished well,

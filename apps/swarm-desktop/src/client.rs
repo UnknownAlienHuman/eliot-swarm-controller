@@ -1482,7 +1482,7 @@ pub async fn submit_interrupt(
 fn approval_args(choice: Option<String>, feedback: Option<String>) -> Value {
     let mut args = serde_json::Map::new();
     if let Some(choice) = choice {
-        args.insert("choice".to_owned(), Value::String(choice));
+        args.insert("choice_id".to_owned(), Value::String(choice));
     }
     if let Some(feedback) = feedback {
         args.insert("feedback".to_owned(), Value::String(feedback));
@@ -1566,6 +1566,54 @@ pub async fn usage_summary(data_dir: &Path, agent: &str) -> Result<UsageSummaryR
         eliot_daemon::client_call_typed(data_dir, "usage.summary", &params).await?;
     params.validate_response(&reply)?;
     Ok(reply)
+}
+
+/// A note into the Agent's context without a new turn (`inject` at
+/// `soonest`): at the running turn's next safe point when the harness has
+/// one, else with the next input. Bound to the generation shown at click
+/// time; the Store freezes the turn it captures.
+pub async fn submit_inject(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    generation: i64,
+    text: &str,
+) -> Result<CommandSubmitResponse> {
+    check_text(text)?;
+    let mut request = submit_request(
+        mutation_id,
+        Some(agent.to_owned()),
+        "inject",
+        serde_json::to_value(eliot_core::InjectArgs {
+            text: text.to_owned(),
+            point: eliot_core::InjectPoint::Soonest,
+            expires_at_ms: None,
+        })
+        .map_err(|_| Error::new("invalid", "the note could not be encoded"))?,
+    )?;
+    request.expected_generation = Some(generation);
+    submit(data_dir, &request).await
+}
+
+/// The Agent's Eliot Goal (`goal.get`); `None` when it has none.
+pub async fn goal_get(data_dir: &Path, agent: &str) -> Result<Option<eliot_core::api::GoalView>> {
+    let request = eliot_core::api::GoalGetRequest {
+        agent: agent.to_owned(),
+        mode: eliot_core::api::GoalMode::Eliot,
+    };
+    request.validate()?;
+    match eliot_daemon::client_call_typed::<_, eliot_core::api::GoalView>(
+        data_dir, "goal.get", &request,
+    )
+    .await
+    {
+        Ok(reply) => {
+            request.validate_response(&reply)?;
+            Ok(Some(reply))
+        }
+        Err(error) if error.code == "not_found" => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Lifecycle stop of exactly the generation observed at click time. This is

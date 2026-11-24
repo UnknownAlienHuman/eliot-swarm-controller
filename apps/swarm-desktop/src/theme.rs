@@ -524,15 +524,6 @@ pub mod winui {
             )
         }
 
-        /// A steered message: the selected role at half strength on the
-        /// surface, so it never reads as an input field.
-        pub fn steer(self) -> Brush {
-            self.role(
-                |r| r.surface.mix(r.selected, 0.5),
-                ThemeBrush::CardBackground,
-            )
-        }
-
         /// A chip in the attention color (Full access in the composer).
         pub fn attention_chip(self) -> ResourceOverrides {
             self.with(|r| {
@@ -582,16 +573,87 @@ pub mod winui {
             })
         }
 
-        /// A tool row: tonal, or the running tint while it runs.
-        pub fn tool_row(self, running: bool) -> ResourceOverrides {
+        /// A work-log step or head (`.step`): no container, the variant
+        /// content; a running step on `secondary-container` at 60 %.
+        pub fn step_row(self, running: bool) -> ResourceOverrides {
             self.with(|r| {
-                if running {
-                    Family::new(Some(r.running), r.text)
+                Family::new(running.then(|| r.surface.mix(r.selected, 0.6)), r.variant).overrides(r)
+            })
+        }
+
+        /// A file chip in an answer (`.fchip`): `surface-container` with
+        /// the text color.
+        pub fn file_chip(self) -> ResourceOverrides {
+            self.with(|r| Family::new(Some(r.sidebar), r.text).overrides(r))
+        }
+
+        /// A pane toggle in the header: pressed on `secondary-container`,
+        /// otherwise an icon button's colors.
+        pub fn toggle(self, on: bool) -> ResourceOverrides {
+            self.with(|r| {
+                if on {
+                    Family::new(Some(r.selected), r.on_selected)
                 } else {
-                    Family::new(Some(r.tonal), r.variant)
+                    Family::new(None, r.variant)
                 }
                 .overrides(r)
             })
+        }
+
+        /// An outlined labelled button (`.btn.out`: Changes +/−, Deny):
+        /// the outline in `outline-variant`, the content on-surface-variant.
+        pub fn outlined_plain(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family {
+                    outline: Some(r.border),
+                    ..Family::new(None, r.variant)
+                }
+                .overrides(r)
+            })
+        }
+
+        /// Tonal: `secondary-container` (Resume, Switch model, Hand off).
+        pub fn tonal_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(Some(r.selected), r.on_selected).overrides(r))
+        }
+
+        /// A text button on the attention strip: `on-tertiary-container`.
+        pub fn strip_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(None, r.on_waiting_container).overrides(r))
+        }
+
+        /// A text button on an error strip: `on-error-container`.
+        pub fn error_strip_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(None, r.on_attention_container).overrides(r))
+        }
+
+        /// The attention strip (`tertiary-container`) and its content.
+        pub fn strip(self) -> (Brush, Brush) {
+            (
+                self.token(|s| s.tertiary_container, ThemeBrush::Accent),
+                self.token(|s| s.on_tertiary_container, ThemeBrush::PrimaryText),
+            )
+        }
+
+        /// Waiting for you as text and outline (`tertiary`): the decision
+        /// panel's kind line and its 2-DIP outline.
+        pub fn tertiary(self) -> Brush {
+            self.token(|s| s.tertiary, ThemeBrush::AccentText)
+        }
+
+        /// The code ground (`code`): a decision panel's subject.
+        pub fn code(self) -> Brush {
+            self.token(|s| s.code, ThemeBrush::CardBackground)
+        }
+
+        /// Primary as text: a status word, a link.
+        pub fn primary_text(self) -> Brush {
+            self.role(|r| r.primary_text, ThemeBrush::AccentText)
+        }
+
+        /// The composer's Resume: `secondary-container`.
+        pub fn resume_fab(self) -> ResourceOverrides {
+            self.tonal_button()
         }
 
         /// The composer's Stop turn: `error` with `on-error`.
@@ -637,21 +699,18 @@ pub mod winui {
             }
         }
 
-        /// The composer's usage ring: a text button whose `ProgressRing`
-        /// takes its arc (primary; attention under 20 % left) and its
-        /// track (the outline) from this button's own resources, which
-        /// WinUI's ring template resolves before the application's.
-        pub fn usage_ring(self, remaining: f64) -> ResourceOverrides {
+        /// The composer's context ring (`.ring`): its arc in `primary`, its
+        /// track in `surface-container-highest`, which WinUI's ring template
+        /// reads from the button's own resources.
+        pub fn context_ring(self) -> ResourceOverrides {
             self.with(|r| {
-                let arc = if remaining < super::QUOTA_LOW {
-                    r.attention
-                } else {
-                    r.primary
-                };
                 Family::new(None, r.variant)
                     .overrides(r)
-                    .set("ProgressRingForegroundThemeBrush", color(arc))
-                    .set("ProgressRingBackgroundThemeBrush", color(r.outline))
+                    .set("ProgressRingForegroundThemeBrush", color(r.primary))
+                    .set(
+                        "ProgressRingBackgroundThemeBrush",
+                        color(super::rgb(r.scheme.surface_container_highest)),
+                    )
             })
         }
 

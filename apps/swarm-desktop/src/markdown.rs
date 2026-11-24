@@ -5,7 +5,8 @@
 //! is plain owned data (`Send`), so workers parse and the UI thread builds the
 //! native `RichText` values. This is not a Markdown engine: paragraphs,
 //! emphasis, lists, quotes, headings, fenced code and links are mapped onto
-//! the controls Reactor 0.100.0 exposes; everything else stays readable text.
+//! the controls Reactor 0.100.0 exposes (a table becomes a grid of cells);
+//! everything else stays readable text.
 //! As Codex shows an answer, no Markdown marker stays visible: list items are
 //! their own blocks (the view gives them a hanging indent), and inline code
 //! drops its backticks. Reactor's runs carry only bold and italic (no font
@@ -60,6 +61,11 @@ pub enum Block {
         text: String,
     },
     Rule,
+    /// A table: its header cells and its body rows, each cell plain text.
+    Table {
+        head: Vec<String>,
+        rows: Vec<Vec<String>>,
+    },
 }
 
 /// Parsed document: owned, `Send`, cheap to cache by content hash.
@@ -135,6 +141,8 @@ struct Builder {
     table_row: Option<Vec<String>>,
     table_cell: Option<String>,
     table_head: bool,
+    /// The open table's header and body rows.
+    table: Option<(Vec<String>, Vec<Vec<String>>)>,
     dropped: usize,
 }
 
@@ -297,7 +305,10 @@ impl Builder {
             Tag::Image { dest_url, .. } => {
                 self.image = Some((dest_url.to_string(), String::new()));
             }
-            Tag::Table(_) => self.close_paragraph(),
+            Tag::Table(_) => {
+                self.close_paragraph();
+                self.table = Some((Vec::new(), Vec::new()));
+            }
             Tag::TableHead => {
                 self.table_head = true;
                 self.table_row = Some(Vec::new());
@@ -375,13 +386,19 @@ impl Builder {
                 }
             }
             TagEnd::TableHead | TagEnd::TableRow => {
-                if let Some(row) = self.table_row.take() {
-                    let bold = std::mem::take(&mut self.table_head);
-                    self.push_block(Block::Paragraph(vec![Inline::Text {
-                        text: row.join("  │  "),
-                        bold,
-                        italic: false,
-                    }]));
+                if let (Some(row), Some((head, rows))) =
+                    (self.table_row.take(), self.table.as_mut())
+                {
+                    if std::mem::take(&mut self.table_head) {
+                        *head = row;
+                    } else {
+                        rows.push(row);
+                    }
+                }
+            }
+            TagEnd::Table => {
+                if let Some((head, rows)) = self.table.take() {
+                    self.push_block(Block::Table { head, rows });
                 }
             }
             _ => {}

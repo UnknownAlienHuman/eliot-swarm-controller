@@ -47,8 +47,6 @@ pub(super) enum Pop {
     /// The open Agent's effort steps and the way into its model picker
     /// (Codex's model-and-effort popover).
     Effort,
-    /// The usage ring's popover: the tightest limits and Manage usage.
-    Usage,
     /// The Home question's project name: the same project list as the
     /// composer's project chip, under the title.
     TitleProject,
@@ -927,7 +925,7 @@ impl DesktopApp {
         }
         let agent = !preset && self.selected_agent_id().is_some();
         let pop = match (agent, pop) {
-            (true, Pop::Effort | Pop::Usage) => pop,
+            (true, Pop::Effort) => pop,
             // A model the harness keeps opens the effort popover, which
             // says so.
             (true, Pop::Model)
@@ -1004,7 +1002,6 @@ impl DesktopApp {
                 // Left and right step the effort, Enter applies it.
                 crate::shortcuts::set_popover(HookPopover::Picker);
             }
-            Pop::Usage => crate::shortcuts::set_popover(HookPopover::List),
             Pop::Quotas => {}
         }
         self.ensure_catalog_watch(context);
@@ -1142,7 +1139,7 @@ impl DesktopApp {
             _ => {}
         }
         match pop {
-            Pop::Manage | Pop::Usage | Pop::Quotas => {}
+            Pop::Manage | Pop::Quotas => {}
             Pop::Effort => {
                 let efforts = self.agent_efforts();
                 let at = self
@@ -1972,7 +1969,6 @@ fn chip_of(pop: Pop) -> u8 {
         Pop::Model | Pop::Manage | Pop::Effort => 0,
         Pop::Access => 1,
         Pop::Project => 2,
-        Pop::Usage => 3,
         Pop::TitleProject => 4,
         Pop::Quotas => 5,
     }
