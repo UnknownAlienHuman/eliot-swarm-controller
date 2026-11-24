@@ -40,7 +40,7 @@ use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetActiveWindow, GetKeyState, VK_APPS, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL,
+    GetActiveWindow, GetKeyState, VK_APPS, VK_B, VK_BROWSER_BACK, VK_BROWSER_FORWARD, VK_CONTROL,
     VK_DOWN, VK_ESCAPE, VK_F, VK_F10, VK_K, VK_LEFT, VK_M, VK_N, VK_OEM_COMMA, VK_RETURN, VK_RIGHT,
     VK_SHIFT, VK_TAB, VK_UP,
 };
@@ -78,6 +78,8 @@ pub enum Shortcut {
     ModelPicker,
     /// Ctrl+, (comma).
     Settings,
+    /// Ctrl+B: hide or show the sidebar.
+    Sidebar,
     /// Alt+←, the keyboard's Back key or the mouse's back button.
     Back,
     /// Alt+→, the keyboard's Forward key or the mouse's forward button.
@@ -319,6 +321,7 @@ fn chord(key: u16, ctrl: bool, shift: bool, alt: bool) -> Option<Shortcut> {
         VK_K => Some(Shortcut::Search),
         VK_M => Some(Shortcut::ModelPicker),
         VK_OEM_COMMA => Some(Shortcut::Settings),
+        VK_B => Some(Shortcut::Sidebar),
         _ => None,
     }
 }
@@ -384,6 +387,7 @@ fn send(found: Shortcut) {
 /// transition (0 when pressed). A panic stops here (unwinding out of an
 /// `extern "system"` function aborts) and the key passes on.
 unsafe extern "system" fn keyboard(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _boundary = crate::startup::native_boundary();
     match std::panic::catch_unwind(|| keyboard_takes(code, wparam, lparam)) {
         // Taken: neither the press nor the release reaches a control.
         Ok(true) => 1,
@@ -464,6 +468,7 @@ fn keyboard_takes(code: i32, wparam: WPARAM, lparam: LPARAM) -> bool {
 /// its `MSLLHOOKSTRUCT`. Steps only while this process's window is in
 /// front and under the pointer; never takes the event. A panic stops here.
 unsafe extern "system" fn side_buttons(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _boundary = crate::startup::native_boundary();
     if let Err(panic) = std::panic::catch_unwind(|| side_button(code, wparam, lparam)) {
         crate::startup::caught_panic("the mouse button hook", &*panic);
     }
@@ -497,6 +502,7 @@ fn side_button(code: i32, wparam: WPARAM, lparam: LPARAM) {
 /// `PM_REMOVE` when it leaves the queue (counted once, not per peek). A
 /// panic stops here.
 unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _boundary = crate::startup::native_boundary();
     if let Err(panic) = std::panic::catch_unwind(|| message_seen(code, wparam, lparam)) {
         crate::startup::caught_panic("the message hook", &*panic);
     }
@@ -506,6 +512,7 @@ unsafe extern "system" fn messages(code: i32, wparam: WPARAM, lparam: LPARAM) ->
 /// `CallWndProc`: a message sent to one of the thread's windows; `lparam`
 /// points to its `CWPSTRUCT`. Passed on unchanged.
 unsafe extern "system" fn sent_messages(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let _boundary = crate::startup::native_boundary();
     if let Err(panic) = std::panic::catch_unwind(|| sent_seen(code, lparam)) {
         crate::startup::caught_panic("the settings hook", &*panic);
     }
@@ -522,6 +529,16 @@ fn accessibility_now() -> (u8, bool, bool) {
         high_contrast,
         animations,
     )
+}
+
+/// Read High Contrast and animation effects now and keep them as the
+/// settings hook's last reading: the one place the window's state and the
+/// hook's comparison both come from, so a reading the window takes itself
+/// (a scheme change) never leaves the hook comparing against a stale value.
+pub fn read_accessibility() -> (bool, bool) {
+    let (packed, high_contrast, animations) = accessibility_now();
+    ACCESSIBILITY.store(packed, Ordering::SeqCst);
+    (high_contrast, animations)
 }
 
 /// The settings hook's work: when Windows announces a changed setting or

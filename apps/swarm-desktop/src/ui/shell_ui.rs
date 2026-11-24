@@ -1,12 +1,15 @@
-//! The one shell: the sidebar (Search tasks, New task, collapsible
-//! projects with their Agents nested, Recents, the fleet status and
-//! Settings), the main area (one conversation or the Settings page) and the
-//! optional right panel (the monitor or the open Agent's details).
+//! The one shell (`screens.css`): on the `surface-container` window
+//! ground, the sidebar (New task, the places Search, Inbox, Agents and
+//! Automations, the projects with their tasks and workers, Chats, then
+//! Show archived, Usage and Settings) and one raised `surface` card holding
+//! the main area (a conversation, a project page or Settings) and the
+//! optional right pane (the fleet view, the Inbox or the open Agent's
+//! details).
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 
 use super::sidebar_ui::{
-    FleetEntry, InboxEntry, PlaceEntry, Renaming, SearchField, SidebarInput, TaskEntry,
+    AgentsEntry, InboxEntry, PlaceEntry, Renaming, SearchField, SidebarInput, TaskEntry,
 };
 use super::*;
 use crate::nav::{Branch, Checkout, Fleet, Row, Shown};
@@ -69,6 +72,9 @@ pub(super) enum ShellMsg {
     RepairSettings,
     /// Start the daemon again on the same data directory.
     RetryStartup,
+    /// A daemon its owner stopped: ask now whether it runs again (the
+    /// list's cadence asks too), and reconnect if it does.
+    RecheckLink,
     /// Open this data directory's editable daemon configuration.
     OpenStartupConfig,
     /// Open the daemon's log (`logs\daemon.log`).
@@ -171,6 +177,13 @@ pub(super) enum ShellMsg {
     SettingsOpened,
     /// Open Settings at one page (the sidebar's Automations and Usage).
     SettingsPage(settings_ui::Page),
+    /// The Projects label's +: Settings › Projects, and its folder picker
+    /// once the settings document is read.
+    AddProject,
+    /// The Usage popover's Refresh: read the limits and holds again.
+    UsageRefresh,
+    /// `provider.holds` for the Usage popover.
+    HoldsLoaded(Box<Fallible<eliot_core::api::ProviderHoldsResponse>>),
     /// The Settings navigation's search field.
     SettingsSearch(String),
     /// The Settings navigation's Back row: the conversation again.
@@ -252,10 +265,11 @@ pub(super) struct Appearance {
 
 impl Appearance {
     pub(super) fn new() -> Self {
+        let (high_contrast, animations) = crate::shortcuts::read_accessibility();
         Self {
             dark: false,
-            high_contrast: crate::accessibility::high_contrast_on(),
-            animations: crate::accessibility::animations_on(),
+            high_contrast,
+            animations,
         }
     }
 
@@ -379,6 +393,7 @@ impl DesktopApp {
                 self.open_settings(Some(Page::Advanced), context);
             }
             ShellMsg::RetryStartup => self.retry_startup(context),
+            ShellMsg::RecheckLink => self.link_watch(context),
             ShellMsg::OpenStartupLog => self.open_in_data_dir(&["logs", "daemon.log"]),
             ShellMsg::OpenDataFolder => self.open_in_data_dir(&[]),
             ShellMsg::LinkProbed(probed) => self.link_probed(probed, context),
@@ -525,11 +540,10 @@ impl DesktopApp {
                 }
             }
             ShellMsg::AgentsLoaded(list_epoch, append, page) => {
-                // The composer's usage indicator reads every harness's quota
-                // once the daemon answers (Usage's Refresh reads again).
-                if self.settings.quotas.is_empty() {
-                    self.load_quotas(context);
-                }
+                // No quota read here: a harness's quota read can start the
+                // vendor's own process, so the limits are read only while
+                // their screen is open (the Usage popover, Settings › Usage)
+                // and on Refresh (skeleton 2.4).
                 if list_epoch != self.nav.list_epoch {
                     return;
                 }
@@ -835,6 +849,14 @@ impl DesktopApp {
             }
             ShellMsg::SettingsOpened => self.open_settings(None, context),
             ShellMsg::SettingsPage(page) => self.open_settings(Some(page), context),
+            ShellMsg::UsageRefresh => self.read_usage(context),
+            ShellMsg::HoldsLoaded(reply) => self.holds_loaded(*reply),
+            ShellMsg::AddProject => {
+                self.open_settings(Some(settings_ui::Page::Projects), context);
+                if self.settings.is_read() {
+                    self.settings_update(SettingsMsg::ProjectBrowse, context);
+                }
+            }
             ShellMsg::SettingsSearch(text) => self.settings.query = text,
             ShellMsg::SettingsClosed => {
                 // A preset's picker does not follow the owner out.
@@ -854,9 +876,19 @@ impl DesktopApp {
             },
             ShellMsg::SchemeObserved(scheme) => {
                 let before = self.palette();
+                let contrast_before = self.appearance.high_contrast;
                 self.appearance.dark = scheme == ColorScheme::Dark;
-                self.appearance.high_contrast = crate::accessibility::high_contrast_on();
-                self.palette_changed(before, context);
+                // High Contrast (and animation effects) through the reading
+                // the settings hook keeps, so its next comparison starts
+                // from what the window shows and never sends a no-op, and
+                // through their one writer, which rebuilds on a change.
+                let (high_contrast, animations) = crate::shortcuts::read_accessibility();
+                self.accessibility_changed(high_contrast, animations, context);
+                // A Light/Dark change alone (a High Contrast change was
+                // rebuilt above).
+                if high_contrast == contrast_before {
+                    self.palette_changed(before, context);
+                }
                 // The first observation colors the title bar even when the
                 // palette is the starting one.
                 self.sync_title_bar();
@@ -980,6 +1012,9 @@ impl DesktopApp {
                 }
             }
             ShellMsg::Shortcut(shortcut) => {
+                // Lines a hook or WinUI handler queued (a caught panic) are
+                // written here, on the UI thread, outside the boundary.
+                crate::startup::drain_deferred();
                 match shortcut {
                     // Before the dialog arm: the hold ends either way (a
                     // closing dialog puts focus back itself).
@@ -1023,6 +1058,10 @@ impl DesktopApp {
                         self.focus_search(FOCUS_TRIES, context)
                     }
                     Shortcut::Settings => self.open_settings(None, context),
+                    Shortcut::Sidebar if self.main != Main::Settings => {
+                        self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed;
+                    }
+                    Shortcut::Sidebar => {}
                     Shortcut::ModelPicker => {
                         if self.launch.open != Some(launch_ui::Pop::Model) {
                             self.launch_update(LaunchMsg::Toggle(launch_ui::Pop::Model), context);
@@ -1170,7 +1209,8 @@ impl DesktopApp {
     }
 
     /// Windows changed High Contrast or animation effects (Reactor 0.100.0
-    /// reports neither; `crate::shortcuts` hears Windows announce it).
+    /// reports neither; `crate::shortcuts` hears Windows announce it, and a
+    /// scheme change reads them too). The one writer of both.
     /// Either rebuilds the tree, keyed by both, with new controls that keep
     /// what was typed.
     fn accessibility_changed(
@@ -1786,7 +1826,8 @@ impl DesktopApp {
         } else {
             tokens::layout::SIDEBAR_WIDTH
         };
-        self.window_width.map(|width| width - side - panel)
+        self.window_width
+            .map(|width| width - side - panel - tokens::layout::CARD_GAP)
     }
 
     /// Tasks hide the sidebar to its rail, by choice or when the window is
@@ -1803,7 +1844,8 @@ impl DesktopApp {
         };
         self.nav.sidebar_collapsed
             || self.window_width.is_some_and(|width| {
-                width - tokens::layout::SIDEBAR_WIDTH - panel < tokens::layout::MAIN_MIN_WIDTH
+                width - tokens::layout::SIDEBAR_WIDTH - panel - tokens::layout::CARD_GAP
+                    < tokens::layout::MAIN_MIN_WIDTH
             })
     }
 
@@ -2162,42 +2204,79 @@ impl DesktopApp {
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
         let rail = self.rail_shown();
-        let mut columns = vec![
-            GridLength::Pixel(if rail {
-                RAIL_WIDTH
-            } else {
-                tokens::layout::SIDEBAR_WIDTH
-            }),
-            GridLength::STAR,
-        ];
+        // The main card (`screens.css` `.card-main`): `surface` at the
+        // extra-large corner, lifted to `elevation-1`, 8 DIPs from the
+        // window's top, right and bottom edges, beside the sidebar on the
+        // `surface-container` ground. The page or conversation and the
+        // right pane sit inside it.
+        let radius = tokens::layout::CARD_RADIUS;
+        let mut card_columns = vec![GridLength::STAR];
         let panel: View = if !self.panel_shown() {
             View::empty()
         } else {
-            columns.push(GridLength::Pixel(tokens::layout::PANEL_WIDTH));
+            card_columns.push(GridLength::Pixel(tokens::layout::PANEL_WIDTH));
             Border::new()
-                .grid_column(2)
+                .grid_column(1)
                 .background(palette.surface())
+                .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
                 .border_brush(palette.outline())
                 .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
                 .content(self.panel_view(context, palette))
         };
-        // Settings replaces the sidebar with its own navigation.
+        // Its `elevation-1` is a real shadow on the composition host
+        // (`crate::shadow`), as the composer's; the true-black themes ring
+        // it.
+        self.card_shadow.set_layers(m3::elevation_layers(palette));
+        let card = m3::lifted(
+            palette,
+            &self.card_shadow,
+            radius,
+            Grid::new().grid_column(1).margin(Thickness::new(
+                0.0,
+                tokens::layout::CARD_GAP,
+                tokens::layout::CARD_GAP,
+                tokens::layout::CARD_GAP,
+            )),
+            Border::new()
+                .background(palette.surface())
+                .corner_radius(radius)
+                .content(
+                    Grid::new()
+                        .columns(card_columns)
+                        .children((Border::new().content(main), panel)),
+                ),
+        );
+        // Settings replaces the sidebar with its own navigation. While the
+        // daemon screen shows, the sidebar keeps the last list it had,
+        // dimmed, and takes no pointer input.
         let side: View = match self.main {
             Main::Settings => self.settings_nav(context, palette),
             _ if rail => self.rail_view(context, palette),
             _ => View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context, palette)),
         };
+        let side: View = if self.link_view_shown() && self.main != Main::Settings {
+            Grid::new()
+                .automation_name("Tasks and places (the last list, while Swarm is not reachable)")
+                .children((
+                    Border::new()
+                        .opacity(tokens::state::DISABLED_CONTENT)
+                        .content(side),
+                    Border::new().background(Brush::Solid(Color::transparent())),
+                ))
+        } else {
+            side
+        };
         let columns_grid = Grid::new()
-            .background(palette.surface())
-            .columns(columns)
-            .children((
-                Border::new()
-                    .grid_column(0)
-                    .background(palette.sidebar())
-                    .content(side),
-                Border::new().grid_column(1).content(main),
-                panel,
-            ));
+            .background(palette.sidebar())
+            .columns([
+                GridLength::Pixel(if rail {
+                    RAIL_WIDTH
+                } else {
+                    tokens::layout::SIDEBAR_WIDTH
+                }),
+                GridLength::STAR,
+            ])
+            .children((Border::new().grid_column(0).content(side), card));
         // One cell: the window, the row-menu button that carries the
         // sidebar's menu flyout, the attach chooser's button, and the
         // confirmation dialog.
@@ -2250,10 +2329,14 @@ impl DesktopApp {
         let listed: &[UiAgent] = if filtered { &found } else { &self.nav.agents };
         let keep = |_: &UiAgent| true;
         let open = self.selected_agent_id();
+        // The no-project bucket is the Chats section: a label, never a
+        // folded project.
+        let mut collapsed = self.nav.collapsed.clone();
+        collapsed.remove(nav::OTHER_LOCATIONS);
         let shown = Shown {
             branches: &self.nav.branches,
             expanded: &self.nav.expanded,
-            collapsed: &self.nav.collapsed,
+            collapsed: &collapsed,
             unfolded: &self.nav.unfolded,
             today_start: today_start_ms(),
             only: filtered.then_some(&keep as &dyn Fn(&UiAgent) -> bool),
@@ -2369,18 +2452,10 @@ impl DesktopApp {
                 self.nav.paging,
             )
         };
-        let tone = if fleet.attention > 0 {
-            StatusTone::Attention
-        } else if fleet.running > 0 {
-            StatusTone::Active
-        } else {
-            StatusTone::Ready
-        };
         SidebarInput {
             palette,
             can_back: self.nav.history.can_back(),
             can_forward: self.nav.history.can_forward(),
-            home: self.main == Main::Conversation && self.chat.convo.is_none(),
             page: (self.main == Main::Settings).then_some(self.settings_page),
             search: self.nav.search.open.then(|| SearchField {
                 text: self.nav.search.text.clone(),
@@ -2414,10 +2489,9 @@ impl DesktopApp {
             more: (more && loaded < total)
                 .then(|| (format!("Show more ({loaded} of {total})"), !reading)),
             show_archived: self.nav.show_archived,
-            fleet: FleetEntry {
+            agents: AgentsEntry {
                 line: fleet.compact(self.nav.agents_total, self.nav.archived),
                 summary: fleet.summary(self.nav.agents_total, self.nav.archived),
-                tone,
                 open: self.panel == Panel::Monitor,
             },
             inbox: InboxEntry {
@@ -2425,6 +2499,7 @@ impl DesktopApp {
                 total: self.inbox.total(),
                 open: self.panel == Panel::Inbox,
             },
+            usage: self.usage_row(context, palette),
             renaming: self.menu.renaming.as_ref().map(|(target, typed)| Renaming {
                 target: target.clone(),
                 typed: typed.clone(),
@@ -2439,7 +2514,16 @@ impl DesktopApp {
     /// One task row as the sidebar shows it now.
     fn task_entry(&self, row: Row, now: i64) -> TaskEntry {
         let agent = &row.agent;
-        let reported = self.reported(agent).map(|incident| incident.words(now));
+        let reported = self.reported(agent).map(|incident| {
+            (
+                if incident.no_code() {
+                    "No code"
+                } else {
+                    "Stuck"
+                },
+                incident.words(now),
+            )
+        });
         let work = agent
             .work
             .as_ref()
@@ -2462,7 +2546,8 @@ impl DesktopApp {
     }
 
     /// The hidden sidebar's rail: show the sidebar, New task, then at the
-    /// bottom the Monitor (with the fleet's most urgent dot) and Settings.
+    /// bottom Agents (the fleet view, with the fleet's most urgent dot) and
+    /// Settings.
     fn rail_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         let pad = SIDEBAR_PADDING;
         let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
@@ -2528,9 +2613,9 @@ impl DesktopApp {
             .children((
                 Grid::new().children((
                     button(
-                        m3::glyph::PULSE,
+                        m3::glyph::HUB,
                         format!(
-                            "Monitor: {summary} ({})",
+                            "Agents: {summary} ({})",
                             if open { "open" } else { "closed" }
                         ),
                         Message::Shell(ShellMsg::PanelToggled(Panel::Monitor)),

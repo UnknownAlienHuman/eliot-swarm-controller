@@ -448,151 +448,158 @@ impl DesktopApp {
         )
     }
 
-    /// The daemon could not start, or stopped and could not be started
-    /// again: its own reason, then the owner's choices, the safe ones first.
-    /// Nothing is moved; a new empty directory is the last, named choice.
-    /// A daemon its Owner stopped gets Start instead.
+    /// The daemon screen in the main card (`Offline.dc.html`, skeleton
+    /// 5.15): the clover, the state's title ("Swarm could not start",
+    /// "Swarm stopped and could not be restarted", "Swarm was stopped"),
+    /// one sentence (the daemon's own failure), the main actions (Retry, or
+    /// Start Swarm with Retry for a daemon its owner stopped), then Repair
+    /// settings, Open config.toml, Open log and Open data folder, and the
+    /// data-directory choices. The sidebar beside it keeps its last list,
+    /// dimmed (`shell_view`).
     pub(super) fn startup_error_view(
         &self,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        if self.link.stopped {
-            return self.stopped_view(context, palette);
-        }
+        let stopped = self.link.stopped;
         let reason = self
             .startup_error
             .as_ref()
             .map_or_else(String::new, eliot_core::Error::user_message);
-        let config = self.startup_error.as_ref().is_some_and(|error| {
-            error.failure_where.as_deref() == Some(eliot_daemon::startup::CONFIG_STARTUP_LOCATION)
-        });
-        let title = if self.link.gave_up {
+        let title = if stopped {
+            "Swarm was stopped"
+        } else if self.link.gave_up {
             "Swarm stopped and could not be restarted"
         } else {
             "Swarm could not start"
+        };
+        let sentence = if stopped {
+            "Its owner stopped it, so it is not started again on its own. This window \
+             reconnects when Swarm runs again; the list on the left is the last one it sent."
+                .to_owned()
+        } else if reason.is_empty() {
+            "The desktop can't reach the daemon. Your tasks and their worktrees are safe on \
+             disk; the list on the left is the last one Swarm sent."
+                .to_owned()
+        } else {
+            reason
+        };
+        let shell = |msg: ShellMsg| context.message(Message::Shell(msg));
+        // A labelled button with its leading icon (`.btn` with `.i`).
+        let with_icon = |glyph: &str, label: &str| -> View {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::SM)
+                .margin(Thickness::xy(
+                    tokens::spacing::INSET - tokens::spacing::ROW,
+                    0.0,
+                ))
+                .children((
+                    m3::icon(glyph),
+                    m3::text(label.to_owned(), tokens::text::BUTTON)
+                        .vertical_alignment(VerticalAlignment::Center),
+                ))
+        };
+        let main_actions: View = if stopped {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .spacing(tokens::spacing::SM)
+                .children((
+                    m3::outlined(palette)
+                        .automation_name("Retry: check whether Swarm runs again")
+                        .on_click(shell(ShellMsg::RecheckLink))
+                        .content(with_icon(m3::glyph::REFRESH, "Retry")),
+                    m3::filled(palette)
+                        .automation_name("Start Swarm")
+                        .on_click(shell(ShellMsg::RetryStartup))
+                        .content(with_icon(m3::glyph::RESUME, "Start Swarm")),
+                ))
+        } else {
+            m3::filled(palette)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .automation_name("Retry: start Swarm again on this data directory")
+                .on_click(shell(ShellMsg::RetryStartup))
+                .content(with_icon(m3::glyph::REFRESH, "Retry"))
+        };
+        let text_action = |name: &str, msg: ShellMsg| -> View {
+            m3::text_button(palette)
+                .automation_name(name.to_owned())
+                .on_click(shell(msg))
+                .content(m3::label(name))
+        };
+        let notice: View = match &self.alert {
+            Some(text) => m3::body(text.clone())
+                .foreground(palette.attention())
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .text_wrapping(TextWrapping::Wrap)
+                .is_text_selection_enabled(true)
+                .into(),
+            None => View::empty(),
         };
         let data_dir = self
             .data_dir
             .as_ref()
             .map_or_else(|_| String::new(), |dir| dir.display().to_string());
-        let shell = |msg: ShellMsg| context.message(Message::Shell(msg));
-        let choice = |key: &str, glyph: &str, title: &str, note: &str, msg: ShellMsg| {
-            KeyedView::new(
-                key,
-                m3::row(palette, false)
-                    .automation_name(title.to_owned())
-                    .on_click(shell(msg))
-                    .content(m3::row_content(Some(glyph), title, note, View::empty())),
-            )
-        };
-        let notice: View = match &self.alert {
-            Some(text) => StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::SM)
-                .automation_name(text.clone())
-                .children((
-                    m3::status_mark(
-                        palette,
-                        crate::theme::StatusTone::Attention,
-                        tokens::layout::DOT,
-                    ),
-                    m3::body(text.clone())
-                        .text_wrapping(TextWrapping::Wrap)
-                        .is_text_selection_enabled(true),
-                )),
-            None => View::empty(),
-        };
-        StackPanel::new()
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .spacing(tokens::spacing::MD)
-            .margin(Thickness::uniform(tokens::spacing::LG))
-            .children((
-                m3::page_title(title),
-                m3::body(reason)
-                    .text_wrapping(TextWrapping::Wrap)
-                    .is_text_selection_enabled(true),
-                // One filled action: Retry on the same data directory.
+        ScrollViewer::new()
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(
                 StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::SM)
+                    .max_width(tokens::layout::OFFLINE_WIDTH)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .margin(Thickness::uniform(tokens::spacing::XL))
+                    .spacing(tokens::spacing::MD)
                     .children((
-                        m3::filled(palette)
-                            .automation_name("Retry")
-                            .on_click(shell(ShellMsg::RetryStartup))
-                            .content(m3::label("Retry")),
-                        m3::outlined(palette)
-                            .automation_name("Repair settings")
-                            .on_click(shell(ShellMsg::RepairSettings))
-                            .content(m3::label("Repair settings")),
-                        if config {
-                            m3::text_button(palette)
-                                .automation_name("Open config.toml")
-                                .on_click(shell(ShellMsg::OpenStartupConfig))
-                                .content(m3::link_content("Open config.toml"))
-                        } else {
-                            View::empty()
-                        },
+                        Border::new()
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .content(m3::carrier(
+                                palette,
+                                |s| s.primary,
+                                "Eliot Swarm",
+                                tokens::layout::MARK_LARGE,
+                                m3::shape(crate::brand::SHAPE_CLOVER, tokens::layout::MARK_LARGE),
+                            )),
+                        m3::text(title, tokens::text::PAGE)
+                            .automation_heading_level(AutomationHeadingLevel::Level1)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .text_wrapping(TextWrapping::Wrap),
+                        m3::body(sentence)
+                            .foreground(palette.muted())
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .text_wrapping(TextWrapping::Wrap)
+                            .is_text_selection_enabled(true),
+                        main_actions,
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .children((
+                                text_action("Repair settings", ShellMsg::RepairSettings),
+                                text_action("Open config.toml", ShellMsg::OpenStartupConfig),
+                                text_action("Open log", ShellMsg::OpenStartupLog),
+                                m3::text_button(palette)
+                                    .automation_name(format!("Open data folder: {data_dir}"))
+                                    .on_click(shell(ShellMsg::OpenDataFolder))
+                                    .content(m3::label("Open data folder")),
+                            )),
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .spacing(tokens::spacing::ROW_GAP)
+                            .children((
+                                text_action(
+                                    "Use another data directory…",
+                                    ShellMsg::ChooseDataDirectory,
+                                ),
+                                text_action(
+                                    "Start over in a new data directory…",
+                                    ShellMsg::UseFreshDirectory,
+                                ),
+                            )),
+                        notice,
                     )),
-                m3::list(
-                    palette,
-                    vec![
-                        choice(
-                            "log",
-                            m3::glyph::FILE,
-                            "Open log",
-                            "The daemon's own record of what failed",
-                            ShellMsg::OpenStartupLog,
-                        ),
-                        choice(
-                            "folder",
-                            m3::glyph::OPEN_FOLDER,
-                            "Open the data folder",
-                            &data_dir,
-                            ShellMsg::OpenDataFolder,
-                        ),
-                        choice(
-                            "another",
-                            m3::glyph::FOLDER,
-                            "Use another data directory…",
-                            "A Swarm data folder you already have",
-                            ShellMsg::ChooseDataDirectory,
-                        ),
-                        choice(
-                            "fresh",
-                            m3::glyph::NEW_TASK,
-                            "Start over in a new empty data directory",
-                            "No chats or settings; the current folder is kept",
-                            ShellMsg::UseFreshDirectory,
-                        ),
-                    ],
-                ),
-                notice,
-            ))
-    }
-
-    /// The daemon's Owner stopped it: nothing starts it again on its own.
-    fn stopped_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        StackPanel::new()
-            .max_width(tokens::layout::READING_WIDTH)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .spacing(tokens::spacing::MD)
-            .margin(Thickness::uniform(tokens::spacing::LG))
-            .children((
-                m3::page_title("Swarm was stopped"),
-                m3::body(
-                    "Its owner stopped it, so it is not started again on its own. \
-                     This window reconnects when Swarm runs again.",
-                )
-                .text_wrapping(TextWrapping::Wrap),
-                m3::filled(palette)
-                    .automation_name("Start Swarm")
-                    .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
-                    .content(m3::label("Start")),
-            ))
+            )
     }
 
     /// Confirm the last choice: a new, empty data directory.

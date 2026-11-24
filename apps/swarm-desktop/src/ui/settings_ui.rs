@@ -553,6 +553,17 @@ pub(super) struct SettingsState {
 }
 
 impl SettingsState {
+    /// The settings document has been read (a save has a revision to
+    /// check against).
+    pub(super) fn is_read(&self) -> bool {
+        self.revision.is_some()
+    }
+
+    /// A quota read of some harness is in flight.
+    pub(super) fn quotas_reading(&self) -> bool {
+        self.quotas_loading > 0
+    }
+
     fn base(&self, section: Section) -> Value {
         self.base
             .get(&section)
@@ -1458,6 +1469,9 @@ impl DesktopApp {
             SettingsMsg::QuotaLoaded(harness, reply) => {
                 self.settings.quotas_loading = self.settings.quotas_loading.saturating_sub(1);
                 self.settings.quotas.insert(harness, *reply);
+                if self.settings.quotas_loading == 0 {
+                    self.usage.read_at = Some(crate::handoff::now_ms());
+                }
             }
             SettingsMsg::WorktreesRefresh => self.load_worktrees(context),
             SettingsMsg::FleetLoaded(reply) => {

@@ -143,6 +143,12 @@ actions! {
     /// Delete every stopped task of the project or subproject.
     DeleteStopped => ("Delete stopped tasks…", m3::glyph::DELETE, true),
     RemoveProject => ("Remove from Swarm…", m3::glyph::DELETE, true),
+    /// The Projects label's "…": archive every finished task.
+    ArchiveAllFinished => ("Archive all finished tasks…", m3::glyph::ARCHIVE, false),
+    /// The Projects label's "…": delete every stopped task.
+    DeleteAllStopped => ("Delete all stopped tasks…", m3::glyph::DELETE, true),
+    /// The Projects label's "…": remove the projects no task uses.
+    RemoveUnused => ("Remove unused projects…", m3::glyph::DELETE, true),
     /// "Move under another task…": open the picker.
     MoveUnder => ("Move under another task…", m3::glyph::MOVE, false),
     /// "Attach to project…": open the project chooser at the row.
@@ -168,6 +174,15 @@ actions! {
     DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
     /// The conversation header's Force stop (it asks first).
     ForceStop => ("Force stop…", m3::glyph::STOP, true),
+    /// Home's Start task menu: queue the task (`launch.enqueue`).
+    QueueLaunch => ("Queue it", m3::glyph::SCHEDULE, false),
+    /// Home's Start task menu: attach a running native session, which the
+    /// desktop does not have yet (shown disabled, the reason in its label).
+    AttachSession => (
+        "Attach an existing session… (not in the desktop yet: swarm attach)",
+        m3::glyph::EXTERNAL,
+        false
+    ),
 }
 
 /// Whether `a` and `b` hold the same text, in a constant context.

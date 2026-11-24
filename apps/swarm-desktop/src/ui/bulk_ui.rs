@@ -144,9 +144,10 @@ pub(super) type Outcome = Result<(), (bool, String)>;
 
 #[derive(Clone, Debug)]
 pub(super) enum BulkMsg {
-    /// The Projects caption's "…" menu: the label chosen (Reactor 0.100.0
-    /// reports a native menu item by its label, not its key).
-    Menu(String),
+    /// The Projects label's "…" menu: the action whose label Reactor
+    /// reported (`menu_ui::Action::from_label`; Reactor 0.100.0 reports a
+    /// native menu item by its label, not its key), if any.
+    Menu(Option<super::menu_ui::Action>),
     /// Read what an action would touch (the action, what, its scope).
     Start(BulkOp, Pick, String),
     /// The plan read for one dialog epoch, with the operation and
@@ -164,13 +165,6 @@ pub(super) enum BulkMsg {
     Stop,
     Closed,
 }
-
-/// The Projects caption's menu items: (id, label).
-pub(super) const ALL_MENU: [(&str, &str); 3] = [
-    ("archive", "Archive all finished tasks…"),
-    ("delete", "Delete all stopped tasks…"),
-    ("unused", "Remove unused projects…"),
-];
 
 /// Most names a confirmation lists before "and N more".
 const LISTED: usize = 8;
@@ -574,31 +568,30 @@ fn remove_checked(
 impl DesktopApp {
     pub(super) fn bulk_update(&mut self, msg: BulkMsg, context: &ComponentContext<Self>) {
         match msg {
-            BulkMsg::Menu(label) => match ALL_MENU
-                .iter()
-                .find(|(_, item)| *item == label)
-                .map_or("", |(id, _)| *id)
-            {
-                "archive" => self.start_bulk(
-                    BulkOp::ArchiveFinished,
-                    Pick::Tasks(None),
-                    "all projects".to_owned(),
-                    context,
-                ),
-                "delete" => self.start_bulk(
-                    BulkOp::DeleteStopped,
-                    Pick::Tasks(None),
-                    "all projects".to_owned(),
-                    context,
-                ),
-                "unused" => self.start_bulk(
-                    BulkOp::RemoveProjects,
-                    Pick::Unused,
-                    "all projects".to_owned(),
-                    context,
-                ),
-                _ => {}
-            },
+            // Only an action the Projects label's menu offers runs.
+            BulkMsg::Menu(action) => {
+                match action.filter(|action| super::sidebar_ui::BULK_MENU.contains(action)) {
+                    Some(super::menu_ui::Action::ArchiveAllFinished) => self.start_bulk(
+                        BulkOp::ArchiveFinished,
+                        Pick::Tasks(None),
+                        "all projects".to_owned(),
+                        context,
+                    ),
+                    Some(super::menu_ui::Action::DeleteAllStopped) => self.start_bulk(
+                        BulkOp::DeleteStopped,
+                        Pick::Tasks(None),
+                        "all projects".to_owned(),
+                        context,
+                    ),
+                    Some(super::menu_ui::Action::RemoveUnused) => self.start_bulk(
+                        BulkOp::RemoveProjects,
+                        Pick::Unused,
+                        "all projects".to_owned(),
+                        context,
+                    ),
+                    _ => {}
+                }
+            }
             BulkMsg::Start(op, pick, scope) => self.start_bulk(op, pick, scope, context),
             BulkMsg::Planned(seq, op, pick, scope, result) => {
                 // A late plan from a cancelled or replaced dialog never

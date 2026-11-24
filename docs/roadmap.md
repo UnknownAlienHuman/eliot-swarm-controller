@@ -1047,6 +1047,37 @@ of the explicitly selected release scope.
     Add as a note, decision panel, states), right pane (Changes with the review
     digest, Agents, Details, Terminal), project page, Inbox, Agents, Automations,
     Settings, dialogs and the daemon screen, per the skeleton.
+    - [x] **Shell.** The window ground and the sidebar are
+      `surface-container`; pages, the conversation and the right pane sit in
+      one `surface` card at `radius-extra-large`, lifted to `elevation-1` on
+      the composition-host shadow, 8 DIPs from the window's top, right and
+      bottom edges.
+    - [x] **Sidebar.** `Sidebar.dc.html`: the brand mark and "Eliot Swarm"
+      (Home), Back, Forward, Hide (Ctrl+B); New task; Search, Inbox with its
+      count badge, Agents with "N working" (the fleet view) and Automations;
+      Projects with Add project and the bulk menu (typed menu actions) on
+      hover, project rows (chevron, name, working count) and task rows with
+      the brand book's state marks (loader, waiting and idle dots, Queued,
+      the error icon) and one end word, `+N −M` or age, workers indented;
+      Chats; Show archived, Usage and Settings. Selection, collapse, search,
+      keyboard, row menus and inline rename are kept.
+    - [x] **Home.** `Main.dc.html`: "What should we build in {project ▾}?"
+      with the project list, the composer's field over one bar (+, project,
+      New worktree or Work locally, model, access) and the split Start task
+      (Queue it through `launch.enqueue`; Attach an existing session shown
+      disabled with its reason), three suggestion cards; the refusal notice
+      with Queue it stays above the composer.
+    - [x] **Usage popover.** The sidebar's Usage row (a ring and "Codex 62% ·
+      1 hold" once read) opens a WinUI flyout: each harness's tightest
+      window with its share left, reset time and meter (`error` under 20 %),
+      "Quota unknown" where none is reported, provider holds
+      (`provider.holds`) and Open usage settings. Opening it, and Refresh,
+      read the limits once.
+    - [x] **Daemon screen.** `Offline.dc.html`: the clover, the state's
+      title, the daemon's own reason, Retry (and Start Swarm with Retry for a
+      daemon its owner stopped), Repair settings, Open config.toml, Open
+      log, Open data folder and the data-directory choices; the sidebar
+      stays dimmed with the last list.
   - [ ] **Owner-level review.** All six themes on a private stand, side by side
     with Codex, Claude Code Desktop and OpenCode; response, alignment, color,
     type and shadows checked.

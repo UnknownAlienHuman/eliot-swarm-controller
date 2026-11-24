@@ -20,6 +20,7 @@ pub fn generate(tokens: &Path, out: &Path) {
     scalars(&root, &mut code);
     types(&root, &mut code);
     glyphs(&root, &mut code);
+    shapes(&root, &mut code);
     std::fs::write(out, code).expect("brand.rs is writable");
 }
 
@@ -358,4 +359,39 @@ fn glyphs(root: &Value, code: &mut String) {
         writeln!(code, "    pub const {ident}: &str = \"\\u{{{point:X}}}\";").unwrap();
     }
     code.push_str("}\n");
+}
+
+/// The Expressive shapes as XAML path data in a 100-unit box: each
+/// `polygon(x% y%, …)` token becomes `M x,y L … Z` (a `PathIcon`'s
+/// geometry, scaled to its size by a `Viewbox`).
+fn shapes(root: &Value, code: &mut String) {
+    for token in tokens(root, "shape") {
+        let value = token["value"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} is a polygon", name(token)));
+        let points = value
+            .trim()
+            .strip_prefix("polygon(")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("{} is polygon(…)", name(token)));
+        let mut data = String::new();
+        for (index, point) in points.split(',').enumerate() {
+            let xy: Vec<f64> = point
+                .split_whitespace()
+                .map(|part| {
+                    part.trim_end_matches('%')
+                        .parse()
+                        .unwrap_or_else(|_| panic!("{} has percent points", name(token)))
+                })
+                .collect();
+            let [x, y] = xy[..] else {
+                panic!("{} has x y points", name(token))
+            };
+            data.push_str(if index == 0 { "M" } else { " L" });
+            write!(data, "{x},{y}").unwrap();
+        }
+        data.push_str(" Z");
+        doc_line(code, "", &doc(token));
+        writeln!(code, "pub const {}: &str = \"{data}\";", upper(name(token))).unwrap();
+    }
 }

@@ -423,19 +423,6 @@ pub mod winui {
             )
         }
 
-        /// The status dot of a tone; `None` for tones that need no mark in
-        /// a list (ready, ended), so a calm fleet shows no dots at all.
-        pub fn dot(self, tone: StatusTone) -> Option<Brush> {
-            let pick: fn(&Roles) -> Rgb8 = match tone {
-                StatusTone::Active => |r| r.primary,
-                StatusTone::Attention => |r| r.waiting,
-                StatusTone::Failed | StatusTone::Unknown => |r| r.attention,
-                StatusTone::Pending => |r| r.muted,
-                StatusTone::Ready | StatusTone::Neutral => return None,
-            };
-            Some(self.role(pick, ThemeBrush::AccentText))
-        }
-
         /// Container and content of a status chip.
         pub fn status_chip(self, tone: StatusTone) -> (Brush, Brush) {
             match self.roles {
@@ -512,28 +499,29 @@ pub mod winui {
             })
         }
 
+        /// A chip that takes no input (a fixed fact): disabled, drawn as a
+        /// chip at rest, its outline and content in the variant tone (the
+        /// attention tone for Full access).
+        pub fn fixed_chip(self, attention: bool) -> ResourceOverrides {
+            self.with(|r| {
+                let (outline, on) = if attention {
+                    (r.attention.mix(r.surface, 0.55), r.attention_text)
+                } else {
+                    (r.border, r.variant)
+                };
+                ResourceOverrides::new()
+                    .set("ButtonBackgroundDisabled", Color::transparent())
+                    .set("ButtonBorderBrushDisabled", color(outline))
+                    .set("ButtonForegroundDisabled", color(on))
+            })
+        }
+
         /// The outline of a chip in the attention tone (Full access).
         pub fn attention_outline(self) -> Brush {
             self.role(
                 |r| r.attention.mix(r.surface, 0.55),
                 ThemeBrush::SystemCritical,
             )
-        }
-
-        /// A chip that switches something on (New worktree): the chip's
-        /// outline at rest, the selected role while on.
-        pub fn toggle_chip(self, on: bool) -> ResourceOverrides {
-            self.with(|r| {
-                Family {
-                    outline: Some(r.border),
-                    ..if on {
-                        Family::new(Some(r.selected), r.on_selected)
-                    } else {
-                        Family::new(None, r.variant)
-                    }
-                }
-                .overrides(r)
-            })
         }
 
         /// A steered message: the selected role at half strength on the
@@ -581,10 +569,17 @@ pub mod winui {
             })
         }
 
-        /// A suggestion card on the home screen: the tonal tone, its icon
-        /// (the content color) in the primary role.
+        /// A suggestion card on the Home screen (`.suggest`):
+        /// `surface-container-low` with an `outline-variant` hairline, its
+        /// icon and label in `on-surface`.
         pub fn suggestion(self) -> ResourceOverrides {
-            self.with(|r| Family::new(Some(r.tonal), r.primary).overrides(r))
+            self.with(|r| {
+                Family {
+                    outline: Some(r.border),
+                    ..Family::new(Some(r.tonal), r.text)
+                }
+                .overrides(r)
+            })
         }
 
         /// A tool row: tonal, or the running tint while it runs.
@@ -657,6 +652,95 @@ pub mod winui {
                     .overrides(r)
                     .set("ProgressRingForegroundThemeBrush", color(arc))
                     .set("ProgressRingBackgroundThemeBrush", color(r.outline))
+            })
+        }
+
+        /// A brand-book color token by `pick`, or `system` under High
+        /// Contrast.
+        fn token(self, pick: fn(&crate::brand::Scheme) -> u32, system: ThemeBrush) -> Brush {
+            match self.roles {
+                Some(roles) => Brush::Solid(color(super::rgb(pick(&roles.scheme)))),
+                None => Brush::Theme(system),
+            }
+        }
+
+        /// A diff's added lines (`add`); the deleted sign is `error`.
+        pub fn add(self) -> Brush {
+            self.token(|s| s.add, ThemeBrush::PrimaryText)
+        }
+
+        /// Waiting for you: a task's attention dot (`tertiary`).
+        pub fn waiting(self) -> Brush {
+            self.token(|s| s.tertiary, ThemeBrush::AccentText)
+        }
+
+        /// An idle task's dot (`outline`).
+        pub fn idle_dot(self) -> Brush {
+            self.token(|s| s.outline, ThemeBrush::CardStroke)
+        }
+
+        /// A counter's container and content (`tertiary-container`,
+        /// `on-tertiary-container`): the Inbox count.
+        pub fn badge(self) -> (Brush, Brush) {
+            (
+                self.token(|s| s.tertiary_container, ThemeBrush::Accent),
+                self.token(|s| s.on_tertiary_container, ThemeBrush::PrimaryText),
+            )
+        }
+
+        /// Content on the selection (`on-secondary-container`).
+        pub fn on_selected(self) -> Brush {
+            self.token(|s| s.on_secondary_container, ThemeBrush::PrimaryText)
+        }
+
+        /// A meter's track (`secondary-container`).
+        pub fn meter_track(self) -> Brush {
+            self.token(|s| s.secondary_container, ThemeBrush::CardBackground)
+        }
+
+        /// A shape or icon in the color `pick` names where it is not a
+        /// pressable (the brand mark, a failed row's error icon): the
+        /// content color of a disabled carrier button, on no container.
+        /// Reactor 0.100.0 colors an icon only through the control around
+        /// it.
+        pub fn carrier(self, pick: fn(&crate::brand::Scheme) -> u32) -> ResourceOverrides {
+            self.with(|r| {
+                let clear = Color::transparent();
+                ResourceOverrides::new()
+                    .set("ButtonBackgroundDisabled", clear)
+                    .set("ButtonBorderBrushDisabled", clear)
+                    .set(
+                        "ButtonForegroundDisabled",
+                        color(super::rgb(pick(&r.scheme))),
+                    )
+            })
+        }
+
+        /// The sidebar's Usage row: the row's colors, and its ring's arc
+        /// (`primary`; `error` when little is left) and track
+        /// (`surface-container-highest`), which WinUI's ring template
+        /// resolves from the button's own resources.
+        pub fn usage_row(self, selected: bool, low: bool) -> ResourceOverrides {
+            let arc = if low {
+                |s: &crate::brand::Scheme| s.error
+            } else {
+                |s: &crate::brand::Scheme| s.primary
+            };
+            self.with(|r| {
+                let row = if selected {
+                    Family::new(Some(r.selected), r.on_selected)
+                } else {
+                    Family::new(None, r.text)
+                };
+                row.overrides(r)
+                    .set(
+                        "ProgressRingForegroundThemeBrush",
+                        color(super::rgb(arc(&r.scheme))),
+                    )
+                    .set(
+                        "ProgressRingBackgroundThemeBrush",
+                        color(super::rgb(r.scheme.surface_container_highest)),
+                    )
             })
         }
 

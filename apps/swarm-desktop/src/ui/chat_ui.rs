@@ -1283,15 +1283,17 @@ impl DesktopApp {
         });
     }
 
-    /// The main area for a conversation: the header, the transcript (or the
-    /// empty state of a new task), pending requests and the composer.
-    /// The home screen (`Main.dc.html`): the greeting at 28/500 and three
-    /// suggestion cards under it, centred above the composer: continue the
-    /// last task, schedule an automation, and a prompt to review the open
-    /// pull requests (it fills the composer).
+    /// The Home screen (`Main.dc.html`): one centred column at the Home
+    /// width, 168 DIPs below the card's top, its parts 28 DIPs apart: the
+    /// question in `title-large` ("What should we build in {project ▾}?",
+    /// the project name a menu button), a refusal notice when there is one,
+    /// the composer, then three suggestion cards: Review the open PRs
+    /// (fills the composer), Schedule an automation, and Continue {the last
+    /// task} when there is one.
     fn home_view(
         &self,
-        greeting: String,
+        alert: View,
+        composer: View,
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
@@ -1304,74 +1306,113 @@ impl DesktopApp {
             .filter(|agent| !agent.native_child && !agent.archived)
             .max_by_key(|agent| agent.updated_at)
             .cloned();
-        let mut cards: Vec<KeyedView> = vec![KeyedView::new(
-            "review",
-            m3::suggestion(palette)
-                .automation_name("Review the open PRs")
-                .on_click(
-                    context.message(Message::Chat(ChatMsg::ComposerChanged(REVIEW.to_owned()))),
-                )
-                .content(m3::suggestion_content(
-                    palette,
-                    m3::glyph::LIST,
-                    "Review the open PRs",
-                )),
-        )];
-        cards.push(KeyedView::new(
-            "automation",
-            m3::suggestion(palette)
-                .grid_column(1)
-                .automation_name("Schedule an automation")
-                .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                    settings_ui::Page::Automations,
-                ))))
-                .content(m3::suggestion_content(
-                    palette,
-                    m3::glyph::AUTOMATION,
-                    "Schedule an automation",
-                )),
-        ));
+        let card = |glyph: &str, label: &str| {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::ROW)
+                .margin(Thickness::xy(
+                    tokens::spacing::TEXT_INSET - tokens::spacing::INSET,
+                    0.0,
+                ))
+                .children((
+                    m3::icon(glyph),
+                    m3::body(label.to_owned())
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
+                        .text_trimming(TextTrimming::CharacterEllipsis),
+                ))
+        };
+        let mut cards: Vec<KeyedView> =
+            vec![
+                KeyedView::new(
+                    "review",
+                    m3::suggestion_card(
+                        palette,
+                        m3::suggestion(palette)
+                            .automation_name("Review the open PRs")
+                            .on_click(context.message(Message::Chat(ChatMsg::ComposerChanged(
+                                REVIEW.to_owned(),
+                            ))))
+                            .content(card(m3::glyph::DIFF, "Review the open PRs")),
+                    ),
+                ),
+                KeyedView::new(
+                    "automation",
+                    m3::suggestion_card(
+                        palette,
+                        m3::suggestion(palette)
+                            .automation_name("Schedule an automation")
+                            .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
+                                settings_ui::Page::Automations,
+                            ))))
+                            .content(card(m3::glyph::SCHEDULE, "Schedule an automation")),
+                    ),
+                ),
+            ];
         if let Some(agent) = last {
+            let label = format!("Continue {}", self.agent_label(&agent));
             cards.push(KeyedView::new(
                 format!("continue:{}", agent.id),
-                m3::suggestion(palette)
-                    .grid_column(2)
-                    .automation_name(format!(
-                        "Continue the last task: {}",
-                        self.agent_label(&agent)
-                    ))
-                    .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
-                    .content(m3::suggestion_content(
-                        palette,
-                        m3::glyph::CODE,
-                        "Continue the last task",
-                    )),
+                m3::suggestion_card(
+                    palette,
+                    m3::suggestion(palette)
+                        .automation_name(label.clone())
+                        .on_click(context.message(Message::Shell(ShellMsg::AgentOpened(agent))))
+                        .content(card(m3::glyph::HISTORY, &label)),
+                ),
             ));
         }
-        // The design's cards keep their width (a third of the home column,
-        // narrower with a narrow window); with no last task to continue,
-        // the two left stay centred.
-        let gap = tokens::spacing::INSET;
-        let column = self
-            .column_width(tokens::layout::HOME_WIDTH)
-            .unwrap_or(tokens::layout::HOME_WIDTH);
-        let card = (column - 2.0 * gap) / 3.0;
-        let count = cards.len();
-        StackPanel::new()
+        let title: View = if self.launch.chat {
+            m3::page_title("What would you like to chat about?")
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .into()
+        } else if self.launch.workspace.is_empty() {
+            m3::page_title("What should we build?")
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .into()
+        } else {
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .automation_name(format!(
+                    "What should we build in {}?",
+                    self.launch_project_label()
+                ))
+                .automation_heading_level(AutomationHeadingLevel::Level2)
+                .children((
+                    m3::text("What should we build in", tokens::text::HERO)
+                        .vertical_alignment(VerticalAlignment::Center),
+                    self.title_project(context, palette),
+                    m3::text("?", tokens::text::HERO).vertical_alignment(VerticalAlignment::Center),
+                ))
+        };
+        let width = self.column_width(tokens::layout::HOME_WIDTH);
+        ScrollViewer::new()
             .grid_row(1)
-            .spacing(tokens::spacing::HOME_GROUP_GAP)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .vertical_alignment(VerticalAlignment::Center)
-            .margin(Thickness::xy(tokens::spacing::XL, 0.0))
-            .children((
-                m3::page_title(greeting).horizontal_alignment(HorizontalAlignment::Center),
-                Grid::new()
-                    .width(count as f64 * card + count.saturating_sub(1) as f64 * gap)
+            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+            .content(
+                StackPanel::new()
+                    .width(width)
+                    .max_width(tokens::layout::HOME_WIDTH)
                     .horizontal_alignment(HorizontalAlignment::Center)
-                    .columns(vec![GridLength::STAR; count])
-                    .column_spacing(gap)
-                    .keyed_children(cards),
-            ))
+                    .margin(Thickness::new(
+                        0.0,
+                        tokens::layout::HOME_TOP,
+                        0.0,
+                        tokens::spacing::XL,
+                    ))
+                    .spacing(tokens::spacing::HOME_GROUP_GAP)
+                    .children((
+                        title,
+                        alert,
+                        composer,
+                        StackPanel::new()
+                            .orientation(Orientation::Horizontal)
+                            .horizontal_alignment(HorizontalAlignment::Center)
+                            .spacing(tokens::spacing::SM)
+                            .keyed_children(cards),
+                    )),
+            )
     }
 
     /// The Settings page is drawn here too, over the transcript component,
@@ -1388,9 +1429,19 @@ impl DesktopApp {
             } else {
                 self.settings_view(context, palette)
             };
+            // Opaque over the transcript beneath; its corners follow the
+            // main card's (a Border does not clip its child).
+            let radius = tokens::layout::CARD_RADIUS;
             let page = Border::new()
                 .grid_row(1)
                 .background(palette.surface())
+                .corner_radius(
+                    if self.panel != Panel::Closed && self.main == Main::Project {
+                        CornerRadius::new(radius, 0.0, 0.0, radius)
+                    } else {
+                        CornerRadius::uniform(radius)
+                    },
+                )
                 .content(content);
             return Grid::new()
                 .rows([
@@ -1418,27 +1469,18 @@ impl DesktopApp {
         };
         // The transcript stays in place without an open Agent too, so the
         // conversation just left is removed over later frames, not at once
-        // (`views::Transcript`); the start or home screen covers it.
+        // (`views::Transcript`); the start or Home screen covers it.
+        let home = agent.is_none() && self.launch.starting.is_none();
         let cover: View = match agent {
-            Some(_) => View::empty(),
             // The start is being submitted: the message and what happens
             // now, at once (no empty pause after Send).
             None if self.launch.starting.is_some() => {
                 let (text, label) = self.launch.starting.clone().unwrap_or_default();
                 starting_view(&text, &label, column, palette)
             }
-            None => {
-                let project = (!self.launch.workspace.is_empty())
-                    .then(|| self.place_title(&self.launch.workspace));
-                let line = match project {
-                    _ if self.launch.chat => "What would you like to chat about?".to_owned(),
-                    Some(project) => format!("What should we build in {project}?"),
-                    None => "What should we build?".to_owned(),
-                };
-                self.home_view(line, context, palette)
-            }
+            // Home is built below, around the notice and the composer.
+            _ => View::empty(),
         };
-        let body = View::fragment((transcript, cover));
         let pending = self.pending_view(column, context, palette);
         let reconnect = self.reconnect_notice(column, palette);
         let alert: View = match (&self.chat.confirm_force, &self.alert) {
@@ -1522,7 +1564,29 @@ impl DesktopApp {
                 .unwrap_or_else(View::empty),
         };
         let composer = self.composer_view(column, context, palette);
+        // Home: the question, the notice, the composer and the suggestions
+        // in one column over the (empty) transcript.
+        if home {
+            let home = self.home_view(alert, composer, context, palette);
+            return Grid::new()
+                .rows([
+                    GridLength::Auto,
+                    GridLength::STAR,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                    GridLength::Auto,
+                ])
+                .children((
+                    header,
+                    View::fragment((transcript, home)),
+                    pending,
+                    View::empty(),
+                    View::empty(),
+                ));
+        }
 
+        let body = View::fragment((transcript, cover));
         // Rows: the header, the transcript, (spare), pending requests, the
         // notice, the composer (its popovers are flyouts on its chips).
         Grid::new()

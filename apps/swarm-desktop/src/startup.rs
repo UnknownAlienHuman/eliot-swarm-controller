@@ -80,13 +80,68 @@ fn usable(handle: HANDLE) -> bool {
 }
 
 /// Record every panic in `desktop.log`, then report it as before (to the
-/// terminal when there is one).
+/// terminal when there is one). A panic inside a native boundary (a
+/// window hook or a WinUI event handler, [`native_boundary`]) only queues
+/// its line: file I/O and terminal output there could outlast a hook's
+/// time limit; the UI thread writes it ([`drain_deferred`]).
 pub fn install_panic_hook() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if NATIVE_DEPTH.with(std::cell::Cell::get) > 0 {
+            defer(format!("panic: {info}"));
+            return;
+        }
         record(&format!("panic: {info}"));
         report(info);
     }));
+}
+
+thread_local! {
+    /// Native boundaries entered on this thread and not left yet.
+    static NATIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Lines a native boundary queued for the UI thread to write.
+static DEFERRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// Most lines the queue holds before the UI thread drains it.
+const DEFERRED_LINES: usize = 32;
+
+/// Inside a native boundary while this guard lives (see
+/// [`install_panic_hook`] and [`caught_panic`]).
+pub struct NativeBoundary(());
+
+impl Drop for NativeBoundary {
+    fn drop(&mut self) {
+        NATIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Enter a native boundary (a hook procedure, a WinUI event handler).
+pub fn native_boundary() -> NativeBoundary {
+    NATIVE_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    NativeBoundary(())
+}
+
+/// Queue a line for the UI thread without waiting: a boundary never blocks
+/// on the queue (a busy one drops the line) and never grows it unbounded.
+fn defer(line: String) {
+    if let Ok(mut queued) = DEFERRED.try_lock()
+        && queued.len() < DEFERRED_LINES
+    {
+        queued.push(line);
+    }
+}
+
+/// Write the lines native boundaries queued (the UI thread, outside any
+/// boundary: the terminal and `desktop.log`).
+pub fn drain_deferred() {
+    let lines = DEFERRED
+        .lock()
+        .map(|mut queued| std::mem::take(&mut *queued))
+        .unwrap_or_default();
+    for line in lines {
+        note(&line);
+    }
 }
 
 /// A start-up or shutdown problem the desktop runs on after: the terminal
@@ -100,16 +155,19 @@ pub fn note(error: &str) {
 static PANIC_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A panic stopped at a native boundary (a WinUI event handler or one of
-/// the window's hooks), where unwinding would abort the process: each one
-/// is noted in the log, and the first of the session also reaches the
-/// window, which shows a notice (`Shortcut::Panicked`).
+/// the window's hooks), where unwinding would abort the process. Here it
+/// only queues its line and, the first time this session, enqueues the
+/// window's notice (`Shortcut::Panicked`): no file I/O and no terminal
+/// output, which could outlast a hook's time limit or fail and unwind out
+/// of the `extern "system"` function. The UI thread writes the line to the
+/// log and shows the notice ([`drain_deferred`]).
 pub fn caught_panic(source: &str, panic: &(dyn std::any::Any + Send)) {
     let what = panic
         .downcast_ref::<&str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "unknown panic".to_owned());
-    note(&format!("{source} panicked and was stopped there: {what}"));
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic");
+    defer(format!("{source} panicked and was stopped there: {what}"));
     if !PANIC_SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
         crate::shortcuts::panicked();
     }
