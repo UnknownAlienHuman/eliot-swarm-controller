@@ -154,14 +154,13 @@ impl Router {
                                 Some("approve" | "deny" | "answer" | "resume" | "stop")
                             ) =>
                         {
-                            let result = self.submit_bound(&action.args, principal, context).await;
-                            self.note_command_submission(
+                            self.submit_bound(
+                                &action.args,
                                 principal,
-                                context.remote,
-                                "owner.decide",
-                                &result,
-                            );
-                            result
+                                context,
+                                Some("owner.decide"),
+                            )
+                            .await
                         }
                         "command.resolve" => self.command_resolve(&action.args, principal).await,
                         "command.cancel" => self.command_cancel(&action.args, principal).await,
