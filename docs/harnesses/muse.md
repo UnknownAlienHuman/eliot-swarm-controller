@@ -152,8 +152,9 @@ of the selector. Only a model named in the response can verify it.
 also fills an omitted provider model with that selector in the raw
 provider facet. An exact echo, an unnamed model or evidence exclusively
 from unlinked tasks leaves verification false with the reason “provider
-did not name a model.” The native result and its text still settle
-normally.
+did not name a model.” Agent and turn readbacks show the requested model
+with `model_verified: false` in that case. The native result and its text
+still settle normally.
 
 Owned startup checks `account/read` before catalogue selection. If the
 endpoint requires credentials and Muse reports `loggedOut`, Swarm fails
@@ -161,8 +162,9 @@ the launch with `auth_required` before creating or resuming a session.
 The read keeps only credential state and requirement. A keyless endpoint
 can launch without sign-in.
 
-An explicit mismatch suppresses that turn's response and records a durable
-[profile model hold](../spec/monitoring.md#provider-holds) with both IDs.
+An explicit mismatch clears the effective model, suppresses that turn's
+response and records a durable [profile model hold](../spec/monitoring.md#provider-holds)
+with both IDs.
 The adapter checks the exact `turn/cancel` acknowledgement and verifies
 the native terminal. A failed or unconfirmed cancellation invokes the
 existing owned-host stop path. The Owner inbox shows one item for the
@@ -279,9 +281,15 @@ The adapter first reads the host's `model/list` snapshot. An empty snapshot
 triggers one refresh with the resolved executable and environment from the
 private plugin directory. The
 refresh and each host query have separate deadlines. A fresh `serve` reads the
-resulting cache even if the refresh fails. An exact selector missing from the
-public catalogue is passed unchanged and reported with
-`catalogue_omits_model: true`. An exact row
+resulting cache even if the refresh fails. For the picker, Swarm augments the
+Meta/TBH `model/list` snapshot with hidden Contributor rows from the provider's
+version 3 `model-catalog/6d657461__p746268.json` under the host-reported `museHome`.
+Muse 1.4.25 writes those rows during `exec --list-models` while omitting them
+from stdout and `model/list`. Swarm labels those choices “Contributor.” Muse
+describes them as models whose submitted content may be used for product
+improvement. The catalogue uses their reported effort tiers when available.
+An exact selector missing from the public catalogue is passed unchanged
+and reported with `catalogue_omits_model: true`. An exact row
 supplies effort variants when known, so a known model/effort mismatch fails
 before a native start or resume. The session `modelId` confirms admission
 before Swarm dispatches input.
