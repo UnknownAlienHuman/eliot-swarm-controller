@@ -345,9 +345,15 @@ fn affected_tasks(agents: &[UiAgent], roots: &[BulkItem]) -> usize {
     affected.len()
 }
 
+/// Why a registration stays while its Git metadata refreshes.
+const GIT_REFRESHING_USE: &str =
+    "Git metadata is refreshing, so its tasks in worktrees are not known yet";
+
 /// Each registration's usage, its name and whether its folder is gone.
+/// The usage is unknown (`None`) while its Git metadata refreshes: tasks
+/// in its linked worktrees are found through checkouts that are not read.
 struct Registrations {
-    rows: Vec<(String, String, nav::Use, bool)>,
+    rows: Vec<(String, String, Option<nav::Use>, bool)>,
 }
 
 fn read_registrations(data_dir: &Path) -> Result<Registrations, String> {
@@ -366,7 +372,8 @@ fn read_registrations(data_dir: &Path) -> Result<Registrations, String> {
                 (
                     registration.id.clone(),
                     nav::place_label(&registration.workspace, &checkouts),
-                    usage.get(&registration.id).copied().unwrap_or_default(),
+                    (!registration.git_refreshing)
+                        .then(|| usage.get(&registration.id).copied().unwrap_or_default()),
                     registration.missing,
                 )
             })
@@ -401,6 +408,10 @@ fn plan_projects(data_dir: &Path, pick: &Pick) -> Result<BulkPlan, String> {
         if !wanted {
             continue;
         }
+        let Some(usage) = usage else {
+            plan.kept.push(format!("{name}: {GIT_REFRESHING_USE}"));
+            continue;
+        };
         let removable = usage.live == 0
             && match pick {
                 Pick::Unused => missing || usage.tasks == 0,
@@ -533,7 +544,9 @@ fn remove_checked(
     let mut ids = Vec::new();
     for item in items {
         match now.rows.iter().find(|(id, ..)| *id == item.id) {
-            Some((_, _, usage, _)) if usage.live > 0 => kept.push(format!(
+            // Its checkout facts are unknown, so it is not taken as unused.
+            Some((_, _, None, _)) => kept.push(format!("{}: {GIT_REFRESHING_USE}", item.name)),
+            Some((_, _, Some(usage), _)) if usage.live > 0 => kept.push(format!(
                 "{}: {} since the review",
                 item.name,
                 use_words(*usage)

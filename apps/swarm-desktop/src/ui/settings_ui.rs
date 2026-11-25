@@ -1338,7 +1338,7 @@ impl DesktopApp {
                     let read = model::policy_fields(&s.base(Section::Projects), &id);
                     PolicyDraft::new(id, read)
                 });
-                self.read_policy_usage(context);
+                self.poll_projects(context);
             }
             SettingsMsg::PolicyEdited(edit) => {
                 if let Some(policy) = s.policy.as_mut() {
@@ -1936,11 +1936,7 @@ impl DesktopApp {
         self.load_settings(context);
         self.load_profile_list(context);
         self.load_routing_preview(context);
-        if let Ok(data_dir) = self.data_dir.clone() {
-            let _task = context.spawn_background(move |_| {
-                Message::Shell(ShellMsg::ProjectsLoaded(load_projects_blocking(&data_dir)))
-            });
-        }
+        self.load_projects(context);
     }
 
     pub(super) fn load_settings(&mut self, context: &ComponentContext<Self>) {

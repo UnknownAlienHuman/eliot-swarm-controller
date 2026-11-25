@@ -335,6 +335,9 @@ impl DesktopApp {
         let checkouts = registered
             .map(|project| project.git_checkouts.as_slice())
             .unwrap_or_default();
+        // While its Git metadata refreshes the checkouts are the last
+        // known: shown, but a linked worktree's folder may be gone.
+        let refreshing = registered.is_some_and(|project| project.git_refreshing);
         let detached: HashSet<String> = checkouts
             .iter()
             .filter(|checkout| checkout.branch.is_none())
@@ -479,6 +482,8 @@ impl DesktopApp {
                     },
                     main: checkout.main,
                     tasks: tasks.join(", "),
+                    paused: refreshing
+                        && nav::path_key(&checkout.path) != nav::path_key(&state.checkout),
                 }
             })
             .collect();
@@ -575,6 +580,7 @@ impl DesktopApp {
             checkout: state.checkout.clone(),
             key: state.key.clone(),
             missing: registered.is_some_and(|project| project.missing),
+            refreshing,
             can_launch: self.can_launch_here(&state.checkout),
             target,
             groups,
@@ -702,6 +708,9 @@ struct WorktreeLine {
     state: String,
     main: bool,
     tasks: String,
+    /// A linked worktree known only from the last Git read
+    /// ([`nav::Checkout::paused`]).
+    paused: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -764,6 +773,8 @@ pub(super) struct ProjectInput {
     checkout: String,
     key: String,
     missing: bool,
+    /// The project's Git metadata is refreshing (`git_refreshing`).
+    refreshing: bool,
     can_launch: bool,
     /// The project's row menu (the sidebar's), when the sidebar lists it.
     target: Option<MenuTarget>,
@@ -830,33 +841,38 @@ impl Component for ProjectView {
             ));
         }
         let path = nav::display_path(&input.checkout);
-        let heading =
-            StackPanel::new().children((
-                page_ui::title(input.name.clone()),
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::XS)
-                    .children((
-                        controls::secondary(format!("{path} ·"))
-                            .vertical_alignment(VerticalAlignment::Center)
-                            .text_trimming(TextTrimming::CharacterEllipsis),
-                        controls::text_button()
-                            .height(tokens::text::CAPTION.size + tokens::spacing::SM)
-                            .min_height(0.0)
-                            .margin(Thickness::new(
-                                -tokens::spacing::ROW,
-                                0.0,
-                                -tokens::spacing::ROW,
-                                0.0,
-                            ))
-                            .automation_name(format!("Open folder {path}"))
-                            .on_click(context.message(Message::Reveal(
-                                input.name.clone(),
-                                input.checkout.clone(),
-                            )))
-                            .content(controls::text("Open folder", tokens::text::CAPTION)),
-                    )),
+        let folder = StackPanel::new()
+            .orientation(Orientation::Horizontal)
+            .spacing(tokens::spacing::XS)
+            .children((
+                controls::secondary(format!("{path} ·"))
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis),
+                controls::text_button()
+                    .height(tokens::text::CAPTION.size + tokens::spacing::SM)
+                    .min_height(0.0)
+                    .margin(Thickness::new(
+                        -tokens::spacing::ROW,
+                        0.0,
+                        -tokens::spacing::ROW,
+                        0.0,
+                    ))
+                    .automation_name(format!("Open folder {path}"))
+                    .on_click(
+                        context
+                            .message(Message::Reveal(input.name.clone(), input.checkout.clone())),
+                    )
+                    .content(controls::text("Open folder", tokens::text::CAPTION)),
             ));
+        // The title is the origin's name: while Git metadata refreshes it
+        // is the last known, and says so.
+        let heading = StackPanel::new().keyed_children(crate::views::slots([
+            Some(page_ui::title(input.name.clone()).into()),
+            input
+                .refreshing
+                .then(|| controls::secondary(GIT_REFRESHING).into()),
+            Some(folder.into()),
+        ]));
         let mut items = vec![KeyedView::new("header", page_ui::toolbar(heading, actions))];
         if input.missing {
             items.push(KeyedView::new(
@@ -1309,7 +1325,9 @@ fn worktrees_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>)
         "head",
         page_ui::panel_head("Branches & worktrees", None),
     )];
-    if input.worktrees.is_empty() {
+    if input.refreshing {
+        rows.push(KeyedView::new("refreshing", page_ui::quiet(GIT_REFRESHING)));
+    } else if input.worktrees.is_empty() {
         rows.push(KeyedView::new(
             "none",
             page_ui::quiet("No checkouts read yet."),
@@ -1321,11 +1339,17 @@ fn worktrees_panel(input: &ProjectInput, context: &mut ViewContext<ProjectView>)
         } else {
             format!("{} · {}", line.tasks, line.folder)
         };
+        let name = format!("Open folder of {}: {}", line.branch, line.folder);
         rows.push(KeyedView::new(
-            line.path.clone(),
+            format!("{}:{}", line.path, line.paused),
             controls::row(false)
                 .min_height(tokens::height::TWO_LINE_ROW)
-                .automation_name(format!("Open folder of {}: {}", line.branch, line.folder))
+                .is_enabled(!line.paused)
+                .automation_name(if line.paused {
+                    format!("{name}, {GIT_PAUSED}")
+                } else {
+                    name
+                })
                 .on_click(context.message(Message::Reveal(line.branch.clone(), line.path.clone())))
                 .content(
                     StackPanel::new()

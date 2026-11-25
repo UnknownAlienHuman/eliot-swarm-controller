@@ -46,13 +46,18 @@ impl SizeClass {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Layout {
     pub(super) class: SizeClass,
+    /// The requested pane would dock: computed with no pane open too, so
+    /// the window already knows on the render that opens the pane whether
+    /// it docks or lies over the main area. Computing it only for an open
+    /// pane would render the opening once with a stale answer and lay it
+    /// out again after this component observed the pane.
     pub(super) docks: bool,
 }
 
 impl Layout {
     /// The layout of a client `width`: `sidebar` is the sidebar's width
     /// (the rail's in a compact window or when hidden by choice), `pane`
-    /// the requested pane width.
+    /// the requested pane width, open or not (see [`Layout::docks`]).
     pub(super) fn of(width: f64, sidebar: f64, rail: bool, pane: f64) -> Self {
         let class = SizeClass::of(width);
         let sidebar = if rail || class == SizeClass::Compact {
@@ -174,7 +179,6 @@ pub(super) struct SplitInput {
     pub(super) wide: bool,
     /// The widths saved in `[desktop]` (defaults when absent).
     pub(super) widths: PanelWidths,
-    pub(super) note: SizeNote,
     pub(super) on_layout: Callback<Layout>,
     pub(super) on_widths: Callback<PanelWidths>,
     pub(super) on_overlay_closed: Callback<bool>,
@@ -199,7 +203,8 @@ pub(super) enum SplitMsg {
     Hover(Option<Edge>),
     /// An arrow key on the focused handle: DIPs toward the right.
     Step(Edge, f64),
-    /// The focus leaves the handle: the arrow keys' widths persist.
+    /// The arrow key is released (once per press or hold) or the focus
+    /// leaves the handle: the arrow keys' widths persist.
     Stepped,
 }
 
@@ -225,7 +230,6 @@ pub(super) struct SplitShell {
     posted: Option<Layout>,
     /// The window has its icon (set once it is shown).
     icon_set: bool,
-    note: SizeNote,
     on_layout: Callback<Layout>,
     on_widths: Callback<PanelWidths>,
 }
@@ -268,7 +272,9 @@ impl SplitShell {
 
     /// `edge`'s width moved to `width`: whole DIPs, within its bounds and
     /// keeping the main area at its required width beside the other panel
-    /// ([`spare`]). Nothing moves before the first size observation.
+    /// ([`spare`]). In a room already below that, the width cannot grow
+    /// but can still narrow. Nothing moves before the first size
+    /// observation.
     fn resize(&mut self, edge: Edge, width: f64) {
         let Some(window) = self.window else {
             return;
@@ -278,7 +284,10 @@ impl SplitShell {
         } else {
             0.0
         };
-        let most = (self.width(edge) + spare(window, self.sidebar_beside(), pane)).floor();
+        let current = self.width(edge);
+        let most = (current + spare(window, self.sidebar_beside(), pane))
+            .floor()
+            .max(current);
         let width = width.round().min(most);
         match edge {
             Edge::Sidebar => {
@@ -311,8 +320,9 @@ impl SplitShell {
 
     /// A panel's drag handle on its inner edge: a 6-DIP strip with the
     /// resize cursor, highlighted under the pointer and while dragged;
-    /// Left and Right move it by 10 DIPs (50 with Shift), and the
-    /// widths persist when the focus leaves it.
+    /// Left and Right move it by 10 DIPs (50 with Shift), and the widths
+    /// persist when the key is released (one write per press or hold) and
+    /// when the focus leaves it.
     fn handle(&self, edge: Edge, context: &mut ViewContext<Self>) -> View {
         let active = self.hover == Some(edge) || self.drag.as_ref().is_some_and(|d| d.edge == edge);
         let sender = context.sender();
@@ -328,6 +338,14 @@ impl SplitShell {
                 _ => return false,
             };
             let _ = sender.send(SplitMsg::Step(edge, step));
+            true
+        });
+        let sender = context.sender();
+        let released = RoutedCallback::new(move |key: KeyEventInfo| {
+            if !matches!(key.key, VirtualKey::LEFT | VirtualKey::RIGHT) {
+                return false;
+            }
+            let _ = sender.send(SplitMsg::Stepped);
             true
         });
         let fill: Brush = if active {
@@ -356,6 +374,7 @@ impl SplitShell {
             )
             .on_pointer_exited(context.callback(|_: PointerEventInfo| SplitMsg::Hover(None)))
             .on_preview_key_down(keys)
+            .on_key_up(released)
             .on_lost_focus(context.callback(|_: FocusEventInfo| SplitMsg::Stepped))
             .tooltip(name)
     }
@@ -377,7 +396,6 @@ impl Component for SplitShell {
             wide: input.wide,
             posted: None,
             icon_set: false,
-            note: input.note.clone(),
             on_layout: input.on_layout.clone(),
             on_widths: input.on_widths.clone(),
         }
@@ -387,7 +405,6 @@ impl Component for SplitShell {
         self.mode = input.mode;
         self.docked = input.pane.is_some() && !input.over;
         self.wide = input.wide;
-        self.note = input.note.clone();
         self.on_layout = input.on_layout.clone();
         self.on_widths = input.on_widths.clone();
         if input.widths != self.adopted {
@@ -405,13 +422,9 @@ impl Component for SplitShell {
                 if !self.icon_set {
                     self.icon_set = crate::app_window::set_icon();
                 }
+                // The size the window restores to is read from its
+                // placement as it closes (`window_place`).
                 self.window = Some(size.width);
-                // A maximized size is not the size the window restores to.
-                let normal = size.width >= 640.0
-                    && size.height >= 480.0
-                    && !crate::window_place::maximized();
-                self.note
-                    .observe(normal.then_some((size.width as u32, size.height as u32)));
                 self.post_layout();
             }
             SplitMsg::Pressed(edge, info) => {

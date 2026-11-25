@@ -1593,14 +1593,16 @@ closed vocabularies exactly. Model ids, provider names, collapsed project and gr
 keys and display-name keys are 1–256 bytes, and effort is 1–128 bytes; these reject
 controls and surrounding whitespace.
 The desktop keeps no other preference store. The desktop writes `window` back once when the
-window closes, and only when it changed. It reads `window` from the file before its window
+window closes, and only when it changed, from the closing window's placement: its normal size
+and place, also when it closes maximized or minimized. It reads `window` from the file before its window
 exists, so the window opens at that size, place and maximized state with no move after the
 first frame; a place no longer on an attached monitor is clamped into the nearest one's work
 area, and without `x`/`y` Windows chooses the place. `panels` (`{sidebar, pane}`: the
 sidebar's width from 200 to 360 DIPs and the context pane's from 320 to 720, in whole DIPs
 as their drag handles left them) is read with `window`, so the first frame lays out at those
-widths. It is written once when a drag on a handle ends, or when the keyboard focus leaves a
-handle the arrow keys moved. Settings › Appearance › Reset panel widths removes it, and
+widths. It is written once when a drag on a handle ends, when an arrow key on a handle is
+released (one write per press or hold), or when the keyboard focus leaves a handle the arrow
+keys moved. Settings › Appearance › Reset panel widths removes it, and
 without it the desktop uses its default widths.
 When the daemon cannot start, the local Owner can open Settings (Repair
 settings) from the startup failure view. Repair uses the daemon's settings reader and

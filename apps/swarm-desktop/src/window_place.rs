@@ -16,7 +16,10 @@
 //!   live); a window still minimized by its start-up show restores
 //!   maximized.
 //! - `HCBT_DESTROYWND`: its placement (`GetWindowPlacement`) is read once
-//!   for the one `[desktop]` write after the window closes.
+//!   for the one `[desktop]` write after the window closes: the normal
+//!   place, the normal client size (the inverse of the creation's frame
+//!   math, so a maximized or minimized window still yields its restored
+//!   size) and the maximized state.
 //!
 //! The start's show command (`STARTUPINFO`) also says whether the desktop
 //! may take the foreground: a start minimized, hidden or without activation
@@ -48,11 +51,11 @@ use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForMonitor, MDT_EFFECTIVE_DPI,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CBT_CREATEWNDW, CallNextHookEx, GetClassNameW, GetForegroundWindow, GetWindowPlacement,
-    HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK, IsIconic, IsWindowVisible, IsZoomed,
-    SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED, SW_SHOWMINNOACTIVE, SW_SHOWNA,
-    SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowsHookExW, UnhookWindowsHookEx, WH_CBT,
-    WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD,
+    CBT_CREATEWNDW, CallNextHookEx, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetForegroundWindow,
+    GetWindowLongW, GetWindowPlacement, HCBT_ACTIVATE, HCBT_CREATEWND, HCBT_DESTROYWND, HHOOK,
+    IsIconic, IsWindowVisible, SW_HIDE, SW_MINIMIZE, SW_SHOWMAXIMIZED, SW_SHOWMINIMIZED,
+    SW_SHOWMINNOACTIVE, SW_SHOWNA, SW_SHOWNOACTIVATE, SetWindowPlacement, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_CBT, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_CHILD,
 };
 
 /// Where the window was when it closed.
@@ -61,6 +64,10 @@ pub struct Closed {
     /// The normal (restored) outer top-left in physical screen pixels.
     pub x: i32,
     pub y: i32,
+    /// The normal (restored) client size in DIPs, as `[desktop] window`
+    /// keeps it.
+    pub width: u32,
+    pub height: u32,
     pub maximized: bool,
 }
 
@@ -214,13 +221,6 @@ pub fn hidden() -> bool {
         && (unsafe { IsIconic(window) } != 0 || unsafe { IsWindowVisible(window) } == 0)
 }
 
-/// Whether the window is maximized now (on the UI thread).
-pub fn maximized() -> bool {
-    let window = WINDOW.get();
-    // SAFETY: a window this thread created, or null (then not maximized).
-    !window.is_null() && unsafe { IsZoomed(window) } != 0
-}
-
 /// Maximize the window, or, while its start-up show keeps it minimized,
 /// make its restore maximized (`WPF_RESTORETOMAXIMIZED`, valid only with
 /// `SW_SHOWMINIMIZED`).
@@ -274,10 +274,7 @@ fn place(
     };
     // SAFETY: valid rectangle; NEAREST always returns a monitor.
     let monitor = unsafe { MonitorFromRect(&estimate, MONITOR_DEFAULTTONEAREST) };
-    let (mut dpi, mut dpi_y) = (96, 96);
-    // SAFETY: valid monitor and out-pointers.
-    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) };
-    let dpi = dpi.max(96);
+    let dpi = monitor_dpi(monitor);
     let pixels = |value: u32| {
         (f64::from(value) * f64::from(dpi) / 96.0)
             .round()
@@ -308,6 +305,14 @@ fn place(
     )
 }
 
+/// The monitor's effective DPI (96 when it cannot be read).
+fn monitor_dpi(monitor: windows_sys::Win32::Graphics::Gdi::HMONITOR) -> u32 {
+    let (mut dpi, mut dpi_y) = (96, 96);
+    // SAFETY: valid monitor and out-pointers.
+    unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y) };
+    dpi.max(96)
+}
+
 fn monitor_info(monitor: windows_sys::Win32::Graphics::Gdi::HMONITOR) -> Option<MONITORINFO> {
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
@@ -317,8 +322,8 @@ fn monitor_info(monitor: windows_sys::Win32::Graphics::Gdi::HMONITOR) -> Option<
     (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info)
 }
 
-/// The window's normal top-left in screen pixels and whether it is (or,
-/// minimized, restores to) maximized.
+/// The window's normal top-left in screen pixels, its normal client size in
+/// DIPs and whether it is (or, minimized, restores to) maximized.
 fn placement(window: HWND) -> Option<Closed> {
     let mut placement = WINDOWPLACEMENT {
         length: size_of::<WINDOWPLACEMENT>() as u32,
@@ -339,10 +344,32 @@ fn placement(window: HWND) -> Option<Closed> {
             info.rcWork.top - info.rcMonitor.top,
         )
     });
+    // The client size: [`place`]'s inverse, the frame of the window's
+    // styles at its monitor's DPI taken off the normal outer size.
+    let dpi = monitor_dpi(monitor);
+    let mut frame = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: read-only style queries on a live window; a valid rectangle,
+    // which stays empty (no frame) on failure.
+    unsafe {
+        let style = GetWindowLongW(window, GWL_STYLE) as u32;
+        let ex_style = GetWindowLongW(window, GWL_EXSTYLE) as u32;
+        AdjustWindowRectExForDpi(&mut frame, style, 0, ex_style, dpi);
+    }
+    let dips = |outer: i32, frame: i32| {
+        let pixels = f64::from(outer.saturating_sub(frame).max(0));
+        (pixels * 96.0 / f64::from(dpi)).round() as u32
+    };
     let show = placement.showCmd as i32;
     Some(Closed {
         x: normal.left + dx,
         y: normal.top + dy,
+        width: dips(normal.right - normal.left, frame.right - frame.left),
+        height: dips(normal.bottom - normal.top, frame.bottom - frame.top),
         maximized: show == SW_SHOWMAXIMIZED
             || (show == SW_SHOWMINIMIZED && placement.flags & WPF_RESTORETOMAXIMIZED != 0),
     })

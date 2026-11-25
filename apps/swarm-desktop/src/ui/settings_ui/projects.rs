@@ -98,11 +98,11 @@ impl DesktopApp {
             let checked = self.settings.project_selected.contains(&id);
             let path = model::project_path(drafts, &id);
             let allowed = model::project_profiles(drafts, &id);
-            let missing = self
-                .nav
-                .projects
-                .iter()
-                .any(|project| project.id == id && project.missing);
+            let shown = self.nav.projects.iter().find(|project| project.id == id);
+            let missing = shown.is_some_and(|project| project.missing);
+            // The name is the origin's: the last known while Git metadata
+            // refreshes.
+            let refreshing = shown.is_some_and(|project| project.git_refreshing);
             let summary = if allowed.is_empty() {
                 "no profiles allowed".to_owned()
             } else {
@@ -110,6 +110,11 @@ impl DesktopApp {
             };
             let note = if missing {
                 format!("Folder missing · {}", nav::display_path(&path))
+            } else if refreshing {
+                format!(
+                    "{GIT_REFRESHING} · {} · {summary}",
+                    nav::display_path(&path)
+                )
             } else {
                 format!("{} · {summary}", nav::display_path(&path))
             };
