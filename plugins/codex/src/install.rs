@@ -15,7 +15,7 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["codex"],
         strategy: InstallStrategy::ByName,
         cli_identity: None,
-        capability_probe: None,
+        version_identity: None,
         allow_script_wrapper: true,
         ide_hint_subpath: None,
         timeout_label: None,

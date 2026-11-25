@@ -19,7 +19,7 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["claude"],
         strategy: InstallStrategy::NewestVerified,
         cli_identity: None,
-        capability_probe: None,
+        version_identity: None,
         allow_script_wrapper: false,
         ide_hint_subpath: None,
         timeout_label: Some(timeout_version_label),

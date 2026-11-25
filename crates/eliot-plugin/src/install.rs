@@ -186,12 +186,10 @@ pub enum InstallStrategy {
     NewestVerified,
 }
 
-/// Adapter-owned readback that verifies the declared executable is a CLI.
+/// Adapter-owned file identity required before reading CLI version metadata.
 #[derive(Clone, Copy)]
-pub struct InstallProbe {
-    pub args: &'static [&'static str],
-    /// Adapter-owned, non-executing identity check before invoking the probe.
-    pub verify_executable: fn(&Path, std::time::Instant) -> bool,
+pub struct InstallIdentity {
+    pub matches_file: fn(&Path, std::time::Instant) -> bool,
     pub refusal: &'static str,
 }
 
@@ -214,8 +212,8 @@ pub struct InstallDiscovery {
     /// Required CLI file stem (without extension): a cmd naming any other
     /// executable is refused before any probe. `None` disables the gate.
     pub cli_identity: Option<&'static str>,
-    /// Native capability readback required before the executable is selected.
-    pub capability_probe: Option<InstallProbe>,
+    /// When present, require both a file identity and a parseable CLI version.
+    pub version_identity: Option<InstallIdentity>,
     /// Whether an explicit executable pin may name a script wrapper. Only
     /// the PATH-resolved harness keeps this; every discovered native
     /// executable must be a real payload.

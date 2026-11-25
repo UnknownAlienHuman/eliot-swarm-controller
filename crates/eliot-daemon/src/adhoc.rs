@@ -861,10 +861,10 @@ fn verify_reader(
         InstallStrategy::MetadataVersion(read) => read(Path::new(&cmd)),
         _ => probe_optional_native_version(&cmd, Some(&decl), deadline)?,
     };
-    if let Some(probe) = decl.capability_probe
+    if let Some(identity) = decl.version_identity
         && version.is_none()
     {
-        return Err(core::Error::new("unsupported", probe.refusal));
+        return Err(core::Error::new("unsupported", identity.refusal));
     }
     Ok((cmd, version))
 }
@@ -917,7 +917,7 @@ pub(crate) fn harness_installation(harness: &str, deadline: Instant) -> Value {
     read().unwrap_or_else(|error| installation_error(harness, error))
 }
 
-#[derive(PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct InstallationFingerprint {
     executables: Vec<VersionKey>,
     metadata_version: Option<String>,
@@ -998,7 +998,7 @@ impl VersionKey {
             modified: metadata.modified().ok(),
             size: metadata.len(),
             adapter_verification: verify
-                .filter(|decl| decl.capability_probe.is_some())
+                .filter(|decl| decl.version_identity.is_some())
                 .map(|decl| decl.name),
         })
     }
@@ -1058,7 +1058,7 @@ fn probe_native_version(
     };
     let result = probe_version_uncached(program, verify, deadline);
     // A caller that used up its own budget should not suppress a later probe.
-    // The capability and version commands' own timeouts still back off.
+    // The version command's own timeout still backs off.
     let caller_timed_out = result
         .as_ref()
         .is_err_and(|error| caller_discovery_timed_out(error, deadline));
@@ -1145,22 +1145,11 @@ fn probe_version_uncached(
     verify: Option<&InstallDiscovery>,
     deadline: Instant,
 ) -> VersionResult {
-    let capability = verify.and_then(|decl| decl.capability_probe);
-    if let Some(probe) = capability {
-        let verified = (probe.verify_executable)(Path::new(program), deadline);
+    let identity = verify.and_then(|decl| decl.version_identity);
+    if let Some(identity) = identity {
+        let verified = (identity.matches_file)(Path::new(program), deadline);
         discovery_remaining(deadline)?;
         if !verified {
-            return Ok(None);
-        }
-        let help = native_capture(
-            program,
-            probe.args,
-            deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
-        )?;
-        discovery_remaining(deadline)?;
-        // The adapter's passive identity check precedes the bounded
-        // subcommand. Help prose and option spelling do not gate it.
-        if !help.is_some_and(|capture| capture.status.success()) {
             return Ok(None);
         }
     }
@@ -1182,7 +1171,7 @@ fn probe_version_uncached(
         let text = std::str::from_utf8(bytes).ok()?.lines().next()?.trim();
         (!text.is_empty()
             && text.len() <= 256
-            && (capability.is_none() || parse_cli_version(text).is_some()))
+            && (identity.is_none() || parse_cli_version(text).is_some()))
         .then(|| text.to_owned())
     }))
 }

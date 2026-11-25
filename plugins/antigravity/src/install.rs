@@ -4,7 +4,8 @@
 
 use eliot_core as core;
 use eliot_plugin::install::{
-    InstallDiscovery, InstallProbe, InstallStrategy, find_on_path, is_script_wrapper, local_roots,
+    InstallDiscovery, InstallIdentity, InstallStrategy, find_on_path, is_script_wrapper,
+    local_roots,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -26,10 +27,9 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["agy"],
         strategy: InstallStrategy::FirstExisting,
         cli_identity: Some(CLI_STEM),
-        capability_probe: Some(InstallProbe {
-            args: &["acp", "--help"],
-            verify_executable: has_cli_module,
-            refusal: "executable did not establish Antigravity CLI ACP capability",
+        version_identity: Some(InstallIdentity {
+            matches_file: has_cli_module,
+            refusal: "executable did not establish Antigravity CLI identity and version",
         }),
         allow_script_wrapper: false,
         ide_hint_subpath: Some(IDE_HINT_SUBPATH),
@@ -43,8 +43,8 @@ pub fn discovery() -> InstallDiscovery {
     }
 }
 
-/// The CLI has no passive capability receipt. Its Go module distinguishes
-/// the native payload from an IDE copied to a file named `agy` before execution.
+/// The embedded CLI module marker must match on every platform before the
+/// binary is eligible for a version read.
 fn has_cli_module(program: &Path, deadline: Instant) -> bool {
     use std::io::Read;
     const MODULE: &[u8] = b"google-antigravity/antigravity-cli";

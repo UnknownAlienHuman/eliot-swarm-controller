@@ -1033,7 +1033,7 @@ impl Router {
                 cache.aggregate_retry_error(),
             )
         };
-        let mut key = if snapshot.is_some() || can_restore {
+        let key = if snapshot.is_some() || can_restore {
             self.catalog_key(deadline).await.ok()
         } else {
             None
@@ -1046,7 +1046,7 @@ impl Router {
             }
             return self.catalog_page(request, &snapshot, deadline).await;
         }
-        if can_restore && let Some(current) = key.take() {
+        if can_restore && let Some(current) = key.as_ref() {
             let snapshot = {
                 let mut cache = self.inner.catalog_cache.lock_recover();
                 cache.restore_seed(current)
@@ -1237,13 +1237,24 @@ impl Router {
     }
 
     async fn persist_catalogue(&self, snapshot: Arc<CachedAggregate>) {
+        if snapshot.restored {
+            return;
+        }
         let root = self.inner.data_root.clone();
         let policy = self.secret_policy_snapshot();
         let result = tokio::task::spawn_blocking(move || -> Result<()> {
-            if let Some(bytes) = PersistedCatalogue::encode(&snapshot, &policy) {
-                crate::platform::data_dir::replace_private_file(&root, CATALOG_SEED_FILE, &bytes)?;
+            if let Some(bytes) = PersistedCatalogue::encode(&snapshot, &policy)? {
+                return crate::platform::data_dir::replace_private_file(
+                    &root,
+                    CATALOG_SEED_FILE,
+                    &bytes,
+                );
             }
-            Ok(())
+            match std::fs::remove_file(root.join(CATALOG_SEED_FILE)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::new("io", format!("prune catalogue seed: {error}"))),
+            }
         })
         .await;
         if let Ok(Err(error)) = result {
@@ -2102,7 +2113,7 @@ impl CachedAggregate {
     }
 }
 
-#[derive(PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct CatalogKey {
     settings_revision: Option<String>,
     installations: Vec<Option<crate::adhoc::InstallationFingerprint>>,
@@ -2134,7 +2145,7 @@ impl CatalogKey {
     }
 }
 
-#[derive(PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct PreviewSource {
     name: String,
     scope: Option<ModelSourceIdentity>,
@@ -2168,10 +2179,10 @@ impl PersistedCatalogue {
         .then_some(seed)
     }
 
-    fn encode(snapshot: &CachedAggregate, policy: &eliot_core::SecretPolicy) -> Option<Vec<u8>> {
-        if snapshot.restored {
-            return None;
-        }
+    fn encode(
+        snapshot: &CachedAggregate,
+        policy: &eliot_core::SecretPolicy,
+    ) -> Result<Option<Vec<u8>>> {
         let models: Vec<_> = snapshot
             .models
             .iter()
@@ -2187,30 +2198,40 @@ impl PersistedCatalogue {
             })
             .collect();
         if models.is_empty() {
-            return None;
+            return Ok(None);
         }
+        let encode_error = || Error::new("internal", "model catalogue seed could not be encoded");
         let seed = serde_json::to_value(Self {
             version: 1,
-            source: snapshot.key.digest()?,
+            source: snapshot.key.digest().ok_or_else(encode_error)?,
             fetched_at_ms: snapshot.fetched_at_ms,
             ttl_ms: snapshot.ttl_ms,
             harnesses: snapshot.harnesses.clone(),
             models,
         })
-        .ok()?;
+        .map_err(|_| encode_error())?;
         if policy.contains_value(&seed) {
-            return None;
+            return Err(Error::new(
+                "secret_in_payload",
+                "model catalogue seed contains a configured secret",
+            ));
         }
-        let bytes = serde_json::to_vec(&seed).ok()?;
-        (bytes.len() <= MAX_CATALOG_SEED_BYTES).then_some(bytes)
+        let bytes = serde_json::to_vec(&seed).map_err(|_| encode_error())?;
+        if bytes.len() > MAX_CATALOG_SEED_BYTES {
+            return Err(Error::new(
+                "frame_too_large",
+                "model catalogue seed exceeds its size bound",
+            ));
+        }
+        Ok(Some(bytes))
     }
 
-    fn restore(self, key: CatalogKey) -> Option<CachedAggregate> {
+    fn restore(self, key: &CatalogKey) -> Option<CachedAggregate> {
         if self.source != key.digest()? {
             return None;
         }
         Some(CachedAggregate {
-            key,
+            key: key.clone(),
             revision: ulid::Ulid::new().to_string(),
             harnesses: self.harnesses,
             models: self.models,
@@ -2243,8 +2264,8 @@ impl CatalogCache {
         }
     }
 
-    fn restore_seed(&mut self, key: CatalogKey) -> Option<Arc<CachedAggregate>> {
-        if let Some(aggregate) = self.cached_catalog(&key) {
+    fn restore_seed(&mut self, key: &CatalogKey) -> Option<Arc<CachedAggregate>> {
+        if let Some(aggregate) = self.cached_catalog(key) {
             return aggregate.is_usable().then_some(aggregate);
         }
         if self.auth_revision != key.auth_revision || self.aggregate.is_some() {

@@ -38,7 +38,7 @@ pub fn discovery() -> InstallDiscovery {
         exe_stems: &["muse"],
         strategy: InstallStrategy::MetadataVersion(payload_version),
         cli_identity: None,
-        capability_probe: None,
+        version_identity: None,
         allow_script_wrapper: false,
         ide_hint_subpath: None,
         timeout_label: None,

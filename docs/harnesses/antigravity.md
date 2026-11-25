@@ -600,11 +600,12 @@ an explicit profile `cmd` is a saved pin. A missing pin never falls back to a
 different executable. An IDE-only install reports `unsupported`
 naming the IDE path with guidance to install `agy`: the IDE executable does
 not implement the native ACP/model CLI and is never launched for discovery.
-CLI identity is established before any discovery probe: a profile or ad-hoc
-`cmd` must name the `agy` file itself (an `Antigravity.exe` cmd is refused
-with a typed error and never launched), and a PATH `agy` whose bounded
-`--version` output does not parse as a CLI triple is refused before any
-`models`, quota or launch use. `swarm models --harness antigravity` returns the live
+Install discovery requires the `agy` filename and its embedded Go module
+marker before it reads bounded `--version` metadata. It refuses a candidate
+without the marker or a parseable CLI version. Discovery does not call
+`acp`, including for help. The controlled launch performs the ACP
+`initialize` exchange under native process custody.
+`swarm models --harness antigravity` returns the live
 read-only catalogue from `agy models` (exact argv `models`, bounded time and
 output, same environment construction as launch): tab-separated native ids
 kept verbatim (for example `gemini-4-argon-medium`, `gemini-4-hydrogen-xhigh`,
