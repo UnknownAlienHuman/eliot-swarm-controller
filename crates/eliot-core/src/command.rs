@@ -179,7 +179,6 @@ impl<'a> ResumeCommandArgs<'a> {
 
 /// An Owner continuation binds Resume to a retained Stop instead of taking text.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResumeContinuationArgs<'a> {
     pub continue_from_stop: &'a str,
 }

@@ -1162,6 +1162,7 @@ fn probe_version_uncached(
     let bytes = native_capture(
         program,
         &["--version"],
+        Path::new(program).parent(),
         deadline.min(Instant::now() + VERSION_PROBE_TIMEOUT),
     )?
     .filter(|capture| capture.status.success() && capture.stdout_complete)
@@ -1181,7 +1182,7 @@ fn probe_version_uncached(
 /// both inside a Tokio runtime and during synchronous configuration loading.
 /// No process handle, pipe reader or runtime survives this call.
 fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8>> {
-    native_capture(program, args, deadline)
+    native_capture(program, args, None, deadline)
         .ok()
         .flatten()
         .map(|capture| capture.stdout)
@@ -1194,6 +1195,7 @@ fn native_read(program: &str, args: &[&str], deadline: Instant) -> Option<Vec<u8
 fn native_capture(
     program: &str,
     args: &[&str],
+    cwd: Option<&Path>,
     deadline: Instant,
 ) -> core::Result<Option<crate::scripts::process::ProcessCapture>> {
     use crate::scripts::process::{ProcessFailure, ProcessOutcome, run_owned_process};
@@ -1223,6 +1225,9 @@ fn native_capture(
                         .args(args)
                         .env_clear()
                         .envs(crate::router::minimal_plugin_environment());
+                    if let Some(cwd) = cwd {
+                        command.current_dir(cwd);
+                    }
                     let (_cancel, cancellation) = tokio::sync::watch::channel(false);
                     match run_owned_process(
                         command,

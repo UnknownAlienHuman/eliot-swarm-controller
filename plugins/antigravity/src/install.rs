@@ -29,7 +29,7 @@ pub fn discovery() -> InstallDiscovery {
         cli_identity: Some(CLI_STEM),
         version_identity: Some(InstallIdentity {
             matches_file: has_cli_module,
-            refusal: "executable did not establish Antigravity CLI identity and version",
+            refusal: "executable did not establish Antigravity CLI Go module identity and version",
         }),
         allow_script_wrapper: false,
         ide_hint_subpath: Some(IDE_HINT_SUBPATH),
@@ -43,40 +43,73 @@ pub fn discovery() -> InstallDiscovery {
     }
 }
 
-/// The embedded CLI module marker must match on every platform before the
-/// binary is eligible for a version read.
+/// Locate Go's build-info section before reading its framed main-module record.
+/// Modern Go stores the compiler version and module info as two length-prefixed strings.
 fn has_cli_module(program: &Path, deadline: Instant) -> bool {
-    use std::io::Read;
-    const MODULE: &[u8] = b"google-antigravity/antigravity-cli";
-    let Ok(mut file) = std::fs::File::open(program) else {
-        return false;
-    };
-    if !file
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() <= 512 * 1024 * 1024)
-    {
-        return false;
+    cli_build_module_matches(program, deadline).unwrap_or(false)
+}
+
+fn cli_build_module_matches(program: &Path, deadline: Instant) -> Option<bool> {
+    use object::{BinaryFormat, Object, ObjectSection, ReadRef, SectionFlags, read::ReadCache};
+    let file = std::fs::File::open(program).ok()?;
+    if file.metadata().ok()?.len() > 512 * 1024 * 1024 || Instant::now() >= deadline {
+        return None;
     }
-    let mut bytes = vec![0; 64 * 1024];
-    let mut carry = 0;
-    while Instant::now() < deadline {
-        let Ok(read) = file.read(&mut bytes[carry..]) else {
-            return false;
-        };
-        if read == 0 {
-            return false;
-        }
-        let end = carry + read;
-        if bytes[..end]
-            .windows(MODULE.len())
-            .any(|window| window == MODULE)
-        {
-            return true;
-        }
-        carry = (MODULE.len() - 1).min(end);
-        bytes.copy_within(end - carry..end, 0);
+    let cache = ReadCache::new(file);
+    let image = object::File::parse(&cache).ok()?;
+    let section = match image.format() {
+        BinaryFormat::Elf => image.section_by_name(".go.buildinfo"),
+        BinaryFormat::MachO => image.section_by_name("__go_buildinfo"),
+        // Go places its PE build info in the first initialized read/write section.
+        BinaryFormat::Pe => image.sections().find(|section| {
+            let expected = object::pe::IMAGE_SCN_CNT_INITIALIZED_DATA
+                | object::pe::IMAGE_SCN_MEM_READ
+                | object::pe::IMAGE_SCN_MEM_WRITE;
+            matches!(section.flags(), SectionFlags::Coff { characteristics }
+                if characteristics & !object::pe::IMAGE_SCN_ALIGN_32BYTES == expected)
+                && section.address() != 0
+                && section.size() != 0
+        }),
+        _ => None,
+    }?;
+    let (offset, size) = section.file_range()?;
+    // Bound the record read even when PE places it alongside other data.
+    let bytes = (&cache).read_bytes_at(offset, size.min(1024 * 1024)).ok()?;
+    let header = bytes
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .position(|chunk| chunk.starts_with(b"\xff Go buildinf:"))?
+        * 16;
+    if *bytes.get(header + 15)? & 0x02 == 0 || Instant::now() >= deadline {
+        return None;
     }
-    false
+    let (version, rest) = take_go_build_string(bytes.get(header + 32..)?)?;
+    let (module, _) = take_go_build_string(rest)?;
+    if !version.starts_with(b"go") {
+        return None;
+    }
+    // Go's cmd/go/internal/modload frames the tab-separated module records.
+    let module = module
+        .strip_prefix(b"\x30\x77\xaf\x0c\x92\x74\x08\x02\x41\xe1\xc1\x07\xe6\xd6\x18\xe6")?
+        .strip_suffix(b"\xf9\x32\x43\x31\x86\x18\x20\x72\x00\x82\x42\x10\x41\x16\xd8\xf2")?;
+    Some(module.split(|byte| *byte == b'\n').any(|line| {
+        line.strip_prefix(b"mod\t")
+            .and_then(|record| record.split(|byte| *byte == b'\t').next())
+            == Some(b"google-antigravity/antigravity-cli")
+    }))
+}
+
+fn take_go_build_string(input: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut len = 0;
+    // The caller caps the whole buffer to 1 MiB, so four base-128 bytes suffice.
+    for (index, &byte) in input.iter().take(4).enumerate() {
+        len |= usize::from(byte & 0x7f) << (index * 7);
+        if byte < 0x80 {
+            return input.get(index + 1..)?.split_at_checked(len);
+        }
+    }
+    None
 }
 
 pub(crate) fn candidate_paths() -> core::Result<Vec<PathBuf>> {

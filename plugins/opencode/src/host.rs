@@ -1684,7 +1684,7 @@ impl OpenCodePlugin {
         // stored session carries the wildcard deny as the last rule of its
         // entire ruleset with a fresh readback on this exact session (the
         // installed evaluator matches actions with wildcard patterns, so
-        // any later rule â€” including a `*` allow â€” can beat the deny). The
+        // any later rule — including a `*` allow — can beat the deny). The
         // readback runs against the pre-create cutoff, so the delete below
         // never inherits an expired deadline. A missing or unreadable denial
         // goes to cleanup before hooks bind: a proved removal fails the
@@ -1932,7 +1932,7 @@ impl OpenCodePlugin {
 
     /// Resume read: the retained session must still exist under its exact
     /// id. Proven absence is `not_found` (the retained session no longer exists
-    /// in the store â€” there is nothing to resume); anything ambiguous is `unknown`.
+    /// in the store — there is nothing to resume); anything ambiguous is `unknown`.
     async fn resume_read_retained(
         session: &AgentSession,
         native_ref: &str,
@@ -3212,7 +3212,7 @@ impl OpenCodePlugin {
     /// Interrupt the exact active turn: the authoritative event-task gate
     /// binds the command first, then one `session.interrupt` write runs.
     /// `interrupted: true` applies (the `interrupted` terminal settles the
-    /// turn on the stream); `false` re-checks the gate â€” a finished turn is
+    /// turn on the stream); `false` re-checks the gate — a finished turn is
     /// stale, a still-active one contradicts the server and stays unknown.
     async fn interrupt_command(&mut self, params: AgentCommandParams) -> Result<Value> {
         let session = if params.owner_control {
@@ -3346,7 +3346,7 @@ impl OpenCodePlugin {
     /// interruption. A finished turn is
     /// stale without a write; anything that cannot prove consumption is
     /// unknown, and a missed input is cancelled by exact id with removal
-    /// proven by inbox-list absence plus a stream-observed cancel â€”
+    /// proven by inbox-list absence plus a stream-observed cancel —
     /// anything unproven latches the session unknown so no later send
     /// dispatches behind the unresolved input.
     async fn steer_command(&mut self, params: AgentCommandParams) -> Result<Value> {
@@ -3478,9 +3478,9 @@ impl OpenCodePlugin {
     /// exact inbox id (best effort; the native 204 also covers the
     /// no-op), then prove removal before letting the session continue.
     /// Removal is proven only by absence from the inbox-list readback
-    /// plus a stream-observed cancel with no delivery. Anything else â€”
+    /// plus a stream-observed cancel with no delivery. Anything else —
     /// still pending, delivered into later work, failed readback, or an
-    /// unanswered stream record â€” latches the session unknown so the
+    /// unanswered stream record — latches the session unknown so the
     /// router cannot dispatch a later send or Goal behind the unresolved
     /// native input. The steer itself is always unknown.
     async fn settle_steer_unproven(
@@ -3990,7 +3990,7 @@ fn policy_from_snapshot(profile: &serde_json::Map<String, Value>) -> Result<McpP
 /// fabricated); `mcp_servers_verified` is true only on `connected`, and
 /// the inventory gate refuses the start when no query succeeded, so a
 /// `null` record never passes as verified. Only
-/// names and the status word are retained â€” never the failure text, which
+/// names and the status word are retained — never the failure text, which
 /// can carry local paths. A non-connected surface alone never fails the
 /// start here: the inventory gate decides, refusing an unreadable
 /// inventory (without it the unexpected-server gate and the
@@ -4636,7 +4636,7 @@ fn start_paths(
         ));
     }
     // No PATH default and no script wrapper: the frozen profile must name
-    // the native `opencode` executable (the Muse treatment â€” stop and
+    // the native `opencode` executable (the Muse treatment — stop and
     // process registration address the exact spawned PID, and a `.cmd`
     // chain would interpose `cmd.exe` between Eliot and the server).
     let program = profile

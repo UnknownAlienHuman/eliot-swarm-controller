@@ -1896,7 +1896,7 @@ impl MusePlugin {
             return Ok(result);
         };
         // Name the captured turn when known: halt running,
-        // keep queue â€” queued submits are a different object (`turn/unqueue`)
+        // keep queue — queued submits are a different object (`turn/unqueue`)
         // and are never touched here. Admission is not the stop: the turn
         // ends when its `turn/completed` with terminal `cancelled` folds on
         // the stream.
@@ -2488,8 +2488,8 @@ fn active_model_mismatch(status: &EventStatus) -> Option<&str> {
 
 /// Fresh exact idle proof for the send gate (k167b): one raw
 /// `session/read`, checked with #427's exact rule (exact session, status
-/// `idle`, explicitly null `activeTurnId`, healthy history). Any failure â€”
-/// transport, schema, or unproven state â€” is not idle: the caller rejects
+/// `idle`, explicitly null `activeTurnId`, healthy history). Any failure —
+/// transport, schema, or unproven state — is not idle: the caller rejects
 /// instead of dispatching.
 async fn session_read_proves_owned_idle(
     client: &NativeClient,
@@ -2881,7 +2881,7 @@ fn session_state(session: &NativeSession) -> &'static str {
 /// Adopt a resume late-joiner pointer set. The observation counter is
 /// captured before the pull, the pulled full params are described
 /// (shape-validated; turn liveness is checked when the event path applies
-/// them), and the event path adopts what still binds â€” guarded so a newer
+/// them), and the event path adopts what still binds — guarded so a newer
 /// stream resolution always wins over this stale snapshot. Returns whether
 /// the pull itself landed; adoption never fails the resume either way.
 async fn adopt_resume_snapshot(
