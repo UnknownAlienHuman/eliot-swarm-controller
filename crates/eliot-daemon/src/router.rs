@@ -1829,17 +1829,12 @@ impl Router {
                         "continuation Resume requires an exact generation",
                     )
                 })?;
-                let stop = request.args[eliot_core::CONTINUE_FROM_STOP_ARG]
-                    .as_str()
-                    .ok_or_else(|| {
-                        Error::new("invalid", "continuation Resume requires a Stop command ID")
-                    })?;
-                let turn = self
-                    .inner
-                    .store
-                    .lock()
-                    .await
-                    .continuation_stop_turn(agent, generation, stop)?;
+                let stop = eliot_core::ResumeContinuationArgs::read(&request.args)?;
+                let turn = self.inner.store.lock().await.continuation_stop_turn(
+                    agent,
+                    generation,
+                    stop.continue_from_stop,
+                )?;
                 let text = self
                     .continuation_brief(agent, generation, Some(&turn), &request.id)
                     .await?;

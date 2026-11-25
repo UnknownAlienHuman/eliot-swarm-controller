@@ -1824,9 +1824,7 @@ async fn terminate_session(session: &mut AgentSession, force: bool, graceful: bo
 /// oversized input never wedges the session.
 fn send_text(params: &AgentCommandParams) -> Result<&str> {
     let text = params
-        .args
-        .get("text")
-        .and_then(Value::as_str)
+        .input_text()
         .ok_or_else(|| Error::new("invalid", "Claude send requires args.text"))?;
     if text.len() > MAX_TEXT_BYTES {
         return Err(Error::new(

@@ -752,9 +752,7 @@ impl Session {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Antigravity send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(
@@ -854,9 +852,7 @@ impl Session {
                 Error::new("stale_turn", "Antigravity steer requires a captured turn")
             })?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Antigravity steer requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new(

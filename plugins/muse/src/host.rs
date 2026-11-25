@@ -1274,9 +1274,7 @@ impl MusePlugin {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Muse send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Muse input exceeds 512 KiB"));
@@ -1629,9 +1627,7 @@ impl MusePlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("stale_turn", "turn/steer requires a captured turn id"))?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Muse steer requires args.text"))?;
         if params.verb != AgentCommandVerb::Inject && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Muse steer input exceeds 512 KiB"));
@@ -1900,7 +1896,7 @@ impl MusePlugin {
             return Ok(result);
         };
         // Name the captured turn when known: halt running,
-        // keep queue — queued submits are a different object (`turn/unqueue`)
+        // keep queue â€” queued submits are a different object (`turn/unqueue`)
         // and are never touched here. Admission is not the stop: the turn
         // ends when its `turn/completed` with terminal `cancelled` folds on
         // the stream.
@@ -2238,13 +2234,7 @@ async fn discard_failed_start(session: &mut AgentSession, error: Error) -> Error
 /// A `configure` model and/or effort request. Admission already gated the
 /// fields against `ConfigureSupport`; this re-checks shape so a malformed
 /// dispatch refuses before any native write.
-#[derive(Debug)]
-struct ConfigureRequest {
-    model: Option<String>,
-    effort: Option<String>,
-}
-
-fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
+fn parse_configure_request(args: &Value) -> Result<eliot_core::ConfigureCommandArgs> {
     let model = args
         .get("model")
         .and_then(Value::as_str)
@@ -2268,7 +2258,7 @@ fn parse_configure_request(args: &Value) -> Result<ConfigureRequest> {
             "Muse configure needs a model or an effort",
         ));
     }
-    Ok(ConfigureRequest { model, effort })
+    Ok(eliot_core::ConfigureCommandArgs { model, effort })
 }
 
 impl MusePlugin {
@@ -2498,8 +2488,8 @@ fn active_model_mismatch(status: &EventStatus) -> Option<&str> {
 
 /// Fresh exact idle proof for the send gate (k167b): one raw
 /// `session/read`, checked with #427's exact rule (exact session, status
-/// `idle`, explicitly null `activeTurnId`, healthy history). Any failure —
-/// transport, schema, or unproven state — is not idle: the caller rejects
+/// `idle`, explicitly null `activeTurnId`, healthy history). Any failure â€”
+/// transport, schema, or unproven state â€” is not idle: the caller rejects
 /// instead of dispatching.
 async fn session_read_proves_owned_idle(
     client: &NativeClient,
@@ -2891,7 +2881,7 @@ fn session_state(session: &NativeSession) -> &'static str {
 /// Adopt a resume late-joiner pointer set. The observation counter is
 /// captured before the pull, the pulled full params are described
 /// (shape-validated; turn liveness is checked when the event path applies
-/// them), and the event path adopts what still binds — guarded so a newer
+/// them), and the event path adopts what still binds â€” guarded so a newer
 /// stream resolution always wins over this stale snapshot. Returns whether
 /// the pull itself landed; adoption never fails the resume either way.
 async fn adopt_resume_snapshot(

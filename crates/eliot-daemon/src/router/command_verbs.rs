@@ -1182,10 +1182,8 @@ impl Router {
                 .await;
             return true;
         }
-        let force = dispatched
-            .args
-            .get("force")
-            .and_then(Value::as_bool)
+        let force = eliot_core::StopCommandArgs::retained(&dispatched.args)
+            .force
             .unwrap_or(false);
         if !force && (dispatched.principal == "owner" || agent.active_turn.is_some()) {
             self.interrupt_before_stop(agent, id).await;

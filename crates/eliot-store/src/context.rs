@@ -864,10 +864,8 @@ pub(super) fn claim_next_input_tx(
     let mut selected = Vec::new();
     let mut selected_ids = Vec::new();
     let mut selected_outcomes: Vec<ContextOutcome> = Vec::new();
-    let original_text = send
-        .args
-        .get("text")
-        .and_then(Value::as_str)
+    let original_text = core::CommandText::read(&send.args)
+        .map(|input| input.text)
         .ok_or_else(|| Error::new("source_integrity", "send command has no text"))?;
     let mut cursor = None;
     // The mandatory `turn.started` receipt, budgeted in the exact shape the

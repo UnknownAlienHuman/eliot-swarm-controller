@@ -2392,9 +2392,7 @@ impl CodexPlugin {
             ));
         }
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Codex send requires args.text"))?;
         if text.len() > MAX_TEXT_BYTES {
             return Err(Error::new("frame_too_large", "Codex input exceeds 512 KiB"));
@@ -2558,9 +2556,7 @@ impl CodexPlugin {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| Error::new("stale_turn", "turn/steer requires a captured turn id"))?;
         let text = params
-            .args
-            .get("text")
-            .and_then(Value::as_str)
+            .input_text()
             .ok_or_else(|| Error::new("invalid", "Codex steer requires args.text"))?;
         if params.verb != AgentCommandVerb::Inject && text.len() > MAX_TEXT_BYTES {
             return Ok(rejected_control("Codex steer input exceeds 512 KiB"));

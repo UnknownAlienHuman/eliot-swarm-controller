@@ -5455,19 +5455,13 @@ impl CommandSubmission {
     }
 
     pub fn resume_continuation(request: SubmitCommand, text: String) -> Result<Self> {
-        if request.verb != "resume"
-            || !request.args.as_object().is_some_and(|args| {
-                args.len() == 1
-                    && args
-                        .get(core::CONTINUE_FROM_STOP_ARG)
-                        .is_some_and(Value::is_string)
-            })
-        {
+        if request.kind() != core::CommandVerb::Resume {
             return Err(Error::new(
                 "invalid",
                 "continuation Resume requires an exact Stop command ID",
             ));
         }
+        core::ResumeContinuationArgs::read(&request.args)?;
         Ok(Self {
             request,
             event: None,

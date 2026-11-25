@@ -752,7 +752,10 @@ impl Store {
                 .optional()
                 .map_err(sql_error)?;
             if let Some(interrupt_id) = interrupt_id.as_deref() {
-                let reason = if record.command.args["interrupt_runtime_unavailable"] == true {
+                let reason = if core::StopCommandArgs::retained(&record.command.args)
+                    .interrupt_runtime_unavailable
+                    == Some(true)
+                {
                     "interrupt_runtime_unavailable"
                 } else {
                     "interrupt_unconfirmed"
@@ -1525,7 +1528,10 @@ pub(super) fn settle_interrupt_after_fallback_tx(
     if interrupt.state.is_terminal() {
         return Ok(());
     }
-    let (reason, message) = if stop.args["interrupt_runtime_unavailable"] == true {
+    let (reason, message) = if core::StopCommandArgs::retained(&stop.args)
+        .interrupt_runtime_unavailable
+        == Some(true)
+    {
         (
             "interrupt_runtime_unavailable_agent_stopped",
             "Swarm found no live plugin for the interrupt and proved the Agent stopped.",

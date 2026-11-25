@@ -395,8 +395,8 @@ pub(super) fn admit_send_member(
             ),
         ));
     }
-    let text = required_string(&request.args, "text")?;
-    check_input(&text)?;
+    let text = core::CommandText::required(&request.args)?.text;
+    check_input(text)?;
     if request.args.get("context_items").is_some() {
         return Err(Error::new(
             "invalid",
@@ -485,13 +485,7 @@ pub(super) fn admit_stop_member(
     events: &mut Vec<Event>,
 ) -> Result<()> {
     let agent_num = parse_agent_id(&agent.id)?;
-    if request
-        .args
-        .get("force")
-        .is_some_and(|value| !value.is_boolean())
-    {
-        return Err(Error::new("invalid", "stop force must be a boolean"));
-    }
+    core::StopCommandArgs::read(&request.args)?;
     check_rpc_frame(
         "agent.stop",
         &json!({
@@ -1611,14 +1605,27 @@ fn admit_resume_tx(
                 "continuation Resume requires the Owner and exact generation",
             ));
         }
-        let stop = required_string(&request.args, core::CONTINUE_FROM_STOP_ARG)?;
-        handoff::continuation_stop_turn_tx(tx, &agent.id, agent.generation, &stop)?;
-        (
-            Some(text.to_owned()),
-            json!({(core::CONTINUE_FROM_STOP_ARG): stop}),
-        )
+        let args = core::ResumeContinuationArgs::read(&request.args)?;
+        if args.continue_from_stop.trim().is_empty() {
+            return Err(Error::new(
+                "invalid",
+                "continue_from_stop must be a non-empty string",
+            ));
+        }
+        handoff::continuation_stop_turn_tx(
+            tx,
+            &agent.id,
+            agent.generation,
+            args.continue_from_stop,
+        )?;
+        (Some(text.to_owned()), json!(args))
     } else {
-        (optional_string(&request.args, "text")?, json!({}))
+        (
+            core::ResumeCommandArgs::read(&request.args)?
+                .text
+                .map(str::to_owned),
+            json!({}),
+        )
     };
     if let Some(text) = &text {
         require_nonempty(text, "args.text")?;
@@ -2059,8 +2066,8 @@ pub(super) fn admit_control_tx(
         }
     };
     if request.verb == "steer" {
-        let text = required_string(&request.args, "text")?;
-        check_input(&text)?;
+        let text = core::CommandText::required(&request.args)?.text;
+        check_input(text)?;
         provider_holds::require_unheld_tx(tx, &agent)?;
         // A safe-point steer waits durably for a hook, so a turn that cannot
         // take it is refused here. Direct-RPC steers settle from their plugin.
@@ -2084,7 +2091,7 @@ pub(super) fn admit_control_tx(
                 &agent,
                 principal,
                 &request.id,
-                &text,
+                text,
             )?;
         }
     }
@@ -2360,12 +2367,13 @@ fn submit_tx_mode(
     let implicit_resume = prepare_implicit_resume_send_tx(tx, &mut request)?;
 
     let mut events = Vec::new();
-    let linked = match request.verb.as_str() {
-        "attach" | "detach" => {
+    use eliot_core::CommandVerb::*;
+    let linked = match request.kind() {
+        Attach | Detach => {
             observer::admit(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "run" => admit_run_tx(
+        Run => admit_run_tx(
             tx,
             principal,
             &request,
@@ -2374,7 +2382,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.fetch" => admit_git_fetch_tx(
+        GitFetch => admit_git_fetch_tx(
             tx,
             principal,
             &request,
@@ -2383,7 +2391,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.integrate" => admit_git_integrate_tx(
+        GitIntegrate => admit_git_integrate_tx(
             tx,
             principal,
             &request,
@@ -2392,7 +2400,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "git.publish" => admit_git_publish_tx(
+        GitPublish => admit_git_publish_tx(
             tx,
             principal,
             &request,
@@ -2401,7 +2409,7 @@ fn submit_tx_mode(
             now,
             &mut events,
         )?,
-        "notify" | "emit" | "attention.emit" => {
+        Notify | Emit | AttentionEmit => {
             let binding_error = if request.verb == "attention.emit" {
                 "attention.emit is a targetless command without Agent bindings"
             } else {
@@ -2422,7 +2430,7 @@ fn submit_tx_mode(
             }
             admit_targetless_tx(tx, principal, &request, &payload_digest, now, &mut events)?
         }
-        "mail.send" | "var.set" => admit_rule_action_tx(
+        MailSend | VarSet => admit_rule_action_tx(
             tx,
             principal,
             &request,
@@ -2432,7 +2440,7 @@ fn submit_tx_mode(
             derived_rule,
             &mut events,
         )?,
-        "inject" => {
+        Inject => {
             events.push(context::admit_tx(
                 tx,
                 principal,
@@ -2443,7 +2451,7 @@ fn submit_tx_mode(
             )?);
             None
         }
-        "launch" => admit_launch_tx(
+        Launch => admit_launch_tx(
             tx,
             principal,
             &request,
@@ -2454,7 +2462,7 @@ fn submit_tx_mode(
             linked_switch_launch,
             &mut events,
         )?,
-        "send" | "stop" => {
+        Send | Stop => {
             let result =
                 admit_send_stop_tx(tx, principal, &request, &payload_digest, now, &mut events);
             retain_owner_control_refusal(
@@ -2468,7 +2476,7 @@ fn submit_tx_mode(
             )?;
             None
         }
-        "worktree.remove" => {
+        WorktreeRemove => {
             admit_worktree_remove_tx(
                 tx,
                 principal,
@@ -2480,7 +2488,7 @@ fn submit_tx_mode(
             )?;
             None
         }
-        "resume" => admit_resume_tx(
+        Resume => admit_resume_tx(
             tx,
             principal,
             &request,
@@ -2499,15 +2507,15 @@ fn submit_tx_mode(
                 error
             }
         })?,
-        "configure" => {
+        Configure => {
             admit_configure_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "compact" => {
+        Compact => {
             admit_compact_tx(tx, principal, &request, &payload_digest, now, &mut events)?;
             None
         }
-        "steer" | "interrupt" | "approve" | "deny" | "answer" => {
+        Steer | Interrupt | Approve | Deny | Answer => {
             let result = admit_control_tx(
                 tx,
                 principal,
@@ -2531,7 +2539,7 @@ fn submit_tx_mode(
         verb => {
             return Err(Error::new(
                 "unsupported",
-                format!("Store does not admit the {verb} verb"),
+                format!("Store does not admit the {} verb", verb.as_str()),
             ));
         }
     };

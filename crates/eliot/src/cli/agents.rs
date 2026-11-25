@@ -20,7 +20,10 @@ use eliot_core::api::{
     HarnessQuotaRequest, HarnessQuotaResponse, MAX_SWARM_WAIT_TARGETS, SwarmDigestRequest,
     SwarmDigestResponse, SwarmWaitRequest, SwarmWaitResponse, WaitTurnRef,
 };
-use eliot_core::{InjectArgs, InjectPoint, SubmitCommand};
+use eliot_core::{
+    CommandText, ConfigureCommandArgs, InjectArgs, InjectPoint, ResumeCommandArgs, StopCommandArgs,
+    SubmitCommand,
+};
 use serde_json::Value;
 use serde_json::json;
 use std::{
@@ -542,7 +545,7 @@ pub(crate) async fn run_send(
     } else {
         None
     };
-    let mut args = json!({ "text": text });
+    let mut args = json!(CommandText { text: &text });
     if !sources.is_empty() {
         args["sources"] = json!(sources);
     }
@@ -589,10 +592,9 @@ pub(crate) async fn run_resume(
     } else {
         None
     };
-    let mut args = json!({});
-    if let Some(prompt) = &prompt {
-        args["text"] = Value::String(prompt.clone());
-    }
+    let args = json!(ResumeCommandArgs {
+        text: prompt.as_deref(),
+    });
     let mut params = submit_request(id, Some(agent), "resume", args)?;
     params.expected_generation = generation;
     let submitted = submit_command(&data_dir, &params).await?;
@@ -640,7 +642,7 @@ pub(crate) async fn run_steer(
     validate_text(Some(&text))?;
     let (generation, turn, capture) =
         resolve_exact_turn_target(&data_dir, "steer", &agent, generation, turn).await?;
-    let mut params = submit_request(id, Some(agent), "steer", json!({ "text": text }))?;
+    let mut params = submit_request(id, Some(agent), "steer", json!(CommandText { text: &text }))?;
     params.expected_generation = generation;
     params.expected_turn_id = turn;
     submit_exact_turn_command(&data_dir, &params, json_output, capture.as_ref()).await
@@ -801,7 +803,11 @@ pub(crate) async fn run_stop(
     json_output: bool,
     id: Option<String>,
 ) -> Result<u8, Failure> {
-    let mut params = submit_request(id, Some(agent), "stop", json!({ "force": force }))?;
+    let args = StopCommandArgs {
+        force: Some(force),
+        ..Default::default()
+    };
+    let mut params = submit_request(id, Some(agent), "stop", json!(args))?;
     if tree {
         params.selector = params.target.take().map(|agent| format!("tree:{agent}"));
     } else {
@@ -827,14 +833,8 @@ pub(crate) async fn run_configure(
             "configure requires --model and/or --effort",
         ));
     }
-    let mut args = serde_json::Map::new();
-    if let Some(model) = model {
-        args.insert("model".to_owned(), Value::String(model));
-    }
-    if let Some(effort) = effort {
-        args.insert("effort".to_owned(), Value::String(effort));
-    }
-    let mut params = submit_request(id, Some(agent), "configure", Value::Object(args))?;
+    let args = ConfigureCommandArgs { model, effort };
+    let mut params = submit_request(id, Some(agent), "configure", json!(args))?;
     params.expected_generation = generation;
     submit_and_print(&data_dir, &params, json_output).await
 }

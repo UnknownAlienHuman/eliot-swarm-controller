@@ -2183,7 +2183,7 @@ impl PluginHost {
                 || retained.verb != "stop"
                 || retained.target.as_deref() != Some(agent.id.as_str())
                 || retained.generation != Some(agent.generation)
-                || retained.args.get("force").and_then(Value::as_bool) != Some(true)
+                || eliot_core::StopCommandArgs::retained(&retained.args).force != Some(true)
                 || !matches!(
                     retained.state,
                     eliot_core::CommandState::Dispatched | eliot_core::CommandState::Unknown
@@ -3239,7 +3239,7 @@ fn agent_command_params(
     context: Vec<ContextItem>,
     config: Option<&eliot_store::AgentConfig>,
 ) -> Result<Value> {
-    let verb = AgentCommandVerb::from(command.verb.as_str());
+    let verb = command.kind();
     let mut args = plugin_command_args(command, &verb)?;
     if let Some(args) = args.as_object_mut() {
         args.remove("context_items");

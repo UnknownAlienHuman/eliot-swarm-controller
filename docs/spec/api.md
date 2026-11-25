@@ -1628,12 +1628,13 @@ valid only for `send`. It is control metadata, never native input text or argume
 hold at dispatch before native I/O. Over-limit hierarchy admission reads `fanout_limit`
 (CLI exit 3) and persists nothing.
 
-The current `command.submit` request has no `wait_ms`, and the daemon does not expose an
-`agent.wait` method. CLI `--wait` follows command and turn readbacks with a bounded client
-deadline; timeout does not cancel the admitted command. `swarm.wait` below is the
-implemented bounded server wait over a frozen child command/turn set. Single-target
-server-side wait semantics further below are retained for a future API layer, not part
-of the current request shape.
+The `command.submit` request has no `wait_ms`. CLI `--wait` can span more than the
+30 seconds one `swarm.wait` call permits, so it waits in bounded server-side
+slices until its client deadline. `swarm.wait` can complete a bound entry from
+its terminal turn while the command row still awaits settlement. CLI commands
+that need that exact row read it back and wait again only while it is open.
+A timeout leaves the admitted work running. Explicit `swarm wait` uses one
+bounded RPC over the captured set.
 
 Submit the targetless `git.integrate` verb through `command.submit`. Its
 [`GitIntegrateDefinitionArgs`](../../crates/eliot-core/src/api/git_integrate.rs)
