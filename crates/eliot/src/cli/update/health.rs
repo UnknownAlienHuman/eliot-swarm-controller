@@ -31,11 +31,20 @@ pub(super) struct HealthReport {
 }
 
 impl HealthReport {
-    pub(super) fn refusal(&self) -> Option<&UpdateStartEvidence> {
+    pub(super) fn matching_refusal(&self) -> Option<&UpdateStartEvidence> {
         self.evidence.iter().find(|evidence| {
             evidence.deterministic_swarm_refusal()
                 && self.previously_accepted.contains(&evidence.subject)
         })
+    }
+
+    pub(super) fn rollback_evidence_complete(&self) -> bool {
+        self.coverage_complete
+            && self.requested == self.evidence.len()
+            && self
+                .evidence
+                .iter()
+                .all(|row| row.state != UpdateStartState::Unknown)
     }
 
     pub(super) fn is_ready(&self) -> bool {
@@ -180,13 +189,19 @@ pub(super) async fn assess_update(path: &Path, previous: PreviousHealth) -> Heal
         evidence,
         previously_accepted: previous.accepted,
     };
-    if result.refusal().is_some() {
-        result.state = "deterministic_refusal";
+    if result.matching_refusal().is_some() {
+        result.state = if result.rollback_evidence_complete() {
+            "deterministic_refusal"
+        } else {
+            "incomplete_refusal_evidence"
+        };
     } else if complete
-        && result
-            .evidence
-            .iter()
-            .all(|row| row.state == UpdateStartState::Ready)
+        && result.evidence.iter().all(|row| {
+            matches!(
+                row.state,
+                UpdateStartState::Ready | UpdateStartState::NotDispatched
+            )
+        })
     {
         result.state = "ready";
     }

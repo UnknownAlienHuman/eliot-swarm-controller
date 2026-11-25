@@ -1378,11 +1378,14 @@ pub(crate) enum DaemonAction {
     /// Drain admitted work and start a new daemon release.
     Update {
         /// Release directory or path to the replacement Swarm executable.
-        #[arg(required_unless_present = "cancel", conflicts_with = "cancel")]
+        #[arg(required_unless_present_any = ["cancel", "health_decision"], conflicts_with_all = ["cancel", "health_decision"])]
         release: Option<PathBuf>,
         /// Reopen admission for the named update drain if it has not sealed.
         #[arg(long, value_name = "PREPARE_ID", conflicts_with = "wait_seconds")]
         cancel: Option<String>,
+        /// Read a retained startup health decision by preparation id.
+        #[arg(long, value_name = "PREPARE_ID", conflicts_with_all = ["cancel", "wait_seconds"])]
+        health_decision: Option<String>,
         /// Maximum seconds to let already-admitted work finish.
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=eliot_core::api::MAX_UPDATE_DRAIN_SECS))]
         wait_seconds: u64,

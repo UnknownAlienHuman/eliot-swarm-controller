@@ -20,7 +20,7 @@ fn subject(agent: &Agent, kind: UpdateProbeKind) -> Result<UpdateStartSubject> {
     let digest = eliot_core::canonical_json_sha256(&json!({
         "agent":agent.id, "generation":agent.generation, "harness": agent.harness,
         "kind":kind, "profile":agent.profile,
-        "workspace":agent.workspace, "native_scope":agent.native_scope, "native_ref":agent.native_ref,
+        "workspace":agent.workspace.as_deref().map(eliot_core::workspace_path_key), "native_scope":agent.native_scope, "native_ref":agent.native_ref,
     })).map_err(|_| Error::new("unknown", "update readiness subject cannot be bound"))?;
     Ok(UpdateStartSubject {
         agent: agent.id.clone(),
@@ -161,6 +161,9 @@ impl Router {
             entry.state = UpdateStartState::Refused;
             entry.code = Some(error.code.clone());
             entry.origin = error.origin;
+            if !entry.deterministic_swarm_refusal() {
+                entry.state = UpdateStartState::NotDispatched;
+            }
         }
     }
 
