@@ -148,7 +148,12 @@ pub struct DaemonShutdownRequest {
     pub restart_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup: bool,
+    /// Wait budget for a lossless planned restart, excluding interruption grace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drain_seconds: Option<u64>,
 }
+
+pub const MAX_UPDATE_DRAIN_SECS: u64 = 30 * 60;
 
 impl DaemonShutdownRequest {
     pub fn new(id: impl Into<String>, mode: ShutdownMode) -> Self {
@@ -157,11 +162,21 @@ impl DaemonShutdownRequest {
             mode,
             restart_id: None,
             backup: false,
+            drain_seconds: None,
         }
     }
 
     pub fn validate(&self) -> Result<()> {
         validate_shutdown_id(&self.id)?;
+        if self.drain_seconds.is_some_and(|seconds| {
+            self.mode != ShutdownMode::PrepareRestart
+                || !(1..=MAX_UPDATE_DRAIN_SECS).contains(&seconds)
+        }) {
+            return Err(Error::new(
+                "invalid",
+                "drain_seconds must be 1–1800 and requires prepare_restart",
+            ));
+        }
         if self.backup && self.mode != ShutdownMode::Restart {
             return Err(Error::new(
                 "invalid",

@@ -161,6 +161,31 @@ const MODE_RESTART: u8 = 2;
 const MODE_DRAIN: u8 = 3;
 const MODE_FORCE: u8 = 4;
 const RESTART_LEASE: Duration = Duration::from_secs(120);
+const RESTART_DRAIN_GRACE: Duration = Duration::from_secs(60);
+
+struct RestartLease {
+    id: String,
+    lossless: bool,
+    expires: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+}
+
+impl RestartLease {
+    fn new(id: String, drain_seconds: Option<u64>) -> Self {
+        let now = tokio::time::Instant::now();
+        let deadline = now
+            + drain_seconds.map_or(RESTART_LEASE, |seconds| {
+                Duration::from_secs(seconds) + RESTART_DRAIN_GRACE
+            });
+        Self {
+            id,
+            lossless: drain_seconds.is_some(),
+            expires: (now + RESTART_LEASE).min(deadline),
+            deadline,
+        }
+    }
+}
+
 const DAEMON_UPDATE_IN_PROGRESS: &str = "daemon_update_in_progress";
 
 fn update_launch_refusal() -> Error {
@@ -219,7 +244,7 @@ struct RouterInner {
     automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
     cleanup_worker: Mutex<Option<String>>,
     mode: AtomicU8,
-    restart_lease: Mutex<Option<String>>,
+    restart_lease: Mutex<Option<RestartLease>>,
     restart_writes: RwLock<()>,
     shutdown_ready: AtomicBool,
     progress: watch::Sender<u64>,
@@ -658,6 +683,14 @@ impl Router {
                 return Err(Error::new(
                     "unavailable",
                     "the Store is sealed for replacement",
+                ));
+            }
+            // Command submission performs its verb-level check under the
+            // Store writer. Other mutations must not enter behind the fence.
+            if self.lossless_quiescing() && method != "command.submit" {
+                return Err(Error::new(
+                    "daemon_update_in_progress",
+                    "daemon is waiting for admitted work to finish before update",
                 ));
             }
             Some(guard)
@@ -1924,6 +1957,14 @@ impl Router {
         if matches!(mode, MODE_FORCE | MODE_RESTART) {
             return Err(Error::new("unavailable", "daemon is shutting down"));
         }
+        if self.lossless_quiescing()
+            && !matches!(verb, "stop" | "interrupt" | "approve" | "deny" | "answer")
+        {
+            return Err(Error::new(
+                "daemon_update_in_progress",
+                "daemon is waiting for admitted work to finish before update",
+            ));
+        }
         if matches!(verb, "launch" | "resume" | "send" | "attach") && mode != MODE_OPEN {
             return Err(Error::new(
                 "unavailable",
@@ -1931,6 +1972,16 @@ impl Router {
             ));
         }
         Ok(())
+    }
+
+    fn lossless_quiescing(&self) -> bool {
+        self.inner.mode.load(Ordering::SeqCst) == MODE_QUIESCE
+            && self
+                .inner
+                .restart_lease
+                .lock_recover()
+                .as_ref()
+                .is_some_and(|lease| lease.lossless)
     }
 
     async fn replay_command_submission(
@@ -6889,10 +6940,22 @@ impl Router {
         request: DaemonShutdownRequest,
         principal: &Principal,
     ) -> Result<Value> {
+        // Every bound restart attempt is a heartbeat, including attempts
+        // that meet an in-flight mutation before acquiring the writer.
+        if request.mode == ShutdownMode::Restart
+            && let Some(lease) = self.inner.restart_lease.lock_recover().as_mut()
+            && lease.lossless
+            && request.restart_id.as_deref() == Some(lease.id.as_str())
+        {
+            let now = tokio::time::Instant::now();
+            if now < lease.expires {
+                lease.expires = (now + RESTART_LEASE).min(lease.deadline);
+            }
+        }
         // In-flight RPC mutations may write settings as well as the Store.
         // Keep the backup behind their completion boundary.
         let _write_barrier =
-            if request.backup {
+            if request.backup || request.drain_seconds.is_some() {
                 Some(self.inner.restart_writes.try_write().map_err(|_| {
                     Error::new("restart_busy", "an admitted mutation is still running")
                 })?)
@@ -6912,20 +6975,30 @@ impl Router {
             ));
         }
         if action == ShutdownMode::PrepareRestart {
-            if mode != MODE_OPEN && !(mode == MODE_QUIESCE && lease.as_ref() == Some(&request.id)) {
+            if mode != MODE_OPEN
+                && !(mode == MODE_QUIESCE
+                    && lease.as_ref().is_some_and(|lease| lease.id == request.id))
+            {
                 return Err(Error::new(
                     "bad_state",
                     "daemon admission is already closed",
                 ));
             }
-        } else if mode != MODE_QUIESCE || lease.as_ref() != request.restart_id.as_ref() {
+        } else if mode != MODE_QUIESCE
+            || lease.as_ref().is_none_or(|lease| {
+                request.restart_id.as_deref() != Some(lease.id.as_str())
+                    || (action == ShutdownMode::Restart
+                        && tokio::time::Instant::now() >= lease.expires)
+            })
+        {
             return Err(Error::new(
                 "bad_state",
                 "the update admission fence is no longer held",
             ));
         }
+        let lossless = lease.as_ref().is_some_and(|lease| lease.lossless);
         if action == ShutdownMode::Restart
-            && (store.has_restart_work()?
+            && (store.has_restart_work(lossless)?
                 || self.inner.workspaces.has_owned_processes()
                 || self.inference_workers_active()
                 || self.run_workers_active())
@@ -6957,8 +7030,14 @@ impl Router {
             crate::update_backup::create(&self.inner.data_root, &request.id, &store)?;
         }
         let owner = principal_name(principal);
-        let payload =
+        let mut payload =
             json!({"mode": action, "restart_id": request.restart_id, "backup": request.backup});
+        if let Some(seconds) = request.drain_seconds {
+            payload["drain_seconds"] = json!(seconds);
+        }
+        if lossless && action == ShutdownMode::Restart {
+            payload["lossless_drain"] = json!(true);
+        }
         let outcome = if action == ShutdownMode::Restart {
             store.record_restart_and_seal(
                 &request.id,
@@ -7002,24 +7081,13 @@ impl Router {
         if admission.is_new {
             match action {
                 ShutdownMode::PrepareRestart => {
-                    *lease = Some(request.id.clone());
+                    let prepared = RestartLease::new(request.id.clone(), request.drain_seconds);
+                    let expires = prepared.expires;
+                    *lease = Some(prepared);
                     self.inner.mode.store(MODE_QUIESCE, Ordering::SeqCst);
                     let router = self.clone();
                     tokio::spawn(async move {
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "This bounded wait is owned by the surrounding operation."
-                        )]
-                        tokio::time::sleep(RESTART_LEASE).await;
-                        let _store = router.inner.store.lock().await;
-                        let mut lease = router.inner.restart_lease.lock_recover();
-                        if router.inner.mode.load(Ordering::SeqCst) == MODE_QUIESCE
-                            && lease.as_ref() == Some(&request.id)
-                        {
-                            *lease = None;
-                            router.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
-                            router.signal_progress();
-                        }
+                        router.expire_restart_lease(&request.id, expires).await;
                     });
                 }
                 ShutdownMode::CancelRestart => {
@@ -7044,6 +7112,49 @@ impl Router {
         }
         self.signal_progress();
         Ok(admission.result)
+    }
+
+    async fn expire_restart_lease(&self, id: &str, mut expires: tokio::time::Instant) {
+        loop {
+            tokio::time::sleep_until(expires).await;
+            let mut store = self.inner.store.lock().await;
+            let mut current = self.inner.restart_lease.lock_recover();
+            if self.inner.mode.load(Ordering::SeqCst) != MODE_QUIESCE {
+                return;
+            }
+            let Some(lease) = current.as_ref().filter(|lease| lease.id == id) else {
+                return;
+            };
+            if tokio::time::Instant::now() < lease.expires {
+                expires = lease.expires;
+                continue;
+            }
+            let unpark_error = if lease.lossless {
+                match store.expire_parked_restart(id, now_ms()) {
+                    Ok(change) => {
+                        self.publish_locked(&change.events);
+                        change.value
+                    }
+                    Err(error) => Some(error),
+                }
+            } else {
+                None
+            };
+            *current = None;
+            self.inner.mode.store(MODE_OPEN, Ordering::SeqCst);
+            drop(current);
+            drop(store);
+            self.signal_progress();
+            if let Some(error) = unpark_error {
+                crate::logging::record(
+                    &self.secret_policy_snapshot(),
+                    "daemon.restart_lease_expired",
+                    &[("command_id", id)],
+                    Some(&error),
+                );
+            }
+            return;
+        }
     }
 
     async fn settle_run_worker_unknown(&self, run_id: &str, cause: &str) {
@@ -7238,6 +7349,13 @@ impl Router {
             };
             if let Ok(change) = &result {
                 self.publish_locked(&change.events);
+                for event in &change.events {
+                    if event.kind == "command.restart_released"
+                        && let Some(command) = event.data["command_id"].as_str()
+                    {
+                        self.schedule_command(command.to_owned(), None);
+                    }
+                }
             }
             (result, store.is_write_faulted())
         };

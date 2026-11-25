@@ -1,13 +1,13 @@
 //! Replace a running daemon without replaying an Agent input.
 
-use super::daemon::{STARTUP_WAIT, shutdown_daemon};
+use super::daemon::{STARTUP_WAIT, daemon_now_ms, shutdown_daemon};
 use super::operator::{
     agents, check_same_daemon, require_running, start_owned, start_update, status, wait_for_exit,
 };
 use super::support::{
     Failure, mutation_id, print_value_or_human, submit_command, submit_request, wait_for_command,
 };
-use eliot_core::api::discovery::{IdentityRequest, IdentityResponse};
+use eliot_core::api::discovery::{IdentityRequest, IdentityResponse, MethodHelpRequest};
 use eliot_core::api::{
     AgentGetRequest, AgentGetResponse, AgentSummary, DaemonShutdownRequest, HarnessCapabilities,
     ShutdownMode, TurnGetRequest,
@@ -140,6 +140,22 @@ pub(crate) async fn run(
     .await
 }
 
+pub(super) async fn cancel(
+    data_dir: &Path,
+    restart_id: String,
+    id: Option<String>,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    let mut request = DaemonShutdownRequest::new(mutation_id(id)?, ShutdownMode::CancelRestart);
+    request.restart_id = Some(restart_id);
+    call_shutdown(data_dir, &request).await?;
+    print_update_value(
+        &json!({"state": "update_cancelled", "admission": "open", "restart_id": request.restart_id}),
+        json_output,
+    );
+    Ok(0)
+}
+
 pub(super) async fn run_interrupting(
     source: PathBuf,
     data_dir: PathBuf,
@@ -171,6 +187,7 @@ async fn run_update(
     if identity.principal != "owner" {
         return Err(Failure::new(3, "daemon update requires the local Owner"));
     }
+    require_lossless_restart_drain(&data_dir).await?;
     let previous_binary = running_binary(&old).map_err(Failure::for_read)?;
     let previous_hash = binary_sha256(&previous_binary).map_err(Failure::for_read)?;
     let binary = release_binary(&source)?;
@@ -209,7 +226,8 @@ async fn run_update(
         .filter(|agent| !agent.state.is_terminal())
         .map(|agent| json!({"agent": agent.id, "generation": agent.generation, "state": agent.state}))
         .collect::<Vec<_>>();
-    let prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
+    let mut prepare = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::PrepareRestart);
+    prepare.drain_seconds = Some(wait_seconds);
     let mut commit = DaemonShutdownRequest::new(mutation_id(None)?, ShutdownMode::Restart);
     commit.restart_id = Some(prepare.id.clone());
     commit.backup = true;
@@ -566,21 +584,60 @@ async fn quiesce(
     prepare: &DaemonShutdownRequest,
     commit: &DaemonShutdownRequest,
     wait: Duration,
+    interrupt_on_deadline: bool,
+    stopped: &mut Vec<StoppedAgent>,
+) -> Result<(), Failure> {
+    let mut signal = Box::pin(wait_for_update_cancel());
+    let mut preparing = Box::pin(call_shutdown(path, prepare));
+    tokio::select! {
+        result = &mut preparing => result?,
+        interrupted = &mut signal => {
+            // The request may already be admitted. Let this bounded RPC
+            // settle before the caller cancels its exact preparation.
+            let _ = preparing.await;
+            return Err(update_cancel_failure(interrupted));
+        }
+    }
+    eprintln!(
+        "Update drain {}. Cancel with Ctrl-C or daemon update --cancel {}",
+        prepare.id, prepare.id
+    );
+    tokio::select! {
+        result = Box::pin(drain_prepared(path, old, commit, wait, interrupt_on_deadline, stopped)) => result,
+        interrupted = &mut signal => Err(update_cancel_failure(interrupted)),
+    }
+}
+
+async fn wait_for_update_cancel() -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let mut ctrl_break = tokio::signal::windows::ctrl_break()?;
+        tokio::select! {
+            signal = tokio::signal::ctrl_c() => signal,
+            _ = ctrl_break.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(windows))]
+    tokio::signal::ctrl_c().await
+}
+
+fn update_cancel_failure(signal: std::io::Result<()>) -> Failure {
+    match signal {
+        Ok(()) => Failure::new(130, "daemon update cancelled by console interrupt"),
+        Err(error) => Failure::new(4, format!("listen for daemon update cancellation: {error}")),
+    }
+}
+
+async fn drain_prepared(
+    path: &Path,
+    old: &DaemonInfo,
+    commit: &DaemonShutdownRequest,
+    wait: Duration,
     mut interrupt_on_deadline: bool,
     stopped: &mut Vec<StoppedAgent>,
 ) -> Result<(), Failure> {
-    call_shutdown(path, prepare).await?;
-    // Stop through the native protocol while terminal events can still commit.
-    // A forced process exit can leave the retained session marked busy.
-    Box::pin(stop_active_turns(
-        path,
-        old,
-        Instant::now() + INTERRUPT_SETTLE_WAIT,
-        stopped,
-        |agent| HarnessCapabilities::of(&agent.harness).restart_requires_idle,
-    ))
-    .await?;
     let mut deadline = Instant::now() + wait;
+    let mut next_report = Instant::now();
     loop {
         check_same_daemon(path, old)?;
         match call_shutdown(path, commit).await {
@@ -602,11 +659,90 @@ async fn quiesce(
             }
             Err(error) => return Err(error),
         }
+        if Instant::now() >= next_report {
+            report_restart_progress(path).await;
+            next_report = Instant::now() + Duration::from_secs(5);
+        }
         #[expect(
             clippy::disallowed_methods,
-            reason = "The update command waits for the replacement daemon's readiness"
+            reason = "The update command polls restart settlement and reports drain progress"
         )]
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(200).min(deadline.saturating_duration_since(Instant::now())))
+            .await;
+    }
+}
+
+async fn require_lossless_restart_drain(path: &Path) -> Result<(), Failure> {
+    let request = MethodHelpRequest {
+        method: "daemon.shutdown".to_owned(),
+        full: Some(true),
+    };
+    #[derive(serde::Deserialize)]
+    struct ShutdownHelp {
+        method: String,
+        request_schema: Option<Value>,
+    }
+    let help: ShutdownHelp = eliot_daemon::client_call_typed(path, "api.help", &request)
+        .await
+        .map_err(Failure::for_read)?;
+    let supports_drain = help.method == "daemon.shutdown"
+        && help
+            .request_schema
+            .as_ref()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(|properties| properties.get("drain_seconds"))
+            .is_some();
+    if !supports_drain {
+        return Err(Failure::for_read(eliot_core::Error::new(
+            "unsupported",
+            "daemon does not advertise lossless restart drains",
+        )));
+    }
+    Ok(())
+}
+
+async fn report_restart_progress(path: &Path) {
+    let report = timeout(Duration::from_secs(2), status(path)).await;
+    let Ok(Ok(snapshot)) = report else {
+        eprintln!("Update drain status unavailable");
+        return;
+    };
+    let Some(drain) = snapshot.drain else {
+        return;
+    };
+    eprintln!(
+        "Update drain: {} running turn(s){}",
+        drain.running_turns_count,
+        if drain.running_turns_truncated {
+            " (status list truncated)"
+        } else {
+            ""
+        }
+    );
+    let mut starts = Vec::with_capacity(drain.running_turns.len());
+    let _ = timeout(Duration::from_secs(2), async {
+        for turn in &drain.running_turns {
+            let request =
+                TurnGetRequest::new(turn.agent.clone(), turn.generation, turn.turn_id.clone());
+            let started =
+                eliot_daemon::client_call_typed::<_, eliot_core::Turn>(path, "turn.get", &request)
+                    .await
+                    .ok()
+                    .and_then(|turn| turn.started_at);
+            starts.push(started);
+        }
+    })
+    .await;
+    let now = daemon_now_ms() as i64;
+    for (index, turn) in drain.running_turns.iter().enumerate() {
+        let age = starts.get(index).copied().flatten().map_or_else(
+            || "age unavailable".to_owned(),
+            |started| format!("active for {}s", now.saturating_sub(started).max(0) / 1_000),
+        );
+        eprintln!(
+            "  turn {} · agent {} generation {} · {}",
+            turn.turn_id, turn.agent, turn.generation, age
+        );
     }
 }
 

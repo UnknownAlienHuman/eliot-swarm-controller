@@ -46,14 +46,31 @@ pub(crate) async fn run_daemon(
     }
     match args.action {
         Some(DaemonAction::Update {
-            release,
+            cancel: Some(restart_id),
+            ..
+        }) => {
+            Box::pin(super::update::cancel(
+                &data_dir,
+                restart_id,
+                id,
+                json_output,
+            ))
+            .await
+        }
+        Some(DaemonAction::Update {
+            release: Some(release),
             wait_seconds,
+            ..
         }) => {
             if id.is_some() {
                 return Err(Failure::new(2, "--id is not valid with daemon update"));
             }
             super::update::run(release, data_dir, wait_seconds, json_output).await
         }
+        Some(DaemonAction::Update { .. }) => Err(Failure::new(
+            2,
+            "daemon update requires a release or --cancel",
+        )),
         Some(DaemonAction::Stop(args)) => {
             if args.drain == args.force {
                 return Err(Failure::new(
