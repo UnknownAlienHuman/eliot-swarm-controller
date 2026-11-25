@@ -145,9 +145,11 @@ impl DesktopApp {
         }
     }
 
-    /// The daemon screen asks whether a daemon runs again.
+    /// The daemon screen asks whether a daemon runs again: after an Owner
+    /// stop, after the restarts gave up, or after a start found no daemon.
     fn link_watched(&self) -> bool {
         self.link.stopped
+            || self.link.gave_up
             || self
                 .startup_error
                 .as_ref()
@@ -206,10 +208,11 @@ impl DesktopApp {
                         self.restart_daemon(attempt + 1, Some(reason), context);
                     } else {
                         self.link.gave_up = true;
+                        // Shown as "Stopped: Swarm stopped again …".
                         self.startup_error = Some(eliot_core::Error::new(
-                            "unavailable",
+                            "stopped",
                             format!(
-                                "{reason}, after {RESTART_ATTEMPTS} restarts in a row. Its log \
+                                "{reason}, the {RESTART_ATTEMPTS}th restart in a row. Its log \
                                  may say why."
                             ),
                         ));

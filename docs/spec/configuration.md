@@ -186,7 +186,8 @@ reason and the choices in this order: Retry on the same data directory (the
 default; named Start Swarm once the restarts gave up), Repair settings, Open log,
 Open the data folder, Use another data directory (an existing private Swarm root)
 and, last, a new empty data directory after a confirmation. While that screen
-shows a start that found no daemon answering, the list's cadence asks
+shows after the restarts gave up, or after a start that found no daemon answering,
+the list's cadence asks
 `daemon.status` (never starting one) and reconnects to a daemon started elsewhere.
 After three failed reconnects in a row, the open conversation's live line says
 Swarm is not answering and offers Start Swarm, the same startup path on the same
