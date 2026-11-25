@@ -101,6 +101,19 @@ fn print_report(report: &AutonomyResponse) {
     row("Checks", &report.checks, |counts| {
         println!("  {} manual, {} Swarm", counts.manual, counts.swarm);
     });
+    if let Some(rounds) = report
+        .checks
+        .counts
+        .as_ref()
+        .and_then(|checks| checks.goal_rounds.as_ref())
+    {
+        row("Goal rounds", rounds, |counts| {
+            println!(
+                "  {} completed, {} blocked, {} unknown",
+                counts.completed, counts.blocked, counts.unknown
+            );
+        });
+    }
     row("Shell waits", &report.waits, |counts| {
         println!("  {} calls", counts.calls)
     });

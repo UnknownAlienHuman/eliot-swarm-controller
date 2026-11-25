@@ -106,6 +106,14 @@ impl Store {
         if event_window_pruned(connection, since)? {
             let reason = "the event retention boundary overlaps the requested window";
             report.checks.limit_coverage(reason);
+            if let Some(goal_rounds) = report
+                .checks
+                .counts
+                .as_mut()
+                .and_then(|checks| checks.goal_rounds.as_mut())
+            {
+                goal_rounds.limit_coverage(reason);
+            }
             report.waits.limit_coverage(reason);
             report.notes.limit_coverage(reason);
             report.executor_swarm.limit_coverage(reason);
