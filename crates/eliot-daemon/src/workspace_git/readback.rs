@@ -257,8 +257,10 @@ impl WorkspaceGit {
                                 main_checkout(&common, parent)
                             });
                         let repositories = main.into_iter().chain(linked_checkouts(&common));
+                        let inventory = git.entries(&common, deadline).await.unwrap_or_default();
+                        let inventory = &inventory;
                         checkouts = stream::iter(repositories.take(MAX_CHECKOUTS))
-                            .map(|repo| git.checkout_readback(repo, deadline))
+                            .map(|repo| git.checkout_readback(repo, inventory, deadline))
                             .buffered(4)
                             .filter_map(std::future::ready)
                             .collect()
@@ -291,6 +293,7 @@ impl WorkspaceGit {
     async fn checkout_readback(
         &self,
         repo: Repository,
+        inventory: &[WorktreeEntry],
         deadline: Instant,
     ) -> Option<ProjectCheckoutView> {
         let head = repo.git_dir.join("HEAD");
@@ -298,29 +301,34 @@ impl WorkspaceGit {
         if !fs::symlink_metadata(&head).is_ok_and(|metadata| metadata.is_file()) {
             return None;
         }
-        let binding = GitBinding {
-            git_dir: &repo.git_dir,
-            common_dir: &repo.common_dir,
-        };
-        let output = self
-            .git
-            .workspace_command_bound(
-                &repo.root,
-                &["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
-                binding,
-                deadline,
-            )
-            .await
-            .ok()?;
-        let branch = match output.code {
-            0 => Some(
-                line(&output.stdout)
-                    .ok()?
-                    .strip_prefix("refs/heads/")?
-                    .to_owned(),
-            ),
-            1 => None, // Detached HEAD.
-            _ => return None,
+        let branch = match inventory_head(&repo, &head, inventory) {
+            Some(branch) => branch,
+            None => {
+                let binding = GitBinding {
+                    git_dir: &repo.git_dir,
+                    common_dir: &repo.common_dir,
+                };
+                let output = self
+                    .git
+                    .workspace_command_bound(
+                        &repo.root,
+                        &["symbolic-ref", "--quiet", "--no-recurse", "HEAD"],
+                        binding,
+                        deadline,
+                    )
+                    .await
+                    .ok()?;
+                match output.code {
+                    0 => Some(
+                        line(&output.stdout)
+                            .ok()?
+                            .strip_prefix("refs/heads/")?
+                            .to_owned(),
+                    ),
+                    1 => None,
+                    _ => return None,
+                }
+            }
         };
         if branch.as_ref().is_some_and(|name| {
             name == ".invalid"
@@ -340,6 +348,42 @@ impl WorkspaceGit {
             branch,
         })
     }
+}
+
+/// Git resolves symbolic chains in the bulk inventory. Compare the first
+/// reference from the already bound checkout so its result also agrees with
+/// `symbolic-ref --no-recurse`. Unborn, changed or ambiguous entries use Git
+/// directly for that checkout.
+fn inventory_head(
+    repo: &Repository,
+    head: &Path,
+    inventory: &[WorktreeEntry],
+) -> Option<Option<String>> {
+    let key = eliot_core::workspace_path_key(repo.root.to_str()?);
+    let mut matches = inventory.iter().filter(|entry| {
+        entry
+            .path
+            .to_str()
+            .is_some_and(|path| eliot_core::workspace_path_key(path) == key)
+    });
+    let entry = matches.next()?;
+    if matches.next().is_some()
+        || entry.incomplete
+        || entry.prunable
+        || !matches!(fs::symlink_metadata(repo.git_dir.join("config.worktree")), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    let current = metadata_line(head).ok()?;
+    if let Some(reference) = current.strip_prefix("ref: ")
+        && entry.branch.as_deref() == Some(reference)
+        && let Some(branch) = reference.strip_prefix("refs/heads/")
+    {
+        return Some(Some(branch.to_owned()));
+    }
+    (is_git_oid(&current) && entry.branch.is_none() && entry.head.as_deref() == Some(&current))
+        .then_some(None)
 }
 
 fn main_checkout(common: &Path, checkout: &Path) -> Option<Repository> {
