@@ -533,8 +533,38 @@ pub struct ConfigMcpServer {
     pub environment: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
     pub url: Option<String>,
-    #[serde(default)]
-    pub headers: Option<std::collections::HashMap<String, String>>,
+    #[serde(
+        default,
+        rename = "headers",
+        deserialize_with = "deserialize_mcp_header_digests"
+    )]
+    pub header_digests: Option<std::collections::HashMap<String, String>>,
+}
+
+fn deserialize_mcp_header_digests<'de, D>(
+    deserializer: D,
+) -> Result<Option<std::collections::HashMap<String, String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let headers = Option::<std::collections::HashMap<String, String>>::deserialize(deserializer)?;
+    Ok(headers.map(mcp_header_digests))
+}
+
+/// Native config may echo expanded credentials. Retain only digests, even
+/// when the typed readback is formatted for debugging.
+pub fn mcp_header_digests(
+    headers: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name,
+                eliot_core::api::inference::sha256_hex(value.as_bytes()),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

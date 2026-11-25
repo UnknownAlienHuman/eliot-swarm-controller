@@ -134,9 +134,10 @@ pub const SWARM_MCP_SERVER_NAME: &str = eliot_plugin::native_cli::WORKER_SWARM_M
 /// fragment is a profile error raised by the caller, never rendered here.
 ///
 /// `swarm_executable` and `swarm_data_dir` are the absolute active Swarm
-/// executable and the Agent's owned Eliot data root. The private config carries
-/// the exact Agent identity in OpenCode's MCP `environment` map, never in the
-/// shell-visible server environment. Shape verified against
+/// executable and the Agent's owned Eliot data root for stdio. Shared HTTP
+/// references `{env:ELIOT_AGENT_TOKEN}` in config and uses the credential
+/// already supplied to the server environment by the frozen profile policy.
+/// The stdio shape was verified against
 /// the installed 2.2.7 server: `mcp add` writes
 /// `mcp.servers.<name> = {type: "local", command: [...], environment?}`,
 /// and `GET /api/config` echoes the document while `GET /api/mcp`

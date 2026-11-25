@@ -13,7 +13,7 @@ use crate::{
         transfer_selected_integration,
         types::{
             ConfigEntry, ConfigMcpServer, InboxUser, McpServerReadback, ModelRef, NativeModelEntry,
-            PermissionRule, SessionInfo,
+            PermissionRule, SessionInfo, mcp_header_digests,
         },
     },
 };
@@ -4252,9 +4252,9 @@ fn verify_managed_mcp_transport(documents: &[ConfigEntry], parsed: &ParsedStart)
             && server.url.as_deref() == Some(remote.url.as_str())
             && server.command.is_none()
             && server.environment.is_none()
-            && server.headers.as_ref().is_some_and(|headers| {
-                *headers == remote.headers(RemoteAgentMcp::TOKEN_REFERENCE)
-                    || *headers == remote.headers(token)
+            && server.header_digests.as_ref().is_some_and(|headers| {
+                *headers == mcp_header_digests(remote.headers(RemoteAgentMcp::TOKEN_REFERENCE))
+                    || *headers == mcp_header_digests(remote.headers(token))
             })
     } else {
         let expected_environment = managed_mcp_environment(parsed);

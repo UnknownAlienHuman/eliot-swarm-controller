@@ -170,8 +170,9 @@ HTTP with `ELIOT_AGENT_TOKEN` as its bearer token environment reference and the 
 Agent id and generation in request headers.
 Codex uses the daemon-provided scoped launch environment; the token is never written
 into config or argv. Shell access follows the existing
-`pass_agent_identity_to_shell` policy. If any condition is unavailable or unsafe,
-Codex keeps the existing private process-local stdio server, using the active Swarm
+`pass_agent_identity_to_shell` policy. If the listener is absent, a proxy is configured,
+or the native environment lacks the token, Codex uses the private stdio server. A
+malformed supplied listener URL refuses start before native spawn. Stdio uses the active Swarm
 executable, the Agent's owned Eliot data directory, and its selected workspace as cwd.
 Either transport exposes only `swarm`, with the installed schema `{ method: string,
 params: object }`. Use the advertised Eliot method and its existing params DTO for Eliot
