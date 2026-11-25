@@ -527,6 +527,16 @@ pub fn rows(inputs: &Inputs) -> Vec<Row> {
             &format!("No models match “{query}”. Clear the search to see every model."),
         ));
     }
+    // A stale catalogue's quota signal is stale too: never Ready.
+    if reply.is_some_and(|reply| reply.stale) {
+        for row in &mut rows {
+            if let Row::Choice(item) = row
+                && item.availability == Availability::Ready
+            {
+                item.availability = Availability::Unknown;
+            }
+        }
+    }
     rows
 }
 
@@ -738,8 +748,11 @@ fn claude_rows(
         }
     };
     if named {
+        // Not `claude:<id>`: a catalogue may list a model whose id is
+        // `default`, and two rows must never share a key (the highlight,
+        // the row's effort and its native element follow the key).
         rows.push(Row::Choice(item(
-            "claude:default".to_owned(),
+            "claude::cli-default".to_owned(),
             None,
             "Default model".to_owned(),
             "the Claude Code CLI picks".to_owned(),
@@ -747,7 +760,7 @@ fn claude_rows(
     }
     if let Some(typed) = typed {
         rows.push(Row::Choice(item(
-            format!("claude:typed:{typed}"),
+            format!("claude::typed:{typed}"),
             Some(typed.to_owned()),
             typed.to_owned(),
             "use this model id".to_owned(),

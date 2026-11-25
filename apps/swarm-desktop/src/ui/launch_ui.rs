@@ -418,12 +418,21 @@ impl DesktopApp {
                     eliot::profile_vocabulary::CLAUDE_EFFORT_LEVELS
                 },
             });
-            if preview.is_some() {
-                for row in &mut rows {
-                    if let Row::Choice(item) = row {
+            // The Agent's account or profile under a hold: every row says
+            // so (its next turn waits for the provider).
+            let held = detail
+                .provider_hold
+                .as_ref()
+                .is_some_and(|hold| hold.state == eliot_core::ProviderHoldState::Held);
+            for row in &mut rows {
+                if let Row::Choice(item) = row {
+                    if preview.is_some() {
                         item.disabled.get_or_insert_with(|| {
                             "Checking which models this task can use…".to_owned()
                         });
+                    }
+                    if held {
+                        item.availability = picker::Availability::Held;
                     }
                 }
             }

@@ -247,8 +247,10 @@ impl DesktopApp {
                 let before = self.panel_counts();
                 self.inbox.counts = status.owner_inbox;
                 // A decision appeared or left: the open conversation's
-                // panel reads the inbox again.
+                // panel reads the inbox again, and its goal (a blocked goal
+                // is counted here, after the turn's last event).
                 if self.panel_counts() != before {
+                    self.read_goal(context);
                     self.read_decisions(context);
                 }
                 self.inbox.profile_command_issues = status.profile_command_issues;

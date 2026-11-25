@@ -307,7 +307,9 @@ pub fn as_catalog(reply: &HarnessModelsResponse) -> ModelsCatalogResponse {
                     .clone()
                     .filter(|_| reply.configure.effort_refusal.is_none()),
                 default: entry.default || reply.default.as_deref() == Some(entry.id.as_str()),
-                availability: eliot_core::api::harness::CATALOG_AVAILABLE.to_owned(),
+                // `harness.models` carries no quota or hold signal: the
+                // picker labels these rows unknown, never Ready (§8.3).
+                availability: eliot_core::api::harness::CATALOG_UNKNOWN.to_owned(),
                 source: entry.source.clone(),
                 profile: None,
             })

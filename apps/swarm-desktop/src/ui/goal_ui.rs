@@ -285,6 +285,8 @@ impl DesktopApp {
                     self.shell_update(ShellMsg::AgentOpened(row), context);
                 }
                 let title = self.agent_title(&agent);
+                // The status decides the controls: read it now.
+                self.read_goal(context);
                 self.goal.open = Some(GoalDialog {
                     agent,
                     title,
@@ -551,11 +553,13 @@ impl DesktopApp {
                 error,
             ]))
             .into();
-        let footer = if open.confirm_clear {
-            self.goal_clear_footer(context)
+        // Keyed by the question, so no button of one footer is reused as
+        // another's (a second click on Clear goal never lands on Save).
+        let footer = Grid::new().keyed_children(vec![if open.confirm_clear {
+            KeyedView::new("ask", self.goal_clear_footer(context))
         } else {
-            self.goal_footer(open, goal, busy, context)
-        };
+            KeyedView::new("controls", self.goal_footer(open, goal, busy, context))
+        }]);
         let heading = match current {
             Some(_) => format!("Goal for “{}”", open.title),
             None => format!("Set a goal for “{}”", open.title),
@@ -565,7 +569,7 @@ impl DesktopApp {
             self.dialog.epoch,
             heading,
             body,
-            footer,
+            footer.into(),
             tokens::layout::GOAL_DIALOG_WIDTH,
         ))
     }

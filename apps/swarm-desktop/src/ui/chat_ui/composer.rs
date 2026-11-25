@@ -650,20 +650,30 @@ impl DesktopApp {
                         monitor::elapsed_label(crate::handoff::now_ms().saturating_sub(at))
                     )
                 });
-                match (fill.percent(), fill.window) {
-                    (Some(share), Some(window)) => (
+                match (fill.used, fill.window, fill.percent()) {
+                    (Some(used), Some(window), Some(share)) => (
                         format!("Context {}%", share.round()),
                         format!(
                             "This {harness} session's context: {} of {} tokens{age}.",
-                            monitor::group(fill.used),
+                            monitor::group(used),
                             monitor::group(window)
                         ),
                     ),
-                    _ => (
-                        format!("Context {}k tokens", fill.used / 1_000),
+                    (Some(used), _, _) => (
+                        format!("Context {}k tokens", used / 1_000),
                         format!(
                             "This {harness} session's context: {} tokens{age}; {harness} does not report the window.",
-                            monitor::group(fill.used)
+                            monitor::group(used)
+                        ),
+                    ),
+                    (None, window, _) => (
+                        "Context unavailable".to_owned(),
+                        format!(
+                            "{harness} reports {}not the tokens this session's context holds{age}.",
+                            window.map_or_else(String::new, |window| format!(
+                                "a {}-token window but ",
+                                monitor::group(window)
+                            ))
                         ),
                     ),
                 }

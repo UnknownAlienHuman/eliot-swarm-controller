@@ -438,7 +438,7 @@ impl DesktopApp {
                 let names: Vec<String> = item
                     .efforts
                     .iter()
-                    .map(|effort| picker::effort_label(effort).to_owned())
+                    .map(|effort| effort_words(effort))
                     .collect();
                 let selected = item
                     .effort
@@ -448,6 +448,8 @@ impl DesktopApp {
                 ComboBox::new()
                     .header(controls::secondary("Effort"))
                     .automation_name(format!("Effort for {}", title_of(item)))
+                    // No level chosen: the harness's own default.
+                    .placeholder_text("Default")
                     .items_source(names)
                     .selected_index(selected)
                     .horizontal_alignment(HorizontalAlignment::Stretch)
@@ -508,7 +510,7 @@ impl DesktopApp {
             item.detail.clone()
         };
         let effort = match item.effort.as_deref() {
-            Some(effort) => Some(format!("{} effort", picker::effort_label(effort))),
+            Some(effort) => Some(format!("{} effort", effort_words(effort))),
             None if model_row => Some(DEFAULT_EFFORT.to_owned()),
             None => None,
         };
@@ -1031,6 +1033,15 @@ fn group_heading(
                 ])),
         )
         .into()
+}
+
+/// An effort in full words, capitalized ("Medium", "Extra high").
+fn effort_words(effort: &str) -> String {
+    let name = picker::effort_name(effort);
+    let mut chars = name.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
 }
 
 fn access_glyph(access: Access) -> &'static str {

@@ -772,30 +772,31 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         created_at: reply.agent.created_at,
         provider_hold: reply.provider_hold.clone(),
         context: reply.session_usage.as_ref().and_then(|usage| {
-            Some(ContextFill {
-                used: usage.context_used_tokens.filter(|used| *used >= 0)?,
+            let fill = ContextFill {
+                used: usage.context_used_tokens.filter(|used| *used >= 0),
                 window: usage.context_window_tokens.filter(|window| *window > 0),
                 observed_at: usage.observed_at,
-            })
+            };
+            (fill.used.is_some() || fill.window.is_some()).then_some(fill)
         }),
     }
 }
 
 /// A session's context as its harness reports it (`session_usage`, brand
-/// book §9.5): the tokens in the context, the window when the harness
-/// names it (only then is there a share), and when it was observed.
+/// book §9.5): the tokens in the context and the window, each when the
+/// harness reports it (a share needs both), and when it was observed.
 #[derive(Clone, Debug, PartialEq)]
 struct ContextFill {
-    used: i64,
+    used: Option<i64>,
     window: Option<i64>,
     observed_at: Option<i64>,
 }
 
 impl ContextFill {
-    /// The share of the window in use, when the window is known.
+    /// The share of the window in use, when both are known.
     fn percent(&self) -> Option<f64> {
-        self.window
-            .map(|window| (self.used as f64 / window as f64 * 100.0).clamp(0.0, 100.0))
+        let (used, window) = (self.used?, self.window?);
+        Some((used as f64 / window as f64 * 100.0).clamp(0.0, 100.0))
     }
 }
 
@@ -898,6 +899,12 @@ impl DesktopApp {
     /// window is the foreground window (`window_place::may_take_focus`,
     /// `ShellMsg::FocusHeld`); the latest request wins.
     fn take_focus(&mut self, target: FocusTarget) {
+        // An open dialog owns the keyboard (a conversation's history that
+        // lands behind it must not pull focus out of its field); closing it
+        // gives focus back ([`DesktopApp::sync_dialog`]).
+        if self.dialog_kind() != 0 {
+            return;
+        }
         let hold = !crate::window_place::may_take_focus();
         crate::window_place::hold_focus(hold);
         if hold {

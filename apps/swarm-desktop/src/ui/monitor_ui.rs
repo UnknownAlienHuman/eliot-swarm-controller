@@ -1605,15 +1605,22 @@ impl DesktopApp {
                 "used",
                 page_ui::kv_text(
                     "Used",
-                    match fill.window {
-                        Some(window) => format!(
+                    match (fill.used, fill.window) {
+                        (Some(used), Some(window)) => format!(
                             "{} of {} tokens",
-                            monitor::group(fill.used),
+                            monitor::group(used),
                             monitor::group(window)
                         ),
-                        None => {
-                            format!("{} tokens (window not reported)", monitor::group(fill.used))
+                        (Some(used), None) => {
+                            format!("{} tokens (window not reported)", monitor::group(used))
                         }
+                        (None, window) => format!(
+                            "not reported{}",
+                            window.map_or_else(String::new, |window| format!(
+                                " (window {} tokens)",
+                                monitor::group(window)
+                            ))
+                        ),
                     },
                 ),
             ));

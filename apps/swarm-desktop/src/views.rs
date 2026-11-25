@@ -1250,6 +1250,39 @@ pub struct Transcript {
     built_above: u64,
 }
 
+/// Whether only the top of the same conversation changed: Load older or
+/// the boundary line came or went, or an earlier item's parts changed,
+/// while the last item and the item count stayed as they were. A change at
+/// the end as well is ambiguous and counts as none.
+fn changed_above(shown: &TranscriptInput, input: &TranscriptInput) -> bool {
+    let (before, after) = (&shown.items.0, &input.items.0);
+    let same_parts = |left: &RenderedItem, right: &RenderedItem| {
+        left.key == right.key
+            && left.parts.len() == right.parts.len()
+            && left
+                .parts
+                .iter()
+                .zip(&right.parts)
+                .all(|(left, right)| Rc::ptr_eq(left, right))
+    };
+    let end_kept = before.len() == after.len()
+        && match (before.last(), after.last()) {
+            (Some(left), Some(right)) => same_parts(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+    let top_changed = shown.load_older.as_ref().map(|(enabled, _)| *enabled)
+        != input.load_older.as_ref().map(|(enabled, _)| *enabled)
+        || shown.boundary != input.boundary
+        || before
+            .iter()
+            .zip(after.iter())
+            .rev()
+            .skip(1)
+            .any(|(left, right)| !same_parts(left, right));
+    end_kept && top_changed
+}
+
 fn part_count(items: &[Rc<RenderedItem>]) -> usize {
     items.iter().map(|item| item.parts.len()).sum()
 }
@@ -1273,6 +1306,11 @@ impl Transcript {
                 .any(|item| item.parts.iter().any(|part| part.key == first))
         {
             // An older page arrived above the oldest drawn part.
+            self.built_above += 1;
+        } else if input.conversation == self.shown.conversation && changed_above(&self.shown, input)
+        {
+            // The top changed and the end did not: Load older left (or its
+            // page filled the older turns), the boundary line changed.
             self.built_above += 1;
         }
         if input.conversation != self.shown.conversation {
@@ -1467,13 +1505,24 @@ pub struct Follow {
     /// Parts added since the view left the end (Jump to latest's count),
     /// kept with `away` and the items, not recounted on every render.
     fresh: Option<usize>,
-    /// Parts are being built above while read higher up: the extent
-    /// before, so the next extent change moves the offset by as much.
-    /// Any other input clears it: content changing at the end would make
-    /// that next extent change ambiguous, and a build above that added no
-    /// height (parts inside a folded log) never changes the extent.
-    above: Option<f64>,
+    /// The top changed while read higher up (parts built above, Load
+    /// older's page): the extent and viewport size before, so the next
+    /// extent change at that size moves the offset by as much. Metrics
+    /// with the same extent leave it waiting (the new parts are not laid
+    /// out yet, or added no height); a viewport size change drops it (the
+    /// text wraps again, so the extent change is not the top's), and any
+    /// other input clears it (content changing at the end would make that
+    /// next extent change ambiguous).
+    above: Option<Above>,
     _observation: ElementObservation,
+}
+
+/// The extent and viewport size when the top changed ([`Follow`]).
+#[derive(Clone, Copy)]
+struct Above {
+    extent: f64,
+    width: f64,
+    height: f64,
 }
 
 impl Follow {
@@ -1512,9 +1561,11 @@ impl Component for Follow {
         } else if input.built_above != self.shown.built_above && self.away.is_some() {
             // Called before the new tree reaches WinUI: the metrics still
             // hold the extent before the parts built above.
-            self.above = self
-                .above
-                .or(self.metrics.map(|metrics| metrics.extent_height));
+            self.above = self.above.or(self.metrics.map(|metrics| Above {
+                extent: metrics.extent_height,
+                width: metrics.viewport_width,
+                height: metrics.viewport_height,
+            }));
         } else {
             self.above = None;
         }
@@ -1526,20 +1577,25 @@ impl Component for Follow {
         match step {
             FollowStep::Scrolled(metrics) => {
                 let before = self.metrics.replace(metrics);
-                // The first metrics after a build above settle it: a new
-                // extent moves the offset by the height built; the same
-                // extent means it added none.
-                if let Some(extent) = self.above.take()
-                    && metrics.extent_height != extent
-                {
-                    let _ = self.shown.scroll.request_scroll_to(
-                        0.0,
-                        metrics.vertical_offset + (metrics.extent_height - extent),
-                        false,
-                        |_| {},
-                    );
-                    self.count_fresh();
-                    return;
+                // The first extent change at the same viewport size after
+                // the top changed moves the offset by the height it added
+                // or removed; the same extent waits for the layout.
+                if let Some(above) = self.above {
+                    if metrics.viewport_width != above.width
+                        || metrics.viewport_height != above.height
+                    {
+                        self.above = None;
+                    } else if metrics.extent_height != above.extent {
+                        self.above = None;
+                        let _ = self.shown.scroll.request_scroll_to(
+                            0.0,
+                            metrics.vertical_offset + (metrics.extent_height - above.extent),
+                            false,
+                            |_| {},
+                        );
+                        self.count_fresh();
+                        return;
+                    }
                 }
                 if at_end(&metrics) {
                     self.away = None;
