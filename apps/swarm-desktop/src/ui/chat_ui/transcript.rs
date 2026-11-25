@@ -104,6 +104,7 @@ impl DesktopApp {
             copy_code: context.callback(|(key, index): (String, usize)| {
                 Message::Chat(ChatMsg::CopyCode(key, index))
             }),
+            copy_output: context.callback(|key| Message::Chat(ChatMsg::CopyOutput(key))),
             retry: context.callback(|key| Message::Chat(ChatMsg::RetryInput(key))),
             pick_model: self
                 .chat
@@ -128,6 +129,12 @@ impl DesktopApp {
             callbacks: Rc::new(callbacks),
             load_older,
             empty,
+            boundary: self
+                .chat
+                .convo
+                .as_ref()
+                .filter(|_| open && !self.chat.items.is_empty())
+                .and_then(|convo| convo.coverage().boundary()),
             automation_id: TRANSCRIPT_ID,
             scroll: self.chat.transcript_ref.clone(),
         })

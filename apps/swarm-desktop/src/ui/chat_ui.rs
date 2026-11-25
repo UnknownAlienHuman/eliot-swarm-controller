@@ -43,6 +43,8 @@ pub(super) enum ChatMsg {
     ToolsToggled(String, bool),
     CopyPart(String),
     CopyCode(String, usize),
+    /// Copy a step's retained output (its part key).
+    CopyOutput(String),
     /// Send, Steer or Resume with the draft, bound when it was clicked.
     DraftRequested(DraftAction),
     /// Retry the unresolved submission with its saved action, body, ledger
@@ -58,9 +60,6 @@ pub(super) enum ChatMsg {
     /// Approve or deny the request, with the offered choice when it has
     /// choices.
     ApprovalRequested(UiPending, bool, Option<String>),
-    /// An approve choice from the split Approve's menu, by its label: the
-    /// request shown when the click is handled.
-    ApproveChoice(String),
     /// The open Agent's goal (`goal.get`), for the Agent it was read for.
     GoalRead(String, Fallible<Option<Box<eliot_core::api::GoalView>>>),
     /// The open Agent's inbox items (`owner.inbox`), for the decision panel.
@@ -78,6 +77,8 @@ pub(super) enum ChatMsg {
     DecideReason(String),
     /// Previous (-1) or next (1) item of the decision panel.
     DecisionStep(i32),
+    /// Check again: read the open Agent and its inbox items anew.
+    DecisionsRecheck,
     /// Wait out the hold: the strip hides until the hold changes.
     HoldWait,
     /// Clear the hold with the owner's evidence.
@@ -455,7 +456,7 @@ pub(super) struct ChatState {
     pub(super) goal: Option<(String, Option<eliot_core::api::GoalView>)>,
     /// The open Agent's `owner.inbox` items (requests, unconfirmed
     /// outcomes), for the decision panel.
-    pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>)>,
+    pub(super) decisions: Option<(String, Vec<eliot_core::api::OwnerInboxItem>, i64)>,
     /// The provider holds with their scopes, read while the open Agent is
     /// held.
     pub(super) holds: Option<(String, Fallible<Vec<eliot_core::ProviderHold>>)>,
@@ -593,7 +594,6 @@ impl DesktopApp {
                         self.check_loss(context);
                         self.sync_open_agent();
                         self.ensure_catalog(context);
-                        self.read_conversation_extras(context);
                         let cursor = snapshot.coverage.cursor;
                         let mut generation_changed = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -613,6 +613,10 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        // After the history is in place: the panel's read
+                        // looks at its unconfirmed turns (a restart showed
+                        // no Resolve card when this ran on the empty one).
+                        self.read_conversation_extras(context);
                         if generation_changed {
                             self.follow_next(
                                 Next::Resnapshot {
@@ -792,6 +796,13 @@ impl DesktopApp {
             }
             ChatMsg::ToolsToggled(key, expanded) => {
                 if expanded {
+                    // A step opened while its turn runs stays in view when
+                    // the turn ends: its finished log opens too.
+                    if let Some(log) = crate::chat::log_part_key(&key)
+                        .filter(|log| *log != key && key.contains("/tools:"))
+                    {
+                        self.chat.expanded.insert(views::log_key("open", &log));
+                    }
                     self.chat.expanded.insert(key);
                 } else {
                     self.chat.expanded.remove(&key);
@@ -885,6 +896,20 @@ impl DesktopApp {
                     Some((count, Ok(()))) => self.set_status(format!("Copied {count} characters.")),
                     Some((_, Err(error))) => self.alert(format!("Copy failed: {error}")),
                     None => self.alert("That message is no longer loaded."),
+                }
+            }
+            ChatMsg::CopyOutput(key) => {
+                let output = self
+                    .chat
+                    .convo
+                    .as_ref()
+                    .and_then(|convo| convo.part(&key))
+                    .and_then(|part| part.step)
+                    .and_then(|step| step.output);
+                match output.map(|(text, _)| crate::clipboard::set_text(&text)) {
+                    Some(Ok(())) => self.set_status("Copied the output."),
+                    Some(Err(error)) => self.alert(format!("Copy failed: {error}")),
+                    None => self.alert("That output is no longer loaded."),
                 }
             }
             ChatMsg::CopyCode(key, index) => {
@@ -1022,27 +1047,6 @@ impl DesktopApp {
                     ))
                 });
             }
-            ChatMsg::ApproveChoice(label) => {
-                let choice = self.chat.detail.as_ref().and_then(|detail| {
-                    detail.pending.iter().find_map(|request| {
-                        request
-                            .choices
-                            .iter()
-                            .find(|choice| {
-                                choice.label == label
-                                    && choice.decision
-                                        == eliot_core::requests::ApprovalDecision::Approve
-                            })
-                            .map(|choice| (request.clone(), choice.id.clone()))
-                    })
-                });
-                if let Some((request, choice)) = choice {
-                    self.chat_update(
-                        ChatMsg::ApprovalRequested(request, true, Some(choice)),
-                        context,
-                    );
-                }
-            }
             ChatMsg::GoalRead(agent, read) => {
                 if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
                     // A failed read shows no mark rather than a stale one.
@@ -1052,7 +1056,9 @@ impl DesktopApp {
             ChatMsg::DecisionsRead(agent, read) => {
                 if self.selected_agent_id().as_deref() == Some(agent.as_str()) {
                     match read {
-                        Ok(items) => self.chat.decisions = Some((agent, items)),
+                        Ok(items) => {
+                            self.chat.decisions = Some((agent, items, crate::handoff::now_ms()));
+                        }
                         Err(error) => {
                             self.set_status(format!("The inbox was not read: {error}"));
                         }
@@ -1069,6 +1075,16 @@ impl DesktopApp {
             }
             ChatMsg::OwnerDecided(words, result) => self.owner_decided(&words, *result, context),
             ChatMsg::DecideReason(text) => self.chat.decide_reason = text,
+            ChatMsg::DecisionsRecheck => {
+                self.queue_reread(
+                    Invalidation {
+                        detail: true,
+                        turns: true,
+                        ..Invalidation::default()
+                    },
+                    context,
+                );
+            }
             ChatMsg::DecisionStep(step) => {
                 self.chat.decision_at = self.chat.decision_at.saturating_add_signed(step as isize);
             }
