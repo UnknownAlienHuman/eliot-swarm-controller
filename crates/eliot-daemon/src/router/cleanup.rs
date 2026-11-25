@@ -2135,9 +2135,10 @@ impl Router {
             };
             (agent, store.agent_artifact_root(id, generation)?)
         };
-        if let Some(root) = root {
-            self.discover_terminal_cargo_children(&root).await?;
-        }
+        let inventory_issue = match root {
+            Some(root) => self.discover_terminal_cargo_children(&root).await?,
+            None => None,
+        };
         let inventory = self
             .inner
             .store
@@ -2148,10 +2149,23 @@ impl Router {
             plan_id: ulid::Ulid::new().to_string(),
             created_at: now_ms(),
             items: Vec::new(),
-            inventory_issues: Vec::new(),
-            truncated: false,
+            truncated: inventory_issue.is_some(),
+            inventory_issues: inventory_issue.into_iter().collect(),
             continuation: None,
         };
+        if plan.truncated {
+            let mut store = self.inner.store.lock().await;
+            let event = store.record_automatic_cleanup(
+                json!({
+                    "plan_id": plan.plan_id,
+                    "items": [],
+                    "truncated": true,
+                    "inventory_issues": plan.inventory_issues,
+                }),
+                now_ms(),
+            )?;
+            self.publish_locked(&[event]);
+        }
         let deadline = Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT;
         for artifact in inventory {
             let Ok(candidate) =

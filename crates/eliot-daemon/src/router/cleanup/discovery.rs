@@ -36,21 +36,23 @@ impl Router {
         issues: &mut Vec<CleanupInventoryIssue>,
     ) -> Result<bool> {
         let mut after = page.owned_backfill_after.unwrap_or(0);
-        let mut resume = page
-            .owned_root_scan
-            .take()
-            .map(|id| {
-                let mut scans = self.inner.automatic_cleanup.lock_recover();
-                if !scans
+        let token = page.owned_root_scan.take();
+        let mut resume = token.as_ref().and_then(|id| {
+            let mut scans = self.inner.automatic_cleanup.lock_recover();
+            if scans
+                .owned_scans
+                .get(id)
+                .is_some_and(|scan| scan.after == after && scan.binding == binding)
+            {
+                scans
                     .owned_scans
-                    .get(&id)
-                    .is_some_and(|scan| scan.after == after && scan.binding == binding)
-                {
-                    return Err(stale_scan());
-                }
-                scans.owned_scans.remove(&id).ok_or_else(stale_scan)
-            })
-            .transpose()?;
+                    .remove(id)
+                    .filter(|scan| scan.expires > Instant::now())
+            } else {
+                None
+            }
+        });
+        let mut restarted = token.is_some() && resume.is_none();
         let deadline = Instant::now() + CLEANUP_BACKFILL_BUDGET;
         for _ in 0..4 {
             let roots = self
@@ -60,14 +62,11 @@ impl Router {
                 .await
                 .cleanup_owned_roots_page(after)?;
             if roots.is_empty() {
-                if resume.is_some() {
-                    return Err(stale_scan());
-                }
                 page.owned_backfill_after = Some(0);
                 return Ok(false);
             }
             for (seq, root) in roots {
-                if resume.is_none() && Instant::now() >= deadline {
+                if resume.is_none() && !restarted && Instant::now() >= deadline {
                     page.owned_backfill_after = Some(after);
                     return Ok(true);
                 }
@@ -83,15 +82,31 @@ impl Router {
                     .as_ref()
                     .is_some_and(|scan| scan.seq != seq || !authorized)
                 {
-                    return Err(stale_scan());
+                    resume = None;
+                    restarted = true;
                 }
                 if authorized {
                     let walk = resume.take().map(|scan| scan.walk);
-                    let resumed = walk.is_some();
-                    match self
+                    let mut result = self
                         .discover_owned_cleanup_children(&root, false, walk, deadline)
-                        .await
+                        .await;
+                    if result
+                        .as_ref()
+                        .is_err_and(|error| error.code == "owned_root_scan_stale")
                     {
+                        restarted = true;
+                        result = self
+                            .discover_owned_cleanup_children(&root, false, None, deadline)
+                            .await;
+                    }
+                    if std::mem::take(&mut restarted) {
+                        issues.push(self.owned_scan_issue(
+                            &root,
+                            "owned_root_scan_restarted",
+                            "The saved scan was unavailable or stale; discovery restarted in this root",
+                        ));
+                    }
+                    match result {
                         Ok(Some(walk)) => {
                             page.owned_root_scan =
                                 Some(self.park_owned_scan(after, seq, binding, walk));
@@ -104,7 +119,6 @@ impl Router {
                             return Ok(true);
                         }
                         Ok(None) => {}
-                        Err(error) if resumed && error.code == "invalid" => return Err(error),
                         Err(error) => issues.push(self.owned_scan_issue(
                             &root,
                             "owned_root_scan_failed",
@@ -178,7 +192,10 @@ impl Router {
         id
     }
 
-    pub(super) async fn discover_terminal_cargo_children(&self, root: &ArtifactView) -> Result<()> {
+    pub(super) async fn discover_terminal_cargo_children(
+        &self,
+        root: &ArtifactView,
+    ) -> Result<Option<CleanupInventoryIssue>> {
         // The terminal hook is opportunistic. Periodic inventory starts its
         // own scan, with continuation, to cover anything beyond this slice.
         if self
@@ -201,8 +218,13 @@ impl Router {
                 ],
                 None,
             );
+            return Ok(Some(self.owned_scan_issue(
+                root,
+                "owned_root_scan_incomplete",
+                "Terminal cache discovery ended after one slice; periodic inventory will scan this root",
+            )));
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn discover_owned_cleanup_children(
@@ -319,8 +341,8 @@ impl Router {
 
 fn stale_scan() -> Error {
     Error::new(
-        "invalid",
-        "owned artifact scan continuation is stale; start a new cleanup plan",
+        "owned_root_scan_stale",
+        "saved owned artifact scan is stale",
     )
 }
 
