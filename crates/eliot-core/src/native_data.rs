@@ -5,6 +5,8 @@ use crate::{Error, Result, api::REDACTION_MARKER};
 
 pub const UNCLASSIFIED_NATIVE_EVENT: &str = "session.native_unclassified";
 pub const NATIVE_WARNING_EVENT: &str = "session.native_warning";
+/// Transport occurrence key for warnings without a vendor notification ID.
+pub const NATIVE_WARNING_OCCURRENCE_PREFIX: &str = "native-warning-occurrence:";
 pub const MAX_NATIVE_WARNING_BYTES: usize = 1024;
 const MAX_LABEL_BYTES: usize = 128;
 

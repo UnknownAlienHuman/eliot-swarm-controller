@@ -812,10 +812,10 @@ truncating it. The schema has no code field, so uncoded notifications use
 after the turn ends. Missing or mismatched thread bindings increment
 `unbound_warnings_dropped` in the native snapshot; malformed notification or
 startup-status payloads increment `malformed_warnings_dropped`. Both discard
-the payload text. Codex provides no native ID for these notices, so every
-accepted occurrence receives a fresh occurrence ID; identical repeated
-warnings remain separate facts, and adapter retries do not replay uncertain
-event writes.
+the payload text. Codex provides no native ID for these notices. The adapter
+names the transport occurrence and Store binds the diagnostic to its batch.
+Identical warnings remain separate facts and the adapter does not replay
+uncertain writes.
 
 The installed schema describes `account/rateLimits/updated` as a sparse rolling
 update. An owned direct account stream translates the primary and secondary

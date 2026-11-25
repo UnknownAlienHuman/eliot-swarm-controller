@@ -1,6 +1,6 @@
 use eliot_core::{
-    Error, MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_EVENT, NativeWarning, Result, SecretPolicy,
-    is_native_discriminator,
+    Error, MAX_NATIVE_WARNING_BYTES, NATIVE_WARNING_OCCURRENCE_PREFIX, NativeWarning, Result,
+    SecretPolicy, is_native_discriminator,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -140,17 +140,9 @@ impl Warnings {
             message,
             truncated,
         };
-        // Codex supplies no identity for these session-scoped advisory
-        // notifications. Give each observed occurrence its own identity so
-        // repeated identical warnings remain distinct and processor restarts
-        // cannot reuse a process-local counter value.
-        let occurrence_id = ulid::Ulid::new();
-        let id = super::event_id(
-            thread,
-            "session",
-            &format!("warning-{occurrence_id}"),
-            NATIVE_WARNING_EVENT,
-        )?;
+        // This occurrence key is for retrying the exact transport batch.
+        // Store assigns the diagnostic's published identity.
+        let id = format!("{NATIVE_WARNING_OCCURRENCE_PREFIX}{}", ulid::Ulid::new());
         let data = serde_json::to_value(warning)
             .map_err(|_| Error::new("internal", "Codex warning could not be encoded"))?;
         Ok(Some((id, data)))

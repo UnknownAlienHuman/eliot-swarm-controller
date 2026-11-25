@@ -1186,9 +1186,10 @@ code inventory and the redacted, UTF-8-bounded message. A missing or mismatched
 thread binding increments `unbound_warnings_dropped` in the native snapshot and
 retains no warning text. Malformed warning and startup-status payloads increment
 `malformed_warnings_dropped` and retain no payload text. Codex supplies no native
-identity for these notifications; each accepted occurrence gets a fresh adapter
-occurrence ID, so repeated identical warnings remain separate facts. The event
-stream does not replay uncertain writes. The diagnostic supplies no lifecycle,
+identity for these notifications. The adapter names the transport occurrence
+and Store assigns a stable diagnostic ID from its exact batch and position.
+Identical warnings in distinct batches remain separate facts. The stream does
+not replay uncertain writes. The diagnostic supplies no lifecycle,
 progress, quota or settlement evidence. MCP startup status emits the same typed diagnostic only
 for `status: failed` on the exact owned thread; starting, ready and cancelled
 updates remain silent. Its bounded message preserves the startup error or typed

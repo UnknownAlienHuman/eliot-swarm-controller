@@ -48,6 +48,24 @@ impl PreparedSourceBatch {
                 refused.push(index);
                 continue;
             }
+            if event.kind == core::NATIVE_WARNING_EVENT
+                && let Some(occurrence) = event
+                    .native_id
+                    .strip_prefix(core::NATIVE_WARNING_OCCURRENCE_PREFIX)
+            {
+                if ulid::Ulid::from_string(occurrence).is_err()
+                    || batch.batch_id != format!("{}:batch", event.native_id)
+                {
+                    return Err(Error::new(
+                        "source_integrity",
+                        "unkeyed warning must bind its exact occurrence batch",
+                    ));
+                }
+                // A warning without a native notification ID is identified by
+                // Store's deduplicated batch and position, not its producer's
+                // lifetime counter. Normalize before computing replay digests.
+                event.native_id = format!("warning-batch:{}:{index}", batch.batch_id);
+            }
             if protected_data_has_secret(&event.data, &policy, false) {
                 return Err(secret_in_batch_binding());
             }
