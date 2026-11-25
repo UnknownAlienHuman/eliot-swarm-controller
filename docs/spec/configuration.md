@@ -176,7 +176,9 @@ elsewhere is reconnected. When nothing answers and there is no marker, the daemo
 failed: the desktop runs its startup path again (it starts a daemon only when none
 is reachable). A restart is tried again only for `unavailable`, `platform_io`,
 `data_dir_unavailable` and `daemon_already_running`, at most five attempts with 1,
-2, 4 and 8 s pauses; a notice above the composer counts them and gives the previous
+2, 4 and 8 s pauses. A restarted daemon that stops again within 60 s of answering
+continues the same chain (the next attempt, its pause, the cap); only one that stayed
+up 60 s starts over at attempt 1; a notice above the composer counts them and gives the previous
 attempt's reason, and the polls and the open conversation wait and read again once
 the daemon answers. Closing the window cancels a start before it starts a daemon.
 Any other failure, the last attempt, or a failed first start shows the daemon's own

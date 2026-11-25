@@ -950,6 +950,7 @@ impl Component for DesktopApp {
                 list_totals: None,
                 attention_due: false,
                 archived_due: false,
+                head_due: false,
                 pending_select: None,
                 collapsed: HashSet::new(),
                 unfolded: HashSet::new(),

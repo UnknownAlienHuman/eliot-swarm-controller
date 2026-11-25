@@ -17,6 +17,10 @@ use crate::theme::winui::Palette;
 /// Restart attempts before the failure view. The pauses before attempts
 /// 2 to 5 grow as [`live::backoff_ms`]: 1, 2, 4 and 8 s.
 const RESTART_ATTEMPTS: u32 = 5;
+/// A restarted daemon that stops again sooner than this after it answered
+/// continues the same restart chain (the next attempt, its pause, the cap);
+/// one that stayed up this long failed anew and starts at attempt 1.
+const STABLE_UP: std::time::Duration = std::time::Duration::from_secs(60);
 /// A probe with no answer this soon leaves the daemon to its readers: it
 /// is busy, not gone.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -63,6 +67,11 @@ pub(super) struct LinkState {
     /// The data directory being started is the owner's new choice: it is
     /// remembered only once its daemon answers.
     candidate: bool,
+    /// The last restart that brought a daemon up: its attempt and when that
+    /// daemon answered. Kept across that success until the daemon stayed
+    /// up [`STABLE_UP`], so a daemon that dies right after each start keeps
+    /// backing off and stops at [`RESTART_ATTEMPTS`].
+    recent: Option<(u32, std::time::Instant)>,
     /// The confirmation of a new empty data directory is open.
     pub(super) confirm_fresh: bool,
 }
@@ -185,7 +194,30 @@ impl DesktopApp {
                     self.alert(text);
                 }
             }
-            Probe::Gone => self.restart_daemon(1, None, context),
+            Probe::Gone => match self.link.recent.take() {
+                // It died again soon after a restart brought it up: the
+                // same chain goes on, or ends at the cap.
+                Some((attempt, up)) if up.elapsed() < STABLE_UP => {
+                    let reason = format!(
+                        "Swarm stopped again {} s after it started",
+                        up.elapsed().as_secs()
+                    );
+                    if attempt < RESTART_ATTEMPTS {
+                        self.restart_daemon(attempt + 1, Some(reason), context);
+                    } else {
+                        self.link.gave_up = true;
+                        self.startup_error = Some(eliot_core::Error::new(
+                            "unavailable",
+                            format!(
+                                "{reason}, after {RESTART_ATTEMPTS} restarts in a row. Its log \
+                                 may say why."
+                            ),
+                        ));
+                        self.park_reads("Swarm is not running", context);
+                    }
+                }
+                _ => self.restart_daemon(1, None, context),
+            },
             Probe::OwnerStopped => {
                 self.link.stopped = true;
                 self.set_status("Swarm was stopped by its owner.");
@@ -249,6 +281,12 @@ impl DesktopApp {
     /// remembered now. True when it was a restart.
     pub(super) fn link_ready(&mut self, context: &ComponentContext<Self>) -> bool {
         let link = std::mem::take(&mut self.link);
+        // A restart that worked is remembered until its daemon stays up
+        // (`STABLE_UP`); a chain still inside that window keeps its count.
+        self.link.recent = match link.restarting {
+            Some((attempt, _)) => Some((attempt, std::time::Instant::now())),
+            None => link.recent,
+        };
         if link.candidate
             && let Ok(root) = self.data_dir.clone()
         {
@@ -284,6 +322,14 @@ impl DesktopApp {
                 self.park_reads("Swarm is not running", context);
             }
         }
+    }
+
+    /// A read answered: failing reads after it ask whether the daemon runs
+    /// without the pause earlier failures built up. The restart chain's
+    /// memory (`recent`) is not reset here: only its stable window does.
+    pub(super) fn link_answered(&mut self) {
+        self.link.pace.reset();
+        self.link.quiet_until = None;
     }
 
     /// Retry, or Start after an Owner stop, on the current data directory

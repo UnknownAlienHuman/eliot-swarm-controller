@@ -583,6 +583,7 @@ impl DesktopApp {
                         let snapshot = *snapshot;
                         let first_load = self.chat.items.is_empty();
                         self.chat.pace.reset();
+                        self.link_answered();
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
                         self.show_control_failure();
@@ -654,6 +655,7 @@ impl DesktopApp {
                     Ok(Some(delivery)) => {
                         let delivery = *delivery;
                         self.chat.pace.reset();
+                        self.link_answered();
                         self.chat.docs.extend(delivery.docs);
                         let mut resnapshot = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -700,6 +702,7 @@ impl DesktopApp {
                     Ok(reread) => {
                         let reread = *reread;
                         self.chat.pace.reset();
+                        self.link_answered();
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));

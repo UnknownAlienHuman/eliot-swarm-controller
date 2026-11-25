@@ -378,6 +378,10 @@ pub(super) struct ShellState {
     pub(super) attention_due: bool,
     /// The next refresh reads the archived counts (the list's total moved).
     pub(super) archived_due: bool,
+    /// The Agents page's fleet read could not account for a listed row (it
+    /// left it out, or the row left a state the fleet read whole): the next
+    /// poll reads the sidebar's own first page even while that page shows.
+    pub(super) head_due: bool,
     pub(super) pending_select: Option<UiAgent>,
     /// Section keys of collapsed projects (`[desktop] collapsed_projects`,
     /// written from [`DesktopApp::collapsed_projects_changed`]).
@@ -733,6 +737,9 @@ impl DesktopApp {
                     self.shell_update(reply, context);
                 }
                 let delay = self.nav.pace.next(!failed, LIST_REFRESH_MS);
+                if !failed {
+                    self.link_answered();
+                }
                 self.watch_list(delay, context);
             }
             ShellMsg::Inbox(msg) => self.inbox_update(msg, context),
@@ -1230,8 +1237,11 @@ impl DesktopApp {
                 }
                 self.nav.batch = Some(Vec::new());
                 // While the Agents page shows, its fleet read (the Monitor's
-                // chain) feeds the sidebar's rows instead (`take_fleet_rows`).
-                if self.preferences_loaded && !self.nav.agents_loading && self.main != Main::Agents
+                // chain) feeds the sidebar's rows instead (`take_fleet_rows`),
+                // unless it could not account for a listed row.
+                if self.preferences_loaded
+                    && !self.nav.agents_loading
+                    && (self.main != Main::Agents || self.nav.head_due)
                 {
                     self.refresh_head(context);
                 }
@@ -2271,6 +2281,7 @@ impl DesktopApp {
             });
             return;
         }
+        self.nav.head_due = false;
         let archived = self.nav.show_archived.then_some("include");
         let head = AgentListRequest {
             limit: AGENT_PAGE,
@@ -2323,8 +2334,23 @@ impl DesktopApp {
     /// the sidebar while that page shows, instead of a second list read:
     /// attention rows join the list as the attention read's would, and any
     /// other row updates a row already listed. Archived rows stay out
-    /// unless Show archived lists them.
-    pub(super) fn take_fleet_rows(&mut self, rows: Vec<UiAgent>) {
+    /// unless Show archived lists them. A listed row the fleet left out, or
+    /// one whose live state the fleet read whole without it, is not left
+    /// with its old state: the next poll reads the sidebar's own first page,
+    /// which says what it is now.
+    pub(super) fn take_fleet_rows(&mut self, fleet: monitor::SidebarRows) {
+        let monitor::SidebarRows {
+            rows,
+            left_out,
+            whole,
+        } = fleet;
+        let read: HashSet<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        if self.nav.agents.iter().any(|agent| {
+            !read.contains(agent.id.as_str())
+                && (left_out.contains(&agent.id) || whole.contains(&agent.state))
+        }) {
+            self.nav.head_due = true;
+        }
         let mut changed = false;
         for row in rows {
             if row.archived && !self.nav.show_archived {

@@ -212,6 +212,15 @@ async fn call_raw<R: Checked>(data_dir: &Path, request: &R) -> Result<Value> {
     eliot_daemon::client_call(data_dir, R::METHOD, params).await
 }
 
+/// A fleet row the row-by-row check changed: shown without its observation
+/// (`kept`) or left out, and why.
+#[derive(Clone, Debug)]
+pub struct RowNote {
+    pub id: String,
+    pub kept: bool,
+    pub text: String,
+}
+
 /// One `agent.list` page checked row by row, for the Monitor's fleet (#826):
 /// the page as a whole (its cursor and totals over the keys of every row
 /// sent, `validate_response_page` and `validate_response_state_totals`) must
@@ -222,7 +231,7 @@ async fn call_raw<R: Checked>(data_dir: &Path, request: &R) -> Result<Value> {
 pub async fn list_agents_by_row(
     data_dir: &Path,
     params: &AgentListRequest,
-) -> Result<(AgentListResponse, Vec<String>)> {
+) -> Result<(AgentListResponse, Vec<RowNote>)> {
     let method = AgentListRequest::METHOD;
     let mut raw = call_raw(data_dir, params).await?;
     let mut notes = Vec::new();
@@ -239,7 +248,11 @@ pub async fn list_agents_by_row(
                         && fields.remove("observation").is_some()
                     {
                         let id = fields.get("id").and_then(Value::as_str).unwrap_or("?");
-                        notes.push(format!("{id}: its observation did not decode"));
+                        notes.push(RowNote {
+                            id: id.to_owned(),
+                            kept: true,
+                            text: format!("{id}: its observation did not decode"),
+                        });
                     }
                 }
             }
@@ -270,13 +283,21 @@ pub async fn list_agents_by_row(
         };
         if without.validate_row(&row, index).is_ok() {
             row.observation = None;
-            notes.push(format!(
-                "{}: shown without its observation ({})",
-                row.summary.id, error.message
-            ));
+            notes.push(RowNote {
+                id: row.summary.id.clone(),
+                kept: true,
+                text: format!(
+                    "{}: shown without its observation ({})",
+                    row.summary.id, error.message
+                ),
+            });
             kept.push(row);
         } else {
-            notes.push(format!("{}: left out ({})", row.summary.id, error.message));
+            notes.push(RowNote {
+                id: row.summary.id.clone(),
+                kept: false,
+                text: format!("{}: left out ({})", row.summary.id, error.message),
+            });
         }
     }
     reply.agents = kept;

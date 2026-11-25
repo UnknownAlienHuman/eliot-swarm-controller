@@ -1096,7 +1096,30 @@ pub struct MonitorSnapshot {
     pub event_cursor: Option<i64>,
     /// Fleet rows shown without their observation or left out, and why
     /// (the other rows still update).
-    pub row_notes: Vec<String>,
+    pub row_notes: Vec<client::RowNote>,
+}
+
+impl MonitorSnapshot {
+    /// Whether any read of this refresh failed: the fleet and its counts,
+    /// the stopped rows, the attention reports, the task's tree, the
+    /// Details (and their usage, diagnosis and mail when read this time)
+    /// or a loss diagnosis.
+    pub fn failed(&self) -> bool {
+        self.groups.iter().any(|(_, page)| page.is_err())
+            || self.counts.iter().any(|(_, count)| count.is_err())
+            || matches!(self.stopped, Some(Err(_)))
+            || matches!(self.attention, Some(Err(_)))
+            || matches!(self.tree, Some((_, Err(_))))
+            || self.losses.iter().any(|(_, summary)| summary.is_err())
+            || match &self.detail {
+                Some(Err(_)) => true,
+                Some(Ok(read)) => {
+                    read.fresh
+                        && (read.usage.is_err() || read.diagnosis.is_err() || read.mail.is_err())
+                }
+                None => false,
+            }
+    }
 }
 
 /// One monitor section: its top-level rows (each with its nested
@@ -1334,7 +1357,7 @@ pub struct Monitor {
     pub errors: Vec<String>,
     /// The last fleet read's rows shown without their observation or left
     /// out, and why: said, not a failed read.
-    pub row_notes: Vec<String>,
+    pub row_notes: Vec<client::RowNote>,
     pub refreshes: u64,
     /// The Agents tab's tree of the open task.
     pub tree: TreeRead,
@@ -1729,7 +1752,7 @@ fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
 type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
 
 enum Read {
-    Fleet(Result<(AgentListResponse, Vec<String>), String>),
+    Fleet(Result<(AgentListResponse, Vec<client::RowNote>), String>),
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
@@ -1817,7 +1840,7 @@ fn fleet_request() -> AgentListRequest {
 /// attention retain their independent cadence.
 fn take_fleet(
     snapshot: &mut MonitorSnapshot,
-    page: Result<(AgentListResponse, Vec<String>), String>,
+    page: Result<(AgentListResponse, Vec<client::RowNote>), String>,
 ) {
     match page {
         Ok((page, notes)) => {
@@ -2052,9 +2075,19 @@ pub async fn refresh(
     Some(snapshot)
 }
 
-/// The fleet read's rows (and the stopped rows read with it) for the
-/// sidebar, when every part of it was read.
-pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<Vec<crate::nav::UiAgent>> {
+/// What one fleet read tells the sidebar: its rows (and the stopped rows
+/// read with it), the rows it left out, and the live states whose page it
+/// read whole (a listed Agent of such a state that is not among the rows
+/// has left it).
+#[derive(Clone, Debug)]
+pub struct SidebarRows {
+    pub rows: Vec<crate::nav::UiAgent>,
+    pub left_out: HashSet<String>,
+    pub whole: Vec<AgentState>,
+}
+
+/// The fleet read's rows for the sidebar, when every part of it was read.
+pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<SidebarRows> {
     if !snapshot.fleet || snapshot.groups.iter().any(|(_, page)| page.is_err()) {
         return None;
     }
@@ -2062,8 +2095,8 @@ pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<Vec<crate::nav::UiAgen
         Some(Ok(page)) => page.agents.as_slice(),
         _ => &[],
     };
-    Some(
-        snapshot
+    Some(SidebarRows {
+        rows: snapshot
             .groups
             .iter()
             .filter_map(|(_, page)| page.as_ref().ok())
@@ -2076,7 +2109,19 @@ pub fn sidebar_rows(snapshot: &MonitorSnapshot) -> Option<Vec<crate::nav::UiAgen
                 agent
             })
             .collect(),
-    )
+        left_out: snapshot
+            .row_notes
+            .iter()
+            .filter(|note| !note.kept)
+            .map(|note| note.id.clone())
+            .collect(),
+        whole: snapshot
+            .groups
+            .iter()
+            .filter(|(_, page)| page.as_ref().is_ok_and(|page| !page.truncated))
+            .map(|(state, _)| *state)
+            .collect(),
+    })
 }
 
 /// How old cached panel data must be before a panel says when it was

@@ -236,17 +236,19 @@ impl DesktopApp {
                     self.monitor.event_cursor = snapshot.event_cursor;
                     let fleet = snapshot.fleet;
                     let tree = snapshot.tree.is_some();
-                    let detail_failed = matches!(snapshot.detail, Some(Err(_)));
+                    // Any read of the refresh that failed (fleet, stopped,
+                    // attention, tree, Details, losses) asks whether the
+                    // daemon runs (itself paced) and waits longer before the
+                    // next, with the same growing pauses as every retry.
+                    let failed = snapshot.failed();
                     let rows = monitor::sidebar_rows(&snapshot);
                     self.monitor.data.apply(*snapshot);
                     if let Some(rows) = rows {
+                        // The fleet read stands in for the sidebar's own: a
+                        // clean one is a clean sidebar round too.
+                        self.nav.pace.reset();
                         self.take_fleet_rows(rows);
                     }
-                    // A refresh with errors (the fleet's reads, or the
-                    // Details' own read when only they show) asks whether
-                    // the daemon runs (itself paced) and waits longer before
-                    // the next, with the same growing pauses as every retry.
-                    let failed = detail_failed || (fleet && !self.monitor.data.errors.is_empty());
                     // A refresh that read a list (the fleet, the task's tree)
                     // comes again at the sidebar's cadence; Details alone at
                     // the Monitor's.
@@ -258,6 +260,8 @@ impl DesktopApp {
                     let delay = self.monitor.pace.next(!failed, period);
                     if failed {
                         self.link_suspect(context);
+                    } else {
+                        self.link_answered();
                     }
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
@@ -967,7 +971,11 @@ impl DesktopApp {
                     palette,
                     format!(
                         "Some rows were not read whole: {}",
-                        data.row_notes.join("; ")
+                        data.row_notes
+                            .iter()
+                            .map(|note| note.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("; ")
                     ),
                 ),
             ));
