@@ -24,6 +24,7 @@ use tokio::time::{Instant, sleep_until, timeout_at};
 
 pub(crate) mod containment;
 mod readback;
+pub(crate) use readback::DiffCheckout;
 #[cfg(any(windows, target_os = "linux"))]
 pub(crate) use readback::linked_watch_admin;
 

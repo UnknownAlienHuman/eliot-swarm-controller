@@ -161,6 +161,8 @@ pub(crate) enum CliCommand {
     /// Digest an Agent's patch for review: files, packages, new
     /// dependencies, public interface, checker changes and suppressions.
     PatchDigest(GitStatusArgs),
+    /// Read one bounded workspace patch.
+    Diff(DiffArgs),
     /// Read one page of edits attributed to an Agent by native file-change hints.
     Edits(EditsArgs),
     /// Follow new committed events; use --after to replay retained history.
@@ -855,6 +857,16 @@ pub(crate) struct GitStatusArgs {
     pub(crate) agent: String,
     #[command(flatten)]
     pub(crate) generation: ReadGenerationArgs,
+}
+
+#[derive(Args)]
+pub(crate) struct DiffArgs {
+    #[command(flatten)]
+    pub(crate) target: GitStatusArgs,
+    #[arg(long, default_value = "uncommitted", value_parser = ["uncommitted", "branch", "last-turn"])]
+    pub(crate) source: String,
+    #[arg(long, value_name = "PATH")]
+    pub(crate) path: Option<String>,
 }
 
 #[derive(Args)]

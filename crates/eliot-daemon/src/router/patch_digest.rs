@@ -3,6 +3,8 @@
 //! checker and lint configuration changes, and added error suppressions.
 //! It is an attention filter from a plain line scan, never a quality score.
 
+mod diff_text;
+
 use super::{Principal, Router, hierarchy, principal_name};
 use crate::git_monitor::{GitProbe, PatchRead};
 use eliot_core::{

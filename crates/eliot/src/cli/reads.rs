@@ -984,6 +984,63 @@ pub(crate) async fn run_patch_digest(
     )
 }
 
+pub(crate) async fn run_diff(
+    args: super::args::DiffArgs,
+    data_dir: PathBuf,
+    json_output: bool,
+) -> Result<u8, Failure> {
+    use eliot_core::api::{AgentDiffRequest, AgentDiffResponse, GitDiffSource};
+    let request = AgentDiffRequest {
+        id: args.target.agent,
+        generation: args.target.generation.generation,
+        source: match args.source.as_str() {
+            "branch" => GitDiffSource::Branch,
+            "last-turn" => GitDiffSource::LastTurn,
+            _ => GitDiffSource::Uncommitted,
+        },
+        path: args.path,
+    };
+    if json_output {
+        read_and_print!(
+            &data_dir,
+            json_output,
+            "agent.diff",
+            request,
+            AgentDiffResponse
+        )
+    } else {
+        request.validate().map_err(Failure::for_read)?;
+        let response: AgentDiffResponse =
+            eliot_daemon::client_call_typed(&data_dir, "agent.diff", &request)
+                .await
+                .map_err(Failure::for_read)?;
+        request
+            .validate_response(&response)
+            .map_err(Failure::invalid_response)?;
+        for file in response.files {
+            let mut text = String::with_capacity(file.text.len());
+            for character in file.text.chars() {
+                if character.is_control() && !matches!(character, '\t' | '\n') {
+                    text.extend(character.escape_default());
+                } else {
+                    text.push(character);
+                }
+            }
+            print!("{text}");
+            if file.truncated {
+                if !file.text.is_empty() && !file.text.ends_with('\n') {
+                    println!();
+                }
+                println!("[Diff truncated for {}]", file.path);
+            }
+        }
+        if response.truncated {
+            eprintln!("Diff is truncated or has incomplete file coverage.");
+        }
+        Ok(0)
+    }
+}
+
 pub(crate) async fn run_edits(
     EditsArgs {
         agent,
