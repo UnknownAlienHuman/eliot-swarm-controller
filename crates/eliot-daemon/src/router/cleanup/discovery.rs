@@ -25,15 +25,15 @@ impl Router {
                     return Ok(Some(after));
                 }
                 after = seq;
-                if let Err(error) = self.discover_owned_cleanup_children(&root).await {
-                    if matches!(error.code.as_str(), "internal" | "unavailable") {
-                        crate::logging::record(
-                            &self.secret_policy_snapshot(),
-                            "daemon.cleanup_discovery_failed",
-                            &[("agent", &root.agent)],
-                            Some(&error),
-                        );
-                    }
+                if let Err(error) = self.discover_owned_cleanup_children(&root).await
+                    && matches!(error.code.as_str(), "internal" | "unavailable")
+                {
+                    crate::logging::record(
+                        &self.secret_policy_snapshot(),
+                        "daemon.cleanup_discovery_failed",
+                        &[("agent", &root.agent)],
+                        Some(&error),
+                    );
                 }
             }
         }
@@ -195,15 +195,26 @@ fn cargo_target(path: &Path) -> bool {
     let Ok(directory) = Directory::open(path) else {
         return false;
     };
-    let Ok(mut tag) = directory.file("CACHEDIR.TAG") else {
-        return false;
-    };
-    let Ok(bytes) = crate::platform::script_file::read(&mut tag) else {
-        return false;
-    };
-    bytes.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55")
-        && directory.file(".rustc_info.json").is_ok()
-        && ["debug", "release"]
-            .into_iter()
-            .any(|profile| Directory::open(&path.join(profile)).is_ok())
+    let cache_tag = directory
+        .file("CACHEDIR.TAG")
+        .and_then(|mut file| crate::platform::script_file::read(&mut file))
+        .is_ok_and(|bytes| bytes.starts_with(b"Signature: 8a477f597d28d172789f06886806bc55"));
+    let rustc_metadata = directory
+        .file(".rustc_info.json")
+        .and_then(|mut file| crate::platform::script_file::read(&mut file))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|value| {
+            value["rustc_fingerprint"].is_u64()
+                && value["outputs"].is_object()
+                && value["successes"].is_object()
+        });
+    (cache_tag || rustc_metadata)
+        && ["debug", "release"].into_iter().any(|profile| {
+            let profile = path.join(profile);
+            Directory::open(&profile).is_ok_and(|dir| dir.file(".cargo-lock").is_ok())
+                && ["deps", "build"]
+                    .into_iter()
+                    .any(|child| Directory::open(&profile.join(child)).is_ok())
+        })
 }

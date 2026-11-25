@@ -310,8 +310,8 @@ Agents. Automatic worktree removal requires a clean checkout and a local Git anc
 proof that the current base contains the branch. Dirty or unmerged worktrees are
 kept with their sizes for the Owner. Disjoint owned artifacts can age out independently.
 Before freezing each automatic inventory, the daemon scans the direct
-children of durable owned artifact roots. A Cargo cache signature, Rust
-metadata and a build profile directory identify a regenerable target.
+children of durable owned artifact roots. A Cargo lock and build layout,
+plus a cache signature or Rust metadata, identify a regenerable target.
 A private stand needs the matching registry, identity, issuer and expiry.
 Historical roots remain eligible after the Agent has ended and all its
 generations' custody and outcomes have settled. Stand cleanup also checks the
