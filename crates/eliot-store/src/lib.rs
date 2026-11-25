@@ -1969,6 +1969,26 @@ impl Store {
             .map_err(sql_error)
     }
 
+    /// Match an attention mutation's committed delivery even if the Agent
+    /// now reports a different supervisor. The write ID by itself proves
+    /// neither the sender nor the incident.
+    pub fn swarm_mail_receipt_matches_thread(&self, id: &str, thread: &str) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM writes w JOIN json_each(w.result,'$.deliveries') d
+                    JOIN messages m ON m.delivery_id=json_extract(d.value,'$.delivery_id')
+                    WHERE w.id=?1 AND w.principal='owner' AND w.method='mail.send'
+                      AND m.sender='swarm' AND m.thread=?2
+                      AND 'a'||m.recipient=json_extract(d.value,'$.recipient')
+                      AND m.recipient_generation=json_extract(d.value,'$.recipient_generation')
+                )",
+                params![id, thread],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)
+    }
+
     /// Whether an owner notice naming this attention incident was committed.
     /// The notice text names the incident id, which is unique per incident.
     pub fn attention_owner_notice_exists(&self, incident_id: &str) -> Result<bool> {

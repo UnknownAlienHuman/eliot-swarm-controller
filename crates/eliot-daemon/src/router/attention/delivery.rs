@@ -369,10 +369,12 @@ impl Router {
 async fn loss_notice_exists(router: &Router, delivery: &FrozenReport) -> Result<bool> {
     let report = &delivery.report;
     let store = router.inner.store.lock().await;
+    let thread = attention_thread(&report.incident_id);
     Ok(store.get_command(&delivery.owner_notify_id)?.is_some()
         || store.attention_owner_notice_exists(&report.incident_id)?
+        || store.swarm_mail_receipt_matches_thread(&delivery.supervisor_mail_id, &thread)?
         || report.parent_agent.as_deref().map_or(Ok(false), |parent| {
-            store.swarm_mail_thread_exists(&attention_thread(&report.incident_id), parent)
+            store.swarm_mail_thread_exists(&thread, parent)
         })?)
 }
 

@@ -1276,6 +1276,9 @@ behind it. When a generic source-unhealthy incident is still open for a
 generation that is then reported lost, any pending delivery settles first
 and the entry is superseded by the deterministic loss report, so the loss
 identity is persisted before any restart and a re-report stays a no-op.
+The deterministic supervisor-mail receipt and exact incident thread prove
+delivery even after the Agent is reparented. Reconciliation keeps the
+original delivery and does not send it to the new supervisor.
 Each attention escalation thread wakes its recipient only once per thread
 (recorded durably when the notice is claimed); an unchanged unread incident
 set cannot generate further wakes until new evidence arrives on a new thread.
