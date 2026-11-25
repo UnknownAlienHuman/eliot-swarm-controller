@@ -631,19 +631,20 @@ async fn report_restart_progress(path: &Path) {
             ""
         }
     );
-    let starts = timeout(
-        Duration::from_secs(2),
-        futures::future::join_all(drain.running_turns.iter().map(|turn| async {
+    let mut starts = Vec::with_capacity(drain.running_turns.len());
+    let _ = timeout(Duration::from_secs(2), async {
+        for turn in &drain.running_turns {
             let request =
                 TurnGetRequest::new(turn.agent.clone(), turn.generation, turn.turn_id.clone());
-            eliot_daemon::client_call_typed::<_, eliot_core::Turn>(path, "turn.get", &request)
-                .await
-                .ok()
-                .and_then(|turn| turn.started_at)
-        })),
-    )
-    .await
-    .unwrap_or_default();
+            let started =
+                eliot_daemon::client_call_typed::<_, eliot_core::Turn>(path, "turn.get", &request)
+                    .await
+                    .ok()
+                    .and_then(|turn| turn.started_at);
+            starts.push(started);
+        }
+    })
+    .await;
     let now = daemon_now_ms() as i64;
     for (index, turn) in drain.running_turns.iter().enumerate() {
         let age = starts.get(index).copied().flatten().map_or_else(

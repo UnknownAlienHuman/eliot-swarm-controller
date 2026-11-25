@@ -186,7 +186,7 @@ pub use monitor_views::{
 };
 pub use mutations::{
     CommandSubmitRequest, CommandSubmitResponse, DaemonShutdownRequest, DaemonShutdownResponse,
-    ShutdownMode,
+    MAX_UPDATE_DRAIN_SECS, ShutdownMode,
 };
 pub use native_pages::{
     DiscoverCoverage, DiscoverPage, DiscoverSubject, MAX_DISCOVER_PAGE_BYTES,
