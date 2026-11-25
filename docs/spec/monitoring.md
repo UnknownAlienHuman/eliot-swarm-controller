@@ -472,19 +472,23 @@ and reciprocal Git registration still match, and the registry branch agrees with
 symbolic `HEAD`. A changed branch must be clean and have a successful native checkout
 in that exact workspace, paired by item, turn and generation with its start event.
 The Store accepts retained structured `git switch` facts from Codex. For a native
-shell result, both events must identify a shell tool and the completion must
-report success. A reported exit code must be zero. The Store recognizes one
+shell result, both events must identify a shell tool and the adapter must
+report a successful completion. Claude Bash uses its false `is_error` verdict,
+including the native default when omitted. The Store recognizes one
 direct `git switch` or `git checkout` with a literal branch operand, including
 `checkout -b` and `checkout -B`. It resolves an optional leading
 `cd <directory> &&` and a Git-global `-C <directory>` against the shell's native
-working directory before comparing the checkout path. The two Claude tool hooks
-must agree on the shell session directory for that exact foreground invocation.
+working directory before comparing the checkout path. Claude records the
+completion-time shell session directory, corroborated by its start hook.
+The literal directory operands above establish a command-specific override.
 OpenCode uses the native shell working directory and a verified local zero exit.
 Paths requiring shell expansion, alias resolution, or parent traversal fall
 outside this attribution grammar.
 The latest HEAD checkout reflog entry
 must name the same transition and fall within that tool's start-to-completion window,
-allowing one second for reflog timestamp precision. The prior branch is the branch in
+allowing one second for reflog timestamp precision. The indexed lookup scopes
+the preceding generation's starts from its retained start to the observed checkout
+window. Only matched candidates count toward the evidence limit. The prior branch is the branch in
 the preceding generation's durable ready outcome; the requested branch remains the
 frozen cleanup identity. Shell wrappers, chains, background tools, and file hints
 alone cannot establish authorship. A matching different Agent is named with its generation;

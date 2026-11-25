@@ -9,9 +9,7 @@ use crate::{
     platform::{CustodyObserver, OwnedChild, worktree_guard::WorktreeWriteGuard},
     router::SecretSet,
     setup,
-    workspace_git::{
-        MissingWorktreeRemoval, NativeBranchSwitchEvidence, RemovalBranch, WorkspaceGit,
-    },
+    workspace_git::{MissingWorktreeRemoval, RemovalBranch, WorkspaceGit},
 };
 use eliot_core::api::{CommandResolveRequest, CommandResolveResponse};
 use eliot_core::is_start_verb;
@@ -501,51 +499,6 @@ impl WorkspaceManager {
         preparation: &WorkspacePreparation,
     ) -> WorkspaceCreationOutcome {
         let prior_generation = preparation.target_generation.saturating_sub(1);
-        let candidates = {
-            let store = self.inner.store.lock().await;
-            store
-                .native_branch_switch_candidates(&preparation.worktree_path, None, None)
-                .ok()
-        };
-        let (evidence, other_candidates) = candidates
-            .filter(|candidates| candidates.len() < 65)
-            .map(|candidates| {
-                let mut evidence = None;
-                let mut others = Vec::new();
-                for candidate in candidates {
-                    if candidate.agent == preparation.agent
-                        && candidate.generation == prior_generation
-                        && evidence.is_none()
-                        && eliot_core::workspace_path_key(&candidate.workspace)
-                            == eliot_core::workspace_path_key(&preparation.worktree_path)
-                    {
-                        let prior_branch = preparation
-                            .outcome
-                            .as_ref()
-                            .and_then(|outcome| outcome.get("resume_previous"))
-                            .and_then(|previous| previous.get("outcome"))
-                            .and_then(|outcome| outcome.get("result"))
-                            .and_then(|result| result.get("branch"))
-                            .and_then(Value::as_str);
-                        if let Some(prior_branch) = prior_branch {
-                            evidence = Some(NativeBranchSwitchEvidence {
-                                branch: candidate.branch,
-                                workspace: candidate.workspace,
-                                prior_branch: prior_branch.to_owned(),
-                                generation: candidate.generation,
-                                event_seq: candidate.terminal_seq,
-                                start_event_seq: candidate.start_seq,
-                                at_ms: candidate.completed_at_ms,
-                                started_at_ms: candidate.started_at_ms,
-                            });
-                        }
-                    } else {
-                        others.push(candidate);
-                    }
-                }
-                (evidence, others)
-            })
-            .unwrap_or_default();
         let prior_drift = preparation
             .outcome
             .as_ref()
@@ -556,9 +509,20 @@ impl WorkspaceManager {
             .and_then(|value| serde_json::from_value(value.clone()).ok());
         git.inspect_resume_retained(
             preparation,
-            evidence.as_ref(),
             prior_drift.as_ref(),
-            &other_candidates,
+            |branch, observed_at| async move {
+                self.inner
+                    .store
+                    .lock()
+                    .await
+                    .native_branch_switch_candidates(
+                        &preparation.agent,
+                        prior_generation,
+                        &preparation.worktree_path,
+                        &branch,
+                        observed_at,
+                    )
+            },
         )
         .await
     }

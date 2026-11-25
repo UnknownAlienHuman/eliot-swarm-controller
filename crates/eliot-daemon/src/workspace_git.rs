@@ -50,16 +50,18 @@ pub(crate) struct FrozenWorkspaceGit {
     pub worktree_path: String,
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct NativeBranchSwitchEvidence {
-    pub branch: String,
-    pub workspace: String,
-    pub prior_branch: String,
-    pub generation: i64,
-    pub event_seq: i64,
-    pub start_event_seq: i64,
-    pub at_ms: i64,
-    pub started_at_ms: i64,
+struct CheckoutReflogEntry {
+    from: String,
+    to: String,
+    at_ms: i64,
+}
+
+impl CheckoutReflogEntry {
+    fn matches_time(&self, started_at_ms: i64, completed_at_ms: i64) -> bool {
+        started_at_ms <= completed_at_ms
+            && self.at_ms >= started_at_ms.saturating_sub(1_000)
+            && self.at_ms <= completed_at_ms.saturating_add(1_000)
+    }
 }
 
 #[derive(Clone)]
@@ -764,13 +766,15 @@ impl WorkspaceGit {
     /// Resume-only readback. Branch drift is accepted only when the Git
     /// registration and symbolic HEAD agree and the changed checkout is clean.
     /// The frozen branch remains the cleanup identity.
-    pub(crate) async fn inspect_resume_retained(
+    pub(crate) async fn inspect_resume_retained<F>(
         &self,
         preparation: &WorkspacePreparation,
-        evidence: Option<&NativeBranchSwitchEvidence>,
         prior_drift: Option<&eliot_core::WorkspaceBranchDrift>,
-        other_candidates: &[eliot_store::NativeBranchSwitchCandidate],
-    ) -> WorkspaceCreationOutcome {
+        lookup: impl FnOnce(String, i64) -> F,
+    ) -> WorkspaceCreationOutcome
+    where
+        F: std::future::Future<Output = Result<Vec<eliot_store::NativeBranchSwitchCandidate>>>,
+    {
         let readback = async {
             let deadline = Instant::now() + READ_TIME;
             let subject = self.subject_inner(preparation, deadline, true).await?;
@@ -822,57 +826,7 @@ impl WorkspaceGit {
                     Some(retained)
                 }
             } else {
-                let mut matched_other = Vec::new();
-                for candidate in other_candidates.iter().filter(|candidate| {
-                    candidate.agent != preparation.agent
-                        && candidate.branch == observed
-                        && eliot_core::workspace_path_key(&candidate.workspace)
-                            == eliot_core::workspace_path_key(&preparation.worktree_path)
-                        && candidate.started_at_ms <= candidate.completed_at_ms
-                        && candidate.start_seq < candidate.terminal_seq
-                }) {
-                    if let Some(from_branch) = self
-                        .checkout_reflog_transition(
-                            &subject.target.root,
-                            &observed,
-                            candidate.started_at_ms,
-                            candidate.completed_at_ms,
-                            deadline,
-                        )
-                        .await?
-                    {
-                        matched_other.push((
-                            candidate.agent.as_str(),
-                            candidate.generation,
-                            from_branch,
-                        ));
-                    }
-                }
-                if matched_other.len() == 1 {
-                    let (agent, generation, from_branch) = &matched_other[0];
-                    return Err(problem(
-                        "workspace_branch_other_agent",
-                        &format!(
-                            "branch change is attributed to Agent {agent} generation {generation}; original '{from_branch}' and observed '{observed}'"
-                        ),
-                    ));
-                }
-                if matched_other.len() > 1 {
-                    return Err(problem(
-                        "workspace_branch_unattributed",
-                        &format!(
-                            "multiple native principals match the checkout change; external or unattributed actor, original '{}' and observed '{}'",
-                            prior_branch, observed
-                        ),
-                    ));
-                }
-                let evidence = evidence.filter(|proof| {
-                    proof.branch == observed
-                        && eliot_core::workspace_path_key(&proof.workspace)
-                            == eliot_core::workspace_path_key(&preparation.worktree_path)
-                        && proof.generation + 1 == preparation.target_generation
-                        && proof.prior_branch == prior_branch
-                }).ok_or_else(|| {
+                let unattributed = || {
                     problem(
                         "workspace_branch_unattributed",
                         &format!(
@@ -880,25 +834,62 @@ impl WorkspaceGit {
                             prior_branch, observed
                         ),
                     )
-                })?;
-                self.verify_native_checkout_reflog(
-                    &subject.target.root,
-                    &evidence.prior_branch,
-                    &observed,
-                    evidence.started_at_ms,
-                    evidence.at_ms,
-                    deadline,
-                )
-                .await?;
+                };
+                let checkout = self
+                    .latest_checkout_reflog(&subject.target.root, deadline)
+                    .await?
+                    .filter(|entry| entry.to == observed)
+                    .ok_or_else(unattributed)?;
+                let candidates = lookup(observed.clone(), checkout.at_ms)
+                    .await
+                    .map_err(|mut error| {
+                        error.message = Box::new(format!(
+                            "{}; original '{}' and observed '{}'",
+                            error.message, prior_branch, observed
+                        ));
+                        error
+                    })?;
+                let mut matched = candidates.iter().filter(|candidate| {
+                    checkout.matches_time(candidate.started_at_ms, candidate.completed_at_ms)
+                });
+                let mut others = matched
+                    .clone()
+                    .filter(|candidate| candidate.agent != preparation.agent);
+                if let Some(other) = others.next() {
+                    if others.next().is_some() {
+                        return Err(problem(
+                            "workspace_branch_unattributed",
+                            &format!(
+                                "multiple native principals match the checkout change; original '{}' and observed '{}'",
+                                prior_branch, observed
+                            ),
+                        ));
+                    }
+                    return Err(problem(
+                        "workspace_branch_other_agent",
+                        &format!(
+                            "branch change is attributed to Agent {} generation {}; original '{}' and observed '{}'",
+                            other.agent, other.generation, checkout.from, observed
+                        ),
+                    ));
+                }
+                let prior_generation = preparation.target_generation.saturating_sub(1);
+                let evidence = matched
+                    .find(|candidate| {
+                        candidate.agent == preparation.agent
+                            && candidate.generation == prior_generation
+                            && checkout.from == prior_branch
+                    })
+                    .ok_or_else(unattributed)?;
                 Some(eliot_core::WorkspaceBranchDrift {
                     original_branch: preparation.requested_branch.clone(),
                     observed_branch: observed.clone(),
-                    prior_generation_branch: Some(evidence.prior_branch.clone()),
-                    native_from_branch: Some(evidence.prior_branch.clone()),
-                    native_event_seq: Some(evidence.event_seq),
-                    native_start_seq: Some(evidence.start_event_seq),
+                    prior_generation_branch: Some(prior_branch.clone()),
+                    native_from_branch: Some(prior_branch.clone()),
+                    native_event_seq: Some(evidence.terminal_seq),
+                    native_start_seq: Some(evidence.start_seq),
                     native_generation: Some(evidence.generation),
-                    native_at_ms: Some(evidence.at_ms),
+                    native_at_ms: Some(evidence.completed_at_ms),
                     native_started_at_ms: Some(evidence.started_at_ms),
                 })
             };
@@ -953,16 +944,15 @@ impl WorkspaceGit {
         native_completed_at_ms: i64,
         deadline: Instant,
     ) -> Result<()> {
-        let transition = self
-            .checkout_reflog_transition(
-                worktree,
-                observed_branch,
-                native_started_at_ms,
-                native_completed_at_ms,
-                deadline,
-            )
-            .await?;
-        if transition.as_deref() != Some(prior_branch) {
+        let valid = self
+            .latest_checkout_reflog(worktree, deadline)
+            .await?
+            .is_some_and(|entry| {
+                entry.from == prior_branch
+                    && entry.to == observed_branch
+                    && entry.matches_time(native_started_at_ms, native_completed_at_ms)
+            });
+        if !valid {
             return Err(problem(
                 "workspace_branch_unattributed",
                 &format!(
@@ -974,14 +964,11 @@ impl WorkspaceGit {
         Ok(())
     }
 
-    async fn checkout_reflog_transition(
+    async fn latest_checkout_reflog(
         &self,
         worktree: &Path,
-        observed_branch: &str,
-        native_started_at_ms: i64,
-        native_completed_at_ms: i64,
         deadline: Instant,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<CheckoutReflogEntry>> {
         let output = self
             .read(
                 worktree,
@@ -1017,14 +1004,11 @@ impl WorkspaceGit {
             .ok()
             .and_then(|seconds| seconds.checked_mul(1000))
             .ok_or_else(|| problem("source_integrity", "checkout reflog time is invalid"))?;
-        if native_started_at_ms > native_completed_at_ms
-            || to != observed_branch
-            || epoch_ms < native_started_at_ms.saturating_sub(1_000)
-            || epoch_ms > native_completed_at_ms.saturating_add(1_000)
-        {
-            return Ok(None);
-        }
-        Ok(Some(from.to_owned()))
+        Ok(Some(CheckoutReflogEntry {
+            from: from.to_owned(),
+            to: to.to_owned(),
+            at_ms: epoch_ms,
+        }))
     }
 
     pub(crate) async fn creation_is_absent(

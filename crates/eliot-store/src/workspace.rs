@@ -113,10 +113,12 @@ pub(super) fn native_branch_checkout<'a>(
             fact["native_at_ms"].as_i64()?,
         )
     } else {
+        // The adapter attaches shell_execution_cwd only to its confirmed
+        // successful terminal. Claude's Bash verdict is false is_error,
+        // while an adapter that reports a process exit must prove exit zero.
         if start["tool_kind"].as_str() != Some("shell")
             || terminal["tool_kind"].as_str() != Some("shell")
             || start["command_truncated"].as_bool() != Some(false)
-            || (!terminal["exit_code"].is_null() && terminal["exit_code"].as_i64() != Some(0))
         {
             return None;
         }

@@ -309,8 +309,9 @@ turn and generation with the native `tool_use.id` as the item id
 (`status` `completed`, or `error` when `is_error` is true). A block whose
 `input` has a string `command` (Bash, PowerShell) adds it to `tool.started`
 as `command`, secret-redacted and bounded (plugin protocol). A successful Bash
-completion can also carry `shell_execution_cwd` when its bound PreToolUse and
-PostToolUse report the same absolute directory. The adapter retains this
+completion can also carry `shell_execution_cwd` when its native `is_error`
+verdict is false and both bound hooks report the same absolute shell directory.
+The fact describes the completion-time shell session directory. The adapter retains this
 directory without publishing the hook's command arguments or successful output.
 Only
 foreground blocks map into this tool table. Ordinary sidechain assistant/user

@@ -1983,7 +1983,9 @@ impl EventProcessor {
             if let Some(at) = eliot_plugin::quota::rfc3339_ms(record.get("timestamp")) {
                 data["native_at_ms"] = json!(at);
             }
-            if result.is_error != Some(true)
+            // Claude's Bash result has no exit code. A false error flag
+            // (including the native default) is the success verdict.
+            if !result.is_error.unwrap_or(false)
                 && let Some(binding) = self.tool_use_turns.get(&result.tool_use_id)
                 && binding.shell_cwd_confirmed
                 && let Some(cwd) = &binding.shell_cwd
@@ -2398,7 +2400,7 @@ impl EventProcessor {
             Value::String(self.credential.clone()),
         );
         if let Some(binding) = self.tool_use_turns.get_mut(&tool_use_id) {
-            // The two native callbacks bracket this exact foreground invocation.
+            // The start callback corroborates the completion-time shell cwd.
             match hook {
                 HookPoint::BeforeTool => binding.shell_cwd = shell_cwd.map(str::to_owned),
                 HookPoint::AfterTool => {
