@@ -91,7 +91,34 @@ fn plain_path(path: &str) -> String {
 /// Normalize verified native file-change hints, including deleted files, without
 /// following a symlink/reparse point outside (or within) the selected worktree.
 pub fn normalize(workspace: &str, path: &str) -> Result<String> {
-    let root = canonical_root(workspace)?;
+    CanonicalEditRoot::new(workspace)?.normalize(path)
+}
+
+/// A worktree root validated for one edit observation.
+pub struct CanonicalEditRoot(PathBuf);
+
+impl CanonicalEditRoot {
+    pub fn new(workspace: &str) -> Result<Self> {
+        let root = canonical_root(workspace)?;
+        debug_assert!(root.is_absolute());
+        debug_assert_eq!(root.canonicalize().ok().as_deref(), Some(root.as_path()));
+        Ok(Self(root))
+    }
+
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn normalize(&self, path: &str) -> Result<String> {
+        normalize_from_canonical_root(self, path)
+    }
+}
+
+pub(crate) fn normalize_from_canonical_root(
+    root: &CanonicalEditRoot,
+    path: &str,
+) -> Result<String> {
+    let root = root.as_path();
     if path.is_empty() || path.contains('\0') {
         return Err(unavailable("file-change hint is empty or malformed"));
     }
@@ -145,7 +172,7 @@ pub fn normalize(workspace: &str, path: &str) -> Result<String> {
         canonical.push(component);
     }
     let relative = canonical
-        .strip_prefix(&root)
+        .strip_prefix(root)
         .map_err(|_| unavailable("file-change hint escapes its worktree"))?;
     let mut parts = Vec::new();
     for component in relative.components() {
