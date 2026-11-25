@@ -851,6 +851,14 @@ the next event on that subject. Supply required inputs in `args` to fill the
 choice's displayed input fields. The same decision ID and payload reuse the
 same inner mutation ID. [Owner inbox DTOs](../../crates/eliot-core/src/api/owner_inbox.rs)
 
+By default, the `agent` item includes the latest failed Owner Resume for the
+current generation of a lost or failed Agent. A stopped Agent gets one item if
+its latest current-generation Resume failed. A newer Resume supersedes the
+prior failure unless it was cancelled. A new generation, archiving, or a
+completed handoff ends the old item's visibility. The latest failure remains
+inspectable through `agent.get`. Each command retains its own receipt. This
+projection needs no configuration key.
+
 Items are ordered by their opaque cursor; `after` is exclusive. `next` is the
 last returned item's cursor only when another item exists. `daemon.sidebar`
 and full `daemon.status` report counts for exactly the same reportable,
