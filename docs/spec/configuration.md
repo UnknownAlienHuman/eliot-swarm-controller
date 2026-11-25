@@ -2326,10 +2326,13 @@ A refused automatic resume leaves an Owner notice and a reason in
 
 `swarm stand up --settings FILE --profile NAME` selects a profile from the
 file's `[profiles]` table. Repeat `--profile` to select several. Without `--settings`,
-names resolve in the current data directory's `config.toml`. A single profiles-only
-TOML path is also accepted as `--profile FILE`. When no profiles are supplied,
+names resolve in the current data directory's `config.toml`. A single TOML path
+with `[profiles]` (and optional `[proxies]` and `[routing]`) tables is also
+accepted as `--profile FILE`. When no profiles are supplied,
 first-start discovery supplies the defaults. Imported profiles are written to the new
-stand's private `config.toml`.
+stand's private `config.toml` together with the `[proxies.*]` tables they
+reference (endpoints and the client-key environment name only, never secret
+values); unreferenced proxy tables are left behind.
 
 `swarm stand up --read-only-copy DATA_DIR` copies committed SQLite state without
 importing config, native sessions or process custody. The offline copy is opened
