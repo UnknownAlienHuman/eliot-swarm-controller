@@ -2031,11 +2031,26 @@ async fn raw_client_call_measured(
     match (response.result, response.error) {
         (Some(value), None) => Ok(value),
         (None, Some(error)) => Err(core_error(error, policy)),
+        // A `null` result is a real result (a read with nothing retained).
+        // `Option<Value>` decodes explicit null as absent, so confirm the
+        // frame carried it before rejecting a resultless reply.
+        (None, None) if frame_has_result(&line) => Ok(Value::Null),
         _ => Err(Error::new(
             "unknown",
             "daemon response must contain exactly one result or error",
         )),
     }
+}
+
+/// Whether the raw reply frame explicitly carries a `result`, even when it
+/// is `null`. `RpcResponse` decodes explicit null as absent, so a missing
+/// Goal (`goal.get` reads none as null) needs the raw frame to tell an
+/// explicit null apart from a malformed resultless reply.
+fn frame_has_result(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|frame| frame.get("result").cloned())
+        .is_some()
 }
 
 fn ipc_closed(read_only_or_unsent: bool, message: &str) -> Error {
@@ -2049,7 +2064,8 @@ fn ipc_closed(read_only_or_unsent: bool, message: &str) -> Error {
 
 /// Typed caller boundary over the existing authenticated client. Params are
 /// serialized once; transport/domain errors retain their original diagnostics.
-/// Current public RPC results are objects, never positional arrays or scalars.
+/// Current public RPC results are objects, never positional arrays or scalars;
+/// `null` is additionally accepted for reads that retain nothing.
 pub async fn client_call_typed<P: Serialize + ?Sized, R: DeserializeOwned>(
     data_dir: &Path,
     method: &str,
@@ -2127,7 +2143,7 @@ fn decode_client_result<R: DeserializeOwned>(method: &str, result: Result<Value>
         "events.subscribe" => "events.subscribe returned a malformed typed result",
         _ => "daemon returned a malformed typed result",
     };
-    if !result.is_object() {
+    if !result.is_object() && !result.is_null() {
         return Err(Error::new("unknown", context));
     }
     serde_json::from_value(result).map_err(|_| Error::new("unknown", context))

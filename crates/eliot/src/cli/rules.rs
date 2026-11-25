@@ -748,7 +748,7 @@ pub(crate) async fn run_goal(
                 mode: goal_mode(&mode)?,
             };
             request.validate().map_err(Failure::for_read)?;
-            let response: GoalView =
+            let response: Option<GoalView> =
                 eliot_daemon::client_call_typed(&data_dir, "goal.get", &request)
                     .await
                     .map_err(Failure::for_read)?;
@@ -757,7 +757,14 @@ pub(crate) async fn run_goal(
                 .map_err(Failure::invalid_response)?;
             let value = serde_json::to_value(&response)
                 .map_err(|_| Failure::new(4, "goal.get response is invalid"))?;
-            print_value_or_human(&value, json_output, || print_goal_summary(&response));
+            match &response {
+                Some(view) => {
+                    print_value_or_human(&value, json_output, || print_goal_summary(view))
+                }
+                None => print_value_or_human(&value, json_output, || {
+                    println!("No goal for {}", request.agent)
+                }),
+            }
             Ok(0)
         }
         GoalCommand::Pause(GoalPauseArgs {

@@ -262,6 +262,7 @@ struct RouterInner {
     /// Worker names already reported as unregistered. In-memory only, so a
     /// restart logs each missing registration once more.
     worker_registration_missing_logged: Mutex<HashSet<String>>,
+    turn_history_unsupported: Mutex<TurnHistoryUnsupported>,
     automatic_cleanup: Mutex<cleanup::AutomaticCleanupState>,
     cleanup_worker: Mutex<Option<String>>,
     mode: AtomicU8,
@@ -308,6 +309,47 @@ struct RouterInner {
 }
 
 const USAGE_SUMMARY_CACHE_CAPACITY: usize = 8;
+
+/// Historical native-turn readbacks already refused as unsupported, by
+/// (agent, generation): the stand refusal is stable for the generation,
+/// so a retry would only repeat the refused plugin open and its log.
+/// Bounded and in-memory only: caching a newer generation drops that
+/// agent's older generations, entries past the cap evict oldest-first,
+/// and a restart logs each refusal once more.
+#[derive(Default)]
+struct TurnHistoryUnsupported {
+    seen: HashSet<(String, i64)>,
+    order: VecDeque<(String, i64)>,
+}
+
+impl TurnHistoryUnsupported {
+    /// Bound on retained refusals; far above one stand's agent generations.
+    const CAPACITY: usize = 4_096;
+
+    fn contains_key(&self, key: &(String, i64)) -> bool {
+        self.seen.contains(key)
+    }
+
+    fn insert(&mut self, key: (String, i64)) {
+        if !self.seen.insert(key.clone()) {
+            return;
+        }
+        // A newer generation supersedes the agent's older refusals.
+        self.order.retain(|prior| {
+            let superseded = prior.0 == key.0 && prior.1 < key.1;
+            if superseded {
+                self.seen.remove(prior);
+            }
+            !superseded
+        });
+        self.order.push_back(key);
+        while self.order.len() > Self::CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct UsageSummaryCacheKey {
@@ -646,6 +688,7 @@ impl Router {
                         .collect(),
                 ),
                 worker_registration_missing_logged: Mutex::new(HashSet::new()),
+                turn_history_unsupported: Mutex::new(TurnHistoryUnsupported::default()),
                 automatic_cleanup: Mutex::new(cleanup::AutomaticCleanupState::default()),
                 cleanup_worker: Mutex::new(None),
                 mode: AtomicU8::new(MODE_OPEN),
