@@ -3,7 +3,10 @@
 //! checker and lint configuration changes, and added error suppressions.
 //! It is an attention filter from a plain line scan, never a quality score.
 
+mod cache;
 mod diff_text;
+
+pub(super) use cache::PatchReadCache;
 
 use super::{Principal, Router, hierarchy, principal_name};
 use crate::git_monitor::{GitProbe, PatchRead};
@@ -17,7 +20,7 @@ use eliot_core::{
     limits::MAX_EVENT_BYTES,
 };
 use serde_json::Value;
-use std::{collections::BTreeSet, path::Path};
+use std::{collections::BTreeSet, path::Path, sync::Arc};
 
 /// Most entries one digest list carries; `truncated` says when one was cut.
 const MAX_ENTRIES: usize = 100;
@@ -192,7 +195,7 @@ impl Router {
         include_fingerprint: bool,
         principal: &Principal,
     ) -> Result<(AgentPatchDigestResponse, Option<String>)> {
-        let (agent, workspace, base) = {
+        let (agent, workspace, base, common) = {
             let store = self.inner.store.lock().await;
             let agent = load_patch_agent(&store, principal, id, generation, include_fingerprint)?;
             if generation.is_some_and(|generation| generation != agent.generation) {
@@ -216,21 +219,31 @@ impl Router {
                     "the patch digest Agent workspace or base differs from the event snapshot",
                 ));
             }
-            let base = match expected_base {
-                Some(base) => Some(base.to_owned()),
-                None => store
-                    .get_workspace_by_path(&workspace)?
-                    .map(|row| row.base_oid),
-            };
-            (agent, workspace, base)
+            let binding = store.get_workspace_by_path(&workspace)?;
+            let common = binding
+                .as_ref()
+                .map(|binding| binding.repo_common_dir.clone());
+            let base = expected_base
+                .map(str::to_owned)
+                .or_else(|| binding.map(|binding| binding.base_oid));
+            (agent, workspace, base, common)
         };
-        let probe = GitProbe::new()?;
         let read = if include_fingerprint {
-            probe
-                .patch_read_with_fingerprint(&workspace, base.as_deref())
-                .await?
+            Arc::new(
+                GitProbe::new()?
+                    .patch_read_with_fingerprint(&workspace, base.as_deref())
+                    .await?,
+            )
         } else {
-            probe.patch_read(&workspace, base.as_deref()).await?
+            self.inner
+                .recent_patch_reads
+                .read(
+                    &self.inner.monitoring,
+                    &workspace,
+                    common.as_deref(),
+                    base.as_deref(),
+                )
+                .await?
         };
         let fingerprint = read.fingerprint.clone();
         let (claims, attributed_paths, attributed_truncated, exclusively_bound) = {
