@@ -274,8 +274,33 @@ fn interrupted_restore() -> Error {
     )
 }
 
+fn git_checkpoint_basis_on(
+    db: &Connection,
+    agent: i64,
+    generation: i64,
+) -> Result<GitCheckpointBasis> {
+    let basis = db
+        .query_row(
+            "SELECT CASE WHEN state IN ('snapshot','clean') THEN fingerprint END,
+                    oid, captured_bytes, CASE WHEN state <> 'none' THEN updated_at END
+             FROM git_checkpoints WHERE agent = ?1 AND generation = ?2",
+            params![agent, generation],
+            |row| {
+                Ok(GitCheckpointBasis {
+                    fingerprint: row.get(0)?,
+                    snapshot: row.get(1)?,
+                    captured_bytes: row.get::<_, i64>(2)?.max(0) as u64,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(sql_error)?;
+    Ok(basis.unwrap_or_default())
+}
+
 /// What the next checkpoint of a generation starts from.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitCheckpointBasis {
     /// Content identity of the last successful checkpoint.
     pub fingerprint: Option<String>,
@@ -887,25 +912,106 @@ impl Store {
 
     pub fn git_checkpoint_basis(&self, agent: &str, generation: i64) -> Result<GitCheckpointBasis> {
         self.ensure_committed_reads()?;
-        let basis = self
-            .connection
-            .query_row(
-                "SELECT CASE WHEN state IN ('snapshot','clean') THEN fingerprint END, oid,
-                        captured_bytes, CASE WHEN state <> 'none' THEN updated_at END
-                 FROM git_checkpoints WHERE agent = ?1 AND generation = ?2",
-                params![parse_agent_id(agent)?, generation],
-                |row| {
-                    Ok(GitCheckpointBasis {
-                        fingerprint: row.get(0)?,
-                        snapshot: row.get(1)?,
-                        captured_bytes: row.get::<_, i64>(2)?.max(0) as u64,
-                        updated_at: row.get(3)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(sql_error)?;
-        Ok(basis.unwrap_or_default())
+        git_checkpoint_basis_on(&self.connection, parse_agent_id(agent)?, generation)
+    }
+
+    /// Settle a turn-end attempt that never acquired a checkpoint intent.
+    /// Keep the event even when a later fact or a different attempt owns the
+    /// latest checkpoint projection. No capture bytes or refs were written.
+    pub fn record_unreserved_turn_checkpoint_failure(
+        &mut self,
+        completion: &Event,
+        workspace: &str,
+        basis: &GitCheckpointBasis,
+        failure: &Error,
+        now: i64,
+    ) -> Result<Vec<Event>> {
+        self.ensure_writer_healthy()?;
+        let result = (|| {
+            let (Some(agent), Some(generation), Some(turn)) = (
+                completion.agent.as_deref(),
+                completion.generation,
+                completion.data["turn_id"].as_str(),
+            ) else {
+                return Err(Error::new(
+                    "source_integrity",
+                    "checkpoint completion is unbound",
+                ));
+            };
+            let num = parse_agent_id(agent)?;
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            let retained: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE seq=?1 AND agent=?2
+                         AND generation=?3 AND kind='turn.completed' AND source='stream'
+                         AND json_extract(data,'$.turn_id')=?4)
+                       OR (?1 <= (SELECT pruned_through FROM rule_history_coverage WHERE singleton=1)
+                           AND EXISTS(SELECT 1 FROM turns WHERE agent=?2 AND generation=?3
+                              AND turn_id=?4 AND state='completed'))",
+                    params![completion.seq, num, generation, turn],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            let Some(current) = load_agent_by_num(&tx, num)? else {
+                return Ok(Vec::new());
+            };
+            if !retained {
+                return Err(Error::new(
+                    "source_integrity",
+                    "checkpoint completion is no longer retained",
+                ));
+            }
+            let (already_recorded, superseded): (bool, bool) = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1 AND generation=?2
+                         AND kind=?3 AND seq>?4 AND json_extract(data,'$.completion_seq')=?4),
+                        EXISTS(SELECT 1 FROM git_checkpoint_intents WHERE agent=?1 AND generation=?2)
+                        OR EXISTS(SELECT 1 FROM events WHERE agent=?1 AND generation=?2
+                           AND kind=?3 AND seq>?4
+                           AND (json_extract(data,'$.state') IN ('snapshot','clean','unchanged')
+                                OR json_extract(data,'$.completion_seq') > ?4))",
+                params![num, generation, GIT_CHECKPOINT, completion.seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            ).map_err(sql_error)?;
+            if already_recorded {
+                return Ok(Vec::new());
+            }
+            let is_latest = current.generation == generation
+                && current.workspace.as_deref() == Some(workspace)
+                && !superseded
+                && git_checkpoint_basis_on(&tx, num, generation)? == *basis;
+            if is_latest {
+                tx.execute(
+                    "INSERT INTO git_checkpoints(agent,generation,state,trigger,turn_id,error,updated_at)
+                     VALUES (?1,?2,'failed','turn_end',?3,?4,?5)
+                     ON CONFLICT(agent,generation) DO UPDATE SET state='failed',
+                       trigger=excluded.trigger, turn_id=excluded.turn_id,
+                       error=excluded.error, updated_at=excluded.updated_at",
+                    params![num, generation, turn, failure.message.as_ref(), now],
+                ).map_err(sql_error)?;
+            }
+            let event = insert_daemon_event(
+                &tx,
+                now,
+                GIT_CHECKPOINT,
+                "git_checkpoint",
+                Some(num),
+                Some(generation),
+                json!({
+                    "state": "failed", "trigger": "turn_end", "turn_id": turn,
+                    "completion_seq": completion.seq, "phase": "before_reservation",
+                    "captured_bytes": 0, "files": 0, "withheld": 0,
+                    "code": failure.code, "error": failure.message,
+                    "superseded": !is_latest,
+                }),
+            )?;
+            commit_transaction(tx, &self.write_faulted)?;
+            Ok(vec![event])
+        })();
+        self.fault_on_persistence_error(&result);
+        result
     }
 
     pub fn reserve_git_checkpoint(
