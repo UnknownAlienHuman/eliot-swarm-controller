@@ -193,17 +193,29 @@ fn reconcile_command_tx(
         // Reconciliation does not release an input that still needs dispatch.
         return Ok(());
     }
-    if command.verb == "resume" && agent.generation == generation && agent.is_terminal()
+    if command.verb == "resume"
+        && agent.generation == generation
+        && agent.is_terminal()
         && let Some(native_ref) = agent.native_ref.as_deref()
         && archived_resume_refusal(outcome, native_ref)
         && super::super::capacity::has_owned_exit_and_reader_drain_tx(tx, target, generation)?
-        && !tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM events WHERE agent=?1 AND generation=?2 AND kind='session.ready' AND source='stream')",
-            params![target,generation], |row| row.get::<_, bool>(0),
-        ).map_err(sql_error)?
+        && !tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events INDEXED BY events_agent
+                WHERE agent=?1 AND generation=?2 AND kind='session.ready' AND source='stream')",
+                params![target, generation],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?
     {
-        events.push(settle_evidence_tx(tx, record, CommandState::Failed, outcome.clone(),
-            &CommandEvidence::ArchivedCodexResume { native_ref }, now)?);
+        events.push(settle_evidence_tx(
+            tx,
+            record,
+            CommandState::Failed,
+            outcome.clone(),
+            &CommandEvidence::ArchivedCodexResume { native_ref },
+            now,
+        )?);
     } else if command.verb == "stop"
         && (agent.generation > generation || agent.is_terminal())
         && super::super::capacity::has_owned_exit_and_reader_drain_tx(tx, target, generation)?
@@ -212,15 +224,35 @@ fn reconcile_command_tx(
             json!({"state":"applied","process_custody_exit_proven":true,"native_source_drain_proven":true}),
             &CommandEvidence::OwnedExitAndReaderDrain, now)?);
         if agent.generation == generation && agent.state == AgentState::Lost {
-            super::super::lifecycle::settle_lost_stop_after_owned_exit_tx(tx, &command.id, now, events)?;
+            super::super::lifecycle::settle_lost_stop_after_owned_exit_tx(
+                tx,
+                &command.id,
+                now,
+                events,
+            )?;
         }
     } else if matches!(command.verb.as_str(), "send" | "inject" | "resume")
         && let Some((seq, receipt)) = applied_command_receipt(tx, record, target, generation)?
     {
-        events.push(settle_evidence_tx(tx, record, CommandState::Applied, receipt,
-            &CommandEvidence::NativeCommandReceipt { seq }, now)?);
-    } else if let Some((evidence, outcome)) = native_lifecycle_receipt(tx, record, target, generation)? {
-        events.push(settle_evidence_tx(tx, record, CommandState::Applied, outcome, &evidence, now)?);
+        events.push(settle_evidence_tx(
+            tx,
+            record,
+            CommandState::Applied,
+            receipt,
+            &CommandEvidence::NativeCommandReceipt { seq },
+            now,
+        )?);
+    } else if let Some((evidence, outcome)) =
+        native_lifecycle_receipt(tx, record, target, generation)?
+    {
+        events.push(settle_evidence_tx(
+            tx,
+            record,
+            CommandState::Applied,
+            outcome,
+            &evidence,
+            now,
+        )?);
     }
     Ok(())
 }
@@ -253,15 +285,23 @@ fn native_lifecycle_receipt(
             // The native intake enforces one start per generation and verifies
             // its retained subject. Journal order also requires this dispatch.
             let ready = tx.query_row(
-                "SELECT e.seq FROM events e WHERE e.agent=?1 AND e.generation=?2
+                "SELECT e.seq FROM events e INDEXED BY events_agent WHERE e.agent=?1 AND e.generation=?2
                     AND e.kind='session.ready' AND e.source='stream' AND e.native_id IS NOT NULL
                     AND json_type(e.data,'$.native_ref')='text' AND json_extract(e.data,'$.native_ref')<>''
                     AND json_type(e.data,'$.native_scope')='text' AND json_extract(e.data,'$.native_scope')<>''
-                    AND COALESCE(json_extract(e.data,'$.command_id'),?3)=?3
+                    AND (json_extract(e.data,'$.command_id')=?3 OR (
+                      json_extract(e.data,'$.command_id') IS NULL
+                      AND EXISTS (SELECT 1 FROM events previous INDEXED BY events_agent
+                        WHERE previous.agent=?1 AND previous.generation=?2-1
+                          AND previous.kind='session.ready' AND previous.source='stream'
+                          AND previous.native_id IS NOT NULL AND previous.seq<e.seq
+                          AND json_extract(previous.data,'$.native_ref')=json_extract(e.data,'$.native_ref')
+                          AND json_extract(previous.data,'$.native_scope')=json_extract(e.data,'$.native_scope'))
+                    ))
                     AND NOT EXISTS (SELECT 1 FROM commands prior
                       WHERE prior.target=?1 AND prior.generation=?2
                         AND prior.verb IN ('launch','resume') AND prior.id<>?3)
-                    AND EXISTS (SELECT 1 FROM events d WHERE d.agent=?1 AND d.generation=?2
+                    AND EXISTS (SELECT 1 FROM events d INDEXED BY events_agent WHERE d.agent=?1 AND d.generation=?2
                       AND d.source='daemon' AND d.kind='command.dispatched' AND d.seq<e.seq
                       AND json_extract(d.data,'$.command_id')=?3)
                  ORDER BY e.seq LIMIT 1",
@@ -277,11 +317,12 @@ fn native_lifecycle_receipt(
         "send" => {
             let event = tx
                 .query_row(
-                    "SELECT e.seq,t.turn_id FROM turns t JOIN events e
+                    "SELECT e.seq,t.turn_id FROM turns t JOIN events e INDEXED BY events_turn_lifecycle
                     ON e.agent=t.agent AND e.generation=t.generation
                     AND json_extract(e.data,'$.turn_id')=t.turn_id
                  WHERE t.agent=?1 AND t.generation=?2 AND t.start_command_id=?3
                     AND (?4 IS NULL OR t.turn_id=?4)
+                    AND e.kind IN ('turn.started', 'turn.completed', 'turn.unknown')
                     AND e.kind='turn.started' AND e.source='stream' AND e.native_id IS NOT NULL
                     AND json_extract(e.data,'$.command_id')=?3
                  ORDER BY e.seq LIMIT 1",
@@ -309,7 +350,7 @@ fn applied_command_receipt(
 ) -> Result<Option<(i64, Value)>> {
     let row: Option<(i64, String)> = tx
         .query_row(
-            "SELECT seq,data FROM events WHERE agent=?1 AND generation=?2 AND source='daemon'
+            "SELECT seq,data FROM events INDEXED BY events_agent WHERE agent=?1 AND generation=?2 AND source='daemon'
             AND kind='command.applied' AND json_extract(data,'$.command_id')=?3
             ORDER BY seq DESC LIMIT 1",
             params![agent, generation, record.command.id],

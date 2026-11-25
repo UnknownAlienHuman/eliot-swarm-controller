@@ -465,7 +465,9 @@ fn project_unknown_commands(
                     CASE c.verb
                         WHEN 'compact' THEN json_extract(c.outcome,'$.message')
                         WHEN 'worktree.remove' THEN json_extract(c.outcome,'$.result.message')
-                    END,1,1024) END
+                    END,1,1024) END,
+                COALESCE(json_type(c.outcome,'$.native_git_write_dispatched')='false'
+                    AND json_type(c.outcome,'$.removal_write_guard') IS NULL,0)
          FROM commands c WHERE c.state IN ('accepted','queued','dispatched','unknown')
            AND NOT EXISTS (SELECT 1 FROM agents check_agent WHERE check_agent.id=c.target
                  AND json_type(check_agent.profile_snapshot, '$._harness_check') IS NOT NULL)", "c.id=?1", bindings)?;
@@ -488,6 +490,7 @@ fn project_unknown_commands(
                 r.get::<_, bool>(13)?,
                 r.get::<_, bool>(14)?,
                 r.get::<_, Option<String>>(15)?,
+                r.get::<_, bool>(16)?,
             ))
         })
         .map_err(sql_error)?;
@@ -509,6 +512,7 @@ fn project_unknown_commands(
             source_open,
             owner_handoff_send,
             detail,
+            removal_no_write,
         ) = row.map_err(sql_error)?;
         let state = match raw_state.as_str() {
             "accepted" => eliot_core::CommandState::Accepted,
@@ -630,10 +634,19 @@ fn project_unknown_commands(
             choices,
         );
         projected.detail = detail;
-        if method == "command.submit" {
+        if reason == "stop_exit_and_reader_drain_proven" {
+            projected.instructions = Some(
+                "Owned processes exited and the reader drained for this Stop. Reconciliation can complete it as applied. Use `swarm cmd settle-stopped` to review the retained proof."
+                    .to_owned(),
+            );
+        } else if method == "command.submit" {
             let check = match verb.as_str() {
+                "worktree.remove" if removal_no_write => Some((
+                    "The retained marker proves Git never ran. Check the exact checkout and its registration with `git worktree list --porcelain` in the source repository. If both remain, the removal failed. If both are absent, check the recorded branch and let the guarded absence readback complete it.",
+                    false,
+                )),
                 "worktree.remove" => Some((
-                    "Verify the checkout directory, Git worktree registration, and branch against the retained removal record.",
+                    "Git may have run. Compare the recorded checkout path on disk with `git worktree list --porcelain` in the source repository. Choose completed only when both are absent and guarded readback proves the branch outcome. Choose failed only when the checkout and registration both remain and no removal effect took place. Leave an inconsistent or unreadable result unknown.",
                     false,
                 )),
                 "resume" => Some((

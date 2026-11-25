@@ -2042,16 +2042,13 @@ impl Router {
                         && command.outcome.as_ref().is_some_and(|outcome| {
                             eliot_store::Store::is_no_write_unknown_removal(outcome, &command.id)
                         })
-                }) {
-                    if self
-                        .inner
-                        .workspaces
-                        .reconcile_no_write_removal(&command, &workspace)
-                        .await?
-                    {
-                        self.signal_progress();
-                    }
-                    return Ok(());
+                }) && self
+                    .inner
+                    .workspaces
+                    .reconcile_no_write_removal(&command, &workspace)
+                    .await?
+                {
+                    self.signal_progress();
                 }
                 continue;
             }
