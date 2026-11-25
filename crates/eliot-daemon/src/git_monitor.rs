@@ -45,6 +45,38 @@ const NUL_LISTING_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const GIT_LISTING_LIMIT: &str = "git_listing_limit";
 const ATTRIBUTE_BATCH_BYTES: usize = OUTPUT_BYTES / 4;
 
+/// These exact built-ins inspect refs or repository metadata. They cannot use
+/// worktree filters, executable aliases or merge drivers.
+fn is_metadata_read(args: &[&str]) -> bool {
+    match args {
+        [
+            "config",
+            "--local",
+            "--no-includes",
+            "--get",
+            "remote.origin.url",
+        ]
+        | ["worktree", "list", "--porcelain", "-z"]
+        | ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"]
+        | ["symbolic-ref", "--quiet", "HEAD"]
+        | [
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ] => true,
+        ["rev-parse", "--verify", "--end-of-options", reference] => {
+            reference.ends_with("^{commit}")
+        }
+        ["show-ref", "--verify", "--quiet" | "--hash", reference]
+        | ["for-each-ref", "--format=%(refname)", reference]
+        | ["check-ref-format", reference] => reference.starts_with("refs/heads/"),
+        ["merge-base", "--is-ancestor", base, tip] => is_git_oid(base) && is_git_oid(tip),
+        _ => false,
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Gitlinks<'a> {
     Reject,
@@ -1306,6 +1338,9 @@ impl GitProbe {
         args: &[&str],
         deadline: Instant,
     ) -> Result<Captured> {
+        if is_metadata_read(args) {
+            return self.run(root, args, &[], &[], deadline).await;
+        }
         let overrides = self.safe_overrides(root, deadline).await?;
         self.run(root, args, &overrides, &[], deadline).await
     }
@@ -1550,17 +1585,7 @@ impl GitProbe {
         binding: Option<GitBinding<'_>>,
         deadline: Instant,
     ) -> Result<Captured> {
-        if !matches!(
-            args,
-            [
-                "config",
-                "--local",
-                "--no-includes",
-                "--get",
-                "remote.origin.url"
-            ] | ["worktree", "list", "--porcelain", "-z"]
-                | ["symbolic-ref", "--quiet", "--no-recurse", "HEAD"]
-        ) {
+        if !is_metadata_read(args) {
             return Err(Error::new(
                 "invalid",
                 "unsupported project Git metadata read",

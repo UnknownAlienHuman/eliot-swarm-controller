@@ -1657,10 +1657,7 @@ impl WorkspaceGit {
         deadline: Instant,
     ) -> Result<Repository> {
         let workspace = canonical_root(path)?;
-        // One rev-parse reports toplevel, git dir and common dir together. Each
-        // read costs two Git spawns (safe-overrides preflight plus the read),
-        // so three separate reads serialize six spawns on every repository
-        // identity check, including each project registration at daemon startup.
+        // Use one metadata-only rev-parse for toplevel, git dir and common dir.
         let bytes = self
             .read(
                 &workspace,
