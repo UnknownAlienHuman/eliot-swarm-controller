@@ -29,7 +29,7 @@ struct CachedProjectReadback {
 }
 
 struct WatchedProject {
-    watcher: WorkspaceInvalidation,
+    watcher: Arc<WorkspaceInvalidation>,
     revision: FilesystemRevision,
     registrations: Vec<String>,
     stamps: Vec<CheckoutReadStamp>,
@@ -52,6 +52,21 @@ impl ProjectReadCache {
             .await
             .ok()??;
         (stamps == entry.watched.stamps && entry.watched.current()).then_some(entry)
+    }
+
+    fn live_watcher(
+        &self,
+        common: &str,
+        registrations: &[String],
+    ) -> Option<(Arc<WorkspaceInvalidation>, HashSet<String>)> {
+        let entry = self.entries.lock_recover().get(common).cloned()?;
+        if entry.watched.registrations != registrations || entry.watched.watcher.is_degraded() {
+            return None;
+        }
+        Some((
+            Arc::clone(&entry.watched.watcher),
+            entry.watched.checkout_roots.clone(),
+        ))
     }
 
     fn replace(&self, common: String, value: Option<CachedProjectReadback>) {
@@ -376,9 +391,16 @@ impl WorkspaceGit {
                     }
                     let watch_common = common_dir.clone();
                     let watch_paths = registration_keys.clone();
+                    let existing = cache.live_watcher(&common_dir, &registration_keys);
                     let watched = tokio::task::spawn_blocking(move || {
-                        let (watcher, checkout_roots) =
-                            project_watcher(&watch_common, &watch_paths)?;
+                        let (watcher, checkout_roots) = match existing {
+                            Some(watcher) => watcher,
+                            None => {
+                                let (watcher, roots) =
+                                    project_watcher(&watch_common, &watch_paths)?;
+                                (Arc::new(watcher), roots)
+                            }
+                        };
                         let revision = watcher.revision()?;
                         let stamps = project_stamps(&watch_paths, &watch_common)?;
                         let state = WatchedProject {
@@ -853,13 +875,49 @@ fn project_watcher(
     let common = key(&common);
     let registry = key(&registry);
     WorkspaceInvalidation::watch_paths(paths.into_iter().collect(), move |path| {
+        if path.to_str().is_none() {
+            return (true, true);
+        }
         let path = key(path);
-        let binding = bindings.contains(&path) || path == registry;
-        let metadata = path == common
-            || path
-                .strip_prefix(&common)
-                .is_some_and(|tail| tail.starts_with('/'));
-        (metadata || binding, binding)
+        let admin = path
+            .strip_prefix(&registry)
+            .and_then(|tail| tail.strip_prefix('/'));
+        let binding = bindings.contains(&path)
+            || path == registry
+            || admin.is_some_and(|tail| {
+                !tail.contains('/') || tail.ends_with("/gitdir") || tail.ends_with("/commondir")
+            });
+        let tracked_file = |name: &str| {
+            matches!(
+                name,
+                "HEAD"
+                    | "head"
+                    | "index"
+                    | "config"
+                    | "config.worktree"
+                    | "packed-refs"
+                    | "commondir"
+                    | "gitdir"
+                    | "locked"
+                    | "objects"
+            )
+        };
+        let common_metadata = path
+            .strip_prefix(&common)
+            .and_then(|tail| tail.strip_prefix('/'))
+            .is_some_and(|tail| {
+                tracked_file(tail)
+                    || ["refs", "info", "reftable"].iter().any(|directory| {
+                        tail == *directory
+                            || tail
+                                .strip_prefix(directory)
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+            });
+        let worktree_metadata = admin
+            .and_then(|tail| tail.split_once('/'))
+            .is_some_and(|(_, file)| tracked_file(file));
+        (binding || common_metadata || worktree_metadata, binding)
     })
     .ok()
     .map(|watcher| (watcher, checkout_roots))
