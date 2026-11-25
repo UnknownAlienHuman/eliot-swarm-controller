@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const CURRENT_SCHEMA_VERSION: i64 = ATTENTION_ENDPOINTS_CUSTODY_VERSION;
+pub(super) const CURRENT_SCHEMA_VERSION: i64 = PROJECT_OVERVIEW_GIT_VERSION;
 const HARNESS_CHECK_SCHEMA_VERSION: i64 = 112;
 const WORK_TRUTH_VERSION: i64 = 113;
 const WORK_TRUTH_INTENT_VERSION: i64 = 114;
@@ -24,6 +24,7 @@ const OWNER_INBOX_LOOKUPS_VERSION: i64 = 131;
 const ATTENTION_NATIVE_TURN_ACTIVITY_VERSION: i64 = 132;
 const AUTH_LOGIN_UNKNOWN_VERSION: i64 = 133;
 const ATTENTION_ENDPOINTS_CUSTODY_VERSION: i64 = 134;
+const PROJECT_OVERVIEW_GIT_VERSION: i64 = 135;
 
 impl Store {
     pub const SCHEMA_VERSION: i64 = CURRENT_SCHEMA_VERSION;
@@ -167,6 +168,23 @@ impl Store {
             tx.execute(
                 "INSERT INTO schema_migrations(version) VALUES (?1)",
                 [ATTENTION_ENDPOINTS_CUSTODY_VERSION],
+            )
+            .map_err(sql_error)?;
+            tx.commit().map_err(sql_error)?;
+        }
+        if current < PROJECT_OVERVIEW_GIT_VERSION {
+            let tx = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql_error)?;
+            tx.execute_batch(
+                "CREATE INDEX project_overview_git ON events(agent, generation, seq DESC)
+                   WHERE source = 'git' AND kind = 'git.changed';",
+            )
+            .map_err(sql_error)?;
+            tx.execute(
+                "INSERT INTO schema_migrations(version) VALUES (?1)",
+                [PROJECT_OVERVIEW_GIT_VERSION],
             )
             .map_err(sql_error)?;
             tx.commit().map_err(sql_error)?;

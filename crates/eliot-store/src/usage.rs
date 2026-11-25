@@ -145,6 +145,99 @@ struct ScopeAccum {
 }
 
 #[derive(Default)]
+struct TurnExpenditureAccum {
+    counted: usize,
+    without_usage: usize,
+    unknown: usize,
+    running: usize,
+    supplied: [usize; TURN_COUNTERS],
+    scopes: BTreeMap<String, ScopeAccum>,
+}
+
+impl TurnExpenditureAccum {
+    fn observe(
+        &mut self,
+        state: &str,
+        usage: Option<&str>,
+        harness: &str,
+    ) -> Result<Option<TurnUsage>> {
+        match state {
+            "completed" => self.counted += 1,
+            "running" => {
+                self.running += 1;
+                return Ok(None);
+            }
+            _ => {
+                self.unknown += 1;
+                return Ok(None);
+            }
+        }
+        let Some(usage) = usage else {
+            self.without_usage += 1;
+            return Ok(None);
+        };
+        let usage = decode_turn_usage(usage, harness)?;
+        let scope = self
+            .scopes
+            .entry(normalize_turn_scope(&usage.scope))
+            .or_default();
+        scope.counted += 1;
+        for index in 0..TURN_COUNTERS {
+            if let Some(value) = turn_counter(&usage, index) {
+                scope.sums[index] += i128::from(value);
+                scope.supplied[index] += 1;
+                self.supplied[index] += 1;
+            }
+        }
+        Ok(Some(usage))
+    }
+
+    fn finish(self) -> TurnExpenditure {
+        TurnExpenditure {
+            turns_counted: self.counted,
+            turns_without_usage: self.without_usage,
+            turns_unknown_excluded: self.unknown,
+            turns_running_excluded: self.running,
+            turns_missing: counter_missing(self.counted, &self.supplied),
+            by_scope: self
+                .scopes
+                .into_iter()
+                .map(|(scope, accum)| TurnScopeTotals {
+                    scope,
+                    turns_counted: accum.counted,
+                    totals: counter_totals(&accum.sums, &accum.supplied),
+                    turns_missing: counter_missing(accum.counted, &accum.supplied),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Read retained turn rows without expanding an Agent selector or reading its events.
+pub(super) fn overview_turn_expenditure(
+    conn: &Connection,
+    member_sql: &str,
+    bindings: impl rusqlite::Params,
+) -> Result<TurnExpenditure> {
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT t.state, t.usage, a.harness FROM agents a
+         CROSS JOIN turns t ON t.agent = a.id
+         WHERE a.project = ?1 AND {member_sql}"
+        ))
+        .map_err(sql_error)?;
+    let mut rows = statement.query(bindings).map_err(sql_error)?;
+    let mut turns = TurnExpenditureAccum::default();
+    while let Some(row) = rows.next().map_err(sql_error)? {
+        let state: String = row.get(0).map_err(sql_error)?;
+        let usage: Option<String> = row.get(1).map_err(sql_error)?;
+        let harness: String = row.get(2).map_err(sql_error)?;
+        turns.observe(&state, usage.as_deref(), &harness)?;
+    }
+    Ok(turns.finish())
+}
+
+#[derive(Default)]
 struct QuotaOriginAccum {
     turns_counted: usize,
     turns_without_usage: usize,
@@ -517,13 +610,7 @@ impl Store {
         let native_child_bindings = self.native_child_bindings(pairs)?;
         let agent_ids: BTreeSet<i64> = wanted.iter().map(|(agent, _)| *agent).collect();
         let mut role_usage = RoleUsage::default();
-        let mut turns_counted = 0_usize;
-        let mut turns_without_usage = 0_usize;
-        let mut turns_unknown_excluded = 0_usize;
-        let mut turns_running_excluded = 0_usize;
-        let mut overall_supplied = [0_usize; TURN_COUNTERS];
-        let mut overall_sums = [0_i128; TURN_COUNTERS];
-        let mut scopes: BTreeMap<String, ScopeAccum> = BTreeMap::new();
+        let mut turns = TurnExpenditureAccum::default();
         let mut first_calls = BTreeMap::new();
         let mut first_calls_truncated = false;
         let mut native_child_turns = BTreeMap::new();
@@ -593,24 +680,9 @@ impl Store {
                     native_child_turns.pop_first();
                     native_child_turns_truncated = true;
                 }
-                if state != "completed" {
-                    // Sums stay over completed turns only, but the skipped
-                    // turns stay visible: an unknown turn may have spent
-                    // tokens this readback cannot see. Any other
-                    // non-terminal state reads as unknown rather than
-                    // vanishing from coverage.
-                    match state.as_str() {
-                        "running" => turns_running_excluded += 1,
-                        _ => turns_unknown_excluded += 1,
-                    }
-                    continue;
-                }
-                turns_counted += 1;
-                let Some(usage) = usage else {
-                    turns_without_usage += 1;
+                let Some(usage) = turns.observe(&state, usage.as_deref(), &harness)? else {
                     continue;
                 };
-                let usage = decode_turn_usage(&usage, &harness)?;
                 role_usage.observe_turn(manager, &usage)?;
                 if let Some(input_tokens) = usage.first_call_input_tokens {
                     first_calls.insert((settled_at, agent, generation, turn_id), input_tokens);
@@ -619,29 +691,8 @@ impl Store {
                         first_calls_truncated = true;
                     }
                 }
-                let accum = scopes
-                    .entry(normalize_turn_scope(&usage.scope))
-                    .or_default();
-                accum.counted += 1;
-                for index in 0..TURN_COUNTERS {
-                    if let Some(value) = turn_counter(&usage, index) {
-                        accum.sums[index] += i128::from(value);
-                        accum.supplied[index] += 1;
-                        overall_sums[index] += i128::from(value);
-                        overall_supplied[index] += 1;
-                    }
-                }
             }
         }
-        let by_scope = scopes
-            .into_iter()
-            .map(|(scope, accum)| TurnScopeTotals {
-                scope,
-                turns_counted: accum.counted,
-                totals: counter_totals(&accum.sums, &accum.supplied),
-                turns_missing: counter_missing(accum.counted, &accum.supplied),
-            })
-            .collect();
         self.accumulate_usage_context(&wanted, &agent_ids, &mut role_usage)?;
         let sessions = self.summarize_sessions(&wanted)?;
         let (swarm_mcp, swarm_mcp_truncated) = self.swarm_mcp_turn_usage(pairs)?;
@@ -655,14 +706,7 @@ impl Store {
             history_complete,
             history_reason,
             pruned_through,
-            turns: TurnExpenditure {
-                turns_counted,
-                turns_without_usage,
-                turns_unknown_excluded,
-                turns_running_excluded,
-                turns_missing: counter_missing(turns_counted, &overall_supplied),
-                by_scope,
-            },
+            turns: turns.finish(),
             sessions,
             by_role,
             first_calls: first_calls

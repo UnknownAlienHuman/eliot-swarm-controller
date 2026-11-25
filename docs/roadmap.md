@@ -216,6 +216,8 @@ Checked layers record delivered increments, not full crash/load qualification.
   detaches and tags under the link revision it read; a capacity refusal offers Queue
   it, and a lost Queue it reply resolves its intent before the draft returns.
   Legacy path labels stay in the no-project bucket; history is not reinterpreted.
+- [x] **6. Project overview.** Read scoped workspace Git status and retained
+  turn usage coverage with project and fleet totals in one Store snapshot.
 
 ## L0 — Archive and smallest workspace
 

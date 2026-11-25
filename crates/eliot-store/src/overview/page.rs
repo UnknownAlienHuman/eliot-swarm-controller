@@ -176,8 +176,8 @@ fn page_projects(
         _ => None,
     };
     let keys = list_overview_projects(conn, filter, after)?;
-    for (index, project) in keys.into_iter().enumerate() {
-        if index == MAX_PAGE_ENTRIES {
+    for project in keys {
+        if page.len() == PROJECTS_PER_PAGE {
             return Ok(page.last().map(|last| Cursor::Projects {
                 after: last.project.clone(),
             }));

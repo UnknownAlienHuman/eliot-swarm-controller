@@ -213,8 +213,9 @@ pub use organization::{
 };
 pub use overview::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
-    OverviewManagerView, OverviewWorkerView, ProjectOverviewEntry, ProjectOverviewRequest,
-    ProjectOverviewResponse, ProjectScopeLimits, ProjectTotals, ScopeLimits, ScopeUsage,
+    OverviewManagerView, OverviewWorkerView, ProjectDirtyState, ProjectDirtyView,
+    ProjectOverviewEntry, ProjectOverviewRequest, ProjectOverviewResponse, ProjectScopeLimits,
+    ProjectTotals, ProjectUsageView, ScopeLimits, ScopeUsage,
 };
 pub use provider::{
     ProviderClearHoldRequest, ProviderClearHoldResponse, ProviderCorrectiveEvidence,

@@ -423,6 +423,24 @@ children, appear as aggregates. A released manager or worker receives
 aggregates. Authorized detail includes assignment state, revision and workspace
 binding, including adopted workspaces.
 
+The overview reports observed Git dirt for the team's distinct retained
+execution workspaces. A complete observation with pending paths makes a
+project dirty. Clean requires a complete clean observation for every included
+workspace. Unobserved workspaces, incomplete observations and failed or stale
+Git sources contribute to the unknown count. The oldest retained observation
+time among known workspaces lets the caller assess age. This read never runs
+Git, and a project with no observed execution workspace reads as unknown.
+For a shared workspace the latest retained observation determines coverage.
+
+The same read includes token expenditure over all retained turn rows for the
+authorized current project team, across its retained generations. It uses the
+same turn scopes, normalization, counter gaps and excluded running and unknown
+turn counts as `usage.summary`. The event retention watermark `pruned_through`
+identifies history gaps. These totals cover the team independently of the rows
+on the page. Session snapshots and per-turn diagnostic detail remain available
+through `usage.summary`. Teams visible only as aggregates omit Git and token
+usage detail.
+
 Live harnesses, dispatched starts, active turns, waiting work and retained
 unknown reservations use their respective committed generation, command, turn
 and reservation evidence. The fleet separately counts distinct observed native

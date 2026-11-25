@@ -512,7 +512,7 @@ command id frozen at claim. The settled event's persisted `kind` is exactly
 | `launch.intent.get` | Read the exact intent and its current state |
 | `launch.queue` | Read one page of scoped interactive intents and assignment waits |
 | `project.budget.set` | Current manager adjusts free budget or priority within the Owner's grant |
-| `project.overview` | Owner or Agent read of one project team or every team with workspaces, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
+| `project.overview` | Owner or Agent read of project teams with workspace Git status, token usage, queue, capacity and whole-fleet totals; a manager sees its own team in full and aggregates for other projects |
 | `rule.list/get/catch_up` | Owner-only paged rule state and definition list, one loaded rule state, and finite committed-history catch-up |
 | `rule.read/save/delete` | Owner-only rule source read, revision-guarded create or replace, and revision-guarded delete through the [rule file editor](automation.md#rule-file-editing) |
 | `profile.list` | owner-only sanitized configured-profile summaries with launch-time resolvability |
@@ -589,11 +589,13 @@ omitted. See [coordination](coordination.md#project-manager-assignment) for
 generation, epoch and dispatch behavior.
 
 `project.overview` returns exact fleet totals beside authorized project and
-native-child detail. A `project` filter scopes the returned detail. Each
+native-child detail. Each project with authorized detail includes `dirty` and
+`usage` from the same Store snapshot. A `project` filter scopes the returned detail. Each
 reply has an event watermark from its committed Store snapshot and a separate
 native observation coverage label. When `next_cursor` is present, pass it as
 `after` with the same filter. Each page applies current read authority and
-reports its own snapshot watermark. CLI callers use
+reports its own snapshot watermark. A page contains at most 16 projects and
+may contain fewer when the detail reaches a page bound. CLI callers use
 `swarm project overview [--project ID] [--after CURSOR]`. See
 [project manager assignment](coordination.md#project-manager-assignment) for
 detail visibility and capacity semantics.

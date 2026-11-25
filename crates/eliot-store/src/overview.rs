@@ -5,12 +5,14 @@ use super::*;
 use eliot_core::api::{
     FleetTotals, HarnessCount, LifecycleTotals, NativeChildView, OverviewCoverage,
     OverviewManagerView, OverviewWorkerView, ProjectAssignment, ProjectAssignmentState,
-    ProjectManagerIdentity, ProjectOverviewEntry, ProjectTotals, ScopeLimits, ScopeUsage,
+    ProjectDirtyView, ProjectManagerIdentity, ProjectOverviewEntry, ProjectTotals,
+    ProjectUsageView, ScopeLimits, ScopeUsage,
 };
 
 const PROJECTS: &str = "SELECT id AS project FROM project_registrations
      UNION SELECT project FROM project_assignments
      UNION SELECT project FROM agents WHERE project <> ''";
+const PROJECTS_PER_PAGE: usize = 16;
 
 const WORKER: &str = "a.observe_only = 0 AND (a.capacity_generation IS NOT NULL
                               OR a.state NOT IN ('stopped','failed','lost'))";
@@ -190,9 +192,10 @@ pub(super) fn list_overview_projects(
         ))
         .map_err(sql_error)?;
     let rows = stmt
-        .query_map(params![filter, after, MAX_PAGE_ENTRIES as i64 + 1], |row| {
-            row.get(0)
-        })
+        .query_map(
+            params![filter, after, PROJECTS_PER_PAGE as i64 + 1],
+            |row| row.get(0),
+        )
         .map_err(sql_error)?;
     rows.collect::<rusqlite::Result<_>>().map_err(sql_error)
 }
@@ -286,6 +289,19 @@ fn project_team(
     let manager_scope = core::CapacityScope::manager_assignment_scope(project);
     let manager_limit = launch_queue::effective_manager_limit(conn, project, &project_limits)?;
     let (totals, project_usage) = project_header_totals(conn, project, limits)?;
+    let usage = detail
+        .then(|| {
+            let (root, scope, slf) = access.members();
+            Ok::<_, Error>(ProjectUsageView {
+                pruned_through: retention::coverage_pruned_through(conn)?,
+                turns: usage::overview_turn_expenditure(
+                    conn,
+                    &member_sql("a", 2, 3, 4),
+                    params![project, root, scope, slf],
+                )?,
+            })
+        })
+        .transpose()?;
     Ok(ProjectOverviewEntry {
         project: project.to_owned(),
         detail,
@@ -298,6 +314,10 @@ fn project_team(
         workspaces,
         workspace_total,
         workspaces_truncated,
+        dirty: detail
+            .then(|| project_dirty(conn, project, access))
+            .transpose()?,
+        usage,
         queue: totals.queued,
         totals,
         capacity: vec![
@@ -309,6 +329,77 @@ fn project_team(
             },
         ],
     })
+}
+
+fn project_dirty(
+    conn: &Connection,
+    project: &str,
+    access: &DetailAccess,
+) -> Result<ProjectDirtyView> {
+    let (root, scope, slf) = access.members();
+    let mut statement = conn
+        .prepare_cached(&format!(
+            "SELECT a.workspace, e.seq, e.ts,
+                      CASE WHEN gs.health NOT IN ('error','stale')
+                             AND json_extract(e.data,'$.workspace') = a.workspace
+                             AND json_extract(e.data,'$.complete') = 1
+                             AND json_type(e.data,'$.dirty') = 'array'
+                           THEN json_array_length(e.data,'$.dirty') > 0 END
+               FROM agents a
+               LEFT JOIN workspaces w ON w.worktree_path = a.workspace
+               LEFT JOIN source_state gs ON gs.agent = a.id AND gs.generation = a.generation
+                                          AND gs.source = 'git'
+               LEFT JOIN events e ON e.seq = (
+                   SELECT g.seq FROM events g INDEXED BY project_overview_git
+                   WHERE g.agent = a.id AND g.generation = a.generation
+                     AND g.source = 'git' AND g.kind = 'git.changed'
+                   ORDER BY g.seq DESC LIMIT 1
+               )
+               WHERE a.project = ?1 AND a.workspace IS NOT NULL AND a.chat = 0
+                 AND COALESCE(w.phase, '') <> 'removed' AND {}",
+            member_sql("a", 2, 3, 4),
+        ))
+        .map_err(sql_error)?;
+    let rows = statement
+        .query_map(params![project, root, scope, slf], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<bool>>(3)?,
+            ))
+        })
+        .map_err(sql_error)?;
+    let mut workspaces = std::collections::HashMap::new();
+    for row in rows {
+        let (workspace, seq, sampled_at, dirty) = row.map_err(sql_error)?;
+        let current = workspaces
+            .entry(core::workspace_path_key(&workspace).into_owned())
+            .or_insert((None, None, None));
+        if (seq, dirty.is_some()) > (current.0, current.2.is_some()) {
+            *current = (seq, sampled_at, dirty);
+        }
+    }
+    let mut output = ProjectDirtyView::default();
+    for (_, sampled_at, dirty) in workspaces.into_values() {
+        match (sampled_at, dirty) {
+            (Some(sampled_at), Some(dirty)) => {
+                if dirty {
+                    output.dirty += 1;
+                } else {
+                    output.clean += 1;
+                }
+                output.oldest_observed_at = Some(
+                    output
+                        .oldest_observed_at
+                        .map_or(sampled_at, |old| old.min(sampled_at)),
+                );
+            }
+            _ => output.unknown += 1,
+        }
+    }
+    output.state = output.observed_state();
+    Ok(output)
 }
 
 /// One project's exact team totals and its project slot use beside the
@@ -479,10 +570,13 @@ fn lifecycle(conn: &Connection, project: Option<&str>) -> Result<LifecycleTotals
     let active = count(conn,
         "SELECT COUNT(*) FROM turns t JOIN agents a ON a.id = t.agent AND a.generation = t.generation
          WHERE t.state = 'running' AND a.observe_only = 0 AND (?1 IS NULL OR a.project = ?1)", [project])?;
+    // Include the sparse unsettled index predicate so SQLite can use that
+    // index even when counting only the two waiting states.
     let queued = count(
         conn,
         "SELECT COUNT(*) FROM commands c LEFT JOIN agents a ON a.id = c.target
-         WHERE c.state IN ('accepted','queued') AND (?1 IS NULL OR a.project = ?1)",
+         WHERE c.state IN ('accepted', 'queued', 'dispatched', 'unknown')
+           AND c.state IN ('accepted','queued') AND (?1 IS NULL OR a.project = ?1)",
         [project],
     )?;
     Ok(LifecycleTotals {
