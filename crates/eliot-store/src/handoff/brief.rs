@@ -154,8 +154,15 @@ pub(crate) fn build(
     } else {
         ""
     };
-    let (priority, priority_ids, priority_clipped) =
-        priority_instructions(tx, request, exact_id, transferred, input_principal, policy)?;
+    let (priority, priority_ids, priority_clipped) = priority_instructions(
+        tx,
+        request,
+        exact_id,
+        transferred,
+        input_principal,
+        policy,
+        directive.is_some(),
+    )?;
     let mandatory_len = task_text.len() + task_note.len() + priority.len();
     if mandatory_len > MAX_HANDOFF_TASK_BYTES {
         return Err(Error::new(
@@ -344,6 +351,7 @@ fn priority_instructions(
     transferred: &[Command],
     principal: Option<&str>,
     policy: &core::SecretPolicy,
+    continues_task: bool,
 ) -> Result<(String, Vec<String>, bool)> {
     let mut rendered = String::new();
     let mut included = Vec::new();
@@ -429,6 +437,16 @@ fn priority_instructions(
         })?;
         let delivery = if transferred.iter().any(|send| send.id == id) {
             "\nA separate successor SEND will deliver this input. Wait for that SEND before acting on it."
+        } else if continues_task
+            && kind == 0
+            && matches!(
+                command.state,
+                CommandState::Accepted | CommandState::Queued | CommandState::Cancelled
+            )
+            && command.verb == "inject"
+            && command.args["point"] == "next_input"
+        {
+            "\nThe source generation did not receive this accepted next-input instruction. The brief carries it forward for the same task. Follow it when continuing, subject to any later applicable instruction."
         } else {
             ""
         };

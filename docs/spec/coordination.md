@@ -1240,7 +1240,9 @@ the private Git task record at `instructions.json`. At each handoff Swarm
 refreshes delivery states from matching retained Store commands. The brief
 includes the latest accepted instruction, with its body and delivery state,
 and any distinct delivered instruction whose turn is unfinished. If a separate
-successor SEND will deliver an item, its copy in the brief is context. Unknown
+successor SEND will deliver an item, its copy in the brief is context. A switch
+or restart brief carries the accepted next-input instruction when its native
+delivery is unavailable because the source generation ended. Unknown
 or dispatched inputs appear by ID and never include their text. Pending trusted
 review findings are quoted with their provenance within the review excerpt
 budget. A legacy record can show unavailable delivery evidence separately from
