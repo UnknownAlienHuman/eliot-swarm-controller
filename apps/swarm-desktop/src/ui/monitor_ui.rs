@@ -70,7 +70,7 @@ pub(super) struct MonitorState {
     refresh_gate: Arc<tokio::sync::Mutex<()>>,
     refreshing: bool,
     /// Refreshes in a row that reported read errors: the next waits longer.
-    failures: u32,
+    pace: live::Pace,
     /// The Agent whose details (and usage) each refresh reads.
     pub(super) selected: Option<String>,
     /// Rows whose children are shown (collapsed by default).
@@ -234,18 +234,18 @@ impl DesktopApp {
                         self.monitor.tree_started_ms = Some(snapshot.read_at_ms);
                     }
                     self.monitor.event_cursor = snapshot.event_cursor;
+                    let fleet = snapshot.fleet;
+                    let detail_failed = matches!(snapshot.detail, Some(Err(_)));
                     self.monitor.data.apply(*snapshot);
-                    // A refresh with errors asks whether the daemon runs
-                    // (itself paced) and waits longer before the next, with
-                    // the same growing pauses as every retry.
-                    let delay = if self.monitor.data.errors.is_empty() {
-                        self.monitor.failures = 0;
-                        monitor::PERIOD_MS
-                    } else {
-                        self.monitor.failures = self.monitor.failures.saturating_add(1);
+                    // A refresh with errors (the fleet's reads, or the
+                    // Details' own read when only they show) asks whether
+                    // the daemon runs (itself paced) and waits longer before
+                    // the next, with the same growing pauses as every retry.
+                    let failed = detail_failed || (fleet && !self.monitor.data.errors.is_empty());
+                    let delay = self.monitor.pace.next(!failed, monitor::PERIOD_MS);
+                    if failed {
                         self.link_suspect(context);
-                        live::backoff_ms(self.monitor.failures).max(monitor::PERIOD_MS)
-                    };
+                    }
                     // The next read waits on its own worker: a timer message
                     // would render the whole window for nothing.
                     self.read_monitor(delay, context);
@@ -942,6 +942,18 @@ impl DesktopApp {
                 page_ui::error_line(
                     palette,
                     format!("Some reads failed: {}", data.errors.join("; ")),
+                ),
+            ));
+        }
+        if !data.row_notes.is_empty() {
+            items.push(KeyedView::new(
+                "row-notes",
+                page_ui::error_line(
+                    palette,
+                    format!(
+                        "Some rows were not read whole: {}",
+                        data.row_notes.join("; ")
+                    ),
                 ),
             ));
         }

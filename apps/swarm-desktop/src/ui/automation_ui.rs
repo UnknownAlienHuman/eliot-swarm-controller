@@ -1120,7 +1120,9 @@ fn timer_run_action(
     };
     let parent = if retained {
         match client::block_on(client::read_command(data_dir, &id)).and_then(|parent| {
-            request.validate_response(&parent)?;
+            request
+                .validate_response(&parent)
+                .map_err(|error| client::invalid_reply("timer.run", &error.message))?;
             Ok(parent)
         }) {
             Ok(parent) => Some(parent),

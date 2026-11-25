@@ -55,7 +55,7 @@ pub(super) struct LinkState {
     /// Probes in a row that found the daemon running after a failed read,
     /// and the earliest next one: repeated failing reads ask it with the
     /// same growing pauses as every other retry.
-    strikes: u32,
+    pace: live::Pace,
     quiet_until: Option<std::time::Instant>,
     /// The start in flight: superseded starts are cancelled, and the
     /// window's close cancels it before it starts a daemon.
@@ -124,13 +124,25 @@ impl DesktopApp {
         self.spawn_probe(context);
     }
 
-    /// While its Owner keeps it stopped, the list's cadence asks whether a
-    /// daemon was started elsewhere (CLI, update) and reconnects to it.
-    /// Asking never starts one.
+    /// While its Owner keeps it stopped, or after a start found no daemon
+    /// answering (the restarts gave up, or the first start failed that
+    /// way), the list's cadence asks whether a daemon was started elsewhere
+    /// (CLI, update, another window) and reconnects to it. Asking never
+    /// starts one; a start that failed for another reason (its
+    /// configuration, its identity) waits for the owner's Retry.
     pub(super) fn link_watch(&mut self, context: &ComponentContext<Self>) {
-        if self.link.stopped && !self.link.probing {
+        if self.link_watched() && !self.link.probing {
             self.spawn_probe(context);
         }
+    }
+
+    /// The daemon screen asks whether a daemon runs again.
+    fn link_watched(&self) -> bool {
+        self.link.stopped
+            || self
+                .startup_error
+                .as_ref()
+                .is_some_and(|error| eliot_daemon::startup::retryable(&error.code))
     }
 
     fn spawn_probe(&mut self, context: &ComponentContext<Self>) {
@@ -155,8 +167,8 @@ impl DesktopApp {
     pub(super) fn link_probed(&mut self, probe: Probe, context: &ComponentContext<Self>) {
         self.link.probing = false;
         let held = self.link.held.take();
-        if self.link.stopped {
-            if probe == Probe::Running {
+        if self.link_view_shown() {
+            if probe == Probe::Running && self.link_watched() {
                 self.retry_startup(context);
             }
             return;
@@ -166,11 +178,9 @@ impl DesktopApp {
         }
         match probe {
             Probe::Running => {
-                self.link.strikes = self.link.strikes.saturating_add(1);
-                self.link.quiet_until = Some(
-                    std::time::Instant::now()
-                        + std::time::Duration::from_millis(live::backoff_ms(self.link.strikes)),
-                );
+                let pause = self.link.pace.fail(0);
+                self.link.quiet_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(pause));
                 if let Some(text) = held {
                     self.alert(text);
                 }
@@ -515,6 +525,13 @@ impl DesktopApp {
                         .on_click(shell(ShellMsg::RetryStartup))
                         .content(with_icon(m3::glyph::RESUME, "Start Swarm")),
                 ))
+        } else if self.link.gave_up {
+            // Swarm ran and stopped: starting it is the main action.
+            m3::filled(palette)
+                .horizontal_alignment(HorizontalAlignment::Center)
+                .automation_name("Start Swarm: start it again on this data directory")
+                .on_click(shell(ShellMsg::RetryStartup))
+                .content(with_icon(m3::glyph::RESUME, "Start Swarm"))
         } else {
             m3::filled(palette)
                 .horizontal_alignment(HorizontalAlignment::Center)

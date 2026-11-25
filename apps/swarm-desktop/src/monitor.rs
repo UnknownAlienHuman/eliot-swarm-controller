@@ -1090,6 +1090,9 @@ pub struct MonitorSnapshot {
     pub fleet: bool,
     /// The event cursor the next wait starts from.
     pub event_cursor: Option<i64>,
+    /// Fleet rows shown without their observation or left out, and why
+    /// (the other rows still update).
+    pub row_notes: Vec<String>,
 }
 
 /// One monitor section: its top-level rows (each with its nested
@@ -1322,6 +1325,9 @@ pub struct Monitor {
     pub detail_errors: Vec<String>,
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
+    /// The last fleet read's rows shown without their observation or left
+    /// out, and why: said, not a failed read.
+    pub row_notes: Vec<String>,
     pub refreshes: u64,
     /// The Agents tab's tree of the open task.
     pub tree: TreeRead,
@@ -1554,6 +1560,9 @@ impl Monitor {
             None => {}
         }
         self.take_fleet(&snapshot.groups, &snapshot.counts, snapshot.read_at_ms);
+        if snapshot.groups.iter().all(|(_, page)| page.is_ok()) {
+            self.row_notes = snapshot.row_notes;
+        }
         if let Some(detail) = snapshot.detail {
             self.take_detail(detail, snapshot.read_at_ms);
         }
@@ -1712,7 +1721,7 @@ fn id_order(a: &str, b: &str) -> std::cmp::Ordering {
 type ReadFuture<'a> = Pin<Box<dyn Future<Output = Read> + 'a>>;
 
 enum Read {
-    Fleet(Result<AgentListResponse, String>),
+    Fleet(Result<(AgentListResponse, Vec<String>), String>),
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
@@ -1794,18 +1803,17 @@ fn fleet_request() -> AgentListRequest {
     }
 }
 
-/// Adapt one validated fleet page into the existing model input. Totals keep
-/// row/byte truncation visible even when an entire state's rows are outside
-/// the page. Stopped rows and attention retain their independent cadence.
-fn take_fleet(snapshot: &mut MonitorSnapshot, page: Result<AgentListResponse, String>) {
-    let page = page.and_then(|page| {
-        fleet_request()
-            .validate_response(&page)
-            .map_err(|error| error.to_string())?;
-        Ok(page)
-    });
+/// Adapt one fleet page, checked row by row ([`client::list_agents_by_row`]),
+/// into the existing model input. Totals keep row/byte truncation visible
+/// even when an entire state's rows are outside the page. Stopped rows and
+/// attention retain their independent cadence.
+fn take_fleet(
+    snapshot: &mut MonitorSnapshot,
+    page: Result<(AgentListResponse, Vec<String>), String>,
+) {
     match page {
-        Ok(page) => {
+        Ok((page, notes)) => {
+            snapshot.row_notes = notes;
             let totals = page.state_totals.as_ref().expect("validated state totals");
             for state in ROW_STATES {
                 let agents: Vec<_> = page
@@ -1917,7 +1925,7 @@ pub async fn refresh(
                 return Read::Cancelled;
             }
             Read::Fleet(
-                client::list_agents(data_dir, &fleet_request())
+                client::list_agents_by_row(data_dir, &fleet_request())
                     .await
                     .map_err(|error| error.to_string()),
             )
@@ -2014,6 +2022,7 @@ pub async fn refresh(
         read_at_ms,
         fleet,
         event_cursor: None,
+        row_notes: Vec::new(),
     };
     if cancelled() || results.iter().any(|read| matches!(read, Read::Cancelled)) {
         return None;

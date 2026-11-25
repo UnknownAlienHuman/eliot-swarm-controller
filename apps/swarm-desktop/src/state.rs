@@ -203,11 +203,15 @@ impl MutationLedger {
 }
 
 /// Whether a failed submission left its outcome uncertain (lost reply,
-/// daemon unavailable). Only then may the same mutation id be reused by a
-/// retry; a definite refusal ends that action, and nothing ever retries with
-/// a new id on its own.
+/// daemon unavailable, or a reply that did not match the request, which
+/// proves nothing about what the daemon did). Only then may the same
+/// mutation id be reused by a retry; a definite refusal ends that action,
+/// and nothing ever retries with a new id on its own.
 pub fn uncertain(error: &eliot_core::Error) -> bool {
-    matches!(error.code.as_str(), "unknown" | "unavailable")
+    matches!(
+        error.code.as_str(),
+        "unknown" | "unavailable" | crate::live::INVALID_REPLY
+    )
 }
 
 /// A read's `code: message` error in plain words: a busy daemon says so,

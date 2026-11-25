@@ -244,6 +244,26 @@ pub(super) enum ShellMsg {
     SidebarToggled,
 }
 
+impl ShellMsg {
+    /// A sidebar refresh's reply that failed to read (its next refresh
+    /// waits longer).
+    fn read_failed(&self) -> bool {
+        use super::inbox_ui::InboxMsg;
+        match self {
+            Self::HeadLoaded(_, page)
+            | Self::AttentionLoaded(_, page)
+            | Self::SearchLoaded(_, _, _, page) => page.is_err(),
+            Self::AttentionReports(_, read) => read.is_err(),
+            Self::OrganizationLoaded(read) => read.stale,
+            Self::QueueLoaded(read) => !read.errors.is_empty(),
+            Self::PolicyUsageLoaded(read) => read.is_err(),
+            Self::Inbox(InboxMsg::Status(read)) => read.is_err(),
+            Self::Inbox(InboxMsg::Loaded(_, read)) => read.is_err(),
+            _ => false,
+        }
+    }
+}
+
 /// Re-check for the empty editor render one frame later.
 const PRIME_RETRY_MS: u64 = 16;
 /// The sidebar's padding around its rows.
@@ -362,6 +382,9 @@ pub(super) struct ShellState {
     pub(super) found: Found,
     /// Ctrl+N and Ctrl+K from the window's keyboard hook.
     pub(super) shortcuts: Option<Arc<Mutex<Receiver<Shortcut>>>>,
+    /// Sidebar refreshes in a row with a failed read (or with no daemon
+    /// answering): each waits longer, a clean one starts over.
+    pub(super) pace: live::Pace,
     /// The sidebar is hidden to its rail (this session).
     pub(super) sidebar_collapsed: bool,
     /// The places visited, for Back and Forward.
@@ -471,7 +494,7 @@ impl DesktopApp {
                         });
                     }
                     if first_connection {
-                        self.watch_list(context);
+                        self.watch_list(LIST_REFRESH_MS, context);
                     } else {
                         // Reconnected: the open conversation and the panel
                         // (the Monitor or the details, one refresh chain)
@@ -680,9 +703,14 @@ impl DesktopApp {
                 }
             }
             ShellMsg::Refreshed(replies) => {
+                // One sidebar refresh replied: the next one comes a cadence
+                // later, or later still after rounds with a failed read.
+                let failed = replies.iter().any(ShellMsg::read_failed);
                 for reply in replies {
                     self.shell_update(reply, context);
                 }
+                let delay = self.nav.pace.next(!failed, LIST_REFRESH_MS);
+                self.watch_list(delay, context);
             }
             ShellMsg::Inbox(msg) => self.inbox_update(msg, context),
             ShellMsg::AttentionReports(cursor, read) => {
@@ -858,7 +886,7 @@ impl DesktopApp {
                     self.ensure_catalog(context);
                 }
                 if self.chat.convo.is_some() {
-                    self.chat.failures = 0;
+                    self.chat.pace.reset();
                     self.start_snapshot(context);
                 }
             }
@@ -1163,11 +1191,15 @@ impl DesktopApp {
                 // its own worker, so the grouping reads never delay an
                 // arbiter's admission or refusal.
                 // Every message renders the whole window (k209), so the
-                // refresh's reads reply together, as one message. While no
-                // daemon answers, the restart owns the connection attempts.
+                // refresh's reads reply together, as one message, and the
+                // next refresh is planned when they did. While no daemon
+                // answers, the restart owns the connection attempts; the
+                // daemon screen only asks whether one runs again, each
+                // round waiting longer (one ask per 15 s at most).
                 if self.daemon_down() {
                     self.link_watch(context);
-                    self.watch_list(context);
+                    let delay = self.nav.pace.fail(LIST_REFRESH_MS);
+                    self.watch_list(delay, context);
                     return;
                 }
                 if self.main == Main::Project {
@@ -1198,7 +1230,9 @@ impl DesktopApp {
                     self.read_inbox(context);
                 }
                 let reads = self.nav.batch.take().unwrap_or_default();
-                if !reads.is_empty() {
+                if reads.is_empty() {
+                    self.watch_list(LIST_REFRESH_MS, context);
+                } else {
                     let _task = context.spawn_background(move |_| {
                         let replies = std::thread::scope(|scope| {
                             let running: Vec<_> =
@@ -1211,7 +1245,6 @@ impl DesktopApp {
                         Message::Shell(ShellMsg::Refreshed(replies))
                     });
                 }
-                self.watch_list(context);
             }
             ShellMsg::FieldsPrimed(epoch) => {
                 if epoch != self.prime_epoch {
@@ -1865,11 +1898,18 @@ impl DesktopApp {
         });
     }
 
-    /// The next sidebar refresh, one cadence from now.
-    pub(super) fn watch_list(&self, context: &ComponentContext<Self>) {
-        let _task = context.spawn_background(|cancel| {
+    /// The next sidebar refresh, `delay_ms` from now. Nothing is read while
+    /// the window is minimized or hidden (checked locally, as the Monitor
+    /// does); the first refresh after it shows again is immediate.
+    pub(super) fn watch_list(&self, delay_ms: u64, context: &ComponentContext<Self>) {
+        let _task = context.spawn_background(move |cancel| {
             let cancelled = || cancel.is_cancelled();
-            let _ = feed::backoff(LIST_REFRESH_MS, &cancelled);
+            let _ = feed::backoff(delay_ms, &cancelled);
+            while crate::window_place::hidden() {
+                if !feed::backoff(monitor::HIDDEN_CHECK_MS, &cancelled) {
+                    break;
+                }
+            }
             Message::Shell(ShellMsg::ListTick)
         });
     }
@@ -2030,15 +2070,7 @@ impl DesktopApp {
                         let request = eliot_core::api::ProjectDiscoverRequest {
                             workspace: workspace.to_string_lossy().into_owned(),
                         };
-                        request.validate()?;
-                        let reply: eliot_core::api::ProjectDiscoverResponse =
-                            eliot_daemon::client_call_typed(
-                                &data_dir,
-                                "project.discover",
-                                &request,
-                            )
-                            .await?;
-                        request.validate_response(&reply)?;
+                        let reply = client::call(&data_dir, &request).await?;
                         discovered = reply.project.map(|project| project.checkout);
                     }
                     let read = config_client::read_settings(&data_dir).await?;

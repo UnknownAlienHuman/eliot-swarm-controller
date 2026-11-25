@@ -476,6 +476,16 @@ fn part_view(
         // Codex…"): its words and the wave.
         PartKind::Working => StackPanel::new().spacing(tokens::spacing::XS).children((
             label(&part.label),
+            // Why the check of its outcome failed, when it did.
+            if part.detail.is_empty() {
+                View::empty()
+            } else {
+                label(&part.detail.join(" · "))
+                    .foreground(palette.attention())
+                    .text_wrapping(TextWrapping::Wrap)
+                    .is_text_selection_enabled(true)
+                    .into()
+            },
             ProgressBar::new()
                 .is_indeterminate(true)
                 .width(tokens::layout::PROGRESS_WIDTH)

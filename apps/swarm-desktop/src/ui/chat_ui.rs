@@ -400,7 +400,9 @@ pub(super) struct ChatState {
     pub(super) depth: Depth,
     pub(super) live: LiveStatus,
     pub(super) live_task: Option<ComponentTask>,
-    pub(super) failures: u32,
+    /// Failed reads in a row of the open conversation (snapshot, feed and
+    /// rereads): each waits longer, a success starts over.
+    pub(super) pace: live::Pace,
     pub(super) reread_inflight: bool,
     pub(super) invalidated: Invalidation,
     pub(super) docs: HashMap<u64, Doc>,
@@ -415,6 +417,8 @@ pub(super) struct ChatState {
     pub(super) waiting_label: Option<String>,
     /// A read of the waiting inputs' outcomes is running.
     pub(super) inputs_checking: bool,
+    /// Failed checks of the waiting inputs in a row.
+    pub(super) inputs_pace: live::Pace,
     /// Launches from this window: the Agent, its first input and what was
     /// submitted, so Retry of a start that did not happen starts it again.
     pub(super) launches: HashMap<String, (String, Submitted)>,
@@ -578,7 +582,7 @@ impl DesktopApp {
                     Ok(snapshot) => {
                         let snapshot = *snapshot;
                         let first_load = self.chat.items.is_empty();
-                        self.chat.failures = 0;
+                        self.chat.pace.reset();
                         self.chat.docs.extend(snapshot.docs);
                         self.chat.detail = Some(detail_from(&snapshot.detail));
                         self.show_control_failure();
@@ -629,18 +633,13 @@ impl DesktopApp {
                         self.queue_reread(Invalidation::default(), context);
                     }
                     Err(error) => {
-                        let next = live::after_error(&error, self.chat.failures);
+                        let next = live::after_error(&error);
                         self.set_status(format!("History read failed: {}", error.user_message()));
                         match next {
                             // A snapshot that cannot read its own window retries later.
-                            Next::Resnapshot { reason } => self.follow_next(
-                                Next::Backoff {
-                                    delay_ms: live::backoff_ms(self.chat.failures),
-                                    attempt: self.chat.failures + 1,
-                                    reason,
-                                },
-                                context,
-                            ),
+                            Next::Resnapshot { reason } => {
+                                self.follow_next(Next::Backoff { reason }, context)
+                            }
                             other => self.follow_next(other, context),
                         }
                     }
@@ -654,7 +653,7 @@ impl DesktopApp {
                     Ok(None) => {}
                     Ok(Some(delivery)) => {
                         let delivery = *delivery;
-                        self.chat.failures = 0;
+                        self.chat.pace.reset();
                         self.chat.docs.extend(delivery.docs);
                         let mut resnapshot = false;
                         if let Some(convo) = self.chat.convo.as_mut() {
@@ -681,7 +680,7 @@ impl DesktopApp {
                         self.follow_next(next, context);
                     }
                     Err(error) => {
-                        let next = live::after_error(&error, self.chat.failures);
+                        let next = live::after_error(&error);
                         self.follow_next(next, context);
                     }
                 }
@@ -700,7 +699,7 @@ impl DesktopApp {
                 match result {
                     Ok(reread) => {
                         let reread = *reread;
-                        self.chat.failures = 0;
+                        self.chat.pace.reset();
                         self.chat.docs.extend(reread.docs);
                         if let Some(detail) = reread.detail.as_ref() {
                             self.chat.detail = Some(detail_from(detail));
@@ -729,8 +728,7 @@ impl DesktopApp {
                         ));
                         self.chat.invalidated.merge(work);
                         // Each failure in a row waits longer (#826).
-                        let delay = live::backoff_ms(self.chat.failures);
-                        self.chat.failures = self.chat.failures.saturating_add(1);
+                        let delay = self.chat.pace.fail(0);
                         self.link_suspect(context);
                         let _task = context.spawn_background(move |cancel| {
                             let cancelled = || cancel.is_cancelled();
@@ -778,19 +776,35 @@ impl DesktopApp {
                 }
                 self.chat.inputs_checking = false;
                 let mut pending = false;
+                // A read that failed is said under the waiting input (#826)
+                // and the next check waits longer; a check that read every
+                // command starts over at the normal pause.
+                let mut error = None;
                 if let Some(convo) = self.chat.convo.as_mut() {
                     for (command, result) in results {
                         match result {
                             Ok(Some(failure)) => convo.set_local_failure(&command, failure),
-                            Ok(None) | Err(_) => pending = true,
+                            Ok(None) => pending = true,
+                            Err(failed) => {
+                                pending = true;
+                                error = Some(failed);
+                            }
                         }
                     }
+                    convo.set_wait_error(error.clone());
                 }
                 self.rebuild_items();
+                let delay = self
+                    .chat
+                    .inputs_pace
+                    .next(error.is_none(), INPUT_RECHECK_MS);
+                if error.is_some() {
+                    self.link_suspect(context);
+                }
                 if pending {
                     let _task = context.spawn_background(move |cancel| {
                         let cancelled = || cancel.is_cancelled();
-                        let _ = feed::backoff(INPUT_RECHECK_MS, &cancelled);
+                        let _ = feed::backoff(delay, &cancelled);
                         Message::Chat(ChatMsg::InputsRecheck(epoch))
                     });
                 }

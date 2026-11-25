@@ -1140,10 +1140,17 @@ impl DesktopApp {
     }
 
     /// The live line under the header (5.2.1): "Reconnecting…", "Catching
-    /// up…" or "Live updates stopped" with Retry.
+    /// up…" or "Live updates stopped" with Retry. After a few failed
+    /// reconnects in a row it says Swarm is not answering and offers Start
+    /// Swarm (the startup path on this data directory, which starts a
+    /// daemon only when none answers); the feed keeps retrying meanwhile.
     pub(super) fn live_line(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let start = self.chat.live.offers_start();
         let (words, retry) = match &self.chat.live {
             LiveStatus::Stale(_) => ("Catching up…".to_owned(), false),
+            LiveStatus::Reconnecting { attempt, .. } if start => {
+                (format!("Swarm is not answering (attempt {attempt})"), false)
+            }
             LiveStatus::Reconnecting { attempt, .. } => (format!("Reconnecting {attempt}…"), false),
             LiveStatus::Stopped(reason) => (format!("Live updates stopped: {reason}"), true),
             _ => return View::empty(),
@@ -1163,6 +1170,11 @@ impl DesktopApp {
                         .automation_name("Retry live updates")
                         .on_click(context.message(Message::Chat(ChatMsg::LiveRetry)))
                         .content(m3::label("Retry"))
+                } else if start {
+                    m3::text_button(palette)
+                        .automation_name("Start Swarm")
+                        .on_click(context.message(Message::Shell(ShellMsg::RetryStartup)))
+                        .content(m3::label("Start Swarm"))
                 } else {
                     View::empty()
                 },

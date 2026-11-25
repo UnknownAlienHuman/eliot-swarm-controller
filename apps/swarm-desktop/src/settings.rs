@@ -370,11 +370,9 @@ impl Preferences {
 
 pub async fn read(data_dir: &Path) -> eliot_core::Result<SettingsReadResponse> {
     let request = SettingsReadRequest::default();
-    request.validate()?;
     let mut consistent = None;
     for attempt in 0..2 {
-        let reply = eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
-        request.validate_response(&reply)?;
+        let reply = crate::client::call(data_dir, &request).await?;
         let source = read_config_source(data_dir)?;
         if source.as_deref().map(source_revision) == reply.revision {
             consistent = Some((reply, source));
@@ -416,17 +414,9 @@ pub async fn read(data_dir: &Path) -> eliot_core::Result<SettingsReadResponse> {
             // The unified file is authoritative now. If deleting the legacy file
             // fails, the next read sees [desktop] and will not import it again.
             let _ = retire_legacy(&legacy_path, saved.saved);
-            let current =
-                eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
-            request.validate_response(&current)?;
-            Ok(current)
+            crate::client::call(data_dir, &request).await
         }
-        Err(error) if error.code == "conflict" => {
-            let current =
-                eliot_daemon::client_call_typed(data_dir, "settings.read", &request).await?;
-            request.validate_response(&current)?;
-            Ok(current)
-        }
+        Err(error) if error.code == "conflict" => crate::client::call(data_dir, &request).await,
         Err(error) => Err(error),
     }
 }
@@ -622,9 +612,7 @@ pub async fn save(
     data_dir: &Path,
     request: &SettingsSaveRequest,
 ) -> eliot_core::Result<SettingsSaveResponse> {
-    request.validate()?;
-    let reply = eliot_daemon::client_call_typed(data_dir, "settings.save", request).await?;
-    request.validate_response(&reply)?;
+    let reply = crate::client::call(data_dir, request).await?;
     Ok(reply)
 }
 
