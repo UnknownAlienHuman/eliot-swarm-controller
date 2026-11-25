@@ -378,6 +378,8 @@ explicit authority from the Owner for the task. Set
 Nonblank custom text supplies the complete shared instruction.
 `settings.read` shows the configured settings and their revision.
 A launch freezes the revision and SHA-256 of the effective text before native dispatch.
+The built-in rule stays frozen for that Agent until it is relaunched, even if
+`default_commit_only` later changes.
 Queued launches use the rules available when they start. A resume reuses the
 retained digest, and a legacy Agent can capture the current setting when explicitly
 reopened. The built-in rule remains available for Agents that froze it before an
@@ -386,6 +388,12 @@ from settings. If the custom text changes before delivery or native reopen, the
 operation reports that the retained rules are unavailable. Settings saves reject values detected by the secret policy, redaction
 markers, and common credential forms such as bearer tokens and private keys. The
 same validation applies to text read for delivery.
+
+`settings.read` includes `default_commit_only` in the `owner_rules` section only
+when it is explicitly configured, preserving the distinction between an unset
+value and explicit `true` or `false`. `settings.save` accepts and writes that
+field alongside `text`. Clients editing only the text must carry the complete
+read section forward. An unchanged rules save therefore keeps the setting.
 
 The Agent's Store record contains delivery metadata. `agent.get` and
 `swarm show` expose revision, digest, delivery method, status and delivered flag.
