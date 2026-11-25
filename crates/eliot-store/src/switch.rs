@@ -1601,12 +1601,7 @@ impl Store {
                     now,
                     false,
                 )?;
-                Self::settle_automatic_handoff_attempt_tx(
-                    &tx,
-                    id,
-                    CommandState::Rejected,
-                    now,
-                )?;
+                Self::settle_automatic_handoff_attempt_tx(&tx, id, CommandState::Rejected, now)?;
                 recovery::release_rejected_switch_fence_tx(&tx, &command, now)?;
                 events.extend(settled.events);
                 commit_transaction(tx, &self.write_faulted)?;
@@ -2858,12 +2853,13 @@ fn consume_switch_child_id(
     child_id: &str,
     kind: &str,
 ) -> Result<()> {
-    let changed = tx.execute(
-        "DELETE FROM switch_child_id_reservations
+    let changed = tx
+        .execute(
+            "DELETE FROM switch_child_id_reservations
          WHERE id=?1 AND switch_command=?2 AND kind=?3",
-        params![child_id, switch_id, kind],
-    )
-    .map_err(sql_error)?;
+            params![child_id, switch_id, kind],
+        )
+        .map_err(sql_error)?;
     if changed != 1 {
         let ordinal = if kind == "launch" { 0 } else { 1 };
         if component(tx, switch_id, child_id, ordinal)?.is_none() {
