@@ -197,7 +197,6 @@ pub mod layout {
     pub const DOT_WAIT: f64 = 8.0;
     pub const DOT_IDLE: f64 = 6.0;
     pub const LOADER_SMALL: f64 = 12.0;
-    pub const ROW_RING: f64 = 18.0;
     /// A worker row's indent past its manager's mark.
     pub const KID_INDENT: f64 = MARK_SLOT + super::spacing::SM;
     pub const LABEL_WIDTH: f64 = 200.0;

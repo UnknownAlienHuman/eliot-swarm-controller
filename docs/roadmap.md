@@ -962,8 +962,10 @@ of the explicitly selected release scope.
       shows its reason by its field. No text box offers Windows text
       prediction. Enter sends and Shift+Enter keeps the line break (the window
       hook marks the line break Enter typed); one Send steers the active turn
-      while one runs and, after a definite `bad_state`/`stale_generation`/
-      `unsupported` refusal, goes as the next message with one line saying so.
+      while one runs; a refused steer (at admission, or `captured_turn_ended`
+      when the turn ends before a safe point) is never sent on by itself: its
+      text goes back to the composer with the refusal in words, and Send
+      sends it as the next message.
       The message shows at once with "Sending…"/"Starting Codex…" until its
       turn starts. Right-click menus on projects and subprojects (New task
       here, Open folder, Rename, Collapse/Expand, Archive finished tasks,

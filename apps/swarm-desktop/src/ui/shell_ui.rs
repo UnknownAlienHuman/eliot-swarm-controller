@@ -530,6 +530,14 @@ impl DesktopApp {
                 if read.stale {
                     self.link_suspect(context);
                 }
+                // Changes were lost: one whole read of the projects (none
+                // when one is in flight, its reply is as new) and the rows.
+                if read.history_gap {
+                    if self.nav.project_reads == 0 {
+                        self.load_projects(context);
+                    }
+                    self.load_agents(context, None);
+                }
             }
             ShellMsg::QueueLoaded(read) => {
                 self.nav.queue_loading = false;
@@ -2567,7 +2575,7 @@ impl DesktopApp {
     /// search's matches flat in their projects, the owner's names, the
     /// Monitor's reports and each row's age and work line, read now.
     fn sidebar_input(&self, context: &mut ViewContext<Self>) -> SidebarInput {
-        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
+        let fleet = Fleet::of_totals(self.nav.list_totals.as_deref());
         let query = self.nav.search.query.trim().to_owned();
         let checkouts = self.checkouts();
         let filtered = !query.is_empty();
@@ -2689,8 +2697,13 @@ impl DesktopApp {
                 .then(|| (format!("Show more ({loaded} of {total})"), !reading)),
             show_archived: self.nav.show_archived,
             agents: AgentsEntry {
-                line: fleet.compact(self.nav.agents_total, self.nav.archived),
-                summary: fleet.summary(self.nav.agents_total, self.nav.archived),
+                line: fleet.map_or_else(String::new, |fleet| {
+                    fleet.compact(self.nav.agents_total, self.nav.archived)
+                }),
+                summary: fleet.map_or_else(
+                    || "counts not read yet".to_owned(),
+                    |fleet| fleet.summary(self.nav.agents_total, self.nav.archived),
+                ),
                 open: self.main == Main::Agents,
             },
             inbox: InboxEntry {
@@ -2749,8 +2762,12 @@ impl DesktopApp {
     /// Settings.
     fn rail_view(&self, context: &mut ViewContext<Self>) -> View {
         let pad = SIDEBAR_PADDING;
-        let fleet = Fleet::of(&self.nav.agents, |agent| self.reported(agent).is_some());
-        let summary = fleet.summary(self.nav.agents_total, self.nav.archived);
+        let fleet = Fleet::of_totals(self.nav.list_totals.as_deref());
+        let summary = fleet.map_or_else(
+            || "counts not read yet".to_owned(),
+            |fleet| fleet.summary(self.nav.agents_total, self.nav.archived),
+        );
+        let fleet = fleet.unwrap_or_default();
         let tone = if fleet.attention > 0 {
             Some(StatusTone::Attention)
         } else if fleet.running > 0 {

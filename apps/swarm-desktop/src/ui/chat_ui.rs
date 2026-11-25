@@ -185,12 +185,6 @@ const FOLLOW_DELAY_MS: u64 = 60;
 /// The transcript viewer's automation id.
 const TRANSCRIPT_ID: &str = "ConversationTranscript";
 
-/// Admission refusals of a steer after which the text goes as the next
-/// message: the turn ended or changed (`bad_state`, `stale_generation`), or
-/// the harness has no native steering (`unsupported`). Each is definite; an
-/// uncertain steer is never followed by a send.
-const STEER_FALLBACK: [&str; 3] = ["bad_state", "stale_generation", "unsupported"];
-
 /// Bound on retained unresolved-submission snapshots (one per Agent): beyond
 /// this, another Agent's entry is evicted to make room for the live one.
 const MAX_PENDING_RETRIES: usize = 16;
@@ -281,7 +275,7 @@ pub(super) fn enter_send_text(previous: &str, text: &str) -> Option<String> {
 }
 
 /// A draft submission that did not go through: the error, its code, and
-/// what was submitted (to give the text back or send it after a steer).
+/// what was submitted (to give the text back).
 #[derive(Clone, Debug)]
 pub(super) struct SendFailure {
     pub(super) error: eliot_core::Error,
@@ -290,7 +284,6 @@ pub(super) struct SendFailure {
     pub(super) text: String,
     pub(super) revision: u64,
     pub(super) action: DraftAction,
-    pub(super) fallback: bool,
 }
 
 impl SendFailure {
@@ -301,7 +294,6 @@ impl SendFailure {
         text: &str,
         revision: u64,
         action: &DraftAction,
-        fallback: bool,
     ) -> Self {
         Self {
             error: error.clone(),
@@ -310,7 +302,6 @@ impl SendFailure {
             text: text.to_owned(),
             revision,
             action: action.clone(),
-            fallback,
         }
     }
 }
@@ -380,8 +371,7 @@ pub(super) struct DecisionFacts {
 /// An unconfirmed submission kept with the draft: the exact action, body,
 /// mutation id and ledger key to retry. The next identical Send reuses this
 /// snapshot instead of rederiving identity, which could admit a second
-/// effect after a fallback `send:...:after-steer` submission whose response
-/// was lost.
+/// effect.
 #[derive(Clone, Debug)]
 pub(super) struct PendingRetry {
     pub(super) action: DraftAction,
@@ -389,7 +379,6 @@ pub(super) struct PendingRetry {
     pub(super) revision: u64,
     pub(super) mutation_id: String,
     pub(super) ledger_key: String,
-    pub(super) fallback: bool,
 }
 
 /// Reuse the unresolved snapshot for this Agent when the draft revision
@@ -449,6 +438,8 @@ pub(super) struct ChatState {
     /// Retry (or the next identical Send) instead of rederiving a fresh
     /// mutation id. Bounded, and abandoned on draft edits and Agent removal.
     pub(super) pending_retry: HashMap<String, PendingRetry>,
+    /// The steers this window submitted, kept until settled.
+    pub(super) steers_sent: crate::chat::SentSteers,
     pub(super) answers: HashMap<String, eliot_core::requests::Answers>,
     /// The Force stop awaiting confirmation, bound at its menu click, with
     /// the title shown in the question.
@@ -562,7 +553,6 @@ impl DesktopApp {
             snapshot.text,
             snapshot.revision,
             blank,
-            snapshot.fallback,
             context,
         );
     }
@@ -645,6 +635,9 @@ impl DesktopApp {
                             });
                         }
                         self.rebuild_items();
+                        // A refusal of this window's steer found on coming
+                        // back puts its text back now.
+                        self.report_refused_steers();
                         // After the history is in place: the panel's read
                         // looks at its unconfirmed turns (a restart showed
                         // no Resolve card when this ran on the empty one).
@@ -706,6 +699,7 @@ impl DesktopApp {
                                 self.queue_reread(invalidation, context);
                             }
                         }
+                        self.report_refused_steers();
                         let next = if resnapshot {
                             Next::Resnapshot {
                                 reason: "a new run started".to_owned(),
@@ -1006,7 +1000,7 @@ impl DesktopApp {
                     abandon_retry(&mut self.chat.pending_retry, &mut self.ledger, &agent_id);
                 }
                 let retry = draft_retry(self.chat.pending_retry.get(&agent_id), revision);
-                let (action, text, key, mutation_id, fallback) = match retry {
+                let (action, text, key, mutation_id) = match retry {
                     Some(snapshot) => {
                         // The ledger still holds this key (an uncertain
                         // outcome never releases it), so the snapshot id is
@@ -1018,13 +1012,12 @@ impl DesktopApp {
                             snapshot.text,
                             snapshot.ledger_key,
                             snapshot.mutation_id,
-                            snapshot.fallback,
                         )
                     }
                     None => {
                         let key = action.key(revision);
                         let mutation_id = self.ledger.id_for(&key);
-                        (action, text, key, mutation_id, false)
+                        (action, text, key, mutation_id)
                     }
                 };
                 let blank = text.trim().is_empty();
@@ -1055,21 +1048,12 @@ impl DesktopApp {
                 }
                 self.rebuild_items();
                 self.follow_latest(true, context);
-                self.spawn_draft(
-                    action,
-                    mutation_id,
-                    key,
-                    text,
-                    revision,
-                    blank,
-                    fallback,
-                    context,
-                );
+                self.spawn_draft(action, mutation_id, key, text, revision, blank, context);
             }
             ChatMsg::RetryPending(agent) => {
                 self.retry_pending(&agent, context);
             }
-            ChatMsg::SendSubmitted(outcome) => self.send_submitted(outcome, context),
+            ChatMsg::SendSubmitted(outcome) => self.send_submitted(outcome),
             ChatMsg::InterruptRequested(bound) => {
                 let turn = bound.turn.clone().unwrap_or_default();
                 let key = format!("interrupt:{}:{}:{turn}", bound.agent, bound.generation);

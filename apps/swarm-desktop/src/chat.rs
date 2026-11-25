@@ -71,6 +71,12 @@ pub const CHAT_KINDS: &[&str] = &[
     "command.accepted",
     // A delivered Swarm note (an `inject` command) settles here.
     "command.applied",
+    // A steer the turn did not take (it ended before a safe point).
+    "command.rejected",
+    // The daemon changed the Agent's Goal (a round's outcome, a pause on
+    // stop or a block): the header and the Goal dialog read it again.
+    "goal.round",
+    "goal.changed",
     // A mail delivery to the Agent (bodyless): an inline mail notice's
     // text is redacted in its command, so its mails are read by delivery.
     "mail.delivered",
@@ -191,6 +197,8 @@ enum Activity {
         command: String,
         /// When the daemon accepted it (its event time).
         at: i64,
+        /// Why the turn did not take it, once the daemon refused it.
+        refused: Option<String>,
     },
     /// A Swarm note (an `inject` command) delivered into this turn, and
     /// whether a project rule caused it (its frame then names the rule).
@@ -994,6 +1002,93 @@ pub struct Conversation {
     /// The Agent's mail deliveries seen in its events, newest last
     /// (bounded by [`MAX_DELIVERIES`]).
     deliveries: VecDeque<String>,
+    /// Commands refused since the last [`Conversation::take_settled`].
+    refused: Vec<RefusedCommand>,
+    /// Commands applied since the last [`Conversation::take_settled`].
+    applied: Vec<String>,
+}
+
+/// A command the daemon refused: its id, why, whether a steer row in its
+/// turn shows it, and whether it arrived live rather than in a snapshot's
+/// history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedCommand {
+    pub command: String,
+    pub reason: String,
+    pub steer: bool,
+    pub live: bool,
+}
+
+/// The text of each steer this window submitted, by its command id (the
+/// mutation id: the daemon admits a command under the id its caller
+/// chose), from submission until it is settled: applied, refused at
+/// admission, or refused by its turn with its text back in the composer.
+/// It does not depend on which conversation is open when the reply or the
+/// refusal comes. Settled steers leave at once, so what the cap evicts is
+/// unsettled, and [`SentSteers::note`] returns it for the caller to say.
+#[derive(Debug, Default)]
+pub struct SentSteers(VecDeque<SentSteer>);
+
+/// One kept steer: its command, Agent, text and send time, and the
+/// refusal's words once it was refused while its composer held other text
+/// (it then waits for that composer to be empty).
+#[derive(Clone, Debug)]
+pub struct SentSteer {
+    pub command: String,
+    pub agent: String,
+    pub text: String,
+    pub at_ms: i64,
+    pub refused: Option<String>,
+}
+
+/// The steers [`SentSteers`] keeps at most.
+const MAX_SENT_STEERS: usize = 32;
+
+impl SentSteers {
+    /// Keep a steer (a retry reuses its command id); the oldest one it
+    /// evicts at the cap, which is no longer kept.
+    pub fn note(&mut self, steer: SentSteer) -> Option<SentSteer> {
+        self.0.retain(|kept| kept.command != steer.command);
+        let evicted = if self.0.len() >= MAX_SENT_STEERS {
+            self.0.pop_front()
+        } else {
+            None
+        };
+        self.0.push_back(steer);
+        evicted
+    }
+
+    /// A settled steer, kept no longer.
+    pub fn take(&mut self, command: &str) -> Option<SentSteer> {
+        let index = self.0.iter().position(|kept| kept.command == command)?;
+        self.0.remove(index)
+    }
+
+    /// The oldest refused steer of `agent` that waits for an empty
+    /// composer, kept no longer.
+    pub fn take_refused(&mut self, agent: &str) -> Option<SentSteer> {
+        let index = self
+            .0
+            .iter()
+            .position(|kept| kept.agent == agent && kept.refused.is_some())?;
+        self.0.remove(index)
+    }
+}
+
+/// Why a command was refused, in the daemon's words (its outcome's
+/// `message`, else its reason code in words).
+fn refusal_words(event: &Event) -> String {
+    let outcome = event.data.get("outcome");
+    let field = |name: &str| {
+        outcome
+            .and_then(|outcome| outcome.get(name))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    };
+    field("message")
+        .map(str::to_owned)
+        .or_else(|| field("reason").map(eliot_core::reason_words))
+        .unwrap_or_else(|| "No reason was reported.".to_owned())
 }
 
 fn data_str<'a>(event: &'a Event, field: &str) -> Option<&'a str> {
@@ -1081,6 +1176,7 @@ impl Conversation {
         let local = std::mem::take(&mut self.local);
         let inputs = std::mem::take(&mut self.inputs);
         let pending_exact = std::mem::take(&mut self.pending_exact);
+        let refused = std::mem::take(&mut self.refused);
         let notes = std::mem::take(&mut self.local_notes);
         let failures = std::mem::take(&mut self.local_failures);
         *self = Self::new(&self.agent);
@@ -1092,6 +1188,14 @@ impl Conversation {
         self.local_failures = failures;
         let cursor = self.coverage.cursor;
         let mut invalidation = self.apply_events(events);
+        // The snapshot's refusals are history (their turns' steer rows show
+        // them); refusals not settled yet stay as they arrived.
+        for known in &mut self.refused {
+            known.live = false;
+        }
+        self.refused
+            .retain(|known| !refused.iter().any(|kept| kept.command == known.command));
+        self.refused.extend(refused);
         self.coverage.cursor = cursor.max(self.applied_seq);
         self.apply_turns(turns);
         let referenced: HashSet<String> = self
@@ -1139,13 +1243,21 @@ impl Conversation {
                 // sidebar row and its menu) reads it again, a loss or stop
                 // included (k113: a lost Agent offers Resume, not Delete).
                 "request.opened" | "request.closed" | "request.resolved" | "agent.failed"
-                | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended" => {
+                | "agent.lost" | "agent.stopped" | "session.ready" | "session.ended"
+                | "goal.round" | "goal.changed" => {
                     invalidation.detail |= generation == self.coverage.generation;
                 }
                 _ => {}
             }
             if event.kind == "command.applied" {
+                if let Some(command) = data_str(event, "command_id") {
+                    self.applied.push(command.to_owned());
+                }
                 self.note_delivered(event, generation, &mut invalidation);
+                continue;
+            }
+            if event.kind == "command.rejected" {
+                self.note_refused(event);
                 continue;
             }
             if event.kind == "mail.delivered" {
@@ -1207,6 +1319,7 @@ impl Conversation {
                             turn.activity.push(Activity::Steer {
                                 command: command.to_owned(),
                                 at: event.ts,
+                                refused: None,
                             });
                         }
                         if !self.inputs.contains_key(command) {
@@ -1270,6 +1383,50 @@ impl Conversation {
             .retain(|command, _| self.local.iter().any(|known| known == command));
         self.enforce_bounds();
         invalidation
+    }
+
+    /// A refused command: a steer shown in its turn says it was not
+    /// applied. Every refusal is kept once for [`Self::take_settled`], with
+    /// or without a steer row (its acceptance can predate the coverage).
+    /// One found in a snapshot is history (`live` false): the window says
+    /// only those of its own steers, whose text it still keeps.
+    fn note_refused(&mut self, event: &Event) {
+        let Some(command) = data_str(event, "command_id") else {
+            return;
+        };
+        let reason = refusal_words(event);
+        let mut found = false;
+        for turn in self.turns.values_mut() {
+            for entry in &mut turn.activity {
+                if let Activity::Steer {
+                    command: known,
+                    refused,
+                    ..
+                } = entry
+                    && known == command
+                    && refused.is_none()
+                {
+                    *refused = Some(reason.clone());
+                    found = true;
+                }
+            }
+        }
+        if !self.refused.iter().any(|known| known.command == command) {
+            self.refused.push(RefusedCommand {
+                command: command.to_owned(),
+                reason,
+                steer: found,
+                live: true,
+            });
+        }
+    }
+
+    /// The commands refused and applied since the last call, each once.
+    pub fn take_settled(&mut self) -> (Vec<RefusedCommand>, Vec<String>) {
+        (
+            std::mem::take(&mut self.refused),
+            std::mem::take(&mut self.applied),
+        )
     }
 
     /// A delivered Swarm note (`command.applied` whose outcome says
@@ -1737,10 +1894,20 @@ impl Conversation {
                     text.clone(),
                     Vec::new(),
                 )),
-                Activity::Steer { command, at } => activity.push(Part::new(
+                Activity::Steer {
+                    command,
+                    at,
+                    refused,
+                } => activity.push(Part::new(
                     format!("steer:{command}"),
                     PartKind::Steer,
-                    format!("Steer \u{b7} {}", crate::monitor::clock(*at)),
+                    match refused {
+                        Some(_) => format!(
+                            "Steer \u{b7} {} \u{b7} not applied",
+                            crate::monitor::clock(*at)
+                        ),
+                        None => format!("Steer \u{b7} {}", crate::monitor::clock(*at)),
+                    },
                     match self.inputs.get(command) {
                         Some(InputText::Loaded(text) | InputText::Note { text, .. }) => {
                             text.clone()
@@ -1755,7 +1922,8 @@ impl Conversation {
                         }
                         None => "(loading input text…)".to_owned(),
                     },
-                    Vec::new(),
+                    // Why the turn did not take it.
+                    refused.iter().cloned().collect(),
                 )),
                 Activity::Note { command, rule } => {
                     let key = format!("note:{command}");

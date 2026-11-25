@@ -108,7 +108,9 @@ pub(super) enum FleetFilter {
     All,
     Working,
     Waiting,
-    /// An open attention report (no progress, no code progress…).
+    /// An open attention report (no progress, no code progress…). Not the
+    /// sidebar's "need attention", which counts the waiting and failed
+    /// states.
     Attention,
     Failed,
     Chats,
@@ -129,9 +131,21 @@ impl FleetFilter {
             Self::All => "All",
             Self::Working => "Working",
             Self::Waiting => "Waiting for you",
-            Self::Attention => "Needs attention",
+            Self::Attention => "Attention reports",
             Self::Failed => "Failed or lost",
             Self::Chats => "Chats",
+        }
+    }
+
+    /// The states whose daemon totals count this filter; `None` where
+    /// only the loaded rows can be counted.
+    fn states(self) -> Option<&'static [AgentState]> {
+        match self {
+            Self::All => Some(&crate::monitor::ROW_STATES),
+            Self::Working => Some(FleetGroup::Working.states()),
+            Self::Waiting => Some(FleetGroup::Waiting.states()),
+            Self::Failed => Some(FleetGroup::Failed.states()),
+            Self::Attention | Self::Chats => None,
         }
     }
 
@@ -824,11 +838,32 @@ impl DesktopApp {
         let search = &self.monitor.filter;
         let incident = |row: &MonitorRow| data.incident(row).is_some();
         let live: Vec<&MonitorRow> = data.rows.iter().filter(|row| !row.native_child).collect();
-        let count = |filter: FleetFilter| {
+        // One source per number: the daemon's state totals of the fleet
+        // read where they exist (`None` when one is missing), else the
+        // loaded rows, which the label then says.
+        let total_of = |states: &[AgentState]| -> Option<usize> {
+            states
+                .iter()
+                .map(|state| {
+                    data.counts
+                        .iter()
+                        .find(|count| count.state == *state)
+                        .and_then(|count| count.total)
+                })
+                .sum()
+        };
+        let loaded = |filter: FleetFilter| {
             live.iter()
                 .filter(|row| filter.keeps(row, incident(row)))
                 .count()
         };
+        // The count, and whether it counts only the loaded rows of a
+        // partial read (its label then says "(loaded)"): one guard for both.
+        let counted = |filter: FleetFilter| match filter.states().and_then(total_of) {
+            Some(total) => (total, false),
+            None => (loaded(filter), partial),
+        };
+        let count = |filter: FleetFilter| counted(filter).0;
         let mut items: Vec<KeyedView> = Vec::new();
 
         // Title row: search and grouping.
@@ -878,21 +913,21 @@ impl DesktopApp {
             .filter(|row| page_ui::held(row.status_line.as_deref()))
             .count();
         let (tokens_today, reporting) = self.tokens_today();
-        let partial_tip =
-            partial.then(|| "Partial: more Agents are live than this read loaded.".to_owned());
+        // Holds have no daemon total: counted in the loaded rows.
+        let holds_label = if partial {
+            "On provider hold (loaded)"
+        } else {
+            "On provider hold"
+        };
         items.push(KeyedView::new(
-            format!("stats:{working}:{waiting}:{holds}:{tokens_today}:{reporting}"),
+            format!("stats:{working}:{waiting}:{holds}:{partial}:{tokens_today}:{reporting}"),
             page_ui::grid(vec![
-                page_ui::stat_panel(
-                    page_ui::stat(working.to_string(), "Working", partial_tip.clone()),
-                ),
-                page_ui::stat_panel(
-                    page_ui::stat(waiting.to_string(), "Waiting for you", partial_tip),
-                ),
+                page_ui::stat_panel(page_ui::stat(working.to_string(), "Working", None)),
+                page_ui::stat_panel(page_ui::stat(waiting.to_string(), "Waiting for you", None)),
                 page_ui::stat_panel(
                     page_ui::stat(
                         holds.to_string(),
-                        "On provider hold",
+                        holds_label,
                         Some("Agents their provider holds (quota, rate limit, sign-in)".to_owned()),
                     ),
                 ),
@@ -913,11 +948,16 @@ impl DesktopApp {
             .into_iter()
             .map(|filter| {
                 let selected = fleet == filter;
-                let n = count(filter);
+                let (n, loaded_only) = counted(filter);
+                let label = if loaded_only {
+                    format!("{} (loaded)", filter.label())
+                } else {
+                    filter.label().to_owned()
+                };
                 KeyedView::new(
-                    format!("{}:{selected}:{n}", filter.label()),
+                    format!("{label}:{selected}:{n}"),
                     page_ui::filter_chip(
-                        filter.label(),
+                        &label,
                         Some(n),
                         selected,
                         context.message(Message::Monitor(MonitorMsg::FleetChosen(filter))),
@@ -1021,25 +1061,35 @@ impl DesktopApp {
                 if rows.is_empty() {
                     continue;
                 }
-                // The state totals count held Agents in their state; they
-                // list under On provider hold instead.
-                let held_here = data
-                    .rows
-                    .iter()
-                    .filter(|row| {
-                        FleetGroup::of(row.state) == group
-                            && page_ui::held(row.status_line.as_deref())
-                    })
-                    .count();
-                let total = data
-                    .counts
-                    .iter()
-                    .filter(|count| group.states().contains(&count.state))
-                    .try_fold(0usize, |sum, count| count.total.map(|total| sum + total))
-                    .map_or(rows.len(), |total| {
-                        total.saturating_sub(held_here).max(rows.len())
-                    });
-                let label = format!("{} · {} of {total}", group.title(), rows.len());
+                // The same total as the group's chip (the daemon's, held
+                // Agents in their state included), with the rows of its
+                // states this read loaded when they are fewer. A group
+                // without states (holds, subagents) counts its loaded rows.
+                let in_group = |row: &&MonitorRow| {
+                    if group.states().is_empty() {
+                        FleetGroup::of_row(row) == group
+                    } else {
+                        group.states().contains(&row.state)
+                    }
+                };
+                let loaded_rows = if group == FleetGroup::Stopped {
+                    data.stopped.iter().filter(in_group).count()
+                } else {
+                    data.rows.iter().filter(in_group).count()
+                };
+                let total = if group.states().is_empty() {
+                    None
+                } else {
+                    total_of(group.states())
+                };
+                let label = match total {
+                    Some(total) if total > loaded_rows => {
+                        format!("{} · {total} · {loaded_rows} loaded", group.title())
+                    }
+                    Some(total) => format!("{} · {total}", group.title()),
+                    None if partial => format!("{} · {loaded_rows} loaded", group.title()),
+                    None => format!("{} · {loaded_rows}", group.title()),
+                };
                 if group == FleetGroup::Stopped {
                     let open = self.monitor.stopped_open || searching;
                     entries.push(monitor_view::MonitorEntry::Stopped(label, open));

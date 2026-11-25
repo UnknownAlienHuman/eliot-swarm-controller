@@ -203,27 +203,6 @@ impl UiAgent {
         )
     }
 
-    /// The owner has something to do: answer a pending request
-    /// (`waiting`), decide about a failed or lost task (Resume, why, or
-    /// archive it), or settle an Agent Swarm controls whose state it cannot
-    /// prove (`unknown`). An observe-only native child is never counted:
-    /// its state is only observed and detach is all it offers.
-    pub fn needs_attention(&self) -> bool {
-        !self.native_child
-            && matches!(
-                self.state,
-                eliot_core::AgentState::Waiting
-                    | eliot_core::AgentState::Failed
-                    | eliot_core::AgentState::Lost
-                    | eliot_core::AgentState::Unknown
-            )
-    }
-
-    /// Ready for the next message: idle and controlled.
-    pub fn idle(&self) -> bool {
-        self.state == eliot_core::AgentState::Idle && !self.native_child
-    }
-
     /// Ended: stopped, failed or lost.
     fn ended(&self) -> bool {
         matches!(
@@ -593,6 +572,11 @@ pub struct Organization {
     /// The `organization.changed` rows the last read returned, applied to
     /// the loaded Agents once ([`apply_changes`]).
     pub changes: Vec<OrgRowChange>,
+    /// The last read's cursor fell below the retained changes
+    /// (`history_gap`): its grouping is whole and the cursor restarts at
+    /// its watermark, but changes in between are lost, so the projects and
+    /// rows are read again whole.
+    pub history_gap: bool,
 }
 
 impl Organization {
@@ -1300,35 +1284,42 @@ impl Archived {
     }
 }
 
-/// The fleet line's counts over the listed Agents.
+/// The fleet line's counts: the daemon's state totals of the sidebar's
+/// list, never its loaded rows (which change with paging, the attention
+/// read and the Agents page's fleet rows).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Fleet {
+    /// Busy, starting or created.
     pub running: usize,
-    /// Agents that need the owner ([`UiAgent::needs_attention`]).
+    /// Waiting for the owner, failed, lost or unknown.
     pub attention: usize,
-    /// Controlled Agents ready for the next message.
+    /// Ready for the next message.
     pub idle: usize,
 }
 
 impl Fleet {
-    /// The counts of `agents`; one with an open attention report
-    /// (`reported`, the Monitor's) needs attention, as in the Monitor.
-    pub fn of(agents: &[UiAgent], reported: impl Fn(&UiAgent) -> bool) -> Self {
-        let mut seen = HashSet::new();
-        let mut fleet = Self::default();
-        for agent in agents {
-            if !seen.insert(agent.id.as_str()) {
-                continue;
-            }
-            if !agent.needs_attention() && reported(agent) {
-                fleet.attention += 1;
-                continue;
-            }
-            fleet.running += usize::from(agent.running());
-            fleet.attention += usize::from(agent.needs_attention());
-            fleet.idle += usize::from(agent.idle());
-        }
-        fleet
+    /// The counts in the last `agent.list` state totals; `None` before
+    /// the first read, so no count is shown that was not read.
+    pub fn of_totals(totals: Option<&[eliot_core::api::AgentStateTotal]>) -> Option<Self> {
+        use eliot_core::AgentState;
+        let totals = totals?;
+        let sum = |states: &[AgentState]| -> usize {
+            totals
+                .iter()
+                .filter(|entry| states.contains(&entry.state))
+                .map(|entry| entry.total)
+                .sum()
+        };
+        Some(Self {
+            running: sum(&[AgentState::Busy, AgentState::Starting, AgentState::Created]),
+            attention: sum(&[
+                AgentState::Waiting,
+                AgentState::Failed,
+                AgentState::Lost,
+                AgentState::Unknown,
+            ]),
+            idle: sum(&[AgentState::Idle]),
+        })
     }
 
     /// The line itself: what is live ("2 working · 1 needs attention · 3

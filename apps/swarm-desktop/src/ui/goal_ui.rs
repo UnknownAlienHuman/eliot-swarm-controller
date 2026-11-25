@@ -193,24 +193,26 @@ fn allowed(status: GoalStatus) -> &'static [client::GoalControl] {
 
 /// The goal's state in a few words, for the dialog's context line.
 fn status_words(goal: &GoalView) -> String {
-    let state = match goal.status {
-        GoalStatus::Active => "Active".to_owned(),
-        GoalStatus::Paused => match goal.paused_reason.as_deref() {
-            Some(reason) => format!("Paused · {reason}"),
-            None => "Paused".to_owned(),
-        },
-        GoalStatus::Blocked => match goal.blocked_reason.as_deref() {
-            Some(reason) => format!("Blocked · {}", eliot_core::reason_words(reason)),
-            None => "Blocked".to_owned(),
-        },
-        GoalStatus::Completed => "Met".to_owned(),
-        GoalStatus::Cleared => "Cleared".to_owned(),
+    let (state, reason) = match goal.status {
+        GoalStatus::Active => ("Active", None),
+        // The caller's own words ("Paused by the owner from the desktop.").
+        GoalStatus::Paused => ("Paused", goal.paused_reason.clone()),
+        GoalStatus::Blocked => (
+            "Blocked",
+            goal.blocked_reason.as_deref().map(eliot_core::reason_words),
+        ),
+        GoalStatus::Completed => ("Met", None),
+        GoalStatus::Cleared => ("Cleared", None),
     };
     let rounds = match goal.definition.max_rounds {
         Some(max) => format!("round {} of {max}", goal.counters.rounds),
         None => format!("round {}", goal.counters.rounds),
     };
-    format!("{state} · {rounds}")
+    // The reason is its own sentence after the state and the rounds.
+    match reason {
+        Some(reason) => format!("{state} · {rounds}. {}.", reason.trim_end_matches('.')),
+        None => format!("{state} · {rounds}."),
+    }
 }
 
 /// An argv as one editable line: arguments with spaces or quotes in
@@ -482,12 +484,15 @@ impl DesktopApp {
         let current = goal.flatten();
         let draft = open.draft.clone().unwrap_or_else(|| Draft::of(current));
         let busy = open.busy.is_some();
+        // While no daemon answers, no read runs: the goal shown is not
+        // confirmed, as after a failed read.
         let read_error = self
             .chat
             .goal_error
             .as_ref()
             .filter(|(id, _)| *id == open.agent)
-            .map(|(_, error)| error.as_str());
+            .map(|(_, error)| error.as_str())
+            .or_else(|| self.daemon_down().then_some("Swarm is not running"));
         // Unknown until a read succeeds: a failed read never reads as "no
         // goal", so Save cannot replace a goal it did not see.
         let context_line = match (goal, read_error) {

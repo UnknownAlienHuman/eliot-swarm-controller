@@ -390,8 +390,9 @@ pub(super) enum MenuMsg {
     Confirmed(bool),
     /// Show archived Agents in the sidebar, or not.
     ArchivedToggled,
-    /// An Agent lifecycle call settled (what, the outcome).
-    Done(String, MutationResult<String>),
+    /// An Agent lifecycle call settled (what, the Agent whose open
+    /// conversation is left once it applied, the outcome).
+    Done(String, Option<String>, MutationResult<String>),
     /// Put the keyboard in the rename field (tries left).
     FocusRename(u8),
     /// `agent.archive` settled (the Agent, archived or not, whether to
@@ -708,7 +709,7 @@ impl DesktopApp {
                     self.load_search(context, None);
                 }
             }
-            MenuMsg::Done(what, outcome) => {
+            MenuMsg::Done(what, leave, outcome) => {
                 self.settle_mutation(
                     outcome
                         .as_ref()
@@ -716,7 +717,14 @@ impl DesktopApp {
                         .is_none_or(|error| !crate::state::uncertain(error)),
                 );
                 match outcome {
-                    Ok(note) => self.set_status(format!("{what}: {note}.")),
+                    Ok(note) => {
+                        // A deleted task's conversation is left only now
+                        // that the delete applied; a refusal stays on it.
+                        if leave.is_some() && self.selected_agent_id() == leave {
+                            self.new_task(context);
+                        }
+                        self.set_status(format!("{what}: {note}."));
+                    }
                     Err(error) if crate::state::uncertain(&error) => self.alert(format!(
                         "{what}: not confirmed (trying again reuses its id): {error}"
                     )),
@@ -1068,12 +1076,10 @@ impl DesktopApp {
             return;
         }
         if let (Action::Delete, Target::Agent(agent)) = (action, target) {
-            if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
-                self.new_task(context);
-            }
             let id = agent.id;
             let key = format!("delete:{id}");
-            self.submit_lifecycle("Delete", key, context, move |data_dir, mutation| {
+            let leave = Some(id.clone());
+            self.submit_lifecycle("Delete", key, leave, context, move |data_dir, mutation| {
                 client::block_on(client::delete_agent(data_dir, mutation, &id)).map(|count| {
                     format!(
                         "{} removed",
@@ -1103,6 +1109,7 @@ impl DesktopApp {
         &mut self,
         what: &str,
         key: String,
+        leave: Option<String>,
         context: &ComponentContext<Self>,
         work: impl FnOnce(&Path, String) -> MutationResult<String> + Send + 'static,
     ) {
@@ -1118,7 +1125,7 @@ impl DesktopApp {
         self.set_status(format!("{what} ({mutation_id})…"));
         let what = what.to_owned();
         let _task = context.spawn_background(move |_| {
-            Message::Menu(MenuMsg::Done(what, work(&data_dir, mutation_id)))
+            Message::Menu(MenuMsg::Done(what, leave, work(&data_dir, mutation_id)))
         });
     }
 
@@ -1132,7 +1139,7 @@ impl DesktopApp {
         context: &ComponentContext<Self>,
     ) {
         let key = format!("organize:{change:?}");
-        self.submit_lifecycle(&what, key, context, move |data_dir, id| {
+        self.submit_lifecycle(&what, key, None, context, move |data_dir, id| {
             client::block_on(client::organize(data_dir, id, change)).map(|reply| {
                 reply
                     .links

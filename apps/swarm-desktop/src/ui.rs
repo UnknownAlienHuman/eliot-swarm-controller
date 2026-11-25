@@ -212,8 +212,6 @@ struct SendOutcome {
     text: String,
     state: String,
     recovered: bool,
-    /// The send that followed a steer the ended turn refused.
-    fallback: bool,
 }
 
 /// Admission of one launch-with-text: the new Agent and its linked input,
@@ -519,6 +517,18 @@ fn load_organization_blocking(
                 changes,
                 ..nav::Organization::default()
             },
+            // The cursor fell below the retained changes (a delete prunes
+            // its rows' history): the grouping just read is whole, so the
+            // cursor restarts at its watermark instead of asking again for
+            // a history that is gone; the caller reads the rest whole.
+            (Ok((groups, watermark)), Some(Err(error))) if error.code == "history_gap" => {
+                nav::Organization {
+                    groups,
+                    changes_after: Some(watermark),
+                    history_gap: true,
+                    ..nav::Organization::default()
+                }
+            }
             (groups, changes) => {
                 let mut errors = Vec::new();
                 if let Err(error) = &groups {
@@ -1048,6 +1058,7 @@ impl Component for DesktopApp {
                 opened_from_search: false,
                 drafts: Rc::default(),
                 pending_retry: HashMap::new(),
+                steers_sent: crate::chat::SentSteers::default(),
                 answers: HashMap::new(),
                 confirm_force: None,
                 control_failures: HashSet::new(),

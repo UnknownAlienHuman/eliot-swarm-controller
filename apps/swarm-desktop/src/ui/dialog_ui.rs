@@ -27,31 +27,30 @@ pub(super) fn surface(
     footer: View,
     width: f64,
 ) -> ContentDialog {
-    // The card is painted here, in the window's scheme: a ContentDialog
-    // resolves its own background from the Windows theme (and keeps it
-    // across a scheme change), which left a Light card under Dark text.
-    // The ContentDialog style makes its own background transparent.
+    // The stock ContentDialog chrome (§18.1) is the one surface: its
+    // template draws the background, stroke and corner and sets the title;
+    // the body and its actions are the content. Reactor gives the dialog
+    // the window's theme (its `RequestedTheme` follows the owner's
+    // `ActualTheme`), so no card of our own repaints it.
     ContentDialog::new()
         .is_open(true)
+        .title(&title)
+        .default_button(ContentDialogButton::None)
         .on_closed(context.callback(move |_| Message::DialogClosed(epoch)))
         .content(
-            Border::new()
-                .background(ThemeBrush::CardBackground)
-                .corner_radius(tokens::radius::CONTAINER)
-                .padding(Thickness::uniform(tokens::spacing::LG))
+            StackPanel::new()
+                .spacing(tokens::spacing::MD)
                 .max_width(width)
+                // Reactor's ContentDialog has no automation name of its
+                // own: the content carries the title for UI Automation.
                 .automation_name(title.clone())
-                .content(
-                    StackPanel::new().spacing(tokens::spacing::MD).children((
-                        controls::text(title, tokens::text::TITLE)
-                            .text_wrapping(TextWrapping::Wrap),
-                        ScrollViewer::new()
-                            .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
-                            .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
-                            .content(body),
-                        footer,
-                    )),
-                ),
+                .children((
+                    ScrollViewer::new()
+                        .max_height(tokens::layout::DIALOG_MAX_HEIGHT)
+                        .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
+                        .content(body),
+                    footer,
+                )),
         )
 }
 
