@@ -572,6 +572,7 @@ impl WorkspaceManager {
         let slot = self.register_slot(preparation).await?;
         let _operation = slot.operation.lock().await;
         let git = WorkspaceGit::new()?;
+        let mut verified_ready = None;
         loop {
             let Some((agent, current)) = self.start(command_id).await? else {
                 return Err(problem(
@@ -585,7 +586,9 @@ impl WorkspaceManager {
             }
             match current.phase {
                 WorkspacePhase::Ready => {
-                    if let Err(error) = self.verify_ready_start(&git, &current).await {
+                    if verified_ready.as_ref() != Some(&current)
+                        && let Err(error) = self.verify_ready_start(&git, &current).await
+                    {
                         if agent.generation > 0 {
                             return Err(error);
                         }
@@ -607,6 +610,7 @@ impl WorkspaceManager {
                         .and_then(|value| value.get("reuse"))
                         .and_then(Value::as_bool)
                         == Some(true);
+                    let mut created_here = false;
                     let outcome = if reuse {
                         self.inspect_resume_git(&git, &current).await
                     } else {
@@ -650,8 +654,14 @@ impl WorkspaceManager {
                                                 ),
                                             )
                                             .await;
-                                        self.finish_workspace_create(&git, &slot, &current, result)
-                                            .await?
+                                        let outcome = self
+                                            .finish_workspace_create(&git, &slot, &current, result)
+                                            .await?;
+                                        created_here = matches!(
+                                            &outcome,
+                                            WorkspaceCreationOutcome::Verified { .. }
+                                        );
+                                        outcome
                                     }
                                     WorkspaceGitReservation::Deferred => {
                                         drop(gate);
@@ -713,6 +723,12 @@ impl WorkspaceManager {
                     self.publish(&change.events);
                     if let Some(error) = failure {
                         return Err(error);
+                    }
+                    // Creation already confirmed Git identity after checking the
+                    // new checkout. Reuse that proof only for this exact Ready
+                    // record, while this preparation still owns the operation.
+                    if created_here && change.value.phase == WorkspacePhase::Ready {
+                        verified_ready = Some(change.value);
                     }
                 }
                 WorkspacePhase::SetupReady => {
