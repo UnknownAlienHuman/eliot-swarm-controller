@@ -64,7 +64,7 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
-    pub history_missing_tool_output: bool,
+    pub session_history_failure_at: Option<Instant>,
     pub compaction: Option<CompactionProgress>,
 }
 
@@ -584,21 +584,21 @@ impl EventProcessor {
                     self.handle_child_notification(&method, params).await;
                     return;
                 }
-                // Turn notices still wait for association. The adapter can
-                // identify broken history from the owned thread even when
-                // the turn/start response never proves that association.
+                // Only a non-retrying error for the owned thread itself
+                // can corroborate a SEND without an exact native turn ID.
+                // Turn-scoped notices may belong to an earlier request.
                 if method == "error"
                     && self.status.ready
                     && self.status.thread_id.as_deref().is_some_and(|thread| {
                         params["threadId"].as_str() == Some(thread)
-                            && params["turnId"].as_str().is_some_and(|id| !id.is_empty())
+                            && params["turnId"].is_null()
                             && params["willRetry"] == false
                             && params["error"]["message"]
                                 .as_str()
                                 .is_some_and(crate::native::types::history_missing_tool_output)
                     })
                 {
-                    self.status.history_missing_tool_output = true;
+                    self.status.session_history_failure_at = Some(Instant::now());
                 }
                 if self.should_buffer(&method, &params) {
                     self.buffer.push(
@@ -2143,6 +2143,9 @@ impl EventProcessor {
             self.pending_requests.remove(&request_id);
             self.transport_requests.remove(&key);
             self.remember_resolved_transport(key);
+        }
+        if notification.turn.status == NativeTurnStatus::Completed {
+            self.status.session_history_failure_at = None;
         }
         self.status.last_turn = Some(TurnFacts {
             command_id,

@@ -1275,9 +1275,6 @@ impl Store {
                     transferred: &originals,
                     facts: Some(facts),
                     directive: directive.as_deref(),
-                    include_uncertain_input_text: !retained.continuation.is_some_and(
-                        |continuation| continuation.reason == HandoffReason::SessionBroken,
-                    ),
                     now,
                 },
             )?

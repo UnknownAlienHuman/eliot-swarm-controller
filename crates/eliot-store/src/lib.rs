@@ -140,6 +140,7 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
                         AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
                   AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
                     SELECT 1 FROM agents a WHERE a.id = commands.target
+                      AND a.generation = commands.generation
                       AND (a.state IN ('stopped','failed','lost')
                         OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
                             AND h.generation = commands.generation))))";
@@ -151,6 +152,7 @@ const RESTART_COMMANDS_WHERE: &str = "state = 'dispatched'
             AND COALESCE(json_extract(args, '$.point'), '') IN ('next_input', 'turn_safe_point')
         ) AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
             SELECT 1 FROM agents a WHERE a.id = commands.target
+              AND a.generation = commands.generation
               AND (a.state IN ('stopped','failed','lost')
                 OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
                     AND h.generation = commands.generation))
@@ -1225,6 +1227,24 @@ impl Store {
             ));
         }
         if seal {
+            // The router's preflight can race with command admission. Recheck
+            // the diagnostics predicate under this immediate transaction,
+            // before writing restart gaps or the receipt.
+            let restart_commands: bool = tx
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM commands WHERE {RESTART_COMMANDS_WHERE})"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(sql_error)?;
+            if restart_commands {
+                return Err(Error::new(
+                    "restart_busy",
+                    "commands still block daemon restart",
+                ));
+            }
             for (agent, generation) in native_sources {
                 let agent_num = parse_agent_id(agent)?;
                 let current = load_agent_by_num(&tx, agent_num)?

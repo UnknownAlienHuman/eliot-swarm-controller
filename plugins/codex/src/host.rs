@@ -135,9 +135,18 @@ struct AgentSession {
     stop_command_id: Option<String>,
 }
 
-fn unknown_send_result(session: &mut AgentSession, reason: &str) -> Result<Value> {
+fn unknown_send_result(
+    session: &mut AgentSession,
+    request_started_at: Instant,
+    reason: &str,
+) -> Result<Value> {
     session.phase = SessionPhase::Unknown;
-    if session.events.status().history_missing_tool_output {
+    if session
+        .events
+        .status()
+        .session_history_failure_at
+        .is_some_and(|failure| failure > request_started_at)
+    {
         return Ok(json!({
             "state": "unknown",
             "reason": reason,
@@ -2425,9 +2434,10 @@ impl CodexPlugin {
         );
         let encoded = serde_json::to_value(turn_params)
             .map_err(|_| Error::new("internal", "Codex turn/start params could not be encoded"))?;
+        let request_started_at = Instant::now();
         let response = session
             .native_client
-            .call("turn/start", encoded, Instant::now() + RPC_TIMEOUT)
+            .call("turn/start", encoded, request_started_at + RPC_TIMEOUT)
             .await;
         let response = match response {
             Ok(value) => value,
@@ -2457,6 +2467,7 @@ impl CodexPlugin {
             Err(_) => {
                 return unknown_send_result(
                     session,
+                    request_started_at,
                     "Codex turn/start may have applied; the input will not be repeated",
                 );
             }
@@ -2467,6 +2478,7 @@ impl CodexPlugin {
                 _ => {
                     return unknown_send_result(
                         session,
+                        request_started_at,
                         "Codex turn/start returned no exact turn identity",
                     );
                 }

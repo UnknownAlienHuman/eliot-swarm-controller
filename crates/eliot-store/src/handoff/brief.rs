@@ -16,7 +16,6 @@ pub(crate) struct BriefInput<'a> {
     pub(crate) transferred: &'a [Command],
     pub(crate) facts: Option<&'a super::BriefFacts>,
     pub(crate) directive: Option<&'a str>,
-    pub(crate) include_uncertain_input_text: bool,
     pub(crate) now: i64,
 }
 
@@ -60,9 +59,13 @@ pub(crate) fn build(
         transferred,
         facts,
         directive,
-        include_uncertain_input_text,
         now,
     } = input;
+    let include_uncertain_input_text = !crate::native_session_failure::is_broken(
+        tx,
+        parse_agent_id(&request.from)?,
+        request.from_generation,
+    )?;
     let record_command = facts.and_then(|facts| facts.task_command.as_deref());
     let typed = facts.and_then(|facts| facts.task_inputs.original.as_ref());
     let selected = task.map(|task| task.id.as_str()).or(record_command);

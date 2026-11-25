@@ -543,8 +543,9 @@ arguments/digests or replay input. See
 For the owned thread, the specific native error `Custom tool call output is missing
 for call id …` establishes missing history when it is the correlated compaction or
 turn-start RPC refusal, the error of a failed bound compaction, or a non-retrying
-native `error` bound to the affected thread and turn while the command outcome is
-unknown. Swarm records the classification on that generation. A compact timeout
+session-level `error` on the owned thread observed during a turn-start request with
+an unknown outcome. A successful turn clears the session-level observation.
+Swarm records the classification on that generation. A compact timeout
 by itself retains its unknown fence. Native history evidence does not settle an
 uncertain send, which remains in the source session and is named in the handoff brief.
 
