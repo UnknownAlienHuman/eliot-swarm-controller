@@ -134,6 +134,62 @@ pub(super) fn open_with_default_app(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("File Explorer did not start: {error}"))
 }
 
+/// Open `folder` in Windows Terminal (`wt.exe -d <folder>`): the app
+/// execution alias under `%LOCALAPPDATA%\Microsoft\WindowsApps`, by
+/// absolute path with explicit argv and no shell. The terminal is the
+/// owner's: it keeps the owner's environment (Windows Terminal does not load
+/// its settings without it) except Swarm's own variables, so no Eliot
+/// identity or credential from this window reaches it; only `ELIOT_HOME`,
+/// which names the data directory, stays. Nothing is waited for. `Err` is
+/// the sentence to show the owner.
+pub(super) fn open_terminal(folder: &str) -> Result<(), String> {
+    let Target::Folder(path) = target(folder)? else {
+        return Err(format!("{} is not a folder.", nav::display_path(folder)));
+    };
+    // Windows Terminal splits its command line at `;` into new tabs.
+    if path.contains(';') {
+        return Err(
+            "Windows Terminal reads a ; in the folder's path as a new command: open the folder from File Explorer instead."
+                .to_owned(),
+        );
+    }
+    let local = std::env::var_os("LOCALAPPDATA")
+        .ok_or_else(|| "Windows Terminal was not found: LOCALAPPDATA is not set.".to_owned())?;
+    let wt = Path::new(&local)
+        .join("Microsoft")
+        .join("WindowsApps")
+        .join("wt.exe");
+    if !wt.is_absolute() || std::fs::symlink_metadata(&wt).is_err() {
+        return Err("Windows Terminal is not installed (wt.exe was not found).".to_owned());
+    }
+    terminal_command(&wt)
+        .arg("-d")
+        .arg(&path)
+        .spawn()
+        .map(drop)
+        .map_err(|error| format!("Windows Terminal did not start: {error}"))
+}
+
+/// Windows Terminal's command without Swarm's variables (but `ELIOT_HOME`).
+#[expect(
+    clippy::disallowed_types,
+    reason = "This helper returns the Windows Terminal command Open in Windows Terminal starts."
+)]
+fn terminal_command(wt: &Path) -> std::process::Command {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "This statement constructs the Windows Terminal process owned by this module."
+    )]
+    let mut command = std::process::Command::new(wt);
+    for (name, _) in std::env::vars_os() {
+        let upper = name.to_string_lossy().to_ascii_uppercase();
+        if upper.starts_with("ELIOT_") && upper != "ELIOT_HOME" {
+            command.env_remove(&name);
+        }
+    }
+    command
+}
+
 const TOOLTIP: &str = "Open in Explorer";
 
 /// A full-width row for a path: its title, a note under it (the path when

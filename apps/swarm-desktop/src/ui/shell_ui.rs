@@ -61,13 +61,36 @@ pub(super) struct PlaceRead {
     more: u32,
 }
 
-/// The optional right panel.
+/// The right pane's open tab (skeleton 5.4-5.6), or no pane. The pane
+/// belongs to the open conversation; the header's toggles open a tab, and
+/// the pressed toggle closes the pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Panel {
     Closed,
-    /// The open conversation's Agent: settings, coverage, resources, usage
-    /// and Change manager.
+    /// The task's changes: Uncommitted, Branch or Last turn, the review
+    /// digest and the files.
+    Changes,
+    /// The task's tree: its manager and workers.
+    Agents,
+    /// The open conversation's Agent, in collapsible sections.
     Details,
+    /// The worktree in Windows Terminal and the Agent's processes.
+    Terminal,
+}
+
+impl Panel {
+    /// The tabs in the pane's order.
+    pub(super) const TABS: [Self; 4] = [Self::Changes, Self::Agents, Self::Details, Self::Terminal];
+
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "",
+            Self::Changes => "Changes",
+            Self::Agents => "Agents",
+            Self::Details => "Details",
+            Self::Terminal => "Terminal",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -461,6 +484,7 @@ impl DesktopApp {
                         if self.monitor_panel() {
                             self.read_monitor(0, context);
                         }
+                        self.pane_reread(context);
                     }
                     if acl_repaired {
                         self.alert("Swarm repaired the data directory ACL.");
@@ -725,9 +749,6 @@ impl DesktopApp {
                 }
                 if self.chat.convo.as_ref().map(Conversation::agent) != Some(&agent.id) {
                     self.open_conversation(&agent, context);
-                }
-                if self.panel == Panel::Details {
-                    self.show_details(&agent.id, context);
                 }
             }
             ShellMsg::ProjectPicked(checkout) => {
@@ -1070,6 +1091,14 @@ impl DesktopApp {
                         self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed;
                     }
                     Shortcut::Sidebar => {}
+                    Shortcut::Terminal => {
+                        let panel = if self.panel == Panel::Terminal && self.panel_shown() {
+                            Panel::Closed
+                        } else {
+                            Panel::Terminal
+                        };
+                        self.shell_update(ShellMsg::PanelToggled(panel), context);
+                    }
                     Shortcut::ModelPicker => {
                         if self.launch.open != Some(launch_ui::Pop::Model) {
                             self.launch_update(LaunchMsg::Toggle(launch_ui::Pop::Model), context);
@@ -1429,7 +1458,7 @@ impl DesktopApp {
             page_ui::Place::Agents => Main::Agents,
             page_ui::Place::Automations => Main::Automations,
         };
-        if self.panel == Panel::Details {
+        if self.panel != Panel::Closed {
             self.close_panel();
         }
         if self.main != main {
@@ -1489,7 +1518,7 @@ impl DesktopApp {
         self.chat.detail = None;
         self.chat.live = LiveStatus::Idle;
         self.chat.items = Rc::new(Vec::new());
-        if self.panel == Panel::Details {
+        if self.panel != Panel::Closed {
             self.close_panel();
         }
         self.load_routing_preview(context);
@@ -1867,11 +1896,7 @@ impl DesktopApp {
     /// when hidden, the Settings navigation in its place) and the open
     /// panel, or None until the first size observation.
     pub(super) fn main_width(&self) -> Option<f64> {
-        let panel = if self.panel_shown() {
-            tokens::layout::PANEL_WIDTH
-        } else {
-            0.0
-        };
+        let panel = self.pane_beside();
         let side = if self.rail_shown() {
             RAIL_WIDTH
         } else {
@@ -1888,11 +1913,7 @@ impl DesktopApp {
         if self.main == Main::Settings || self.link_view_shown() {
             return false;
         }
-        let panel = if self.panel_shown() {
-            tokens::layout::PANEL_WIDTH
-        } else {
-            0.0
-        };
+        let panel = self.pane_beside();
         self.nav.sidebar_collapsed
             || self.window_width.is_some_and(|width| {
                 width - tokens::layout::SIDEBAR_WIDTH - panel - tokens::layout::CARD_GAP
@@ -1902,8 +1923,38 @@ impl DesktopApp {
 
     /// The right panel belongs to the conversation: Settings shows two
     /// columns (its navigation and the page), as in the Codex app.
-    fn panel_shown(&self) -> bool {
-        self.panel != Panel::Closed && self.main != Main::Settings && !self.link_view_shown()
+    pub(super) fn panel_shown(&self) -> bool {
+        self.panel != Panel::Closed
+            && self.main == Main::Conversation
+            && self.selected_agent_id().is_some()
+            && !self.link_view_shown()
+    }
+
+    /// The pane's width at its chosen size (Normal or Wide).
+    pub(super) fn pane_width(&self) -> f64 {
+        if self.pane.wide {
+            tokens::layout::PANEL_WIDE_WIDTH
+        } else {
+            tokens::layout::PANEL_WIDTH
+        }
+    }
+
+    /// The pane lies over the main area: the window is narrower than the
+    /// skeleton's breakpoint (Full view covers it anyway).
+    pub(super) fn pane_overlays(&self) -> bool {
+        self.window_width
+            .is_some_and(|width| width < tokens::layout::PANEL_OVERLAY_BELOW)
+    }
+
+    /// The width the pane takes beside the main area: none when closed,
+    /// when it lies over the main area or in Full view (the main area is
+    /// then hidden, and its width is the pane's).
+    fn pane_beside(&self) -> f64 {
+        if self.panel_shown() && !self.pane.full && !self.pane_overlays() {
+            self.pane_width()
+        } else {
+            0.0
+        }
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -2262,13 +2313,38 @@ impl DesktopApp {
         // right pane sit inside it.
         let radius = tokens::layout::CARD_RADIUS;
         let mut card_columns = vec![GridLength::STAR];
+        // The pane (`.pane-r`): `surface-container-low` behind an
+        // `outline-variant` hairline, at its Normal or Wide width beside
+        // the main area, over it in a narrow window, or the whole card in
+        // Full view (the conversation is then not drawn).
+        let full = self.panel_shown() && self.pane.full;
+        let main: View = if full { View::empty() } else { main };
         let panel: View = if !self.panel_shown() {
             View::empty()
+        } else if full {
+            Border::new()
+                .background(palette.pane())
+                .corner_radius(radius)
+                .content(self.panel_view(context, palette))
+        } else if self.pane_overlays() {
+            Border::new()
+                .width(
+                    self.pane_width().min(
+                        self.window_width
+                            .map_or(f64::MAX, |width| width - tokens::layout::CARD_GAP),
+                    ),
+                )
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .background(palette.pane())
+                .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
+                .border_brush(palette.outline())
+                .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
+                .content(self.panel_view(context, palette))
         } else {
-            card_columns.push(GridLength::Pixel(tokens::layout::PANEL_WIDTH));
+            card_columns.push(GridLength::Pixel(self.pane_width()));
             Border::new()
                 .grid_column(1)
-                .background(palette.surface())
+                .background(palette.pane())
                 .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
                 .border_brush(palette.outline())
                 .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
@@ -2755,12 +2831,9 @@ impl DesktopApp {
         self.alert = Some(text);
     }
 
-    /// The right panel: the monitor or the open Agent's details.
+    /// The right pane: its tabs over the open tab.
     fn panel_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
-        match self.panel {
-            Panel::Details => self.details_view(context, palette),
-            Panel::Closed => View::empty(),
-        }
+        self.pane_view(context, palette)
     }
 }
 

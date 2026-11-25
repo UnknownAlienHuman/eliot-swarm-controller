@@ -5,8 +5,10 @@
 //! observations and scoped state totals (and, every `STOPPED_EVERY`
 //! refreshes, the stopped rows for Recently stopped), the
 //! new `x.user.agent.attention` reports after the last cursor (the first
-//! read starts `ATTENTION_WINDOW_MS` back), and, for the selected Agent
-//! only, `agent.get`, `usage.summary` and `diagnose`. No per-Agent timers,
+//! read starts `ATTENTION_WINDOW_MS` back), for the selected Agent only,
+//! `agent.get`, `usage.summary`, `diagnose` and its unread mail, and, while
+//! the pane's Agents tab shows, its task's tree (one `agent.list` by
+//! hierarchy root). No per-Agent timers,
 //! no `agent.stats` per row, at most `MAX_CONCURRENT_READS` reads at once,
 //! and only while the monitor is open.
 //!
@@ -76,6 +78,22 @@ pub fn fleet_filter(agent: Option<&str>) -> eliot_core::api::EventsFilter {
         sources: Vec::new(),
     }
 }
+/// The event filter the pane's Agents tab follows: these Agents' fleet
+/// events (the task's tree as last read, and its root).
+pub fn tree_filter(agents: Vec<String>) -> eliot_core::api::EventsFilter {
+    eliot_core::api::EventsFilter {
+        agents,
+        kinds: FLEET_KINDS.iter().map(|kind| (*kind).to_owned()).collect(),
+        sources: Vec::new(),
+    }
+}
+
+/// Rows the Agents tab reads of one task's tree (managers, workers and
+/// observed subagents, stopped ones included).
+pub const TREE_ROWS: usize = 200;
+/// Unread mail deliveries Details › Mail shows.
+pub const MAIL_ROWS: usize = 20;
+
 /// Rows displayed per live state from the bounded fleet page.
 pub const ROWS_PER_STATE: usize = 100;
 /// Total live rows read in one page; per-state counts reveal any shortfall.
@@ -642,7 +660,7 @@ pub fn tokens_label(row: &MonitorRow) -> String {
 }
 
 impl MonitorRow {
-    fn from_list(row: &AgentListRow) -> Self {
+    pub fn from_list(row: &AgentListRow) -> Self {
         let summary = &row.summary;
         let (tokens, tokens_scope) = match summary.fleet_usage() {
             Some((tokens, scope)) => (Some(tokens), Some(scope.to_owned())),
@@ -987,6 +1005,8 @@ pub struct DetailRead {
     pub agent: AgentGetResponse,
     pub usage: Result<UsageSummaryResponse, String>,
     pub diagnosis: Result<DiagnoseResponse, String>,
+    /// The Agent's unread mail (`mail.inbox`; reading marks nothing).
+    pub mail: Result<eliot_core::api::MailInboxResponse, String>,
     /// Usage and diagnosis were read this time (a selection change); else
     /// the last ones of the same generation stay.
     pub fresh: bool,
@@ -1061,6 +1081,8 @@ pub struct MonitorSnapshot {
     pub stopped: Option<Result<AgentListResponse, String>>,
     pub attention: Option<Result<AttentionRead, String>>,
     pub detail: Option<Result<DetailRead, String>>,
+    /// The Agents tab's tree, when this refresh read it.
+    pub tree: Option<(String, Result<AgentListResponse, String>)>,
     /// `swarm why` summaries of the lost or failed generations it read.
     pub losses: Vec<((String, i64), Result<DiagnoseResponse, String>)>,
     pub read_at_ms: i64,
@@ -1301,6 +1323,46 @@ pub struct Monitor {
     pub read_at_ms: Option<i64>,
     pub errors: Vec<String>,
     pub refreshes: u64,
+    /// The Agents tab's tree of the open task.
+    pub tree: TreeRead,
+}
+
+/// The Agents tab's last tree read: the hierarchy root it was read for,
+/// its rows, or why it failed (the last rows stay shown meanwhile).
+#[derive(Clone, Debug, Default)]
+pub struct TreeRead {
+    pub root: Option<String>,
+    pub rows: Vec<MonitorRow>,
+    /// A read for `root` landed (rows or an error).
+    pub read: bool,
+    pub error: Option<String>,
+    /// The tree had more rows than one read carries.
+    pub truncated: bool,
+    pub read_at_ms: Option<i64>,
+}
+
+impl TreeRead {
+    /// The Agents the next wait follows: the rows read and the root.
+    pub fn agents(&self) -> Vec<String> {
+        let mut agents: Vec<String> = self.rows.iter().map(|row| row.id.clone()).collect();
+        if let Some(root) = &self.root
+            && !agents.contains(root)
+        {
+            agents.push(root.clone());
+        }
+        agents
+    }
+
+    /// The direct children of `parent`, in creation order.
+    pub fn children(&self, parent: &str) -> Vec<&MonitorRow> {
+        let mut children: Vec<&MonitorRow> = self
+            .rows
+            .iter()
+            .filter(|row| row.parent.as_deref() == Some(parent))
+            .collect();
+        children.sort_by(|a, b| id_order(&a.id, &b.id));
+        children
+    }
 }
 
 impl Monitor {
@@ -1450,6 +1512,24 @@ impl Monitor {
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {
+        if let Some((root, tree)) = snapshot.tree.as_ref() {
+            if self.tree.root.as_ref() != Some(root) {
+                self.tree = TreeRead {
+                    root: Some(root.clone()),
+                    ..TreeRead::default()
+                };
+            }
+            self.tree.read = true;
+            match tree {
+                Ok(page) => {
+                    self.tree.rows = page.agents.iter().map(MonitorRow::from_list).collect();
+                    self.tree.truncated = page.total > page.agents.len();
+                    self.tree.error = None;
+                    self.tree.read_at_ms = Some(snapshot.read_at_ms);
+                }
+                Err(error) => self.tree.error = Some(error.clone()),
+            }
+        }
         if !snapshot.fleet {
             // Only Details were read: the fleet, its reports and the
             // stopped rows stay as last read.
@@ -1584,6 +1664,7 @@ impl Monitor {
             if let Some(last) = previous {
                 read.usage = last.read.usage;
                 read.diagnosis = last.read.diagnosis;
+                read.mail = last.read.mail;
                 usage_ms = last.usage_ms;
                 diagnosis_ms = last.diagnosis_ms;
             }
@@ -1600,6 +1681,9 @@ impl Monitor {
         }
         if let Err(error) = &read.diagnosis {
             self.detail_errors.push(format!("diagnosis: {error}"));
+        }
+        if let Err(error) = &read.mail {
+            self.detail_errors.push(format!("mail: {error}"));
         }
         if let Some(last) = previous {
             if read.usage.is_err() && last.read.usage.is_ok() {
@@ -1632,6 +1716,7 @@ enum Read {
     Stopped(Result<AgentListResponse, String>),
     Attention(Result<AttentionRead, String>),
     Detail(Box<Result<DetailRead, String>>),
+    Tree(String, Result<AgentListResponse, String>),
     Loss((String, i64), Result<DiagnoseResponse, String>),
     Cancelled,
 }
@@ -1786,6 +1871,8 @@ pub struct RefreshPlan {
     pub attention_cursor: Option<i64>,
     /// Lost or failed generations whose loss origin to read.
     pub losses: Vec<(String, i64)>,
+    /// The hierarchy root whose tree the pane's Agents tab shows.
+    pub tree: Option<String>,
 }
 
 /// One refresh: the fixed read set, at most `MAX_CONCURRENT_READS` at once.
@@ -1802,6 +1889,7 @@ pub async fn refresh(
         stopped,
         attention_cursor,
         losses,
+        tree,
     } = plan;
     let mut reads: Vec<ReadFuture<'_>> = Vec::new();
     if fleet && stopped {
@@ -1849,6 +1937,7 @@ pub async fn refresh(
                     agent: read,
                     usage: Err(String::new()),
                     diagnosis: Err(String::new()),
+                    mail: Err(String::new()),
                     fresh: false,
                 })));
             }
@@ -1864,12 +1953,39 @@ pub async fn refresh(
             let diagnosis = client::diagnose(data_dir, &agent)
                 .await
                 .map_err(|error| error.to_string());
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let mail = client::mail_inbox(data_dir, &agent, MAIL_ROWS)
+                .await
+                .map_err(|error| error.to_string());
             Read::Detail(Box::new(Ok(DetailRead {
                 agent: read,
                 usage,
                 diagnosis,
+                mail,
                 fresh: true,
             })))
+        }));
+    }
+    if let Some(root) = tree {
+        reads.push(Box::pin(async move {
+            if cancelled() {
+                return Read::Cancelled;
+            }
+            let request = AgentListRequest {
+                root: Some(root.clone()),
+                limit: TREE_ROWS,
+                observations: true,
+                archived: eliot_core::api::ArchivedFilter::Include,
+                ..Default::default()
+            };
+            Read::Tree(
+                root,
+                client::list_agents(data_dir, &request)
+                    .await
+                    .map_err(|error| error.to_string()),
+            )
         }));
     }
     for key in losses {
@@ -1893,6 +2009,7 @@ pub async fn refresh(
         stopped: None,
         attention: None,
         detail: None,
+        tree: None,
         losses: Vec::new(),
         read_at_ms,
         fleet,
@@ -1907,6 +2024,7 @@ pub async fn refresh(
             Read::Stopped(page) => snapshot.stopped = Some(page),
             Read::Attention(read) => snapshot.attention = Some(read),
             Read::Detail(detail) => snapshot.detail = Some(*detail),
+            Read::Tree(root, page) => snapshot.tree = Some((root, page)),
             Read::Loss(key, summary) => snapshot.losses.push((key, summary)),
             Read::Cancelled => {}
         }

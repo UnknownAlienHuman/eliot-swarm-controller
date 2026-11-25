@@ -129,6 +129,8 @@ impl DesktopApp {
             toggle_tools: context.callback(|(key, expanded): (String, bool)| {
                 Message::Chat(ChatMsg::ToolsToggled(key, expanded))
             }),
+            view_changes: context
+                .callback(|()| Message::Pane(crate::ui::pane_ui::PaneMsg::ViewChanges)),
         };
         View::component::<views::Transcript>(views::TranscriptInput {
             conversation,

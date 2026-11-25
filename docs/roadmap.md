@@ -1160,6 +1160,30 @@ of the explicitly selected release scope.
       `provider.clear_hold`); "What went wrong" and "Stopped by a Swarm
       restart"; the live line; the hand-off dialog as three kinds of
       destination with the list under the chosen one.
+    - [x] **Right pane.** `Decision.dc.html` and `Finished.dc.html`: the
+      header's Changes, Agents, Details and Terminal toggles open one pane of
+      tabs in the main card, at `size-pane` or Wide (`size-reading`) and Full
+      view (over the main area below 1200 DIPs). Changes reads `agent.git` and
+      `agent.patch_digest` on open, task change and Refresh: Uncommitted,
+      Branch or Last turn, the summary, the review digest (counts that open
+      their paths), the files (name and folder, state word, Filter files)
+      and Merge and check (`git.integrate`) with its result card; the daemon
+      has no diff-text read, so Unified, Split and Word wrap show unavailable
+      with that reason and no diff is drawn. Agents is the task's tree from
+      one `agent.list` by hierarchy root on the Monitor's chain (state mark,
+      name, observed, model, activity, +/−, Open, Stop Agent with its
+      confirmation, Hand off). Details keeps every field in collapsible
+      sections (Summary, Task, Goal, Work, Mail from `mail.inbox`, What went
+      wrong, Activity & resources, Context, Heavy work, Technical with Copy).
+      Terminal opens the worktree in Windows Terminal (Ctrl+J) and lists the
+      Agent's processes. Reads stop while the tab is hidden or the window is
+      minimized.
+    - [ ] **Right pane, unproven or open.** Goal Pause, Resume and Clear live;
+      Open in editor and Copy path live; a passing Merge and check; Edit and
+      Set goal (no goal editor yet); the daemon reads the skeleton lists as
+      dependencies: diff text and per-file line counts, the task record and
+      checkpoints, the `[desktop] pane` key, a goal round key for Run a round
+      now, and an embedded terminal.
     - [ ] **Conversation, unproven variants.** The question and confidential
       panels (Claude asks its question as an approval), the unconfirmed-outcome
       panel, the Failed, Lost and live-line notices, the Edited files card

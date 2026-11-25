@@ -1689,13 +1689,11 @@ impl DesktopApp {
             let page = Border::new()
                 .grid_row(1)
                 .background(palette.surface())
-                .corner_radius(
-                    if self.panel != Panel::Closed && self.main == Main::Project {
-                        CornerRadius::new(radius, 0.0, 0.0, radius)
-                    } else {
-                        CornerRadius::uniform(radius)
-                    },
-                )
+                .corner_radius(if self.panel_shown() && self.main == Main::Project {
+                    CornerRadius::new(radius, 0.0, 0.0, radius)
+                } else {
+                    CornerRadius::uniform(radius)
+                })
                 .content(content);
             return Grid::new()
                 .rows([

@@ -282,6 +282,8 @@ pub struct RowCallbacks {
     pub pick_model: Option<Callback<()>>,
     pub copy_code: Callback<(String, usize)>,
     pub toggle_tools: Callback<(String, bool)>,
+    /// View changes: the right pane's Changes tab on the last turn.
+    pub view_changes: Callback<()>,
 }
 
 fn label(text: &str) -> TextBlock {
@@ -1316,7 +1318,7 @@ fn log_head(
 }
 
 /// The Edited files card under an answer (`.edited`): up to five paths,
-/// "Show N more", and View changes (the Changes tab, not in this build).
+/// "Show N more", and View changes (the Changes tab on Last turn).
 fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette: Palette) -> View {
     let shown = if all {
         part.detail.len()
@@ -1364,17 +1366,11 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks, palette
             .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
             .children((
                 more,
-                Border::new()
+                crate::m3::text_button(palette)
                     .grid_column(2)
-                    .content(
-                        crate::m3::text_button(palette)
-                            .is_enabled(false)
-                            .automation_name(
-                                "View changes: the Changes tab is not in this build yet",
-                            )
-                            .content(crate::m3::label("View changes")),
-                    )
-                    .tooltip("The Changes tab is not in this build yet"),
+                    .automation_name("View changes")
+                    .on_click(callbacks.view_changes.clone())
+                    .content(crate::m3::label("View changes")),
             )),
     ));
     Border::new()

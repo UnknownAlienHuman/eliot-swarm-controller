@@ -1634,3 +1634,152 @@ pub async fn submit_stop(
     request.expected_generation = Some(generation);
     submit(data_dir, &request).await
 }
+
+/// The Changes tab's Git snapshot of one Agent's worktree (`agent.git`):
+/// dirty paths with their porcelain status, commits and committed paths
+/// against the frozen base, and the complete line counts when probed.
+pub async fn agent_git(data_dir: &Path, id: &str) -> Result<eliot_core::api::AgentGitResponse> {
+    let request = eliot_core::api::AgentGitRequest::new(id);
+    request.validate()?;
+    let reply: eliot_core::api::AgentGitResponse =
+        eliot_daemon::client_call_typed(data_dir, "agent.git", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// The Changes tab's review digest (`agent.patch_digest`): the files of the
+/// patch against the worktree base and the attention lists.
+pub async fn patch_digest(
+    data_dir: &Path,
+    id: &str,
+) -> Result<eliot_core::api::AgentPatchDigestResponse> {
+    let request = eliot_core::api::AgentPatchDigestRequest {
+        id: id.to_owned(),
+        generation: None,
+    };
+    request.validate()?;
+    let reply: eliot_core::api::AgentPatchDigestResponse =
+        eliot_daemon::client_call_typed(data_dir, "agent.patch_digest", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// The first page of an Agent's scoped process records (`agent.processes`),
+/// for the Terminal tab's read-only Agent processes list.
+pub async fn agent_processes(
+    data_dir: &Path,
+    id: &str,
+) -> Result<eliot_core::api::AgentProcessesResponse> {
+    let request = eliot_core::api::AgentProcessesRequest::new(id);
+    request.validate()?;
+    let reply: eliot_core::api::AgentProcessesResponse =
+        eliot_daemon::client_call_typed(data_dir, "agent.processes", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// One page of an Agent's unread mail (`mail.inbox`, no long-poll). Reading
+/// marks nothing: Details shows another Agent's mail without acknowledging it.
+pub async fn mail_inbox(
+    data_dir: &Path,
+    agent: &str,
+    limit: usize,
+) -> Result<eliot_core::api::MailInboxResponse> {
+    let request = eliot_core::api::MailInboxRequest {
+        agent: Some(agent.to_owned()),
+        limit: Some(limit),
+        after: None,
+        wait_ms: 0,
+        thread: None,
+        reply_to: None,
+    };
+    request.validate()?;
+    let reply: eliot_core::api::MailInboxResponse =
+        eliot_daemon::client_call_typed(data_dir, "mail.inbox", &request).await?;
+    request.validate_response(&reply)?;
+    Ok(reply)
+}
+
+/// A Goal control from Details › Goal, with its retained mutation id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalControl {
+    Pause,
+    Resume,
+    Clear,
+}
+
+impl GoalControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pause => "Pause",
+            Self::Resume => "Resume",
+            Self::Clear => "Clear",
+        }
+    }
+}
+
+/// `goal.pause`, `goal.resume` or `goal.clear` on the Agent's Eliot Goal;
+/// the Goal as the daemon left it.
+pub async fn goal_control(
+    data_dir: &Path,
+    mutation_id: String,
+    agent: &str,
+    control: GoalControl,
+) -> Result<eliot_core::api::GoalView> {
+    use eliot_core::api::{GoalClearRequest, GoalMode, GoalPauseRequest, GoalResumeRequest};
+    let agent = agent.to_owned();
+    match control {
+        GoalControl::Pause => {
+            let request = GoalPauseRequest {
+                id: mutation_id,
+                agent,
+                mode: GoalMode::Eliot,
+                reason: Some("Paused by the owner from Details.".to_owned()),
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "goal.pause", &request).await?;
+            request.validate_response(&reply)?;
+            Ok(reply)
+        }
+        GoalControl::Resume => {
+            let request = GoalResumeRequest {
+                id: mutation_id,
+                agent,
+                mode: GoalMode::Eliot,
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "goal.resume", &request).await?;
+            request.validate_response(&reply)?;
+            Ok(reply)
+        }
+        GoalControl::Clear => {
+            let request = GoalClearRequest {
+                id: mutation_id,
+                agent,
+                mode: GoalMode::Eliot,
+            };
+            request.validate()?;
+            let reply = eliot_daemon::client_call_typed(data_dir, "goal.clear", &request).await?;
+            request.validate_response(&reply)?;
+            Ok(reply)
+        }
+    }
+}
+
+/// `git.integrate` through `command.submit`: the daemon merges the pinned
+/// branch commits with the base in its own checkout and runs the project
+/// check; the worktree and the remote stay as they are.
+pub async fn submit_integrate(
+    data_dir: &Path,
+    mutation_id: String,
+    definition: &eliot_core::api::GitIntegrateDefinitionArgs,
+) -> Result<CommandSubmitResponse> {
+    definition.validate()?;
+    let args = serde_json::to_value(definition)
+        .map_err(|_| Error::new("invalid", "the integration request could not be encoded"))?;
+    submit(
+        data_dir,
+        &submit_request(mutation_id, None, "git.integrate", args)?,
+    )
+    .await
+}

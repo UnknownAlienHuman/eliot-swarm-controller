@@ -177,6 +177,8 @@ actions! {
     DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
     /// The conversation header's Force stop (it asks first).
     ForceStop => ("Force stop…", m3::glyph::STOP, true),
+    /// Details › Goal's Clear (it asks first: the goal ends).
+    ClearGoal => ("Clear goal…", m3::glyph::GOAL, true),
     /// Home's Start task menu: queue the task (`launch.enqueue`).
     QueueLaunch => ("Queue it", m3::glyph::SCHEDULE, false),
     /// Home's Start task menu: attach a running native session, which the
@@ -1016,6 +1018,10 @@ impl DesktopApp {
             self.stop_agent(&agent.id, agent.generation, context);
             return;
         }
+        if let (Action::ClearGoal, Target::Agent(agent)) = (action, &target) {
+            self.goal_control(agent.id.clone(), client::GoalControl::Clear, context);
+            return;
+        }
         if let (Action::Delete, Target::Agent(agent)) = (action, target) {
             if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
                 self.new_task(context);
@@ -1341,6 +1347,14 @@ impl DesktopApp {
                     agent.id, agent.generation
                 ),
                 "Stop Agent",
+            ),
+            Target::Agent(agent) if action == Action::ClearGoal => (
+                format!("Clear the goal of “{}”?", target.title()),
+                format!(
+                    "Swarm clears Agent {}'s goal: no more rounds or checks run for it. The Agent and its work stay; a new goal starts from swarm goal set.",
+                    agent.id
+                ),
+                "Clear goal",
             ),
             Target::Agent(agent) if action == Action::Delete => {
                 let history = match agent.harness.as_str() {

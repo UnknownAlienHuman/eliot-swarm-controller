@@ -66,6 +66,7 @@ mod menu_ui;
 mod monitor_ui;
 mod move_ui;
 pub(crate) mod page_ui;
+mod pane_ui;
 mod picker_ui;
 mod profiles_ui;
 mod project_ui;
@@ -183,6 +184,13 @@ struct UiDetail {
     control_failure: Option<eliot_core::api::AgentControlFailure>,
     /// The task's Git branch.
     branch: Option<String>,
+    /// The branch or commit the task's worktree was made from (`base_ref`).
+    base_ref: Option<String>,
+    /// The frozen hierarchy root: the task this Agent works under (itself
+    /// for a task).
+    root: String,
+    /// When the Agent was created (ms since the epoch).
+    created_at: i64,
     /// The hold on the Agent's frozen account or profile, if any.
     provider_hold: Option<eliot_core::api::AgentProviderHold>,
     /// The session's context fill: tokens used and the window, when the
@@ -272,6 +280,8 @@ enum Message {
     Menu(MenuMsg),
     Move(MoveMsg),
     Bulk(BulkMsg),
+    /// The right pane: its tabs, width, Changes, Agents and Terminal.
+    Pane(pane_ui::PaneMsg),
     /// Open a path in File Explorer (any path row's click).
     Reveal(String, String),
 }
@@ -408,6 +418,8 @@ struct DesktopApp {
     project: project_ui::ProjectState,
     /// The sidebar's right-click menu, rename and confirmation.
     menu: menu_ui::MenuState,
+    /// The right pane's width, its tabs' reads and choices.
+    pane: pane_ui::PaneState,
     /// The open bulk action (remove projects, archive or delete tasks).
     bulk: Option<bulk_ui::BulkDialog>,
     /// Dialog epochs handed out by [`Self::start_bulk`]: each dialog's
@@ -735,6 +747,9 @@ fn detail_from(reply: &AgentGetResponse) -> UiDetail {
         routing: reply.agent.profile_choice.clone(),
         control_failure: reply.last_control_failure.clone(),
         branch: reply.agent.branch.clone(),
+        base_ref: reply.agent.base_ref.clone(),
+        root: reply.agent.root.clone(),
+        created_at: reply.agent.created_at,
         provider_hold: reply.provider_hold.clone(),
         context: reply.session_usage.as_ref().and_then(|usage| {
             usage
@@ -984,6 +999,7 @@ impl Component for DesktopApp {
             automation: automation_ui::AutomationState::default(),
             project: project_ui::ProjectState::default(),
             menu: menu_ui::MenuState::default(),
+            pane: pane_ui::PaneState::default(),
             bulk: None,
             bulk_seq: 0,
             missing_cleanup: HashMap::new(),
@@ -1039,10 +1055,12 @@ impl Component for DesktopApp {
             Message::Menu(msg) => self.menu_update(msg, context),
             Message::Move(msg) => self.move_update(msg, context),
             Message::Bulk(msg) => self.bulk_update(msg, context),
+            Message::Pane(msg) => self.pane_update(msg, context),
             Message::Reveal(item, path) => self.reveal_path(item, path),
         }
         self.record_location();
         self.sync_monitor();
+        self.sync_pane(context);
         self.sync_dialog(context);
     }
 
