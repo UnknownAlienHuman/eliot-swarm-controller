@@ -2546,11 +2546,20 @@ pub fn load_remote_manager_grants(data_root: &Path) -> core::Result<Vec<core::Re
 
 /// Owner and manager audiences accepted by the HTTP Access verifier.
 pub fn load_cloud_access_audiences(data_root: &Path) -> core::Result<Vec<String>> {
-    let (_, owner_audience) = load_cloud_access_config(data_root)?;
+    Ok(load_cloud_access_snapshot(data_root)?.2)
+}
+
+/// One config snapshot for the HTTP origin verifier: issuer, owner audience
+/// tag, and accepted audiences. Read once per verification so a grant add or
+/// revoke applies before the next request without pairing values from
+/// separate reads.
+pub fn load_cloud_access_snapshot(data_root: &Path) -> core::Result<(String, String, Vec<String>)> {
+    let (issuer, owner_audience) = load_cloud_access_config(data_root)?;
     let grants = load_remote_manager_grants(data_root)?;
-    Ok(std::iter::once(owner_audience)
-        .chain(grants.into_iter().map(|grant| grant.audience))
-        .collect())
+    let mut audiences = Vec::with_capacity(grants.len() + 1);
+    audiences.push(owner_audience.clone());
+    audiences.extend(grants.into_iter().map(|grant| grant.audience));
+    Ok((issuer, owner_audience, audiences))
 }
 
 fn parse_remote_manager_grants(
