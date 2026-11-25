@@ -219,8 +219,14 @@ pub(super) enum ShellMsg {
     /// The Settings navigation's Back row: the conversation again.
     SettingsClosed,
     PanelToggled(Panel),
-    /// The window's client size (Reactor `on_window_size`).
-    WindowResized(WindowSize),
+    /// The size class or the docking result changed (`split_ui`).
+    Layout(split_ui::Layout),
+    /// A panel handle was released at these widths.
+    PanelsResized(split_ui::PanelWidths),
+    /// Settings › Appearance: the default panel widths again.
+    PanelsReset,
+    /// The compact window's navigation pane closed (light dismiss).
+    OverlayClosed,
     ThemeChosen(ThemeChoice),
     StartupChosen(Startup),
     /// The re-created editors of this re-prime exist: give them their text.
@@ -267,8 +273,6 @@ impl ShellMsg {
 const PRIME_RETRY_MS: u64 = 16;
 /// The sidebar's padding around its rows.
 const SIDEBAR_PADDING: f64 = tokens::spacing::SM;
-/// The hidden sidebar: a rail of icon buttons, one control wide.
-const RAIL_WIDTH: f64 = tokens::height::CONTROL + 2.0 * SIDEBAR_PADDING;
 /// Focus attempts for Ctrl+K and for focus held back until the window is
 /// the foreground window, and the wait between them: right after a cold
 /// start or an activation WinUI refuses focus until the content is ready.
@@ -374,6 +378,8 @@ pub(super) struct ShellState {
     pub(super) pace: live::Pace,
     /// The sidebar is hidden to its rail (this session).
     pub(super) sidebar_collapsed: bool,
+    /// A compact window's sidebar is open in the navigation pane.
+    pub(super) overlay_open: bool,
     /// The places visited, for Back and Forward.
     pub(super) history: crate::history::History<Location>,
     /// The Back or Forward step waiting for its Agent's read.
@@ -760,7 +766,7 @@ impl DesktopApp {
                     Err(error) => self.alert(format!("Search not read: {error}")),
                 }
             }
-            ShellMsg::SidebarToggled => self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed,
+            ShellMsg::SidebarToggled => self.toggle_sidebar(),
             ShellMsg::AgentOpened(agent) => {
                 // A match beyond the loaded pages joins them, so it stays in
                 // its project once the search closes.
@@ -928,21 +934,24 @@ impl DesktopApp {
                 Panel::Closed => self.close_panel(),
                 panel => self.choose_panel(panel, context),
             },
-            ShellMsg::WindowResized(size) => {
-                self.window_width = Some(size.width);
-                self.window_height = Some(size.height);
-                self.sync_icon();
-                // A maximized size is not the size the window restores to.
-                if size.width >= 640.0 && size.height >= 480.0 && !crate::window_place::maximized()
-                {
-                    let window = (size.width as u32, size.height as u32);
-                    if self.window_size != Some(window) {
-                        self.window_size = Some(window);
-                        // No write here: the size persists once, at close.
-                        self.note_window_size();
-                    }
+            ShellMsg::Layout(layout) => {
+                if layout.class != split_ui::SizeClass::Compact {
+                    self.nav.overlay_open = false;
                 }
+                self.layout = layout;
             }
+            ShellMsg::PanelsResized(widths) => {
+                self.prefs.panels = Some(widths.saved());
+                self.prefs_rev += 1;
+                self.save_preferences(context);
+            }
+            ShellMsg::PanelsReset if self.prefs.panels.is_some() => {
+                self.prefs.panels = None;
+                self.prefs_rev += 1;
+                self.save_preferences(context);
+            }
+            ShellMsg::PanelsReset => {}
+            ShellMsg::OverlayClosed => self.nav.overlay_open = false,
             // The list reports the value it shows when it is built: only a
             // change saves. WinUI redraws in the new theme by itself.
             ShellMsg::ThemeChosen(theme) if theme != self.prefs.theme => {
@@ -972,7 +981,7 @@ impl DesktopApp {
                         .insert(self.settings_page, settings_ui::Note::of(false, &result));
                 }
                 // A newer change arrived while this one was written.
-                if saved != self.prefs || window != self.window_size {
+                if saved != self.prefs || window != self.size_note.size() {
                     self.save_preferences(context);
                 } else if self.settings.loaded && result.is_ok() {
                     // The revision moved: the page's drafts save against it.
@@ -1090,8 +1099,11 @@ impl DesktopApp {
                         self.focus_search(FOCUS_TRIES, context)
                     }
                     Shortcut::Settings => self.open_settings(None, context),
-                    Shortcut::Sidebar if self.main != Main::Settings => {
-                        self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed;
+                    Shortcut::Sidebar
+                        if self.main != Main::Settings
+                            || self.layout.class == split_ui::SizeClass::Compact =>
+                    {
+                        self.toggle_sidebar()
                     }
                     Shortcut::Sidebar => {}
                     Shortcut::Terminal => {
@@ -1242,14 +1254,6 @@ impl DesktopApp {
         }
     }
 
-    /// Give the window its icon once it is shown; until then the next size
-    /// observation tries again.
-    fn sync_icon(&mut self) {
-        if !self.icon_set {
-            self.icon_set = crate::app_window::set_icon();
-        }
-    }
-
     /// Open Settings, at `page` when given.
     fn open_settings(&mut self, page: Option<settings_ui::Page>, context: &ComponentContext<Self>) {
         self.close_popover();
@@ -1301,6 +1305,16 @@ impl DesktopApp {
     /// Keep the place shown now in the history (after every update, so
     /// every way of getting somewhere counts: a row, a search, a menu, a
     /// shortcut, archiving the open chat).
+    /// Show or hide the sidebar: a compact window opens it in the
+    /// navigation pane, a wider one hides it to its rail.
+    fn toggle_sidebar(&mut self) {
+        if self.layout.class == split_ui::SizeClass::Compact {
+            self.nav.overlay_open = !self.nav.overlay_open;
+        } else {
+            self.nav.sidebar_collapsed = !self.nav.sidebar_collapsed;
+        }
+    }
+
     pub(super) fn record_location(&mut self) {
         if let Some(place) = self.location() {
             self.nav.history.visit(place);
@@ -1713,6 +1727,7 @@ impl DesktopApp {
         }
         // The search box lives in the full sidebar.
         self.nav.sidebar_collapsed = false;
+        self.nav.overlay_open = self.layout.class == split_ui::SizeClass::Compact;
         let Some(left) = tries.checked_sub(1) else {
             return;
         };
@@ -1856,33 +1871,14 @@ impl DesktopApp {
         }
     }
 
-    /// The main area's width from the window width, the sidebar (its rail
-    /// when hidden, the Settings navigation in its place) and the open
-    /// panel, or None until the first size observation.
-    pub(super) fn main_width(&self) -> Option<f64> {
-        let panel = self.pane_beside();
-        let side = if self.rail_shown() {
-            RAIL_WIDTH
-        } else {
-            tokens::layout::SIDEBAR_WIDTH
-        };
-        self.window_width
-            .map(|width| width - side - panel - tokens::layout::CARD_GAP)
-    }
-
-    /// Tasks hide the sidebar to its rail, by choice or when the window is
-    /// too narrow to keep the task area at its minimum beside the sidebar
-    /// (and the open panel); Settings always shows its navigation.
+    /// A compact window shows the rail and opens the sidebar (or the
+    /// Settings navigation in its place) in the navigation pane (§6.2);
+    /// a wider one hides the sidebar to its rail by choice, never the
+    /// Settings navigation.
     fn rail_shown(&self) -> bool {
-        if self.main == Main::Settings || self.link_view_shown() {
-            return false;
-        }
-        let panel = self.pane_beside();
-        self.nav.sidebar_collapsed
-            || self.window_width.is_some_and(|width| {
-                width - tokens::layout::SIDEBAR_WIDTH - panel - tokens::layout::CARD_GAP
-                    < tokens::layout::MAIN_MIN_WIDTH
-            })
+        !self.link_view_shown()
+            && (self.layout.class == split_ui::SizeClass::Compact
+                || (self.main != Main::Settings && self.nav.sidebar_collapsed))
     }
 
     /// The right panel belongs to the conversation: Settings shows two
@@ -1894,31 +1890,11 @@ impl DesktopApp {
             && !self.link_view_shown()
     }
 
-    /// The pane's width at its chosen size (Normal or Wide).
-    pub(super) fn pane_width(&self) -> f64 {
-        if self.pane.wide {
-            tokens::layout::PANEL_WIDE_WIDTH
-        } else {
-            tokens::layout::PANEL_WIDTH
-        }
-    }
-
-    /// The pane lies over the main area: the window is narrower than the
-    /// skeleton's breakpoint (Full view covers it anyway).
-    pub(super) fn pane_overlays(&self) -> bool {
-        self.window_width
-            .is_some_and(|width| width < tokens::layout::PANEL_OVERLAY_BELOW)
-    }
-
-    /// The width the pane takes beside the main area: none when closed,
-    /// when it lies over the main area or in Full view (the main area is
-    /// then hidden, and its width is the pane's).
-    fn pane_beside(&self) -> f64 {
-        if self.panel_shown() && !self.pane.full && !self.pane_overlays() {
-            self.pane_width()
-        } else {
-            0.0
-        }
+    /// The open pane docks beside the main area (§6.2's docking condition,
+    /// not Full view); otherwise it takes the main area, over the
+    /// conversation, which keeps its scroll, selection and draft.
+    pub(super) fn pane_docked(&self) -> bool {
+        self.panel_shown() && !self.pane.full && self.layout.docks
     }
 
     /// Write an explicit theme or startup choice into `[desktop]` at once,
@@ -1934,7 +1910,7 @@ impl DesktopApp {
             return;
         };
         self.prefs_saving = true;
-        let (preferences, window) = (self.prefs.clone(), self.window_size);
+        let (preferences, window) = (self.prefs.clone(), self.size_note.size());
         let _task = context.spawn_background(move |_| {
             let saved = client::block_on(config_client::save_preferences(
                 &data_dir,
@@ -1945,11 +1921,11 @@ impl DesktopApp {
         });
     }
 
-    /// Remember the last observed size (and its data directory) for the one
-    /// `[desktop]` write after the window closes.
-    pub(super) fn note_window_size(&mut self) {
-        if let (Ok(data_dir), Some(window)) = (self.data_dir.clone(), self.window_size) {
-            self.close_window.store(data_dir, window);
+    /// Name the data directory the `[desktop]` write after the window
+    /// closes goes to.
+    pub(super) fn note_data_dir(&self) {
+        if let Ok(data_dir) = self.data_dir.clone() {
+            self.size_note.set_data_dir(data_dir);
         }
     }
 
@@ -2344,9 +2320,6 @@ impl DesktopApp {
                 )
                 .theme(window_theme(self.prefs.theme)),
         );
-        context
-            .on_window_size(context.callback(|size| Message::Shell(ShellMsg::WindowResized(size))));
-
         let main: View = match self.main {
             main if main != Main::Settings && self.link_view_shown() => {
                 self.startup_error_view(context)
@@ -2358,81 +2331,24 @@ impl DesktopApp {
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
         let rail = self.rail_shown();
-        // The main card: a card surface on the window's base, 8 DIPs from
-        // the window's top, right and bottom edges, beside the sidebar. The
-        // page or conversation and the right pane sit inside it.
-        let radius = tokens::layout::CARD_RADIUS;
-        let mut card_columns = vec![GridLength::STAR];
-        // The pane: behind a hairline at its Normal or Wide width beside
-        // the main area, over it on the opaque base in a narrow window, or
-        // the whole card in Full view (the conversation is then not drawn).
-        let full = self.panel_shown() && self.pane.full;
-        let main: Option<View> = if full { None } else { Some(main) };
-        let panel: Option<View> = if !self.panel_shown() {
-            None
-        } else {
-            Some(if full {
-                Border::new()
-                    .corner_radius(radius)
-                    .content(self.panel_view(context))
-                    .into()
-            } else if self.pane_overlays() {
-                Border::new()
-                    .width(
-                        self.pane_width().min(
-                            self.window_width
-                                .map_or(f64::MAX, |width| width - tokens::layout::CARD_GAP),
-                        ),
-                    )
-                    .horizontal_alignment(HorizontalAlignment::Right)
-                    .background(ThemeBrush::SolidBackground)
-                    .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                    .border_brush(ThemeBrush::CardStroke)
-                    .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                    .content(self.panel_view(context))
-                    .into()
-            } else {
-                card_columns.push(GridLength::Pixel(self.pane_width()));
-                Border::new()
-                    .grid_column(1)
-                    .corner_radius(CornerRadius::new(0.0, radius, radius, 0.0))
-                    .border_brush(ThemeBrush::CardStroke)
-                    .border_thickness(Thickness::new(tokens::layout::HAIRLINE, 0.0, 0.0, 0.0))
-                    .content(self.panel_view(context))
-                    .into()
-            })
-        };
-        let card: View = Grid::new()
-            .grid_column(1)
-            .margin(Thickness::new(
-                0.0,
-                tokens::layout::CARD_GAP,
-                tokens::layout::CARD_GAP,
-                tokens::layout::CARD_GAP,
-            ))
-            .children((Border::new()
-                .background(ThemeBrush::CardBackground)
-                .border_brush(ThemeBrush::CardStroke)
-                .border_thickness(Thickness::uniform(tokens::layout::HAIRLINE))
-                .corner_radius(radius)
-                .content(
-                    Grid::new()
-                        .columns(card_columns)
-                        .keyed_children(crate::views::slots([
-                            Some(
-                                crate::views::MaybeContent::maybe_content(Border::new(), main)
-                                    .into(),
-                            ),
-                            panel,
-                        ])),
-                ),))
-            .into();
+        // The pane docks beside the main area, or lies over it (Full view,
+        // or a window too narrow to dock it; see `split_ui`).
+        let pane: Option<View> = self.panel_shown().then(|| self.panel_view(context));
         // Settings replaces the sidebar with its own navigation. While the
         // daemon screen shows, the sidebar keeps the last list it had,
-        // dimmed, and takes no pointer input.
+        // dimmed, and takes no pointer input. A compact window opens the
+        // sidebar over the main area, its rail staying in place.
+        let compact = self.layout.class == split_ui::SizeClass::Compact;
+        let overlay: Option<View> = (rail && compact && self.nav.overlay_open).then(|| {
+            if self.main == Main::Settings {
+                self.settings_nav(context)
+            } else {
+                View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context))
+            }
+        });
         let side: View = match self.main {
-            Main::Settings => self.settings_nav(context),
             _ if rail => self.rail_view(context),
+            Main::Settings => self.settings_nav(context),
             _ => View::component::<sidebar_ui::Sidebar>(self.sidebar_input(context)),
         };
         let side: View = if self.link_view_shown() && self.main != Main::Settings {
@@ -2448,17 +2364,24 @@ impl DesktopApp {
         } else {
             side
         };
-        let columns_grid = Grid::new()
-            .background(ThemeBrush::SolidBackground)
-            .columns([
-                GridLength::Pixel(if rail {
-                    RAIL_WIDTH
-                } else {
-                    tokens::layout::SIDEBAR_WIDTH
-                }),
-                GridLength::STAR,
-            ])
-            .children((Border::new().grid_column(0).content(side), card));
+        let shell = View::component::<split_ui::SplitShell>(split_ui::SplitInput {
+            side,
+            mode: if rail {
+                split_ui::Side::Rail
+            } else {
+                split_ui::Side::Panel
+            },
+            overlay,
+            main,
+            pane,
+            over: !self.pane_docked(),
+            wide: self.pane.wide,
+            widths: split_ui::PanelWidths::of(self.prefs.panels),
+            note: self.size_note.clone(),
+            on_layout: context.callback(|layout| Message::Shell(ShellMsg::Layout(layout))),
+            on_widths: context.callback(|widths| Message::Shell(ShellMsg::PanelsResized(widths))),
+            on_overlay_closed: context.callback(|_: bool| Message::Shell(ShellMsg::OverlayClosed)),
+        });
         // One cell: the window, the row-menu button that carries the
         // sidebar's menu flyout and the attach chooser's button; the
         // confirmation dialog is attached to it (a Reactor 0.101 dialog is
@@ -2479,7 +2402,7 @@ impl DesktopApp {
             Some(self.task_dialog(context))
         };
         let window = Grid::new().children((
-            columns_grid,
+            shell,
             self.menu_anchor(context),
             self.attach_anchor(context),
         ));

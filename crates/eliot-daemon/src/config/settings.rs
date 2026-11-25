@@ -424,6 +424,7 @@ fn desktop_default() -> JsonValue {
         "model_visibility": [],
         "collapsed_model_groups": [],
         "display_names": [],
+        "panels": null,
     })
 }
 

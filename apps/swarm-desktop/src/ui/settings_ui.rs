@@ -86,6 +86,11 @@ const INDEX: &[(Page, &str, &str)] = &[
     ),
     (
         Page::General,
+        "Panel widths",
+        "reset panel widths sidebar pane resize width",
+    ),
+    (
+        Page::General,
         "On startup",
         "startup start conversation open reopen last task",
     ),
@@ -2128,15 +2133,14 @@ impl DesktopApp {
             },
             |error| Some(self.read_error(error, context)),
         );
-        let width = self.settings_column_width();
         // The page's tree is keyed by page, so its editors are new controls
         // (see `reprime_fields`).
         let scroll = ScrollViewer::new()
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
                 StackPanel::new()
-                    .maybe_width(width)
-                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .min_width(tokens::layout::MIN_COLUMN)
+                    .max_width(tokens::page::SETTINGS_WIDTH)
                     .margin(Thickness::uniform(tokens::spacing::LG))
                     .spacing(tokens::spacing::MD)
                     .keyed_children(
@@ -2274,15 +2278,6 @@ impl DesktopApp {
             ));
         }
         Some(controls::settings_card(rows))
-    }
-
-    /// The settings column: one explicit width, so every page's groups
-    /// line up (content-sized until the window size is observed).
-    pub(super) fn settings_column_width(&self) -> Option<f64> {
-        self.main_width().map(|width| {
-            (width - 2.0 * tokens::spacing::LG)
-                .clamp(tokens::layout::MIN_COLUMN, tokens::page::SETTINGS_WIDTH)
-        })
     }
 
     /// Whether the page's changes save as they are made (no Save button):

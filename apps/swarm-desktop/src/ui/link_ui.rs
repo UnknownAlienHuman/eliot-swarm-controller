@@ -362,7 +362,7 @@ impl DesktopApp {
             self.new_task(context);
         }
         self.data_dir = Ok(candidate.clone());
-        self.note_window_size();
+        self.note_data_dir();
         self.link.candidate = true;
         self.retry_startup(context);
         self.set_status(format!("Starting Swarm in {}", candidate.display()));
@@ -465,17 +465,14 @@ impl DesktopApp {
     }
 
     /// The restart in progress, above the composer: calm, not an alert.
-    pub(super) fn reconnect_notice(&self, column: Option<f64>) -> Option<View> {
+    pub(super) fn reconnect_notice(&self) -> Option<View> {
         let (attempt, reason) = self.link.restarting.as_ref()?;
         let text = format!("Swarm stopped. Reconnecting… attempt {attempt} of {RESTART_ATTEMPTS}");
         let reason = reason.clone().unwrap_or_default();
         Some(
             Border::new()
                 .grid_row(4)
-                .maybe_width(column)
-                .max_width(tokens::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                .column(tokens::layout::READING_WIDTH, tokens::spacing::SM, 0.0)
                 .background(ThemeBrush::CardBackground)
                 .corner_radius(tokens::radius::CONTAINER)
                 .padding(Thickness::xy(tokens::spacing::MD, tokens::spacing::SM))

@@ -732,7 +732,6 @@ impl DesktopApp {
                             Some(controls::glyph::CHECKLIST),
                             "Select",
                             false,
-                            tokens::layout::PROJECT_CHIP_WIDTH,
                         )),
                 )],
             ),
@@ -867,7 +866,7 @@ impl DesktopApp {
                     .content(controls::label("Next page")),
             ));
         }
-        page_ui::page("Owner inbox", self.page_width(tokens::page::WIDTH), items)
+        page_ui::page("Owner inbox", tokens::page::WIDTH, items)
     }
 
     /// The selection bar (`.bulk`): select all, the count, Snooze and

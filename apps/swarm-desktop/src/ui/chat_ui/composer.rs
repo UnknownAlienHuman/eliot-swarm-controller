@@ -56,11 +56,7 @@ impl DesktopApp {
     /// shows (its trailing button, chips, usage ring and attachments);
     /// the composer draws it and owns its text, so a keystroke redraws
     /// the card alone.
-    pub(super) fn composer_view(
-        &self,
-        column: Option<f64>,
-        context: &mut ViewContext<Self>,
-    ) -> View {
+    pub(super) fn composer_view(&self, context: &mut ViewContext<Self>) -> View {
         let agent = self.selected_agent_id();
         // Only a readback of the open Agent binds its controls; until then
         // the card keeps the shape its sidebar row implies.
@@ -76,43 +72,17 @@ impl DesktopApp {
             _ if running || reading == Some(RowMode::Running) => "Type to steer the running turn",
             _ => "Send a follow-up",
         };
-        let widest = if home {
-            tokens::layout::HOME_WIDTH
-        } else {
-            tokens::layout::READING_WIDTH
-        };
-        // Home's composer takes the home column (760), a conversation's its
-        // reading column (720).
-        let width = if home {
-            self.column_width(widest)
-        } else {
-            column
-        };
-        // A narrow composer drops its hint and trims its chips' labels to
-        // the room left, so the buttons and the chevrons stay whole. Home's
-        // split Start task names its action: no hint there.
-        let hint =
-            !home && width.is_none_or(|width| width >= tokens::layout::COMPOSER_HINT_MIN_WIDTH);
-        let label = |others: f64| {
-            width.map_or(tokens::layout::PROJECT_CHIP_WIDTH, |width| {
-                (width - tokens::layout::COMPOSER_ACTIONS_WIDTH - others).clamp(
-                    tokens::layout::COMPOSER_LABEL_MIN_WIDTH,
-                    tokens::layout::PROJECT_CHIP_WIDTH,
-                )
-            })
-        };
         let chips: Option<View> = match (agent.as_deref(), detail) {
-            (None, _) => Some(self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context)),
-            (Some(_), Some(detail)) => Some(
-                StackPanel::new()
-                    .orientation(Orientation::Horizontal)
-                    .spacing(tokens::spacing::CHIP_GAP)
-                    .keyed_children(crate::views::slots([
-                        Some(self.model_chip(detail, running, label(0.0), context)),
-                        access_chip(detail),
-                    ]))
-                    .into(),
-            ),
+            (None, _) => Some(self.composer_chips(context)),
+            (Some(_), Some(detail)) => Some(controls::chip_row(
+                [
+                    Some(self.model_chip(detail, running, context)),
+                    access_chip(detail),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+            )),
             (Some(_), None) => None,
         };
         let retry = agent
@@ -182,10 +152,7 @@ impl DesktopApp {
                 .filter(|detail| !home && !detail.observe_only && !resumable(detail))
                 .map(|detail| detail.generation),
             primary,
-            hint,
             enabled: !self.submitting(),
-            width,
-            widest,
             agent,
             send: context.forward(),
         })
@@ -197,7 +164,6 @@ impl DesktopApp {
         &self,
         detail: &UiDetail,
         running: bool,
-        label_width: f64,
         context: &mut ViewContext<Self>,
     ) -> View {
         let full = detail.settings.next_model().unwrap_or("Default model");
@@ -230,7 +196,6 @@ impl DesktopApp {
                             Some(controls::glyph::MODEL),
                             &label,
                             false,
-                            label_width,
                         )),
                 )
                 .tooltip("Change the model between turns");
@@ -243,7 +208,7 @@ impl DesktopApp {
                     if open { "open" } else { "change" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort)))),
-            controls::chip_content(Some(controls::glyph::MODEL), &label, true, label_width),
+            controls::chip_content(Some(controls::glyph::MODEL), &label, true),
             &[Pop::Effort, Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
@@ -815,13 +780,8 @@ pub(in crate::ui) struct ComposerInput {
     /// Add as a note is offered: the Agent's generation.
     note: Option<i64>,
     primary: Primary,
-    /// The hint before the trailing buttons ("Enter to send"), left out
-    /// of a narrow composer.
-    hint: bool,
     /// No submission is in flight.
     enabled: bool,
-    width: Option<f64>,
-    widest: f64,
     send: Callback<Message>,
 }
 
@@ -917,10 +877,11 @@ impl Component for Composer {
                 0.0,
             ))
             .content(field);
-        // The design: + (attach files), then the chips, 6 DIPs apart.
-        let chips = StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::CHIP_GAP)
+        // The design: + (attach files), then the chips, 6 DIPs apart; the
+        // chips' row trims its widest label to the room left.
+        let chips = Grid::new()
+            .columns([GridLength::Auto, GridLength::STAR])
+            .column_spacing(tokens::spacing::CHIP_GAP)
             .keyed_children(crate::views::slots([
                 Some(
                     controls::icon_button()
@@ -929,19 +890,50 @@ impl Component for Composer {
                         .content(controls::icon(controls::glyph::NEW_TASK))
                         .tooltip("Attach files"),
                 ),
-                input.chips.clone(),
+                input
+                    .chips
+                    .clone()
+                    .map(|chips| Border::new().grid_column(1).content(chips).into()),
             ]));
-        let bottom = Grid::new()
-            .columns([GridLength::STAR, GridLength::Auto])
-            .column_spacing(tokens::spacing::SM)
-            .children((
-                Border::new()
-                    .vertical_alignment(VerticalAlignment::Center)
-                    .content(chips),
-                Border::new()
+        // The hint before the ring and the action, while Enter steers: the
+        // lowest-priority cell, it trims away first.
+        let hint: Option<View> = match &input.primary {
+            Primary::Turn {
+                running: Some(_), ..
+            } if !blank => Some(
+                controls::secondary("Enter to steer")
                     .grid_column(1)
-                    .content(composer_actions(input, blank, context)),
-            ));
+                    .horizontal_alignment(HorizontalAlignment::Right)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .text_trimming(TextTrimming::CharacterEllipsis)
+                    .into(),
+            ),
+            _ => None,
+        };
+        // Without the hint its cell is empty and takes no room.
+        let hint_cell = if hint.is_some() {
+            GridLength::STAR
+        } else {
+            GridLength::Auto
+        };
+        let bottom = Grid::new()
+            .columns([GridLength::Star(3.0), hint_cell, GridLength::Auto])
+            .column_spacing(tokens::spacing::SM)
+            .keyed_children(crate::views::slots([
+                Some(
+                    Border::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .content(chips)
+                        .into(),
+                ),
+                hint,
+                Some(
+                    Border::new()
+                        .grid_column(2)
+                        .content(composer_actions(input, blank, context))
+                        .into(),
+                ),
+            ]));
         // Home (`Main.dc.html`): the field first, then one bar (+, the
         // project, place, model and access chips, Start task); a folder
         // outside the projects takes its field above. Attached files as
@@ -959,23 +951,25 @@ impl Component for Composer {
         }
         rows.push(KeyedView::new("field", field));
         rows.push(KeyedView::new("bottom", bottom));
-        Border::new()
-            .grid_row(5)
-            .maybe_width(input.width)
-            .max_width(input.widest)
-            .horizontal_alignment(HorizontalAlignment::Center)
-            .margin(if home {
-                Thickness::uniform(0.0)
-            } else {
-                Thickness::new(0.0, tokens::spacing::INSET, 0.0, tokens::spacing::LG)
-            })
-            .content(controls::composer_card(
-                Grid::new(),
-                StackPanel::new()
-                    .spacing(tokens::spacing::SM)
-                    .keyed_children(rows),
-            ))
-            .into()
+        // Home's composer stretches across the home column; a
+        // conversation's takes the reading column.
+        let card = Border::new().grid_row(5);
+        if home {
+            card
+        } else {
+            card.column(
+                tokens::layout::READING_WIDTH,
+                tokens::spacing::INSET,
+                tokens::spacing::LG,
+            )
+        }
+        .content(controls::composer_card(
+            Grid::new(),
+            StackPanel::new()
+                .spacing(tokens::spacing::SM)
+                .keyed_children(rows),
+        ))
+        .into()
     }
 }
 
@@ -1069,17 +1063,6 @@ fn composer_actions(
         },
         Primary::Start => start_split(enabled, draft_blank, context),
     };
-    // The hint before the ring and the action, while Enter steers.
-    let hint: Option<View> = match &input.primary {
-        Primary::Turn {
-            running: Some(_), ..
-        } if input.hint && !draft_blank => Some(
-            controls::secondary("Enter to steer")
-                .vertical_alignment(VerticalAlignment::Center)
-                .into(),
-        ),
-        _ => None,
-    };
     // The ▾ beside the action (an open Agent): Add as a note, the text
     // into the Agent's context at its next safe point without a new turn.
     let note: Option<View> = match (&input.primary, input.note) {
@@ -1131,7 +1114,6 @@ fn composer_actions(
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
         .keyed_children(crate::views::slots([
-            hint,
             input.usage.clone(),
             Some(
                 StackPanel::new()
@@ -1179,12 +1161,7 @@ fn attachment_chips(files: &[String], context: &mut ViewContext<Composer>) -> Vi
                             .orientation(Orientation::Horizontal)
                             .spacing(tokens::spacing::CHIP_GAP)
                             .children((
-                                controls::chip_content(
-                                    Some(controls::glyph::FILE),
-                                    name,
-                                    false,
-                                    tokens::layout::PROJECT_CHIP_WIDTH,
-                                ),
+                                controls::chip_content(Some(controls::glyph::FILE), name, false),
                                 controls::small_icon(controls::glyph::CLOSE),
                             )),
                     )

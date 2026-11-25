@@ -16,35 +16,17 @@ pub(super) enum Place {
     Automations,
 }
 
-impl DesktopApp {
-    /// A page column's width: the card's width less the page's side
-    /// padding, at most `max` (content-sized until the window size is
-    /// observed). An explicit width, as Settings has: a column sized by an
-    /// auto cell would follow its widest text past the card.
-    pub(super) fn page_width(&self, max: f64) -> Option<f64> {
-        self.main_width()
-            .map(|width| (width - 2.0 * tokens::spacing::XL).clamp(tokens::layout::MIN_COLUMN, max))
-    }
-}
-
-/// A scrolling page: its parts in one column `width` wide
-/// ([`DesktopApp::page_width`]), centred, 24 DIPs from the card's top and
+/// A scrolling page: its parts in one centred column at most `widest`
+/// wide (see [`crate::views::Column`]), 24 DIPs from the card's top and
 /// bottom, 16 DIPs apart.
-pub(super) fn page(name: &str, width: Option<f64>, items: Vec<KeyedView>) -> View {
+pub(super) fn page(name: &str, widest: f64, items: Vec<KeyedView>) -> View {
     ScrollViewer::new()
         .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
         .horizontal_scroll_bar_visibility(ScrollBarVisibility::Disabled)
         .automation_name(name)
         .content(
             StackPanel::new()
-                .maybe_width(width)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(
-                    0.0,
-                    tokens::spacing::LG,
-                    0.0,
-                    tokens::spacing::LG,
-                ))
+                .column(widest, tokens::spacing::LG, tokens::spacing::LG)
                 .spacing(tokens::spacing::MD)
                 .keyed_children(items),
         )
@@ -236,12 +218,7 @@ pub(super) fn filter_chip(
             format!("Show {text}")
         })
         .on_click(on_click)
-        .content(controls::chip_content(
-            glyph,
-            &text,
-            false,
-            tokens::layout::PROJECT_CHIP_WIDTH,
-        ))
+        .content(controls::chip_content(glyph, &text, false))
         .into()
 }
 

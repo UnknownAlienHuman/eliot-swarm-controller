@@ -58,7 +58,7 @@ impl DesktopApp {
     }
 
     /// The new task's project chip (it opens the project list).
-    fn project_chip(&self, label_width: f64, context: &mut ViewContext<Self>) -> View {
+    fn project_chip(&self, context: &mut ViewContext<Self>) -> View {
         let label = self.launch_project_label();
         let open = self.launch.open == Some(Pop::Project);
         let glyph = if self.launch.chat {
@@ -73,11 +73,22 @@ impl DesktopApp {
                     if open { "list open" } else { "choose" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Project)))),
-            controls::chip_content(Some(glyph), &label, false, label_width),
+            controls::chip_content(Some(glyph), &label, false),
             &[Pop::Project],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
         )
+    }
+
+    /// A Home chip's label: none below the Wide size class (§6.2), where
+    /// the chips show their icons (their names and tooltips keep the
+    /// words) so the bar fits beside Start task.
+    fn home_chip_label<'a>(&self, label: &'a str) -> &'a str {
+        if self.layout.class < super::split_ui::SizeClass::Wide {
+            ""
+        } else {
+            label
+        }
     }
 
     /// Where the new task works (the design's place chip): "New worktree"
@@ -91,7 +102,7 @@ impl DesktopApp {
                 controls::fixed_chip(
                     false,
                     Some(controls::glyph::WORKTREE),
-                    "New worktree",
+                    self.home_chip_label("New worktree"),
                     "New worktree: this project starts each task in its own worktree",
                 )
                 .tooltip("This project starts each task in its own worktree."),
@@ -106,9 +117,8 @@ impl DesktopApp {
                     .on_click(context.callback(|()| Message::Launch(LaunchMsg::WorktreeToggled)))
                     .content(controls::chip_content(
                         Some(controls::glyph::WORKTREE),
-                        if on { "New worktree" } else { "Work locally" },
+                        self.home_chip_label(if on { "New worktree" } else { "Work locally" }),
                         false,
-                        tokens::layout::PROJECT_CHIP_WIDTH,
                     ))
                     .tooltip(if on {
                         "The task works in a new worktree. Click to work in this folder."
@@ -122,9 +132,8 @@ impl DesktopApp {
     /// The new task's chips (the design's bar, after +): the project,
     /// where it works, the model (Auto by default, Swarm's pick in its
     /// tooltip) and the access level (a preset's is read-only). The
-    /// project's and the model's labels trim at `label_width` (the
-    /// composer's room).
-    pub(super) fn composer_chips(&self, label_width: f64, context: &mut ViewContext<Self>) -> View {
+    /// project's label trims to the composer's room.
+    pub(super) fn composer_chips(&self, context: &mut ViewContext<Self>) -> View {
         let auto_profile = self.launch.auto_profile();
         let label = match self.launch.choice {
             Choice::Auto => "Auto".to_owned(),
@@ -138,7 +147,11 @@ impl DesktopApp {
                     self.launch.choice.chip_name(auto_profile)
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Model)))),
-            controls::chip_content(Some(controls::glyph::MODEL), &label, false, label_width),
+            controls::chip_content(
+                Some(controls::glyph::MODEL),
+                self.home_chip_label(&label),
+                false,
+            ),
             &[Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
@@ -167,9 +180,8 @@ impl DesktopApp {
                                 })),
                             controls::chip_content(
                                 Some(access_glyph(access)),
-                                access.label(),
+                                self.home_chip_label(access.label()),
                                 false,
-                                tokens::layout::PROJECT_CHIP_WIDTH,
                             ),
                             &[Pop::Access],
                             FlyoutPlacement::TopEdgeAlignedLeft,
@@ -195,23 +207,24 @@ impl DesktopApp {
                 controls::fixed_chip(
                     full,
                     Some(controls::glyph::SHIELD),
-                    &label,
+                    self.home_chip_label(&label),
                     &format!("Access: {label}, set by the preset"),
                 )
                 .tooltip("Set by the preset.")
             }
         };
         // The design: project, place, model, access, 6 DIPs apart.
-        StackPanel::new()
-            .orientation(Orientation::Horizontal)
-            .spacing(tokens::spacing::CHIP_GAP)
-            .keyed_children(crate::views::slots([
-                Some(self.project_chip(label_width, context)),
+        controls::chip_row(
+            [
+                Some(self.project_chip(context)),
                 self.place_chip(context),
                 Some(model),
                 Some(access),
-            ]))
-            .into()
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        )
     }
 
     /// The Home question's project name (`Main.dc.html`'s title button): a

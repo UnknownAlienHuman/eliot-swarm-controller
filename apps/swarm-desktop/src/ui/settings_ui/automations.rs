@@ -286,7 +286,7 @@ impl DesktopApp {
         ));
         if scripts {
             items.push(KeyedView::new("scripts", self.scripts_view(context)));
-            return page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items);
+            return page_ui::page("Automations", tokens::page::WIDTH, items);
         }
         let cards = self.automation_cards();
         let mut left: Vec<KeyedView> = vec![KeyedView::new(
@@ -455,7 +455,7 @@ impl DesktopApp {
             "columns",
             page_ui::columns(left, tokens::spacing::SM, right),
         ));
-        page_ui::page("Automations", self.page_width(tokens::page::WIDTH), items)
+        page_ui::page("Automations", tokens::page::WIDTH, items)
     }
 
     /// One row (`.srow.arow`): its plain name, the trigger with the last
@@ -597,7 +597,6 @@ impl DesktopApp {
                     .content(controls::status_pill(
                         card.state.tone(),
                         &card.state.label(),
-                        tokens::page::FLEET_NUMBER * 2.0,
                     )),
                 Border::new()
                     .grid_column(2)

@@ -682,6 +682,20 @@ pub fn desktop_window_in_bounds(width: u32, height: u32, x: Option<i32>, y: Opti
         && coordinate(y)
 }
 
+/// `[desktop] panels`: the desktop's sidebar and context pane widths in
+/// DIPs, as their drag handles left them.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct DesktopPanels {
+    sidebar: u32,
+    pane: u32,
+}
+
+/// `[desktop] panels` bounds in DIPs: the desktop clamps its handles to
+/// these (`ui/tokens.rs`).
+const DESKTOP_SIDEBAR_WIDTH: std::ops::RangeInclusive<u32> = 200..=360;
+const DESKTOP_PANE_WIDTH: std::ops::RangeInclusive<u32> = 320..=720;
+
 /// One desktop model favorite or recent entry.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -764,6 +778,8 @@ struct DesktopSettings {
     collapsed_model_groups: Vec<String>,
     #[serde(default)]
     display_names: Vec<DesktopDisplayName>,
+    #[serde(default)]
+    panels: Option<DesktopPanels>,
 }
 
 /// Bounds for the `[desktop]` picker lists.
@@ -796,6 +812,14 @@ impl DesktopSettings {
             return Err(core::Error::new(
                 "profile_error",
                 "config.toml: desktop window must be 640 by 480 to 32768 by 32768, with x and y within -32768 to 32768",
+            ));
+        }
+        if self.panels.as_ref().is_some_and(|panels| {
+            !DESKTOP_SIDEBAR_WIDTH.contains(&panels.sidebar)
+                || !DESKTOP_PANE_WIDTH.contains(&panels.pane)
+        }) {
+            return Err(desktop_error(
+                "desktop panels must have sidebar 200 to 360 and pane 320 to 720",
             ));
         }
         if self.favorite_models.len() > MAX_DESKTOP_FAVORITES {

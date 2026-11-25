@@ -1594,25 +1594,28 @@ impl DesktopApp {
             .filter(|agent| !agent.native_child && !agent.archived)
             .max_by_key(|agent| agent.updated_at)
             .cloned();
+        // The row rule: the icon, then the label in the star cell, on up
+        // to two lines in a narrow window (a longer one ends in "…").
         let card = |glyph: &str, label: &str| {
-            StackPanel::new()
-                .orientation(Orientation::Horizontal)
-                .spacing(tokens::spacing::ROW)
+            Border::new()
                 .margin(Thickness::xy(
                     tokens::spacing::TEXT_INSET - tokens::spacing::INSET,
                     0.0,
                 ))
-                .children((
-                    controls::icon(glyph),
+                .content(controls::row_grid(
+                    Some(controls::icon(glyph)),
                     controls::body(label.to_owned())
-                        .vertical_alignment(VerticalAlignment::Center)
-                        .max_width(tokens::layout::PROJECT_CHIP_WIDTH)
-                        .text_trimming(TextTrimming::CharacterEllipsis),
+                        .text_wrapping(TextWrapping::Wrap)
+                        .max_lines(2)
+                        .text_trimming(TextTrimming::CharacterEllipsis)
+                        .into(),
+                    None,
+                    tokens::spacing::ROW,
                 ))
         };
-        let mut cards: Vec<KeyedView> = vec![
-            KeyedView::new(
-                "review",
+        let mut cards: Vec<(String, Button)> = vec![
+            (
+                "review".to_owned(),
                 controls::suggestion()
                     .automation_name("Review the open PRs")
                     .on_click(
@@ -1620,8 +1623,8 @@ impl DesktopApp {
                     )
                     .content(card(controls::glyph::DIFF, "Review the open PRs")),
             ),
-            KeyedView::new(
-                "automation",
+            (
+                "automation".to_owned(),
                 controls::suggestion()
                     .automation_name("Schedule an automation")
                     .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
@@ -1632,7 +1635,7 @@ impl DesktopApp {
         ];
         if let Some(agent) = last {
             let label = format!("Continue {}", self.agent_label(&agent));
-            cards.push(KeyedView::new(
+            cards.push((
                 format!("continue:{}", agent.id),
                 controls::suggestion()
                     .automation_name(label.clone())
@@ -1666,32 +1669,35 @@ impl DesktopApp {
                 ))
                 .into()
         };
-        let width = self.column_width(tokens::layout::HOME_WIDTH);
         ScrollViewer::new()
             .grid_row(1)
             .vertical_scroll_bar_visibility(ScrollBarVisibility::Auto)
             .content(
                 StackPanel::new()
-                    .maybe_width(width)
-                    .max_width(tokens::layout::HOME_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::new(
-                        0.0,
+                    .column(
+                        tokens::layout::HOME_WIDTH,
                         tokens::layout::HOME_TOP,
-                        0.0,
                         tokens::spacing::XL,
-                    ))
+                    )
                     .spacing(tokens::spacing::HOME_GROUP_GAP)
                     .keyed_children(crate::views::slots([
                         Some(title),
                         alert,
                         Some(composer),
                         Some(
-                            StackPanel::new()
-                                .orientation(Orientation::Horizontal)
-                                .horizontal_alignment(HorizontalAlignment::Center)
-                                .spacing(tokens::spacing::SM)
-                                .keyed_children(cards)
+                            // The cards share the column in equal cells.
+                            Grid::new()
+                                .columns(vec![GridLength::STAR; cards.len()])
+                                .column_spacing(tokens::spacing::SM)
+                                .keyed_children(cards.into_iter().enumerate().map(
+                                    |(index, (key, card))| {
+                                        KeyedView::new(
+                                            key,
+                                            card.grid_column(index as i32)
+                                                .horizontal_alignment(HorizontalAlignment::Stretch),
+                                        )
+                                    },
+                                ))
                                 .into(),
                         ),
                     ])),
@@ -1705,12 +1711,11 @@ impl DesktopApp {
     /// conversation opens (`views::Transcript`), instead of tearing them all
     /// down in one frame. Back to tasks builds it again from its end.
     pub(super) fn chat_view(&self, context: &mut ViewContext<Self>) -> View {
-        let column = self.reading_width();
         // The running seconds tick only while a conversation is on screen.
         views::clock::set_shown(
             self.main == Main::Conversation && self.selected_agent_id().is_some(),
         );
-        let transcript = self.transcript_view(column, context);
+        let transcript = self.transcript_view(context);
         if self.main != Main::Conversation {
             let content = match self.main {
                 Main::Project => self.project_view(context),
@@ -1768,16 +1773,14 @@ impl DesktopApp {
             // now, at once (no empty pause after Send).
             None if self.launch.starting.is_some() => {
                 let (text, label) = self.launch.starting.clone().unwrap_or_default();
-                Some(starting_view(&text, &label, column))
+                Some(starting_view(&text, &label))
             }
             // Home is built below, around the notice and the composer.
             _ => None,
         };
-        let reconnect = self.reconnect_notice(column);
+        let reconnect = self.reconnect_notice();
         let alert: Option<View> = match (&self.chat.confirm_force, &self.alert) {
-            (Some((bound, title)), _) => {
-                Some(self.force_stop_banner(bound, title, column, context))
-            }
+            (Some((bound, title)), _) => Some(self.force_stop_banner(bound, title, context)),
             // A restart in progress says so once, over the reads it stalls.
             (None, _) if reconnect.is_some() => reconnect,
             (None, Some(text)) => {
@@ -1802,10 +1805,7 @@ impl DesktopApp {
                 Some(
                     Border::new()
                         .grid_row(4)
-                        .maybe_width(column)
-                        .max_width(tokens::layout::READING_WIDTH)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                        .column(tokens::layout::READING_WIDTH, tokens::spacing::SM, 0.0)
                         // Alerts are refusals, uncertain outcomes and failed
                         // reads: the attention surface and mark, the text in
                         // the body color so it stays easy to read.
@@ -1865,13 +1865,13 @@ impl DesktopApp {
                 )
             }
             (None, None) => self
-                .archived_notice(column, context)
-                .or_else(|| self.loss_notice(column, context)),
+                .archived_notice(context)
+                .or_else(|| self.loss_notice(context)),
         };
         // Waiting for the owner: the decision panel takes the composer's
         // place; otherwise the hold strip and the workers line sit above
         // the composer.
-        let composer = match self.decision_panel(column, context) {
+        let composer = match self.decision_panel(context) {
             Some(panel) if !home => panel,
             _ => {
                 let above: Vec<KeyedView> = [
@@ -1882,7 +1882,7 @@ impl DesktopApp {
                 .flatten()
                 .map(|(key, view)| KeyedView::new(key, view))
                 .collect();
-                let composer = self.composer_view(column, context);
+                let composer = self.composer_view(context);
                 if home || above.is_empty() {
                     composer
                 } else {
@@ -1890,10 +1890,7 @@ impl DesktopApp {
                         .grid_row(5)
                         .children((
                             StackPanel::new()
-                                .maybe_width(column)
-                                .max_width(tokens::layout::READING_WIDTH)
-                                .horizontal_alignment(HorizontalAlignment::Center)
-                                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+                                .column(tokens::layout::READING_WIDTH, tokens::spacing::SM, 0.0)
                                 .spacing(tokens::spacing::SM)
                                 .keyed_children(above),
                             composer,
@@ -1957,22 +1954,5 @@ impl DesktopApp {
                 .flatten(),
             )
             .into()
-    }
-
-    /// The reading column's width: the reading width, or the main area less
-    /// its gutters when narrower; content-sized until the window size is
-    /// observed. Inside the ScrollViewer a stretched MaxWidth column was
-    /// arranged in a slot wider than the viewport (off center), so the
-    /// column gets an explicit width.
-    fn reading_width(&self) -> Option<f64> {
-        self.column_width(tokens::layout::READING_WIDTH)
-    }
-
-    /// The column the main area gives: its width less the design's 32-DIP
-    /// side padding, at most `widest` (720 in a conversation, 760 at home).
-    pub(super) fn column_width(&self, widest: f64) -> Option<f64> {
-        self.main_width().map(|width| {
-            (width - 2.0 * tokens::spacing::XL).clamp(tokens::layout::MIN_COLUMN, widest)
-        })
     }
 }

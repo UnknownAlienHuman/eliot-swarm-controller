@@ -187,7 +187,7 @@ impl Component for Sidebar {
                                     |label| Message::Shell(ShellMsg::SearchChosen(label)),
                                 )))
                                 .automation_name("Search tasks")
-                                .height(tokens::height::CONTROL),
+                                .min_height(tokens::height::CONTROL),
                             controls::icon_button()
                                 .grid_column(1)
                                 .automation_name("Close search")
@@ -385,7 +385,7 @@ fn title_row(input: &SidebarInput, context: &mut ViewContext<Sidebar>) -> View {
         .children((controls::text("Eliot Swarm", tokens::text::TITLE)
             .vertical_alignment(VerticalAlignment::Center),));
     Grid::new()
-        .height(tokens::height::TITLE_ROW)
+        .min_height(tokens::height::TITLE_ROW)
         .margin(Thickness::new(0.0, 0.0, tokens::spacing::XS, 0.0))
         .columns([
             GridLength::STAR,

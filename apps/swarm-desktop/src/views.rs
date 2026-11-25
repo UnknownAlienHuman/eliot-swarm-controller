@@ -51,23 +51,43 @@ impl MaybeContent for Border {
     }
 }
 
-/// Optional sizes: Reactor 0.101 takes a plain `f64`; an omitted size
-/// leaves the control at its default (Auto), as `None` did in 0.100.
+/// A content column (§6.3): stretched across its slot less the 32-DIP side
+/// gutters, at most `widest` wide and at least [`tokens::layout::MIN_COLUMN`];
+/// WinUI centres a stretched element its MaxWidth caps, so no width is
+/// derived from the window.
+pub trait Column: Sized {
+    fn column(self, widest: f64, top: f64, bottom: f64) -> Self;
+}
+
+macro_rules! column {
+    ($($control:ty),*) => {$(
+        impl Column for $control {
+            fn column(self, widest: f64, top: f64, bottom: f64) -> Self {
+                self.min_width(crate::tokens::layout::MIN_COLUMN)
+                    .max_width(widest)
+                    .horizontal_alignment(HorizontalAlignment::Stretch)
+                    .margin(Thickness::new(
+                        crate::tokens::spacing::XL,
+                        top,
+                        crate::tokens::spacing::XL,
+                        bottom,
+                    ))
+            }
+        }
+    )*};
+}
+
+column!(Border, StackPanel, Grid);
+
+/// An optional maximum width: Reactor 0.101 takes a plain `f64`; an
+/// omitted size leaves the control at its default, as `None` did in 0.100.
 pub trait MaybeSize: Sized {
-    fn maybe_width(self, width: Option<f64>) -> Self;
     fn maybe_max_width(self, width: Option<f64>) -> Self;
 }
 
 macro_rules! maybe_size {
     ($($control:ty),*) => {$(
         impl MaybeSize for $control {
-            fn maybe_width(self, width: Option<f64>) -> Self {
-                match width {
-                    Some(width) => self.width(width),
-                    None => self,
-                }
-            }
-
             fn maybe_max_width(self, width: Option<f64>) -> Self {
                 match width {
                     Some(width) => self.max_width(width),
@@ -973,7 +993,6 @@ pub struct TranscriptInput {
     pub items: Shared<Vec<Rc<RenderedItem>>>,
     pub expanded: Rc<HashSet<String>>,
     pub callbacks: Rc<RowCallbacks>,
-    pub column: Option<f64>,
     /// "Load older messages" when more history exists: enabled, and its
     /// callback.
     pub load_older: Option<(bool, Callback<()>)>,
@@ -1160,10 +1179,11 @@ impl Component for Transcript {
             .automation_id(input.automation_id)
             .content(
                 StackPanel::new()
-                    .maybe_width(input.column)
-                    .max_width(tokens::layout::READING_WIDTH)
-                    .horizontal_alignment(HorizontalAlignment::Center)
-                    .margin(Thickness::xy(0.0, tokens::spacing::MD))
+                    .column(
+                        tokens::layout::READING_WIDTH,
+                        tokens::spacing::MD,
+                        tokens::spacing::MD,
+                    )
                     .keyed_children(crate::views::slots([
                         load_older,
                         empty,
@@ -1304,12 +1324,11 @@ fn turn_views(input: &TranscriptInput, skip: usize) -> Vec<KeyedView> {
                     }
                 }
             }
-            // A turn takes the reading column's width explicitly: a short
-            // turn's bubble still reaches the right edge.
+            // A turn stretches across the reading column: a short turn's
+            // bubble still reaches the right edge.
             Some(KeyedView::new(
                 item.key.clone(),
                 StackPanel::new()
-                    .maybe_width(input.column)
                     .spacing(tokens::spacing::SM)
                     .margin(Thickness::new(0.0, 0.0, 0.0, tokens::spacing::LG))
                     .keyed_children(views),
@@ -1441,7 +1460,7 @@ fn edited_card(part: &RenderedPart, all: bool, callbacks: &RowCallbacks) -> View
         rows.push(KeyedView::new(
             path.clone(),
             Grid::new()
-                .height(tokens::height::CONTROL)
+                .min_height(tokens::height::CONTROL)
                 .columns([GridLength::Auto, GridLength::STAR])
                 .column_spacing(tokens::spacing::SM)
                 .automation_name(format!("Edited {path}"))

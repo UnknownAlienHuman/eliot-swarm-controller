@@ -154,6 +154,14 @@ pub const MAX_DISPLAY_NAME_CHARS: usize = 120;
 /// The longest collapsed-project key `[desktop]` accepts.
 pub const MAX_COLLAPSED_KEY: usize = 256;
 
+/// `[desktop] panels`: the sidebar's and the context pane's widths in DIPs,
+/// as their handles left them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Panels {
+    pub sidebar: u32,
+    pub pane: u32,
+}
+
 /// The `[desktop]` preferences the window applies.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
@@ -173,6 +181,8 @@ pub struct Preferences {
     pub collapsed_groups: Vec<String>,
     /// Owner-given names of sidebar projects and Agents.
     pub names: Vec<DisplayName>,
+    /// The panel widths; the defaults when absent.
+    pub panels: Option<Panels>,
 }
 
 impl Preferences {
@@ -202,6 +212,7 @@ impl Preferences {
             names: field("display_names")
                 .and_then(|value| serde_json::from_value(value).ok())
                 .unwrap_or_default(),
+            panels: field("panels").and_then(|value| serde_json::from_value(value).ok()),
         }
     }
 

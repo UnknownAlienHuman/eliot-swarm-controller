@@ -1120,7 +1120,7 @@ impl DesktopApp {
                 },
             ),
         ));
-        page_ui::page("Agents", self.page_width(tokens::page::WIDTH), items)
+        page_ui::page("Agents", tokens::page::WIDTH, items)
     }
 
     /// Details (skeleton 5.5, `Finished.dc.html`): the open Agent in
