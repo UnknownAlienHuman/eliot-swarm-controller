@@ -533,6 +533,8 @@ pub struct ConfigMcpServer {
     pub environment: Option<std::collections::HashMap<String, String>>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
 }
 
 // ---------------------------------------------------------------------------

@@ -24,6 +24,39 @@ use tokio::{io::AsyncReadExt, time::Instant};
 
 use crate::{harness_diagnostic, native_lifecycle::kill_and_reap, spawn_stderr};
 
+/// Enable controller-owned HTTP only when the exact Agent credential is
+/// already in the native environment and no proxy can carry it elsewhere.
+pub fn shared_agent_mcp_url<'a>(
+    candidate: Option<&'a str>,
+    environment: &[(OsString, OsString)],
+) -> Result<Option<&'a str>> {
+    let Some(url) = candidate else {
+        return Ok(None);
+    };
+    let port = url
+        .strip_prefix("http://127.0.0.1:")
+        .and_then(|url| url.strip_suffix("/mcp"))
+        .filter(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|port| port.parse::<u16>().ok());
+    if port.is_none_or(|port| port == 0) {
+        return Err(Error::new(
+            "not_allowed",
+            "Agent MCP shared endpoint is not an explicit IPv4 loopback MCP URL",
+        ));
+    }
+    if environment.iter().any(|(name, value)| {
+        !value.is_empty()
+            && ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+                .iter()
+                .any(|proxy| name.to_string_lossy().eq_ignore_ascii_case(proxy))
+    }) {
+        return Ok(None);
+    }
+    Ok(unique_environment_value(environment, "ELIOT_AGENT_TOKEN")
+        .filter(|token| !token.is_empty())
+        .map(|_| url))
+}
+
 /// Static message labels for one bounded one-shot read. Every harness keeps
 /// its exact pinned strings; only these labels differ between call sites.
 pub struct BoundedReadLabels {

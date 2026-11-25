@@ -105,6 +105,9 @@ impl CodexRoute {
         swarm_executable: &Path,
         data_dir: &Path,
         cwd: &Path,
+        agent_mcp_url: Option<&str>,
+        agent_id: &str,
+        generation: i64,
         mcp_disables: &[crate::mcp::EffectiveMcpServer],
         plugin_disables: &[String],
         native_subagents: Option<&str>,
@@ -165,11 +168,20 @@ impl CodexRoute {
             }
         } else {
             let scope_dir = quote_path(data_dir)?;
-            let server = format!(
-                "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {scope_dir}], env = {{ ELIOT_AGENT_DATA_DIR = {scope_dir} }}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
-                quote_path(swarm_executable)?,
-                quote_path(cwd)?,
-            );
+            let server = if let Some(url) = agent_mcp_url {
+                format!(
+                    "{{ enabled = true, url = {}, bearer_token_env_var = \"ELIOT_AGENT_TOKEN\", http_headers = {{ \"x-eliot-agent-id\" = {}, \"x-eliot-agent-generation\" = {} }}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
+                    quote(url)?,
+                    quote(agent_id)?,
+                    quote(&generation.to_string())?,
+                )
+            } else {
+                format!(
+                    "{{ enabled = true, command = {}, args = [\"mcp\", \"--require-agent\", \"--data-dir\", {scope_dir}], env = {{ ELIOT_AGENT_DATA_DIR = {scope_dir} }}, env_vars = [\"ELIOT_AGENT_ID\", \"ELIOT_AGENT_GENERATION\", \"ELIOT_AGENT_TOKEN\"], cwd = {}, tools = {{ swarm = {{ approval_mode = \"approve\" }} }} }}",
+                    quote_path(swarm_executable)?,
+                    quote_path(cwd)?,
+                )
+            };
             push_override(
                 &mut mcp_override,
                 &format!("mcp_servers.{server_name}"),
