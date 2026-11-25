@@ -119,7 +119,10 @@ impl Store {
         next_cursor: impl Fn(&AgentSummary) -> String,
     ) -> Result<AgentListPage> {
         let records = {
-            let mut statement = self.connection.prepare(&page.sql).map_err(sql_error)?;
+            let mut statement = self
+                .connection
+                .prepare_cached(&page.sql)
+                .map_err(sql_error)?;
             let rows = statement
                 .query_map(
                     rusqlite::params_from_iter(page.params.iter()),
@@ -136,8 +139,9 @@ impl Store {
         let total_page = select_page(filter, AgentListProjection::Count)?;
         let total: i64 = self
             .connection
+            .prepare_cached(&total_page.sql)
+            .map_err(sql_error)?
             .query_row(
-                &total_page.sql,
                 rusqlite::params_from_iter(total_page.params.iter()),
                 |row| row.get(0),
             )
@@ -146,7 +150,10 @@ impl Store {
             let mut all_states = filter.clone();
             all_states.states = None;
             let select = select_page(&all_states, AgentListProjection::StateTotals)?;
-            let mut statement = self.connection.prepare(&select.sql).map_err(sql_error)?;
+            let mut statement = self
+                .connection
+                .prepare_cached(&select.sql)
+                .map_err(sql_error)?;
             let rows = statement
                 .query_map(rusqlite::params_from_iter(select.params.iter()), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
@@ -255,19 +262,29 @@ impl Store {
             return Err(Error::new("internal", "Agent progress page is incomplete"));
         }
         let mut lookups = Vec::with_capacity(records.len());
+        let mut provider_scopes: HashMap<_, String> = HashMap::new();
         for (record, &last_progress_at) in records.iter().zip(&progress) {
-            let profile_snapshot: Value = decode_json(&record.profile_snapshot)?;
+            let key = (
+                record.profile.as_str(),
+                record.harness.as_str(),
+                record.profile_snapshot.as_str(),
+            );
+            let provider_scope = match provider_scopes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    let scope =
+                        core::frozen_provider_scope_for(key.0, key.1, &decode_json(key.2)?)?;
+                    entry.insert(scope.clone());
+                    scope
+                }
+            };
             lookups.push(AgentStatusLookup {
                 agent_num: record.id,
                 generation: record.generation,
                 active_turn: record.active_turn.clone(),
                 last_progress_at,
                 model_hold_scope: core::model_hold_scope(&record.profile),
-                provider_scope: core::frozen_provider_scope_for(
-                    &record.profile,
-                    &record.harness,
-                    &profile_snapshot,
-                )?,
+                provider_scope,
             });
         }
         let statuses = self.project_agent_statuses(&lookups)?;
@@ -308,6 +325,18 @@ impl Store {
     ) -> Result<AgentSummary> {
         let state: AgentState = parse_enum(&record.state, "Agent state")?;
         let id = format_agent_id(record.id);
+        let activity = if record.origin == "native" && record.observe_only {
+            Some(native_children::activity_from_facts(
+                &self.connection,
+                (record.id, record.generation),
+                state == AgentState::Stopped,
+                facts.native_open_turn,
+                last_progress_at,
+                facts.terminal.as_ref().map(|turn| turn.2.as_deref()),
+            )?)
+        } else {
+            None
+        };
         let terminal = facts
             .terminal
             .map(|turn| decode_terminal_turn(turn, &record.harness))
@@ -338,8 +367,8 @@ impl Store {
             }
         };
         let heavy = if facts.heavy_count > 0 {
-            let episodes: Vec<String> = serde_json::from_str(&facts.heavy_episodes)
-                .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+            let episodes: Vec<HeavyRollupEpisode> =
+                serde_json::from_str(&facts.heavy_episodes).map_err(heavy_rollup_error)?;
             project_heavy_rollup(facts.heavy_count, episodes.into_iter().map(Ok))?
         } else {
             None
@@ -397,15 +426,7 @@ impl Store {
             last_turn_id,
             last_outcome,
             last_resolution_source,
-            activity: if record.origin == "native" && record.observe_only {
-                Some(native_children::activity(
-                    &self.connection,
-                    record.id,
-                    record.generation,
-                )?)
-            } else {
-                None
-            },
+            activity,
             usage,
             usage_scope,
             updated_at: record.updated_at,
@@ -432,7 +453,8 @@ impl Store {
             return Ok(HashMap::new());
         }
         let sql = format!(
-            "SELECT a.id AS agent_id, a.generation AS agent_generation,
+            concat!(
+                "SELECT a.id AS agent_id, a.generation AS agent_generation,
                     terminal.turn_id AS terminal_id, terminal.outcome AS terminal_outcome,
                     terminal.status AS terminal_status, terminal.usage AS terminal_usage,
                     terminal.resolution_source, usage.snapshot, w.repo_common_dir,
@@ -442,6 +464,9 @@ impl Store {
                     work.files_changed, work.insertions, work.deletions, work.diff_digest,
                     work.dirty_digest, work.work_available, work.work_error,
                     work.last_write_at, work.last_commit_at,
+                    CASE WHEN a.origin = 'native' AND a.observe_only THEN EXISTS(",
+                native_children::native_open_turn_select!("a.id", "a.generation"),
+                ") ELSE 0 END AS native_open_turn,
                     {} AS organization, o.tags, o.revision AS organization_revision,
                     (SELECT substr(json_extract(args, '$.text'), 1, ?2)
                      FROM commands INDEXED BY commands_target
@@ -449,7 +474,7 @@ impl Store {
                      ORDER BY created_at, rowid LIMIT 1) AS preview,
                     (SELECT COUNT(*) FROM events WHERE kind = 'activity.heavy'
                      AND agent = a.id AND generation = a.generation) AS heavy_count,
-                    (SELECT json_group_array(data ORDER BY seq DESC) FROM (
+                    (SELECT json_group_array(json(data) ORDER BY seq DESC) FROM (
                          SELECT seq, data FROM events WHERE kind = 'activity.heavy'
                          AND agent = a.id AND generation = a.generation
                          ORDER BY seq DESC LIMIT ?3
@@ -471,10 +496,11 @@ impl Store {
                  AND source.generation = a.generation AND source.source = 'git'
                  AND a.workspace IS NOT NULL
              LEFT JOIN git_work_state work ON work.workspace = a.workspace
-                 AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL",
+                 AND source.health NOT IN ('error', 'stale') AND source.last_store_seq IS NOT NULL"
+            ),
             organization::organization_group()
         );
-        let mut statement = self.connection.prepare(&sql).map_err(sql_error)?;
+        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
         statement
             .query_map(
                 params![
@@ -497,6 +523,7 @@ impl Store {
 
 struct FleetPageFacts {
     terminal: Option<StoredTerminalTurn>,
+    native_open_turn: bool,
     session_usage: Option<String>,
     repo_common_dir: Option<String>,
     preview: Option<String>,
@@ -538,6 +565,7 @@ impl FleetPageFacts {
         };
         Ok(Self {
             terminal,
+            native_open_turn: row.get("native_open_turn")?,
             session_usage: row.get("snapshot")?,
             repo_common_dir: row.get("repo_common_dir")?,
             preview: row.get("preview")?,
@@ -1029,7 +1057,7 @@ fn agent_list_select(
     }
     let mut forced_index = structural.or(fallback).or(match filter.archived {
         core::api::ArchivedFilter::Include => None,
-        _ => Some("agents_list_archived"),
+        _ => Some("agents_list_visible"),
     });
     let mut prefix = String::new();
     if let Some(caller) = caller {
@@ -1138,19 +1166,11 @@ fn agent_list_select(
     let held_extra: Option<(String, Vec<rusqlite::types::Value>)> = if custody_ids.is_empty() {
         None
     } else {
-        let placeholders = custody_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
         let extra_sql = format!(
-            "(agents.state IN ({}) AND agents.id IN ({placeholders}))",
+            "(agents.state IN ({}) AND agents.id IN (SELECT value FROM json_each(?)))",
             super::agent_lifecycle::CUSTODY_VISIBLE_STATES,
         );
-        let extra_params = custody_ids
-            .iter()
-            .map(|id| rusqlite::types::Value::from(*id))
-            .collect();
+        let extra_params = vec![rusqlite::types::Value::from(encode_json(&custody_ids)?)];
         Some((extra_sql, extra_params))
     };
     let (archived_held, held_params) = branch(1, held_extra);

@@ -29,19 +29,9 @@ fn queued_sends_blocked_by(
     generation: i64,
     blocker_id: &str,
 ) -> eliot_core::Result<Vec<(String, String)>> {
-    // The unbound-turn exception can change turn blockers, but it never
-    // changes whether this command fences SEND for the generation.
-    if !crate::send_outcome_gate_blockers(db, agent, generation, None)?
-        .iter()
-        .any(|blocker| {
-            blocker.kind == "command" && blocker.id == blocker_id && blocker.state == "unknown"
-        })
-    {
-        return Ok(Vec::new());
-    }
     let mut statement = db
         .prepare_cached(
-            "SELECT id FROM commands
+            "SELECT id FROM commands INDEXED BY commands_pending_send_page
          WHERE target = ?1 AND generation = ?2 AND verb = 'send'
            AND state IN ('accepted','queued')
          ORDER BY created_at, id LIMIT 64",
@@ -50,9 +40,22 @@ fn queued_sends_blocked_by(
     let rows = statement
         .query_map([agent, generation], |row| row.get::<_, String>(0))
         .map_err(crate::sql_error)?;
-    rows.map(|row| row.map(|send_id| (send_id, "send".to_owned())))
+    let sends = rows
+        .map(|row| row.map(|send_id| (send_id, "send".to_owned())))
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(crate::sql_error)
+        .map_err(crate::sql_error)?;
+    // No queued SEND can display a blocker on an empty page. Resolve the
+    // full outcome gate only when the generation has input to annotate.
+    if sends.is_empty()
+        || !crate::send_outcome_gate_blockers(db, agent, generation, None)?
+            .iter()
+            .any(|blocker| {
+                blocker.kind == "command" && blocker.id == blocker_id && blocker.state == "unknown"
+            })
+    {
+        return Ok(Vec::new());
+    }
+    Ok(sends)
 }
 
 fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<OwnerInboxItem>> {
@@ -442,10 +445,10 @@ fn project_unknown_commands(
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
         "SELECT c.id,c.verb,c.method,c.target,c.generation,c.turn_id,c.created_at,c.state,
-                COALESCE((SELECT e.ts FROM events e
+                COALESCE((SELECT e.ts FROM events e INDEXED BY owner_inbox_unknown_receipt
                   WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id ORDER BY e.seq DESC LIMIT 1),c.updated_at),
-                COALESCE((SELECT MAX(e.seq) FROM events e
+                COALESCE((SELECT MAX(e.seq) FROM events e INDEXED BY owner_inbox_unknown_receipt
                   WHERE e.kind='command.unknown'
                   AND CAST(json_extract(e.data,'$.command_id') AS TEXT)=c.id),0),
                 json_extract(c.outcome,'$.stage'),
@@ -807,12 +810,19 @@ fn project_unknown_turns(
     stats: &mut SwarmLiveness,
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
-    let mut stmt = projection_query(db,
+    let mut stmt = projection_query(
+        db,
         "SELECT t.agent,t.generation,t.turn_id,COALESCE(t.completed_at,t.started_at,a.updated_at),
-                COALESCE((SELECT MAX(e.seq) FROM events e WHERE e.agent=t.agent AND e.generation=t.generation
+                COALESCE((SELECT e.seq FROM events e INDEXED BY owner_inbox_turn_events
+                  WHERE e.agent=t.agent AND e.generation=t.generation
                   AND json_type(e.data,'$.turn_id')='text'
-                  AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id),0)
-         FROM turns t JOIN agents a ON a.id=t.agent WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL", "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3", bindings)?;
+                  AND CAST(json_extract(e.data,'$.turn_id') AS TEXT)=t.turn_id
+                  ORDER BY e.seq DESC LIMIT 1),0)
+         FROM turns t CROSS JOIN agents a INDEXED BY owner_inbox_ordinary_agent ON a.id=t.agent
+         WHERE t.state='unknown' AND json_type(a.profile_snapshot, '$._harness_check') IS NULL",
+        "t.agent=?1 AND t.generation=?2 AND t.turn_id=?3",
+        bindings,
+    )?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((
@@ -1064,7 +1074,7 @@ fn project_work_not_in_git(
     let mut stmt = projection_query(
         db,
         "SELECT c.agent, c.generation, c.state, c.updated_at
-         FROM git_checkpoints c JOIN agents a ON a.id = c.agent AND a.generation = c.generation
+         FROM git_checkpoints c CROSS JOIN agents a ON a.id = c.agent AND a.generation = c.generation
          WHERE a.archived = 0
            AND (c.state = 'failed'
                 OR (c.state = 'snapshot' AND a.state IN ('stopped','lost','failed')))
@@ -1409,7 +1419,16 @@ fn project_agents(
     bindings: &[&dyn ToSql],
 ) -> eliot_core::Result<()> {
     let mut stmt = projection_query(db,
-        "SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
+        "WITH candidates(id) AS (
+             SELECT id FROM agents INDEXED BY agents_list_archived_state
+             WHERE archived=0 AND state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
+             UNION ALL
+             SELECT DISTINCT c.target FROM commands c INDEXED BY owner_inbox_resume_tip
+             CROSS JOIN agents stopped ON stopped.id=c.target AND stopped.generation=c.generation
+             WHERE c.verb='resume' AND c.principal='owner' AND c.state<>'cancelled'
+               AND c.state IN ('failed','rejected') AND stopped.state='stopped' AND stopped.archived=0
+         )
+         SELECT a.id,a.generation,a.state,a.updated_at,a.active_turn,a.archived,
                 a.native_scope,a.native_ref,a.observe_only,
                 CASE WHEN a.state IN ('created','starting','failed','lost') THEN EXISTS(SELECT 1 FROM commands c
                   WHERE c.target=a.id AND (c.generation=a.generation OR c.expected_generation=a.generation)
@@ -1437,14 +1456,16 @@ fn project_agents(
                     AND p.role='plugin' AND p.state='running') ELSE 0 END,
                 aw.expires_at,aw.created_at,json_extract(aw.condition,'$.kind'),
                 json_extract(aw.condition,'$.seconds'), resume.id, resume.updated_at
-         FROM agents a
+         FROM candidates CROSS JOIN agents a ON a.id=candidates.id
          LEFT JOIN commands resume ON resume.id = CASE WHEN a.state IN ('failed','lost','stopped') THEN (
-             SELECT newest.id FROM commands newest INDEXED BY commands_target
+             SELECT newest.id FROM commands newest INDEXED BY owner_inbox_resume_tip
              WHERE newest.target=a.id AND newest.generation=a.generation
                AND newest.verb='resume' AND newest.principal='owner' AND newest.state<>'cancelled'
              ORDER BY newest.created_at DESC,newest.rowid DESC LIMIT 1
          ) END AND resume.state IN ('rejected','failed')
-         LEFT JOIN agent_wakes aw ON aw.agent=a.id AND aw.generation=a.generation
+         LEFT JOIN agent_wakes aw INDEXED BY agent_wakes_one_open_per_generation
+            ON aw.agent=a.id AND aw.generation=a.generation
+            AND aw.state IN ('waiting','satisfied','delivery_pending')
             AND aw.state='waiting' AND EXISTS(
                 SELECT 1 FROM turns wt
                 WHERE wt.agent=aw.agent AND wt.generation=aw.generation AND wt.turn_id=aw.turn_id
@@ -1460,9 +1481,10 @@ fn project_agents(
                              AND ws.source NOT IN ('daemon','os','git','workspace_process'))))
                   ))
          WHERE a.observe_only=0 AND a.archived=0
-            AND json_type(a.profile_snapshot, '$._harness_check') IS NULL
-            AND (a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
-                 OR resume.id IS NOT NULL)", "a.id=?1", bindings)?;
+           AND CASE WHEN a.state IN ('created','starting','idle','busy','waiting','failed','lost','unknown')
+                     OR resume.id IS NOT NULL
+               THEN json_type(a.profile_snapshot, '$._harness_check') IS NULL
+               ELSE 0 END", "a.id=?1", bindings)?;
     let rows = stmt
         .query_map(bindings, |r| {
             Ok((

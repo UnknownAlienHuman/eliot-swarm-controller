@@ -797,7 +797,8 @@ pub(crate) fn default_list_custody_agents(connection: &Connection) -> Result<Vec
     }
     let mut statement = connection
         .prepare(
-            "SELECT DISTINCT agent FROM artifacts WHERE json_extract(body,'$.state')='unknown'",
+            "SELECT DISTINCT agent FROM artifacts INDEXED BY artifacts_unknown_agent
+             WHERE json_extract(body,'$.state')='unknown'",
         )
         .map_err(sql_error)?;
     let rows = statement

@@ -28,7 +28,9 @@ pub use cleanup::{CleanupInventoryPage, CleanupJobReceipt, cleanup_worktree_comm
 mod git_integration_custody;
 mod projects;
 pub use git_integration_custody::IntegrationCustody;
+mod projection_readers;
 mod provider_holds;
+pub use projection_readers::ProjectionReaders;
 mod restart_queue;
 mod result_page;
 mod rules;
@@ -2168,7 +2170,10 @@ impl Store {
     /// unknowns: no page cap, so an older retained unknown can never hide
     /// behind the classification bound and block drain forever.
     pub fn count_retained_unknown_commands(&self) -> Result<i64> {
-        let sql = format!("SELECT COUNT(*) FROM commands WHERE {RETAINED_UNKNOWN_PREDICATE}");
+        let sql = format!(
+            "SELECT COUNT(*) FROM commands INDEXED BY commands_retained_unknown_page
+             WHERE {RETAINED_UNKNOWN_PREDICATE}"
+        );
         self.connection
             .query_row(&sql, [], |row| row.get(0))
             .map_err(sql_error)
@@ -2179,6 +2184,32 @@ impl Store {
     /// honestly against the total for any omission reason.
     pub fn list_retained_unknown_commands(&self, limit: usize) -> Result<Vec<Command>> {
         self.list_commands_matching(RETAINED_UNKNOWN_PREDICATE, limit)
+    }
+
+    /// Observation mode for one bounded drain page. The caller holds the
+    /// Store writer from the retained-command predicate through this read.
+    pub fn drain_agent_observation_modes(
+        &self,
+        page: &[Command],
+    ) -> Result<BTreeMap<String, bool>> {
+        let agents = page
+            .iter()
+            .filter_map(|command| command.target.as_deref())
+            .map(parse_agent_id)
+            .collect::<Result<Vec<_>>>()?;
+        let mut statement = self
+            .connection
+            .prepare_cached(
+                "SELECT id,observe_only FROM agents WHERE id IN (SELECT value FROM json_each(?1))",
+            )
+            .map_err(sql_error)?;
+        statement
+            .query_map([encode_json(&agents)?], |row| {
+                Ok((format_agent_id(row.get(0)?), row.get(1)?))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+            .map_err(sql_error)
     }
 
     /// Return unsettled commands without letting terminal history consume the limit.
@@ -6361,13 +6392,29 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .map_err(sql_error)?;
-        project_heavy_rollup(count, rows.map(|row| row.map_err(sql_error)))
+        project_heavy_rollup(
+            count,
+            rows.map(|row| {
+                serde_json::from_str(&row.map_err(sql_error)?).map_err(heavy_rollup_error)
+            }),
+        )
     }
+}
+
+#[derive(serde::Deserialize)]
+struct HeavyRollupEpisode {
+    category: Option<Value>,
+    ended_at: Option<Value>,
+    cpu_ms: u64,
+}
+
+fn heavy_rollup_error(_: serde_json::Error) -> Error {
+    Error::new("internal", "heavy episode data is malformed")
 }
 
 fn project_heavy_rollup(
     count: i64,
-    rows: impl IntoIterator<Item = Result<String>>,
+    rows: impl IntoIterator<Item = Result<HeavyRollupEpisode>>,
 ) -> Result<Option<HeavySummaryView>> {
     if count <= 0 {
         return Ok(None);
@@ -6376,21 +6423,16 @@ fn project_heavy_rollup(
     let mut latest_ended_at = None;
     let mut total_cpu_ms: u64 = 0;
     for row in rows {
-        let raw = row?;
-        let data: Value = serde_json::from_str(&raw)
-            .map_err(|_| Error::new("internal", "heavy episode data is malformed"))?;
+        let episode = row?;
         if latest_category.is_none() {
-            latest_category = data
-                .get("category")
+            latest_category = episode
+                .category
+                .as_ref()
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            latest_ended_at = data.get("ended_at").and_then(Value::as_i64);
+            latest_ended_at = episode.ended_at.as_ref().and_then(Value::as_i64);
         }
-        total_cpu_ms = total_cpu_ms.saturating_add(
-            data.get("cpu_ms")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| Error::new("internal", "heavy episode data is malformed"))?,
-        );
+        total_cpu_ms = total_cpu_ms.saturating_add(episode.cpu_ms);
     }
     let Some(category) = latest_category.filter(|category| !category.trim().is_empty()) else {
         return Err(Error::new("internal", "heavy episode data is malformed"));

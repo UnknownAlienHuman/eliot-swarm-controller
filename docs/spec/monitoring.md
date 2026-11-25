@@ -1588,6 +1588,12 @@ blocking on them; the stored outcome stays `unknown`.
 
 ## Local RPC latency
 
+Owner and fleet reads can reuse up to four idle SQLite readers per daemon.
+Each read starts a fresh read-only transaction and releases its snapshot
+before returning the connection. The pool retains page and statement caches,
+while the projections are recomputed from committed rows. A reader targets
+an 8 MiB SQLite page cache and keeps up to 128 prepared statements.
+
 The daemon keeps a process-local rolling sample of authenticated local RPCs
 with successfully written replies. A sample measures transport acceptance
 through reply encoding and write. It also records the sum of waits for the
@@ -1601,6 +1607,12 @@ five minutes. Per-method counts describe the retained samples. Durations
 are integer microseconds, and p50 and p95 use nearest rank. The ten slowest
 retained calls contain method and duration only. Sampling adds no per-call
 log lines and resets on daemon restart.
+
+Intentional waits stay outside both the method windows and the slowest-call
+list. This includes `swarm.wait`, `events.subscribe`, `inject.wait`, and
+`mail.inbox` with a positive wait and `child.run` with a positive effective
+wait, including continuations that use the default. Ordinary `events.read`
+and `events.bounds` remain measured.
 
 ## Swarm autonomy
 

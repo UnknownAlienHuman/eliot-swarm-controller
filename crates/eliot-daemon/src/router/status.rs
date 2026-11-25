@@ -69,6 +69,8 @@ impl Router {
         &self,
         request: eliot_core::api::DaemonStatusRequest,
     ) -> Result<Value> {
+        let (projection, (blockers, drain)) =
+            tokio::try_join!(self.read_owner_projection(None), self.blockers_and_drain(),)?;
         let eliot_store::OwnerProjection {
             owner_inbox,
             liveness,
@@ -76,12 +78,11 @@ impl Router {
             goals_without_progress,
             repeated_failure_inbox_items,
             ..
-        } = self.read_owner_projection(None).await?;
+        } = projection;
         let DaemonSidebarResponse {
             owner_inbox,
             profile_command_issues,
         } = self.sidebar_fields(owner_inbox);
-        let (blockers, drain) = self.blockers_and_drain().await?;
         let retention = Some(self.retention_view().await?);
         let (automatic_cleanup, owner_decision_count) = self.automatic_cleanup_view();
         let mut disk_usage = self
@@ -251,16 +252,20 @@ impl Router {
     /// the drain receipt names each one with its resolvability and owner
     /// action. Returns the bounded receipt page plus the exact total.
     async fn retained_unresolved_unknowns(&self) -> Result<(Vec<RetainedUnknownSummary>, i64)> {
-        let (page, total) = {
+        let (page, total, observation_modes) = {
             let store = self.inner.store.lock().await;
-            (
-                store.list_retained_unknown_commands(STATUS_BLOCKER_MAX)?,
-                store.count_retained_unknown_commands()?,
-            )
+            let page = store.list_retained_unknown_commands(STATUS_BLOCKER_MAX)?;
+            let modes = store.drain_agent_observation_modes(&page)?;
+            (page, store.count_retained_unknown_commands()?, modes)
         };
         let mut retained = Vec::new();
         for command in &page {
-            if let Some(summary) = self.retained_summary(command).await {
+            if let Some(observe_only) = command
+                .target
+                .as_ref()
+                .and_then(|id| observation_modes.get(id))
+                && let Some(summary) = self.retained_summary(command, *observe_only)
+            {
                 retained.push(summary);
             }
         }
@@ -268,11 +273,15 @@ impl Router {
         Ok((retained, total))
     }
 
-    /// Receipt entry for one SQL-classified retained unknown. Re-verifies
-    /// the predicate at summary time and returns `None` while a live plugin
+    /// Receipt entry for one retained unknown from the Store snapshot.
+    /// Returns `None` while a live plugin
     /// reader still observes the generation: the in-memory reader is not a
     /// durable fact, so it stays a daemon-side block, never a silent excuse.
-    async fn retained_summary(&self, command: &Command) -> Option<RetainedUnknownSummary> {
+    fn retained_summary(
+        &self,
+        command: &Command,
+        observe_only: bool,
+    ) -> Option<RetainedUnknownSummary> {
         let target = command.target.clone()?;
         let generation = command.generation?;
         if self
@@ -282,15 +291,6 @@ impl Router {
         {
             return None;
         }
-        let agent = {
-            let store = self.inner.store.lock().await;
-            // The page above and this read race live state; only a
-            // still-retained row may retire the drain wait.
-            if !store.is_retained_unknown(&command.id).ok()? {
-                return None;
-            }
-            store.get_agent(&target).ok().flatten()?
-        };
         // The predicate already encodes the durable turn checks (only a
         // recorded turn matching the live turn backs the command, and a
         // live turn on the same generation blocks); the plugin check above
@@ -310,7 +310,7 @@ impl Router {
         // Floor to a character boundary first: the old truncate-then-fix-up
         // ran after the panic. 'bound_chars' never splits UTF-8 mid-codepoint.
         reason = eliot_core::bound_chars(&reason, 128);
-        let resolvable = !agent.observe_only;
+        let resolvable = !observe_only;
         let hint = if resolvable {
             "owner-resolvable with cmd resolve (command) or turn resolve (turn); retained for the record; use --force only for live work".to_owned()
         } else {

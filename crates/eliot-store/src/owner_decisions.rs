@@ -272,60 +272,79 @@ impl Store {
         page: Option<OwnerInboxPage>,
     ) -> Result<OwnerProjection> {
         read_inbox_snapshot(path, |connection| {
-            let snoozes = inbox_snoozes(connection)?;
-            let snoozed = snoozes
-                .iter()
-                .map(|r| (r.kind, r.subject.as_str(), r.revision.as_str()))
-                .collect();
-            let mut sink = OwnerProjectionSink {
-                now,
-                confirmed,
-                snoozed,
-                page,
-                items: Vec::new(),
-                owner_inbox: OwnerInboxKind::ALL
-                    .into_iter()
-                    .map(|kind| (kind, 0))
-                    .collect(),
-                waiting_over_24h: 0,
-                unreportable_stuck: 0,
-                unreportable_reasons: HashMap::new(),
-                command_without_dispatcher_count: 0,
-                oldest_command_without_dispatcher: None,
-                goals_without_progress: 0,
-                repeated_failure_inbox_items: 0,
-            };
-            let mut liveness = super::owner_inbox::project_into(connection, now, &mut sink)?;
-            liveness.stuck = liveness.stuck.saturating_sub(sink.unreportable_stuck);
-            for (reason, count) in &sink.unreportable_reasons {
-                if let Some(current) = liveness.reasons.get_mut(reason) {
-                    *current = current.saturating_sub(*count);
+            Self::owner_projection(connection, now, confirmed, page)
+        })
+    }
+
+    /// Read the Owner view inside the caller's read-only snapshot.
+    pub fn owner_projection_from_snapshot(
+        &self,
+        now: i64,
+        confirmed: &StuckStates,
+        page: Option<OwnerInboxPage>,
+    ) -> Result<OwnerProjection> {
+        Self::owner_projection(&self.connection, now, confirmed, page)
+    }
+
+    fn owner_projection(
+        connection: &Connection,
+        now: i64,
+        confirmed: &StuckStates,
+        page: Option<OwnerInboxPage>,
+    ) -> Result<OwnerProjection> {
+        let snoozes = inbox_snoozes(connection)?;
+        let snoozed = snoozes
+            .iter()
+            .map(|r| (r.kind, r.subject.as_str(), r.revision.as_str()))
+            .collect();
+        let mut sink = OwnerProjectionSink {
+            now,
+            confirmed,
+            snoozed,
+            page,
+            items: Vec::new(),
+            owner_inbox: OwnerInboxKind::ALL
+                .into_iter()
+                .map(|kind| (kind, 0))
+                .collect(),
+            waiting_over_24h: 0,
+            unreportable_stuck: 0,
+            unreportable_reasons: HashMap::new(),
+            command_without_dispatcher_count: 0,
+            oldest_command_without_dispatcher: None,
+            goals_without_progress: 0,
+            repeated_failure_inbox_items: 0,
+        };
+        let mut liveness = super::owner_inbox::project_into(connection, now, &mut sink)?;
+        liveness.stuck = liveness.stuck.saturating_sub(sink.unreportable_stuck);
+        for (reason, count) in &sink.unreportable_reasons {
+            if let Some(current) = liveness.reasons.get_mut(reason) {
+                *current = current.saturating_sub(*count);
+            }
+        }
+        liveness.reasons.retain(|_, count| *count > 0);
+        let command_without_dispatcher = match sink.oldest_command_without_dispatcher {
+            Some((age_ms, subject)) => {
+                let id = subject
+                    .strip_prefix("command:")
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| Error::new("corrupt", "invalid command liveness subject"))?;
+                CommandWithoutDispatcherStatus {
+                    count: sink.command_without_dispatcher_count,
+                    oldest_id: Some(id.to_owned()),
+                    oldest_age_ms: Some(age_ms),
                 }
             }
-            liveness.reasons.retain(|_, count| *count > 0);
-            let command_without_dispatcher = match sink.oldest_command_without_dispatcher {
-                Some((age_ms, subject)) => {
-                    let id = subject
-                        .strip_prefix("command:")
-                        .filter(|id| !id.is_empty())
-                        .ok_or_else(|| Error::new("corrupt", "invalid command liveness subject"))?;
-                    CommandWithoutDispatcherStatus {
-                        count: sink.command_without_dispatcher_count,
-                        oldest_id: Some(id.to_owned()),
-                        oldest_age_ms: Some(age_ms),
-                    }
-                }
-                None => CommandWithoutDispatcherStatus::default(),
-            };
-            Ok(OwnerProjection {
-                items: sink.items,
-                owner_inbox: sink.owner_inbox,
-                waiting_over_24h: sink.waiting_over_24h,
-                liveness,
-                command_without_dispatcher,
-                goals_without_progress: sink.goals_without_progress,
-                repeated_failure_inbox_items: sink.repeated_failure_inbox_items,
-            })
+            None => CommandWithoutDispatcherStatus::default(),
+        };
+        Ok(OwnerProjection {
+            items: sink.items,
+            owner_inbox: sink.owner_inbox,
+            waiting_over_24h: sink.waiting_over_24h,
+            liveness,
+            command_without_dispatcher,
+            goals_without_progress: sink.goals_without_progress,
+            repeated_failure_inbox_items: sink.repeated_failure_inbox_items,
         })
     }
 

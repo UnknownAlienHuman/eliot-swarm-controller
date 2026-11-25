@@ -208,6 +208,7 @@ struct RouterInner {
     store: StoreHandle,
     autonomy_reader: Arc<tokio::sync::Semaphore>,
     agent_list_readers: Arc<tokio::sync::Semaphore>,
+    projection_readers: Arc<eliot_store::ProjectionReaders>,
     confirmed_stuck: Mutex<Arc<eliot_store::StuckStates>>,
     integration_cleanup: AsyncMutex<()>,
     bus: Bus,
@@ -510,6 +511,9 @@ impl Router {
         let catalog_cache = Mutex::new(catalog::CatalogCache::new(&data_root));
         Ok(Self {
             inner: Arc::new(RouterInner {
+                projection_readers: Arc::new(eliot_store::ProjectionReaders::new(
+                    data_root.join("eliot.db"),
+                )),
                 rpc_latencies: Default::default(),
                 acl_notices,
                 data_root,
@@ -1084,17 +1088,38 @@ impl Router {
         self.signal_progress();
     }
 
+    pub(crate) fn rpc_latency_method(request: &eliot_plugin::RpcRequest) -> Option<&'static str> {
+        let method = discovery::canonical_method(&request.method)?;
+        match method {
+            "swarm.wait" | "events.subscribe" | "inject.wait" => None,
+            "child.run"
+                if <eliot_core::api::ChildRunRequest as serde::Deserialize>::deserialize(
+                    &request.params["_payload"],
+                )
+                .is_ok_and(|request| request.effective_wait_ms() > 0) =>
+            {
+                None
+            }
+            "mail.inbox"
+                if request.params["_payload"]["wait_ms"]
+                    .as_u64()
+                    .is_some_and(|wait| wait > 0) =>
+            {
+                None
+            }
+            _ => Some(method),
+        }
+    }
+
     pub(crate) fn record_rpc_latency(
         &self,
-        method: &str,
+        method: &'static str,
         duration: Duration,
         store_wait: Duration,
     ) {
-        if let Some(method) = discovery::canonical_method(method) {
-            self.inner
-                .rpc_latencies
-                .record(method, duration, store_wait);
-        }
+        self.inner
+            .rpc_latencies
+            .record(method, duration, store_wait);
     }
 
     pub(crate) async fn request_force(&self) {
@@ -5902,20 +5927,21 @@ impl Router {
                 .acquire_owned()
                 .await
                 .map_err(|_| Error::new("unavailable", "agent list readers are closed"))?;
-            let db_path = self.inner.data_root.join("eliot.db");
+            let readers = Arc::clone(&self.inner.projection_readers);
             let filter_clone = filter.clone();
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let store = eliot_store::Store::open_read_only(&db_path)?;
-                Self::read_agent_list_page_from_store(
-                    &store,
-                    agent_caller.as_deref(),
-                    &filter_clone,
-                    after.as_deref(),
-                    limit,
-                    now_ms(),
-                    &growth,
-                )
+                readers.read(|store| {
+                    Self::read_agent_list_page_from_store(
+                        store,
+                        agent_caller.as_deref(),
+                        &filter_clone,
+                        after.as_deref(),
+                        limit,
+                        now_ms(),
+                        &growth,
+                    )
+                })
             })
             .await
             .map_err(|_| Error::new("internal", "agent list reader failed"))??
