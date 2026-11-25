@@ -10,12 +10,8 @@
 //! route selectors are bound by digest and resolved only in the process environment.
 use crate::harness_capabilities::ProfileCapabilities;
 use core::api::harness::NativeRoute;
-use core::api::native_profile::{
-    ANTIGRAVITY_MODES, CLAUDE_EFFORT_LEVELS, CLAUDE_PERMISSION_MODES, CodexApprovalPolicy,
-    CodexCollaborationMode, CodexPermissions, MUSE_APPROVALS, MUSE_PERMISSIONS,
-};
+use core::api::native_profile::{NativeProfileInput, ProfileEffort};
 use eliot_core as core;
-use eliot_plugin::session::split_provider_model;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -43,7 +39,6 @@ const MAX_PROFILE_NAME_LEN: usize = 128;
 const MAX_PROFILES: usize = 256;
 const MAX_MODEL_LEN: usize = 256;
 const MAX_EFFORT_LEN: usize = 128;
-const MAX_AUTH_INTEGRATION_LEN: usize = 128;
 const MAX_CMD_LEN: usize = 1024;
 const MAX_ENV_NAME_LEN: usize = 256;
 const MAX_PASS_ENV_ENTRIES: usize = 64;
@@ -1899,14 +1894,14 @@ fn freeze_profile_quota_policy(
             "profile_error",
         )
     })?;
-    let quota_unknown = validated_choice(
-        site,
+    let quota_unknown = eliot_plugin::capabilities::validated_native_choice(
         "quota_unknown",
         entry.quota_unknown.as_deref(),
         &["admit", "hold"],
         "must be admit or hold",
         "profile_error",
-    )?
+    )
+    .map_err(|error| site.error(error.field, &error.reason, error.code))?
     .unwrap_or("admit");
     let snapshot = snapshot.as_object_mut().ok_or_else(|| {
         core::Error::new("internal", "resolved profile snapshot must be an object")
@@ -2406,64 +2401,66 @@ fn snapshot_from_entry(
             ),
         ],
     )?;
+    let mapping = ProfileCapabilities::of(harness)
+        .named_profile
+        .ok_or_else(|| site.error("harness", "unsupported harness", "unsupported"))?;
+    let native_refusal = |error: core::api::native_profile::NativeProfileRefusal| {
+        site.error(error.field, &error.reason, error.code)
+    };
     let model = entry.model.as_deref();
     if let Some(model) = model {
         validate_model(name, model, source, table_offset)?;
-        if harness == "opencode" && split_provider_model(model).is_none() {
-            return Err(site.error(
-                "model",
-                "must be provider/model with non-empty slash segments and no variant suffix",
-                "profile_error",
-            ));
+        if let Some(validate_native_model) = mapping.model {
+            validate_native_model(model).map_err(native_refusal)?;
         }
     }
-    let effort = match harness {
-        "claude" => validated_choice(
-            site,
-            "effort",
-            entry
-                .effort
-                .as_deref()
-                .filter(|value| !value.trim().is_empty()),
-            CLAUDE_EFFORT_LEVELS,
-            "unknown Claude effort level (low, medium, high, xhigh, or max)",
-            "profile_error",
-        )?,
-        "antigravity" => None,
-        // OpenCode uses the catalogue's Model.Variant id.
-        _ => validated_effort(site, entry.effort.as_deref())?,
+    let effort = match mapping.effort {
+        ProfileEffort::Choices { allowed, refusal } => {
+            eliot_plugin::capabilities::validated_native_choice(
+                "effort",
+                entry
+                    .effort
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty()),
+                allowed,
+                refusal,
+                "profile_error",
+            )
+            .map_err(native_refusal)?
+        }
+        ProfileEffort::Adapter => None,
+        ProfileEffort::Freeform => validated_effort(site, entry.effort.as_deref())?,
+    };
+    let native = NativeProfileInput {
+        model,
+        effort: entry.effort.as_deref(),
+        approval: entry.approval.as_deref(),
+        collaboration_mode: entry.collaboration_mode.as_deref(),
+        permissions: entry.permissions.as_deref(),
+        approval_policy: entry.approval_policy.as_deref(),
+        project_doc_max_bytes: entry.project_doc_max_bytes,
+        auth_integration: entry.auth_integration.as_deref(),
+        mode: entry.mode.as_deref(),
+        dangerously_skip_permissions: entry.dangerously_skip_permissions,
+        local_provider: entry.local_provider.as_ref(),
     };
     let mut snapshot = profile_snapshot(harness, model, effort);
-    let (native_name, minimal, allow) = match harness {
-        "muse" => {
-            freeze_muse_fields(site, entry, &mut snapshot)?;
-            ("Muse", false, false)
-        }
-        "claude" => {
-            freeze_claude_fields(site, entry, &mut snapshot)?;
-            ("Claude", true, false)
-        }
-        "opencode" => {
-            validate_opencode_fields(site, entry)?;
-            ("OpenCode", true, false)
-        }
-        "antigravity" => {
-            freeze_antigravity_fields(site, entry, &mut snapshot)?;
-            ("Antigravity", true, true)
-        }
-        _ => {
-            freeze_codex_fields(site, entry, &mut snapshot)?;
-            ("Codex", true, true)
-        }
-    };
+    (mapping.fields)(&native, &mut snapshot).map_err(native_refusal)?;
     let tail = validate_profile_tail(name, entry, table_offset, source)?;
-    if harness == "opencode" {
-        freeze_opencode_route(site, entry, &tail, &mut snapshot)?;
+    if let Some(freeze_native_route) = mapping.route {
+        freeze_native_route(&native, &tail.pass_env, &mut snapshot).map_err(native_refusal)?;
     }
     let control = || validated_control(name, entry.control.as_deref(), source, table_offset);
-    let claude_control = (harness == "claude").then(control).transpose()?;
-    freeze_mcp_policy(&mut snapshot, site, entry, native_name, minimal, allow)?;
-    let control = claude_control.map_or_else(control, Ok)?;
+    let early_control = mapping.control_before_mcp.then(control).transpose()?;
+    freeze_mcp_policy(
+        &mut snapshot,
+        site,
+        entry,
+        mapping.name,
+        mapping.mcp_minimal,
+        mapping.mcp_allow,
+    )?;
+    let control = early_control.map_or_else(control, Ok)?;
     snapshot.insert("control".to_owned(), json!(control));
     insert_profile_tail(&mut snapshot, tail, &entry.setup)?;
     Ok(Value::Object(snapshot))
@@ -2492,77 +2489,6 @@ pub(crate) fn profile_snapshot(
         unreachable!("profile selectors serialize as an object");
     };
     fields
-}
-
-fn freeze_codex_fields(
-    site: ProfileSite<'_>,
-    entry: &ProfileEntry,
-    snapshot: &mut JsonMap<String, Value>,
-) -> core::Result<()> {
-    let collaboration_mode = validated_choice(
-        site,
-        "collaboration_mode",
-        entry.collaboration_mode.as_deref(),
-        &CodexCollaborationMode::ALL.map(CodexCollaborationMode::as_str),
-        "must be default or plan",
-        "profile_error",
-    )?;
-    let permissions = validated_choice(
-        site,
-        "permissions",
-        entry.permissions.as_deref(),
-        &CodexPermissions::ALL.map(CodexPermissions::as_str),
-        "unsupported permission mode",
-        "unsupported",
-    )?
-    .unwrap_or(CodexPermissions::default().as_str());
-    let approval_policy = validated_choice(
-        site,
-        "approval_policy",
-        entry.approval_policy.as_deref(),
-        &CodexApprovalPolicy::ALL.map(CodexApprovalPolicy::as_str),
-        "must be never or on-request",
-        "profile_error",
-    )?
-    .unwrap_or(CodexApprovalPolicy::default().as_str());
-    reject_unmapped(
-        site,
-        &[
-            (
-                "approval",
-                entry.approval.is_some(),
-                "the Codex slice has no approval mapping; use approval_policy",
-            ),
-            (
-                "mode",
-                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
-                "mode and dangerously_skip_permissions have no Codex mapping",
-            ),
-            (
-                "auth_integration",
-                entry.auth_integration.is_some(),
-                "auth_integration has no Codex mapping",
-            ),
-        ],
-    )?;
-    if let Some(limit) = entry.project_doc_max_bytes {
-        snapshot.insert("project_doc_max_bytes".to_owned(), json!(limit));
-    }
-    if let Some(collaboration_mode) = collaboration_mode {
-        snapshot.insert(
-            "collaboration_mode".to_owned(),
-            Value::String(collaboration_mode.to_owned()),
-        );
-    }
-    snapshot.insert(
-        "permissions".to_owned(),
-        Value::String(permissions.to_owned()),
-    );
-    snapshot.insert(
-        "approval_policy".to_owned(),
-        Value::String(approval_policy.to_owned()),
-    );
-    Ok(())
 }
 
 /// Shared profile fields validated after the harness-specific fields.
@@ -2681,158 +2607,6 @@ fn insert_profile_tail(
     Ok(())
 }
 
-/// Freeze a Muse profile. The PR1 slice carries an explicit model id, an
-/// optional native `cmd` pin (omitting it discovers the launcher's native
-/// payload; resolving `muse` from PATH could land on the launcher wrapper and
-/// orphan the host on stop), an optional
-/// reasoning effort, optional approval mode, and explicit permissions
-/// (`workspace-write` or `danger-full-access`; host birth control passes
-/// `--disable-sandbox` for full access); collaboration presets, adopted routes,
-/// read-only permissions and approval policies stay rejected until their native
-/// mappings land.
-fn freeze_muse_fields(
-    site: ProfileSite<'_>,
-    entry: &ProfileEntry,
-    snapshot: &mut JsonMap<String, Value>,
-) -> core::Result<()> {
-    let approval = validated_choice(
-        site,
-        "approval",
-        entry.approval.as_deref(),
-        &MUSE_APPROVALS,
-        "must be allowAll, promptUnmatched, onRequest or denyUnmatched",
-        "profile_error",
-    )?;
-    reject_unmapped(
-        site,
-        &[(
-            "collaboration_mode",
-            entry.collaboration_mode.is_some(),
-            "the Muse slice has no collaboration preset mapping",
-        )],
-    )?;
-    let permissions = validated_choice(
-        site,
-        "permissions",
-        entry.permissions.as_deref(),
-        &MUSE_PERMISSIONS.map(CodexPermissions::as_str),
-        "the Muse slice supports only workspace-write or danger-full-access",
-        "unsupported",
-    )?
-    .unwrap_or(CodexPermissions::default().as_str());
-    validated_choice(
-        site,
-        "approval_policy",
-        entry.approval_policy.as_deref(),
-        &[CodexApprovalPolicy::Never.as_str()],
-        "the Muse slice leaves approvals unconnected",
-        "unsupported",
-    )?;
-    reject_unmapped(
-        site,
-        &[
-            (
-                "mode",
-                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
-                "the Muse slice has no mapping for this preset",
-            ),
-            (
-                "auth_integration",
-                entry.auth_integration.is_some(),
-                "the Muse slice has no mapping for this preset",
-            ),
-        ],
-    )?;
-    if let Some(approval) = approval {
-        snapshot.insert("approval".to_owned(), Value::String(approval.to_owned()));
-    }
-    snapshot.insert(
-        "permissions".to_owned(),
-        Value::String(permissions.to_owned()),
-    );
-    snapshot.insert(
-        "approval_policy".to_owned(),
-        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
-    );
-    Ok(())
-}
-
-/// Freeze a Claude profile. The PR2 slice carries an exact model id, an
-/// optional explicit native `cmd` pin (`latest` or omission selects the
-/// newest verified native CLI), the CLI permission modes mapped from
-/// `approval`, and approve/deny replies through the stdio permission
-/// callback, and the CLI `--effort` level (low, medium, high, xhigh, max).
-/// Collaboration presets, non-default permissions, and a non-`never`
-/// Eliot-side `approval_policy` stay rejected until their mappings land.
-fn freeze_claude_fields(
-    site: ProfileSite<'_>,
-    entry: &ProfileEntry,
-    snapshot: &mut JsonMap<String, Value>,
-) -> core::Result<()> {
-    let permission_mode = validated_choice(
-        site,
-        "approval",
-        entry
-            .approval
-            .as_deref()
-            .filter(|value| !value.trim().is_empty()),
-        &CLAUDE_PERMISSION_MODES,
-        "unknown Claude permission mode (acceptEdits, auto, bypassPermissions, manual, dontAsk, or plan)",
-        "profile_error",
-    )?;
-    reject_unmapped(
-        site,
-        &[(
-            "collaboration_mode",
-            entry.collaboration_mode.is_some(),
-            "the Claude slice has no collaboration preset mapping",
-        )],
-    )?;
-    validated_choice(
-        site,
-        "permissions",
-        entry.permissions.as_deref(),
-        &[CodexPermissions::WorkspaceWrite.as_str()],
-        "the Claude slice runs the CLI-default permission posture",
-        "unsupported",
-    )?;
-    validated_choice(
-        site,
-        "approval_policy",
-        entry.approval_policy.as_deref(),
-        &[CodexApprovalPolicy::Never.as_str()],
-        "the Claude slice leaves approvals unconnected",
-        "unsupported",
-    )?;
-    reject_unmapped(
-        site,
-        &[
-            (
-                "mode",
-                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
-                "the Claude slice has no mapping for this preset",
-            ),
-            (
-                "auth_integration",
-                entry.auth_integration.is_some(),
-                "the Claude slice has no mapping for this preset",
-            ),
-        ],
-    )?;
-    snapshot.insert(
-        "permissions".to_owned(),
-        Value::String(CodexPermissions::WorkspaceWrite.as_str().to_owned()),
-    );
-    snapshot.insert(
-        "approval_policy".to_owned(),
-        Value::String(CodexApprovalPolicy::Never.as_str().to_owned()),
-    );
-    if let Some(mode) = permission_mode {
-        snapshot.insert("permission_mode".to_owned(), Value::String(mode.to_owned()));
-    }
-    Ok(())
-}
-
 /// Names of configured OpenCode profiles backed by the daemon config file.
 /// Used by the `models.catalog` aggregate to merge profile-scoped provider
 /// previews independently of the ad-hoc read.
@@ -2853,160 +2627,6 @@ pub(crate) fn profile_names_for_harness(data_root: &Path, harness: &str) -> Vec<
         .collect();
     names.sort();
     names
-}
-
-/// Freeze an OpenCode profile. The L6.2 PR1 slice carries an explicit model
-/// id in the installed `provider/model` form (split at the first slash) and an optional native
-/// `cmd` pin (discovery follows the package executable, never the `.cmd` shim; stop and process registration address
-/// the exact spawned PID, so `.cmd`/`.bat`/`.ps1` wrappers are rejected).
-/// An optional nonsecret `auth_integration` names the one native integration
-/// whose canonical credential the pre-serve transfer prepares; the plugin
-/// requires it at admission. Effort, approval, collaboration, permission and
-/// approval-policy presets have no OpenCode mapping and stay rejected until
-/// one lands.
-///
-/// A typed local provider selects one of its own models and uses optional
-/// environment-backed authentication in place of a canonical integration.
-fn validate_opencode_fields(site: ProfileSite<'_>, entry: &ProfileEntry) -> core::Result<()> {
-    let no_mapping = "the OpenCode slice has no mapping for this preset";
-    reject_unmapped(
-        site,
-        &[
-            ("approval", entry.approval.is_some(), no_mapping),
-            (
-                "collaboration_mode",
-                entry.collaboration_mode.is_some(),
-                no_mapping,
-            ),
-            ("permissions", entry.permissions.is_some(), no_mapping),
-            (
-                "approval_policy",
-                entry.approval_policy.is_some(),
-                no_mapping,
-            ),
-            (
-                "mode",
-                entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
-                no_mapping,
-            ),
-        ],
-    )?;
-    if let Some(selector) = entry.auth_integration.as_deref() {
-        let trimmed = selector.trim();
-        if trimmed.is_empty()
-            || trimmed.len() > MAX_AUTH_INTEGRATION_LEN
-            || trimmed.starts_with('-')
-            || trimmed.chars().any(|value| value.is_control())
-        {
-            return Err(site.error(
-                "auth_integration",
-                "must be a non-empty integration ID or name of at most 128 bytes with no control characters and no leading dash",
-                "profile_error",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn freeze_opencode_route(
-    site: ProfileSite<'_>,
-    entry: &ProfileEntry,
-    tail: &ProfileTail,
-    snapshot: &mut JsonMap<String, Value>,
-) -> core::Result<()> {
-    if let Some(provider) = entry.local_provider.as_ref() {
-        let field_error = |field, message: &str| site.error(field, message, "profile_error");
-        provider
-            .validate(&tail.pass_env)
-            .map_err(|message| field_error("local_provider", &message))?;
-        if !entry
-            .model
-            .as_deref()
-            .and_then(split_provider_model)
-            .is_some_and(|(id, model)| provider.contains_model(id, model))
-        {
-            return Err(field_error(
-                "model",
-                "a local provider profile must select one of its declared models",
-            ));
-        }
-        if entry.auth_integration.is_some() {
-            return Err(field_error(
-                "auth_integration",
-                "a local provider profile cannot name a canonical auth_integration",
-            ));
-        }
-        let frozen = serde_json::to_value(provider)
-            .map_err(|_| field_error("local_provider", "could not encode local provider"))?;
-        snapshot.insert("local_provider".to_owned(), frozen);
-    } else if let Some(selector) = entry.auth_integration.as_deref() {
-        snapshot.insert(
-            "auth_integration".to_owned(),
-            Value::String(selector.trim().to_owned()),
-        );
-    }
-    Ok(())
-}
-
-/// Freeze an Antigravity profile. The L6.4 slice carries an exact model id, an
-/// optional native `cmd` pin (discovery selects the `agy` CLI), an optional native `mode` and an explicit
-/// `dangerously_skip_permissions` flag. Effort, approval, collaboration,
-/// permission and approval-policy presets have no mapping and stay rejected.
-fn freeze_antigravity_fields(
-    site: ProfileSite<'_>,
-    entry: &ProfileEntry,
-    snapshot: &mut JsonMap<String, Value>,
-) -> core::Result<()> {
-    reject_unmapped(
-        site,
-        &[(
-            "effort",
-            entry
-                .effort
-                .as_deref()
-                .is_some_and(|effort| !effort.trim().is_empty()),
-            "the Antigravity slice has no reasoning-effort mapping",
-        )],
-    )?;
-    let mode = validated_choice(
-        site,
-        "mode",
-        entry.mode.as_deref(),
-        &ANTIGRAVITY_MODES,
-        "must be plan, auto, or accept-edits",
-        "profile_error",
-    )?;
-    let no_mapping = "the Antigravity slice has no mapping for this preset";
-    reject_unmapped(
-        site,
-        &[
-            ("approval", entry.approval.is_some(), no_mapping),
-            (
-                "collaboration_mode",
-                entry.collaboration_mode.is_some(),
-                no_mapping,
-            ),
-            ("permissions", entry.permissions.is_some(), no_mapping),
-            (
-                "approval_policy",
-                entry.approval_policy.is_some(),
-                no_mapping,
-            ),
-            (
-                "auth_integration",
-                entry.auth_integration.is_some(),
-                no_mapping,
-            ),
-        ],
-    )?;
-    if let Some(mode) = mode {
-        snapshot.insert("mode".to_owned(), Value::String(mode.to_owned()));
-    }
-    snapshot.insert(
-        "dangerously_skip_permissions".to_owned(),
-        Value::Bool(entry.dangerously_skip_permissions.unwrap_or(false)),
-    );
-    Ok(())
 }
 
 fn bind_route_and_capacity(
@@ -3447,22 +3067,6 @@ fn reject_unmapped(site: ProfileSite<'_>, checks: &[(&str, bool, &str)]) -> core
         Some((field, _, message)) => Err(site.error(field, message, "unsupported")),
         None => Ok(()),
     }
-}
-
-/// Trims an optional choice; fails with `code` unless it is one of `allowed`.
-fn validated_choice<'a>(
-    site: ProfileSite<'_>,
-    field: &str,
-    value: Option<&'a str>,
-    allowed: &[&str],
-    message: &str,
-    code: &str,
-) -> core::Result<Option<&'a str>> {
-    let value = value.map(str::trim);
-    if value.is_some_and(|value| !allowed.contains(&value)) {
-        return Err(site.error(field, message, code));
-    }
-    Ok(value)
 }
 
 /// Trims an optional free-text effort: non-empty, at most `MAX_EFFORT_LEN`

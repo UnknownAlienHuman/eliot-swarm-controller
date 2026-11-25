@@ -33,6 +33,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("claude-cli-oauth"),
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 store_paths: &["CLAUDE_CONFIG_DIR"],
                 legacy_captured_paths: &["CLAUDE_CONFIG_DIR"],

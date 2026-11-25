@@ -280,6 +280,7 @@ pub struct FrozenStoreEnvironment {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProfileCapabilities {
     pub environment: ProfileEnvironment,
+    pub named_profile: Option<super::native_profile::NativeProfileMapping>,
     pub route_selectors_resolved: bool,
     pub route_scope_secret_names: &'static [&'static str],
     pub latest_cmd: bool,

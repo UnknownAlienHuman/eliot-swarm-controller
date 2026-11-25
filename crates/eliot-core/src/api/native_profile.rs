@@ -5,6 +5,67 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Typed vendor-facing part of a named profile. The daemon retains the
+/// source location and validates all shared fields.
+pub struct NativeProfileInput<'a> {
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    pub approval: Option<&'a str>,
+    pub collaboration_mode: Option<&'a str>,
+    pub permissions: Option<&'a str>,
+    pub approval_policy: Option<&'a str>,
+    pub project_doc_max_bytes: Option<u64>,
+    pub auth_integration: Option<&'a str>,
+    pub mode: Option<&'a str>,
+    pub dangerously_skip_permissions: Option<bool>,
+    pub local_provider: Option<&'a crate::local_provider::LocalProvider>,
+}
+
+pub struct NativeProfileRefusal {
+    pub field: &'static str,
+    pub reason: String,
+    pub code: &'static str,
+}
+
+impl NativeProfileRefusal {
+    pub fn new(field: &'static str, reason: impl Into<String>, code: &'static str) -> Self {
+        Self {
+            field,
+            reason: reason.into(),
+            code,
+        }
+    }
+}
+
+pub type NativeProfileResult<T> = Result<T, NativeProfileRefusal>;
+type MapNativeFields =
+    fn(&NativeProfileInput<'_>, &mut Map<String, Value>) -> NativeProfileResult<()>;
+type MapNativeRoute =
+    fn(&NativeProfileInput<'_>, &[String], &mut Map<String, Value>) -> NativeProfileResult<()>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ProfileEffort {
+    Freeform,
+    Choices {
+        allowed: &'static [&'static str],
+        refusal: &'static str,
+    },
+    Adapter,
+}
+
+/// Adapter-owned validation, defaults and native field projection.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeProfileMapping {
+    pub name: &'static str,
+    pub model: Option<fn(&str) -> NativeProfileResult<()>>,
+    pub effort: ProfileEffort,
+    pub fields: MapNativeFields,
+    pub route: Option<MapNativeRoute>,
+    pub mcp_minimal: bool,
+    pub mcp_allow: bool,
+    pub control_before_mcp: bool,
+}
+
 /// Claude's closed reasoning-effort vocabulary for frozen profiles.
 pub const CLAUDE_EFFORT_LEVELS: &[&str] = &CLAUDE_EFFORTS;
 

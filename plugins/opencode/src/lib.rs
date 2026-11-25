@@ -8,6 +8,7 @@ mod host;
 pub mod install;
 mod instructions;
 mod native;
+mod profile_config;
 mod project_mcp;
 mod quota;
 

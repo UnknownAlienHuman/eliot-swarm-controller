@@ -36,6 +36,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::FixedCredential("ambient"),
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 auth_scope: &["MUSE_AUTH_PATH", "META_API_KEY"],
                 managed_update: &["MUSE_NO_AUTO_UPDATE", "MUSE_UPDATE_INTERVAL_SECONDS"],

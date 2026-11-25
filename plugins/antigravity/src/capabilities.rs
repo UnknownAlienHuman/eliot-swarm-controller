@@ -26,6 +26,7 @@ pub fn declaration() -> HarnessCapabilities {
         native_auth: None,
         native_route: NativeRoute::FixedCredential("antigravity-cli-keyring"),
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 protected_home_paths: &[".gemini", ".antigravity", ".agy"],
                 protected_cleanup_names: &[".antigravity"],

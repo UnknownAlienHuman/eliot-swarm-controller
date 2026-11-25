@@ -35,6 +35,7 @@ pub fn declaration() -> HarnessCapabilities {
         }),
         native_route: NativeRoute::AuthIntegration,
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 store_paths: &[
                     "XDG_CONFIG_HOME",

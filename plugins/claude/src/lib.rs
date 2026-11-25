@@ -8,6 +8,7 @@ pub mod install;
 mod instructions;
 mod native;
 mod owner_scan;
+mod profile_config;
 mod quota;
 
 pub async fn run_claude() -> eliot_core::Result<()> {

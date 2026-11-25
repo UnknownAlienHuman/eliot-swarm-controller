@@ -1,0 +1,114 @@
+//! Named profile settings for this adapter.
+
+use eliot_core::api::native_profile::{
+    NativeProfileInput, NativeProfileMapping, NativeProfileRefusal, NativeProfileResult,
+    ProfileEffort,
+};
+use eliot_plugin::capabilities::reject_unmapped_native_fields;
+use serde_json::{Map as JsonMap, Value};
+
+pub(super) const MAPPING: NativeProfileMapping = NativeProfileMapping {
+    name: "OpenCode",
+    model: Some(validate_model),
+    effort: ProfileEffort::Freeform,
+    fields,
+    route: Some(route),
+    mcp_minimal: true,
+    mcp_allow: false,
+    control_before_mcp: false,
+};
+
+use eliot_plugin::session::split_provider_model;
+
+const MAX_AUTH_INTEGRATION_LEN: usize = 128;
+
+fn fields(
+    entry: &NativeProfileInput<'_>,
+    _snapshot: &mut JsonMap<String, Value>,
+) -> NativeProfileResult<()> {
+    let no_mapping = "the OpenCode slice has no mapping for this preset";
+    reject_unmapped_native_fields(&[
+        ("approval", entry.approval.is_some(), no_mapping),
+        (
+            "collaboration_mode",
+            entry.collaboration_mode.is_some(),
+            no_mapping,
+        ),
+        ("permissions", entry.permissions.is_some(), no_mapping),
+        (
+            "approval_policy",
+            entry.approval_policy.is_some(),
+            no_mapping,
+        ),
+        (
+            "mode",
+            entry.mode.is_some() || entry.dangerously_skip_permissions.is_some(),
+            no_mapping,
+        ),
+    ])?;
+    if let Some(selector) = entry.auth_integration {
+        let trimmed = selector.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > MAX_AUTH_INTEGRATION_LEN
+            || trimmed.starts_with('-')
+            || trimmed.chars().any(|value| value.is_control())
+        {
+            return Err(NativeProfileRefusal::new(
+                "auth_integration",
+                "must be a non-empty integration ID or name of at most 128 bytes with no control characters and no leading dash",
+                "profile_error",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn route(
+    entry: &NativeProfileInput<'_>,
+    pass_env: &[String],
+    snapshot: &mut JsonMap<String, Value>,
+) -> NativeProfileResult<()> {
+    if let Some(provider) = entry.local_provider {
+        let field_error =
+            |field, message: &str| NativeProfileRefusal::new(field, message, "profile_error");
+        provider
+            .validate(pass_env)
+            .map_err(|message| field_error("local_provider", &message))?;
+        if !entry
+            .model
+            .and_then(split_provider_model)
+            .is_some_and(|(id, model)| provider.contains_model(id, model))
+        {
+            return Err(field_error(
+                "model",
+                "a local provider profile must select one of its declared models",
+            ));
+        }
+        if entry.auth_integration.is_some() {
+            return Err(field_error(
+                "auth_integration",
+                "a local provider profile cannot name a canonical auth_integration",
+            ));
+        }
+        let frozen = serde_json::to_value(provider)
+            .map_err(|_| field_error("local_provider", "could not encode local provider"))?;
+        snapshot.insert("local_provider".to_owned(), frozen);
+    } else if let Some(selector) = entry.auth_integration {
+        snapshot.insert(
+            "auth_integration".to_owned(),
+            Value::String(selector.trim().to_owned()),
+        );
+    }
+    Ok(())
+}
+
+fn validate_model(model: &str) -> NativeProfileResult<()> {
+    if split_provider_model(model).is_none() {
+        return Err(NativeProfileRefusal::new(
+            "model",
+            "must be provider/model with non-empty slash segments and no variant suffix",
+            "profile_error",
+        ));
+    }
+    Ok(())
+}

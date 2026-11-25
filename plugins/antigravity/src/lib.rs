@@ -10,6 +10,7 @@ mod instructions;
 mod mcp;
 mod native;
 mod profile;
+mod profile_config;
 mod quota;
 mod session;
 

@@ -90,6 +90,7 @@ pub fn declaration() -> HarnessCapabilities {
             ],
         },
         profile: ProfileCapabilities {
+            named_profile: Some(crate::profile_config::MAPPING),
             environment: eliot_core::api::harness::ProfileEnvironment {
                 auth_scope: CODEX_PROXY_SELECTOR_ENV_NAMES,
                 cleanup_roots: CODEX_PROXY_SELECTOR_ENV_NAMES,

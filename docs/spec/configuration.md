@@ -1295,6 +1295,9 @@ cleanup protect. Shared code resolves and validates the declared paths,
 captures the same snapshot keys, and hashes credential presence where declared.
 The adapter supplies its stand directory and native guard-file name. Shared
 code checks custody and prohibits linked paths before a native operation.
+Named-profile validation uses the adapter's native field mapping, including
+its refusal text and defaults. Shared configuration owns source locations,
+shared fields and validation order.
 
 New launch/attach admissions [capture](../../crates/eliot-daemon/src/config.rs) only
 the nonsecret `CODEX_HOME` and `CODEX_SQLITE_HOME` inputs in
