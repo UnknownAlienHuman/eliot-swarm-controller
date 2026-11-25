@@ -160,7 +160,9 @@ delete sharing for every directory and file until disposition/close, refuses
 reparse points and deletes by handle disposition. A scan is bounded to 262,144
 entries and by its deadline. Any file whose link count is
 not exactly one keeps the entire tree with `hard_link`, including Cargo targets
-with shared binaries. Guarded scans at both plan and apply refuse repository
+with shared binaries. For owned trees, Windows ignores a regular file's read-only
+attribute only at disposition on its pinned handle. Guarded scans at both plan
+and apply refuse repository
 roots (including bare repositories), every `.git` entry, and native/user config
 descendants. Only a clean, retained Swarm worktree may include its exact
 reciprocal `.git` pointer, verified by opened identity; nested repositories stay

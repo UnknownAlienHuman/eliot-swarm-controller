@@ -554,7 +554,8 @@ impl CleanupTree {
                 check(&child, true)?;
                 self.visit(child, depth + 1, deadline)?;
             } else {
-                let len = check_cleanup_file(&child)?;
+                let len = cleanup_file_size(&child)?;
+                require_single_cleanup_link(&child)?;
                 self.bytes = self.bytes.checked_add(len).ok_or_else(refused)?;
                 self.entries.push(child);
             }
@@ -593,7 +594,7 @@ impl CleanupTree {
                     Error::new("unknown", "forced shutdown interrupted a partial cleanup")
                 });
             }
-            native::delete_handle(&file)
+            native::delete_cleanup_entry(&file)
                 .map_err(|_| Error::new("unknown", "partial cleanup; no replay"))?;
             drop(file);
         }
@@ -667,20 +668,37 @@ pub(crate) fn protected_cleanup_name(name: &str) -> bool {
 
 #[cfg(windows)]
 fn check_cleanup_file(file: &File) -> Result<u64> {
+    let len = cleanup_file_size(file)?;
+    if file
+        .metadata()
+        .map_err(|_| refused())?
+        .permissions()
+        .readonly()
+    {
+        return Err(Error::new("not_allowed", "cleanup refuses read-only files"));
+    }
+    require_single_cleanup_link(file)?;
+    Ok(len)
+}
+
+#[cfg(windows)]
+fn cleanup_file_size(file: &File) -> Result<u64> {
     let metadata = file.metadata().map_err(|_| refused())?;
     if crate::platform::is_reparse_point(&metadata) || !metadata.is_file() {
         return Err(refused());
     }
-    if metadata.permissions().readonly() {
-        return Err(Error::new("not_allowed", "cleanup refuses read-only files"));
-    }
+    Ok(metadata.len())
+}
+
+#[cfg(windows)]
+fn require_single_cleanup_link(file: &File) -> Result<()> {
     if native::links(file).map_err(|_| refused())? != 1 {
         return Err(Error::new(
             "hard_link",
             "cleanup refuses files with multiple links",
         ));
     }
-    Ok(metadata.len())
+    Ok(())
 }
 
 /// At most the editor limit plus one byte, always from the verified handle.
@@ -995,6 +1013,39 @@ mod native {
                 file.as_raw_handle(),
                 FileDispositionInfo,
                 (&info as *const FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn delete_cleanup_entry(file: &File) -> io::Result<()> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || !metadata.permissions().readonly() {
+            return delete_handle(file);
+        }
+        // Apply only to the pinned, owned file being removed. Do not modify
+        // persistent attributes during preflight or before disposition.
+        delete_with_flags(
+            file,
+            FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        )
+    }
+
+    pub(super) fn delete_with_flags(
+        file: &File,
+        flags: FILE_DISPOSITION_INFO_EX_FLAGS,
+    ) -> io::Result<()> {
+        let info = FILE_DISPOSITION_INFO_EX { Flags: flags };
+        // SAFETY: file owns the verified handle and info lives through the call.
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfoEx,
+                (&info as *const FILE_DISPOSITION_INFO_EX).cast(),
                 std::mem::size_of_val(&info) as u32,
             )
         } == 0
