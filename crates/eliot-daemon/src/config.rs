@@ -1756,6 +1756,9 @@ pub(crate) enum QuotaUnknownPolicy {
     Hold,
 }
 
+const DEFAULT_OWNER_QUOTA_RESERVE_PERCENT: i64 = 20;
+pub(crate) const DEFAULTED_QUOTA_RESERVE_FIELD: &str = "_quota_reserve_defaulted";
+
 /// Read the frozen percentage, defaulting older profile snapshots to zero.
 pub(crate) fn profile_quota_reserve_percent(snapshot: &Value) -> u8 {
     snapshot
@@ -2012,7 +2015,13 @@ fn freeze_profile_quota_policy(
     site: ProfileSite<'_>,
     entry: &ProfileEntry,
 ) -> core::Result<()> {
-    let reserve_percent = entry.quota_reserve_percent.unwrap_or_default();
+    let defaulted = entry.quota_reserve_percent.is_none()
+        && ProfileCapabilities::of(entry.harness.trim()).owner_subscription_reserve;
+    let reserve_percent = entry.quota_reserve_percent.unwrap_or(if defaulted {
+        DEFAULT_OWNER_QUOTA_RESERVE_PERCENT
+    } else {
+        0
+    });
     if !(0..=100).contains(&reserve_percent) {
         return Err(site.error(
             "quota_reserve_percent",
@@ -2044,6 +2053,9 @@ fn freeze_profile_quota_policy(
             "quota_reserve_percent".to_owned(),
             Value::from(reserve_percent),
         );
+        if defaulted {
+            snapshot.insert(DEFAULTED_QUOTA_RESERVE_FIELD.to_owned(), Value::Bool(true));
+        }
     }
     if quota_unknown != "admit" {
         snapshot.insert(

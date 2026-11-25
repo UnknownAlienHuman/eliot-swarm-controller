@@ -1722,8 +1722,10 @@ switch keeps the executable bound to the source generation.
 #### Owner quota reserve (#872)
 
 Set `quota_reserve_percent` on a named profile to an integer from 0 through 100.
-It defaults to 0. The Owner may configure a positive reserve to set aside that
-many percentage points of each applicable provider window. A new
+Omission reserves 20 percentage points for the Owner on named Claude profiles.
+The reserve uses confirmed subscription usage when it is available. Other
+profiles default to 0, including Codex and Muse. Set the key to 0 to turn off
+the reserve on a named profile. A new
 automatic launch skips the route with `quota_reserve` when current usage of any
 applicable window is strictly greater than `100 - quota_reserve_percent`.
 `quota_unknown = "admit"` is the default. Set it to `"hold"` to skip with
@@ -1737,11 +1739,12 @@ The reserve applies to new Agent children, automated assignments, and rule and
 timer launches, including explicit profile choices. Owner-initiated launches and
 messages, in-flight turns, and Goal continuations of existing Agents are exempt.
 Provider holds and real provider limits retain their existing force.
-An automatic role with a configured quota policy tries eligible candidates with
-headroom. It prefers the lowest observed weekly usage, using the most-used
-applicable weekly window for a route. Candidates with a weekly reading precede
-those without one, and configured order breaks ties. Roles with both default
-settings throughout keep their existing ordering. Arbitration retains the
+An automatic role with an explicitly configured positive reserve or
+`quota_unknown = "hold"` ranks eligible candidates by lowest observed weekly
+usage, using the most-used applicable weekly window for a route. Candidates with a
+weekly reading precede those without one, and configured order breaks ties.
+The built-in reserve alone preserves configured order among eligible routes.
+Arbitration retains the
 automation class of waiting work. A waiting automatic role launch evaluates
 its configured candidates again on each attempt. A waiting explicit profile
 launch keeps its original route binding.
