@@ -73,7 +73,9 @@ impl DesktopApp {
         // Settings and a project page leave the conversation as New task does.
         let conversation = match self.main {
             Main::Conversation => self.selected_agent_id().unwrap_or_default(),
-            Main::Project | Main::Settings => String::new(),
+            Main::Project | Main::Inbox | Main::Agents | Main::Automations | Main::Settings => {
+                String::new()
+            }
         };
         let open = !conversation.is_empty();
         // Not while the first read is in flight: its coverage is not known.

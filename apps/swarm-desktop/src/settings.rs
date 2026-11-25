@@ -80,6 +80,18 @@ pub enum Startup {
     LastConversation,
 }
 
+impl Startup {
+    pub const ALL: [Self; 2] = [Self::NewTask, Self::LastConversation];
+
+    /// The words Settings › General shows for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NewTask => "New task",
+            Self::LastConversation => "Last conversation",
+        }
+    }
+}
+
 /// A launch access level: the Owner ad-hoc launch `access` and
 /// `[desktop] last_access` (`docs/spec/configuration.md`, the access table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

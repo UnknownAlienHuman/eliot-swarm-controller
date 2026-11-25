@@ -45,6 +45,8 @@ pub(super) enum AutomationMsg {
     RunNow(Option<String>, String),
     RunFinished(TimerKey, RunOutcome),
     RunReadback(TimerKey),
+    /// The page's tabs, the rule editor, the rows' switches and menus.
+    Rule(RuleMsg),
 }
 
 /// The form's text fields.
@@ -100,6 +102,17 @@ pub(super) struct AutomationState {
     pub(super) form: Option<AssignmentForm>,
     /// The last Run now per timer (its run key).
     pub(super) runs: HashMap<TimerKey, RunLine>,
+    /// The Scripts tab is shown.
+    pub(super) scripts_tab: bool,
+    /// The row whose editor shows (its card key).
+    pub(super) open: Option<String>,
+    pub(super) editor: Option<RuleEditor>,
+    /// Each rule's last outcome and refusal (`rule.get`).
+    pub(super) status: HashMap<TimerKey, Fallible<eliot_core::api::RuleShowView>>,
+    status_seq: u64,
+    /// Rows whose switch is being saved, and why one was refused.
+    pub(super) toggling: HashSet<String>,
+    pub(super) toggle_errors: HashMap<String, String>,
 }
 
 impl AutomationState {
@@ -286,6 +299,12 @@ pub(super) struct Card {
     /// Edit).
     pub(super) assignment: Option<(String, bool)>,
     pub(super) technical: Vec<String>,
+    /// The rules-file rule it is, if it is one.
+    pub(super) rule: Option<RuleRef>,
+    /// The page's group it lists under.
+    pub(super) group: AutoGroup,
+    /// When it fires, in words ("A turn ends", "Every 5m").
+    pub(super) trigger: String,
 }
 
 /// One settings assignment as read from the settings draft.
@@ -329,6 +348,16 @@ pub(super) fn interval_ms(text: &str) -> Option<i64> {
 
 /// A folder by its last two names (`agent-briefs\queue10`): enough to know
 /// it; the full path is the card's link.
+/// A rule id as a plain name: "check-after-turn" → "Check after turn".
+fn plain_name(id: &str) -> String {
+    let words = id.replace(['-', '_'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => words,
+    }
+}
+
 fn short_folder(path: &str) -> String {
     let shown = nav::display_path(path);
     let shown = shown.trim_end_matches(['\\', '/']);
@@ -535,6 +564,13 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
             assignment: Some((assignment.key.clone(), assignment.enabled)),
             state,
             technical,
+            rule: None,
+            group: AutoGroup::Schedules,
+            trigger: format!(
+                "Every {} · briefs from {}",
+                assignment.interval,
+                short_folder(&assignment.folder)
+            ),
         });
     }
     for namespace in inputs.namespaces {
@@ -603,12 +639,20 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
                 technical.push("enabled = false in its rules file".to_owned());
             }
             let key = TimerKey(namespace.project.clone(), rule.id.clone());
+            let name = plain_name(&rule.id);
             cards.push(Card {
                 key: key.card_key(),
                 title: match &project {
-                    Some((label, _)) => format!("{} · {label}", rule.id),
-                    None => rule.id.clone(),
+                    Some((label, _)) => format!("{name} · {label}"),
+                    None => name,
                 },
+                rule: Some(RuleRef {
+                    key: key.clone(),
+                    file: entry.source_file.clone(),
+                    enabled: rule.enabled,
+                }),
+                group: AutoGroup::of(&entry.definition, entry.timer.is_some()),
+                trigger: trigger_words(&entry.definition),
                 sentence: match text.limit {
                     Some(limit) => format!("{} {limit}", text.sentence),
                     None => text.sentence,
@@ -649,24 +693,6 @@ pub(super) fn cards(inputs: &CardInputs<'_>) -> Vec<Card> {
     cards
 }
 
-/// The edit form whose assignment no longer has a card (another writer
-/// removed it while it was open): render it after the cards so its retained
-/// inputs and refusal stay visible.
-pub(super) fn unmatched_editing_form<'a>(
-    form: Option<&'a AssignmentForm>,
-    cards: &'a [Card],
-) -> Option<&'a AssignmentForm> {
-    let form = form.filter(|form| form.editing.is_some())?;
-    let editing = form.editing.as_ref()?;
-    let matched = cards
-        .iter()
-        .any(|card| card.assignment.as_ref().map(|(key, _)| key) == Some(editing));
-    (!matched).then_some(form)
-}
-
-/// A refused Run now in words. An assignment with no new brief or with its
-/// most tasks already running refuses the manual run
-/// (`automation::assignment::prepare`): that is an answer, not a failure.
 pub(super) fn refusal_words(error: &eliot_core::Error) -> RunLine {
     let quiet = |text: &str| RunLine {
         text: text.to_owned(),
@@ -820,10 +846,12 @@ impl DesktopApp {
             return;
         }
         match msg {
+            AutomationMsg::Rule(msg) => self.rule_update(msg, context),
             AutomationMsg::RulesLoaded(epoch, namespaces, worker) => {
                 if epoch != self.automation.epoch {
                     return;
                 }
+                let read_status = self.main == Main::Automations;
                 if !matches!(
                     (&self.automation.worker, &worker),
                     (RuleWorker::Down(_), RuleWorker::Unreadable)
@@ -878,6 +906,9 @@ impl DesktopApp {
                     for key in pending {
                         self.read_timer_run(key, false, context);
                     }
+                }
+                if read_status {
+                    self.read_rule_status(context);
                 }
             }
             AutomationMsg::AutomationRefreshRequested => self.load_rules(context),
@@ -1204,5 +1235,1085 @@ fn settle_timer_run(
                 }
             }
         }
+    }
+}
+
+/// The Automations page's groups (`Automations.dc.html`), in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AutoGroup {
+    /// A check after a turn, a PR check, a red main: a `run` action.
+    Checks,
+    /// Everything that answers an event otherwise.
+    Reactions,
+    /// Merge the branch and check: a Git action.
+    AfterWork,
+    /// Timers and brief queues.
+    Schedules,
+}
+
+impl AutoGroup {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Checks,
+        Self::Reactions,
+        Self::AfterWork,
+        Self::Schedules,
+    ];
+
+    pub(super) fn title(self) -> &'static str {
+        match self {
+            Self::Checks => "Checks",
+            Self::Reactions => "Reactions",
+            Self::AfterWork => "After work",
+            Self::Schedules => "Schedules",
+        }
+    }
+
+    /// The group of a rule's definition.
+    fn of(definition: &serde_json::Value, timer: bool) -> Self {
+        let actions: Vec<&str> = definition
+            .get("do")
+            .and_then(serde_json::Value::as_array)
+            .map(|actions| {
+                actions
+                    .iter()
+                    .filter_map(|action| action.get("action").and_then(serde_json::Value::as_str))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if timer {
+            Self::Schedules
+        } else if actions.iter().any(|action| action.starts_with("git.")) {
+            Self::AfterWork
+        } else if actions.contains(&"run") {
+            Self::Checks
+        } else {
+            Self::Reactions
+        }
+    }
+}
+
+/// A rule from a rules file, as its row and editor reach it.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct RuleRef {
+    pub(super) key: TimerKey,
+    /// Its top-level rules file; `None` for a rule Swarm generates from
+    /// the settings (a monitoring reaction, an assignment's rules).
+    pub(super) file: Option<String>,
+    pub(super) enabled: bool,
+}
+
+/// The events the sentence editor names in words; any other event kind is
+/// "Another event…" with its kind typed.
+pub(super) const EVENTS: [(&str, &str); 7] = [
+    ("turn.completed", "A turn ends"),
+    ("request.opened", "An agent asks for approval"),
+    ("command.applied", "A command is applied"),
+    ("command.failed", "A command fails"),
+    ("project.check.passed", "The project check passes"),
+    ("hook.before_tool", "A tool is about to run"),
+    ("x.user.agent.attention", "A task needs attention"),
+];
+
+/// The When choices after the named events.
+const OTHER_EVENT: &str = "Another event…";
+const EVERY: &str = "Every…";
+const CRON: &str = "On a schedule (cron)…";
+const ONCE: &str = "Once at…";
+
+/// The actions the sentence editor names in words (the connected rule
+/// actions of `docs/spec/automation.md`).
+pub(super) const ACTIONS: [(&str, &str); 10] = [
+    ("send", "Send a message"),
+    ("steer", "Steer the running turn"),
+    ("inject", "Add a note at the next safe point"),
+    ("run", "Run a command"),
+    ("launch", "Start a task"),
+    ("stop", "Stop the Agent"),
+    ("resume", "Resume the Agent"),
+    ("mail.send", "Send mail"),
+    ("var.set", "Set a variable"),
+    ("git.integrate", "Merge the branch and check"),
+];
+
+/// What a rule's When is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum WhenKind {
+    #[default]
+    Event,
+    Every,
+    Cron,
+    Once,
+}
+
+impl WhenKind {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Every => "every",
+            Self::Cron => "cron",
+            Self::Once => "at",
+        }
+    }
+}
+
+/// The editor's fields that can carry a check's error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EditorField {
+    Name,
+    When,
+    OnlyIf,
+    Do,
+    Repeat,
+}
+
+/// One rule as the sentence says it: When · Only if · Do · Repeat.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Sentence {
+    pub(super) when: WhenKind,
+    /// The event kind, the interval ("30m"), the cron line or the instant.
+    pub(super) when_value: String,
+    /// A cron line's time zone (UTC when empty).
+    pub(super) zone: String,
+    /// `on.match` as the inside of a TOML inline table.
+    pub(super) only_if: String,
+    /// The first action's verb, and its text when it carries one.
+    pub(super) action: String,
+    pub(super) text: Option<String>,
+    /// More actions after the first (edited as TOML).
+    pub(super) more_actions: usize,
+    /// `limit.max`, when the rule has a limit, and the limit's other words.
+    pub(super) repeat: Option<i64>,
+    pub(super) limit_words: Option<String>,
+}
+
+impl Sentence {
+    /// The When choice's index in [`when_labels`].
+    pub(super) fn when_index(&self) -> usize {
+        match self.when {
+            WhenKind::Event => EVENTS
+                .iter()
+                .position(|(kind, _)| *kind == self.when_value)
+                .unwrap_or(EVENTS.len()),
+            WhenKind::Every => EVENTS.len() + 1,
+            WhenKind::Cron => EVENTS.len() + 2,
+            WhenKind::Once => EVENTS.len() + 3,
+        }
+    }
+
+    /// Whether the When value is typed (another event, a timer).
+    pub(super) fn when_typed(&self) -> bool {
+        self.when_index() >= EVENTS.len()
+    }
+
+    /// The action choice's index in [`action_labels`] (the rule's own verb
+    /// is listed after the named ones when it is another).
+    pub(super) fn action_index(&self) -> usize {
+        ACTIONS
+            .iter()
+            .position(|(verb, _)| *verb == self.action)
+            .unwrap_or(ACTIONS.len())
+    }
+}
+
+/// The When dropdown's labels.
+pub(super) fn when_labels() -> Vec<String> {
+    EVENTS
+        .iter()
+        .map(|(_, words)| (*words).to_owned())
+        .chain([OTHER_EVENT, EVERY, CRON, ONCE].map(str::to_owned))
+        .collect()
+}
+
+/// The Do dropdown's labels: the named actions, then the rule's own verb
+/// when it is another.
+pub(super) fn action_labels(sentence: &Sentence) -> Vec<String> {
+    let mut labels: Vec<String> = ACTIONS
+        .iter()
+        .map(|(_, words)| (*words).to_owned())
+        .collect();
+    if sentence.action_index() == ACTIONS.len() {
+        labels.push(sentence.action.clone());
+    }
+    labels
+}
+
+/// A rule's trigger in words, for its row ("A turn ends", "Every 5m").
+pub(super) fn trigger_words(definition: &serde_json::Value) -> String {
+    let on = definition.get("on");
+    let text = |key: &str| {
+        on.and_then(|on| on.get(key))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    };
+    if let Some(event) = text("event") {
+        return EVENTS
+            .iter()
+            .find(|(kind, _)| *kind == event)
+            .map_or_else(|| format!("On {event}"), |(_, words)| (*words).to_owned());
+    }
+    if let Some(every) = text("every") {
+        return format!("Every {every}");
+    }
+    if let Some(cron) = text("cron") {
+        return match text("tz") {
+            Some(zone) => format!("At {cron} ({zone})"),
+            None => format!("At {cron} (UTC)"),
+        };
+    }
+    if let Some(at) = text("at") {
+        return format!("Once at {at}");
+    }
+    "When it is run".to_owned()
+}
+
+/// The `[[rule]]` table with `id` in a rules file.
+fn rule_table<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    id: &str,
+) -> Result<&'a mut toml_edit::Table, String> {
+    let rules = doc
+        .get_mut("rule")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| "This file has no [[rule]] tables. Edit it as TOML.".to_owned())?;
+    rules
+        .iter_mut()
+        .find(|table| table.get("id").and_then(toml_edit::Item::as_str) == Some(id))
+        .ok_or_else(|| format!("Rule {id} is not in this file any more. Read it again."))
+}
+
+fn parse(content: &str) -> Result<toml_edit::DocumentMut, String> {
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("The file does not parse: {error}"))
+}
+
+/// The sentence of rule `id` in a rules file's text.
+pub(super) fn read_sentence(content: &str, id: &str) -> Result<Sentence, String> {
+    let mut doc = parse(content)?;
+    let table = rule_table(&mut doc, id)?;
+    let mut sentence = Sentence::default();
+    if let Some(on) = table.get("on").and_then(toml_edit::Item::as_table_like) {
+        let text = |key: &str| {
+            on.get(key)
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_owned)
+        };
+        for kind in [
+            WhenKind::Event,
+            WhenKind::Every,
+            WhenKind::Cron,
+            WhenKind::Once,
+        ] {
+            if let Some(value) = text(kind.key()) {
+                sentence.when = kind;
+                sentence.when_value = value;
+                break;
+            }
+        }
+        sentence.zone = text("tz").unwrap_or_default();
+        if let Some(conditions) = on.get("match").and_then(toml_edit::Item::as_table_like) {
+            sentence.only_if = conditions
+                .iter()
+                .map(|(key, item)| {
+                    let value = item
+                        .as_value()
+                        .map(|value| value.to_string().trim().to_owned())
+                        .unwrap_or_default();
+                    format!("{} = {value}", toml_edit::Key::new(key).display_repr())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+        }
+    }
+    if let Some(actions) = table.get("do").and_then(toml_edit::Item::as_array) {
+        if let Some(first) = actions.get(0).and_then(toml_edit::Value::as_inline_table) {
+            sentence.action = first
+                .get("action")
+                .and_then(toml_edit::Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            sentence.text = first
+                .get("text")
+                .and_then(toml_edit::Value::as_str)
+                .map(str::to_owned);
+        }
+        sentence.more_actions = actions.len().saturating_sub(1);
+    }
+    if let Some(limit) = table.get("limit").and_then(toml_edit::Item::as_table_like) {
+        sentence.repeat = limit.get("max").and_then(toml_edit::Item::as_integer);
+        let words: Vec<String> = ["per", "window"]
+            .into_iter()
+            .filter_map(|key| {
+                limit
+                    .get(key)
+                    .and_then(toml_edit::Item::as_str)
+                    .map(|value| format!("{key} {value}"))
+            })
+            .collect();
+        sentence.limit_words = Some(words.join(" · "));
+    }
+    Ok(sentence)
+}
+
+/// The sentence's own checks, before the daemon's: which field is wrong.
+fn check(sentence: &Sentence) -> Result<(), (EditorField, String)> {
+    if sentence.when_value.trim().is_empty() {
+        return Err((
+            EditorField::When,
+            match sentence.when {
+                WhenKind::Event => "Name the event, for example turn.completed.",
+                WhenKind::Every => "Say how often, for example 30m or 1h.",
+                WhenKind::Cron => "Write five cron fields, for example 0 9 * * 1-5.",
+                WhenKind::Once => "Write the instant, for example 2026-12-01T09:00:00Z.",
+            }
+            .to_owned(),
+        ));
+    }
+    if sentence.action.trim().is_empty() {
+        return Err((EditorField::Do, "Choose what the rule does.".to_owned()));
+    }
+    if sentence.repeat.is_some_and(|max| max < 1) {
+        return Err((EditorField::Repeat, "Repeat at least once.".to_owned()));
+    }
+    Ok(())
+}
+
+/// The `match` inline table the Only if text writes.
+fn conditions(only_if: &str) -> Result<Option<toml_edit::InlineTable>, (EditorField, String)> {
+    if only_if.trim().is_empty() {
+        return Ok(None);
+    }
+    let doc = format!("x = {{ {only_if} }}")
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| {
+            (
+                EditorField::OnlyIf,
+                format!(
+                    "Write conditions as key = value, separated by commas ({}).",
+                    error.message()
+                ),
+            )
+        })?;
+    doc.get("x")
+        .and_then(toml_edit::Item::as_inline_table)
+        .cloned()
+        .map(Some)
+        .ok_or_else(|| {
+            (
+                EditorField::OnlyIf,
+                "Write conditions as key = value.".to_owned(),
+            )
+        })
+}
+
+/// Rule `id` in `content` with the sentence written into it: its trigger,
+/// conditions, first action and repeat limit; every other key stays as it
+/// was. Field errors name the field.
+pub(super) fn write_sentence(
+    content: &str,
+    id: &str,
+    sentence: &Sentence,
+) -> Result<String, (EditorField, String)> {
+    check(sentence)?;
+    let conditions = conditions(&sentence.only_if)?;
+    let mut doc = parse(content).map_err(|error| (EditorField::Name, error))?;
+    let table = rule_table(&mut doc, id).map_err(|error| (EditorField::Name, error))?;
+    write_into(table, sentence, conditions)?;
+    Ok(doc.to_string())
+}
+
+fn write_into(
+    table: &mut toml_edit::Table,
+    sentence: &Sentence,
+    conditions: Option<toml_edit::InlineTable>,
+) -> Result<(), (EditorField, String)> {
+    if table.get("on").is_none() {
+        table.insert("on", toml_edit::value(toml_edit::InlineTable::new()));
+    }
+    let on = table
+        .get_mut("on")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| {
+            (
+                EditorField::When,
+                "Its trigger is not a table. Edit it as TOML.".to_owned(),
+            )
+        })?;
+    for kind in ["event", "every", "cron", "at"] {
+        if kind != sentence.when.key() {
+            on.remove(kind);
+        }
+    }
+    on.insert(
+        sentence.when.key(),
+        toml_edit::value(sentence.when_value.trim()),
+    );
+    if sentence.when == WhenKind::Cron && !sentence.zone.trim().is_empty() {
+        on.insert("tz", toml_edit::value(sentence.zone.trim()));
+    } else {
+        on.remove("tz");
+    }
+    match conditions {
+        Some(conditions) => {
+            on.insert("match", toml_edit::value(conditions));
+        }
+        None => {
+            on.remove("match");
+        }
+    }
+    if table.get("do").is_none() {
+        let mut actions = toml_edit::Array::new();
+        actions.push(toml_edit::InlineTable::new());
+        table.insert("do", toml_edit::value(actions));
+    }
+    let first = table
+        .get_mut("do")
+        .and_then(toml_edit::Item::as_array_mut)
+        .and_then(|actions| actions.get_mut(0))
+        .and_then(toml_edit::Value::as_inline_table_mut)
+        .ok_or_else(|| {
+            (
+                EditorField::Do,
+                "Its actions are not a list. Edit it as TOML.".to_owned(),
+            )
+        })?;
+    first.insert("action", sentence.action.trim().into());
+    match &sentence.text {
+        Some(text) => {
+            first.insert("text", text.as_str().into());
+        }
+        None => {
+            first.remove("text");
+        }
+    }
+    if let Some(max) = sentence.repeat {
+        let limit = table
+            .get_mut("limit")
+            .and_then(toml_edit::Item::as_table_like_mut)
+            .ok_or_else(|| {
+                (
+                    EditorField::Repeat,
+                    "This rule has no limit. Edit it as TOML to add one.".to_owned(),
+                )
+            })?;
+        limit.insert("max", toml_edit::value(max));
+    }
+    Ok(())
+}
+
+/// A new rules file holding one rule.
+pub(super) fn new_rule_file(
+    id: &str,
+    sentence: &Sentence,
+) -> Result<String, (EditorField, String)> {
+    let valid = !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if !valid {
+        return Err((
+            EditorField::Name,
+            "Use letters, digits, -, _ and . for the name.".to_owned(),
+        ));
+    }
+    check(sentence)?;
+    let conditions = conditions(&sentence.only_if)?;
+    let mut table = toml_edit::Table::new();
+    table.insert("id", toml_edit::value(id));
+    write_into(&mut table, sentence, conditions)?;
+    let mut rules = toml_edit::ArrayOfTables::new();
+    rules.push(table);
+    let mut doc = toml_edit::DocumentMut::new();
+    doc.insert("rule", toml_edit::Item::ArrayOfTables(rules));
+    Ok(doc.to_string())
+}
+
+/// Rule `id` in `content` switched on or off (its `enabled` key).
+pub(super) fn write_enabled(content: &str, id: &str, on: bool) -> Result<String, String> {
+    let mut doc = parse(content)?;
+    let table = rule_table(&mut doc, id)?;
+    table.insert("enabled", toml_edit::value(on));
+    Ok(doc.to_string())
+}
+
+/// `content` without rule `id`; `None` when it was the file's only rule
+/// (the file is removed instead).
+pub(super) fn without_rule(content: &str, id: &str) -> Result<Option<String>, String> {
+    let mut doc = parse(content)?;
+    let rules = doc
+        .get_mut("rule")
+        .and_then(toml_edit::Item::as_array_of_tables_mut)
+        .ok_or_else(|| "This file has no [[rule]] tables. Edit it as TOML.".to_owned())?;
+    let before = rules.len();
+    rules.retain(|table| table.get("id").and_then(toml_edit::Item::as_str) != Some(id));
+    if rules.len() == before {
+        return Err(format!(
+            "Rule {id} is not in this file any more. Read it again."
+        ));
+    }
+    let empty = rules.is_empty() && doc.iter().count() == 1;
+    Ok((!empty).then(|| doc.to_string()))
+}
+
+/// The open rule editor (`Automations.dc.html`'s right panel).
+#[derive(Clone, Debug, Default)]
+pub(super) struct RuleEditor {
+    /// The card it edits; `None` for a new rule.
+    pub(super) card: Option<String>,
+    pub(super) rule: Option<RuleRef>,
+    /// A new rule's name (its id and file name).
+    pub(super) id: String,
+    /// The file as read, its byte revision and the sentence it holds.
+    pub(super) content: String,
+    pub(super) revision: Option<String>,
+    pub(super) base: Sentence,
+    pub(super) sentence: Sentence,
+    /// The whole file as TOML while Edit as TOML is open.
+    pub(super) toml: Option<String>,
+    /// A field's check error, or the daemon's refusal or read error.
+    pub(super) field_error: Option<(EditorField, String)>,
+    pub(super) note: Option<(String, bool)>,
+    pub(super) reading: bool,
+    pub(super) saving: bool,
+}
+
+impl RuleEditor {
+    pub(super) fn dirty(&self) -> bool {
+        self.sentence != self.base || self.toml.as_ref().is_some_and(|toml| *toml != self.content)
+    }
+}
+
+/// The Automations page's own messages: its tabs, the rule editor, the
+/// rows' switches and menus, and each rule's last outcome.
+#[derive(Clone, Debug)]
+pub(super) enum RuleMsg {
+    /// Show the Scripts tab (true) or Automations.
+    TabChosen(bool),
+    /// Open a row's editor (its card key).
+    Opened(String),
+    /// A rules file read for the editor: the card key and the reply.
+    Read(String, Box<Fallible<eliot_core::api::RuleReadResponse>>),
+    /// A new rule in the global rules folder.
+    New,
+    Id(String),
+    When(Option<usize>),
+    WhenValue(String),
+    Zone(String),
+    OnlyIf(String),
+    Action(Option<usize>),
+    Text(String),
+    Repeat(Option<f64>),
+    /// Open or close Edit as TOML.
+    TomlToggled,
+    TomlText(String),
+    Save,
+    Cancel,
+    Delete,
+    /// A save or delete landed: the card key, the content saved (none when
+    /// the file was removed) and the reply (the new revision).
+    Saved(String, Option<String>, Box<MutationResult<Option<String>>>),
+    /// A row's switch: its card key and on.
+    Toggled(String, bool),
+    /// A rule's switch landed: its card key and what happened.
+    ToggleDone(String, Box<MutationResult<()>>),
+    /// The rules' last outcomes and refusals (`rule.get`), by read.
+    StatusLoaded(
+        u64,
+        Vec<(TimerKey, Fallible<eliot_core::api::RuleShowView>)>,
+    ),
+    /// A row's menu: the action, a unit separator, the card key.
+    Menu(String),
+}
+
+/// The most rules whose last outcome one page read asks for.
+const STATUS_READS: usize = 64;
+
+impl DesktopApp {
+    /// The cards the page shows now (the same builder as the rows).
+    pub(super) fn automation_cards(&self) -> Vec<Card> {
+        let projects = self.automation_projects();
+        let data_dir = self.data_dir.as_ref().ok().map(PathBuf::as_path);
+        cards(&CardInputs {
+            assignments: self.assignment_views(),
+            worker: &self.automation.worker,
+            namespaces: &self.automation.rules,
+            global_rules_current: self.automation.global_rules_current,
+            projects: &projects,
+            data_dir,
+        })
+    }
+
+    /// Read every listed rule's last outcome and refusal (`rule.get`), at
+    /// most [`STATUS_READS`], while the page shows.
+    pub(super) fn read_rule_status(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let keys: Vec<TimerKey> = self
+            .automation
+            .rules
+            .iter()
+            .flat_map(|namespace| {
+                namespace
+                    .rules
+                    .iter()
+                    .flatten()
+                    .map(|entry| TimerKey(namespace.project.clone(), entry.state.id.clone()))
+            })
+            .take(STATUS_READS)
+            .collect();
+        self.automation.status_seq += 1;
+        let seq = self.automation.status_seq;
+        let _task = context.spawn_background(move |_| {
+            let reads = keys
+                .into_iter()
+                .map(|key| {
+                    let read = client::block_on(config_client::rule_status(
+                        &data_dir,
+                        key.0.clone(),
+                        key.1.clone(),
+                    ))
+                    .map_err(|error| error.user_message());
+                    (key, read)
+                })
+                .collect();
+            Message::Automation(AutomationMsg::Rule(RuleMsg::StatusLoaded(seq, reads)))
+        });
+    }
+
+    fn read_rule_file(&mut self, card: String, rule: &RuleRef, context: &ComponentContext<Self>) {
+        let (Ok(data_dir), Some(file)) = (self.data_dir.clone(), rule.file.clone()) else {
+            return;
+        };
+        let project = rule.key.0.clone();
+        let _task = context.spawn_background(move |_| {
+            let read = client::block_on(config_client::read_rule_file(&data_dir, project, file))
+                .map_err(|error| error.user_message());
+            Message::Automation(AutomationMsg::Rule(RuleMsg::Read(card, Box::new(read))))
+        });
+    }
+
+    pub(super) fn rule_update(&mut self, msg: RuleMsg, context: &ComponentContext<Self>) {
+        let busy = self
+            .automation
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.saving);
+        match msg {
+            RuleMsg::TabChosen(scripts) => {
+                self.automation.scripts_tab = scripts;
+                if scripts {
+                    self.load_scripts(context);
+                }
+            }
+            RuleMsg::Opened(card) => {
+                if busy {
+                    return;
+                }
+                self.automation.open = Some(card.clone());
+                self.automation.editor = None;
+                let cards = self.automation_cards();
+                let Some(found) = cards.iter().find(|found| found.key == card) else {
+                    return;
+                };
+                if let Some((key, _)) = &found.assignment {
+                    self.automation_update(AutomationMsg::FormOpened(Some(key.clone())), context);
+                    return;
+                }
+                self.automation.form = None;
+                if let Some(rule) = found.rule.clone() {
+                    let reading = rule.file.is_some();
+                    self.automation.editor = Some(RuleEditor {
+                        card: Some(card.clone()),
+                        rule: Some(rule.clone()),
+                        reading,
+                        ..RuleEditor::default()
+                    });
+                    if reading {
+                        self.read_rule_file(card, &rule, context);
+                    }
+                }
+            }
+            RuleMsg::Read(card, read) => {
+                let Some(editor) = self
+                    .automation
+                    .editor
+                    .as_mut()
+                    .filter(|editor| editor.card.as_deref() == Some(card.as_str()))
+                else {
+                    return;
+                };
+                editor.reading = false;
+                let id = editor
+                    .rule
+                    .as_ref()
+                    .map(|rule| rule.key.1.clone())
+                    .unwrap_or_default();
+                match *read {
+                    Ok(reply) => match read_sentence(&reply.content, &id) {
+                        Ok(sentence) => {
+                            editor.base = sentence.clone();
+                            editor.sentence = sentence;
+                            editor.content = reply.content;
+                            editor.revision = Some(reply.revision);
+                            editor.field_error = None;
+                        }
+                        Err(error) => {
+                            editor.content = reply.content.clone();
+                            editor.revision = Some(reply.revision);
+                            editor.toml = Some(reply.content);
+                            editor.note = Some((error, true));
+                        }
+                    },
+                    Err(error) => editor.note = Some((format!("Not read: {error}"), true)),
+                }
+            }
+            RuleMsg::New => {
+                if busy {
+                    return;
+                }
+                self.automation.form = None;
+                self.automation.open = None;
+                self.automation.editor = Some(RuleEditor {
+                    sentence: Sentence {
+                        when_value: EVENTS[0].0.to_owned(),
+                        action: ACTIONS[0].0.to_owned(),
+                        text: Some(String::new()),
+                        ..Sentence::default()
+                    },
+                    ..RuleEditor::default()
+                });
+            }
+            RuleMsg::Cancel => {
+                if !busy {
+                    self.automation.editor = None;
+                    self.automation.open = None;
+                }
+            }
+            RuleMsg::Save => self.save_rule(context),
+            RuleMsg::Delete => self.delete_rule(context),
+            RuleMsg::Saved(card, content, result) => {
+                let Some(editor) = self.automation.editor.as_mut() else {
+                    return;
+                };
+                editor.saving = false;
+                match *result {
+                    Ok(Some(revision)) => {
+                        if let Some(content) = content {
+                            editor.content = content;
+                        }
+                        editor.revision = Some(revision);
+                        editor.toml = None;
+                        editor.base = editor.sentence.clone();
+                        editor.note = Some(("Saved.".to_owned(), false));
+                        editor.field_error = None;
+                        if editor.card.is_none() {
+                            // A new rule: its row appears with the next read.
+                            self.automation.editor = None;
+                        }
+                    }
+                    Ok(None) => {
+                        self.automation.editor = None;
+                        if self.automation.open.as_deref() == Some(card.as_str()) {
+                            self.automation.open = None;
+                        }
+                    }
+                    // Uncertain: never resent on our own; the file is read
+                    // again to show what it holds.
+                    Err(error) if crate::state::uncertain(&error) => {
+                        editor.note = Some((
+                            format!(
+                                "Not confirmed ({}). Read the rule again before another save.",
+                                error.user_message()
+                            ),
+                            true,
+                        ));
+                    }
+                    Err(error) => editor.note = Some((error.user_message(), true)),
+                }
+                self.reload_rules_soon(context);
+            }
+            RuleMsg::Toggled(card, on) => self.toggle_rule(card, on, context),
+            RuleMsg::ToggleDone(card, result) => {
+                self.automation.toggling.remove(&card);
+                match *result {
+                    Ok(()) => {
+                        self.automation.toggle_errors.remove(&card);
+                        let reread = self.automation.editor.as_ref().and_then(|editor| {
+                            (editor.card.as_deref() == Some(card.as_str()) && !editor.dirty())
+                                .then(|| editor.rule.clone())
+                                .flatten()
+                        });
+                        if let Some(rule) = reread {
+                            if let Some(editor) = self.automation.editor.as_mut() {
+                                editor.reading = true;
+                            }
+                            self.read_rule_file(card.clone(), &rule, context);
+                        }
+                    }
+                    Err(error) => {
+                        self.automation
+                            .toggle_errors
+                            .insert(card, error.user_message());
+                    }
+                }
+                self.reload_rules_soon(context);
+            }
+            RuleMsg::StatusLoaded(seq, reads) => {
+                if seq == self.automation.status_seq {
+                    self.automation.status = reads.into_iter().collect();
+                }
+            }
+            RuleMsg::Menu(key) => {
+                let Some((action, card)) = key.split_once('\u{1f}') else {
+                    return;
+                };
+                let cards = self.automation_cards();
+                let Some(found) = cards.iter().find(|found| found.key == card) else {
+                    return;
+                };
+                match action {
+                    "run" => {
+                        if let Some(TimerKey(project, rule)) = found.run.clone() {
+                            self.automation_update(AutomationMsg::RunNow(project, rule), context);
+                        }
+                    }
+                    "edit" => self.rule_update(RuleMsg::Opened(card.to_owned()), context),
+                    "remove" => {
+                        if let Some((assignment, _)) = &found.assignment {
+                            self.automation_update(
+                                AutomationMsg::Removed(assignment.clone()),
+                                context,
+                            );
+                        } else {
+                            self.rule_update(RuleMsg::Opened(card.to_owned()), context);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            edit => {
+                let Some(editor) = self.automation.editor.as_mut().filter(|_| !busy) else {
+                    return;
+                };
+                editor.note = None;
+                editor.field_error = None;
+                let sentence = &mut editor.sentence;
+                match edit {
+                    RuleMsg::Id(text) => editor.id = text,
+                    RuleMsg::When(Some(index)) => {
+                        let (kind, value) = match index {
+                            index if index < EVENTS.len() => {
+                                (WhenKind::Event, EVENTS[index].0.to_owned())
+                            }
+                            index if index == EVENTS.len() => (WhenKind::Event, String::new()),
+                            index if index == EVENTS.len() + 1 => (WhenKind::Every, String::new()),
+                            index if index == EVENTS.len() + 2 => (WhenKind::Cron, String::new()),
+                            _ => (WhenKind::Once, String::new()),
+                        };
+                        if sentence.when_index() != index {
+                            sentence.when = kind;
+                            sentence.when_value = value;
+                        }
+                    }
+                    RuleMsg::WhenValue(text) => sentence.when_value = text,
+                    RuleMsg::Zone(text) => sentence.zone = text,
+                    RuleMsg::OnlyIf(text) => sentence.only_if = text,
+                    RuleMsg::Action(Some(index)) => {
+                        if let Some((verb, _)) = ACTIONS.get(index) {
+                            sentence.action = (*verb).to_owned();
+                            if matches!(*verb, "send" | "steer" | "inject" | "mail.send") {
+                                sentence.text.get_or_insert_with(String::new);
+                            }
+                        }
+                    }
+                    RuleMsg::Text(text) => sentence.text = Some(text),
+                    RuleMsg::Repeat(value) => {
+                        if sentence.repeat.is_some() {
+                            sentence.repeat = value.map(|value| value.round() as i64);
+                        }
+                    }
+                    RuleMsg::TomlToggled => {
+                        editor.toml = match editor.toml.take() {
+                            Some(_) => None,
+                            None => Some(editor.content.clone()),
+                        };
+                    }
+                    RuleMsg::TomlText(text) => editor.toml = Some(text),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Save the editor: the TOML as typed, else the sentence written into
+    /// the file read (a new rule: a new file in the global rules folder),
+    /// against the revision it was read at.
+    fn save_rule(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let Some(editor) = self
+            .automation
+            .editor
+            .as_mut()
+            .filter(|editor| !editor.saving)
+        else {
+            return;
+        };
+        let (project, path, expected, content) = match (&editor.rule, &editor.toml) {
+            (Some(rule), Some(toml)) => (
+                rule.key.0.clone(),
+                rule.file.clone().unwrap_or_default(),
+                editor.revision.clone(),
+                toml.clone(),
+            ),
+            (Some(rule), None) => {
+                match write_sentence(&editor.content, &rule.key.1, &editor.sentence) {
+                    Ok(content) => (
+                        rule.key.0.clone(),
+                        rule.file.clone().unwrap_or_default(),
+                        editor.revision.clone(),
+                        content,
+                    ),
+                    Err(error) => {
+                        editor.field_error = Some(error);
+                        return;
+                    }
+                }
+            }
+            (None, _) => match new_rule_file(editor.id.trim(), &editor.sentence) {
+                Ok(content) => (None, format!("{}.toml", editor.id.trim()), None, content),
+                Err(error) => {
+                    editor.field_error = Some(error);
+                    return;
+                }
+            },
+        };
+        if path.is_empty() || (editor.rule.is_some() && expected.is_none()) {
+            editor.note = Some(("Read the rule again before saving.".to_owned(), true));
+            return;
+        }
+        editor.saving = true;
+        editor.note = Some(("Saving…".to_owned(), false));
+        let card = editor.card.clone().unwrap_or_default();
+        let _task = context.spawn_background(move |_| {
+            let result = client::block_on(config_client::save_rule_file(
+                &data_dir,
+                project,
+                path,
+                expected,
+                content.clone(),
+            ))
+            .map(|reply| Some(reply.revision));
+            Message::Automation(AutomationMsg::Rule(RuleMsg::Saved(
+                card,
+                Some(content),
+                Box::new(result),
+            )))
+        });
+    }
+
+    /// Delete the edited rule: remove its file when it is the file's only
+    /// rule, else save the file without it.
+    fn delete_rule(&mut self, context: &ComponentContext<Self>) {
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        let Some(editor) = self
+            .automation
+            .editor
+            .as_mut()
+            .filter(|editor| !editor.saving)
+        else {
+            return;
+        };
+        let (Some(rule), Some(revision)) = (editor.rule.clone(), editor.revision.clone()) else {
+            return;
+        };
+        let Some(path) = rule.file.clone() else {
+            return;
+        };
+        let rest = match without_rule(&editor.content, &rule.key.1) {
+            Ok(rest) => rest,
+            Err(error) => {
+                editor.note = Some((error, true));
+                return;
+            }
+        };
+        editor.saving = true;
+        editor.note = Some(("Deleting…".to_owned(), false));
+        let card = editor.card.clone().unwrap_or_default();
+        let project = rule.key.0.clone();
+        let _task = context.spawn_background(move |_| {
+            let result = client::block_on(async {
+                match &rest {
+                    Some(content) => config_client::save_rule_file(
+                        &data_dir,
+                        project,
+                        path,
+                        Some(revision),
+                        content.clone(),
+                    )
+                    .await
+                    .map(|_| None),
+                    None => config_client::delete_rule_file(&data_dir, project, path, revision)
+                        .await
+                        .map(|_| None),
+                }
+            });
+            Message::Automation(AutomationMsg::Rule(RuleMsg::Saved(
+                card,
+                None,
+                Box::new(result),
+            )))
+        });
+    }
+
+    /// A row's switch: an assignment's `enabled` in the settings, a rule's
+    /// `enabled` key in its rules file (read, switched, saved against the
+    /// revision read).
+    fn toggle_rule(&mut self, card: String, on: bool, context: &ComponentContext<Self>) {
+        let cards = self.automation_cards();
+        let Some(found) = cards.iter().find(|found| found.key == card) else {
+            return;
+        };
+        if let Some((assignment, _)) = &found.assignment {
+            self.automation_update(AutomationMsg::Enabled(assignment.clone(), on), context);
+            return;
+        }
+        let Some(rule) = found.rule.clone().filter(|rule| rule.file.is_some()) else {
+            return;
+        };
+        let Ok(data_dir) = self.data_dir.clone() else {
+            return;
+        };
+        if !self.automation.toggling.insert(card.clone()) {
+            return;
+        }
+        let _task = context.spawn_background(move |_| {
+            let result = client::block_on(async {
+                let file = rule.file.clone().unwrap_or_default();
+                let read =
+                    config_client::read_rule_file(&data_dir, rule.key.0.clone(), file.clone())
+                        .await?;
+                let content = write_enabled(&read.content, &rule.key.1, on)
+                    .map_err(|error| eliot_core::Error::new("invalid", error))?;
+                config_client::save_rule_file(
+                    &data_dir,
+                    rule.key.0.clone(),
+                    file,
+                    Some(read.revision),
+                    content,
+                )
+                .await
+                .map(|_| ())
+            });
+            Message::Automation(AutomationMsg::Rule(RuleMsg::ToggleDone(
+                card,
+                Box::new(result),
+            )))
+        });
     }
 }

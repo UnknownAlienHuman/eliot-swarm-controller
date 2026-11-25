@@ -91,27 +91,6 @@ pub enum Group {
     Stopped,
 }
 
-impl Group {
-    /// The state filter's word for the group.
-    pub fn filter_label(self) -> &'static str {
-        match self {
-            Self::Attention => "Attention",
-            Self::Stopped => "Stopped",
-            other => other.title(),
-        }
-    }
-
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Attention => "Needs attention",
-            Self::Working => "Working",
-            Self::Idle => "Idle",
-            Self::UnparentedSubagents => "Subagents without a visible parent",
-            Self::Stopped => "Recently stopped",
-        }
-    }
-}
-
 /// One open attention report: its incident and reason code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incident {
@@ -1227,35 +1206,15 @@ pub struct ProjectRef {
     pub name: String,
 }
 
-/// One Agent the overview counts: its row, its own live group and its
-/// project.
-#[derive(Clone, Debug)]
-pub struct Counted<'a> {
-    pub row: &'a MonitorRow,
-    pub group: Group,
-    pub project: ProjectRef,
-}
-
-/// What the list below the overview is narrowed to: the state the owner
-/// chose (kept while no Agent is in it: the list says so) and the search.
+/// The Agents page's search.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
-    pub group: Option<Group>,
     /// The search field's text: a row matches when its title, id, harness,
     /// model or project contains it, case-insensitively (k195 P3-2).
     pub text: String,
 }
 
-/// The states the Monitor's state filter offers, in its order (`None`:
-/// every state).
-/// The Monitor's state filter; what needs the owner is the Inbox pane.
-pub const STATE_FILTERS: [Option<Group>; 3] = [None, Some(Group::Working), Some(Group::Idle)];
-
 impl Filter {
-    pub fn is_active(&self) -> bool {
-        self.group.is_some() || !self.text.trim().is_empty()
-    }
-
     /// Whether `row`, in the project named `project`, matches the search
     /// text (an empty search matches every row).
     pub fn matches_text(&self, row: &MonitorRow, project: &str) -> bool {
@@ -1273,68 +1232,6 @@ impl Filter {
         ]
         .iter()
         .any(|field| field.to_lowercase().contains(&wanted))
-    }
-
-    /// Whether a recently stopped `row` stays under this filter: the state
-    /// filter is every state or Stopped and the text matches.
-    pub fn keeps_stopped(&self, row: &MonitorRow, project: &ProjectRef) -> bool {
-        self.group.is_none_or(|group| group == Group::Stopped)
-            && self.matches_text(row, &project.name)
-    }
-
-    fn keeps(&self, counted: &Counted) -> bool {
-        self.group.is_none_or(|group| counted.group == group)
-            && self.matches_text(counted.row, &counted.project.name)
-    }
-}
-
-/// The Monitor overview at one instant: the counted rows and whether the
-/// bounded read left live Agents out.
-#[derive(Clone, Debug)]
-pub struct Overview<'a> {
-    pub rows: Vec<Counted<'a>>,
-    /// A live state holds more Agents than the read returned (its
-    /// `state_totals` count exceeds its rows): every count is partial.
-    /// Those totals include native children the chart leaves out, so no
-    /// number of missing Agents is claimed.
-    pub partial: bool,
-}
-
-impl<'a> Overview<'a> {
-    /// Keep the selected filter on a partial read, but show all loaded
-    /// chart rows if none match it.
-    pub fn list_for_filter(&self, filter: &Filter) -> (Vec<Section<'a>>, bool) {
-        let showing_loaded = self.partial && !self.rows.iter().any(|row| filter.keeps(row));
-        let sections = if showing_loaded {
-            self.filtered(&Filter::default())
-        } else {
-            self.filtered(filter)
-        };
-        (sections, showing_loaded)
-    }
-
-    /// The list under a filter: exactly the counted rows it keeps, flat,
-    /// in the list's section order (attention by urgency, the others by
-    /// id), so the list always matches the number that was clicked.
-    fn filtered(&self, filter: &Filter) -> Vec<Section<'a>> {
-        [Group::Attention, Group::Working, Group::Idle]
-            .into_iter()
-            .map(|group| {
-                let mut rows: Vec<&'a MonitorRow> = self
-                    .rows
-                    .iter()
-                    .filter(|counted| counted.group == group && filter.keeps(counted))
-                    .map(|counted| counted.row)
-                    .collect();
-                rows.sort_by(|a, b| match group {
-                    Group::Attention => attention_rank(a.state)
-                        .cmp(&attention_rank(b.state))
-                        .then_with(|| id_order(&a.id, &b.id)),
-                    _ => id_order(&a.id, &b.id),
-                });
-                Section { group, rows }
-            })
-            .collect()
     }
 }
 
@@ -1500,34 +1397,14 @@ impl Monitor {
         tree
     }
 
-    /// The overview: every shown controlled Agent in a live group, by its
-    /// own state (workers nested under a row included, native subagents
-    /// not, as the sidebar's fleet line counts them), with its project from
-    /// `project_of` (the sidebar's name), which a filtered list reads.
-    pub fn overview(
-        &self,
-        now_ms: i64,
-        project_of: &dyn Fn(&MonitorRow) -> ProjectRef,
-    ) -> Overview<'_> {
-        let rows: Vec<Counted> = self
-            .all_rows()
-            .filter(|row| !row.native_child && visible(row, now_ms))
-            .filter_map(|row| {
-                let group = row.group(self.incident(row));
-                (group != Group::Stopped).then(|| Counted {
-                    row,
-                    group,
-                    project: project_of(row),
-                })
-            })
-            .collect();
-        // A live state with more Agents than the bounded read returned,
-        // including one with no rows in the page at all.
-        let partial = self.counts.iter().any(|count| {
+    /// Whether a live state holds more Agents than the bounded read
+    /// returned (its `state_totals` count exceeds its rows), including one
+    /// with no rows in the page at all: every count is then partial.
+    pub fn partial(&self) -> bool {
+        self.counts.iter().any(|count| {
             count.state != AgentState::Stopped
                 && count.total.is_some_and(|total| total > count.shown)
-        });
-        Overview { rows, partial }
+        })
     }
 
     pub fn apply(&mut self, snapshot: MonitorSnapshot) {

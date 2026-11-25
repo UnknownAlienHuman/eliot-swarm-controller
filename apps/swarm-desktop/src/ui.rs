@@ -65,6 +65,7 @@ mod link_ui;
 mod menu_ui;
 mod monitor_ui;
 mod move_ui;
+pub(crate) mod page_ui;
 mod picker_ui;
 mod profiles_ui;
 mod project_ui;

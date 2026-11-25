@@ -1292,7 +1292,7 @@ the `no_progress` window.
 - retires as soon as a write or commit lands (last_code_progress_at advances);
 - reuses the existing attention machinery: a bounded incident per Agent/generation, no new timer service.
 
-The report carries `code_progress_at` (that window's start) and the turn's `tool_calls` and `messages`, so an agent actively using tools but not writing code is clearly distinguished from an idle one. The desktop shows the open report on the Agent's Monitor row, its sidebar row and in Details ("Working without writing code for 14m") until the daemon retires it. The sidebar reads the Monitor's reports: the panel's refresh reads them while it is open, the sidebar's refresh runs the same incremental read while it is closed, never both.
+The report carries `code_progress_at` (that window's start) and the turn's `tool_calls` and `messages`, so an agent actively using tools but not writing code is clearly distinguished from an idle one. The desktop shows the open report on the Agent's row on the Agents page, its sidebar row and in Details ("Working without writing code for 14m") until the daemon retires it. The sidebar reads the Agents page's reports: the page's refresh reads them while it is shown, the sidebar's refresh runs the same incremental read otherwise, never both.
 
 ## Restart reconciliation
 
@@ -1440,7 +1440,7 @@ Agent within one minute, it records `daemon.repeated_command_rejected` and uses
 the same Owner inbox path. Further matching rejections in that window add no
 diagnostics. Each command keeps its own durable outcome and event.
 
-Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, desktop Monitor)
+Fleet usage cells (`agent.list`, `swarm ls`, `swarm top`, the desktop's Agents page)
 sum uncached input, cached input and output on the [shared usage basis](core.md).
 They prefer the newest terminal turn (`usage_scope: "turn"`) and fall back
 to the latest cumulative snapshot (`usage_scope: "session"`) when that turn

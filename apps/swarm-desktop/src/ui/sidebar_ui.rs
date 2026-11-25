@@ -22,6 +22,8 @@ pub(super) struct SidebarInput {
     pub(super) can_forward: bool,
     /// The Settings page shown, if any (its nav row is selected).
     pub(super) page: Option<settings_ui::Page>,
+    /// Inbox, Agents or Automations shown in the main card, if any.
+    pub(super) place: Option<super::page_ui::Place>,
     /// The Search row opened into its field.
     pub(super) search: Option<SearchField>,
     /// A search query lists what it found, flat in its projects.
@@ -221,13 +223,13 @@ impl Component for Sidebar {
         });
         nav.push(inbox_row(&input.inbox, context, palette));
         nav.push(agents_row(&input.agents, context, palette));
-        let automations = input.page == Some(settings_ui::Page::Automations);
+        let automations = input.place == Some(super::page_ui::Place::Automations);
         nav.push(KeyedView::new(
             format!("automations:{automations}"),
             m3::row(palette, automations)
                 .automation_name("Automations")
-                .on_click(context.message(Message::Shell(ShellMsg::SettingsPage(
-                    settings_ui::Page::Automations,
+                .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+                    super::page_ui::Place::Automations,
                 ))))
                 .content(m3::sidebar_row(
                     m3::nav_icon(m3::glyph::AUTOMATION, automations),
@@ -1021,7 +1023,9 @@ fn inbox_row(
                 inbox.counts,
                 if open { "open" } else { "closed" }
             ))
-            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Inbox))))
+            .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+                super::page_ui::Place::Inbox,
+            ))))
             .content(m3::sidebar_row(
                 m3::nav_icon(m3::glyph::INBOX, open),
                 "Inbox",
@@ -1056,7 +1060,9 @@ fn agents_row(
                 agents.summary,
                 if open { "open" } else { "closed" }
             ))
-            .on_click(context.message(Message::Shell(ShellMsg::PanelToggled(Panel::Monitor))))
+            .on_click(context.message(Message::Shell(ShellMsg::PlaceOpened(
+                super::page_ui::Place::Agents,
+            ))))
             .content(m3::sidebar_row(
                 m3::nav_icon(m3::glyph::HUB, open),
                 "Agents",

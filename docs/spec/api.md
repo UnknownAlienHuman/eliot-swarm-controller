@@ -1290,7 +1290,7 @@ worktrees never trim to the same text.
 `swarm ls`/`swarm top` default to `order: "recent"` for humans; `--json` and an
 `id`-form `--after aN` cursor keep the ID order unless `--order` is explicit.
 
-The desktop Monitor reads one such page for its eight live states, capped at
+The desktop's Agents page reads one such page for its eight live states, capped at
 800 total rows, and shows at most 100 rows per state. It groups the rows
 locally using the scoped totals; each group's shown/total count exposes a
 shortfall caused by either row or byte truncation, including a state with no

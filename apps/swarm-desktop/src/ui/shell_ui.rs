@@ -24,6 +24,12 @@ pub(super) enum Main {
     Conversation,
     /// A project's page: its tasks, worktrees, check and automations.
     Project,
+    /// The Owner inbox: what waits for the owner's decision.
+    Inbox,
+    /// The fleet: every Agent as a tree, with the summary and autonomy.
+    Agents,
+    /// Rules, timers and brief queues, and the scripts.
+    Automations,
     Settings,
 }
 
@@ -39,6 +45,8 @@ pub(super) enum Location {
     Agent(String),
     /// A project page, by its sidebar key.
     Project(String),
+    /// Inbox, Agents or Automations.
+    Place(page_ui::Place),
     Settings(settings_ui::Page),
 }
 
@@ -57,10 +65,6 @@ pub(super) struct PlaceRead {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Panel {
     Closed,
-    /// Every Agent as a simple card.
-    Monitor,
-    /// The Owner inbox: what waits for the owner's decision.
-    Inbox,
     /// The open conversation's Agent: settings, coverage, resources, usage
     /// and Change manager.
     Details,
@@ -177,6 +181,9 @@ pub(super) enum ShellMsg {
     SettingsOpened,
     /// Open Settings at one page (the sidebar's Automations and Usage).
     SettingsPage(settings_ui::Page),
+    /// Open Inbox, Agents or Automations in the main card (the sidebar's
+    /// places).
+    PlaceOpened(page_ui::Place),
     /// The Projects label's +: Settings › Projects, and its folder picker
     /// once the settings document is read.
     AddProject,
@@ -849,6 +856,7 @@ impl DesktopApp {
             }
             ShellMsg::SettingsOpened => self.open_settings(None, context),
             ShellMsg::SettingsPage(page) => self.open_settings(Some(page), context),
+            ShellMsg::PlaceOpened(place) => self.open_place(place, context),
             ShellMsg::UsageRefresh => self.read_usage(context),
             ShellMsg::HoldsLoaded(reply) => self.holds_loaded(*reply),
             ShellMsg::AddProject => {
@@ -866,11 +874,8 @@ impl DesktopApp {
                     self.reprime_fields(context);
                 }
             }
-            // The sidebar's Monitor entry opens and closes the Monitor;
-            // the pane's X closes the pane.
+            // The pane's X closes the pane.
             ShellMsg::PanelToggled(panel) => match panel {
-                Panel::Monitor if self.panel == Panel::Monitor => self.close_panel(),
-                Panel::Inbox if self.panel == Panel::Inbox => self.close_panel(),
                 Panel::Closed => self.close_panel(),
                 panel => self.choose_panel(panel, context),
             },
@@ -1157,7 +1162,7 @@ impl DesktopApp {
                 // The navigation's inbox counts on every poll; the items
                 // only while the Inbox shows them.
                 self.read_inbox_counts(context);
-                if self.panel == Panel::Inbox {
+                if self.main == Main::Inbox {
                     self.read_inbox(context);
                 }
                 let reads = self.nav.batch.take().unwrap_or_default();
@@ -1286,6 +1291,9 @@ impl DesktopApp {
         Some(match self.main {
             Main::Settings => Location::Settings(self.settings_page),
             Main::Project => Location::Project(self.project.key.clone()),
+            Main::Inbox => Location::Place(page_ui::Place::Inbox),
+            Main::Agents => Location::Place(page_ui::Place::Agents),
+            Main::Automations => Location::Place(page_ui::Place::Automations),
             Main::Conversation => match self.selected_agent_id() {
                 Some(agent) => Location::Agent(agent),
                 // A folder being typed is no place yet.
@@ -1402,7 +1410,47 @@ impl DesktopApp {
             Location::Project(key) => {
                 self.open_project(key, context);
             }
+            Location::Place(place) => self.open_place(*place, context),
             Location::Settings(page) => self.open_settings(Some(*page), context),
+        }
+    }
+
+    /// Show Inbox, Agents or Automations in the main card. Agents runs the
+    /// fleet's refresh chain while it shows (with the open Agent's
+    /// details); the Inbox reads with the sidebar's poll; Automations
+    /// reads its rules and the settings it edits.
+    pub(super) fn open_place(&mut self, place: page_ui::Place, context: &ComponentContext<Self>) {
+        self.close_popover();
+        let main = match place {
+            page_ui::Place::Inbox => Main::Inbox,
+            page_ui::Place::Agents => Main::Agents,
+            page_ui::Place::Automations => Main::Automations,
+        };
+        if self.panel == Panel::Details {
+            self.close_panel();
+        }
+        if self.main != main {
+            self.main = main;
+            self.reprime_fields(context);
+        }
+        match place {
+            page_ui::Place::Inbox => {
+                self.read_inbox(context);
+                self.read_inbox_counts(context);
+            }
+            page_ui::Place::Agents => {
+                self.start_monitor(context);
+                self.read_liveness(context);
+                if self.monitor.autonomy.report.is_none() {
+                    self.read_autonomy(0, context);
+                }
+            }
+            page_ui::Place::Automations => {
+                if !self.settings.loaded {
+                    self.load_settings(context);
+                }
+                self.load_rules(context);
+            }
         }
     }
 
@@ -2194,12 +2242,12 @@ impl DesktopApp {
         m3::set_palette(palette);
 
         let main: View = match self.main {
-            Main::Conversation | Main::Project if self.link_view_shown() => {
+            main if main != Main::Settings && self.link_view_shown() => {
                 self.startup_error_view(context, palette)
             }
-            // Settings and a project page are drawn in the conversation's
+            // Settings and the pages are drawn in the conversation's
             // place, which keeps its transcript (see `chat_view`).
-            Main::Conversation | Main::Project | Main::Settings => self.chat_view(context, palette),
+            _ => self.chat_view(context, palette),
         };
         // Settings always shows its navigation; tasks may hide the sidebar
         // to its rail.
@@ -2288,6 +2336,8 @@ impl DesktopApp {
             self.bulk_dialog(dialog, context, palette)
         } else if self.link.confirm_fresh {
             self.fresh_confirmation(context, palette)
+        } else if self.inbox.confirm.is_some() {
+            self.inbox_confirmation(context, palette)
         } else {
             self.task_dialog(context, palette)
         };
@@ -2347,7 +2397,7 @@ impl DesktopApp {
 
     /// The menu target of a sidebar row key (`agent:<id>`, `project:<key>`),
     /// as its "⋯" builds it.
-    fn row_target(&self, row: &str) -> Option<menu_ui::Target> {
+    pub(super) fn row_target(&self, row: &str) -> Option<menu_ui::Target> {
         if let Some(id) = row.strip_prefix("agent:") {
             return self.find_agent(id).cloned().map(menu_ui::Target::Agent);
         }
@@ -2457,6 +2507,12 @@ impl DesktopApp {
             can_back: self.nav.history.can_back(),
             can_forward: self.nav.history.can_forward(),
             page: (self.main == Main::Settings).then_some(self.settings_page),
+            place: match self.main {
+                Main::Inbox => Some(page_ui::Place::Inbox),
+                Main::Agents => Some(page_ui::Place::Agents),
+                Main::Automations => Some(page_ui::Place::Automations),
+                _ => None,
+            },
             search: self.nav.search.open.then(|| SearchField {
                 text: self.nav.search.text.clone(),
                 results: self
@@ -2492,12 +2548,12 @@ impl DesktopApp {
             agents: AgentsEntry {
                 line: fleet.compact(self.nav.agents_total, self.nav.archived),
                 summary: fleet.summary(self.nav.agents_total, self.nav.archived),
-                open: self.panel == Panel::Monitor,
+                open: self.main == Main::Agents,
             },
             inbox: InboxEntry {
                 counts: super::inbox_ui::counts_line(&self.inbox.counts),
                 total: self.inbox.total(),
-                open: self.panel == Panel::Inbox,
+                open: self.main == Main::Inbox,
             },
             usage: self.usage_row(context, palette),
             renaming: self.menu.renaming.as_ref().map(|(target, typed)| Renaming {
@@ -2599,7 +2655,7 @@ impl DesktopApp {
                     Message::Shell(ShellMsg::NewTask),
                 ),
             ));
-        let open = self.panel == Panel::Monitor;
+        let open = self.main == Main::Agents;
         let bottom = StackPanel::new()
             .grid_row(1)
             .vertical_alignment(VerticalAlignment::Bottom)
@@ -2618,7 +2674,7 @@ impl DesktopApp {
                             "Agents: {summary} ({})",
                             if open { "open" } else { "closed" }
                         ),
-                        Message::Shell(ShellMsg::PanelToggled(Panel::Monitor)),
+                        Message::Shell(ShellMsg::PlaceOpened(page_ui::Place::Agents)),
                     ),
                     dot,
                 )),
@@ -2697,8 +2753,6 @@ impl DesktopApp {
     /// The right panel: the monitor or the open Agent's details.
     fn panel_view(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
         match self.panel {
-            Panel::Monitor => self.monitor_view(context, palette),
-            Panel::Inbox => self.inbox_view(context, palette),
             Panel::Details => self.details_view(context, palette),
             Panel::Closed => View::empty(),
         }
