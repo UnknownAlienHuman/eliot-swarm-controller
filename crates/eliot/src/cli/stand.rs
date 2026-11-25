@@ -634,6 +634,47 @@ pub(crate) async fn prune(json_output: bool) -> Result<u8, Failure> {
     for entry in entries {
         let root = entry.registration.marker.root.clone();
         let data_dir = display(&root);
+        if fs::symlink_metadata(&root)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            // The stand directory is already gone, so there is nothing to
+            // drain and no expiry to wait for: drop the registration instead
+            // of lingering until the TTL (or erroring past it).
+            let reg_name = registry_name(&root);
+            match locate_stand_registration(&root)
+                .map_err(Failure::for_read)
+                .and_then(|located| {
+                    remove_stand_registration(&located.registry, &reg_name)
+                        .map_err(Failure::for_read)?;
+                    Ok(located.former.then(|| {
+                        (
+                            "removed".to_owned(),
+                            located.registry.join(&reg_name).display().to_string(),
+                        )
+                    }))
+                }) {
+                Ok(former) => {
+                    results.push(json!({
+                        "data_dir": data_dir,
+                        "outcome": "removed",
+                        "reason": "root_missing",
+                        "daemon_pid": Value::Null,
+                        "former_registration": former_value(former.as_ref()),
+                    }));
+                }
+                Err(error) => {
+                    any_blocked = true;
+                    results.push(json!({
+                        "data_dir": data_dir,
+                        "outcome": "error",
+                        "reason": error.code.unwrap_or_else(|| "error".to_owned()),
+                        "message": error.message,
+                        "former_registry": entry.former_path,
+                    }));
+                }
+            }
+            continue;
+        }
         let expired = entry
             .registration
             .marker
@@ -778,13 +819,21 @@ async fn prove_stand_exit(root: &Path) -> Result<(u32, Option<String>), Failure>
         .ok_or_else(|| unproven_exit(root))?;
     #[cfg(windows)]
     eliot_daemon::operator::stop_desktop(root).map_err(Failure::for_read)?;
-    let force_blocker = if daemon_alive(&daemon).map_err(Failure::for_read)? {
-        stop_and_drain_stand(root, &daemon).await?
-    } else {
-        None
-    };
-    verify_stand_daemon_exit(root, &daemon).map_err(|_| unproven_exit(root))?;
-    Ok((daemon.pid, force_blocker))
+    if daemon_alive(&daemon).map_err(Failure::for_read)? {
+        let force_blocker = stop_and_drain_stand(root, &daemon).await?;
+        verify_stand_daemon_exit(root, &daemon).map_err(|_| unproven_exit(root))?;
+        return Ok((daemon.pid, force_blocker));
+    }
+    // The recorded PID is verifiably gone: daemon_alive checks the exact
+    // PID+start-time identity, so no live process can be this daemon even
+    // under PID reuse. Require the published record to still name this exact
+    // daemon (no replacement started), then settle without the clean
+    // shutdown file a killed daemon never writes.
+    let current = daemon_info(root).map_err(Failure::for_read)?;
+    if current.as_ref() != Some(&daemon) {
+        return Err(unproven_exit(root));
+    }
+    Ok((daemon.pid, None))
 }
 
 fn unproven_exit(root: &Path) -> Failure {
