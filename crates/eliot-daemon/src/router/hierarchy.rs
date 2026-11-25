@@ -145,8 +145,14 @@ fn stripped_child_snapshot(snapshot: &Value, profile: &str) -> Result<Value> {
         ));
     };
     let mut stripped = serde_json::Map::with_capacity(object.len());
+    let defaulted_reserve = snapshot[crate::config::DEFAULTED_QUOTA_RESERVE_FIELD] == true;
     for (key, value) in object {
-        if ignored_child_snapshot_key(key) {
+        // Keep the previous native-authority comparison for named profiles
+        // whose Owner left the reserve unset. Explicit policy stays comparable.
+        if ignored_child_snapshot_key(key)
+            || key == crate::config::DEFAULTED_QUOTA_RESERVE_FIELD
+            || (defaulted_reserve && key == "quota_reserve_percent")
+        {
             continue;
         }
         if key == "capacity_scopes" {
