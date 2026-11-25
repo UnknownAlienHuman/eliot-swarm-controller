@@ -53,6 +53,7 @@ struct QueuedToolBatch {
 }
 
 enum ToolBatchOutcome {
+    Direct(SourceBatch),
     Committed {
         result: Result<BatchCommit>,
         wait: Duration,
@@ -74,7 +75,7 @@ impl ReadyToolBatches {
         bus: &Bus,
         batch: SourceBatch,
         until: Instant,
-    ) -> std::result::Result<ToolBatchOutcome, SourceBatch> {
+    ) -> ToolBatchOutcome {
         let (reply, mut received) = oneshot::channel();
         let ticket = Arc::new(());
         let agent = batch.agent_id.clone();
@@ -86,7 +87,7 @@ impl ReadyToolBatches {
             let mut queue = self.0.lock_recover();
             queue.retain(|job| !job.reply.is_closed());
             if queue.len() >= TOOL_BATCH_GROUP || queue.iter().any(matches_source) {
-                return Err(batch);
+                return ToolBatchOutcome::Direct(batch);
             }
             queue.push(QueuedToolBatch {
                 ticket: Arc::clone(&ticket),
@@ -146,24 +147,24 @@ impl ReadyToolBatches {
         })
         .await
         {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(_)) => Ok(ToolBatchOutcome::Unsettled(Error::new(
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => ToolBatchOutcome::Unsettled(Error::new(
                 "unknown",
                 "tool group acknowledgement was not delivered",
-            ))),
+            )),
             Err(_) => {
                 let mut queue = self.0.lock_recover();
                 if let Some(index) = queue.iter().position(|job| Arc::ptr_eq(&job.ticket, &ticket)) {
                     queue.remove(index);
-                    Ok(ToolBatchOutcome::Unsettled(Error::new(
+                    ToolBatchOutcome::Unsettled(Error::new(
                         "busy",
                         "Store lock deadline elapsed for events.put",
-                    )))
+                    ))
                 } else {
-                    Ok(ToolBatchOutcome::Unsettled(Error::new(
+                    ToolBatchOutcome::Unsettled(Error::new(
                         "unknown",
                         "tool group acknowledgement deadline elapsed after dequeue",
-                    )))
+                    ))
                 }
             }
         }
@@ -824,15 +825,15 @@ async fn put_events(
             .try_submit(&host, store, bus, batch, until)
             .await
     } else {
-        Err(batch)
+        ToolBatchOutcome::Direct(batch)
     };
     let result = match ready_group {
-        Ok(ToolBatchOutcome::Committed {
+        ToolBatchOutcome::Committed {
             result,
             wait,
             held,
             batches,
-        }) => {
+        } => {
             if crate::logging::is_debug()
                 && let Ok(commit) = &result
             {
@@ -851,12 +852,12 @@ async fn put_events(
             }
             result
         }
-        Ok(ToolBatchOutcome::RestartCutoff(cutoff)) => {
+        ToolBatchOutcome::RestartCutoff(cutoff) => {
             record_planned_restart_cutoff(credentials, &gap, &batch_id, &event_kinds, &cutoff);
             return Err(planned_restart_cutoff_error(&cutoff));
         }
-        Ok(ToolBatchOutcome::Unsettled(error)) => Err(error),
-        Err(batch) => {
+        ToolBatchOutcome::Unsettled(error) => Err(error),
+        ToolBatchOutcome::Direct(batch) => {
             let queued = Instant::now();
             match timeout_at(until, store.lock()).await {
                 Ok(mut store) => {
