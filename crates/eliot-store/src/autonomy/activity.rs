@@ -1,7 +1,7 @@
 use crate::usage::manager_at_sql;
 use eliot_core::api::{
-    AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyNotes, AutonomyRow,
-    AutonomySteer, AutonomyWaits, AutonomyWorkInGit, SWARM_MAIL_SENDER,
+    AutonomyChecks, AutonomyExecutorProfile, AutonomyExecutorSwarm, AutonomyGoalRounds,
+    AutonomyNotes, AutonomyRow, AutonomySteer, AutonomyWaits, AutonomyWorkInGit, SWARM_MAIL_SENDER,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::HashMap;
@@ -320,17 +320,39 @@ fn read_shell_activity(
         AutonomyWaits { calls: waits },
     );
 
-    let (goals, goal_overflow) = bounded_count(
-        tx,
-        "SELECT COUNT(*), COALESCE(SUM(has_exit), 0) FROM (
-             SELECT json_type(data, '$.exit_code') IS 'integer' AS has_exit
+    let (examined, goal_checks, completed, blocked, unknown, classified) = tx.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(has_exit), 0),
+                COUNT(CASE WHEN outcome = 'completed' THEN 1 END),
+                COUNT(CASE WHEN outcome = 'blocked' THEN 1 END),
+                COUNT(CASE WHEN outcome = 'unknown' THEN 1 END),
+                COUNT(CASE WHEN outcome IN ('completed','blocked','unknown','continued','retryable') THEN 1 END)
+         FROM (
+             SELECT json_type(data, '$.exit_code') IS 'integer' AS has_exit,
+                    json_extract(data, '$.outcome') AS outcome
              FROM events INDEXED BY autonomy_activity_events_window
              WHERE kind = 'goal.round' AND source = 'daemon' AND ts BETWEEN ?1 AND ?2
              ORDER BY ts, seq LIMIT ?3
          )",
-        since,
-        until,
-    )?;
+        params![since, until, INPUT_PROBE_ROWS],
+        |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get::<_, i64>(5)?)),
+    ).map_err(crate::sql_error)?;
+    let goal_overflow = examined == INPUT_PROBE_ROWS;
+    let mut outcome_reasons = Vec::new();
+    if goal_overflow {
+        add_cap_reason(&mut outcome_reasons, "Goal rounds");
+    }
+    if classified != examined {
+        outcome_reasons.push("some retained Goal rounds have unrecognized outcomes".into());
+    }
+    let goal_rounds = coverage_row(
+        "daemon goal.round",
+        outcome_reasons,
+        AutonomyGoalRounds {
+            completed: as_count(completed),
+            blocked: as_count(blocked),
+            unknown: as_count(unknown),
+        },
+    );
     let (fast, fast_overflow) = bounded_count(
         tx,
         "SELECT COUNT(*), COUNT(*) FROM (
@@ -352,7 +374,8 @@ fn read_shell_activity(
             reasons,
             AutonomyChecks {
                 manual,
-                swarm: goals + fast,
+                swarm: as_count(goal_checks) + fast,
+                goal_rounds: Some(goal_rounds),
             },
         ),
         wait_row,

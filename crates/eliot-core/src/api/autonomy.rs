@@ -148,6 +148,15 @@ pub struct AutonomySteer {
 pub struct AutonomyChecks {
     pub manual: u64,
     pub swarm: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_rounds: Option<AutonomyRow<AutonomyGoalRounds>>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+pub struct AutonomyGoalRounds {
+    pub completed: u64,
+    pub blocked: u64,
+    pub unknown: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]

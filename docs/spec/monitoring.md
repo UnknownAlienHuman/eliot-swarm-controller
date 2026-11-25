@@ -1699,7 +1699,7 @@ the ordinary revision-bound actions and cursor.
 | --- | --- |
 | Project policy | Retained Swarm Agent creation, project policy applied flag and explicit opt-out reason from admission (#868). |
 | Steers | Retained steer commands classified by caller and automation cause. |
-| Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. |
+| Checks | Captured shell invocations and recorded Swarm Goal or fast project check runs. `checks.counts.goal_rounds` reports completed, blocked, and unknown round outcomes from retained daemon `goal.round` events, including outcomes without a checker exit. Continued and retryable rounds do not contribute to those counts. Goal round coverage uses its own event bound and retention evidence. |
 | Waits | Captured shell invocations matching wait commands. |
 | Swarm fact notes | Deliveries, moves and cancellations of retained fact notes, with counts and confirmed corrections by kind. |
 | Owner backlog | All current decision subjects, including snoozed revisions, with per-kind counts and ages from each source row's recorded transition time. |
