@@ -62,6 +62,19 @@ impl Router {
                 .await
                 .cleanup_owned_roots_page(after)?;
             if roots.is_empty() {
+                if std::mem::take(&mut restarted) {
+                    let policy = self.secret_policy_snapshot();
+                    issues.push(CleanupInventoryIssue {
+                        agent: principal.to_owned(),
+                        generation: 0,
+                        path: None,
+                        reason: "owned_root_scan_restarted".to_owned(),
+                        detail: policy.redact_bounded(
+                            "The saved scan was unavailable or stale; no owned roots remained to rescan",
+                            384,
+                        ),
+                    });
+                }
                 page.owned_backfill_after = Some(0);
                 return Ok(false);
             }
@@ -128,6 +141,19 @@ impl Router {
                 }
                 after = seq;
             }
+        }
+        if std::mem::take(&mut restarted) {
+            let policy = self.secret_policy_snapshot();
+            issues.push(CleanupInventoryIssue {
+                agent: principal.to_owned(),
+                generation: 0,
+                path: None,
+                reason: "owned_root_scan_restarted".to_owned(),
+                detail: policy.redact_bounded(
+                    "The saved scan was unavailable or stale; no authorized owned roots were rescanned",
+                    384,
+                ),
+            });
         }
         page.owned_backfill_after = Some(after);
         Ok(true)

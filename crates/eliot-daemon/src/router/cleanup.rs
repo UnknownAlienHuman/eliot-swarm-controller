@@ -2168,6 +2168,11 @@ impl Router {
                 now_ms(),
             )?;
             self.publish_locked(&[event]);
+            // The item outcomes below are recorded as a second
+            // `cleanup.automatic` event. Rotate the plan ID so readers
+            // keyed by `plan_id` do not collapse the truncated notice and
+            // the outcome event into one entry.
+            plan.plan_id = ulid::Ulid::new().to_string();
         }
         let deadline = Instant::now() + CLEANUP_PLAN_MAX_PREFLIGHT;
         for artifact in inventory {
