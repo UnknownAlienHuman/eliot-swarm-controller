@@ -545,9 +545,16 @@ default true), a routed recipient may receive one coalesced notice per minute,
 with at most one open notice command. The count-only fallback is
 `N unread: mail.inbox, then mail.ack`. An unread reply whose
 `reply_to_delivery` names mail the recipient itself sent, admitted after the
-last presentation, skips the one-minute cooldown once, so an answer to an
-Agent's own question wakes it at once; the open-notice, busy, pending-input
-and unknown gates still apply.
+last presentation, skips the one-minute cooldown once. A fresh Swarm
+completion digest registered by the same recipient generation can also skip
+it once. The digest must still be unread and untouched by a notice, with an
+admission time after the previous notice. Open-notice, busy, pending-input,
+provider-hold and unknown gates still apply.
+The claim spends cooldown for a self-requested completion. If submission is
+refused, inline completion delivery remains unread and consumes one of its
+two wake attempts. Its one automatic retry uses the ordinary cooldown.
+Completions requested by an earlier generation or handed off to a successor
+also use the ordinary cooldown. Once wake-eligible, they can wait up to a minute.
 The notice is an ordinary owner `send` bound to the recipient's
 current generation. At claim, Store selects eligible unread mail addressed to
 that generation, in admission order. Each inline entry carries its sender,
@@ -602,9 +609,10 @@ parses notice text. Internal `notice_kind` remains Store admission metadata
 and is stripped at daemon dispatch, so vendor plugins receive only text arguments.
 Deferred mail re-offers on idle through the same atomic claim. An idle event
 caused by that recipient's own notice command cannot trigger a re-offer.
-Deferral leaves the cooldown timestamp unchanged. A claim preserves the prior
-`last_notice_at`, initially 0, and a failed admission clears only the matching
-open claim. Settlement of a notice `send` as `rejected`, `failed`, or `cancelled`
+Deferral leaves the cooldown timestamp unchanged. An ordinary claim preserves
+the prior `last_notice_at`, initially 0. A failed admission clears only the
+matching open claim and releases its inline bindings. Settlement of a notice
+`send` as `rejected`, `failed`, or `cancelled`
 stamps the shared cooldown and clears that exact open claim in the same
 transaction. Restart recovery clears only commandless open claims.
 Command retention clears the open reference of the exact completed notice it
@@ -614,9 +622,9 @@ A daemon driver checks every two seconds. It re-pages due recipients from
 indexed unread wake-enabled mail after a candidate input changes or a
 cooldown boundary arrives. Between changes it reuses the existing recipient
 pages and reapplies the routing and atomic claim gates. Current `idle`,
-non-observer agents holding unread mail past the normal cooldown are
-re-offered through the same atomic claim, so an agent that idles with no
-new event still wakes once due. Normal queued mail and older-generation
+non-observer agents with eligible mail past cooldown or a fresh completion
+they registered are re-offered through the same atomic claim. Normal queued
+mail and older-generation
 unread rows can therefore surface as a fresh current-generation count notice.
 Only current-generation ordinary mail bodies are inlined; older-generation
 bodies remain in the inbox and are represented by the remainder count.
@@ -976,17 +984,20 @@ input is `args.text`, committed as the launch's linked `SEND`; `sources` uses th
 existing bounded source delivery and replay path.
 `worktree` and `base` use the same rules as an ordinary Agent child launch.
 
-`wait_ms` defaults to 20,000 and is limited to 25,000 ms per call, leaving
-response time within the native 30-second MCP/plugin RPC deadline. `wait_ms:0`
-takes an immediate durable snapshot. The same method continues with
-`{id, wait_ms?}` and reads the same launch's exact linked first input; it never
-launches or sends again. A pending or `unknown` result, and every zero-wait
-request, registers the existing completion digest over that one linked input.
+`wait_ms` defaults to zero for a new child and 20,000 ms for a continuation.
+Each call allows at most 25,000 ms within the native 30-second MCP/plugin deadline.
+A zero-wait call reads an immediate durable snapshot. The same method continues
+with `{id, wait_ms?}` and reads the same launch's exact linked first input.
+A continuation cannot launch the child or send input again. A pending or
+`unknown` result registers the existing completion digest over that input.
+An explicit `wait_ms:0` also registers delivery if the child already settled.
 The registration id is a deterministic sibling ULID, preserving retry
 identity while keeping the digest reservation separate from the launch
 command id. Existing digest delivery provides one durable completion mail
 wake, including after a daemon restart. A digest retry reuses its registration
 and mail identity.
+A manager with a pending completion wake can do other work or finish its turn
+and receive the result through ordinary addressed mail.
 
 The compact response contains the exact input status, bound Agent/generation
 when visible, the retained managed `branch` when available, a `branch_error` code

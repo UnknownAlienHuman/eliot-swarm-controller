@@ -4,7 +4,7 @@ use super::MAX_WAIT_FINAL_TEXT_BYTES;
 use crate::{Error, Result, limits::MAX_EVENT_BYTES};
 use serde::{Deserialize, Serialize};
 
-/// Default child.run long-poll, leaving room under the native 30 s RPC deadline.
+/// Default continuation long-poll within the native 30 s RPC deadline.
 pub const DEFAULT_CHILD_RUN_WAIT_MS: u64 = 20_000;
 /// Hard wait bound for one child.run call; continuation reuses the same limit.
 pub const MAX_CHILD_RUN_WAIT_MS: u64 = 25_000;
@@ -53,7 +53,7 @@ pub struct ChildRunRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(
         range(min = 0, max = 25000),
-        description = "Optional wait in milliseconds, 0..=25000. Defaults to 20000."
+        description = "Wait in milliseconds, 0..=25000. A new child defaults to an immediate reply and wakes you on completion. A continuation defaults to 20000 ms."
     )]
     pub wait_ms: Option<u64>,
 }
@@ -107,7 +107,12 @@ impl ChildRunRequest {
     }
 
     pub fn effective_wait_ms(&self) -> u64 {
-        self.wait_ms.unwrap_or(DEFAULT_CHILD_RUN_WAIT_MS)
+        let default = if self.is_continuation() {
+            DEFAULT_CHILD_RUN_WAIT_MS
+        } else {
+            0
+        };
+        self.wait_ms.unwrap_or(default)
     }
 
     pub fn is_continuation(&self) -> bool {

@@ -411,9 +411,9 @@ impl Router {
     /// drain, unknown gates, plus final mail-only busy/pending
     /// revalidation via structured kind) — skips the notice; a skipped
     /// notice never fails the admitted write. When the claimed `send` is
-    /// not admitted, the claim is released so the failure does not consume
-    /// the notice cooldown. An admitted attempt spends it at native
-    /// presentation or at a definite unsuccessful settlement.
+    /// not admitted, the claim is released. A self-requested completion
+    /// already spent its cooldown at claim. Ordinary mail spends cooldown
+    /// only on native presentation or definite unsuccessful settlement.
     pub(super) async fn offer_notice(&self, recipient: &str) {
         let agent = {
             let store = self.inner.store.lock().await;
