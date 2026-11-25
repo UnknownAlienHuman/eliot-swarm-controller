@@ -1591,7 +1591,8 @@ blocking on them; the stored outcome stays `unknown`.
 Owner and fleet reads can reuse up to four idle SQLite readers per daemon.
 Each read starts a fresh read-only transaction and releases its snapshot
 before returning the connection. The pool retains page and statement caches,
-while the projections are recomputed from committed rows.
+while the projections are recomputed from committed rows. A reader targets
+an 8 MiB SQLite page cache and keeps up to 128 prepared statements.
 
 The daemon keeps a process-local rolling sample of authenticated local RPCs
 with successfully written replies. A sample measures transport acceptance

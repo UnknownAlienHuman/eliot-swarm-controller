@@ -27,8 +27,9 @@ impl ProjectionReaders {
                 let store = Store::open_read_only(&self.path)?;
                 store
                     .connection
-                    .execute_batch("ROLLBACK")
+                    .execute_batch("ROLLBACK; PRAGMA cache_size = -8192;")
                     .map_err(sql_error)?;
+                store.connection.set_prepared_statement_cache_capacity(128);
                 store
             }
         };
