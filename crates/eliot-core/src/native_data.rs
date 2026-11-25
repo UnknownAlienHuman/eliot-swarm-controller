@@ -17,9 +17,36 @@ pub fn is_native_discriminator(text: &str) -> bool {
 fn is_published_label(text: &str) -> bool {
     !text.is_empty()
         && text.len() <= MAX_LABEL_BYTES * REDACTION_MARKER.len()
-        && text
-            .split(REDACTION_MARKER)
-            .all(|part| part.is_empty() || is_native_discriminator(part))
+        && has_only_published_label_parts(text)
+}
+
+fn has_only_published_label_parts(mut text: &str) -> bool {
+    while let Some((head, suffix)) = text.split_once('[') {
+        let Some((marker, rest)) = suffix.split_once(']') else {
+            return false;
+        };
+        if (!head.is_empty() && !is_native_discriminator(head)) || !is_marker(marker) {
+            return false;
+        }
+        text = rest;
+    }
+    text.is_empty() || is_native_discriminator(text)
+}
+
+fn is_marker(marker: &str) -> bool {
+    if marker == "REDACTED" {
+        return true;
+    }
+    marker
+        .strip_prefix("REDACTED:")
+        .and_then(|parts| parts.split_once(':'))
+        .is_some_and(|(kind, len)| {
+            !kind.is_empty()
+                && kind
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+                && len.parse::<usize>().is_ok_and(|length| length > 0)
+        })
 }
 
 /// Fence diagnostic metadata before either controlled or observed publication.

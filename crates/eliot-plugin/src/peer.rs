@@ -386,7 +386,8 @@ impl CommitSink {
             ));
         }
 
-        let expected_count = i64::try_from(batch.events.len())
+        let offered_count = batch.events.len();
+        let expected_count = i64::try_from(offered_count)
             .map_err(|_| Error::new("frame_too_large", "event batch is too large"))?;
         let offered_diagnostics = batch
             .events
@@ -424,7 +425,12 @@ impl CommitSink {
                 .and_then(|range| range.checked_add(1)),
             _ => None,
         };
+        let refused_fields = &ack.refused_native_fields;
         if !(0..=offered_diagnostics).contains(&ack.dropped_unclassified)
+            || refused_fields
+                .last()
+                .is_some_and(|last| *last >= offered_count)
+            || !refused_fields.windows(2).all(|pair| pair[0] < pair[1])
             || actual_count != Some(expected_count - ack.dropped_unclassified)
             || ack.cursor != expected_cursor
         {

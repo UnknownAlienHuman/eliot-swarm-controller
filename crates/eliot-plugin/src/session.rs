@@ -1049,7 +1049,7 @@ pub fn attach_native_error(data: &mut Value, message: Option<&str>, policy: &Sec
     let budget = MAX_EVENT_BYTES
         .saturating_sub(encoded.len().saturating_add(r#","native_error":"#.len()))
         .min(4 * 1024);
-    let mut message = policy.redact_native_text(message);
+    let mut message = policy.redact_text(message);
     let mut truncated = false;
     loop {
         let diagnostic = json!({"message": &message, "truncated": truncated});
@@ -1081,7 +1081,7 @@ pub fn attach_final_text(data: &mut Value, final_text: &str) {
     };
     fields.insert(
         "final_text".to_owned(),
-        Value::String(SecretPolicy::default().redact_native_text(final_text)),
+        Value::String(SecretPolicy::default().redact_text(final_text)),
     );
     // Adapters can also retain the attached reply for a private snapshot.
     // Its smaller public event budget is applied when the Store writes it.
@@ -1310,12 +1310,26 @@ impl StreamSource<'_> {
             data,
             ts: None,
         }]);
-        self.commit_batch_ack(batch).await
+        let ack = self.commit_batch_ack(batch).await?;
+        if !ack.refused_native_fields.is_empty() {
+            return Err(Error::new(
+                "secret_in_payload",
+                "Store refused an unbindable native event field",
+            )
+            .with_where("plugin.events.put"));
+        }
+        Ok(ack)
     }
 
     fn event_batch(&self, events: Vec<NativeEvent>) -> SourceBatch {
+        let native_id = &events[0].native_id;
+        let batch_id = if SecretPolicy::default().contains_native_secret(native_id) {
+            ulid::Ulid::new().to_string()
+        } else {
+            format!("{native_id}:batch")
+        };
         SourceBatch {
-            batch_id: format!("{}:batch", events[0].native_id),
+            batch_id,
             agent_id: self.agent_id.to_owned(),
             generation: self.generation,
             source: "stream".to_owned(),
@@ -1618,9 +1632,8 @@ pub fn require_nonempty(value: &str, harness: &str, what: &str) -> Result<()> {
 
 /// Redact the free-text offer fields of a normalized public request view for
 /// the committed `request.opened` event: the approval `summary`, `questions`
-/// and approval `choices`. The in-memory offer stays raw so choice matching
-/// and re-issue comparison keep working on exact native values; only the
-/// persisted copy is redacted.
+/// and approval `choices`. Keep the raw in-memory offer for native replies
+/// and use the shared redacted form when comparing display values.
 pub fn redact_request_details_for_commit(details: &Value, policy: &SecretPolicy) -> Value {
     let mut redacted = details.clone();
     if let Some(fields) = redacted.as_object_mut() {

@@ -569,11 +569,16 @@ semantic values before the Store computes canonical event and batch digests.
 Recognized provider and GitHub keys, JWTs, Bearer values, query credential values
 and high-entropy values in named secret fields become
 `[REDACTED:<kind>:<original byte length>]`. The digest sees the marker and
-surrounding text. Ordinary Git SHAs and ULIDs remain intact. A credential in
-an immutable correlation or object key rejects the batch with
-`secret_in_payload`. Bounded adapter views apply the same shared policy before
-truncation. Native outcome and recovery text and daemon diagnostics also use
-this policy.
+surrounding text. Ordinary Git SHAs and ULIDs remain intact. The Store accepts
+only prepared batches, including direct, observed, child and grouped intake.
+A credential in a batch binding, an immutable payload correlation or an object
+key rejects the batch with `secret_in_payload`. A credential in an event's
+`native_id` or `kind` refuses that field and writes a
+`source.native_field_refused` diagnostic at the same batch position.
+The affected fact cannot drive native effects. Other positions retain normal
+commit order and the ACK identifies refused positions. Bounded adapter views
+apply the same policy before truncation. Native outcomes, recovery text and
+daemon diagnostics use the same matcher and scoped literal set.
 
 Redaction is stable on repeated application, so same-ID replay of normalized
 content reproduces the digest. Digests exclude transport IDs and timing. The
@@ -1055,6 +1060,9 @@ Public requests and answers are universal: `request.opened` details and kinds us
 shared [`eliot_core::requests`](../../crates/eliot-core/src/requests.rs) shapes
 (`QuestionRequest`/`ApprovalRequest`), and `answer` args use `AnswerArgs`. Only the
 plugin translates between these shapes and its vendor format in both directions.
+The Store redacts request summaries, questions and choices before publication.
+Adapters compare reissued offer text in its redacted form and retain exact
+private native bindings for replies.
 The desktop consumes the nested question DTOs: text entry, one-choice lists,
 multiple-choice checkboxes, number text entry without rounding, and a Yes/No choice. Unedited
 questions stay omitted from partial answers; Leave unanswered removes an

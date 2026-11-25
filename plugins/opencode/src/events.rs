@@ -2404,7 +2404,7 @@ impl EventProcessor {
             .filter(|command| !command.trim().is_empty())
         {
             let policy = SecretPolicy::new(self.secrets.iter().cloned());
-            let redacted = policy.redact_native_text(command);
+            let redacted = policy.redact_text(command);
             data["command_truncated"] = json!(redacted.len() > MAX_TOOL_COMMAND_BYTES);
             data["command"] =
                 Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
@@ -2842,7 +2842,7 @@ impl EventProcessor {
             let data = json!({
                 "command_id": command_id,
                 "turn_id": turn_id,
-                "text": secrets.redact_native_text(text),
+                "text": secrets.redact_text(text),
             });
             let native_id = event_id(
                 &terminal.session_id,
@@ -3104,7 +3104,7 @@ impl EventProcessor {
     }
 
     /// Durably open a described native request. Details commit redacted;
-    /// the raw offer stays in memory for choice matching.
+    /// Raw offer values stay available for exact native replies.
     async fn open_request(&mut self, pending: CorePending) -> Result<()> {
         if self.resolved_native_ids.contains(&pending.id) {
             self.record_gap("OpenCode native request was re-issued after resolution")
@@ -3114,10 +3114,11 @@ impl EventProcessor {
                 "OpenCode native request identity is ambiguous",
             ));
         }
+        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         if let Some(existing) = self.pending_requests.get(&pending.id) {
             if existing.request.turn_id != pending.turn_id
                 || existing.request.kind != pending.kind
-                || existing.request.details != pending.details
+                || !secrets.same_redacted_values(&existing.request.details, &pending.details)
             {
                 self.record_gap("OpenCode native request offer changed after opening")
                     .await?;
@@ -3164,7 +3165,6 @@ impl EventProcessor {
                 "OpenCode public request view could not be normalized",
             ));
         };
-        let secrets = SecretPolicy::new(self.secrets.iter().cloned());
         let committed = redact_request_details_for_commit(&public_details, &secrets);
         let guard_commands = (pending.kind == "approval"
             && pending.details["action"].as_str().is_some_and(|action| {
@@ -3750,7 +3750,7 @@ fn terminal_turn_data(
         );
     }
     if let Some(text) = readback.and_then(|readback| readback.final_text.as_deref()) {
-        attach_final_text(&mut data, &secrets.redact_native_text(text));
+        attach_final_text(&mut data, &secrets.redact_text(text));
     }
     data
 }

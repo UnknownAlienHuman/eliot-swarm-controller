@@ -1265,7 +1265,7 @@ impl EventProcessor {
             Error::new("native_protocol", "Codex child agentMessage omitted text")
         })?;
         let policy = SecretPolicy::new(self.secrets.iter().cloned());
-        let text = policy.redact_native_text(text);
+        let text = policy.redact_text(text);
         let turn_id = child_message_turn_id(
             params,
             self.child_states

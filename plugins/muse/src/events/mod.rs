@@ -1819,12 +1819,13 @@ impl EventProcessor {
         // offer and its current requirement).
         let reissued = self.pending_requests.contains_key(&request_id);
         if reissued {
+            let policy = SecretPolicy::new(self.secrets.iter().cloned());
             let same = request.kind != "approval"
                 || self
                     .pending_requests
                     .get(&request_id)
                     .is_some_and(|existing| {
-                        same_approval_offer(&existing.request.details, &params)
+                        same_approval_offer(&existing.request.details, &params, &policy)
                     });
             let observed = self.observe();
             let (prior, newer) = self
@@ -3091,7 +3092,7 @@ impl EventProcessor {
                 .record_gap("Muse agentMessage omitted its item id")
                 .await;
         }
-        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_native_text(text);
+        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(text);
         let mut data = json!({
             "turn_id": turn_id,
             "text": text,
@@ -3969,13 +3970,14 @@ impl EventProcessor {
                 .await;
         };
         let observed = self.observe();
+        let policy = SecretPolicy::new(self.secrets.iter().cloned());
         let (prior, same, newer) = self
             .pending_requests
             .get(&request_id)
             .map(|entry| {
                 (
                     entry.reply_state,
-                    same_approval_offer(&entry.request.details, &raw),
+                    same_approval_offer(&entry.request.details, &raw, &policy),
                     is_newer_approval_requirement(&entry.request.details, &raw),
                 )
             })

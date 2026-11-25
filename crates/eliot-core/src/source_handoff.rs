@@ -138,7 +138,7 @@ impl SourceHandoff {
             ));
         }
         if let Some(gap) = self.gap.as_mut() {
-            gap.reason = policy.redact_native_text(&gap.reason);
+            gap.reason = policy.redact_text(&gap.reason);
         }
         Ok(())
     }

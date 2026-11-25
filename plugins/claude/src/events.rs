@@ -1765,7 +1765,7 @@ impl EventProcessor {
             }
             return Ok(());
         }
-        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_native_text(&text);
+        let text = SecretPolicy::new(self.secrets.iter().cloned()).redact_text(&text);
         let command_id = self.status.active_command_id.as_deref();
         let mut data = json!({
             "command_id": command_id,
@@ -1862,7 +1862,7 @@ impl EventProcessor {
             }
             if let Some(command) = &tool_use.command {
                 let policy = SecretPolicy::new(self.secrets.iter().cloned());
-                let redacted = policy.redact_native_text(command);
+                let redacted = policy.redact_text(command);
                 data["command_truncated"] = json!(redacted.len() > MAX_TOOL_COMMAND_BYTES);
                 data["command"] =
                     Value::String(policy.redact_bounded(&redacted, MAX_TOOL_COMMAND_BYTES));
@@ -3510,7 +3510,7 @@ impl EventProcessor {
         if let Some(text) = final_text {
             // Attach the one final native message; the shared boundary
             // accounts for its event payload size.
-            attach_final_text(&mut data, &secrets.redact_native_text(&text));
+            attach_final_text(&mut data, &secrets.redact_text(&text));
         }
         let session_id = self.status.session_id.as_deref().unwrap_or_default();
         let native_id = format!("claude:{session_id}:{turn_id}:turn.completed");

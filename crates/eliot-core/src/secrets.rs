@@ -1,8 +1,9 @@
-//! Immutable literal-secret policy shared by admission, transports and logging.
+//! Shared complete-text redaction and streaming literal-secret protection.
 
 mod credentials;
 
 use serde_json::Value;
+use std::borrow::Cow;
 
 const MARKER: &[u8] = b"[REDACTED]";
 
@@ -32,13 +33,20 @@ impl SecretPolicy {
         self.values.iter().any(|secret| text.contains(secret))
     }
 
-    /// Redact complete input before applying any bound. Complete redaction
-    /// markers are preserved across repeated sanitization. Streaming callers
-    /// must retain the unfinished suffix from `redact_prefix(_, false)`;
-    /// guessing whether an arbitrary text suffix is a secret is unsafe.
+    /// Redact recognizable shapes and the scoped set of exact secrets.
+    /// Call on complete text before truncation, hashing or persistence.
     pub fn redact_text(&self, text: &str) -> String {
-        let (safe, _) = self.redact_prefix(text.as_bytes(), true);
-        String::from_utf8_lossy(&safe).into_owned()
+        self.redact_field_text(text, None).into_owned()
+    }
+
+    fn redact_field_text<'a>(&self, text: &'a str, field: Option<&str>) -> Cow<'a, str> {
+        let shaped = credentials::redact_field(text, field);
+        if self.contains_text(&shaped) {
+            let (safe, _) = self.redact_prefix(shaped.as_bytes(), true);
+            Cow::Owned(String::from_utf8_lossy(&safe).into_owned())
+        } else {
+            shaped
+        }
     }
 
     /// Redact complete text, then bound it to `max_bytes` at a character
@@ -54,38 +62,16 @@ impl SecretPolicy {
         self.contains_text(text) || credentials::contains(text)
     }
 
-    /// Redact complete native text before truncating, logging or hashing it.
-    pub fn redact_native_text(&self, text: &str) -> String {
-        let safe = credentials::redact(text);
-        if self.contains_text(&safe) {
-            self.redact_text(&safe)
-        } else {
-            safe.into_owned()
-        }
-    }
-
-    /// Redact native text before applying the caller's byte limit.
-    pub fn redact_native_bounded(&self, text: &str, max_bytes: usize) -> String {
-        let mut safe = self.redact_native_text(text);
-        safe.truncate(safe.floor_char_boundary(max_bytes));
-        safe
-    }
-
-    /// Redact native string values, with context from explicit secret fields.
+    /// Redact string values with context from explicit secret fields.
     /// Object keys remain intact for the caller's metadata validation.
-    pub fn redact_native_values(&self, value: &mut Value) -> bool {
-        self.redact_native_field(value, None)
+    pub fn redact_values(&self, value: &mut Value) -> bool {
+        self.redact_field(value, None)
     }
 
-    fn redact_native_field(&self, value: &mut Value, field: Option<&str>) -> bool {
+    fn redact_field(&self, value: &mut Value, field: Option<&str>) -> bool {
         match value {
             Value::String(text) => {
-                let safe = credentials::redact_field(text, field);
-                let safe = if self.contains_text(&safe) {
-                    self.redact_text(&safe)
-                } else if let std::borrow::Cow::Owned(safe) = safe {
-                    safe
-                } else {
+                let Cow::Owned(safe) = self.redact_field_text(text, field) else {
                     return false;
                 };
                 if *text == safe {
@@ -97,14 +83,14 @@ impl SecretPolicy {
             Value::Array(values) => {
                 let mut changed = false;
                 for value in values {
-                    changed |= self.redact_native_field(value, field);
+                    changed |= self.redact_field(value, field);
                 }
                 changed
             }
             Value::Object(values) => {
                 let mut changed = false;
                 for (key, value) in values {
-                    changed |= self.redact_native_field(value, Some(key));
+                    changed |= self.redact_field(value, Some(key));
                 }
                 changed
             }
@@ -124,33 +110,16 @@ impl SecretPolicy {
         }
     }
 
-    /// Redact string values, never object keys. Returns whether values changed.
-    pub fn redact_values(&self, value: &mut Value) -> bool {
-        match value {
-            Value::String(text) => {
-                let safe = self.redact_text(text);
-                if safe == *text {
-                    return false;
-                }
-                *text = safe;
-                true
-            }
-            Value::Array(values) => {
-                let mut changed = false;
-                for value in values {
-                    changed |= self.redact_values(value);
-                }
-                changed
-            }
-            Value::Object(values) => {
-                let mut changed = false;
-                for value in values.values_mut() {
-                    changed |= self.redact_values(value);
-                }
-                changed
-            }
-            _ => false,
+    /// Compare public offer values using the same text as their retained view.
+    pub fn same_redacted_values(&self, left: &Value, right: &Value) -> bool {
+        if left == right {
+            return true;
         }
+        let mut left = left.clone();
+        let mut right = right.clone();
+        self.redact_values(&mut left);
+        self.redact_values(&mut right);
+        left == right
     }
 
     /// Return safe output and the number of ORIGINAL bytes consumed. The caller

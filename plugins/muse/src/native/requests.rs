@@ -1004,14 +1004,20 @@ pub(crate) fn is_newer_approval_requirement(existing_details: &Value, raw: &Valu
 /// Whether a re-issued `approval/request` carries the same offer the entry
 /// already holds (same choices and requirement): an idempotent re-presentation
 /// refreshes nothing, a different offer replaces the in-memory snapshot.
-pub(crate) fn same_approval_offer(existing_details: &Value, raw: &Value) -> bool {
+pub(crate) fn same_approval_offer(
+    existing_details: &Value,
+    raw: &Value,
+    policy: &eliot_core::SecretPolicy,
+) -> bool {
     let existing = (
         existing_details.get("available_choices"),
         existing_details.get("current_requirement"),
     );
     let incoming = (raw.get("availableChoices"), raw.get("currentRequirementId"));
     match (existing, incoming) {
-        ((Some(a), Some(b)), (Some(c), Some(d))) => a == c && b == d,
+        ((Some(old_choices), Some(old_requirement)), (Some(choices), Some(requirement))) => {
+            old_requirement == requirement && policy.same_redacted_values(old_choices, choices)
+        }
         _ => false,
     }
 }
