@@ -1292,28 +1292,39 @@ fn default_background_wake_max_wait_secs() -> i64 {
     core::DEFAULT_BACKGROUND_WAKE_MAX_WAIT_SECS
 }
 
+fn validate_absolute_setting_path(path: &str) -> std::result::Result<(), &'static str> {
+    if path.len() > 4096 {
+        return Err("exceeds 4096 bytes");
+    }
+    if path.chars().any(char::is_control) {
+        return Err("contains a control character");
+    }
+    if !Path::new(path).is_absolute() {
+        return Err("must be an absolute path");
+    }
+    Ok(())
+}
+
 impl DaemonConfig {
     fn validate(self) -> core::Result<Self> {
-        if self.chats_root.as_ref().is_some_and(|p| {
-            p.len() > 4096
-                || !std::path::Path::new(p).is_absolute()
-                || p.chars().any(char::is_control)
-        }) {
+        if let Some(path) = &self.chats_root {
+            validate_absolute_setting_path(path).map_err(|reason| {
+                core::Error::new("profile_error", format!("daemon.chats_root {reason}"))
+            })?;
+        }
+        if self.artifact_roots.len() > 32 {
             return Err(core::Error::new(
                 "profile_error",
-                "daemon.chats_root must be an absolute local root",
+                "daemon.artifact_roots must contain at most 32 paths",
             ));
         }
-        if self.artifact_roots.len() > 32
-            || self
-                .artifact_roots
-                .iter()
-                .any(|p| p.len() > 4096 || !std::path::Path::new(p).is_absolute())
-        {
-            return Err(core::Error::new(
-                "profile_error",
-                "daemon.artifact_roots must contain at most 32 absolute local roots",
-            ));
+        for (index, path) in self.artifact_roots.iter().enumerate() {
+            validate_absolute_setting_path(path).map_err(|reason| {
+                core::Error::new(
+                    "profile_error",
+                    format!("daemon.artifact_roots[{index}] {reason}"),
+                )
+            })?;
         }
         self.limits.validate().map_err(|error| {
             core::Error::new("profile_error", format!("config.toml: {}", error.message))

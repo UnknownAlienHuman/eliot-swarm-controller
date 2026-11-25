@@ -11,7 +11,12 @@ generation root. Existing unbound directories are never adopted. Shared
 configured roots, workspace paths alone and user/native configuration
 remain protected. This does not scan or adopt existing unregistered files. See
 [registered artifacts and cleanup](coordination.md#registered-artifacts-and-cleanup-k69).
-The setting is available through the existing Daemon settings section. A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
+The Daemon settings section returns configured artifact paths in their saved
+spelling. Use the returned absolute paths unchanged in a save. Each invalid
+entry identifies its index and the path problem. The data directory is selected
+at startup, and the managed worktree root is derived from that data directory.
+
+A folder assignment opts in with `[automation.assignments.<key>] cleanup_on_retire = true`
 (default false): after an applied stop retires its Agent, the existing stop
 worker cleans that Agent's build, temp and managed-worktree artifacts with
 Owner authority and retained receipts. It is not a second executor.
@@ -2182,12 +2187,13 @@ workspaces or start a daemon.
 
 `[daemon].chats_root` is an optional absolute local root (at most 4096 bytes),
 defaulting to `<user home>/Eliot/chats`. `settings.read` exposes the effective
-root and `settings.save` replaces it with the daemon section; both resolve the
-explicit and the default root through the same validator, so a stored root
-inside the owner chat tree is refused at readback exactly as at launch. The one
-exception is an explicit root equal to the canonical owner chat tree itself: the
-Owner may choose it for a non-default data directory, such as a production
-controller. Derived defaults never resolve there. When
+root and `settings.save` accepts the same path unchanged. Readback, save and
+chat launch use the same filesystem validator. On Windows, ordinary and
+verbatim local drive paths use the same rooted component checks and protected
+directory comparison. Refusals identify the path problem, such as a relative
+path, link, file component, or protected-root overlap. The Owner may explicitly
+choose the canonical owner chat tree for a non-default data directory, such as
+a production controller. Derived defaults never resolve there. When
 the owner home cannot be resolved for a non-default data directory, validation
 fails closed instead of omitting the owner tree from the protected set. It must
 be outside the daemon data directory, harness homes and user configuration

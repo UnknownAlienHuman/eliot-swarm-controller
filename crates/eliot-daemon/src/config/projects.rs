@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_PROJECT_PATH_LEN: usize = 4096;
+const MAX_GIT_ENDPOINT_LEN: usize = 4096;
 const MAX_PROJECT_CHECK_ROUNDS: i64 = 16;
 const DEFAULT_PROJECT_CHECK_ROUNDS: i64 = 3;
 
@@ -97,29 +97,6 @@ fn project_policy_false(value: &bool) -> bool {
     !value
 }
 
-/// Default chat root for one data dir. The Owner's default data dir keeps
-/// the historical `~/Eliot/chats`; every other data dir (including a
-/// private `--data-dir` daemon) gets a root specific to that dir that is
-/// never under the owner's canonical `~/Eliot/chats` tree: a
-/// `<data-dir>-chats` sibling when the protected-path checks accept it,
-/// otherwise a deterministic `~/Eliot/chats-<name>-<hash>` fallback.
-/// An explicit `daemon.chats_root` always wins; when no default passes,
-/// the error asks for one.
-pub(crate) fn default_chats_root(data_root: &Path) -> core::Result<std::path::PathBuf> {
-    if is_owner_default_data_dir(data_root) {
-        return owner_chats_root();
-    }
-    let protected = protected_paths(data_root)?;
-    if let Some(sibling) = sibling_chats_root(data_root)
-        && validate_chats_root(&sibling, &protected).is_ok()
-    {
-        return Ok(sibling);
-    }
-    let fallback = home_namespaced_chats_root(data_root)?;
-    validate_chats_root(&fallback, &protected)?;
-    Ok(fallback)
-}
-
 fn owner_chats_root() -> core::Result<std::path::PathBuf> {
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).ok_or_else(|| {
@@ -178,53 +155,62 @@ fn sibling_chats_root(data_root: &Path) -> Option<std::path::PathBuf> {
     Some(parent.join(format!("{name}-chats")))
 }
 
-fn is_owner_default_data_dir(data_root: &Path) -> bool {
-    let Ok(default) = crate::platform::data_dir::default_data_dir() else {
-        return false;
-    };
-    std::path::absolute(data_root).ok() == std::path::absolute(&default).ok()
-}
-
+/// Resolve an explicit chat root, or choose the Owner's usual root for the
+/// default daemon and a disjoint sibling or namespaced fallback otherwise.
 pub(crate) fn validate_chats_location(
     data_root: &Path,
     chats_root: Option<&str>,
-) -> core::Result<std::path::PathBuf> {
-    let explicit = chats_root.map(std::path::PathBuf::from);
-    let root = match &explicit {
-        Some(root) => root.clone(),
-        None => default_chats_root(data_root)?,
-    };
-    let mut protected = protected_paths(data_root)?;
-    // An Owner may explicitly choose the canonical chat tree itself for a
-    // non-default data dir (a production controller dir, for example).
-    // Derived defaults and every other explicit root stay outside it.
-    if explicit.is_some() && !is_owner_default_data_dir(data_root) {
+) -> core::Result<PathBuf> {
+    let owner_default = crate::platform::data_dir::default_data_dir()
+        .is_ok_and(|default| same_absolute_path(data_root, &default));
+    let explicit = chats_root.map(Path::new);
+    let mut protected = protected_paths(data_root);
+    if !owner_default {
         let owner = owner_chats_root()?;
-        if same_absolute_path(&root, &owner) {
-            protected.retain(|path| !same_absolute_path(path, &owner));
+        // Only the explicit choice of the Owner's chat root waives this
+        // protection. Configured harness and data roots stay protected.
+        if explicit.is_none_or(|root| !same_absolute_path(root, &owner)) {
+            protected.push(owner);
         }
     }
-    validate_chats_root(&root, &protected)
+    if let Some(root) = explicit {
+        return validate_chats_root(root, &protected);
+    }
+    if owner_default {
+        return validate_chats_root(&owner_chats_root()?, &protected);
+    }
+    if let Some(sibling) = sibling_chats_root(data_root)
+        && let Ok(root) = validate_chats_root(&sibling, &protected)
+    {
+        return Ok(root);
+    }
+    validate_chats_root(&home_namespaced_chats_root(data_root)?, &protected)
 }
 
 fn same_absolute_path(left: &Path, right: &Path) -> bool {
     match (std::path::absolute(left), std::path::absolute(right)) {
-        (Ok(left), Ok(right)) => left == right,
+        (Ok(left), Ok(right)) => path_comparison_key(&left) == path_comparison_key(&right),
         _ => false,
     }
 }
 
-/// Every location a chat root must stay disjoint from: the daemon data
-/// dir, the canonical owner chat tree for non-default data dirs,
-/// credential and configuration homes. Shared by the explicit path and
-/// every automatic default. When the owner home cannot be resolved for a
-/// non-default data dir, this fails closed instead of omitting the owner
-/// tree from the protected set.
-fn protected_paths(data_root: &Path) -> core::Result<Vec<PathBuf>> {
-    let mut protected = vec![data_root.to_owned()];
-    if !is_owner_default_data_dir(data_root) {
-        protected.push(owner_chats_root()?);
+/// Keep filesystem spelling for opens. Drive aliases, separators and casing
+/// must compare consistently for all Windows chat-root containment checks.
+fn path_comparison_key(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        PathBuf::from(core::workspace_path_key(&path.to_string_lossy()).as_ref())
     }
+    #[cfg(not(windows))]
+    {
+        path.to_path_buf()
+    }
+}
+
+/// Directories every chat root must stay disjoint from, in addition to
+/// the Owner's chats where applicable.
+fn protected_paths(data_root: &Path) -> Vec<PathBuf> {
+    let mut protected = vec![data_root.to_owned()];
     for name in [
         "CODEX_HOME",
         "CODEX_SQLITE_HOME",
@@ -259,96 +245,101 @@ fn protected_paths(data_root: &Path) -> core::Result<Vec<PathBuf>> {
             protected.push(home.join("AppData"));
         }
     }
-    Ok(protected)
+    protected
 }
 
 fn validate_chats_root(root: &Path, protected: &[PathBuf]) -> core::Result<PathBuf> {
-    let refused = || {
-        core::Error::new(
-            "profile_error",
-            "chats_root overlaps protected data/configuration or traverses a link",
-        )
-    };
-    if !root.is_absolute() {
-        return Err(refused());
-    }
+    use std::path::Component;
+
+    let refused =
+        |reason: &str| core::Error::new("profile_error", format!("daemon.chats_root {reason}"));
+    let text = root
+        .to_str()
+        .ok_or_else(|| refused("must be valid UTF-8"))?;
+    super::validate_absolute_setting_path(text).map_err(refused)?;
+
     // Inspect the supplied spelling before canonicalization can erase a link
     // or junction. Nonexistent suffixes are allowed for exclusive creation.
     let mut prefix = PathBuf::new();
     for component in root.components() {
         match component {
-            std::path::Component::ParentDir | std::path::Component::CurDir => return Err(refused()),
+            Component::ParentDir | Component::CurDir => {
+                return Err(refused("must not contain traversal components"));
+            }
             #[cfg(windows)]
-            std::path::Component::Normal(name)
+            Component::Prefix(drive) => {
+                if !matches!(
+                    drive.kind(),
+                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
+                ) {
+                    return Err(refused("must use a local Windows drive"));
+                }
+                // A drive prefix by itself is not a filesystem location.
+                // Inspect it once the root separator has been appended.
+                prefix.push(component);
+                continue;
+            }
+            #[cfg(windows)]
+            Component::Normal(name)
                 if name
                     .to_str()
                     .is_none_or(|name| name.ends_with(['.', ' ']) || name.contains(':')) =>
             {
-                return Err(refused());
-            }
-            #[cfg(windows)]
-            std::path::Component::Prefix(p)
-                if !matches!(
-                    p.kind(),
-                    std::path::Prefix::Disk(_) | std::path::Prefix::VerbatimDisk(_)
-                ) =>
-            {
-                return Err(refused());
+                return Err(refused("contains an invalid Windows path component"));
             }
             _ => prefix.push(component),
         }
         match std::fs::symlink_metadata(&prefix) {
             Ok(metadata)
                 if metadata.file_type().is_symlink()
-                    || crate::platform::is_reparse_point(&metadata)
-                    || !metadata.is_dir() =>
+                    || crate::platform::is_reparse_point(&metadata) =>
             {
-                return Err(refused());
+                return Err(refused("traverses a link or reparse point"));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(refused("contains a component that is not a directory"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(refused()),
+            Err(error) => return Err(refused(&format!("could not be inspected: {error}"))),
         }
     }
-    let resolve = |path: &Path| -> core::Result<PathBuf> {
-        let mut existing = std::path::absolute(path).map_err(|_| refused())?;
-        let mut suffix = Vec::new();
-        loop {
-            match std::fs::canonicalize(&existing) {
-                Ok(mut resolved) => {
-                    for name in suffix.into_iter().rev() {
-                        resolved.push(name);
-                    }
-                    return Ok(resolved);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    suffix.push(existing.file_name().ok_or_else(refused)?.to_owned());
-                    if !existing.pop() {
-                        return Err(refused());
-                    }
-                }
-                Err(_) => return Err(refused()),
-            }
-        }
-    };
-    let root = resolve(root)?;
-    let normalized = |path: &Path| {
-        let text = path.to_string_lossy().replace('\\', "/");
-        let text = text.strip_prefix("//?/").unwrap_or(&text);
-        std::path::PathBuf::from(if cfg!(windows) {
-            text.to_lowercase()
-        } else {
-            text.to_owned()
-        })
-    };
-    let normalized_root = normalized(&root);
+
+    let root = resolve_existing_prefix(root)
+        .map_err(|error| refused(&format!("could not be resolved: {error}")))?;
+    let normalized_root = path_comparison_key(&root);
     for path in protected {
-        let protected = normalized(&resolve(path)?);
+        let protected = resolve_existing_prefix(path)
+            .map_err(|error| refused(&format!("could not verify a protected root: {error}")))?;
+        let protected = path_comparison_key(&protected);
         if normalized_root.starts_with(&protected) || protected.starts_with(&normalized_root) {
-            return Err(refused());
+            return Err(refused("overlaps a protected data or configuration root"));
         }
     }
     Ok(root)
+}
+
+fn resolve_existing_prefix(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = std::path::absolute(path)?;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut resolved) => {
+                resolved.extend(suffix.into_iter().rev());
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = existing.file_name() else {
+                    return Err(error);
+                };
+                suffix.push(name.to_owned());
+                if !existing.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -443,19 +434,15 @@ pub(super) fn project_registrations_in(
         }
 
         let path = entry.path.trim();
-        if path.is_empty()
-            || path.len() > MAX_PROJECT_PATH_LEN
-            || path.chars().any(char::is_control)
-            || !Path::new(path).is_absolute()
-        {
-            return Err(config_error_at(
+        super::validate_absolute_setting_path(path).map_err(|reason| {
+            config_error_at(
                 source,
                 offset,
                 &format!("projects.{id}.path"),
-                "must be a nonempty absolute checkout path of at most 4096 characters",
+                reason,
                 "profile_error",
-            ));
-        }
+            )
+        })?;
 
         let profiles = normalize_project_allowlist(
             &entry.profiles,
@@ -909,7 +896,7 @@ fn validate_project_git_config(
 fn is_direct_project_fetch_endpoint(endpoint: &str) -> bool {
     if endpoint.trim() != endpoint
         || endpoint.starts_with('-')
-        || endpoint.len() > MAX_PROJECT_PATH_LEN
+        || endpoint.len() > MAX_GIT_ENDPOINT_LEN
         || endpoint.chars().any(char::is_control)
         || has_git_remote_helper_delimiter(endpoint)
     {
