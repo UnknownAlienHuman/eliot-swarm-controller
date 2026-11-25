@@ -1021,40 +1021,57 @@ pub struct RefusedCommand {
 
 /// The text of each steer this window submitted, by its command id (the
 /// mutation id: the daemon admits a command under the id its caller
-/// chose), from submission until the turn takes or refuses it. It does not
-/// depend on which conversation is open when the reply or the refusal
-/// comes. Bounded: the oldest goes first.
+/// chose), from submission until it is settled: applied, refused at
+/// admission, or refused by its turn with its text back in the composer.
+/// It does not depend on which conversation is open when the reply or the
+/// refusal comes. Settled steers leave at once, so what the cap evicts is
+/// unsettled, and [`SentSteers::note`] returns it for the caller to say.
 #[derive(Debug, Default)]
 pub struct SentSteers(VecDeque<SentSteer>);
 
-#[derive(Debug)]
-struct SentSteer {
-    command: String,
-    agent: String,
-    text: String,
+/// One kept steer: its command, Agent, text and send time, and the
+/// refusal's words once it was refused while its composer held other text
+/// (it then waits for that composer to be empty).
+#[derive(Clone, Debug)]
+pub struct SentSteer {
+    pub command: String,
+    pub agent: String,
+    pub text: String,
+    pub at_ms: i64,
+    pub refused: Option<String>,
 }
 
 /// The steers [`SentSteers`] keeps at most.
-const MAX_SENT_STEERS: usize = 16;
+const MAX_SENT_STEERS: usize = 32;
 
 impl SentSteers {
-    /// Keep a submitted steer's text (a retry reuses its command id).
-    pub fn note(&mut self, command: &str, agent: &str, text: &str) {
-        self.0.retain(|steer| steer.command != command);
-        if self.0.len() == MAX_SENT_STEERS {
-            self.0.pop_front();
-        }
-        self.0.push_back(SentSteer {
-            command: command.to_owned(),
-            agent: agent.to_owned(),
-            text: text.to_owned(),
-        });
+    /// Keep a steer (a retry reuses its command id); the oldest one it
+    /// evicts at the cap, which is no longer kept.
+    pub fn note(&mut self, steer: SentSteer) -> Option<SentSteer> {
+        self.0.retain(|kept| kept.command != steer.command);
+        let evicted = if self.0.len() >= MAX_SENT_STEERS {
+            self.0.pop_front()
+        } else {
+            None
+        };
+        self.0.push_back(steer);
+        evicted
     }
 
-    /// A settled steer's Agent and text, which are kept no longer.
-    pub fn take(&mut self, command: &str) -> Option<(String, String)> {
-        let index = self.0.iter().position(|steer| steer.command == command)?;
-        self.0.remove(index).map(|steer| (steer.agent, steer.text))
+    /// A settled steer, kept no longer.
+    pub fn take(&mut self, command: &str) -> Option<SentSteer> {
+        let index = self.0.iter().position(|kept| kept.command == command)?;
+        self.0.remove(index)
+    }
+
+    /// The oldest refused steer of `agent` that waits for an empty
+    /// composer, kept no longer.
+    pub fn take_refused(&mut self, agent: &str) -> Option<SentSteer> {
+        let index = self
+            .0
+            .iter()
+            .position(|kept| kept.agent == agent && kept.refused.is_some())?;
+        self.0.remove(index)
     }
 }
 
@@ -1371,6 +1388,8 @@ impl Conversation {
     /// A refused command: a steer shown in its turn says it was not
     /// applied. Every refusal is kept once for [`Self::take_settled`], with
     /// or without a steer row (its acceptance can predate the coverage).
+    /// One found in a snapshot is history (`live` false): the window says
+    /// only those of its own steers, whose text it still keeps.
     fn note_refused(&mut self, event: &Event) {
         let Some(command) = data_str(event, "command_id") else {
             return;
