@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 pub use eliot_core::limits::{
     MAX_COMMAND_ID_BYTES, MAX_CREDENTIAL_BYTES, MAX_EVENT_BYTES, MAX_FRAME_BYTES, MAX_TEXT_BYTES,
 };
-pub use eliot_core::{AgentStartParams, NativeStoreBinding};
+pub use eliot_core::{AgentStartParams, NativeStoreBinding, ProfileStoreResult};
 use eliot_core::{ContextItem, Error, SessionUsage};
 
 /// Live session usage sample sent to the bound daemon source without adding a
@@ -397,16 +397,6 @@ pub struct AgentModelCatalogue {
     #[serde(flatten)]
     pub binding: AgentModelsParams,
     pub models: Vec<eliot_core::api::HarnessModelEntry>,
-}
-
-/// One launch's verified native-store selection and optional plugin-owned
-/// startup metadata from the same read. The daemon freezes both at dispatch.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProfileStoreResult {
-    pub binding: eliot_core::NativeStoreBinding,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub startup: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -182,6 +182,9 @@ pub(crate) async fn profile_store(
         Ok(eliot_plugin::protocol::ProfileStoreResult {
             binding: store.native_binding(metadata_secrets)?,
             startup,
+            catalogue_digest: Some(
+                crate::route::model_catalogue_digest(&config["config"], deadline).await?,
+            ),
         })
     }
     .await;
@@ -415,7 +418,7 @@ pub(crate) async fn list_models(
     let probe_result: Result<Vec<NativeModelEntry>> = async {
         let client = probe.client();
         route
-            .verify_effective_config(&client, &cwd, metadata_secrets, deadline)
+            .verify_effective_config(&client, &cwd, metadata_secrets, None, deadline)
             .await?;
         let (entries, _) = collect_model_pages(
             &client,

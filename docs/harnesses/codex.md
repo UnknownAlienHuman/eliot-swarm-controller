@@ -536,12 +536,19 @@ requested effort echoed on the ChatGPT route. When an endpoint/billing fact is n
 exposed, report it as unverified rather than inventing readback. An unexpected effective route does not authorize further input.
 
 The direct route uses the native OpenAI catalogue source. A named Responses
-route uses the `model_catalog_url` derived from its frozen endpoint. Launch,
-Resume and model enumeration verify effective native configuration before
-starting a thread or listing models. A configured `model_catalog_json` takes
-precedence over those sources, so the adapter refuses it with `profile_error`
-at `plugin.codex.route.model_catalog_json`. It does not rewrite the Owner's
-configuration or substitute a different catalogue.
+route uses the `model_catalog_url` derived from its frozen endpoint. The
+Owner may configure `model_catalog_json` to override either catalogue.
+At launch dispatch, `profile.store` freezes the effective catalogue digest:
+SHA-256 of byte `1` followed by the configured file's exact bytes, or
+SHA-256 of byte `0` when no file is set. Replacing a file with identical
+contents preserves its identity.
+
+Before opening or resuming a thread, the worker checks the effective
+provider route and compares the current catalogue digest with the frozen
+digest. A change returns `model_catalogue_changed` with both digests.
+Legacy frozen profiles without a digest keep their existing launch and
+resume behavior. The adapter reads the Owner's configuration and catalogue
+without writing to them.
 
 Controlled launch resolves the effective native store through a dedicated read-only
 `profile.store` reader after workspace preparation, then commits its binding with launch

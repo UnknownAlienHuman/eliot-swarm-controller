@@ -92,7 +92,7 @@ pub use native_child::{
 pub use native_data::{
     UNCLASSIFIED_NATIVE_EVENT, is_native_discriminator, validate_unclassified_native_data,
 };
-pub use native_store::NativeStoreBinding;
+pub use native_store::{NativeStoreBinding, ProfileStoreResult};
 pub use observe::{
     ACTIVITY_HEAVY_KIND, ATTENTION_STEP_KIND, AttentionStep, BUILD_WORKER_PROGRAMS,
     CATEGORY_SOURCE_CMDLINE, CATEGORY_SOURCE_IMAGE, CONSOLE_HOST_PROGRAMS, DEFAULT_HEAVY_CPU_SECS,

@@ -97,7 +97,7 @@ fn dispatch_launch_tx(
     agent: &Agent,
     agent_num: i64,
     command_generation: i64,
-    native_store: Option<(&Agent, &NativeStoreBinding, Option<&Value>)>,
+    native_store: Option<(&Agent, &core::ProfileStoreResult)>,
     now: i64,
     events: &mut Vec<Event>,
 ) -> Result<()> {
@@ -122,8 +122,8 @@ fn dispatch_launch_tx(
         now,
     )?);
     let snapshot = native_store
-        .map(|(expected, binding, startup)| {
-            workspace::launch_snapshot_with_native_store(agent, expected, binding, startup, id)
+        .map(|(expected, binding)| {
+            workspace::launch_snapshot_with_native_store(agent, expected, binding, id)
         })
         .transpose()?;
     let token = format!("{}{}", Ulid::new(), Ulid::new());
@@ -1322,7 +1322,7 @@ impl Store {
         &mut self,
         id: &str,
         now: i64,
-        native_store: Option<(&Agent, &NativeStoreBinding, Option<&Value>)>,
+        native_store: Option<(&Agent, &core::ProfileStoreResult)>,
         input: Option<&mut SendInput>,
     ) -> Result<Change<Command>> {
         let tx = self
