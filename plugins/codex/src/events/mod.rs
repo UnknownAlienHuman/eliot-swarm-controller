@@ -64,6 +64,7 @@ pub(crate) struct EventStatus {
     pub batch_unknown: bool,
     pub source_unknown: bool,
     pub stopped: bool,
+    pub history_missing_tool_output: bool,
     pub compaction: Option<CompactionProgress>,
 }
 
@@ -77,6 +78,7 @@ pub(crate) struct CompactionProgress {
     pub item_started: bool,
     pub item_completed: bool,
     pub terminal_status: Option<String>,
+    pub history_missing_tool_output: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1055,6 +1057,10 @@ impl EventProcessor {
                     NativeTurnStatus::InProgress => "unknown",
                     NativeTurnStatus::Other => "unknown",
                 };
+                progress.history_missing_tool_output |= status == "failed"
+                    && notification.turn.error.as_ref().is_some_and(|error| {
+                        crate::native::types::history_missing_tool_output(&error.message)
+                    });
                 progress.terminal_status =
                     Some(
                         if status == "completed"
@@ -1066,6 +1072,22 @@ impl EventProcessor {
                         }
                         .to_owned(),
                     );
+            }
+            "error"
+                if serde_json::from_value::<NativeErrorNotification>(params.clone()).is_ok_and(
+                    |notification| {
+                        notification.will_retry == Some(false)
+                            && notification.error.as_ref().is_some_and(|error| {
+                                crate::native::types::history_missing_tool_output(&error.message)
+                            })
+                    },
+                ) =>
+            {
+                self.status
+                    .compaction
+                    .as_mut()
+                    .unwrap()
+                    .history_missing_tool_output = true;
             }
             _ => {}
         }
@@ -1432,6 +1454,13 @@ impl EventProcessor {
         ) else {
             return Ok(());
         };
+        if self.status.thread_id.as_deref() == Some(thread_id)
+            && !turn_id.is_empty()
+            && notification.will_retry == Some(false)
+            && crate::native::types::history_missing_tool_output(&error.message)
+        {
+            self.status.history_missing_tool_output = true;
+        }
         if self.status.active_turn_id.as_deref() != Some(turn_id)
             || self.status.active_command_id.is_none()
         {

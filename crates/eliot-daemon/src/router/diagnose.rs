@@ -105,6 +105,40 @@ impl Router {
             None
         };
         let mut steps = vec![command_step(&command)];
+        if command.verb == "send"
+            && matches!(
+                command.state,
+                eliot_core::CommandState::Accepted | eliot_core::CommandState::Queued
+            )
+        {
+            let blockers = store.queued_send_gate_blockers(command_id)?;
+            if !blockers.is_empty() {
+                steps.push(DiagnoseStep {
+                    kind: "dispatch_fence".to_owned(),
+                    code: Some("send_outcome_gate_closed".to_owned()),
+                    message: Some(format!(
+                        "Queued SEND {} is blocked by {}",
+                        command.id,
+                        blockers
+                            .iter()
+                            .map(|blocker| format!(
+                                "{} {} is {}",
+                                blocker.verb.as_deref().unwrap_or(&blocker.kind),
+                                blocker.id,
+                                blocker.state
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )),
+                    failure_where: None,
+                    origin: Some("swarm".to_owned()),
+                    origin_evidence: None,
+                    exit_code: None,
+                    ntstatus: None,
+                    at: None,
+                });
+            }
+        }
         if let Some(linked) = &linked_send {
             steps.push(command_step(linked));
         }

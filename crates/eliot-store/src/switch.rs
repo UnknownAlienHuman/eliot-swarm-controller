@@ -847,6 +847,9 @@ fn continuation_directive(
         ),
         HandoffReason::ProviderResponseWithheld => "the provider withheld the response".to_owned(),
         HandoffReason::SessionLost => format!("the {source} session was lost or failed"),
+        HandoffReason::SessionBroken => {
+            format!("the {source} native session reported broken history")
+        }
     };
     let caution = if uncertain {
         "\nThe previous turn stopped partway. Do not repeat any of its steps until Git and the files show that step did not take effect."
@@ -2788,7 +2791,20 @@ fn source_tx(
     if source.generation != request.from_generation {
         return Err(Error::new("stale_generation", "source generation moved"));
     }
-    handoff::transfer_source_ready(tx, &source)?;
+    // A proven broken generation can reserve the switch's owned Stop while
+    // a command is unknown. Launch and transfer still require exit proof.
+    if source.state == AgentState::Idle
+        && source.active_turn.is_none()
+        && super::native_session_failure::is_broken(
+            tx,
+            parse_agent_id(&source.id)?,
+            source.generation,
+        )?
+    {
+        observer::require_controlled(&source)?;
+    } else {
+        handoff::transfer_source_ready(tx, &source)?;
+    }
     project_transfer::require_no_intent(tx, &source.project)?;
     let (_, inputs) = handoff::source_inputs(
         tx,

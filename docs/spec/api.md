@@ -1839,6 +1839,10 @@ NTSTATUS and the redacted stderr tail (a loss to a daemon restart is `swarm` at
 any raw panic marker lines. The process step can carry the startup panic marker
 summary in `origin_evidence`. Diagnosis also includes the previous-run crash
 marker when the terminal failure is unclassified.
+For a queued SEND, `swarm why COMMAND_ID` reports the retained command or turn
+that closes its send gate, including an unknown compaction's command ID and
+verb. The corresponding Owner inbox item identifies the queued inputs waiting
+on an unknown command.
 For a refused `worktree.remove`, `swarm why COMMAND_ID` shows the retained
 code, cause and failure location when available. `swarm why AGENT` includes
 that refusal while it is the current managed worktree outcome for the terminal
@@ -3187,7 +3191,9 @@ fence before the CLI submits any Agent Stop commands. A new launch, including
 `child.run`, is refused during the fence with `daemon_update_in_progress`
 and an instruction to retry after the update. Previously queued launches stay
 queued. The writer accepts `restart` after Agent starts, unsettled commands
-and daemon-owned workers settle. Claude requires a native terminal before
+and daemon-owned workers settle. Queued commands left on stopped or handed-off
+Agents are excluded from this gate. A restart refusal names the blocking
+commands by verb, ID and state, with a bounded list. Claude requires a native terminal before
 replacement. The CLI stops an exact busy Claude generation under the fence
 and verifies its terminal, process exit, and reader drain while the Store is
 still writable. Other in-flight native turns can be interrupted during

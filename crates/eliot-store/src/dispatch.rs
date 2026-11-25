@@ -220,6 +220,7 @@ fn dispatch_resume_tx(
     }
     // Control-verb support is owned by the PluginHost manifest
     // check; only generation, state and pending work are rechecked.
+    super::native_session_failure::require_usable(tx, agent)?;
     require_resolved_start(tx, agent_num)?;
     if has_pending_resume_tx(tx, agent_num, old_generation, id)? {
         return Err(Error::new(

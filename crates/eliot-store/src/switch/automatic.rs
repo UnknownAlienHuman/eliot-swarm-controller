@@ -735,8 +735,10 @@ fn owed_work(
     } else {
         None
     };
-    if reason != HandoffReason::ProviderResponseWithheld
-        && latest_turn_has_withheld_marker(connection, agent)?
+    if matches!(
+        reason,
+        HandoffReason::SessionLost | HandoffReason::ProviderHold
+    ) && latest_turn_has_withheld_marker(connection, agent)?
     {
         return Ok(None);
     }
@@ -752,6 +754,7 @@ fn owed_work(
             .map_err(sql_error)?,
         (HandoffReason::SessionLost, Some(_)) => true,
         (HandoffReason::SessionLost, None) => safe_resume_predecessor.is_some(),
+        (HandoffReason::SessionBroken, _) => true,
         (HandoffReason::ProviderResponseWithheld, Some(turn)) => withheld_turn == Some(turn),
         _ => false,
     };
@@ -943,6 +946,29 @@ impl Store {
         if !include_ordinary || candidates.len() == limit {
             return Ok(candidates);
         }
+        let mut broken = self
+            .connection
+            .prepare_cached(
+                "SELECT a.id FROM broken_native_sessions b
+             JOIN agents a ON a.id=b.agent AND a.generation=b.generation
+             WHERE a.chat=0 AND a.observe_only=0 AND a.archived=0 AND a.project<>''
+               AND NOT EXISTS (SELECT 1 FROM agent_successors s
+                   WHERE s.agent=b.agent AND s.generation=b.generation)
+             ORDER BY b.recorded_at DESC LIMIT ?1",
+            )
+            .map_err(sql_error)?;
+        let broken = broken
+            .query_map([LOST_SCAN_LIMIT], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    None,
+                    None,
+                    HandoffReason::SessionBroken,
+                ))
+            })
+            .map_err(sql_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sql_error)?;
         let mut held = self
             .connection
             .prepare_cached(
@@ -963,6 +989,7 @@ impl Store {
                     row.get::<_, i64>(0)?,
                     Some(row.get::<_, String>(1)?),
                     Some(row.get::<_, i64>(2)?),
+                    HandoffReason::ProviderHold,
                 ))
             })
             .map_err(sql_error)?
@@ -1001,12 +1028,19 @@ impl Store {
         let lost = lost
             .query_map(
                 params![losses_since, now - LOSS_GRACE_MS, LOST_SCAN_LIMIT],
-                |row| Ok((row.get::<_, i64>(0)?, None, None)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        None,
+                        None,
+                        HandoffReason::SessionLost,
+                    ))
+                },
             )
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?;
-        for (id, kind, held_since) in held.into_iter().chain(lost) {
+        for (id, kind, held_since, reason) in broken.into_iter().chain(held).chain(lost) {
             if candidates.len() == limit {
                 break;
             }
@@ -1016,15 +1050,19 @@ impl Store {
             let Some(agent) = load_agent_by_num(&self.connection, id)? else {
                 continue;
             };
+            if reason != HandoffReason::SessionBroken
+                && super::super::native_session_failure::is_broken(
+                    &self.connection,
+                    id,
+                    agent.generation,
+                )?
+            {
+                continue;
+            }
             let kind = match kind.as_deref() {
                 Some("quota") => Some(core::ProviderRestrictionKind::Quota),
                 Some("rate_limit") => Some(core::ProviderRestrictionKind::RateLimit),
                 _ => None,
-            };
-            let reason = if held_since.is_some() {
-                HandoffReason::ProviderHold
-            } else {
-                HandoffReason::SessionLost
             };
             if agent.is_terminal()
                 && handoff::session_exit_blocker(&self.connection, &agent)?.is_some()
@@ -1121,6 +1159,9 @@ impl Store {
                 ),
                 HandoffReason::SessionLost => {
                     matches!(agent.state, AgentState::Lost | AgentState::Failed)
+                }
+                HandoffReason::SessionBroken => {
+                    super::super::native_session_failure::is_broken(&tx, num, agent.generation)?
                 }
                 HandoffReason::Request | HandoffReason::Routing => false,
             };

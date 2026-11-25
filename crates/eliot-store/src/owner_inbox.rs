@@ -23,6 +23,38 @@ pub(crate) const SWITCH_FENCE_NEEDS_OWNER: &str = "switch_checkout_release_needs
 pub(crate) const REPEATED_FAILURE_REASON: &str = "repeated_failure";
 const ARTIFACT_LEDGER_SUBJECT: &str = "artifact-ledger";
 
+fn queued_sends_blocked_by(
+    db: &Connection,
+    agent: i64,
+    generation: i64,
+    blocker_id: &str,
+) -> eliot_core::Result<Vec<(String, String)>> {
+    // The unbound-turn exception can change turn blockers, but it never
+    // changes whether this command fences SEND for the generation.
+    if !crate::send_outcome_gate_blockers(db, agent, generation, None)?
+        .iter()
+        .any(|blocker| {
+            blocker.kind == "command" && blocker.id == blocker_id && blocker.state == "unknown"
+        })
+    {
+        return Ok(Vec::new());
+    }
+    let mut statement = db
+        .prepare_cached(
+            "SELECT id FROM commands
+         WHERE target = ?1 AND generation = ?2 AND verb = 'send'
+           AND state IN ('accepted','queued')
+         ORDER BY created_at, id LIMIT 64",
+        )
+        .map_err(crate::sql_error)?;
+    let rows = statement
+        .query_map([agent, generation], |row| row.get::<_, String>(0))
+        .map_err(crate::sql_error)?;
+    rows.map(|row| row.map(|send_id| (send_id, "send".to_owned())))
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(crate::sql_error)
+}
+
 fn artifact_capacity_item(connection: &Connection) -> eliot_core::Result<Option<OwnerInboxItem>> {
     let capacity = super::cleanup::artifact_capacity(connection)?;
     if !capacity.approaching_limit() {
@@ -649,7 +681,7 @@ fn project_unknown_commands(
         } else {
             "unknown_command_needs_owner_outcome"
         };
-        items.push(item(
+        let mut projected = item(
             OwnerInboxKind::UnknownCommand,
             id,
             format!("generation:{generation:?}:turn:{turn:?}:event:{seq}"),
@@ -658,7 +690,22 @@ fn project_unknown_commands(
             reason,
             recommended,
             choices,
-        ));
+        );
+        if let (Some(agent), Some(generation)) = (target, generation) {
+            let queued = queued_sends_blocked_by(db, agent, generation, &projected.subject)?;
+            if !queued.is_empty() {
+                projected.detail = Some(format!(
+                    "Unknown command {} ({verb}) closes the SEND outcome gate for queued SENDs: {}",
+                    projected.subject,
+                    queued
+                        .iter()
+                        .map(|(id, verb)| format!("{id} ({verb})"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        items.push(projected);
     }
     Ok(())
 }
@@ -782,7 +829,7 @@ fn project_unknown_turns(
         let choices = ["completed", "failed", "interrupted"].into_iter().map(|status| action(status, "turn.resolve", json!({
             "agent":format!("a{agent}"),"generation":generation,"turn_id":turn,"status":status,"reason":null
         }))).collect();
-        items.push(item(
+        let mut projected = item(
             OwnerInboxKind::UnknownTurn,
             format!("a{agent}:g{generation}:{turn}"),
             format!("event:{seq}"),
@@ -791,7 +838,19 @@ fn project_unknown_turns(
             "unknown_turn_needs_owner_outcome",
             None,
             choices,
-        ));
+        );
+        let queued = queued_sends_blocked_by(db, agent, generation, &turn)?;
+        if !queued.is_empty() {
+            projected.detail = Some(format!(
+                "Unknown turn {turn} closes the SEND outcome gate for queued SENDs: {}",
+                queued
+                    .iter()
+                    .map(|(id, verb)| format!("{id} ({verb})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        items.push(projected);
     }
     Ok(())
 }

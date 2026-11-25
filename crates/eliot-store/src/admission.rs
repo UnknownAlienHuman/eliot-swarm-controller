@@ -1520,6 +1520,7 @@ fn admit_resume_tx(
     let agent_num = parse_agent_id(target)?;
     let agent = load_agent_by_num(tx, agent_num)?
         .ok_or_else(|| Error::new("not_found", format!("Agent {target} was not found")))?;
+    super::native_session_failure::require_usable(tx, &agent)?;
     provider_holds::require_model_unheld(tx, &agent)?;
     if agent.archived {
         return Err(Error::new(

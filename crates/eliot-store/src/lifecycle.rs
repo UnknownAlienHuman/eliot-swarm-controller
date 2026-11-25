@@ -213,6 +213,13 @@ impl Store {
             id,
             json!({"command_id": id, "state": state_name, "outcome": outcome}),
         )?);
+        events.extend(super::native_session_failure::record_broken_session(
+            &tx,
+            &record,
+            state,
+            outcome.as_ref(),
+            now,
+        )?);
         if state == CommandState::Rejected && record.command.method == "swarm.switch" {
             if super::switch::release_rejected_switch_fence_tx(&tx, &record.command, now)? {
                 events.push(insert_daemon_command_event(

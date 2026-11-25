@@ -137,7 +137,24 @@ const UNSETTLED_COMMANDS_WHERE: &str = "state IN ('accepted', 'queued', 'dispatc
                   AND NOT (state = 'unknown' AND verb IN ('attach','detach')
                     AND EXISTS(SELECT 1 FROM agents a WHERE a.id = commands.target AND a.observe_only = 1)
                     AND NOT EXISTS(SELECT 1 FROM source_state s WHERE s.agent = commands.target
-                        AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))";
+                        AND s.source NOT IN ('daemon','os','git','workspace_process') AND s.state = 'open'))
+                  AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
+                    SELECT 1 FROM agents a WHERE a.id = commands.target
+                      AND (a.state IN ('stopped','failed','lost')
+                        OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
+                            AND h.generation = commands.generation))))";
+// Deferred Swarm notes can wait for a post-restart safe point. A claimed
+// note is dispatched and remains subject to the ordinary settlement gate.
+const RESTART_COMMANDS_WHERE: &str = "state = 'dispatched'
+    OR (state IN ('accepted', 'queued') AND NOT (
+            verb = 'inject' AND principal GLOB 'swarm_note:*'
+            AND COALESCE(json_extract(args, '$.point'), '') IN ('next_input', 'turn_safe_point')
+        ) AND NOT (state = 'queued' AND target IS NOT NULL AND EXISTS (
+            SELECT 1 FROM agents a WHERE a.id = commands.target
+              AND (a.state IN ('stopped','failed','lost')
+                OR EXISTS(SELECT 1 FROM agent_successors h WHERE h.agent = a.id
+                    AND h.generation = commands.generation))
+        )))";
 const COMMAND_RECORD_SELECT: &str = command_record_select!();
 /// Live Agent rows that can still produce work. Shared by the bounded drain
 /// list and its total for the same honest-truncation reason as unsettled
@@ -267,6 +284,7 @@ pub use native_children::{
 mod agent_lifecycle;
 mod auth_login;
 mod native_events;
+mod native_session_failure;
 mod observer;
 mod owner_decisions;
 mod owner_inbox;
@@ -1987,24 +2005,22 @@ impl Store {
         if starting {
             return Ok(true);
         }
-        // Deferred Swarm notes wait for an input or safe point and may have
-        // no consumer until after restart. Loss recovery cancels them with
-        // the old generation. A claimed note is already dispatched and
-        // must settle through the usual command gate.
+        let sql = format!("SELECT EXISTS(SELECT 1 FROM commands WHERE {RESTART_COMMANDS_WHERE})");
         self.connection
-            .query_row(
-                "SELECT EXISTS(
-                     SELECT 1 FROM commands
-                     WHERE state = 'dispatched'
-                        OR (state IN ('accepted', 'queued') AND NOT (
-                            verb = 'inject' AND principal GLOB 'swarm_note:*'
-                            AND COALESCE(json_extract(args, '$.point'), '')
-                                IN ('next_input', 'turn_safe_point')
-                        ))
-                 )",
-                [],
-                |row| row.get(0),
-            )
+            .query_row(&sql, [], |row| row.get(0))
+            .map_err(sql_error)
+    }
+
+    pub fn restart_command_blockers(&self, limit: i64) -> Result<Vec<(String, String, String)>> {
+        let sql = format!(
+            "SELECT id, verb, state FROM commands WHERE {RESTART_COMMANDS_WHERE}
+             ORDER BY created_at, id LIMIT ?1"
+        );
+        let mut statement = self.connection.prepare_cached(&sql).map_err(sql_error)?;
+        let rows = statement
+            .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(sql_error)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)
     }
 
@@ -6666,33 +6682,106 @@ fn send_outcome_gate_open_except(
     generation: i64,
     open_native_turn: Option<&str>,
 ) -> Result<bool> {
-    let turn_block: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM turns
-                 WHERE agent = ?1 AND generation = ?2 AND state IN ('running', 'unknown')
-                   AND turn_id IS NOT ?3
-             )",
-            params![agent_num, generation, open_native_turn],
-            |row| row.get(0),
-        )
+    let mut statement = connection
+        .prepare_cached(SEND_OUTCOME_GATE_SQL)
         .map_err(sql_error)?;
-    if turn_block {
-        return Ok(false);
-    }
-    let input_block: bool = connection
-        .query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM commands
-                 WHERE target = ?1 AND generation = ?2
-                   AND state IN ('dispatched', 'unknown')
-                   AND (verb IN ('stop','compact') OR (verb = 'send' AND turn_id IS NULL))
-             )",
-            params![agent_num, generation],
-            |row| row.get(0),
-        )
+    statement
+        .exists(params![agent_num, generation, open_native_turn])
+        .map(|blocked| !blocked)
+        .map_err(sql_error)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendOutcomeGateBlocker {
+    pub kind: String,
+    pub id: String,
+    pub verb: Option<String>,
+    pub state: String,
+}
+
+const SEND_OUTCOME_GATE_SQL: &str = "SELECT 'turn', turn_id, NULL, state
+     FROM turns
+     WHERE agent = ?1 AND generation = ?2 AND state IN ('running', 'unknown')
+       AND turn_id IS NOT ?3
+     UNION ALL
+     SELECT 'command', id, verb, state
+     FROM commands
+     WHERE target = ?1 AND generation = ?2
+       AND state IN ('dispatched', 'unknown')
+       AND (verb IN ('stop','compact') OR (verb = 'send' AND turn_id IS NULL))
+     UNION ALL
+     SELECT 'session', command_id, NULL, 'broken'
+     FROM broken_native_sessions WHERE agent = ?1 AND generation = ?2";
+
+/// Return the exact retained rows that close the durable SEND outcome gate.
+/// `send_outcome_gate_open_except` uses this same projection as its predicate.
+fn send_outcome_gate_blockers(
+    connection: &Connection,
+    agent_num: i64,
+    generation: i64,
+    open_native_turn: Option<&str>,
+) -> Result<Vec<SendOutcomeGateBlocker>> {
+    let mut statement = connection
+        .prepare_cached(SEND_OUTCOME_GATE_SQL)
         .map_err(sql_error)?;
-    Ok(!input_block)
+    let rows = statement
+        .query_map(params![agent_num, generation, open_native_turn], |row| {
+            Ok(SendOutcomeGateBlocker {
+                kind: row.get(0)?,
+                id: row.get(1)?,
+                verb: row.get(2)?,
+                state: row.get(3)?,
+            })
+        })
+        .map_err(sql_error)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(sql_error)
+}
+
+/// Identify gate blockers for one queued SEND using the same native-turn
+/// exception as send_input_gate_open.
+pub(crate) fn queued_send_gate_blockers(
+    connection: &Connection,
+    command_id: &str,
+) -> Result<Vec<SendOutcomeGateBlocker>> {
+    let command: Option<(i64, i64)> = connection
+        .query_row(
+            "SELECT target, generation FROM commands
+             WHERE id = ?1 AND verb = 'send' AND state IN ('accepted','queued')
+               AND target IS NOT NULL AND generation IS NOT NULL",
+            [command_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(sql_error)?;
+    let Some((agent_num, generation)) = command else {
+        return Ok(Vec::new());
+    };
+    let agent = load_agent_by_num(connection, agent_num)?;
+    let open_native_turn = match agent {
+        Some(agent)
+            if agent.generation == generation
+                && agent.state == AgentState::Busy
+                && core::api::HarnessCapabilities::of(&agent.harness)
+                    .accepts_send_during_native_turn =>
+        {
+            match agent.active_turn.as_deref() {
+                Some(turn_id)
+                    if is_unbound_native_turn(connection, agent_num, generation, turn_id)? =>
+                {
+                    Some(turn_id.to_owned())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    send_outcome_gate_blockers(
+        connection,
+        agent_num,
+        generation,
+        open_native_turn.as_deref(),
+    )
 }
 
 fn earliest_pending_send(
