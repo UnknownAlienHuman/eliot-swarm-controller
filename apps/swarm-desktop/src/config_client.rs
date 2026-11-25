@@ -315,6 +315,29 @@ pub async fn provider_holds(data_dir: &Path) -> Result<eliot_core::api::Provider
     Ok(reply)
 }
 
+/// Clear a provider hold with the owner's corrective evidence
+/// (`provider.clear_hold`): `credentials_updated` after a sign-in,
+/// `configuration_updated` after a settings fix, `owner_verified` to clear
+/// it anyway.
+pub async fn provider_clear_hold(
+    data_dir: &Path,
+    id: String,
+    scope: &str,
+    evidence: eliot_core::api::ProviderCorrectiveEvidence,
+) -> Result<eliot_core::api::ProviderClearHoldResponse> {
+    let params = eliot_core::api::ProviderClearHoldRequest {
+        id,
+        scope: scope.to_owned(),
+        corrective_evidence: evidence,
+        expected_probe_command: None,
+    };
+    params.validate()?;
+    let reply: eliot_core::api::ProviderClearHoldResponse =
+        eliot_daemon::client_call_typed(data_dir, "provider.clear_hold", &params).await?;
+    params.validate_response(&reply)?;
+    Ok(reply)
+}
+
 /// Sanitized configured-profile summaries for the launch picker.
 pub async fn list_profiles(data_dir: &Path) -> Result<ProfileListResponse> {
     let params = ProfileListRequest {};

@@ -255,9 +255,7 @@ impl Roles {
         match tone {
             StatusTone::Active | StatusTone::Pending => (self.selected, self.on_selected),
             StatusTone::Attention => (self.waiting_container, self.on_waiting_container),
-            StatusTone::Failed | StatusTone::Unknown => {
-                (self.attention_container, self.on_attention_container)
-            }
+            StatusTone::Failed => (self.attention_container, self.on_attention_container),
             StatusTone::Ready | StatusTone::Neutral => (self.container, self.variant),
         }
     }
@@ -272,29 +270,12 @@ pub enum StatusTone {
     Ready,
     /// Needs the owner (`waiting`: a pending request).
     Attention,
-    /// Outcome not proven (`unknown`).
-    Unknown,
     /// `failed` or `lost`.
     Failed,
     /// On its way (`created`, `starting`).
     Pending,
     /// Ended or anything else (`stopped`).
     Neutral,
-}
-
-impl StatusTone {
-    /// The tone of a controlled Agent's typed lifecycle state.
-    pub fn of_state(state: eliot_core::AgentState) -> Self {
-        match state {
-            eliot_core::AgentState::Busy => Self::Active,
-            eliot_core::AgentState::Idle => Self::Ready,
-            eliot_core::AgentState::Waiting => Self::Attention,
-            eliot_core::AgentState::Unknown => Self::Unknown,
-            eliot_core::AgentState::Failed | eliot_core::AgentState::Lost => Self::Failed,
-            eliot_core::AgentState::Created | eliot_core::AgentState::Starting => Self::Pending,
-            eliot_core::AgentState::Stopped => Self::Neutral,
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -582,16 +563,87 @@ pub mod winui {
             })
         }
 
-        /// A tool row: tonal, or the running tint while it runs.
-        pub fn tool_row(self, running: bool) -> ResourceOverrides {
+        /// A work-log step or head (`.step`): no container, the variant
+        /// content; a running step on `secondary-container` at 60 %.
+        pub fn step_row(self, running: bool) -> ResourceOverrides {
             self.with(|r| {
-                if running {
-                    Family::new(Some(r.running), r.text)
+                Family::new(running.then(|| r.surface.mix(r.selected, 0.6)), r.variant).overrides(r)
+            })
+        }
+
+        /// A file chip in an answer (`.fchip`): `surface-container` with
+        /// the text color.
+        pub fn file_chip(self) -> ResourceOverrides {
+            self.with(|r| Family::new(Some(r.sidebar), r.text).overrides(r))
+        }
+
+        /// A pane toggle in the header: pressed on `secondary-container`,
+        /// otherwise an icon button's colors.
+        pub fn toggle(self, on: bool) -> ResourceOverrides {
+            self.with(|r| {
+                if on {
+                    Family::new(Some(r.selected), r.on_selected)
                 } else {
-                    Family::new(Some(r.tonal), r.variant)
+                    Family::new(None, r.variant)
                 }
                 .overrides(r)
             })
+        }
+
+        /// An outlined labelled button (`.btn.out`: Changes +/−, Deny):
+        /// the outline in `outline-variant`, the content on-surface-variant.
+        pub fn outlined_plain(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family {
+                    outline: Some(r.border),
+                    ..Family::new(None, r.variant)
+                }
+                .overrides(r)
+            })
+        }
+
+        /// Tonal: `secondary-container` (Resume, Switch model, Hand off).
+        pub fn tonal_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(Some(r.selected), r.on_selected).overrides(r))
+        }
+
+        /// A text button on the attention strip: `on-tertiary-container`.
+        pub fn strip_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(None, r.on_waiting_container).overrides(r))
+        }
+
+        /// A text button on an error strip: `on-error-container`.
+        pub fn error_strip_button(self) -> ResourceOverrides {
+            self.with(|r| Family::new(None, r.on_attention_container).overrides(r))
+        }
+
+        /// The attention strip (`tertiary-container`) and its content.
+        pub fn strip(self) -> (Brush, Brush) {
+            (
+                self.token(|s| s.tertiary_container, ThemeBrush::Accent),
+                self.token(|s| s.on_tertiary_container, ThemeBrush::PrimaryText),
+            )
+        }
+
+        /// Waiting for you as text and outline (`tertiary`): the decision
+        /// panel's kind line and its 2-DIP outline.
+        pub fn tertiary(self) -> Brush {
+            self.token(|s| s.tertiary, ThemeBrush::AccentText)
+        }
+
+        /// The code ground (`code`): a decision panel's subject.
+        pub fn code(self) -> Brush {
+            self.token(|s| s.code, ThemeBrush::CardBackground)
+        }
+
+        /// Primary as text: a status word, a link.
+        pub fn primary_text(self) -> Brush {
+            self.role(|r| r.primary_text, ThemeBrush::AccentText)
+        }
+
+        /// The composer's Resume: `secondary-container`.
+        pub fn resume_fab(self) -> ResourceOverrides {
+            self.tonal_button()
         }
 
         /// The composer's Stop turn: `error` with `on-error`.
@@ -652,6 +704,21 @@ pub mod winui {
                     .overrides(r)
                     .set("ProgressRingForegroundThemeBrush", color(arc))
                     .set("ProgressRingBackgroundThemeBrush", color(r.outline))
+            })
+        }
+
+        /// The composer's context ring (`.ring`): its arc in `primary`, its
+        /// track in `surface-container-highest`, which WinUI's ring template
+        /// reads from the button's own resources.
+        pub fn context_ring(self) -> ResourceOverrides {
+            self.with(|r| {
+                Family::new(None, r.variant)
+                    .overrides(r)
+                    .set("ProgressRingForegroundThemeBrush", color(r.primary))
+                    .set(
+                        "ProgressRingBackgroundThemeBrush",
+                        color(super::rgb(r.scheme.surface_container_highest)),
+                    )
             })
         }
 

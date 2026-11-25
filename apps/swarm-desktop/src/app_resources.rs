@@ -1411,6 +1411,22 @@ pub(crate) fn own_window() -> Option<HWND> {
     (!search.found.is_null()).then_some(search.found)
 }
 
+/// Whether this process's window is minimized; the handle is found once
+/// and found again when it is gone (no window reads as not minimized).
+pub(crate) fn window_minimized() -> bool {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindow};
+    static WINDOW: AtomicIsize = AtomicIsize::new(0);
+    let mut window = WINDOW.load(Ordering::Relaxed) as HWND;
+    // SAFETY: a plain Win32 query; a stale or null handle reads as no window.
+    if window.is_null() || unsafe { IsWindow(window) } == 0 {
+        window = own_window().unwrap_or(std::ptr::null_mut());
+        WINDOW.store(window as isize, Ordering::Relaxed);
+    }
+    // SAFETY: as above, on a window of this process.
+    !window.is_null() && unsafe { IsIconic(window) } != 0
+}
+
 /// The window class of a WinUI 3 desktop window.
 pub(crate) const WINUI_WINDOW_CLASS: &str = "WinUIDesktopWin32WindowClass";
 

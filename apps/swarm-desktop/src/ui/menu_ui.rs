@@ -161,15 +161,18 @@ actions! {
     Unarchive => ("Unarchive", m3::glyph::ARCHIVE, false),
     /// Resume an ended task in its conversation.
     Resume => ("Resume", m3::glyph::RESUME, false),
-    Stop => ("Stop", m3::glyph::STOP, false),
+    /// Stop the Agent itself (it asks first: the Agent's work ends).
+    Stop => ("Stop Agent…", m3::glyph::STOP, false),
     /// The More submenu (never chosen itself).
     More => ("More", m3::glyph::MORE, false),
     Delete => ("Delete…", m3::glyph::DELETE, true),
     CopyId => ("Copy Agent ID", m3::glyph::COPY, false),
+    /// The conversation header's Copy branch name.
+    CopyBranch => ("Copy branch name", m3::glyph::COPY, false),
     /// The conversation header's Agent details.
     Details => ("Agent details", m3::glyph::INFO, false),
     /// The conversation header's handoff or switch.
-    Handoff => ("Hand off or switch…", m3::glyph::FORWARD, false),
+    Handoff => ("Hand off or switch model…", m3::glyph::FORWARD, false),
     /// Detach Eliot's observer from an observed Agent (header only).
     DetachObserver => ("Detach", m3::glyph::EXTERNAL, false),
     /// The conversation header's Force stop (it asks first).
@@ -254,27 +257,10 @@ impl Entry {
         }
     }
 
-    fn action(&self) -> Action {
+    pub(super) fn action(&self) -> Action {
         match self {
             Self::Item { action, .. } | Self::Submenu { action, .. } => *action,
         }
-    }
-
-    /// Whether it deletes or removes.
-    pub(super) fn is_destructive(&self) -> bool {
-        matches!(self, Self::Item { action, .. } if action.danger())
-    }
-
-    /// Whether it is the More submenu (the conversation header has its
-    /// own).
-    pub(super) fn is_more(&self) -> bool {
-        matches!(
-            self,
-            Self::Submenu {
-                action: Action::More,
-                ..
-            }
-        )
     }
 }
 
@@ -969,8 +955,10 @@ impl DesktopApp {
                 Ok(()) => self.set_status(format!("Copied {}.", agent.id)),
                 Err(error) => self.alert(format!("Copy failed: {error}")),
             },
-            (Action::Stop, Target::Agent(agent)) => {
-                self.stop_agent(&agent.id, agent.generation, context);
+            // Stopping the Agent ends its work: it asks first, bound to the
+            // generation the menu was built for.
+            (Action::Stop, Target::Agent(agent)) if !agent.native_child => {
+                self.menu.confirm = Some((target, action));
             }
             (Action::Archive | Action::Unarchive, Target::Agent(agent)) => {
                 self.submit_archive(agent.clone(), action == Action::Archive, false, context);
@@ -1024,6 +1012,10 @@ impl DesktopApp {
         action: Action,
         context: &ComponentContext<Self>,
     ) {
+        if let (Action::Stop, Target::Agent(agent)) = (action, &target) {
+            self.stop_agent(&agent.id, agent.generation, context);
+            return;
+        }
         if let (Action::Delete, Target::Agent(agent)) = (action, target) {
             if self.selected_agent_id().as_deref() == Some(agent.id.as_str()) {
                 self.new_task(context);
@@ -1342,6 +1334,14 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let (title, body, button) = match target {
+            Target::Agent(agent) if action == Action::Stop => (
+                format!("Stop “{}”?", target.title()),
+                format!(
+                    "Swarm stops Agent {} (run {}) and its session: its work ends now and a running turn is cut off. The worktree and branch stay; Resume starts it again.",
+                    agent.id, agent.generation
+                ),
+                "Stop Agent",
+            ),
             Target::Agent(agent) if action == Action::Delete => {
                 let history = match agent.harness.as_str() {
                     "claude" => "Claude Code keeps its own chat history.",

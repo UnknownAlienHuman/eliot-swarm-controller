@@ -26,7 +26,12 @@ impl DesktopApp {
         if self.chat.pending_retry.contains_key(&agent) {
             return Some(Message::Chat(ChatMsg::RetryPending(agent)));
         }
-        let detail = self.chat.detail.as_ref()?;
+        let detail = match self.bound_detail() {
+            Ok(detail) => detail,
+            Err(reason) => {
+                return Some(Message::Chat(ChatMsg::Refused(reason)));
+            }
+        };
         let action = match (&detail.active_turn, resumable(detail)) {
             (_, true) => DraftAction::Resume {
                 agent,
@@ -59,7 +64,9 @@ impl DesktopApp {
         palette: Palette,
     ) -> View {
         let agent = self.selected_agent_id();
-        let detail = self.chat.detail.as_ref();
+        // Only a readback of the open Agent binds its controls; until then
+        // the card keeps the shape its sidebar row implies.
+        let detail = self.bound_detail().ok();
         let home = agent.is_none();
         let running =
             detail.is_some_and(|detail| detail.active_turn.is_some() && !detail.observe_only);
@@ -100,32 +107,44 @@ impl DesktopApp {
             (None, _) => {
                 self.composer_chips(label(tokens::layout::HOME_BAR_FIXED), context, palette)
             }
-            (Some(_), Some(detail)) => self.model_chip(detail, label(0.0), context, palette),
+            (Some(_), Some(detail)) => StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::CHIP_GAP)
+                .children((
+                    self.model_chip(detail, running, label(0.0), context, palette),
+                    access_chip(detail, palette),
+                )),
             (Some(_), None) => View::empty(),
         };
         let retry = agent
             .as_ref()
             .is_some_and(|agent| self.chat.pending_retry.contains_key(agent));
-        let primary = match (agent.clone(), detail) {
-            (Some(agent), _) if retry => Primary::Retry(agent),
-            (Some(agent), Some(detail)) if resumable(detail) => {
-                Primary::Resume(agent, detail.generation)
-            }
-            (Some(_), None) if reading == Some(RowMode::Resume) => Primary::ReadingResume,
-            (Some(_), None) if reading == Some(RowMode::Running) => Primary::ReadingRunning,
-            (Some(agent), detail) => Primary::Turn {
-                running: detail
-                    .filter(|detail| !detail.observe_only)
-                    .and_then(|detail| {
-                        detail
-                            .active_turn
-                            .as_deref()
-                            .map(|turn| BoundAction::turn_control(&agent, detail.generation, turn))
+        let primary =
+            match (agent.clone(), detail) {
+                (Some(agent), _) if retry => Primary::Retry(agent),
+                (Some(agent), Some(detail)) if resumable(detail) => {
+                    Primary::Resume(agent, detail.generation)
+                }
+                (Some(_), None) if reading == Some(RowMode::Resume) => Primary::ReadingResume,
+                (Some(_), None) if reading == Some(RowMode::Running) => Primary::ReadingRunning,
+                (Some(agent), detail) => Primary::Turn {
+                    running: detail
+                        .filter(|detail| !detail.observe_only)
+                        .and_then(|detail| {
+                            detail.active_turn.as_deref().map(|turn| {
+                                BoundAction::turn_control(&agent, detail.generation, turn)
+                            })
+                        }),
+                    held: detail.is_some_and(|detail| {
+                        detail.active_turn.is_none()
+                            && detail.provider_hold.as_ref().is_some_and(|hold| {
+                                hold.state == eliot_core::ProviderHoldState::Held
+                            })
                     }),
-                agent,
-            },
-            (None, _) => Primary::Start,
-        };
+                    agent,
+                },
+                (None, _) => Primary::Start,
+            };
         View::component::<Composer>(ComposerInput {
             palette,
             drafts: views::Shared(Rc::clone(&self.chat.drafts)),
@@ -143,11 +162,24 @@ impl DesktopApp {
             chips,
             // Home's bar is the design's (+, the chips, Start task): the
             // limits are the sidebar's Usage row there.
+            // The task's quota ring (its harness's tightest window, with
+            // its popover) and the context ring.
             usage: if home {
                 View::empty()
             } else {
-                self.usage_indicator(context, palette)
+                StackPanel::new()
+                    .orientation(Orientation::Horizontal)
+                    .spacing(tokens::spacing::XS)
+                    .vertical_alignment(VerticalAlignment::Center)
+                    .children((
+                        self.usage_indicator(context, palette),
+                        self.context_ring(context, palette),
+                    ))
             },
+            // Add as a note: a live Agent the daemon can take a note for.
+            note: detail
+                .filter(|detail| !home && !detail.observe_only && !resumable(detail))
+                .map(|detail| detail.generation),
             primary,
             hint,
             enabled: !self.submitting(),
@@ -163,6 +195,7 @@ impl DesktopApp {
     fn model_chip(
         &self,
         detail: &UiDetail,
+        running: bool,
         label_width: f64,
         context: &mut ViewContext<Self>,
         palette: Palette,
@@ -181,6 +214,27 @@ impl DesktopApp {
             "{model} · {}",
             effort.map_or_else(|| "default effort".to_owned(), effort_name)
         );
+        // The model and effort change between turns only: while one runs
+        // the chip rests disabled and says so (a flyout's chip takes no
+        // tooltip, so this one opens nothing).
+        if running {
+            return Border::new()
+                .vertical_alignment(VerticalAlignment::Center)
+                .content(
+                    m3::chip(palette)
+                        .is_enabled(false)
+                        .automation_name(format!(
+                            "Model and effort: {name} (change the model between turns)"
+                        ))
+                        .content(m3::chip_content(
+                            Some(m3::glyph::MODEL),
+                            &label,
+                            false,
+                            label_width,
+                        )),
+                )
+                .tooltip("Change the model between turns");
+        }
         let open = self.launch.open == Some(Pop::Effort);
         self.popover_chip(
             m3::chip(palette)
@@ -189,7 +243,7 @@ impl DesktopApp {
                     if open { "open" } else { "change" }
                 ))
                 .on_click(context.callback(|()| Message::Launch(LaunchMsg::Toggle(Pop::Effort)))),
-            m3::chip_content(None, &label, true, label_width),
+            m3::chip_content(Some(m3::glyph::MODEL), &label, true, label_width),
             &[Pop::Effort, Pop::Model, Pop::Manage],
             FlyoutPlacement::TopEdgeAlignedLeft,
             context,
@@ -204,7 +258,7 @@ impl DesktopApp {
             return None;
         }
         self.selected_agent_id()?;
-        self.chat.detail.as_ref()
+        self.bound_detail().ok()
     }
 
     /// The open Agent's route catalogue, read for its exact generation:
@@ -212,7 +266,7 @@ impl DesktopApp {
     /// or at once from its Retry).
     pub(in crate::ui) fn agent_catalog(&self) -> Option<&Result<HarnessModelsResponse, String>> {
         let agent = self.selected_agent_id()?;
-        let generation = self.chat.detail.as_ref()?.generation;
+        let generation = self.bound_detail().ok()?.generation;
         self.configure
             .catalog
             .as_ref()
@@ -247,7 +301,7 @@ impl DesktopApp {
 
     /// Confirmed effort steps of the open Agent's next model.
     pub(in crate::ui) fn agent_efforts(&self) -> Vec<String> {
-        match (self.agent_catalog(), self.chat.detail.as_ref()) {
+        match (self.agent_catalog(), self.bound_detail().ok()) {
             (Some(Ok(reply)), Some(detail)) if reply.configure.effort_refusal.is_none() => {
                 configure::options(reply, detail.settings.next_model()).1
             }
@@ -264,7 +318,7 @@ impl DesktopApp {
         context: &mut ViewContext<Self>,
         palette: Palette,
     ) -> View {
-        let Some(detail) = self.chat.detail.as_ref() else {
+        let Some(detail) = self.bound_detail().ok() else {
             return View::empty();
         };
         let harness = crate::picker::harness_label(&detail.harness);
@@ -604,6 +658,64 @@ impl DesktopApp {
             button,
         )])
     }
+
+    /// The context ring beside the main action (`.ring`): how full the
+    /// session's context is, as the harness reports it ("Context 34%",
+    /// used and window in its tooltip); a click opens Details. Nothing
+    /// when the harness reports no context fill.
+    fn context_ring(&self, context: &mut ViewContext<Self>, palette: Palette) -> View {
+        let Some((used, window)) = self.bound_detail().ok().and_then(|detail| detail.context)
+        else {
+            return View::empty();
+        };
+        let share = (used as f64 / window as f64 * 100.0).clamp(0.0, 100.0);
+        let words = format!(
+            "Context {}% \u{b7} {}k of {}k tokens",
+            share.round(),
+            used / 1_000,
+            window / 1_000
+        );
+        Button::new()
+            .resource_overrides(palette.context_ring())
+            .style(ButtonStyle::Subtle)
+            .width(tokens::height::CONTROL)
+            .height(tokens::height::CONTROL)
+            .vertical_alignment(VerticalAlignment::Center)
+            .automation_name(format!("{words} (open Details)"))
+            .on_click(context.message(Message::Monitor(MonitorMsg::PanelChosen(Panel::Details))))
+            .content(
+                ProgressRing::new()
+                    .is_indeterminate(false)
+                    .minimum(0.0)
+                    .maximum(100.0)
+                    .value(share)
+                    .width(tokens::layout::USAGE_RING)
+                    .height(tokens::layout::USAGE_RING)
+                    .horizontal_alignment(HorizontalAlignment::Center)
+                    .vertical_alignment(VerticalAlignment::Center),
+            )
+            .tooltip(words)
+    }
+}
+
+/// The open Agent's access, read only (`.chip.plain`): fixed for the
+/// Agent; changing it is a hand-off. None when the launch named no level.
+fn access_chip(detail: &UiDetail, palette: Palette) -> View {
+    let Some(access) = detail.settings.access.as_deref().and_then(|wire| {
+        crate::settings::Access::ALL
+            .into_iter()
+            .find(|access| access.wire() == wire)
+    }) else {
+        return View::empty();
+    };
+    m3::fixed_chip(
+        palette,
+        access == crate::settings::Access::Full,
+        Some(m3::glyph::SHIELD),
+        access.label(),
+        &format!("Access: {} (fixed for this Agent)", access.label()),
+    )
+    .tooltip("Access is fixed for this Agent; hand off to change it")
 }
 
 /// A stopped, failed or lost Agent that Resume starts again (not while a
@@ -621,7 +733,7 @@ impl DesktopApp {
     /// implies: the card keeps the shape it will have (Resume for an ended
     /// task, Stop for a working one), so an open never flashes another.
     fn reading_row(&self) -> Option<RowMode> {
-        if self.chat.detail.is_some() {
+        if self.bound_detail().is_ok() {
             return None;
         }
         let row = self.find_agent(&self.selected_agent_id()?)?;
@@ -662,10 +774,11 @@ pub(in crate::ui) enum Primary {
     ReadingResume,
     ReadingRunning,
     /// An open Agent: Stop with an empty field and Steer with text while
-    /// this turn runs; Send otherwise.
+    /// this turn runs; Send otherwise (closed during a provider hold).
     Turn {
         agent: String,
         running: Option<BoundAction>,
+        held: bool,
     },
     /// The new task's Start.
     Start,
@@ -696,6 +809,8 @@ pub(in crate::ui) struct ComposerInput {
     attached: Vec<String>,
     chips: View,
     usage: View,
+    /// Add as a note is offered: the Agent's generation.
+    note: Option<i64>,
     primary: Primary,
     /// The hint before the trailing buttons ("Enter to send"), left out
     /// of a narrow composer.
@@ -873,13 +988,13 @@ impl Component for Composer {
     }
 }
 
-/// The one trailing button, as in Codex: Send; while a turn runs, Stop
-/// (it interrupts that turn) with an empty field and Steer with text;
-/// Resume for a stopped Agent. An unresolved submission shows Retry
-/// instead, resubmitting its saved identity. Each is bound by the window
-/// from the detail on screen. A stopped Agent has one Resume: the filled
-/// button while the field is empty, the Send arrow (resume with the
-/// message) once it has text.
+/// The composer's main action (`ComposerAction`), as in Codex: Send;
+/// while a turn runs, Stop turn (`error`, it interrupts that turn) with an
+/// empty field and Steer (`tertiary`) with text; Resume
+/// (`secondary-container`) for a stopped Agent, with the message when
+/// there is one. An unresolved submission shows Retry instead,
+/// resubmitting its saved identity. Each is bound by the window from the
+/// detail on screen. Beside it, 2 DIPs apart, the ▾ with Add as a note.
 fn composer_actions(
     input: &ComposerInput,
     draft_blank: bool,
@@ -893,7 +1008,12 @@ fn composer_actions(
         Primary::Turn {
             running: Some(_), ..
         } => enabled,
-        Primary::Turn { running: None, .. } | Primary::Start => enabled && !draft_blank,
+        Primary::Turn {
+            running: None,
+            held,
+            ..
+        } => enabled && !draft_blank && !held,
+        Primary::Start => enabled && !draft_blank,
         Primary::Retry(_)
         | Primary::Resume(..)
         | Primary::ReadingResume
@@ -906,110 +1026,167 @@ fn composer_actions(
             .on_click(context.message(Message::Chat(ChatMsg::RetryPending(agent.clone()))))
             .content(m3::label("Retry"))
             .tooltip("Retry with the same id"),
-        Primary::Resume(agent, generation) => {
-            let resume = context.message(Message::Chat(ChatMsg::DraftRequested(
+        Primary::Resume(agent, generation) => m3::resume_button(palette)
+            .is_enabled(enabled)
+            .automation_name(if draft_blank {
+                "Resume (Enter)"
+            } else {
+                "Resume with this message (Enter)"
+            })
+            .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                 DraftAction::Resume {
                     agent: agent.clone(),
                     generation: *generation,
                 },
-            )));
-            if draft_blank {
-                m3::filled(palette)
-                    .is_enabled(enabled)
-                    .automation_name("Resume")
-                    .on_click(resume)
-                    .content(m3::label("Resume"))
+            ))))
+            .content(m3::icon(m3::glyph::RESUME))
+            .tooltip(if draft_blank {
+                "Resume"
             } else {
-                m3::send_button(palette)
-                    .is_enabled(enabled)
-                    .automation_name("Resume with this message (Enter)")
-                    .on_click(resume)
-                    .content(m3::send_icon())
-                    .tooltip("Resume with this message")
-            }
-        }
-        Primary::ReadingResume => m3::filled(palette)
+                "Resume with this message"
+            }),
+        Primary::ReadingResume => m3::resume_button(palette)
             .is_enabled(false)
             .automation_name("Resume")
-            .content(m3::label("Resume")),
+            .content(m3::icon(m3::glyph::RESUME)),
         Primary::ReadingRunning => m3::stop_button(palette)
             .is_enabled(false)
-            .automation_name("Stop the running turn")
+            .automation_name("Stop turn")
             .content(m3::stop_mark(palette)),
-        // Codex's one trailing button: while a turn runs, Stop with an
-        // empty field (it interrupts that turn) and Steer once there is
-        // text; otherwise Send.
-        Primary::Turn { agent, running } => match running {
+        Primary::Turn {
+            agent,
+            running,
+            held,
+        } => match running {
             Some(bound) if draft_blank => m3::stop_button(palette)
                 .is_enabled(enabled)
-                .automation_name("Stop the running turn")
+                .automation_name("Stop turn")
                 .on_click(
                     context.message(Message::Chat(ChatMsg::InterruptRequested(bound.clone()))),
                 )
                 .content(m3::stop_mark(palette))
-                .tooltip("Stop"),
+                .tooltip("Stop turn"),
             Some(bound) => m3::steer_button(palette)
                 .is_enabled(enabled)
                 .automation_name("Steer the running turn (Enter)")
                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                     DraftAction::Steer(bound.clone()),
                 ))))
-                .content(m3::send_icon())
+                .content(m3::icon(m3::glyph::STEER))
                 .tooltip("Steer"),
             None => m3::send_button(palette)
-                .is_enabled(enabled && !draft_blank)
-                .automation_name("Send (Enter)")
+                .is_enabled(enabled && !draft_blank && !held)
+                .automation_name(if *held {
+                    "Send: closed during the provider hold"
+                } else {
+                    "Send (Enter)"
+                })
                 .on_click(context.message(Message::Chat(ChatMsg::DraftRequested(
                     DraftAction::Send {
                         agent: agent.clone(),
                     },
                 ))))
                 .content(m3::send_icon())
-                .tooltip("Send"),
+                .tooltip(if *held {
+                    "Closed during the provider hold"
+                } else {
+                    "Send"
+                }),
         },
         Primary::Start => start_split(palette, enabled, draft_blank, context),
     };
-    // The design's hint before the ring and the FAB.
-    let hint = match &input.primary {
-        Primary::Retry(_) => "",
-        Primary::Resume(..) | Primary::ReadingResume => "Enter resumes",
-        Primary::ReadingRunning => "Stop the turn",
+    // The hint before the ring and the action, while Enter steers.
+    let hint: View = match &input.primary {
         Primary::Turn {
             running: Some(_), ..
-        } => {
-            if draft_blank {
-                "Stop the turn"
-            } else {
-                "Enter steers the running turn"
-            }
-        }
-        _ => "Enter to send",
-    };
-    let hint: View = if input.hint && !hint.is_empty() {
-        m3::secondary(hint)
+        } if input.hint && !draft_blank => m3::secondary("Enter to steer")
             .vertical_alignment(VerticalAlignment::Center)
-            .into()
-    } else {
-        View::empty()
+            .into(),
+        _ => View::empty(),
+    };
+    // The ▾ beside the action (an open Agent): Add as a note, the text
+    // into the Agent's context at its next safe point without a new turn.
+    let note: View = match (&input.primary, input.note) {
+        (Primary::Start, _) => View::empty(),
+        (primary, generation) => {
+            let ready = enabled && !draft_blank && generation.is_some();
+            let item = if ready {
+                MenuItem::item(NOTE_LABEL, NOTE_LABEL)
+            } else {
+                MenuItem::disabled(NOTE_LABEL, NOTE_LABEL)
+            };
+            let overrides = match primary {
+                Primary::Turn {
+                    running: Some(_), ..
+                } if draft_blank => palette.stop_fab(),
+                Primary::Turn {
+                    running: Some(_), ..
+                } => palette.steer_fab(),
+                Primary::Resume(..) | Primary::ReadingResume => palette.resume_fab(),
+                _ => palette.filled(),
+            };
+            m3::send_menu_button(overrides)
+                .is_enabled(ready)
+                .automation_name("More send options: Add as a note")
+                .content(m3::small_icon(m3::glyph::CHEVRON_DOWN))
+                .menu(Menu::new(
+                    vec![item],
+                    // Capture-free: one identity across renders.
+                    context.callback(|label: String| {
+                        if label == NOTE_LABEL {
+                            Message::Chat(ChatMsg::NoteRequested)
+                        } else {
+                            Message::Menu(MenuMsg::Ignored)
+                        }
+                    }),
+                ))
+        }
     };
     // The glow's host shares the action's cell, under it; the action keeps
     // its key whether it glows or not.
+    // The action and its menu are keyed by their kind: WinUI reads a
+    // button's colors only when its template is applied, so a Send turned
+    // Stop would keep Send's colors.
+    let kind = match &input.primary {
+        Primary::Retry(_) => "retry",
+        Primary::Resume(..) | Primary::ReadingResume => "resume",
+        Primary::ReadingRunning => "stop",
+        Primary::Turn {
+            running: Some(_), ..
+        } if draft_blank => "stop",
+        Primary::Turn {
+            running: Some(_), ..
+        } => "steer",
+        Primary::Turn { .. } | Primary::Start => "send",
+    };
     let mut action = Vec::new();
     if glows {
         action.push(KeyedView::new("glow", glow.view()));
     }
-    action.push(KeyedView::new("action", primary));
+    action.push(KeyedView::new(format!("action:{kind}"), primary));
     StackPanel::new()
         .orientation(Orientation::Horizontal)
         .spacing(tokens::spacing::ROW)
         .children((
             hint,
             input.usage.clone(),
-            Grid::new()
+            StackPanel::new()
+                .orientation(Orientation::Horizontal)
+                .spacing(tokens::spacing::ROW_GAP)
                 .vertical_alignment(VerticalAlignment::Center)
-                .keyed_children(action),
+                .children((
+                    Grid::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .keyed_children(action),
+                    Grid::new()
+                        .vertical_alignment(VerticalAlignment::Center)
+                        .keyed_children(vec![KeyedView::new(format!("note:{kind}"), note)]),
+                )),
         ))
 }
+
+/// The composer menu's one item.
+const NOTE_LABEL: &str = "Add as a note";
 
 /// Files attached in the composer: one outlined chip each (file glyph,
 /// name, the full path in its tooltip); a click removes it.

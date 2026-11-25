@@ -212,7 +212,11 @@ impl DesktopApp {
         ) else {
             return;
         };
-        if detail.state != eliot_core::AgentState::Lost || detail.observe_only {
+        if !matches!(
+            detail.state,
+            eliot_core::AgentState::Lost | eliot_core::AgentState::Failed
+        ) || detail.observe_only
+        {
             self.chat.loss = None;
             return;
         }
@@ -233,41 +237,95 @@ impl DesktopApp {
         });
     }
 
-    /// Why the open Agent stopped ("Stopped by a Swarm restart"), one line
-    /// above the composer. Resume itself is the composer's one action (the
-    /// filled button, or Send with a message), never repeated here.
-    pub(super) fn loss_notice(&self, column: Option<f64>) -> Option<View> {
+    /// Why the open Agent ended, above the composer: a lost one's "Stopped
+    /// by a Swarm restart" as a service line; a failed one's diagnosis as
+    /// the "What went wrong" card with Details. Resume itself is the
+    /// composer's one action, never repeated here.
+    pub(super) fn loss_notice(
+        &self,
+        column: Option<f64>,
+        context: &mut ViewContext<Self>,
+        palette: Palette,
+    ) -> Option<View> {
         let detail = self.chat.detail.as_ref()?;
         let agent = self.selected_agent_id()?;
         let (read, generation, words) = self.chat.loss.as_ref()?;
         let words = words.as_deref()?;
-        if *read != agent
-            || *generation != detail.generation
-            || detail.state != eliot_core::AgentState::Lost
-        {
+        if *read != agent || *generation != detail.generation {
             return None;
         }
-        Some(
-            Border::new()
-                .grid_row(4)
-                .width(column)
-                .max_width(tokens::layout::READING_WIDTH)
-                .horizontal_alignment(HorizontalAlignment::Center)
-                .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
-                .padding(Thickness::xy(tokens::spacing::MD, 0.0))
-                .automation_name(words.to_owned())
-                .content(
+        let place = Border::new()
+            .grid_row(4)
+            .width(column)
+            .max_width(tokens::layout::READING_WIDTH)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .margin(Thickness::new(0.0, tokens::spacing::SM, 0.0, 0.0))
+            .automation_name(words.to_owned());
+        match detail.state {
+            eliot_core::AgentState::Lost => Some(
+                place.content(
                     StackPanel::new()
                         .orientation(Orientation::Horizontal)
                         .spacing(tokens::spacing::SM)
+                        .horizontal_alignment(HorizontalAlignment::Center)
                         .children((
-                            m3::icon(m3::glyph::INFO),
+                            m3::muted_icon(m3::glyph::RESTART),
                             m3::secondary(words.to_owned())
                                 .vertical_alignment(VerticalAlignment::Center)
                                 .text_trimming(TextTrimming::CharacterEllipsis),
                         )),
                 ),
-        )
+            ),
+            eliot_core::AgentState::Failed => {
+                let (container, on) = palette.status_chip(crate::theme::StatusTone::Failed);
+                Some(
+                    place
+                        .background(container)
+                        .corner_radius(tokens::radius::CONTAINER)
+                        .padding(Thickness::new(
+                            tokens::spacing::INSET,
+                            tokens::layout::STRIP_INSET,
+                            tokens::layout::STRIP_INSET,
+                            tokens::layout::STRIP_INSET,
+                        ))
+                        .content(
+                            Grid::new()
+                                .columns([GridLength::Auto, GridLength::STAR, GridLength::Auto])
+                                .column_spacing(tokens::spacing::ROW)
+                                .children((
+                                    m3::carrier(
+                                        palette,
+                                        |s| s.on_error_container,
+                                        "",
+                                        tokens::icon::ROW,
+                                        m3::icon(m3::glyph::ERROR),
+                                    ),
+                                    StackPanel::new()
+                                        .grid_column(1)
+                                        .orientation(Orientation::Horizontal)
+                                        .spacing(tokens::spacing::XS)
+                                        .vertical_alignment(VerticalAlignment::Center)
+                                        .children((
+                                            m3::text("What went wrong", tokens::text::BUTTON)
+                                                .foreground(on),
+                                            m3::body(words.to_owned())
+                                                .foreground(on)
+                                                .text_trimming(TextTrimming::CharacterEllipsis),
+                                        )),
+                                    m3::text_button(palette)
+                                        .resource_overrides(palette.error_strip_button())
+                                        .grid_column(2)
+                                        .automation_name("Details")
+                                        .on_click(context.message(Message::Monitor(
+                                            MonitorMsg::PanelChosen(Panel::Details),
+                                        )))
+                                        .content(m3::label("Details")),
+                                )),
+                        ),
+                )
+            }
+            _ => None,
+        }
     }
 
     /// Retry a local input that definitely did not start: a launch that
@@ -319,6 +377,11 @@ impl DesktopApp {
         self.chat.items = Rc::new(Vec::new());
         self.chat.live = LiveStatus::Loading;
         self.chat.confirm_force = None;
+        self.chat.goal = None;
+        self.chat.decisions = None;
+        self.chat.holds = None;
+        self.chat.decision_at = 0;
+        self.chat.decide_reason.clear();
         self.alert = None;
         if let Some((target, command, text)) = self.chat.pending_local.take() {
             if target == agent.id

@@ -356,7 +356,7 @@ impl DesktopApp {
 
 /// A time on the local clock: "14:20" today, "Fri 09:00" within the
 /// week, "24 Nov 09:00" beyond.
-fn clock(at_ms: i64, now_ms: i64) -> String {
+pub(in crate::ui) fn clock(at_ms: i64, now_ms: i64) -> String {
     use chrono::{Local, TimeZone};
     let (Some(at), Some(now)) = (
         Local.timestamp_millis_opt(at_ms).single(),
