@@ -1666,6 +1666,12 @@ with a reason, or `unavailable` with a reason and no counts). Counts with partia
 coverage describe observed evidence. List truncation is explicit. The report
 contains no command text, message bodies, or thresholds for judging performance.
 
+For rollout, `swarm doctor` reports how many registered projects have a
+configured check and lists up to 32 projects missing one. It uses the same
+policy parser as launch admission, including legacy check settings. An unreadable
+or invalid configuration reports coverage as unavailable. The diagnostic
+reads settings without running a project check.
+
 The window includes both endpoints. The Owner backlog is measured as of the
 report end, using an age strictly greater than 24 hours regardless of the start
 of the activity window. The daemon runs one report at a time on a separate

@@ -612,6 +612,30 @@ pub(crate) async fn run_doctor(
         print_value(&value, true);
     } else {
         print_doctor_table(&response);
+        if let Some(project_checks) = &response.project_checks {
+            use eliot_core::api::ProjectCheckConfiguration;
+            match project_checks {
+                ProjectCheckConfiguration::Available {
+                    registered,
+                    configured,
+                    unconfigured_projects,
+                } => {
+                    println!(
+                        "\nProject checks configured for {configured} of {registered} registered projects"
+                    );
+                    for project in unconfigured_projects {
+                        println!("  {project} needs policy.check.argv");
+                    }
+                    let omitted = registered - configured - unconfigured_projects.len();
+                    if omitted > 0 {
+                        println!("  {omitted} additional projects need a check");
+                    }
+                }
+                ProjectCheckConfiguration::Unavailable => {
+                    println!("\nProject check configuration is unavailable");
+                }
+            }
+        }
         if let Some(latency) = &response.rpc_latency {
             println!(
                 "\nLocal RPC latency (µs, rolling {} s)",

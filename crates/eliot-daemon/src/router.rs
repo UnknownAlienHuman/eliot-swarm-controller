@@ -110,12 +110,13 @@ use eliot_core::{
         MAX_WAIT_FINAL_TEXT_BYTES, MAX_WAIT_FRAME_BYTES, MaintenancePurgeLegacyAttentionRequest,
         MaintenancePurgeLegacyAttentionResponse, MaintenanceRunRequest, MaintenanceRunResponse,
         ObservationPage, ObservationQuery, ObservationView, ObserveHeavyRequest,
-        ObserveHeavyResponse, ProcessPageCursor, ProjectCheckPassed, ProjectDiscoverRequest,
-        ProjectRegistrationView, ProviderClearHoldRequest, ProviderHoldsRequest, RuleGetRequest,
-        RuleStateView, SWITCH_BLANK_SCOPE_ARG, SWITCH_PROJECT_REVISION_ARG, SessionGrowthView,
-        ShutdownMode, SourceState, SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest,
-        TimerStateView, TurnGetRequest, UsageScopeView, UsageSummaryRequest, UsageSummaryResponse,
-        WaitEntryResult, WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
+        ObserveHeavyResponse, ProcessPageCursor, ProjectCheckConfiguration, ProjectCheckPassed,
+        ProjectDiscoverRequest, ProjectRegistrationView, ProviderClearHoldRequest,
+        ProviderHoldsRequest, RuleGetRequest, RuleStateView, SWITCH_BLANK_SCOPE_ARG,
+        SWITCH_PROJECT_REVISION_ARG, SessionGrowthView, ShutdownMode, SourceState,
+        SwarmWaitRequest, SwarmWaitResponse, TimerGetRequest, TimerStateView, TurnGetRequest,
+        UsageScopeView, UsageSummaryRequest, UsageSummaryResponse, WaitEntryResult,
+        WorkSummaryView, WorkerTaskHealth, WorkerTaskStatus, fair_excerpt_cap,
         is_supported_harness,
     },
 };
@@ -5312,14 +5313,43 @@ impl Router {
             store.profile_native_child_usage()?;
         drop(store);
         let data_root = self.inner.data_root.clone();
-        let (owner_rules_drift, owner_rules_check_unavailable) = match tokio::task::spawn_blocking(
-            move || owner_rules_doctor::check(&data_root),
-        )
-        .await
-        {
-            Ok(Ok(files)) => (files, false),
-            _ => (Vec::new(), true),
-        };
+        let ((owner_rules_drift, owner_rules_check_unavailable), project_checks) =
+            tokio::task::spawn_blocking(move || {
+                let owner_rules = match owner_rules_doctor::check(&data_root) {
+                    Ok(files) => (files, false),
+                    Err(_) => (Vec::new(), true),
+                };
+                let project_checks =
+                    match crate::config::load_project_registration_config(&data_root) {
+                        Ok(projects) => {
+                            let registered = projects.len();
+                            let mut unconfigured_projects: Vec<_> = projects
+                                .into_iter()
+                                .filter(|project| {
+                                    project
+                                        .policy
+                                        .as_ref()
+                                        .and_then(|policy| policy.check.as_ref())
+                                        .is_none()
+                                })
+                                .map(|project| project.id)
+                                .collect();
+                            let configured = registered - unconfigured_projects.len();
+                            unconfigured_projects.sort_unstable();
+                            unconfigured_projects
+                                .truncate(eliot_core::api::MAX_UNCONFIGURED_PROJECT_CHECKS);
+                            ProjectCheckConfiguration::Available {
+                                registered,
+                                configured,
+                                unconfigured_projects,
+                            }
+                        }
+                        Err(_) => ProjectCheckConfiguration::Unavailable,
+                    };
+                (owner_rules, project_checks)
+            })
+            .await
+            .unwrap_or_else(|_| ((Vec::new(), true), ProjectCheckConfiguration::Unavailable));
         let response = HarnessDoctorResponse {
             rpc_latency: Some(self.inner.rpc_latencies.report()),
             harnesses,
@@ -5332,6 +5362,7 @@ impl Router {
             attention_thresholds: Some(self.attention_thresholds().await?),
             owner_rules_drift,
             owner_rules_check_unavailable,
+            project_checks: Some(project_checks),
         };
         request
             .validate_response(&response)
