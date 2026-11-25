@@ -384,6 +384,15 @@ fn decode_owner_rules_delivery(value: &str) -> Result<StoredOwnerRulesDelivery> 
 
 fn sql_error(error: rusqlite::Error) -> Error {
     if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.as_str() == "switch_child_id_reserved"
+    ) {
+        Error::new(
+            "id_conflict",
+            "mutation id is reserved by an unsettled switch",
+        )
+    } else if matches!(
         error.sqlite_error_code(),
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
     ) {
@@ -1262,6 +1271,19 @@ impl Store {
             return Err(Error::new(
                 "id_conflict",
                 "write id is already used by a completion digest",
+            ));
+        }
+        if tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=?1)",
+                [id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(sql_error)?
+        {
+            return Err(Error::new(
+                "id_conflict",
+                "write id is reserved by a switch child",
             ));
         }
         if let Some((old_principal, old_method, old_digest, old_result)) = write_binding(&tx, id)? {

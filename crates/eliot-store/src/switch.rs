@@ -1081,6 +1081,27 @@ fn reserve_switch_tx(
         warning: None,
         next_action: "preparing_launch".into(),
     };
+    for child_id in [
+        value.launch_command.as_str(),
+        value.handoff_command.as_str(),
+    ] {
+        if command_binding(tx, child_id)?.is_some()
+            || write_exists(tx, child_id)?
+            || digest_id_bound(tx, child_id)?
+            || tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations WHERE id=?1)",
+                    [child_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(sql_error)?
+        {
+            return Err(Error::new(
+                "id_conflict",
+                "generated switch child id is already reserved",
+            ));
+        }
+    }
     let mut parent = SubmitCommand::new(&request.id, "switch");
     parent.args = args;
     let outcome = serde_json::to_value(&value)
@@ -1094,6 +1115,11 @@ fn reserve_switch_tx(
         },
         json!({"command_id":request.id,"verb":"switch"}),
     )?;
+    tx.execute(
+        "INSERT INTO switch_child_id_reservations(id,switch_command,kind) VALUES (?1,?2,'launch'),(?3,?2,'handoff')",
+        params![value.launch_command, request.id, value.handoff_command],
+    )
+    .map_err(sql_error)?;
     Ok(Change {
         value,
         events: vec![event],
@@ -1553,6 +1579,37 @@ impl Store {
                 });
             }
             let value = stored_result(&command.outcome)?;
+            if !switch_child_id_reserved(&tx, &value.launch_command, "launch", id)?
+                || !switch_child_id_reserved(&tx, &value.handoff_command, "handoff", id)?
+            {
+                let error = Error::new(
+                    "id_conflict",
+                    "legacy switch child id was already bound before reservation recovery",
+                );
+                let mut rejected = value;
+                rejected.error = Some(error.code.clone());
+                rejected.error_reason = Some(error.message.to_string());
+                rejected.state = CommandState::Rejected;
+                rejected.next_action.clear();
+                let outcome = serde_json::to_value(&rejected)
+                    .map_err(|_| Error::new("internal", "cannot encode switch result"))?;
+                let settled = Self::settle_command_tx(
+                    &tx,
+                    id,
+                    CommandState::Rejected,
+                    Some(outcome),
+                    now,
+                    false,
+                )?;
+                Self::settle_automatic_handoff_attempt_tx(&tx, id, CommandState::Rejected, now)?;
+                recovery::release_rejected_switch_fence_tx(&tx, &command, now)?;
+                events.extend(settled.events);
+                commit_transaction(tx, &self.write_faulted)?;
+                return Ok(Change {
+                    value: None,
+                    events,
+                });
+            }
             let RetainedSwitch {
                 request,
                 source_stop_command: _,
@@ -2048,6 +2105,7 @@ impl Store {
             super::work_truth::require_no_checkpoint_intent_tx(&tx, &agent)?;
             // Roll back the launch, worktree reservation and capacity together
             // on any refusal before commit. Git creation follows admission.
+            consume_switch_child_id(&tx, id, &request.id, "launch")?;
             let admission = admission::submit_switch_launch_tx(
                 &tx,
                 "owner",
@@ -2287,6 +2345,7 @@ impl Store {
                     uncertain =
                         handoff::last_turn_uncertain(&tx, source_num, request.from_generation)?
                             || has_unknown_gate(&tx, source_num)?;
+                    consume_switch_child_id(&tx, id, &plan.handoff_command, "handoff")?;
                     let change = handoff::handoff_tx(
                         &tx,
                         "owner",
@@ -2782,6 +2841,49 @@ fn component(
     } else {
         Ok(None)
     }
+}
+
+pub(super) fn switch_child_id_reserved(
+    tx: &Connection,
+    id: &str,
+    kind: &str,
+    switch_id: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM switch_child_id_reservations r
+         JOIN commands s ON s.id=r.switch_command
+         WHERE r.id=?1 AND r.kind=?2 AND r.switch_command=?3 AND s.method='swarm.switch'
+           AND s.verb='switch' AND s.principal='owner'
+           AND json_extract(s.outcome, CASE r.kind WHEN 'launch' THEN '$.launch_command' ELSE '$.handoff_command' END)=r.id)",
+        params![id, kind, switch_id],
+        |row| row.get(0),
+    )
+    .map_err(sql_error)
+}
+
+fn consume_switch_child_id(
+    tx: &Connection,
+    switch_id: &str,
+    child_id: &str,
+    kind: &str,
+) -> Result<()> {
+    let changed = tx
+        .execute(
+            "DELETE FROM switch_child_id_reservations
+         WHERE id=?1 AND switch_command=?2 AND kind=?3",
+            params![child_id, switch_id, kind],
+        )
+        .map_err(sql_error)?;
+    if changed != 1 {
+        let ordinal = if kind == "launch" { 0 } else { 1 };
+        if component(tx, switch_id, child_id, ordinal)?.is_none() {
+            return Err(Error::new(
+                "source_integrity",
+                "switch child id reservation is missing",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Check the exact unused successor again when its reserved stop dispatches.
