@@ -28,13 +28,14 @@ pub struct TerminalHistory<A, T> {
     pub input_position: usize,
     pub terminal_position: usize,
     pub terminal: T,
-    /// Includes newer observations so callers can deduplicate native counters
-    /// before projecting the exact terminal-to-input interval.
+    /// Includes assistants from newer segments for native counter deduplication.
+    /// Project text and usage only inside the exact terminal-to-input interval.
     pub assistants: Vec<(usize, A)>,
 }
 
-/// An exact input can bind a newer terminal in the same history segment.
-/// A different input, a missing input, or a readback error leaves the turn unresolved.
+/// A terminal binds only an input in its own newest-first history segment.
+/// A different input clears the candidate terminal. A missing input or
+/// readback error leaves the turn unresolved.
 pub async fn read_turn_history<A, T, PageRead>(
     harness: &str,
     input_id: &str,
@@ -66,12 +67,7 @@ where
                         assistants,
                     }));
                 }
-                HistoryMessage::Input(_) => {
-                    return Err(Error::new(
-                        "unknown",
-                        format!("{harness} terminal readback crossed a different input"),
-                    ));
-                }
+                HistoryMessage::Input(_) => terminal = None,
                 HistoryMessage::Assistant(message) => assistants.push((position, message)),
                 HistoryMessage::Terminal(message) if terminal.is_none() => {
                     terminal = Some((position, message));

@@ -8,9 +8,12 @@ the adapter.
 
 For exact-turn history readback, the adapter decodes native pages into input,
 assistant and terminal facts. Shared Rust owns the page limit and cursor
-progress. A newer terminal can bind to the first input in that history segment
-when it matches the request. A different or missing input leaves the result
-unknown. Shared settlement also combines the
+progress. In newest-first history, a terminal binds only an input in the same
+segment. Each intervening input clears the candidate terminal. An exact input
+without a terminal in its segment reports running. Missing input or readback
+failure leaves the result unknown. The readback retains newer assistant IDs for
+counter deduplication. Text and usage come from the exact terminal-to-input
+interval. Shared settlement also combines the
 translated terminal status with a definitive billing or quota refusal. A
 native success with that refusal is a failed task, and the original native
 status remains available.
